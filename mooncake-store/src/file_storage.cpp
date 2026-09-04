@@ -795,6 +795,45 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         LOG(WARNING) << "Disk watermark eviction failed: "
                      << disk_eviction_result.error();
     }
+
+    if (ssd_metric_) {
+        if (const auto stats = storage_backend_->SnapshotStats()) {
+            ssd_metric_->backend_physical_bytes.update(
+                static_cast<int64_t>(stats->physical_bytes));
+            ssd_metric_->backend_live_record_bytes.update(
+                static_cast<int64_t>(stats->live_record_bytes));
+            ssd_metric_->backend_logical_value_bytes.update(
+                static_cast<int64_t>(stats->logical_value_bytes));
+            ssd_metric_->backend_reclaimable_bytes.update(
+                static_cast<int64_t>(stats->reclaimable_bytes));
+            ssd_metric_->backend_active_segments.update(
+                static_cast<int64_t>(stats->active_segments));
+            ssd_metric_->backend_sealed_segments.update(
+                static_cast<int64_t>(stats->sealed_segments));
+            ssd_metric_->backend_retired_segments.update(
+                static_cast<int64_t>(stats->retired_segments));
+            ssd_metric_->backend_compaction_runs.update(
+                static_cast<int64_t>(stats->compaction_runs));
+            ssd_metric_->backend_compaction_input_bytes.update(
+                static_cast<int64_t>(stats->compaction_input_bytes));
+            ssd_metric_->backend_compaction_output_bytes.update(
+                static_cast<int64_t>(stats->compaction_output_bytes));
+            ssd_metric_->backend_compaction_reclaimed_bytes.update(
+                static_cast<int64_t>(stats->compaction_reclaimed_bytes));
+            ssd_metric_->backend_compaction_conflicts.update(
+                static_cast<int64_t>(stats->compaction_conflicts));
+            ssd_metric_->backend_compaction_cancellations.update(
+                static_cast<int64_t>(stats->compaction_cancellations));
+            ssd_metric_->backend_compaction_errors.update(
+                static_cast<int64_t>(stats->compaction_errors));
+            ssd_metric_->backend_compaction_last_duration_us.update(
+                static_cast<int64_t>(stats->compaction_last_duration_us));
+            ssd_metric_->backend_wal_sequence.update(
+                static_cast<int64_t>(stats->wal_sequence));
+            ssd_metric_->backend_checkpoint_sequence.update(
+                static_cast<int64_t>(stats->checkpoint_sequence));
+        }
+    }
     return {};
 }
 

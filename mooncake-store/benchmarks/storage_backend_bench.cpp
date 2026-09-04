@@ -15,7 +15,7 @@
 /**
  * @file storage_backend_bench.cpp
  * @brief Comprehensive benchmark for storage backends (OffsetAllocator, Bucket,
- * FilePerKey)
+ * FilePerKey, LogStructured)
  *
  * TESTS AVAILABLE:
  *   - init: Backend initialization time
@@ -92,6 +92,7 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#include "storage/local/log_structured/log_structured_backend.h"
 #include "storage_backend.h"
 
 namespace fs = std::filesystem;
@@ -101,8 +102,10 @@ namespace fs = std::filesystem;
 // ============================================================================
 
 // === Core Parameters ===
-DEFINE_string(backend, "offset_allocator",
-              "Backend type: offset_allocator, bucket, file_per_key, or all");
+DEFINE_string(
+    backend, "offset_allocator",
+    "Backend type: offset_allocator, bucket, file_per_key, log_structured, or "
+    "all");
 DEFINE_uint64(value_size, 128 * 1024, "Value size in bytes (default: 128KB)");
 DEFINE_uint64(batch_size, 32, "Batch size for operations (default: 32)");
 DEFINE_uint64(num_operations, 1000,
@@ -242,7 +245,12 @@ AccessPattern StringToAccessPattern(const std::string& str) {
 // Backend Types
 // ============================================================================
 
-enum class BackendType { OFFSET_ALLOCATOR, BUCKET, FILE_PER_KEY };
+enum class BackendType {
+    OFFSET_ALLOCATOR,
+    BUCKET,
+    FILE_PER_KEY,
+    LOG_STRUCTURED
+};
 
 std::string BackendTypeToString(BackendType type) {
     switch (type) {
@@ -252,6 +260,8 @@ std::string BackendTypeToString(BackendType type) {
             return "bucket";
         case BackendType::FILE_PER_KEY:
             return "file_per_key";
+        case BackendType::LOG_STRUCTURED:
+            return "log_structured";
     }
     return "unknown";
 }
@@ -260,6 +270,7 @@ BackendType StringToBackendType(const std::string& str) {
     if (str == "offset_allocator") return BackendType::OFFSET_ALLOCATOR;
     if (str == "bucket") return BackendType::BUCKET;
     if (str == "file_per_key") return BackendType::FILE_PER_KEY;
+    if (str == "log_structured") return BackendType::LOG_STRUCTURED;
     LOG(FATAL) << "Unknown backend type: " << str;
     return BackendType::OFFSET_ALLOCATOR;
 }
@@ -831,8 +842,44 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
             return std::make_shared<mooncake::StorageBackendAdaptor>(
                 config, fpk_config);
         }
+        case BackendType::LOG_STRUCTURED: {
+            config.storage_backend_type =
+                mooncake::StorageBackendType::kLogStructured;
+            return std::make_shared<mooncake::LogStructuredStorageBackend>(
+                config);
+        }
     }
     return nullptr;
+}
+
+void PrintBackendStorageStats(
+    const std::shared_ptr<mooncake::StorageBackendInterface>& backend) {
+    const auto stats = backend->SnapshotStats();
+    if (!stats) return;
+    const double physical_amplification =
+        stats->logical_value_bytes == 0
+            ? 0.0
+            : static_cast<double>(stats->physical_bytes) /
+                  static_cast<double>(stats->logical_value_bytes);
+    std::cout << "\n  --- BACKEND STORAGE STATE ---\n";
+    std::cout << "  Physical bytes:   " << stats->physical_bytes << "\n";
+    std::cout << "  Live record bytes:" << stats->live_record_bytes << "\n";
+    std::cout << "  Logical bytes:    " << stats->logical_value_bytes << "\n";
+    std::cout << "  Reclaimable bytes:" << stats->reclaimable_bytes << "\n";
+    std::cout << "  Physical amp:     " << std::fixed << std::setprecision(2)
+              << physical_amplification << "x\n";
+    std::cout << "  Segments A/S/R:   " << stats->active_segments << "/"
+              << stats->sealed_segments << "/" << stats->retired_segments
+              << "\n";
+    std::cout << "  Compaction runs:  " << stats->compaction_runs << "\n";
+    std::cout << "  Compaction bytes: " << stats->compaction_input_bytes
+              << " input, " << stats->compaction_output_bytes << " output, "
+              << stats->compaction_reclaimed_bytes << " reclaimed\n";
+    std::cout << "  Compaction C/C/E: " << stats->compaction_conflicts << "/"
+              << stats->compaction_cancellations << "/"
+              << stats->compaction_errors << "\n";
+    std::cout << "  WAL/checkpoint:   " << stats->wal_sequence << "/"
+              << stats->checkpoint_sequence << "\n";
 }
 
 // ============================================================================
@@ -2130,6 +2177,7 @@ void BenchChurn(BackendType type, const std::string& storage_path,
     stats.StopTimer();
     stats.Finalize();
     stats.PrintStatistics("CHURN");
+    PrintBackendStorageStats(backend);
 }
 
 // ============================================================================
@@ -2263,6 +2311,7 @@ void BenchRestart(BackendType type, const std::string& storage_path,
     std::cout << "  Samples:          " << first_load_latencies.size() << "\n";
     std::cout << "  Average:          " << avg_first_load << " ms\n";
     std::cout << "  First:            " << first_load_latencies[0] << " ms\n";
+    PrintBackendStorageStats(backend);
 }
 
 // ============================================================================
@@ -2280,9 +2329,9 @@ struct BenchmarkResult {
 };
 
 void RunAllBenchmarks(const std::string& storage_path, size_t capacity) {
-    std::vector<BackendType> backends = {BackendType::OFFSET_ALLOCATOR,
-                                         BackendType::BUCKET,
-                                         BackendType::FILE_PER_KEY};
+    std::vector<BackendType> backends = {
+        BackendType::OFFSET_ALLOCATOR, BackendType::BUCKET,
+        BackendType::FILE_PER_KEY, BackendType::LOG_STRUCTURED};
 
     std::vector<BenchmarkResult> results;
 

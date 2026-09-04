@@ -73,6 +73,24 @@ class FileStorageTest : public ::testing::Test {
                                 batch_data, buckets);
     }
 
+    tl::expected<void, ErrorCode> FileStorageInitBackend(
+        FileStorage& fileStorage) {
+        return fileStorage.storage_backend_->Init();
+    }
+
+    tl::expected<void, ErrorCode> FileStorageScanMeta(
+        FileStorage& fileStorage,
+        const std::function<ErrorCode(const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&)>&
+            handler) {
+        return fileStorage.storage_backend_->ScanMeta(handler);
+    }
+
+    std::optional<StorageBackendStats> FileStorageSnapshotBackendStats(
+        FileStorage& fileStorage) {
+        return fileStorage.storage_backend_->SnapshotStats();
+    }
+
     tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
     FileStorageAllocateBatch(FileStorage& fileStorage,
                              const std::vector<std::string>& keys,
@@ -1004,6 +1022,112 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
             << "key not found in batch_data: " << key;
         EXPECT_EQ(data, found->second);
     }
+}
+
+TEST_F(FileStorageTest, LogStructuredBackendSurvivesFileStorageRestart) {
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kLogStructured;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 128 * 1024 * 1024;
+    config.total_keys_limit = 1000;
+    config.total_size_limit = 64 * 1024 * 1024;
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+    {
+        FileStorage file_storage(config, nullptr, "localhost:9003");
+        ASSERT_TRUE(
+            FileStorageBatchOffload(file_storage, keys, sizes, batch_data));
+        auto allocated = FileStorageAllocateBatch(file_storage, keys, sizes);
+        ASSERT_TRUE(allocated.has_value());
+        ASSERT_TRUE(
+            FileStorageBatchLoad(file_storage, allocated.value()->slices));
+        for (const auto& [key, slice] : allocated.value()->slices) {
+            EXPECT_EQ(std::string(static_cast<char*>(slice.ptr), slice.size),
+                      batch_data.at(key));
+        }
+    }
+
+    FileStorage recovered(config, nullptr, "localhost:9003");
+    ASSERT_TRUE(FileStorageInitBackend(recovered));
+    std::vector<std::string> scanned_keys;
+    ASSERT_TRUE(FileStorageScanMeta(
+        recovered, [&](const std::vector<std::string>& batch_keys,
+                       std::vector<StorageObjectMetadata>& metadatas) {
+            EXPECT_EQ(batch_keys.size(), metadatas.size());
+            scanned_keys.insert(scanned_keys.end(), batch_keys.begin(),
+                                batch_keys.end());
+            return ErrorCode::OK;
+        }));
+    EXPECT_EQ(scanned_keys.size(), keys.size());
+
+    auto allocated = FileStorageAllocateBatch(recovered, keys, sizes);
+    ASSERT_TRUE(allocated.has_value());
+    ASSERT_TRUE(FileStorageBatchLoad(recovered, allocated.value()->slices));
+    for (const auto& [key, slice] : allocated.value()->slices) {
+        EXPECT_EQ(std::string(static_cast<char*>(slice.ptr), slice.size),
+                  batch_data.at(key));
+    }
+}
+
+TEST_F(FileStorageTest, HeartbeatProjectsLogStructuredBackendStats) {
+    std::filesystem::path master_root =
+        std::filesystem::path(data_path) / "log_stats_master";
+    std::filesystem::create_directories(master_root);
+
+    testing::InProcMaster master;
+    auto master_config = InProcMasterConfigBuilder()
+                             .set_enable_offload(true)
+                             .set_root_fs_dir(master_root.string())
+                             .build();
+    ASSERT_TRUE(master.Start(master_config));
+
+    std::string local_rpc_addr =
+        "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
+                                 std::nullopt, master.master_address());
+    ASSERT_TRUE(client.has_value());
+    ASSERT_TRUE(client.value()->MountLocalDiskSegment(true).has_value());
+
+    auto config = FileStorageConfig::FromEnvironment();
+    config.storage_backend_type = StorageBackendType::kLogStructured;
+    config.storage_filepath = data_path + "/log_stats";
+    config.local_buffer_size = 128 * 1024 * 1024;
+    config.total_keys_limit = 1000;
+    config.total_size_limit = 64 * 1024 * 1024;
+    config.enable_disk_watermark_eviction = false;
+    fs::create_directories(config.storage_filepath);
+
+    SsdMetric ssd_metric;
+    FileStorage file_storage(config, client.value(), local_rpc_addr,
+                             &ssd_metric);
+    ASSERT_TRUE(FileStorageInitBackend(file_storage).has_value());
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+    ASSERT_TRUE(FileStorageBatchOffload(file_storage, keys, sizes, batch_data));
+
+    const auto backend_stats = FileStorageSnapshotBackendStats(file_storage);
+    ASSERT_TRUE(backend_stats.has_value());
+    ASSERT_GT(backend_stats->physical_bytes, 0);
+    ASSERT_GT(backend_stats->logical_value_bytes, 0);
+    ASSERT_GT(backend_stats->wal_sequence, 0);
+
+    ASSERT_TRUE(FileStorageHeartbeat(file_storage).has_value());
+    EXPECT_EQ(ssd_metric.backend_physical_bytes.value(),
+              static_cast<int64_t>(backend_stats->physical_bytes));
+    EXPECT_EQ(ssd_metric.backend_live_record_bytes.value(),
+              static_cast<int64_t>(backend_stats->live_record_bytes));
+    EXPECT_EQ(ssd_metric.backend_logical_value_bytes.value(),
+              static_cast<int64_t>(backend_stats->logical_value_bytes));
+    EXPECT_EQ(ssd_metric.backend_active_segments.value(),
+              static_cast<int64_t>(backend_stats->active_segments));
+    EXPECT_EQ(ssd_metric.backend_wal_sequence.value(),
+              static_cast<int64_t>(backend_stats->wal_sequence));
+    EXPECT_EQ(ssd_metric.backend_checkpoint_sequence.value(),
+              static_cast<int64_t>(backend_stats->checkpoint_sequence));
 }
 
 TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {

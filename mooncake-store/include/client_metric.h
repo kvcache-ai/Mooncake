@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 #include <ylt/metric/counter.hpp>
+#include <ylt/metric/gauge.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "environ.h"
@@ -537,6 +538,56 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          backend_physical_bytes(
+              "mooncake_ssd_backend_physical_bytes",
+              "Physical bytes occupied by the selected SSD backend", labels),
+          backend_live_record_bytes(
+              "mooncake_ssd_backend_live_record_bytes",
+              "Physical record bytes referenced by the current backend index",
+              labels),
+          backend_logical_value_bytes(
+              "mooncake_ssd_backend_logical_value_bytes",
+              "Logical value bytes referenced by the current backend index",
+              labels),
+          backend_reclaimable_bytes(
+              "mooncake_ssd_backend_reclaimable_bytes",
+              "Physical backend bytes eligible for reclamation", labels),
+          backend_active_segments("mooncake_ssd_backend_active_segments",
+                                  "Number of active backend segments", labels),
+          backend_sealed_segments("mooncake_ssd_backend_sealed_segments",
+                                  "Number of sealed backend segments", labels),
+          backend_retired_segments(
+              "mooncake_ssd_backend_retired_segments",
+              "Number of retired backend segments pending cleanup", labels),
+          backend_compaction_runs("mooncake_ssd_backend_compaction_runs_total",
+                                  "Completed backend compaction transactions",
+                                  labels),
+          backend_compaction_input_bytes(
+              "mooncake_ssd_backend_compaction_input_bytes_total",
+              "Physical bytes selected by backend compaction", labels),
+          backend_compaction_output_bytes(
+              "mooncake_ssd_backend_compaction_output_bytes_total",
+              "Physical bytes written by backend compaction", labels),
+          backend_compaction_reclaimed_bytes(
+              "mooncake_ssd_backend_compaction_reclaimed_bytes_total",
+              "Physical bytes reclaimed by backend compaction", labels),
+          backend_compaction_conflicts(
+              "mooncake_ssd_backend_compaction_conflicts_total",
+              "Backend compactions aborted by concurrent mutations", labels),
+          backend_compaction_cancellations(
+              "mooncake_ssd_backend_compaction_cancellations_total",
+              "Cancelled backend compactions", labels),
+          backend_compaction_errors(
+              "mooncake_ssd_backend_compaction_errors_total",
+              "Failed backend compactions", labels),
+          backend_compaction_last_duration_us(
+              "mooncake_ssd_backend_compaction_last_duration_us",
+              "Duration of the latest backend compaction attempt", labels),
+          backend_wal_sequence("mooncake_ssd_backend_wal_sequence",
+                               "Latest backend WAL sequence", labels),
+          backend_checkpoint_sequence(
+              "mooncake_ssd_backend_checkpoint_sequence",
+              "Latest backend checkpoint sequence", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -551,6 +602,23 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::gauge_t backend_physical_bytes;
+    ylt::metric::gauge_t backend_live_record_bytes;
+    ylt::metric::gauge_t backend_logical_value_bytes;
+    ylt::metric::gauge_t backend_reclaimable_bytes;
+    ylt::metric::gauge_t backend_active_segments;
+    ylt::metric::gauge_t backend_sealed_segments;
+    ylt::metric::gauge_t backend_retired_segments;
+    ylt::metric::counter_t backend_compaction_runs;
+    ylt::metric::counter_t backend_compaction_input_bytes;
+    ylt::metric::counter_t backend_compaction_output_bytes;
+    ylt::metric::counter_t backend_compaction_reclaimed_bytes;
+    ylt::metric::counter_t backend_compaction_conflicts;
+    ylt::metric::counter_t backend_compaction_cancellations;
+    ylt::metric::counter_t backend_compaction_errors;
+    ylt::metric::gauge_t backend_compaction_last_duration_us;
+    ylt::metric::gauge_t backend_wal_sequence;
+    ylt::metric::gauge_t backend_checkpoint_sequence;
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -566,6 +634,23 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        backend_physical_bytes.serialize(str);
+        backend_live_record_bytes.serialize(str);
+        backend_logical_value_bytes.serialize(str);
+        backend_reclaimable_bytes.serialize(str);
+        backend_active_segments.serialize(str);
+        backend_sealed_segments.serialize(str);
+        backend_retired_segments.serialize(str);
+        backend_compaction_runs.serialize(str);
+        backend_compaction_input_bytes.serialize(str);
+        backend_compaction_output_bytes.serialize(str);
+        backend_compaction_reclaimed_bytes.serialize(str);
+        backend_compaction_conflicts.serialize(str);
+        backend_compaction_cancellations.serialize(str);
+        backend_compaction_errors.serialize(str);
+        backend_compaction_last_duration_us.serialize(str);
+        backend_wal_sequence.serialize(str);
+        backend_checkpoint_sequence.serialize(str);
     }
 
     std::string summary_metrics() {

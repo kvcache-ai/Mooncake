@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -158,6 +159,26 @@ struct OffloadMetadata {
         : total_keys(keys), total_size(size) {}
 };
 
+struct StorageBackendStats {
+    uint64_t physical_bytes{0};
+    uint64_t live_record_bytes{0};
+    uint64_t logical_value_bytes{0};
+    uint64_t reclaimable_bytes{0};
+    uint64_t active_segments{0};
+    uint64_t sealed_segments{0};
+    uint64_t retired_segments{0};
+    uint64_t compaction_runs{0};
+    uint64_t compaction_input_bytes{0};
+    uint64_t compaction_output_bytes{0};
+    uint64_t compaction_reclaimed_bytes{0};
+    uint64_t compaction_conflicts{0};
+    uint64_t compaction_cancellations{0};
+    uint64_t compaction_errors{0};
+    uint64_t compaction_last_duration_us{0};
+    uint64_t wal_sequence{0};
+    uint64_t checkpoint_sequence{0};
+};
+
 enum class FileMode { Read, Write };
 
 enum class StorageBackendType {
@@ -165,7 +186,8 @@ enum class StorageBackendType {
     kBucket,
     kOffsetAllocator,
     kDistributed,
-    kNvmeKv
+    kNvmeKv,
+    kLogStructured
 };
 
 static constexpr size_t kKB = 1024;
@@ -381,6 +403,10 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual std::optional<StorageBackendStats> SnapshotStats() const {
+        return std::nullopt;
     }
 
     FileStorageConfig file_storage_config_;
