@@ -2708,6 +2708,123 @@ TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
 }
 #endif
 
+// Regression for the duplicate-key collapse on the LOCAL_DISK (SSD offload)
+// batch-get path. Pre-fix, disk_ops in RealClient::batch_get_buffer_internal
+// keyed offload_objects (first occurrence wins the buffer) and disk_key_to_idx
+// (last occurrence wins the index) by object key, so a key repeated within one
+// batch returned the last occurrence's never-written buffer as success. Force a
+// LOCAL_DISK-only replica (offload, then drop the MEMORY replica), then request
+// the key several times in one batch so every occurrence routes through
+// disk_ops, and assert each occurrence's own buffer is actually filled.
+TEST_F(RealClientTest, BatchGetBufferDuplicateKeysLocalDiskAllFilled) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_dupkey_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    // Distinctive, position-dependent payload so an unwritten buffer (zero /
+    // recycled memory) is clearly detectable rather than coincidentally equal.
+    constexpr size_t kSize = 256 * 1024;  // 256 KB
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "duplicate_key_local_disk_regression";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    // Wait for proactive offload to create a LOCAL_DISK replica.
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+                break;
+            }
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready) << "object never offloaded to a LOCAL_DISK replica";
+
+    // Drop the MEMORY replica so only LOCAL_DISK remains -> forces disk_ops.
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared) << "failed to clear the MEMORY replica";
+
+    auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1u);
+    ASSERT_TRUE(replicas.front().is_local_disk_replica());
+
+    // Request the SAME key several times in one batch -> all via disk_ops.
+    const size_t kOccurrences = 3;
+    std::vector<std::string> keys(kOccurrences, key);
+    auto results = py_client_->batch_get_buffer(keys);
+    ASSERT_EQ(results.size(), kOccurrences);
+
+    for (size_t i = 0; i < kOccurrences; ++i) {
+        ASSERT_NE(results[i], nullptr)
+            << "batch_get_buffer returned nullptr for LOCAL_DISK duplicate "
+               "occurrence "
+            << i;
+        ASSERT_EQ(results[i]->size(), source.size())
+            << "size mismatch for LOCAL_DISK duplicate occurrence " << i;
+        const char* got = static_cast<const char*>(results[i]->ptr());
+        if (std::memcmp(got, source.data(), source.size()) != 0) {
+            size_t first_bad = 0;
+            while (first_bad < source.size() &&
+                   got[first_bad] == source[first_bad]) {
+                ++first_bad;
+            }
+            ADD_FAILURE()
+                << "LOCAL_DISK duplicate occurrence " << i << " of key '" << key
+                << "' was reported successful but its buffer holds stale data "
+                << "(first mismatch at byte " << first_bad << "). The disk_ops "
+                << "path collapsed duplicate keys onto one buffer, leaving "
+                   "this "
+                << "occurrence's buffer unwritten.";
+        }
+    }
+
+    // Each occurrence must receive its own distinct destination buffer.
+    for (size_t i = 0; i < kOccurrences; ++i) {
+        for (size_t j = i + 1; j < kOccurrences; ++j) {
+            EXPECT_NE(results[i]->ptr(), results[j]->ptr())
+                << "LOCAL_DISK duplicate occurrences " << i << " and " << j
+                << " unexpectedly share the same buffer pointer";
+        }
+    }
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
