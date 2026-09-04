@@ -187,6 +187,49 @@ TEST(LogStructuredStorageBackendTest, SupportsConcurrentBatchLoads) {
 }
 
 TEST(LogStructuredStorageBackendTest,
+     BatchLoadWaitsUntilMasterAcknowledgedWriteIsCommitted) {
+    BackendTempDirectory temp;
+    const auto config = BackendConfig(temp);
+    const std::string storage_key = TenantId("tenant-a").MakeScopedKey("key");
+    std::string value = "payload";
+
+    LogStructuredStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+
+    std::promise<void> callback_entered;
+    std::promise<void> allow_callback_return;
+    auto callback_gate = allow_callback_return.get_future().share();
+    auto offload = std::async(std::launch::async, [&]() {
+        return backend.BatchOffload(
+            SingleValueBatch(storage_key, value),
+            [&](const std::vector<std::string>&,
+                std::vector<StorageObjectMetadata>&) {
+                callback_entered.set_value();
+                callback_gate.wait();
+                return ErrorCode::OK;
+            });
+    });
+
+    ASSERT_EQ(callback_entered.get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+
+    std::string loaded(value.size(), '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {storage_key, Slice{loaded.data(), loaded.size()}}};
+    auto read = std::async(std::launch::async,
+                           [&]() { return backend.BatchLoad(slices); });
+    EXPECT_EQ(read.wait_for(std::chrono::milliseconds(50)),
+              std::future_status::timeout);
+
+    allow_callback_return.set_value();
+    ASSERT_TRUE(offload.get().has_value());
+    ASSERT_EQ(read.wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    EXPECT_TRUE(read.get().has_value());
+    EXPECT_EQ(loaded, value);
+}
+
+TEST(LogStructuredStorageBackendTest,
      CallbackFailureAbortsNewVersionAndPreservesCommittedValue) {
     BackendTempDirectory temp;
     const auto config = BackendConfig(temp);

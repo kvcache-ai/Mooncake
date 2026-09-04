@@ -303,6 +303,7 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> LogStructuredStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
+    std::shared_lock lock(mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }

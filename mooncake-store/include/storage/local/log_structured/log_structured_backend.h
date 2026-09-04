@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 
 #include "storage/local/log_structured/store.h"
@@ -79,7 +80,7 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
     RunCompaction(const logstructured::CompactionOptions& options);
 
     LogStructuredBackendConfig backend_config_;
-    mutable std::mutex mutex_;
+    mutable std::shared_mutex mutex_;
     std::condition_variable_any compaction_wakeup_;
     std::jthread compaction_thread_;
     uint64_t committed_since_checkpoint_{0};
