@@ -14,6 +14,9 @@ ADD_OPERATION_COUNT_ONE = 1
 ADD_OPERATION_COUNT_ZERO = 0   
 NO_ADD_LATENCY = 0              
 NO_ADD_DATA_SIZE = 0            
+PUT_RETRY_TIMEOUT_SECONDS = 120
+CLEANUP_RETRY_TIMEOUT_SECONDS = 30
+RETRYABLE_REMOVE_RESULTS = {-703, -706, -708}
 
 # This test need to set the environment valid client storage root path. 
 # Put data is more than segment size,so some data will be eviced ,and get from local file later
@@ -336,6 +339,8 @@ class TestDistributedObjectStore(unittest.TestCase):
                 # PUT operation phase
                 put_start = time.perf_counter()
                 index = 0
+                retry_start = None
+                retry_count = 0
                 while index < OPERATIONS_PER_THREAD:
                     key = KEY_PREFIX + str(index)
                     test_data = references[key]
@@ -344,6 +349,37 @@ class TestDistributedObjectStore(unittest.TestCase):
                     result = self.store.put(key, test_data)
                     op_end = time.perf_counter()
                     latency = op_end - op_start
+                    if result == -200:
+                        # Memory pressure can temporarily prevent a new
+                        # replica from starting while eviction is in flight.
+                        # Retry this logical PUT before reading the key.
+                        if retry_start is None:
+                            retry_start = time.monotonic()
+                        retry_count += 1
+                        if (
+                            time.monotonic() - retry_start
+                            >= PUT_RETRY_TIMEOUT_SECONDS
+                        ):
+                            raise RuntimeError(
+                                f"Put operation did not make progress for key "
+                                f"{key} after {retry_count} retries and "
+                                f"{PUT_RETRY_TIMEOUT_SECONDS}s"
+                            )
+                        put_stats.record_operation(
+                            False,
+                            ADD_OPERATION_COUNT_ONE,
+                            latency,
+                            VALUE_SIZE,
+                            result,
+                        )
+                        time.sleep(0.01)
+                        continue
+                    if result != 0:
+                        raise RuntimeError(
+                            f"Put operation failed for key {key}: {result}"
+                        )
+                    retry_start = None
+                    retry_count = 0
                     success = (result == 0)
                     put_stats.record_operation(success, ADD_OPERATION_COUNT_ONE, latency, VALUE_SIZE, result if not success else None)
                     index = index + 1
@@ -396,8 +432,43 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Record overall end time
         overall_end = time.perf_counter()
         
+        # Cleanup before checking worker errors so partial writes do not
+        # contaminate subsequent test cases. Replication may still be
+        # completing after the lease expires, so retry transient remove
+        # failures and report any key that cannot be removed.
+        time.sleep(default_kv_lease_ttl / 1000)
+        cleanup_failures = []
+        cleanup_deadline = (
+            time.monotonic() + CLEANUP_RETRY_TIMEOUT_SECONDS
+        )
+        index = 0
+        while index < OPERATIONS_PER_THREAD:
+            key = KEY_PREFIX + str(index)
+            while True:
+                result = self.store.remove(key)
+                if result in (0, -704):
+                    break
+                if result not in RETRYABLE_REMOVE_RESULTS:
+                    cleanup_failures.append(
+                        f"{key}: remove failed with {result}"
+                    )
+                    break
+                if time.monotonic() >= cleanup_deadline:
+                    cleanup_failures.append(
+                        f"{key}: remove did not make progress for "
+                        f"{CLEANUP_RETRY_TIMEOUT_SECONDS}s; last result "
+                        f"{result}"
+                    )
+                    break
+                time.sleep(0.01)
+            index += 1
+        print("Cleanup completed")
+
         # Check for exceptions
-        self.assertEqual(len(thread_exceptions), 0, "\n".join(thread_exceptions))
+        failures = thread_exceptions + [
+            f"Cleanup failed: {failure}" for failure in cleanup_failures
+        ]
+        self.assertEqual(len(failures), 0, "\n".join(failures))
 
         # Merge thread statistics into main statistics objects
         for i in range(NUM_THREADS):
@@ -420,14 +491,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         get_stats.print_stats()
         throughput_stats.print_throughput(thread_put_stats, thread_get_stats)
 
-        # Cleanup
-        time.sleep(default_kv_lease_ttl / 1000)
-        index = 0
-        while index < OPERATIONS_PER_THREAD:
-            key = KEY_PREFIX + str(index)
-            self.store.remove(key)
-            index += 1
-        print("Cleanup completed")  
         self.assertEqual(
             get_stats.failure_count,
             0,
