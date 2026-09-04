@@ -47,32 +47,67 @@ int32_t ResolveCurrentEngineId(bool agent_mode) {
     return current_device_id;
 }
 
-int ResolveAscendMemType(const std::string &location, void *addr,
-                         adxl::MemType &mem_type) {
-    if (location.starts_with("cpu")) {
+bool IsAclVmmLocation(aclrtMemLocationType type) {
+    return type == ACL_MEM_LOCATION_TYPE_HOST ||
+           type == ACL_MEM_LOCATION_TYPE_DEVICE ||
+           type == ACL_MEM_LOCATION_TYPE_HOST_NUMA;
+}
+
+// FabricMem RegisterMem retains foreign VA via aclrtMemRetainAllocationHandle.
+// Hugepage/mmap is not ACL VMM, so reject before HIXL hits Retain.
+int EnsureFabricCompatibleMemory(void *addr) {
+    aclrtPtrAttributes attributes{};
+    CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
+    if (IsAclVmmLocation(attributes.location.type)) {
+        return 0;
+    }
+    LOG(ERROR) << "FabricMem cannot register hugepage or other non-VMM memory, "
+                  "addr:"
+               << addr << ", location.type:"
+               << static_cast<int>(attributes.location.type);
+    return ERR_INVALID_ARGUMENT;
+}
+
+int ResolveWildcardMemType(void *addr, adxl::MemType &mem_type,
+                           bool use_fabric_mem) {
+    aclrtPtrAttributes attributes{};
+    CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        mem_type = adxl::MEM_DEVICE;
+        return 0;
+    }
+    if (IsAclVmmLocation(attributes.location.type)) {
         mem_type = adxl::MEM_HOST;
         return 0;
     }
+    if (use_fabric_mem) {
+        LOG(ERROR)
+            << "FabricMem cannot register hugepage or other non-VMM memory, "
+               "addr:"
+            << addr;
+        return ERR_INVALID_ARGUMENT;
+    }
+    LOG(INFO) << "mem addr:" << addr
+              << " can not be recognized, try set to host mem.";
+    mem_type = adxl::MEM_HOST;
+    return 0;
+}
+
+int ResolveAscendMemType(const std::string &location, void *addr,
+                         adxl::MemType &mem_type, bool use_fabric_mem) {
+    if (location.starts_with("cpu")) {
+        mem_type = adxl::MEM_HOST;
+        return use_fabric_mem ? EnsureFabricCompatibleMemory(addr) : 0;
+    }
     if (location.starts_with("npu")) {
         mem_type = adxl::MEM_DEVICE;
-        return 0;
+        return use_fabric_mem ? EnsureFabricCompatibleMemory(addr) : 0;
     }
     if (location != kWildcardLocation) {
         LOG(ERROR) << "location:" << location << " is not supported.";
         return ERR_INVALID_ARGUMENT;
     }
-    aclrtPtrAttributes attributes;
-    CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
-    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-        mem_type = adxl::MEM_HOST;
-    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-        mem_type = adxl::MEM_DEVICE;
-    } else {
-        LOG(INFO) << "mem addr:" << addr
-                  << " can not be recognized, try set to host mem.";
-        mem_type = adxl::MEM_HOST;
-    }
-    return 0;
+    return ResolveWildcardMemType(addr, mem_type, use_fabric_mem);
 }
 
 int StampBufferDeviceId(TransferMetadata::BufferDesc &buffer_desc) {
@@ -372,7 +407,8 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     adxl::MemType mem_type;
-    int type_ret = ResolveAscendMemType(location, addr, mem_type);
+    int type_ret =
+        ResolveAscendMemType(location, addr, mem_type, use_fabric_mem_);
     if (type_ret != 0) {
         return type_ret;
     }
