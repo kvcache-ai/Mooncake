@@ -1080,6 +1080,16 @@ class RealClient : public PyClient {
     void ReleaseAllMountedSegmentRecords();
     void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
     void ReleaseAllAllocatedSegmentRecords();
+
+    // MappedShm whose spdk_mem_unregister failed during teardown. The mapping
+    // is deliberately retained (never munmapped) so SPDK does not hold a
+    // translation to a freed/reused VA; retried on later teardown entry points.
+    // Guarded by dummy_client_mutex_.
+    std::vector<MappedShm> quarantine_shms_;
+
+    // Re-attempt unregister+munmap of quarantine_shms_. Caller must hold
+    // dummy_client_mutex_. Failures stay quarantined.
+    void RetryQuarantinedShmsLocked();
 };
 
 }  // namespace mooncake

@@ -121,10 +121,17 @@ bool ShmHelper::cleanup() {
             if (shm->spdk_registered) {
                 if (SpdkWrapper::GetInstance().UnregisterMemory(
                         shm->base_addr, shm->size) != 0) {
-                    LOG(WARNING)
-                        << "Failed to unregister shared memory from SPDK "
-                           "during cleanup: "
-                        << shm->base_addr;
+                    // SPDK still holds a translation for this range: do NOT
+                    // munmap or clear spdk_registered, or a later mmap could
+                    // reuse the VA and NoF would silently DMA to the wrong
+                    // memory. Retain the mapping (released by the OS at process
+                    // exit; cleanup() only runs from ~ShmHelper).
+                    LOG(ERROR) << "Failed to unregister shared memory from "
+                                  "SPDK during cleanup; retaining mapping "
+                                  "(never munmap): "
+                               << shm->base_addr;
+                    ret = false;
+                    continue;
                 }
                 shm->spdk_registered = false;
             }
@@ -273,16 +280,22 @@ int ShmHelper::free(void* addr) {
         if ((*it)->base_addr == addr) {
             if ((*it)->fd != -1) {
                 close((*it)->fd);
+                (*it)->fd = -1;
             }
             if ((*it)->base_addr) {
 #ifdef USE_NOF
                 if ((*it)->spdk_registered) {
                     if (SpdkWrapper::GetInstance().UnregisterMemory(
                             (*it)->base_addr, (*it)->size) != 0) {
-                        LOG(WARNING)
-                            << "Failed to unregister shared memory from SPDK "
-                               "during free: "
-                            << (*it)->base_addr;
+                        // SPDK still holds a translation for this range: do NOT
+                        // munmap, clear spdk_registered, or erase the segment.
+                        // Retain the mapping so the VA cannot be reused while
+                        // SPDK's translation is live (a later free() retries).
+                        LOG(ERROR) << "Failed to unregister shared memory from "
+                                      "SPDK during free; retaining mapping "
+                                      "(never munmap): "
+                                   << (*it)->base_addr;
+                        return -1;
                     }
                     (*it)->spdk_registered = false;
                 }
