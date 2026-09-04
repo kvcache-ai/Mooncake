@@ -707,12 +707,10 @@ DummyClient::prepare_ranged_read_buffer(
             for (size_t j = 0; j < fragment_count; ++j) {
                 const size_t offset = dst_offsets[i][j];
                 const size_t fragment_size = sizes[i][j];
-                if (offset > capacity ||
-                    fragment_size > capacity - offset) {
+                if (offset > capacity || fragment_size > capacity - offset) {
                     continue;
                 }
-                staging_size =
-                    std::max(staging_size, offset + fragment_size);
+                staging_size = std::max(staging_size, offset + fragment_size);
             }
         }
         return prepare_buffer(buffer, staging_size, false, true);
@@ -727,8 +725,8 @@ DummyClient::prepare_ranged_read_buffer(
     return prepare_buffer(buffer, shm->size - (address - base), false, true);
 }
 
-bool DummyClient::copy_from_staging(const PreparedBuffer& buffer,
-                                    size_t size, size_t offset) const {
+bool DummyClient::copy_from_staging(const PreparedBuffer& buffer, size_t size,
+                                    size_t offset) const {
     if (!buffer.copy_back || buffer.staging == nullptr || size == 0)
         return true;
     if (offset > buffer.size || size > buffer.size - offset) return false;
@@ -1275,9 +1273,9 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
         buffers.size() != all_dst_offsets.size() ||
         buffers.size() != all_src_offsets.size() ||
         buffers.size() != all_sizes.size()) {
-        return build_ranged_read_error_results(
-            buffers.size(), all_keys, all_dst_offsets,
-            ErrorCode::INVALID_PARAMS);
+        return build_ranged_read_error_results(buffers.size(), all_keys,
+                                               all_dst_offsets,
+                                               ErrorCode::INVALID_PARAMS);
     }
 
     std::vector<PreparedBuffer> prepared;
@@ -1287,12 +1285,12 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     prepared.reserve(buffers.size());
     dummy_buffer_sizes.reserve(buffers.size());
     for (size_t i = 0; i < buffers.size(); ++i) {
-        auto item = prepare_ranged_read_buffer(
-            buffers[i], all_dst_offsets[i], all_sizes[i]);
+        auto item = prepare_ranged_read_buffer(buffers[i], all_dst_offsets[i],
+                                               all_sizes[i]);
         if (!item) {
-            return build_ranged_read_error_results(
-                buffers.size(), all_keys, all_dst_offsets,
-                ErrorCode::INVALID_PARAMS);
+            return build_ranged_read_error_results(buffers.size(), all_keys,
+                                                   all_dst_offsets,
+                                                   ErrorCode::INVALID_PARAMS);
         }
         dummy_buffers[i] = reinterpret_cast<uint64_t>(item->dummy);
         dummy_buffer_sizes.push_back(item->size);
@@ -1303,8 +1301,8 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     auto cached_query_results =
         build_cached_query_results_from_query_result_cache(query_result_cache);
     const auto start_time = std::chrono::steady_clock::now();
-    using RangedReadResults = std::vector<
-        std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>;
+    using RangedReadResults =
+        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>;
     auto internal_results =
         requires_staging
             ? invoke_rpc<&RealClient::get_into_ranges_staged_shm_helper,
@@ -1331,8 +1329,7 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                 if (result < 0) continue;
                 if (j >= all_dst_offsets[i].size() ||
                     k >= all_dst_offsets[i][j].size() ||
-                    !copy_from_staging(prepared[i],
-                                       static_cast<size_t>(result),
+                    !copy_from_staging(prepared[i], static_cast<size_t>(result),
                                        all_dst_offsets[i][j][k])) {
                     result = toInt(ErrorCode::INTERNAL_ERROR);
                 }

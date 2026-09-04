@@ -218,8 +218,7 @@ class DummyClient : public PyClient {
                                                  bool copy_to_staging,
                                                  bool copy_back = false);
     std::optional<PreparedBuffer> prepare_ranged_read_buffer(
-        void *buffer,
-        const std::vector<std::vector<size_t>> &dst_offsets,
+        void *buffer, const std::vector<std::vector<size_t>> &dst_offsets,
         const std::vector<std::vector<size_t>> &sizes);
     bool copy_from_staging(const PreparedBuffer &buffer, size_t size,
                            size_t offset = 0) const;
