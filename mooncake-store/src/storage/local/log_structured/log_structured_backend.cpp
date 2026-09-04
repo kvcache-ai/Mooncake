@@ -350,10 +350,19 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::ScanMeta(
 logstructured::CompactionOptions
 LogStructuredStorageBackend::MakeCompactionOptions(
     std::stop_token stop_token) const {
+    uint64_t max_temporary_bytes = std::numeric_limits<uint64_t>::max();
+    if (store_ && file_storage_config_.total_size_limit > 0) {
+        const uint64_t capacity =
+            static_cast<uint64_t>(file_storage_config_.total_size_limit);
+        const uint64_t physical_bytes = store_->SnapshotStats().physical_bytes;
+        max_temporary_bytes =
+            physical_bytes < capacity ? capacity - physical_bytes : 0;
+    }
     return {
         .max_source_segments = backend_config_.compaction_max_sources,
         .max_input_bytes = backend_config_.compaction_max_bytes_per_round,
         .max_target_bytes = backend_config_.compaction_max_target_bytes,
+        .max_temporary_bytes = max_temporary_bytes,
         .fanout = backend_config_.compaction_fanout,
         .max_levels = backend_config_.compaction_max_levels,
         .min_reclaim_ratio = backend_config_.compaction_min_reclaim_ratio,
@@ -459,6 +468,7 @@ void LogStructuredStorageBackend::RemoveAll() {
         .max_source_segments = std::numeric_limits<size_t>::max(),
         .max_input_bytes = std::numeric_limits<uint64_t>::max(),
         .max_target_bytes = backend_config_.compaction_max_target_bytes,
+        .max_temporary_bytes = std::numeric_limits<uint64_t>::max(),
         .fanout = backend_config_.compaction_fanout,
         .max_levels = backend_config_.compaction_max_levels,
         .min_reclaim_ratio = 0.0,

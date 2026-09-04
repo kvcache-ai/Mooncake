@@ -687,7 +687,9 @@ void LogStructuredStore::CleanupRetiredSegmentsLocked() {
 tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
     const CompactionOptions& options) {
     if (options.max_source_segments == 0 || options.max_input_bytes == 0 ||
-        options.min_reclaim_ratio < 0.0 || options.min_reclaim_ratio > 1.0) {
+        options.max_target_bytes == 0 || options.fanout == 0 ||
+        options.max_levels == 0 || options.min_reclaim_ratio < 0.0 ||
+        options.min_reclaim_ratio > 1.0) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
     if (options.stop_token.stop_requested()) {
@@ -755,24 +757,27 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 break;
             }
         }
-        if (sources.size() > options.max_source_segments) {
-            sources.resize(options.max_source_segments);
-        }
+        std::vector<SegmentMetadata> bounded_sources;
+        bounded_sources.reserve(
+            std::min(sources.size(), options.max_source_segments));
         uint64_t selected_bytes = 0;
-        size_t selected_count = 0;
-        for (; selected_count < sources.size(); ++selected_count) {
-            const auto bytes = sources[selected_count].valid_bytes;
-            if (selected_count != 0 &&
-                bytes > options.max_input_bytes - selected_bytes) {
+        uint64_t selected_live_bytes = 0;
+        for (const auto& source : sources) {
+            if (bounded_sources.size() == options.max_source_segments) break;
+            if (!bounded_sources.empty() &&
+                source.valid_bytes > options.max_input_bytes - selected_bytes) {
                 break;
             }
-            selected_bytes += bytes;
-            if (selected_bytes >= options.max_input_bytes) {
-                ++selected_count;
-                break;
+            if (source.live_bytes >
+                options.max_temporary_bytes - selected_live_bytes) {
+                continue;
             }
+            bounded_sources.push_back(source);
+            selected_bytes += source.valid_bytes;
+            selected_live_bytes += source.live_bytes;
+            if (selected_bytes >= options.max_input_bytes) break;
         }
-        sources.resize(selected_count);
+        sources = std::move(bounded_sources);
         if (sources.empty()) return CompactionResult{};
 
         std::unordered_set<uint64_t> source_ids;

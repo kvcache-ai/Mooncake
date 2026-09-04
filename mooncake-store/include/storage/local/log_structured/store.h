@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stop_token>
@@ -46,6 +47,7 @@ struct CompactionOptions {
     size_t max_source_segments{8};
     uint64_t max_input_bytes{1024ULL * 1024 * 1024};
     uint64_t max_target_bytes{4ULL * 1024 * 1024 * 1024};
+    uint64_t max_temporary_bytes{std::numeric_limits<uint64_t>::max()};
     size_t fanout{4};
     uint32_t max_levels{4};
     double min_reclaim_ratio{0.20};

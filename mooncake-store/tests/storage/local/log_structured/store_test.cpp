@@ -381,6 +381,52 @@ TEST(LogStructuredStoreTest, ReportsPhysicalAndReclaimableBytes) {
     EXPECT_GE(stats.sealed_segments, size_t{1});
 }
 
+TEST(LogStructuredStoreTest, CompactionHonorsTemporarySpaceBudget) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 512));
+    ASSERT_TRUE(store.has_value());
+    const auto stale = StoreIdentity("first", 1);
+    const auto live = StoreIdentity("second", 1);
+    const auto replacement = StoreIdentity("first", 2);
+
+    auto stale_write = (*store)->PreparePut(stale, std::string(80, 'a'));
+    ASSERT_TRUE(stale_write.has_value());
+    ASSERT_TRUE((*store)->CommitPut(stale, stale_write->sequence).has_value());
+    auto live_write = (*store)->PreparePut(live, std::string(80, 'b'));
+    ASSERT_TRUE(live_write.has_value());
+    ASSERT_TRUE((*store)->CommitPut(live, live_write->sequence).has_value());
+    auto replacement_write =
+        (*store)->PreparePut(replacement, std::string(160, 'c'));
+    ASSERT_TRUE(replacement_write.has_value());
+    ASSERT_TRUE((*store)
+                    ->CommitPut(replacement, replacement_write->sequence)
+                    .has_value());
+
+    const auto before = (*store)->SnapshotStats();
+    auto deferred = (*store)->CompactOnce({.max_source_segments = 1,
+                                           .max_input_bytes = 4096,
+                                           .max_target_bytes = 4096,
+                                           .max_temporary_bytes = 0,
+                                           .min_reclaim_ratio = 0.0,
+                                           .stop_token = {}});
+    ASSERT_TRUE(deferred.has_value());
+    EXPECT_EQ(deferred->source_segments, size_t{0});
+    EXPECT_EQ((*store)->SnapshotStats().physical_bytes, before.physical_bytes);
+    EXPECT_EQ((*store)->Get(live).value(), std::string(80, 'b'));
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                            .max_input_bytes = 4096,
+                                            .max_target_bytes = 4096,
+                                            .max_temporary_bytes = 4096,
+                                            .min_reclaim_ratio = 0.0,
+                                            .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_GT(compacted->reclaimed_bytes, uint64_t{0});
+    EXPECT_EQ((*store)->Get(live).value(), std::string(80, 'b'));
+    EXPECT_EQ((*store)->Get(replacement).value(), std::string(160, 'c'));
+}
+
 TEST(LogStructuredStoreTest, CancelledCompactionLeavesSourcesReadable) {
     StoreTempDirectory temp;
     auto store = LogStructuredStore::Open(Config(temp, 128));
