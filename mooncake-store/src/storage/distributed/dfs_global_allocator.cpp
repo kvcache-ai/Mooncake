@@ -40,11 +40,12 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    mount_path_ = config.fsdir;
     shard_count_ = config.shard_count;
     alignment_ = config.alignment;
     shards_.clear();
     shards_.resize(shard_count_);
+    shard_paths_.clear();
+    shard_paths_.reserve(shard_count_);
 
     eviction_enabled_ = config.eviction_enabled;
     eviction_high_watermark_ = config.eviction_high_watermark;
@@ -52,12 +53,15 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
     deferred_free_duration_ = config.deferred_free_duration;
     eviction_check_interval_ = config.eviction_check_interval;
 
-    std::error_code ec;
-    std::filesystem::create_directories(mount_path_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to create DFS mount path " << mount_path_ << ": "
-                   << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    const auto& primary_root = config.RootForShard(0);
+    if (config.root_dirs.empty()) {
+        std::error_code ec;
+        std::filesystem::create_directories(primary_root, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to create DFS mount path " << primary_root
+                       << ": " << ec.message();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
     }
 
     if (config.fs_adapter_type == "posix") {
@@ -73,18 +77,20 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
 #endif
     }
 
-    auto adapter_init = fs_adapter_->Init(mount_path_);
+    auto adapter_init = fs_adapter_->Init(primary_root);
     if (!adapter_init) {
         LOG(ERROR) << "Failed to initialize DFS fs adapter "
                    << config.fs_adapter_type
-                   << " for mount_path=" << mount_path_
+                   << " for mount_path=" << primary_root
                    << ", error=" << adapter_init.error();
         return tl::make_unexpected(adapter_init.error());
     }
 
     for (int i = 0; i < shard_count_; ++i) {
-        std::string path = mount_path_ + "/dfs_shard_" +
-                           FormatShardIdx(i, shard_count_) + ".data";
+        std::string path =
+            (std::filesystem::path(config.RootForShard(i)) /
+             ("dfs_shard_" + FormatShardIdx(i, shard_count_) + ".data"))
+                .string();
         auto prealloc =
             fs_adapter_->PreallocateFile(path, config.shard_capacity);
         if (!prealloc) {
@@ -107,6 +113,7 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
                        << i;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        shard_paths_.push_back(std::move(path));
         shards_[i] = std::move(shard);
     }
 
@@ -145,14 +152,8 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
                                             reserved_bytes};
     handle_lock.unlock();
 
-    return DistributedFSDescriptor{
-        mount_path_ + "/dfs_shard_" + FormatShardIdx(shard_idx, shard_count_) +
-            ".data",
-        alloc_offset,
-        size,
-        aligned_size,
-        shard_idx,
-    };
+    return DistributedFSDescriptor{shard_paths_[shard_idx], alloc_offset, size,
+                                   aligned_size, shard_idx};
 }
 
 void DfsGlobalAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,

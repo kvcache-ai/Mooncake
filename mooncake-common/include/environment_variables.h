@@ -68,6 +68,7 @@ struct ClientMetricEnvironmentVariables {
 };
 
 struct DistributedStorageEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ROOT_DIRS);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_ROOT_DIR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DISTRIBUTED_ROOT_DIR);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_DFS_FS_ADAPTER);
