@@ -43,7 +43,11 @@ struct PreparedWrite {
 struct CompactionOptions {
     size_t max_source_segments{8};
     uint64_t max_input_bytes{1024ULL * 1024 * 1024};
+    uint64_t max_target_bytes{4ULL * 1024 * 1024 * 1024};
+    size_t fanout{4};
+    uint32_t max_levels{4};
     double min_reclaim_ratio{0.20};
+    bool enable_tiering{false};
 };
 
 struct CompactionResult {
@@ -69,6 +73,8 @@ class LogStructuredStore {
     tl::expected<void, StoreError> AbortPut(const RecordIdentity& identity,
                                             uint64_t sequence);
     tl::expected<void, StoreError> Delete(const RecordIdentity& identity);
+    tl::expected<void, StoreError> Sync();
+    tl::expected<void, StoreError> SealActiveSegment();
     tl::expected<void, StoreError> Checkpoint();
     tl::expected<CompactionResult, StoreError> CompactOnce(
         const CompactionOptions& options = {});
@@ -97,6 +103,7 @@ class LogStructuredStore {
     void RefreshSegmentLiveBytes();
     tl::expected<void, StoreError> RotateSegmentIfNeeded(
         uint64_t next_record_bytes);
+    tl::expected<void, StoreError> RotateActiveSegmentLocked();
     tl::expected<PreparedWrite, StoreError> PreparePutLocked(
         const RecordIdentity& identity, std::string_view value);
     tl::expected<std::string, StoreError> ReadEntryLocked(

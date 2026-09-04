@@ -354,5 +354,37 @@ TEST(LogStructuredStoreTest, RemovesUnpublishedCompactionTargetOnRecovery) {
     EXPECT_FALSE(std::filesystem::exists(orphan_path));
 }
 
+TEST(LogStructuredStoreTest, TieredCompactionMergesCleanSegments) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 256));
+    ASSERT_TRUE(store.has_value());
+    std::vector<RecordIdentity> identities;
+    for (uint64_t i = 0; i < 5; ++i) {
+        identities.push_back(StoreIdentity("key-" + std::to_string(i), 1));
+        auto write =
+            (*store)->PreparePut(identities.back(), std::string(96, 'a' + i));
+        ASSERT_TRUE(write.has_value());
+        ASSERT_TRUE((*store)
+                        ->CommitPut(identities.back(), write->sequence)
+                        .has_value());
+    }
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 4,
+                                            .max_input_bytes = 1024 * 1024,
+                                            .max_target_bytes = 1024,
+                                            .fanout = 4,
+                                            .max_levels = 4,
+                                            .min_reclaim_ratio = 1.0,
+                                            .enable_tiering = true});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{4});
+    EXPECT_EQ(compacted->target_segments, size_t{1});
+    EXPECT_EQ(compacted->reclaimed_bytes, uint64_t{0});
+    for (size_t i = 0; i < identities.size(); ++i) {
+        EXPECT_EQ((*store)->Get(identities[i]).value(),
+                  std::string(96, 'a' + i));
+    }
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured

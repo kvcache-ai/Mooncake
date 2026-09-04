@@ -1,18 +1,35 @@
 #include "storage/local/log_structured/log_structured_backend.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cerrno>
+#include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <string_view>
 
 #include <glog/logging.h>
 
+#include "environ.h"
 #include "tenant_id.h"
 
 namespace mooncake {
 namespace {
 
-constexpr uint64_t kDefaultSegmentBytes = 256ULL * 1024 * 1024;
+double ParseRatio(std::string_view value, double fallback) {
+    if (value.empty()) return fallback;
+    std::string owned(value);
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = std::strtod(owned.c_str(), &end);
+    if (errno != 0 || end != owned.c_str() + owned.size() ||
+        !std::isfinite(parsed)) {
+        return fallback;
+    }
+    return parsed;
+}
 
 std::pair<std::string, std::string> SplitStorageKey(
     std::string_view storage_key) {
@@ -22,9 +39,73 @@ std::pair<std::string, std::string> SplitStorageKey(
 
 }  // namespace
 
+LogStructuredBackendConfig LogStructuredBackendConfig::FromEnvironment() {
+    LogStructuredBackendConfig config;
+    config.segment_size_bytes = Environ::GetUInt64(
+        "MOONCAKE_LOG_SEGMENT_SIZE_BYTES", config.segment_size_bytes);
+    config.checkpoint_interval_records = Environ::GetUInt64(
+        "MOONCAKE_LOG_CHECKPOINT_INTERVAL", config.checkpoint_interval_records);
+    config.compaction_interval_ms = Environ::GetUInt64(
+        "MOONCAKE_LOG_COMPACTION_INTERVAL_MS", config.compaction_interval_ms);
+    config.compaction_fanout = static_cast<size_t>(Environ::GetUInt64(
+        "MOONCAKE_LOG_COMPACTION_FANOUT", config.compaction_fanout));
+    config.compaction_max_levels = static_cast<uint32_t>(Environ::GetUInt64(
+        "MOONCAKE_LOG_COMPACTION_MAX_LEVELS", config.compaction_max_levels));
+    config.compaction_max_sources = static_cast<size_t>(Environ::GetUInt64(
+        "MOONCAKE_LOG_COMPACTION_MAX_SOURCES", config.compaction_max_sources));
+    config.compaction_max_bytes_per_round =
+        Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND",
+                           config.compaction_max_bytes_per_round);
+    config.compaction_max_target_bytes =
+        Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES",
+                           config.compaction_max_target_bytes);
+    config.compaction_min_reclaim_ratio = ParseRatio(
+        Environ::GetString("MOONCAKE_LOG_COMPACTION_MIN_RECLAIM_RATIO", ""),
+        config.compaction_min_reclaim_ratio);
+
+    const auto sync_policy =
+        Environ::GetString("MOONCAKE_LOG_SYNC_POLICY", "record");
+    if (sync_policy == "batch") {
+        config.sync_policy = LogStructuredSyncPolicy::kBatch;
+    } else if (sync_policy == "none") {
+        config.sync_policy = LogStructuredSyncPolicy::kNone;
+    } else {
+        config.sync_policy = LogStructuredSyncPolicy::kRecord;
+    }
+
+    const auto compaction_policy =
+        Environ::GetString("MOONCAKE_LOG_COMPACTION_POLICY", "none");
+    if (compaction_policy == "reclaim_only") {
+        config.compaction_policy = LogStructuredCompactionPolicy::kReclaimOnly;
+    } else if (compaction_policy == "tiered") {
+        config.compaction_policy = LogStructuredCompactionPolicy::kTiered;
+    } else {
+        config.compaction_policy = LogStructuredCompactionPolicy::kNone;
+    }
+    return config;
+}
+
+bool LogStructuredBackendConfig::Validate() const {
+    return segment_size_bytes > 0 && compaction_interval_ms > 0 &&
+           compaction_fanout >= 2 && compaction_max_levels > 0 &&
+           compaction_max_sources > 0 && compaction_max_bytes_per_round > 0 &&
+           compaction_max_target_bytes >= segment_size_bytes &&
+           compaction_min_reclaim_ratio >= 0.0 &&
+           compaction_min_reclaim_ratio <= 1.0;
+}
+
 LogStructuredStorageBackend::LogStructuredStorageBackend(
-    const FileStorageConfig& config)
-    : StorageBackendInterface(config) {}
+    const FileStorageConfig& config, LogStructuredBackendConfig backend_config)
+    : StorageBackendInterface(config),
+      backend_config_(std::move(backend_config)) {}
+
+LogStructuredStorageBackend::~LogStructuredStorageBackend() {
+    if (compaction_thread_.joinable()) {
+        compaction_thread_.request_stop();
+        compaction_wakeup_.notify_all();
+        compaction_thread_.join();
+    }
+}
 
 ErrorCode LogStructuredStorageBackend::ToWriteError(
     logstructured::StoreError error) {
@@ -71,20 +152,30 @@ tl::expected<std::string, ErrorCode> LogStructuredStorageBackend::ConcatSlices(
 tl::expected<void, ErrorCode> LogStructuredStorageBackend::Init() {
     std::lock_guard lock(mutex_);
     if (initialized_.load(std::memory_order_acquire)) return {};
+    if (!backend_config_.Validate()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const std::filesystem::path root =
         std::filesystem::path(file_storage_config_.storage_filepath) /
         "log_structured";
     auto store = logstructured::LogStructuredStore::Open(
         {.root_path = root.string(),
-         .max_segment_bytes = kDefaultSegmentBytes,
-         .sync_data = true,
-         .sync_wal = true});
+         .max_segment_bytes = backend_config_.segment_size_bytes,
+         .sync_data =
+             backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
+         .sync_wal =
+             backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord});
     if (!store) {
         LOG(ERROR) << "Failed to initialize log-structured backend at " << root;
         return tl::make_unexpected(ToWriteError(store.error()));
     }
     store_ = std::move(store.value());
     initialized_.store(true, std::memory_order_release);
+    if (backend_config_.compaction_policy !=
+        LogStructuredCompactionPolicy::kNone) {
+        compaction_thread_ = std::jthread(
+            [this](std::stop_token token) { CompactionLoop(token); });
+    }
     return {};
 }
 
@@ -125,6 +216,13 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
     if (prepared.empty()) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
+        !store_->Sync()) {
+        for (const auto& write : prepared) {
+            static_cast<void>(store_->AbortPut(write.identity, write.sequence));
+        }
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
 
     if (complete_handler) {
         const auto result = complete_handler(keys, metadatas);
@@ -139,6 +237,21 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
         auto committed = store_->CommitPut(write.identity, write.sequence);
         if (!committed) {
             return tl::make_unexpected(ToWriteError(committed.error()));
+        }
+    }
+    if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
+        !store_->Sync()) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    committed_since_checkpoint_ += prepared.size();
+    if (backend_config_.checkpoint_interval_records != 0 &&
+        committed_since_checkpoint_ >=
+            backend_config_.checkpoint_interval_records) {
+        auto checkpointed = store_->Checkpoint();
+        if (!checkpointed) {
+            LOG(ERROR) << "Failed to checkpoint log-structured backend";
+        } else {
+            committed_since_checkpoint_ = 0;
         }
     }
     return static_cast<int64_t>(prepared.size());
@@ -221,6 +334,68 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::ScanMeta(
         if (result != ErrorCode::OK) return tl::make_unexpected(result);
     }
     return {};
+}
+
+void LogStructuredStorageBackend::CompactionLoop(std::stop_token stop_token) {
+    std::mutex wait_mutex;
+    std::unique_lock wait_lock(wait_mutex);
+    while (!stop_token.stop_requested()) {
+        compaction_wakeup_.wait_for(
+            wait_lock, stop_token,
+            std::chrono::milliseconds(backend_config_.compaction_interval_ms),
+            [] { return false; });
+        if (stop_token.stop_requested()) break;
+        auto compacted = store_->CompactOnce(
+            {.max_source_segments = backend_config_.compaction_max_sources,
+             .max_input_bytes = backend_config_.compaction_max_bytes_per_round,
+             .max_target_bytes = backend_config_.compaction_max_target_bytes,
+             .fanout = backend_config_.compaction_fanout,
+             .max_levels = backend_config_.compaction_max_levels,
+             .min_reclaim_ratio = backend_config_.compaction_min_reclaim_ratio,
+             .enable_tiering = backend_config_.compaction_policy ==
+                               LogStructuredCompactionPolicy::kTiered});
+        if (!compacted) {
+            LOG(ERROR) << "Log-structured compaction failed";
+        }
+    }
+}
+
+void LogStructuredStorageBackend::RemoveAll() {
+    std::lock_guard lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire) || !store_) return;
+
+    for (const auto& entry : store_->SnapshotCurrentIndex()) {
+        auto deleted = store_->Delete(entry.identity);
+        if (!deleted) {
+            LOG(ERROR) << "Failed to tombstone object during RemoveAll: "
+                       << entry.identity.object_key;
+            return;
+        }
+    }
+    if (!store_->SealActiveSegment()) {
+        LOG(ERROR) << "Failed to seal active segment during RemoveAll";
+        return;
+    }
+
+    const logstructured::CompactionOptions options{
+        .max_source_segments = std::numeric_limits<size_t>::max(),
+        .max_input_bytes = std::numeric_limits<uint64_t>::max(),
+        .max_target_bytes = backend_config_.compaction_max_target_bytes,
+        .fanout = backend_config_.compaction_fanout,
+        .max_levels = backend_config_.compaction_max_levels,
+        .min_reclaim_ratio = 0.0,
+        .enable_tiering = false};
+    while (true) {
+        auto compacted = store_->CompactOnce(options);
+        if (!compacted) {
+            LOG(ERROR) << "Failed to reclaim segments during RemoveAll";
+            return;
+        }
+        if (compacted->source_segments == 0) break;
+    }
+    if (!store_->Checkpoint()) {
+        LOG(ERROR) << "Failed to checkpoint RemoveAll";
+    }
 }
 
 void LogStructuredStorageBackend::SetTestFailurePredicate(

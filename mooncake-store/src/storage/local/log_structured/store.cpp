@@ -415,6 +415,10 @@ tl::expected<void, StoreError> LogStructuredStore::RotateSegmentIfNeeded(
             config_.max_segment_bytes) {
         return {};
     }
+    return RotateActiveSegmentLocked();
+}
+
+tl::expected<void, StoreError> LogStructuredStore::RotateActiveSegmentLocked() {
     auto synced = active_segment_->Sync();
     if (!synced) return tl::unexpected(StoreError::kIoError);
     auto old_metadata = segments_.find(active_segment_->segment_id());
@@ -577,6 +581,20 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
     return {};
 }
 
+tl::expected<void, StoreError> LogStructuredStore::Sync() {
+    std::lock_guard lock(mutex_);
+    if (!active_segment_->Sync() || !wal_->Sync()) {
+        return tl::unexpected(StoreError::kIoError);
+    }
+    return {};
+}
+
+tl::expected<void, StoreError> LogStructuredStore::SealActiveSegment() {
+    std::lock_guard lock(mutex_);
+    if (active_segment_->tail() == 0) return {};
+    return RotateActiveSegmentLocked();
+}
+
 tl::expected<void, StoreError> LogStructuredStore::Checkpoint() {
     std::lock_guard lock(mutex_);
     return CheckpointLocked();
@@ -683,6 +701,7 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         std::lock_guard lock(mutex_);
         CleanupRetiredSegmentsLocked();
         RefreshSegmentLiveBytes();
+        std::vector<SegmentMetadata> sealed;
         for (const auto& [segment_id, segment] : segments_) {
             static_cast<void>(segment_id);
             if (segment.state != SegmentLifecycle::kSealed ||
@@ -690,16 +709,16 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 segment.live_bytes > segment.valid_bytes) {
                 continue;
             }
+            sealed.push_back(segment);
             const uint64_t reclaimable =
                 segment.valid_bytes - segment.live_bytes;
             const double reclaim_ratio =
                 static_cast<double>(reclaimable) / segment.valid_bytes;
-            if (reclaimable == 0 ||
-                (segment.live_bytes != 0 &&
-                 reclaim_ratio < options.min_reclaim_ratio)) {
-                continue;
+            if (reclaimable != 0 &&
+                (segment.live_bytes == 0 ||
+                 reclaim_ratio >= options.min_reclaim_ratio)) {
+                sources.push_back(segment);
             }
-            sources.push_back(segment);
         }
         std::sort(
             sources.begin(), sources.end(),
@@ -713,6 +732,24 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 }
                 return left.segment_id < right.segment_id;
             });
+        if (sources.empty() && options.enable_tiering) {
+            for (uint32_t level = 0; level + 1 < options.max_levels; ++level) {
+                std::vector<SegmentMetadata> level_segments;
+                for (const auto& segment : sealed) {
+                    if (segment.level == level)
+                        level_segments.push_back(segment);
+                }
+                if (level_segments.size() < options.fanout) continue;
+                std::sort(level_segments.begin(), level_segments.end(),
+                          [](const SegmentMetadata& left,
+                             const SegmentMetadata& right) {
+                              return left.segment_id < right.segment_id;
+                          });
+                level_segments.resize(options.fanout);
+                sources = std::move(level_segments);
+                break;
+            }
+        }
         if (sources.size() > options.max_source_segments) {
             sources.resize(options.max_source_segments);
         }
@@ -737,7 +774,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         for (auto& source : sources) {
             source_ids.insert(source.segment_id);
             input_bytes += source.valid_bytes;
-            target_level = std::max(target_level, source.level + 1);
+            const uint32_t next_level =
+                source.level + static_cast<uint32_t>(source.level + 1 != 0);
+            target_level = std::max(target_level, next_level);
             auto path = segment_paths_.find(source.segment_id);
             if (path == segment_paths_.end()) {
                 return tl::unexpected(StoreError::kCorruptData);
@@ -758,6 +797,17 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             reserved_target_ids.push_back(next_segment_id_++);
         }
     }
+
+    target_level = std::min(target_level, options.max_levels - 1);
+    uint64_t target_bytes = config_.max_segment_bytes;
+    for (uint32_t level = 0; level < target_level; ++level) {
+        if (target_bytes > options.max_target_bytes / options.fanout) {
+            target_bytes = options.max_target_bytes;
+            break;
+        }
+        target_bytes *= options.fanout;
+    }
+    target_bytes = std::min(target_bytes, options.max_target_bytes);
 
     struct TargetOutput {
         uint64_t segment_id{0};
@@ -807,8 +857,8 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             return tl::unexpected(StoreError::kCorruptData);
         }
         const uint64_t record_bytes = entry.version.physical.total_length;
-        if (!writer || (writer->tail() != 0 && writer->tail() + record_bytes >
-                                                   config_.max_segment_bytes)) {
+        if (!writer || (writer->tail() != 0 &&
+                        writer->tail() + record_bytes > target_bytes)) {
             if (writer && !writer->Sync()) {
                 cleanup_targets();
                 reset_sources();

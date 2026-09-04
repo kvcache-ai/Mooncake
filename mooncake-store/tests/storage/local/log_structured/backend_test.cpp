@@ -3,10 +3,12 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -166,6 +168,141 @@ TEST(LogStructuredStorageBackendTest, PartialFailureReportsOnlyStoredKeys) {
     EXPECT_EQ(completed, std::vector<std::string>{"key-1"});
     EXPECT_EQ(backend.IsExist("key-1").value(), true);
     EXPECT_EQ(backend.IsExist("key-2").value(), false);
+}
+
+TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
+    setenv("MOONCAKE_LOG_SEGMENT_SIZE_BYTES", "4096", 1);
+    setenv("MOONCAKE_LOG_SYNC_POLICY", "batch", 1);
+    setenv("MOONCAKE_LOG_CHECKPOINT_INTERVAL", "17", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_POLICY", "tiered", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_INTERVAL_MS", "25", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_FANOUT", "3", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MAX_LEVELS", "5", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MAX_SOURCES", "6", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND", "8192", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES", "16384", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MIN_RECLAIM_RATIO", "0.35", 1);
+
+    const auto config = LogStructuredBackendConfig::FromEnvironment();
+
+    unsetenv("MOONCAKE_LOG_SEGMENT_SIZE_BYTES");
+    unsetenv("MOONCAKE_LOG_SYNC_POLICY");
+    unsetenv("MOONCAKE_LOG_CHECKPOINT_INTERVAL");
+    unsetenv("MOONCAKE_LOG_COMPACTION_POLICY");
+    unsetenv("MOONCAKE_LOG_COMPACTION_INTERVAL_MS");
+    unsetenv("MOONCAKE_LOG_COMPACTION_FANOUT");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_LEVELS");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_SOURCES");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MIN_RECLAIM_RATIO");
+
+    EXPECT_TRUE(config.Validate());
+    EXPECT_EQ(config.segment_size_bytes, uint64_t{4096});
+    EXPECT_EQ(config.sync_policy, LogStructuredSyncPolicy::kBatch);
+    EXPECT_EQ(config.checkpoint_interval_records, uint64_t{17});
+    EXPECT_EQ(config.compaction_policy, LogStructuredCompactionPolicy::kTiered);
+    EXPECT_EQ(config.compaction_interval_ms, uint64_t{25});
+    EXPECT_EQ(config.compaction_fanout, size_t{3});
+    EXPECT_EQ(config.compaction_max_levels, uint32_t{5});
+    EXPECT_EQ(config.compaction_max_sources, size_t{6});
+    EXPECT_EQ(config.compaction_max_bytes_per_round, uint64_t{8192});
+    EXPECT_EQ(config.compaction_max_target_bytes, uint64_t{16384});
+    EXPECT_DOUBLE_EQ(config.compaction_min_reclaim_ratio, 0.35);
+}
+
+TEST(LogStructuredStorageBackendTest, BackgroundTieringKeepsObjectsReadable) {
+    BackendTempDirectory temp;
+    auto config = BackendConfig(temp);
+    LogStructuredBackendConfig backend_config;
+    backend_config.segment_size_bytes = 256;
+    backend_config.sync_policy = LogStructuredSyncPolicy::kBatch;
+    backend_config.checkpoint_interval_records = 2;
+    backend_config.compaction_policy = LogStructuredCompactionPolicy::kTiered;
+    backend_config.compaction_interval_ms = 5;
+    backend_config.compaction_fanout = 4;
+    backend_config.compaction_max_sources = 4;
+    backend_config.compaction_max_target_bytes = 1024;
+    backend_config.compaction_min_reclaim_ratio = 1.0;
+
+    LogStructuredStorageBackend backend(config, backend_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    std::vector<std::string> values;
+    for (size_t i = 0; i < 5; ++i) {
+        values.push_back(std::string(96, static_cast<char>('a' + i)));
+        const std::string key = "key-" + std::to_string(i);
+        ASSERT_TRUE(backend
+                        .BatchOffload(SingleValueBatch(key, values.back()),
+                                      [](const std::vector<std::string>&,
+                                         std::vector<StorageObjectMetadata>&) {
+                                          return ErrorCode::OK;
+                                      })
+                        .has_value());
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    size_t segment_count = 0;
+    do {
+        segment_count = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(
+                 temp.path() / "log_structured" / "segments")) {
+            if (entry.is_regular_file()) ++segment_count;
+        }
+        if (segment_count <= 2) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    } while (std::chrono::steady_clock::now() < deadline);
+    EXPECT_LE(segment_count, size_t{2});
+
+    for (size_t i = 0; i < values.size(); ++i) {
+        const std::string key = "key-" + std::to_string(i);
+        std::string loaded(values[i].size(), '\0');
+        std::unordered_map<std::string, Slice> slices{
+            {key, Slice{loaded.data(), loaded.size()}}};
+        ASSERT_TRUE(backend.BatchLoad(slices).has_value());
+        EXPECT_EQ(loaded, values[i]);
+    }
+}
+
+TEST(LogStructuredStorageBackendTest, RemoveAllSurvivesRestart) {
+    BackendTempDirectory temp;
+    const auto config = BackendConfig(temp);
+    std::string first = "first-value";
+    std::string second = "second-value";
+    {
+        LogStructuredBackendConfig backend_config;
+        backend_config.segment_size_bytes = 256;
+        backend_config.compaction_policy = LogStructuredCompactionPolicy::kNone;
+        LogStructuredStorageBackend backend(config, backend_config);
+        ASSERT_TRUE(backend.Init().has_value());
+        std::unordered_map<std::string, std::vector<Slice>> batch{
+            {"first", {Slice{first.data(), first.size()}}},
+            {"second", {Slice{second.data(), second.size()}}}};
+        ASSERT_TRUE(backend
+                        .BatchOffload(batch,
+                                      [](const std::vector<std::string>&,
+                                         std::vector<StorageObjectMetadata>&) {
+                                          return ErrorCode::OK;
+                                      })
+                        .has_value());
+        backend.RemoveAll();
+        EXPECT_FALSE(backend.IsExist("first").value());
+        EXPECT_FALSE(backend.IsExist("second").value());
+    }
+
+    LogStructuredStorageBackend recovered(config);
+    ASSERT_TRUE(recovered.Init().has_value());
+    EXPECT_FALSE(recovered.IsExist("first").value());
+    EXPECT_FALSE(recovered.IsExist("second").value());
+    size_t scanned = 0;
+    ASSERT_TRUE(recovered
+                    .ScanMeta([&](const std::vector<std::string>& keys,
+                                  std::vector<StorageObjectMetadata>&) {
+                        scanned += keys.size();
+                        return ErrorCode::OK;
+                    })
+                    .has_value());
+    EXPECT_EQ(scanned, size_t{0});
 }
 
 }  // namespace
