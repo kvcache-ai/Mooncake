@@ -1,5 +1,6 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -77,6 +78,13 @@ class SegmentWriter {
     tl::expected<std::vector<PhysicalRecord>, SegmentError> AppendBatch(
         const std::vector<SegmentAppendRequest>& requests, bool sync,
         size_t parallelism);
+    tl::expected<std::vector<PhysicalRecord>, SegmentError> ReserveBatch(
+        const std::vector<SegmentAppendRequest>& requests);
+    tl::expected<void, SegmentError> WriteReservedBatch(
+        const std::vector<SegmentAppendRequest>& requests,
+        const std::vector<PhysicalRecord>& physical_records, bool sync,
+        size_t parallelism);
+    void CancelReservedBatch();
 
     tl::expected<void, SegmentError> Sync();
 
@@ -95,11 +103,21 @@ class SegmentWriter {
 
     SegmentWriter(std::string path, uint64_t segment_id, int fd, uint64_t tail);
 
+    tl::expected<std::vector<PhysicalRecord>, SegmentError> ReserveBatchLocked(
+        const std::vector<SegmentAppendRequest>& requests);
+    tl::expected<void, SegmentError> WriteBatchAt(
+        const std::vector<SegmentAppendRequest>& requests,
+        const std::vector<PhysicalRecord>& physical_records, bool sync,
+        size_t parallelism);
+    void FinishReservedBatch();
+
     std::string path_;
     uint64_t segment_id_;
     int fd_;
     mutable std::mutex append_mutex_;
+    std::condition_variable append_cv_;
     uint64_t tail_;
+    size_t in_flight_batches_{0};
 };
 
 class SegmentReader {

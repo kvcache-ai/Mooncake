@@ -214,12 +214,28 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
                             std::vector<StorageObjectMetadata>&)>
         complete_handler,
     EvictionHandler) {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     if (batch_object.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    std::vector<size_t> key_stripes;
+    key_stripes.reserve(batch_object.size());
+    for (const auto& [key, slices] : batch_object) {
+        static_cast<void>(slices);
+        key_stripes.push_back(std::hash<std::string>{}(key) %
+                              key_mutexes_.size());
+    }
+    std::sort(key_stripes.begin(), key_stripes.end());
+    key_stripes.erase(std::unique(key_stripes.begin(), key_stripes.end()),
+                      key_stripes.end());
+    std::vector<std::unique_lock<std::mutex>> key_locks;
+    key_locks.reserve(key_stripes.size());
+    for (const size_t stripe : key_stripes) {
+        key_locks.emplace_back(key_mutexes_[stripe]);
     }
 
     std::vector<logstructured::PreparedWrite> prepared;
@@ -272,30 +288,34 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    if (complete_handler) {
-        const auto result = complete_handler(keys, metadatas);
-        if (result != ErrorCode::OK) {
-            static_cast<void>(store_->AbortPuts(prepared));
-            return tl::make_unexpected(result);
+    {
+        std::lock_guard publication_lock(publication_mutex_);
+        if (complete_handler) {
+            const auto result = complete_handler(keys, metadatas);
+            if (result != ErrorCode::OK) {
+                static_cast<void>(store_->AbortPuts(prepared));
+                return tl::make_unexpected(result);
+            }
         }
-    }
-    auto committed = store_->CommitPuts(prepared);
-    if (!committed) {
-        return tl::make_unexpected(ToWriteError(committed.error()));
+        auto committed = store_->CommitPuts(prepared);
+        if (!committed) {
+            return tl::make_unexpected(ToWriteError(committed.error()));
+        }
     }
     if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
         !store_->Sync()) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    committed_since_checkpoint_ += prepared.size();
+    const uint64_t committed = committed_since_checkpoint_.fetch_add(
+                                   prepared.size(), std::memory_order_relaxed) +
+                               prepared.size();
     if (backend_config_.checkpoint_interval_records != 0 &&
-        committed_since_checkpoint_ >=
-            backend_config_.checkpoint_interval_records) {
+        committed >= backend_config_.checkpoint_interval_records) {
         auto checkpointed = store_->Checkpoint();
         if (!checkpointed) {
             LOG(ERROR) << "Failed to checkpoint log-structured backend";
         } else {
-            committed_since_checkpoint_ = 0;
+            committed_since_checkpoint_.store(0, std::memory_order_relaxed);
         }
     }
     return static_cast<int64_t>(prepared.size());
@@ -304,6 +324,7 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
 tl::expected<void, ErrorCode> LogStructuredStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
     std::shared_lock lock(mutex_);
+    std::shared_lock publication_lock(publication_mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -321,7 +342,8 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::BatchLoad(
 
 tl::expected<bool, ErrorCode> LogStructuredStorageBackend::IsExist(
     const std::string& key) {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
+    std::shared_lock publication_lock(publication_mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -331,7 +353,8 @@ tl::expected<bool, ErrorCode> LogStructuredStorageBackend::IsExist(
 
 tl::expected<bool, ErrorCode>
 LogStructuredStorageBackend::IsEnableOffloading() {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
+    std::shared_lock publication_lock(publication_mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -355,7 +378,8 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::ScanMeta(
     const std::function<ErrorCode(const std::vector<std::string>&,
                                   std::vector<StorageObjectMetadata>&)>&
         handler) {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
+    std::shared_lock publication_lock(publication_mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -563,7 +587,7 @@ std::optional<StorageBackendStats> LogStructuredStorageBackend::SnapshotStats()
     if (!initialized_.load(std::memory_order_acquire)) {
         return std::nullopt;
     }
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
     if (!store_) return std::nullopt;
     const auto stats = store_->SnapshotStats();
     return StorageBackendStats{

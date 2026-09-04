@@ -7,6 +7,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <stop_token>
 #include <string>
 #include <unordered_map>
@@ -158,9 +159,7 @@ class LogStructuredStore {
     tl::expected<void, StoreError> RecoverSegments(
         const std::vector<SegmentMetadata>& expected_segments,
         uint64_t active_segment_id);
-    tl::expected<void, StoreError> ValidateIndexRecords(
-        const std::unordered_map<uint64_t, std::vector<ScannedRecord>>&
-            scanned_segments) const;
+    tl::expected<void, StoreError> ValidateIndexRecords() const;
     void RefreshSegmentLiveBytes();
     tl::expected<void, StoreError> AddLiveRecordLocked(
         const PhysicalRecord& physical);
@@ -189,6 +188,7 @@ class LogStructuredStore {
     std::string segments_path_;
     std::string wal_path_;
     mutable std::mutex mutex_;
+    mutable std::shared_mutex mutation_mutex_;
     std::mutex compaction_mutex_;
     std::unique_ptr<StorageDirectory> directory_;
     VersionIndex index_;
@@ -198,7 +198,9 @@ class LogStructuredStore {
     mutable std::deque<std::pair<uint64_t, std::shared_ptr<SegmentReader>>>
         reader_cache_;
     std::map<uint64_t, SegmentMetadata> segments_;
-    std::unique_ptr<SegmentWriter> active_segment_;
+    std::unordered_map<uint64_t, size_t> pending_segment_writes_;
+    std::shared_ptr<SegmentWriter> active_segment_;
+    std::vector<std::shared_ptr<SegmentWriter>> sealed_writers_;
     std::unique_ptr<WalWriter> wal_;
     uint64_t next_sequence_{1};
     uint64_t next_segment_id_{1};

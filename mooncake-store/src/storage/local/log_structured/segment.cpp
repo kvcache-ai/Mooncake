@@ -32,9 +32,12 @@ std::mutex write_failure_mutex;
 std::function<bool(std::string_view, uint64_t, size_t)> write_failure_predicate;
 
 bool ShouldFailWrite(std::string_view path, uint64_t offset, size_t length) {
-    std::lock_guard lock(write_failure_mutex);
-    return write_failure_predicate &&
-           write_failure_predicate(path, offset, length);
+    std::function<bool(std::string_view, uint64_t, size_t)> predicate;
+    {
+        std::lock_guard lock(write_failure_mutex);
+        predicate = write_failure_predicate;
+    }
+    return predicate && predicate(path, offset, length);
 }
 
 template <typename T>
@@ -219,7 +222,32 @@ tl::expected<std::vector<PhysicalRecord>, SegmentError>
 SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
                            bool sync, size_t parallelism) {
     std::lock_guard lock(append_mutex_);
-    if (requests.empty() || parallelism == 0) {
+    const uint64_t original_tail = tail_;
+    auto physical_records = ReserveBatchLocked(requests);
+    if (!physical_records) return tl::unexpected(physical_records.error());
+    auto written = WriteBatchAt(requests, *physical_records, sync, parallelism);
+    if (!written) {
+        tail_ = original_tail;
+        if (ftruncate(fd_, static_cast<off_t>(original_tail)) != 0) {
+            return tl::unexpected(SegmentError::kTruncateFailed);
+        }
+        return tl::unexpected(written.error());
+    }
+    return physical_records;
+}
+
+tl::expected<std::vector<PhysicalRecord>, SegmentError>
+SegmentWriter::ReserveBatch(const std::vector<SegmentAppendRequest>& requests) {
+    std::lock_guard lock(append_mutex_);
+    auto reserved = ReserveBatchLocked(requests);
+    if (reserved) ++in_flight_batches_;
+    return reserved;
+}
+
+tl::expected<std::vector<PhysicalRecord>, SegmentError>
+SegmentWriter::ReserveBatchLocked(
+    const std::vector<SegmentAppendRequest>& requests) {
+    if (requests.empty()) {
         return tl::unexpected(SegmentError::kInvalidArgument);
     }
 
@@ -246,6 +274,50 @@ SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
              .value_length = request.value.size(),
              .total_length = record_size});
         next_offset += record_size;
+    }
+    tail_ = next_offset;
+    return physical_records;
+}
+
+tl::expected<void, SegmentError> SegmentWriter::WriteReservedBatch(
+    const std::vector<SegmentAppendRequest>& requests,
+    const std::vector<PhysicalRecord>& physical_records, bool sync,
+    size_t parallelism) {
+    if (requests.empty() || requests.size() != physical_records.size()) {
+        return tl::unexpected(SegmentError::kInvalidArgument);
+    }
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const uint64_t expected_size = AlignedRecordSize(
+            static_cast<uint32_t>(requests[index].identity.tenant_id.size()),
+            static_cast<uint32_t>(requests[index].identity.object_key.size()),
+            requests[index].value.size());
+        const auto& physical = physical_records[index];
+        if (expected_size == 0 || physical.segment_id != segment_id_ ||
+            physical.total_length != expected_size) {
+            return tl::unexpected(SegmentError::kInvalidArgument);
+        }
+    }
+    struct ReservationGuard {
+        SegmentWriter* writer;
+        ~ReservationGuard() { writer->FinishReservedBatch(); }
+    } guard{this};
+    return WriteBatchAt(requests, physical_records, sync, parallelism);
+}
+
+void SegmentWriter::CancelReservedBatch() { FinishReservedBatch(); }
+
+void SegmentWriter::FinishReservedBatch() {
+    std::lock_guard lock(append_mutex_);
+    if (in_flight_batches_ > 0) --in_flight_batches_;
+    append_cv_.notify_all();
+}
+
+tl::expected<void, SegmentError> SegmentWriter::WriteBatchAt(
+    const std::vector<SegmentAppendRequest>& requests,
+    const std::vector<PhysicalRecord>& physical_records, bool sync,
+    size_t parallelism) {
+    if (parallelism == 0) {
+        return tl::unexpected(SegmentError::kInvalidArgument);
     }
 
     std::vector<std::string> encoded_records(requests.size());
@@ -284,21 +356,17 @@ SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
 
     std::vector<UringWriteRequest> write_requests;
     write_requests.reserve(requests.size());
-    bool injected_failure = false;
     for (size_t index = 0; index < requests.size(); ++index) {
         const uint64_t offset = physical_records[index].record_offset;
         if (ShouldFailWrite(path_, offset, encoded_records[index].size())) {
-            injected_failure = true;
-            break;
+            return tl::unexpected(SegmentError::kIoError);
         }
         write_requests.push_back({.data = encoded_records[index].data(),
                                   .length = encoded_records[index].size(),
                                   .offset = offset});
     }
 
-    auto write_result = injected_failure
-                            ? UringBatchWriteResult::kIoError
-                            : UringBatchWrite(fd_, write_requests, parallelism);
+    auto write_result = UringBatchWrite(fd_, write_requests, parallelism);
     if (write_result == UringBatchWriteResult::kUnavailable) {
         write_result = UringBatchWriteResult::kSuccess;
         for (const auto& request : write_requests) {
@@ -309,21 +377,18 @@ SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
         }
     }
     if (write_result != UringBatchWriteResult::kSuccess) {
-        if (ftruncate(fd_, static_cast<off_t>(tail_)) != 0) {
-            return tl::unexpected(SegmentError::kTruncateFailed);
-        }
         return tl::unexpected(SegmentError::kIoError);
     }
     if (sync && fdatasync(fd_) != 0) {
         return tl::unexpected(SegmentError::kSyncFailed);
     }
-    tail_ = next_offset;
-    return physical_records;
+    return {};
 }
 
 tl::expected<void, SegmentError> SegmentWriter::Sync() {
-    std::lock_guard lock(append_mutex_);
-    if (fdatasync(fd_) != 0) {
+    std::unique_lock lock(append_mutex_);
+    append_cv_.wait(lock, [this] { return in_flight_batches_ == 0; });
+    if (ftruncate(fd_, static_cast<off_t>(tail_)) != 0 || fdatasync(fd_) != 0) {
         return tl::unexpected(SegmentError::kSyncFailed);
     }
     return {};
@@ -522,12 +587,10 @@ tl::expected<void, SegmentError> SegmentReader::ReadValue(
             static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
                 physical.total_length ||
         physical.value_offset < physical.record_offset + kRecordHeaderSize ||
-        physical.value_offset >
-            physical.record_offset + physical.total_length -
-                kRecordFooterSize ||
-        physical.value_length >
-            physical.record_offset + physical.total_length -
-                kRecordFooterSize - physical.value_offset) {
+        physical.value_offset > physical.record_offset + physical.total_length -
+                                    kRecordFooterSize ||
+        physical.value_length > physical.record_offset + physical.total_length -
+                                    kRecordFooterSize - physical.value_offset) {
         return tl::unexpected(SegmentError::kInvalidArgument);
     }
     if (value_size != 0 &&

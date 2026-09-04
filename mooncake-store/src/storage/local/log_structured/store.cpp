@@ -345,6 +345,14 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
             return tl::unexpected(StoreError::kCorruptData);
         }
     }
+
+    std::unordered_map<uint64_t, uint64_t> referenced_records;
+    for (const auto& snapshot : index_.Snapshot()) {
+        if (snapshot.version.physical.total_length != 0) {
+            ++referenced_records[snapshot.version.physical.segment_id];
+        }
+    }
+
     for (auto it = ordered_segments.begin(); it != ordered_segments.end();) {
         if (segments_.contains(it->first)) {
             ++it;
@@ -360,26 +368,18 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
             it = ordered_segments.erase(it);
             continue;
         }
-        if (!expected_segments.empty() &&
-            it->first < post_checkpoint_segment_floor) {
+        if (it->first < post_checkpoint_segment_floor) {
             return tl::unexpected(StoreError::kCorruptData);
         }
         ++it;
     }
 
     uint64_t active_segment_id = checkpoint_active_segment_id;
-    if (expected_segments.empty() && !ordered_segments.empty()) {
-        active_segment_id = ordered_segments.rbegin()->first;
-    } else {
-        for (const auto& [segment_id, path] : ordered_segments) {
-            static_cast<void>(path);
-            if (!segments_.contains(segment_id)) {
-                active_segment_id = std::max(active_segment_id, segment_id);
-            }
-        }
+    if (!ordered_segments.empty()) {
+        active_segment_id =
+            std::max(active_segment_id, ordered_segments.rbegin()->first);
     }
 
-    std::unordered_map<uint64_t, std::vector<ScannedRecord>> scanned_segments;
     for (const auto& [segment_id, path] : ordered_segments) {
         auto metadata = segments_.find(segment_id);
         if (metadata != segments_.end() &&
@@ -387,19 +387,9 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
             segment_paths_.emplace(segment_id, path);
             continue;
         }
-        auto scan = ScanSegment(path, segment_id);
-        if (!scan) return tl::unexpected(StoreError::kCorruptData);
-        if (scan->termination == ScanTermination::kCorruptRecord ||
-            (scan->termination == ScanTermination::kIncompleteTail &&
-             segment_id != active_segment_id)) {
-            return tl::unexpected(StoreError::kCorruptData);
-        }
-        if (scan->termination == ScanTermination::kIncompleteTail) {
-            auto truncated = TruncateSegment(path, scan->valid_bytes);
-            if (!truncated) return tl::unexpected(StoreError::kIoError);
-        }
 
-        metadata = segments_.find(segment_id);
+        const uint64_t file_size = fs::file_size(path, error);
+        if (error) return tl::unexpected(StoreError::kIoError);
         if (metadata == segments_.end()) {
             segments_.emplace(
                 segment_id,
@@ -408,35 +398,31 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
                                 .state = segment_id == active_segment_id
                                              ? SegmentLifecycle::kActive
                                              : SegmentLifecycle::kSealed,
-                                .valid_bytes = scan->valid_bytes,
+                                .valid_bytes = file_size,
                                 .live_bytes = 0,
-                                .record_count = scan->records.size(),
+                                .record_count = referenced_records[segment_id],
                                 .mutation_epoch = 1});
         } else {
             const bool was_checkpoint_active =
                 segment_id == checkpoint_active_segment_id;
             if ((!was_checkpoint_active &&
-                 (metadata->second.valid_bytes != scan->valid_bytes ||
-                  metadata->second.record_count != scan->records.size())) ||
+                 metadata->second.valid_bytes != file_size) ||
                 (was_checkpoint_active &&
-                 (metadata->second.valid_bytes > scan->valid_bytes ||
-                  metadata->second.record_count > scan->records.size()))) {
+                 metadata->second.valid_bytes > file_size)) {
                 return tl::unexpected(StoreError::kCorruptData);
             }
-            metadata->second.valid_bytes = scan->valid_bytes;
-            metadata->second.record_count = scan->records.size();
+            metadata->second.valid_bytes = file_size;
             if (segment_id != active_segment_id &&
                 metadata->second.state == SegmentLifecycle::kActive) {
                 metadata->second.state = SegmentLifecycle::kSealed;
                 ++metadata->second.mutation_epoch;
             }
         }
-        scanned_segments.emplace(segment_id, std::move(scan->records));
         segment_paths_.emplace(segment_id, path);
         next_segment_id_ = std::max(next_segment_id_, segment_id + 1);
     }
 
-    auto validated = ValidateIndexRecords(scanned_segments);
+    auto validated = ValidateIndexRecords();
     if (!validated) return validated;
 
     for (auto it = segments_.begin(); it != segments_.end();) {
@@ -491,27 +477,20 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
     return {};
 }
 
-tl::expected<void, StoreError> LogStructuredStore::ValidateIndexRecords(
-    const std::unordered_map<uint64_t, std::vector<ScannedRecord>>&
-        scanned_segments) const {
+tl::expected<void, StoreError> LogStructuredStore::ValidateIndexRecords()
+    const {
     for (const auto& snapshot : index_.Snapshot()) {
         if (snapshot.version.state != VersionState::kCommitted) continue;
         if (snapshot.version.physical.total_length == 0) {
             return tl::unexpected(StoreError::kCorruptData);
         }
-        auto segment =
-            scanned_segments.find(snapshot.version.physical.segment_id);
-        if (segment == scanned_segments.end()) {
+        auto path = segment_paths_.find(snapshot.version.physical.segment_id);
+        if (path == segment_paths_.end()) {
             return tl::unexpected(StoreError::kCorruptData);
         }
-        const auto record = std::find_if(
-            segment->second.begin(), segment->second.end(),
-            [&](const ScannedRecord& candidate) {
-                return candidate.identity == snapshot.identity &&
-                       candidate.sequence == snapshot.version.sequence &&
-                       candidate.physical == snapshot.version.physical;
-            });
-        if (record == segment->second.end()) {
+        auto record = ReadRecord(path->second, snapshot.version.physical);
+        if (!record || record->identity != snapshot.identity ||
+            record->sequence != snapshot.version.sequence) {
             return tl::unexpected(StoreError::kCorruptData);
         }
     }
@@ -584,8 +563,6 @@ tl::expected<void, StoreError> LogStructuredStore::RotateSegmentIfNeeded(
 }
 
 tl::expected<void, StoreError> LogStructuredStore::RotateActiveSegmentLocked() {
-    auto synced = active_segment_->Sync();
-    if (!synced) return tl::unexpected(StoreError::kIoError);
     auto old_metadata = segments_.find(active_segment_->segment_id());
     if (old_metadata == segments_.end()) {
         return tl::unexpected(StoreError::kCorruptData);
@@ -596,8 +573,12 @@ tl::expected<void, StoreError> LogStructuredStore::RotateActiveSegmentLocked() {
     if (!created || !SyncDirectory(segments_path_)) {
         return tl::unexpected(StoreError::kIoError);
     }
-    old_metadata->second.state = SegmentLifecycle::kSealed;
+    old_metadata->second.state =
+        pending_segment_writes_[active_segment_->segment_id()] != 0
+            ? SegmentLifecycle::kSealing
+            : SegmentLifecycle::kSealed;
     ++old_metadata->second.mutation_epoch;
+    sealed_writers_.push_back(active_segment_);
     ++next_segment_id_;
     segment_paths_.emplace(segment_id, path);
     segments_.emplace(segment_id,
@@ -614,6 +595,7 @@ tl::expected<void, StoreError> LogStructuredStore::RotateActiveSegmentLocked() {
 
 tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
     const RecordIdentity& identity, std::string_view value) {
+    std::shared_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     return PreparePutLocked(identity, value);
 }
@@ -631,10 +613,7 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
 
 tl::expected<std::vector<PreparedWrite>, StoreError>
 LogStructuredStore::PreparePutBatch(const std::vector<PutRequest>& requests) {
-    std::lock_guard lock(mutex_);
-    if (recovery_required_) {
-        return tl::unexpected(StoreError::kRecoveryRequired);
-    }
+    std::shared_lock mutation_lock(mutation_mutex_);
     if (requests.empty()) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
@@ -660,93 +639,161 @@ LogStructuredStore::PreparePutBatch(const std::vector<PutRequest>& requests) {
         record_sizes.push_back(record_bytes);
     }
 
-    const uint64_t physical_bytes = PhysicalBytesLocked();
-    if (physical_bytes > config_.max_physical_bytes ||
-        total_record_bytes > config_.max_physical_bytes - physical_bytes ||
-        physical_bytes > config_.max_total_physical_bytes ||
-        compaction_reserved_bytes_ >
-            config_.max_total_physical_bytes - physical_bytes ||
-        total_record_bytes > config_.max_total_physical_bytes - physical_bytes -
-                                 compaction_reserved_bytes_) {
-        return tl::unexpected(StoreError::kNoSpace);
+    struct ReservedChunk {
+        std::shared_ptr<SegmentWriter> writer;
+        std::vector<SegmentAppendRequest> appends;
+        std::vector<PhysicalRecord> physical_records;
+    };
+    std::vector<ReservedChunk> chunks;
+
+    {
+        std::lock_guard lock(mutex_);
+        if (recovery_required_) {
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        const uint64_t physical_bytes = PhysicalBytesLocked();
+        if (physical_bytes > config_.max_physical_bytes ||
+            total_record_bytes > config_.max_physical_bytes - physical_bytes ||
+            physical_bytes > config_.max_total_physical_bytes ||
+            compaction_reserved_bytes_ >
+                config_.max_total_physical_bytes - physical_bytes ||
+            total_record_bytes > config_.max_total_physical_bytes -
+                                     physical_bytes -
+                                     compaction_reserved_bytes_) {
+            return tl::unexpected(StoreError::kNoSpace);
+        }
+
+        size_t begin = 0;
+        while (begin < requests.size()) {
+            auto rotated = RotateSegmentIfNeeded(record_sizes[begin]);
+            if (!rotated) return tl::unexpected(rotated.error());
+
+            const uint64_t segment_tail = active_segment_->tail();
+            uint64_t chunk_bytes = 0;
+            size_t end = begin;
+            while (end < requests.size()) {
+                const uint64_t next_bytes = record_sizes[end];
+                if (end != begin &&
+                    (chunk_bytes > config_.max_segment_bytes - segment_tail ||
+                     next_bytes > config_.max_segment_bytes - segment_tail -
+                                      chunk_bytes)) {
+                    break;
+                }
+                chunk_bytes += next_bytes;
+                ++end;
+                if (segment_tail + chunk_bytes >= config_.max_segment_bytes) {
+                    break;
+                }
+            }
+
+            ReservedChunk chunk;
+            chunk.writer = active_segment_;
+            chunk.appends.reserve(end - begin);
+            for (size_t index = begin; index < end; ++index) {
+                const uint64_t sequence = next_sequence_++;
+                RecordIdentity identity{
+                    .tenant_id = requests[index].tenant_id,
+                    .object_key = requests[index].object_key,
+                    .incarnation = {.high = directory_->identity().high,
+                                    .low = sequence}};
+                chunk.appends.push_back({.identity = std::move(identity),
+                                         .value = requests[index].value,
+                                         .kind = RecordKind::kValue,
+                                         .sequence = sequence});
+            }
+            auto reserved = chunk.writer->ReserveBatch(chunk.appends);
+            if (!reserved) {
+                for (auto& reserved_chunk : chunks) {
+                    reserved_chunk.writer->CancelReservedBatch();
+                    auto pending = pending_segment_writes_.find(
+                        reserved_chunk.writer->segment_id());
+                    if (pending != pending_segment_writes_.end() &&
+                        --pending->second == 0) {
+                        pending_segment_writes_.erase(pending);
+                    }
+                }
+                return tl::unexpected(StoreError::kIoError);
+            }
+            chunk.physical_records = std::move(*reserved);
+            auto& segment = segments_.at(chunk.writer->segment_id());
+            segment.valid_bytes = chunk.writer->tail();
+            ++segment.mutation_epoch;
+            ++pending_segment_writes_[chunk.writer->segment_id()];
+            chunks.push_back(std::move(chunk));
+            begin = end;
+        }
     }
 
+    bool write_failed = false;
+    for (auto& chunk : chunks) {
+        auto written = chunk.writer->WriteReservedBatch(
+            chunk.appends, chunk.physical_records, config_.sync_data,
+            config_.payload_write_parallelism);
+        if (!written) write_failed = true;
+    }
     std::vector<PreparedWrite> prepared;
     prepared.reserve(requests.size());
-    size_t begin = 0;
-    while (begin < requests.size()) {
-        auto rotated = RotateSegmentIfNeeded(record_sizes[begin]);
-        if (!rotated) return tl::unexpected(rotated.error());
-
-        const uint64_t segment_tail = active_segment_->tail();
-        uint64_t chunk_bytes = 0;
-        size_t end = begin;
-        while (end < requests.size()) {
-            const uint64_t next_bytes = record_sizes[end];
-            if (end != begin &&
-                (chunk_bytes > config_.max_segment_bytes - segment_tail ||
-                 next_bytes >
-                     config_.max_segment_bytes - segment_tail - chunk_bytes)) {
-                break;
+    std::lock_guard lock(mutex_);
+    auto finish_pending = [&] {
+        for (const auto& chunk : chunks) {
+            auto pending =
+                pending_segment_writes_.find(chunk.writer->segment_id());
+            if (pending == pending_segment_writes_.end()) continue;
+            if (--pending->second != 0) continue;
+            pending_segment_writes_.erase(pending);
+            auto segment = segments_.find(chunk.writer->segment_id());
+            if (segment != segments_.end() &&
+                segment->second.state == SegmentLifecycle::kSealing) {
+                segment->second.state = SegmentLifecycle::kSealed;
+                ++segment->second.mutation_epoch;
             }
-            chunk_bytes += next_bytes;
-            ++end;
-            if (segment_tail + chunk_bytes >= config_.max_segment_bytes) break;
         }
+    };
+    if (write_failed) {
+        finish_pending();
+        return tl::unexpected(StoreError::kIoError);
+    }
 
-        std::vector<SegmentAppendRequest> appends;
-        std::vector<WalRecord> wal_records;
-        appends.reserve(end - begin);
-        wal_records.reserve(end - begin);
-        for (size_t index = begin; index < end; ++index) {
-            const uint64_t sequence = next_sequence_++;
-            RecordIdentity identity{
-                .tenant_id = requests[index].tenant_id,
-                .object_key = requests[index].object_key,
-                .incarnation = {.high = directory_->identity().high,
-                                .low = sequence}};
-            appends.push_back({.identity = std::move(identity),
-                               .value = requests[index].value,
-                               .kind = RecordKind::kValue,
-                               .sequence = sequence});
-        }
-
-        auto physical_records = active_segment_->AppendBatch(
-            appends, config_.sync_data, config_.payload_write_parallelism);
-        if (!physical_records) {
-            return tl::unexpected(StoreError::kIoError);
-        }
-        auto& segment = segments_.at(active_segment_->segment_id());
-        segment.valid_bytes = active_segment_->tail();
-        segment.record_count += appends.size();
-        ++segment.mutation_epoch;
-
-        for (size_t index = 0; index < appends.size(); ++index) {
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    std::vector<WalRecord> wal_records;
+    wal_records.reserve(requests.size());
+    for (const auto& chunk : chunks) {
+        for (size_t index = 0; index < chunk.appends.size(); ++index) {
             wal_records.push_back({.type = WalRecordType::kPrepareValue,
-                                   .sequence = appends[index].sequence,
-                                   .identity = appends[index].identity,
-                                   .physical = (*physical_records)[index]});
+                                   .sequence = chunk.appends[index].sequence,
+                                   .identity = chunk.appends[index].identity,
+                                   .physical = chunk.physical_records[index]});
         }
-        if (!wal_->AppendBatch(wal_records, config_.sync_wal)) {
-            return tl::unexpected(StoreError::kIoError);
-        }
-
-        for (size_t index = 0; index < appends.size(); ++index) {
-            auto indexed = index_.Prepare(appends[index].identity,
-                                          (*physical_records)[index],
-                                          appends[index].sequence);
+    }
+    if (!wal_->AppendBatch(wal_records, config_.sync_wal)) {
+        finish_pending();
+        return tl::unexpected(StoreError::kIoError);
+    }
+    for (const auto& chunk : chunks) {
+        auto& segment = segments_.at(chunk.writer->segment_id());
+        segment.record_count += chunk.appends.size();
+        for (size_t index = 0; index < chunk.appends.size(); ++index) {
+            auto indexed = index_.Prepare(chunk.appends[index].identity,
+                                          chunk.physical_records[index],
+                                          chunk.appends[index].sequence);
             if (!indexed) {
                 recovery_required_ = true;
+                finish_pending();
                 return tl::unexpected(StoreError::kRecoveryRequired);
             }
-            auto live = AddLiveRecordLocked((*physical_records)[index]);
-            if (!live) return tl::unexpected(live.error());
-            prepared.push_back({.identity = appends[index].identity,
-                                .sequence = appends[index].sequence,
-                                .physical = (*physical_records)[index]});
+            auto live = AddLiveRecordLocked(chunk.physical_records[index]);
+            if (!live) {
+                finish_pending();
+                return tl::unexpected(live.error());
+            }
+            prepared.push_back({.identity = chunk.appends[index].identity,
+                                .sequence = chunk.appends[index].sequence,
+                                .physical = chunk.physical_records[index]});
         }
-        begin = end;
     }
+    finish_pending();
     return prepared;
 }
 
@@ -806,6 +853,7 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
 
 tl::expected<void, StoreError> LogStructuredStore::CommitPut(
     const RecordIdentity& identity, uint64_t sequence) {
+    std::shared_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
@@ -840,6 +888,7 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
 
 tl::expected<void, StoreError> LogStructuredStore::CommitPuts(
     const std::vector<PreparedWrite>& writes) {
+    std::shared_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
@@ -882,6 +931,7 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPuts(
 
 tl::expected<void, StoreError> LogStructuredStore::AbortPut(
     const RecordIdentity& identity, uint64_t sequence) {
+    std::shared_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
@@ -911,6 +961,7 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPut(
 
 tl::expected<void, StoreError> LogStructuredStore::AbortPuts(
     const std::vector<PreparedWrite>& writes) {
+    std::shared_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
@@ -949,6 +1000,7 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPuts(
 
 tl::expected<void, StoreError> LogStructuredStore::Delete(
     const RecordIdentity& identity) {
+    std::shared_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
@@ -980,17 +1032,23 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
 }
 
 tl::expected<void, StoreError> LogStructuredStore::Sync() {
+    std::unique_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    for (const auto& writer : sealed_writers_) {
+        if (!writer->Sync()) return tl::unexpected(StoreError::kIoError);
+    }
     if (!active_segment_->Sync() || !wal_->Sync()) {
         return tl::unexpected(StoreError::kIoError);
     }
+    sealed_writers_.clear();
     return {};
 }
 
 tl::expected<void, StoreError> LogStructuredStore::SealActiveSegment() {
+    std::unique_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
@@ -1000,6 +1058,7 @@ tl::expected<void, StoreError> LogStructuredStore::SealActiveSegment() {
 }
 
 tl::expected<void, StoreError> LogStructuredStore::Checkpoint() {
+    std::unique_lock mutation_lock(mutation_mutex_);
     std::lock_guard lock(mutex_);
     return CheckpointLocked();
 }
@@ -1008,9 +1067,13 @@ tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    for (const auto& writer : sealed_writers_) {
+        if (!writer->Sync()) return tl::unexpected(StoreError::kIoError);
+    }
     if (!active_segment_->Sync() || !wal_->Sync()) {
         return tl::unexpected(StoreError::kIoError);
     }
+    sealed_writers_.clear();
     const uint64_t generation = manifest_generation_ + 1;
     const uint64_t checkpoint_sequence = next_sequence_ - 1;
     std::vector<SegmentMetadata> segment_snapshot;

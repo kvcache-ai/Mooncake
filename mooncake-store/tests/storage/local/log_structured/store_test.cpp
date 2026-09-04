@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstdlib>
 #include <filesystem>
 #include <future>
@@ -1355,6 +1356,91 @@ TEST(LogStructuredStoreTest, GetCompletesWhileCompactionWaitsToPublish) {
     ASSERT_TRUE(compacted.has_value());
     EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
               std::string(96, 'b'));
+}
+
+TEST(LogStructuredStoreTest, RecoversCommittedBatchAfterAbandonedReservation) {
+    StoreTempDirectory temp;
+    auto config = Config(temp);
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    SegmentWriter::SetWriteFailurePredicateForTest(
+        [](std::string_view, uint64_t, size_t) { return true; });
+    std::vector<PutRequest> failed_requests{{.tenant_id = "tenant-a",
+                                             .object_key = "failed",
+                                             .value = "abandoned-payload"}};
+    auto failed = (*store)->PreparePutBatch(failed_requests);
+    SegmentWriter::SetWriteFailurePredicateForTest({});
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), StoreError::kIoError);
+
+    std::vector<PutRequest> committed_requests{{.tenant_id = "tenant-a",
+                                                .object_key = "committed",
+                                                .value = "durable-value"}};
+    auto prepared = (*store)->PreparePutBatch(committed_requests);
+    ASSERT_TRUE(prepared.has_value());
+    ASSERT_TRUE((*store)->CommitPuts(*prepared).has_value());
+    store.value().reset();
+
+    auto reopened = LogStructuredStore::Open(config);
+    ASSERT_TRUE(reopened.has_value());
+    EXPECT_EQ((*reopened)->GetLatest("tenant-a", "committed").value(),
+              "durable-value");
+    EXPECT_EQ((*reopened)->GetLatest("tenant-a", "failed").error(),
+              StoreError::kNotFound);
+}
+
+TEST(LogStructuredStoreTest, ConcurrentBatchesWritePayloadsInParallel) {
+    StoreTempDirectory temp;
+    auto config = Config(temp);
+    config.payload_write_parallelism = 1;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    std::mutex overlap_mutex;
+    std::condition_variable overlap_cv;
+    size_t entered = 0;
+    std::atomic<bool> overlapped{false};
+    SegmentWriter::SetWriteFailurePredicateForTest(
+        [&](std::string_view, uint64_t, size_t) {
+            std::unique_lock lock(overlap_mutex);
+            ++entered;
+            overlap_cv.notify_all();
+            overlap_cv.wait_for(lock, std::chrono::seconds(2),
+                                [&] { return entered >= 2; });
+            if (entered >= 2) overlapped.store(true, std::memory_order_release);
+            return false;
+        });
+
+    auto prepare = [&](std::string key, char fill) {
+        std::string value(128 * 1024, fill);
+        std::vector<PutRequest> requests{{.tenant_id = "tenant-a",
+                                          .object_key = std::move(key),
+                                          .value = value}};
+        return (*store)->PreparePutBatch(requests);
+    };
+    auto first =
+        std::async(std::launch::async, [&] { return prepare("first", 'a'); });
+    auto second =
+        std::async(std::launch::async, [&] { return prepare("second", 'b'); });
+    auto first_result = first.get();
+    auto second_result = second.get();
+    SegmentWriter::SetWriteFailurePredicateForTest({});
+
+    ASSERT_TRUE(first_result.has_value());
+    ASSERT_TRUE(second_result.has_value());
+    EXPECT_TRUE(overlapped.load(std::memory_order_acquire));
+    ASSERT_TRUE((*store)->CommitPuts(*first_result).has_value());
+    ASSERT_TRUE((*store)->CommitPuts(*second_result).has_value());
+    ASSERT_TRUE((*store)->Checkpoint().has_value());
+    store.value().reset();
+
+    auto reopened = LogStructuredStore::Open(config);
+    ASSERT_TRUE(reopened.has_value());
+    EXPECT_EQ((*reopened)->GetLatest("tenant-a", "first").value(),
+              std::string(128 * 1024, 'a'));
+    EXPECT_EQ((*reopened)->GetLatest("tenant-a", "second").value(),
+              std::string(128 * 1024, 'b'));
 }
 
 TEST(LogStructuredStoreTest, PreparesBatchAcrossSegmentsAndRecovers) {

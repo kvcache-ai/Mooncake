@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <functional>
@@ -81,9 +82,11 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
 
     LogStructuredBackendConfig backend_config_;
     mutable std::shared_mutex mutex_;
+    mutable std::shared_mutex publication_mutex_;
+    std::array<std::mutex, 256> key_mutexes_;
     std::condition_variable_any compaction_wakeup_;
     std::jthread compaction_thread_;
-    uint64_t committed_since_checkpoint_{0};
+    std::atomic<uint64_t> committed_since_checkpoint_{0};
     std::unique_ptr<logstructured::LogStructuredStore> store_;
     std::function<bool(const std::string& key)> test_failure_predicate_;
     std::atomic<uint64_t> compaction_runs_{0};
