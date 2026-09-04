@@ -16,6 +16,7 @@
 #include <type_traits>
 
 #include "crc32c.h"
+#include "storage/local/log_structured/uring_batch_io.h"
 
 namespace mooncake::logstructured {
 namespace {
@@ -228,11 +229,12 @@ SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
         next_offset += record_size;
     }
 
+    std::vector<std::string> encoded_records(requests.size());
     std::atomic<size_t> next_index{0};
-    std::atomic<int> failure{0};
+    std::atomic<bool> encode_failed{false};
     const size_t worker_count = std::min(parallelism, requests.size());
-    auto write_records = [&] {
-        while (failure.load(std::memory_order_relaxed) == 0) {
+    auto encode_records = [&] {
+        while (!encode_failed.load(std::memory_order_relaxed)) {
             const size_t index =
                 next_index.fetch_add(1, std::memory_order_relaxed);
             if (index >= requests.size()) break;
@@ -240,35 +242,58 @@ SegmentWriter::AppendBatch(const std::vector<SegmentAppendRequest>& requests,
             auto encoded = EncodeRecord(request.identity, request.value,
                                         request.kind, request.sequence);
             if (!encoded) {
-                failure.store(1, std::memory_order_relaxed);
+                encode_failed.store(true, std::memory_order_relaxed);
                 break;
             }
-            const uint64_t offset = physical_records[index].record_offset;
-            if (ShouldFailWrite(path_, offset, encoded->size()) ||
-                !PwriteAll(fd_, encoded->data(), encoded->size(), offset)) {
-                failure.store(2, std::memory_order_relaxed);
-                break;
-            }
+            encoded_records[index] = std::move(*encoded);
         }
     };
     if (worker_count == 1) {
-        write_records();
+        encode_records();
     } else {
         std::vector<std::future<void>> workers;
         workers.reserve(worker_count);
         for (size_t worker = 0; worker < worker_count; ++worker) {
-            workers.push_back(std::async(std::launch::async, write_records));
+            workers.push_back(std::async(std::launch::async, encode_records));
         }
         for (auto& worker : workers) worker.get();
     }
 
-    const int failure_code = failure.load(std::memory_order_relaxed);
-    if (failure_code != 0) {
+    if (encode_failed.load(std::memory_order_relaxed)) {
+        return tl::unexpected(SegmentError::kInvalidArgument);
+    }
+
+    std::vector<UringWriteRequest> write_requests;
+    write_requests.reserve(requests.size());
+    bool injected_failure = false;
+    for (size_t index = 0; index < requests.size(); ++index) {
+        const uint64_t offset = physical_records[index].record_offset;
+        if (ShouldFailWrite(path_, offset, encoded_records[index].size())) {
+            injected_failure = true;
+            break;
+        }
+        write_requests.push_back({.data = encoded_records[index].data(),
+                                  .length = encoded_records[index].size(),
+                                  .offset = offset});
+    }
+
+    auto write_result = injected_failure
+                            ? UringBatchWriteResult::kIoError
+                            : UringBatchWrite(fd_, write_requests, parallelism);
+    if (write_result == UringBatchWriteResult::kUnavailable) {
+        write_result = UringBatchWriteResult::kSuccess;
+        for (const auto& request : write_requests) {
+            if (!PwriteAll(fd_, request.data, request.length, request.offset)) {
+                write_result = UringBatchWriteResult::kIoError;
+                break;
+            }
+        }
+    }
+    if (write_result != UringBatchWriteResult::kSuccess) {
         if (ftruncate(fd_, static_cast<off_t>(tail_)) != 0) {
             return tl::unexpected(SegmentError::kTruncateFailed);
         }
-        return tl::unexpected(failure_code == 1 ? SegmentError::kInvalidArgument
-                                                : SegmentError::kIoError);
+        return tl::unexpected(SegmentError::kIoError);
     }
     if (sync && fdatasync(fd_) != 0) {
         return tl::unexpected(SegmentError::kSyncFailed);
