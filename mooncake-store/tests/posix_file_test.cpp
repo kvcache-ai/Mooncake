@@ -426,6 +426,63 @@ TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
 
     remove(direct_filename.c_str());
 }
+
+TEST_F(PosixFileTest, UringVectorWriteAbortsWhenPreservationReadFails) {
+    const std::string direct_filename = "direct_vector_preserve_fail.bin";
+    remove(direct_filename.c_str());
+
+    {
+        int setup_fd = open(direct_filename.c_str(),
+                            O_CREAT | O_RDWR | O_DIRECT | O_CLOEXEC, 0644);
+        ASSERT_GE(setup_fd, 0) << strerror(errno);
+        ASSERT_EQ(ftruncate(setup_fd, 16384), 0);
+        UringFile setup_file(direct_filename, setup_fd, 32, true);
+
+        const std::string neighbor = "keep-neighbor-bytes";
+        iovec neighbor_iov;
+        neighbor_iov.iov_base = const_cast<char*>(neighbor.data());
+        neighbor_iov.iov_len = neighbor.size();
+        auto neighbor_write = setup_file.vector_write(&neighbor_iov, 1, 0);
+        ASSERT_TRUE(neighbor_write.has_value())
+            << toString(neighbor_write.error());
+    }
+
+    // Re-open write-only so the RMW preservation read must fail. The write
+    // must abort without clobbering the already-written neighbor bytes.
+    int write_only_fd =
+        open(direct_filename.c_str(), O_WRONLY | O_DIRECT | O_CLOEXEC);
+    ASSERT_GE(write_only_fd, 0) << strerror(errno);
+    {
+        UringFile write_only_file(direct_filename, write_only_fd, 32, true);
+        char payload[64];
+        std::memset(payload, 'X', sizeof(payload));
+        iovec write_iov;
+        write_iov.iov_base = payload;
+        write_iov.iov_len = sizeof(payload);
+
+        constexpr off_t kOffset = 513;
+        auto write_result =
+            write_only_file.vector_write(&write_iov, 1, kOffset);
+        ASSERT_FALSE(write_result.has_value());
+        EXPECT_EQ(write_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+
+    int verify_fd =
+        open(direct_filename.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    ASSERT_GE(verify_fd, 0) << strerror(errno);
+    UringFile verify_file(direct_filename, verify_fd, 32, true);
+
+    const std::string neighbor = "keep-neighbor-bytes";
+    std::string out_neighbor(neighbor.size(), '\0');
+    iovec neighbor_read_iov;
+    neighbor_read_iov.iov_base = out_neighbor.data();
+    neighbor_read_iov.iov_len = out_neighbor.size();
+    auto neighbor_read = verify_file.vector_read(&neighbor_read_iov, 1, 0);
+    ASSERT_TRUE(neighbor_read.has_value()) << toString(neighbor_read.error());
+    EXPECT_EQ(out_neighbor, neighbor);
+
+    remove(direct_filename.c_str());
+}
 #endif
 
 }  // namespace mooncake
