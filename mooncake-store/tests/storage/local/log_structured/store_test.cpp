@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
@@ -407,6 +408,73 @@ TEST(LogStructuredStoreTest, CancelledCompactionLeavesSourcesReadable) {
     EXPECT_EQ(compacted.error(), StoreError::kCancelled);
     EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(),
               std::string(96, 'b'));
+}
+
+TEST(LogStructuredStoreTest,
+     ConcurrentMutationRejectsStaleCompactionPublication) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 256 * 1024));
+    ASSERT_TRUE(store.has_value());
+    const auto updated = StoreIdentity("updated", 1);
+    const auto replacement_identity = StoreIdentity("updated", 2);
+    const auto deleted = StoreIdentity("deleted", 1);
+    const std::string old_value(32 * 1024, 'a');
+    const std::string deleted_value(32 * 1024, 'b');
+
+    auto old_write = (*store)->PreparePut(updated, old_value);
+    ASSERT_TRUE(old_write.has_value());
+    ASSERT_TRUE((*store)->CommitPut(updated, old_write->sequence).has_value());
+    auto deleted_write = (*store)->PreparePut(deleted, deleted_value);
+    ASSERT_TRUE(deleted_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(deleted, deleted_write->sequence).has_value());
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+    auto compaction = std::async(std::launch::async, [&]() {
+        return (*store)->CompactOnce({.max_source_segments = 1,
+                                      .max_input_bytes = 1024 * 1024,
+                                      .max_target_bytes = 1024 * 1024,
+                                      .fanout = 1,
+                                      .max_levels = 2,
+                                      .min_reclaim_ratio = 1.0,
+                                      .max_bytes_per_second = 256 * 1024,
+                                      .enable_tiering = true,
+                                      .stop_token = {}});
+    });
+
+    const auto temporary_path = temp.path() / "tmp";
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool copy_started = false;
+    do {
+        for (const auto& entry :
+             std::filesystem::directory_iterator(temporary_path)) {
+            if (entry.is_regular_file() && entry.file_size() != 0) {
+                copy_started = true;
+                break;
+            }
+        }
+        if (!copy_started) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    } while (!copy_started && std::chrono::steady_clock::now() < deadline);
+    ASSERT_TRUE(copy_started);
+
+    const std::string new_value(32 * 1024, 'c');
+    auto replacement = (*store)->PreparePut(replacement_identity, new_value);
+    ASSERT_TRUE(replacement.has_value());
+    ASSERT_TRUE((*store)
+                    ->CommitPut(replacement_identity, replacement->sequence)
+                    .has_value());
+    ASSERT_TRUE((*store)->Delete(deleted).has_value());
+
+    auto compacted = compaction.get();
+    ASSERT_FALSE(compacted.has_value());
+    EXPECT_EQ(compacted.error(), StoreError::kInvalidTransition);
+    EXPECT_EQ((*store)->Get(updated).error(), StoreError::kNotFound);
+    EXPECT_EQ((*store)->Get(replacement_identity).value(), new_value);
+    EXPECT_EQ((*store)->Get(deleted).error(), StoreError::kNotFound);
+    EXPECT_TRUE(std::filesystem::is_empty(temporary_path));
 }
 
 TEST(LogStructuredStoreTest, TieredCompactionMergesCleanSegments) {
