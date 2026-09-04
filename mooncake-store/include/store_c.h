@@ -24,6 +24,12 @@ extern "C" {
 
 typedef void *mooncake_store_t;
 
+enum mooncake_client_type {
+    MOONCAKE_CLIENT_REAL = 0,
+    MOONCAKE_CLIENT_DUMMY = 1,
+};
+typedef enum mooncake_client_type mooncake_client_type_t;
+
 struct mooncake_replicate_config {
     size_t replica_num;
     int with_soft_pin;
@@ -47,6 +53,9 @@ typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 
 mooncake_store_t mooncake_store_create();
 
+mooncake_store_t mooncake_store_create_with_type(
+    mooncake_client_type_t client_type);
+
 void mooncake_store_destroy(mooncake_store_t store);
 
 int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
@@ -55,6 +64,11 @@ int mooncake_store_setup(mooncake_store_t store, const char *local_hostname,
                          uint64_t local_buffer_size, const char *protocol,
                          const char *device_name,
                          const char *master_server_addr);
+
+int mooncake_store_setup_dummy(mooncake_store_t store, uint64_t mem_pool_size,
+                               uint64_t local_buffer_size,
+                               const char *server_address,
+                               const char *ipc_socket_path);
 
 int mooncake_store_init_all(mooncake_store_t store, const char *protocol,
                             const char *device_name,
@@ -124,6 +138,17 @@ int mooncake_store_register_buffer(mooncake_store_t store, void *buffer,
                                    size_t size);
 
 int mooncake_store_unregister_buffer(mooncake_store_t store, void *buffer);
+
+// ---------------------------------------------------------------------------
+// DummyClient-specific: Query registered buffers
+// ---------------------------------------------------------------------------
+
+size_t mooncake_store_get_registered_buffer_count(mooncake_store_t store);
+
+void *mooncake_store_get_registered_buffer_at(mooncake_store_t store,
+                                              size_t index, size_t *size_out);
+
+int mooncake_store_is_hot_cache_ptr(mooncake_store_t store, const void *ptr);
 
 #ifdef __cplusplus
 }

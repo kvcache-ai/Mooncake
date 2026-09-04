@@ -1150,6 +1150,20 @@ std::string DummyClient::get_hostname() const {
     return "";
 }
 
+std::vector<DummyClient::RegisteredBufferInfo>
+DummyClient::get_registered_buffers() const {
+    std::vector<RegisteredBufferInfo> result;
+    if (!shm_helper_) return result;
+
+    const auto& shms = shm_helper_->get_shms();
+    for (const auto& shm : shms) {
+        if (shm->registered && shm->base_addr && shm->size > 0) {
+            result.push_back({shm->base_addr, shm->size, shm->is_local});
+        }
+    }
+    return result;
+}
+
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
