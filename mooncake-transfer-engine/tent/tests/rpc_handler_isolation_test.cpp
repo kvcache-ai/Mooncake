@@ -158,6 +158,12 @@ TEST_F(RpcHandlerIsolationTest, OffloadedHandlerExceptionReachesTheCaller) {
     EXPECT_FALSE(client.call(addr_, kThrowingFunc, "", response).ok());
 }
 
+TEST_F(RpcHandlerIsolationTest, UnknownFunctionReturnsAnError) {
+    CoroRpcAgent client;
+    std::string response;
+    EXPECT_FALSE(client.call(addr_, 0x7fffffff, "", response).ok());
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
