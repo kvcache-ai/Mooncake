@@ -46,6 +46,9 @@ class LogStructuredStore {
 
     tl::expected<PreparedWrite, StoreError> PreparePut(
         const RecordIdentity& identity, std::string_view value);
+    tl::expected<PreparedWrite, StoreError> PreparePut(std::string tenant_id,
+                                                       std::string object_key,
+                                                       std::string_view value);
     tl::expected<void, StoreError> CommitPut(const RecordIdentity& identity,
                                              uint64_t sequence);
     tl::expected<void, StoreError> AbortPut(const RecordIdentity& identity,
@@ -54,8 +57,13 @@ class LogStructuredStore {
     tl::expected<void, StoreError> Checkpoint();
     tl::expected<std::string, StoreError> Get(
         const RecordIdentity& identity) const;
+    tl::expected<std::string, StoreError> GetLatest(
+        std::string_view tenant_id, std::string_view object_key) const;
+    bool ContainsLatest(std::string_view tenant_id,
+                        std::string_view object_key) const;
 
     std::vector<IndexSnapshotEntry> SnapshotIndex() const;
+    std::vector<IndexSnapshotEntry> SnapshotCurrentIndex() const;
     uint64_t active_segment_id() const;
     uint64_t next_sequence() const;
 
@@ -72,6 +80,10 @@ class LogStructuredStore {
     void RefreshSegmentLiveBytes();
     tl::expected<void, StoreError> RotateSegmentIfNeeded(
         uint64_t next_record_bytes);
+    tl::expected<PreparedWrite, StoreError> PreparePutLocked(
+        const RecordIdentity& identity, std::string_view value);
+    tl::expected<std::string, StoreError> ReadEntryLocked(
+        const IndexSnapshotEntry& entry) const;
     std::string SegmentPath(uint64_t segment_id) const;
 
     LogStructuredStoreConfig config_;

@@ -60,6 +60,26 @@ TEST(LogStructuredStoreTest, PutIsInvisibleUntilMasterCommit) {
     EXPECT_EQ((*store)->Get(identity).value(), "value");
 }
 
+TEST(LogStructuredStoreTest, GeneratesIncarnationsForLatestLookup) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(store.has_value());
+
+    auto first = (*store)->PreparePut("tenant-a", "key", "first");
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(first->identity, first->sequence).has_value());
+    auto second = (*store)->PreparePut("tenant-a", "key", "second");
+    ASSERT_TRUE(second.has_value());
+    ASSERT_NE(first->identity.incarnation, second->identity.incarnation);
+    ASSERT_TRUE(
+        (*store)->CommitPut(second->identity, second->sequence).has_value());
+
+    EXPECT_EQ((*store)->GetLatest("tenant-a", "key").value(), "second");
+    EXPECT_TRUE((*store)->ContainsLatest("tenant-a", "key"));
+    ASSERT_EQ((*store)->SnapshotCurrentIndex().size(), size_t{1});
+}
+
 TEST(LogStructuredStoreTest, AbortedUpdateDoesNotHideCommittedIncarnation) {
     StoreTempDirectory temp;
     auto store = LogStructuredStore::Open(Config(temp));

@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <shared_mutex>
+#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -63,8 +64,11 @@ class VersionIndex {
 
     std::optional<VersionEntry> LookupCommitted(
         const RecordIdentity& identity) const;
+    std::optional<IndexSnapshotEntry> LookupCurrent(
+        std::string_view tenant_id, std::string_view object_key) const;
     std::optional<VersionEntry> Lookup(const RecordIdentity& identity) const;
     std::vector<IndexSnapshotEntry> Snapshot() const;
+    std::vector<IndexSnapshotEntry> CurrentSnapshot() const;
     tl::expected<void, IndexError> Restore(
         const std::vector<IndexSnapshotEntry>& snapshot);
     size_t size() const;

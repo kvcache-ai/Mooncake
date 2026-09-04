@@ -102,6 +102,21 @@ TEST(LogStructuredIndexTest, CompactionInstallUsesPhysicalAndEpochCas) {
               IndexError::kStaleSequence);
 }
 
+TEST(LogStructuredIndexTest, LatestLookupTracksNewestCommittedIncarnation) {
+    VersionIndex index;
+    const auto first = Identity("key", 1);
+    const auto second = Identity("key", 2);
+    ASSERT_TRUE(index.Prepare(first, Physical(1, 0), 1).has_value());
+    ASSERT_TRUE(index.Commit(first, 1).has_value());
+    ASSERT_TRUE(index.Prepare(second, Physical(1, 128), 2).has_value());
+    ASSERT_TRUE(index.Commit(second, 2).has_value());
+
+    auto current = index.LookupCurrent("tenant-a", "key");
+    ASSERT_TRUE(current.has_value());
+    EXPECT_EQ(current->identity, second);
+    ASSERT_EQ(index.CurrentSnapshot().size(), size_t{1});
+}
+
 TEST(LogStructuredIndexTest, ReplayOperationsAreIdempotent) {
     VersionIndex index;
     const auto identity = Identity("key", 1);

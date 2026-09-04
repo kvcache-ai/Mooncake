@@ -375,8 +375,28 @@ tl::expected<void, StoreError> LogStructuredStore::RotateSegmentIfNeeded(
 tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
     const RecordIdentity& identity, std::string_view value) {
     std::lock_guard lock(mutex_);
+    return PreparePutLocked(identity, value);
+}
+
+tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
+    std::string tenant_id, std::string object_key, std::string_view value) {
+    std::lock_guard lock(mutex_);
+    RecordIdentity identity{.tenant_id = std::move(tenant_id),
+                            .object_key = std::move(object_key),
+                            .incarnation = {.high = directory_->identity().high,
+                                            .low = next_sequence_}};
+    return PreparePutLocked(identity, value);
+}
+
+tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
+    const RecordIdentity& identity, std::string_view value) {
+    if (identity.tenant_id.size() > kMaxTenantLength ||
+        identity.object_key.size() > kMaxKeyLength) {
+        return tl::unexpected(StoreError::kInvalidArgument);
+    }
     const uint64_t record_bytes = AlignedRecordSize(
-        identity.tenant_id.size(), identity.object_key.size(), value.size());
+        static_cast<uint32_t>(identity.tenant_id.size()),
+        static_cast<uint32_t>(identity.object_key.size()), value.size());
     if (record_bytes == 0) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
@@ -553,26 +573,52 @@ tl::expected<void, StoreError> LogStructuredStore::Checkpoint() {
     return {};
 }
 
-tl::expected<std::string, StoreError> LogStructuredStore::Get(
-    const RecordIdentity& identity) const {
-    std::lock_guard lock(mutex_);
-    auto entry = index_.LookupCommitted(identity);
-    if (!entry) return tl::unexpected(StoreError::kNotFound);
-    auto path = segment_paths_.find(entry->physical.segment_id);
+tl::expected<std::string, StoreError> LogStructuredStore::ReadEntryLocked(
+    const IndexSnapshotEntry& entry) const {
+    auto path = segment_paths_.find(entry.version.physical.segment_id);
     if (path == segment_paths_.end()) {
         return tl::unexpected(StoreError::kCorruptData);
     }
-    auto record = ReadRecord(path->second, entry->physical);
-    if (!record || record->identity != identity ||
+    auto record = ReadRecord(path->second, entry.version.physical);
+    if (!record || record->identity != entry.identity ||
         record->kind == RecordKind::kTombstone) {
         return tl::unexpected(StoreError::kCorruptData);
     }
     return std::move(record->value);
 }
 
+tl::expected<std::string, StoreError> LogStructuredStore::Get(
+    const RecordIdentity& identity) const {
+    std::lock_guard lock(mutex_);
+    auto version = index_.LookupCommitted(identity);
+    if (!version) return tl::unexpected(StoreError::kNotFound);
+    return ReadEntryLocked(
+        IndexSnapshotEntry{.identity = identity, .version = *version});
+}
+
+tl::expected<std::string, StoreError> LogStructuredStore::GetLatest(
+    std::string_view tenant_id, std::string_view object_key) const {
+    std::lock_guard lock(mutex_);
+    auto entry = index_.LookupCurrent(tenant_id, object_key);
+    if (!entry) return tl::unexpected(StoreError::kNotFound);
+    return ReadEntryLocked(*entry);
+}
+
+bool LogStructuredStore::ContainsLatest(std::string_view tenant_id,
+                                        std::string_view object_key) const {
+    std::lock_guard lock(mutex_);
+    return index_.LookupCurrent(tenant_id, object_key).has_value();
+}
+
 std::vector<IndexSnapshotEntry> LogStructuredStore::SnapshotIndex() const {
     std::lock_guard lock(mutex_);
     return index_.Snapshot();
+}
+
+std::vector<IndexSnapshotEntry> LogStructuredStore::SnapshotCurrentIndex()
+    const {
+    std::lock_guard lock(mutex_);
+    return index_.CurrentSnapshot();
 }
 
 uint64_t LogStructuredStore::active_segment_id() const {

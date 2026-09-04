@@ -205,6 +205,22 @@ std::optional<VersionEntry> VersionIndex::LookupCommitted(
     return it->second;
 }
 
+std::optional<IndexSnapshotEntry> VersionIndex::LookupCurrent(
+    std::string_view tenant_id, std::string_view object_key) const {
+    std::shared_lock lock(mutex_);
+    LogicalKey key{.tenant_id = std::string(tenant_id),
+                   .object_key = std::string(object_key)};
+    auto current = current_.find(key);
+    if (current == current_.end()) return std::nullopt;
+    auto version = versions_.find(current->second);
+    if (version == versions_.end() ||
+        version->second.state != VersionState::kCommitted) {
+        return std::nullopt;
+    }
+    return IndexSnapshotEntry{.identity = version->first,
+                              .version = version->second};
+}
+
 std::optional<VersionEntry> VersionIndex::Lookup(
     const RecordIdentity& identity) const {
     std::shared_lock lock(mutex_);
@@ -222,6 +238,22 @@ std::vector<IndexSnapshotEntry> VersionIndex::Snapshot() const {
     for (const auto& [identity, version] : versions_) {
         snapshot.push_back(
             IndexSnapshotEntry{.identity = identity, .version = version});
+    }
+    return snapshot;
+}
+
+std::vector<IndexSnapshotEntry> VersionIndex::CurrentSnapshot() const {
+    std::shared_lock lock(mutex_);
+    std::vector<IndexSnapshotEntry> snapshot;
+    snapshot.reserve(current_.size());
+    for (const auto& [logical_key, identity] : current_) {
+        static_cast<void>(logical_key);
+        auto version = versions_.find(identity);
+        if (version != versions_.end() &&
+            version->second.state == VersionState::kCommitted) {
+            snapshot.push_back(IndexSnapshotEntry{.identity = version->first,
+                                                  .version = version->second});
+        }
     }
     return snapshot;
 }
