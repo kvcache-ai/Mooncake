@@ -29,7 +29,7 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
       master_client_metric(labels),
       transfer_operation_metric(labels),
       ssd_metric(labels),
-      dfs_metric(labels), 
+      dfs_metric(labels),
       build_info("mooncake_build_info",
                  "Build version of the running client; the value is always 1 "
                  "and the version strings are carried by the labels",

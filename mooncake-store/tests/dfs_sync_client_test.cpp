@@ -435,9 +435,8 @@ TEST_F(DfsSyncClientTest, DfsMetricsRecordUnavailableBackend) {
 
     std::string value(4096, 'T');
     std::vector<Slice> slices{{value.data(), value.size()}};
-    auto result =
-        client_without_backend->Put("dfs_metric_no_backend", slices,
-                                    DfsConfig());
+    auto result = client_without_backend->Put("dfs_metric_no_backend", slices,
+                                              DfsConfig());
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
     EXPECT_EQ(metric->dfs_write_errors.value(unavailable_label), 1);

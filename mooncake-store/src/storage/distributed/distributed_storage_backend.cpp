@@ -332,9 +332,8 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             request.slices.size() >
                 static_cast<size_t>(std::numeric_limits<int>::max())) {
             LOG(ERROR) << "DFS read request exceeds platform limits for key "
-                       << request.key
-                       << ", object_size=" << desc.object_size
-                       << ", slice_count=" << request.slices.size();           
+                       << request.key << ", object_size=" << desc.object_size
+                       << ", slice_count=" << request.slices.size();
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;

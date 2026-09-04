@@ -1753,12 +1753,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
-                    LOG(WARNING)
-                        << "DFS read failed, action=batch_read, key="
-                        << request.key
-                        << ", offset=" << request.descriptor.offset
-                        << ", size=" << request.descriptor.object_size
-                        << ", error=" << dfs_results[i].error();
+                    LOG(WARNING) << "DFS read failed, action=batch_read, key="
+                                 << request.key
+                                 << ", offset=" << request.descriptor.offset
+                                 << ", size=" << request.descriptor.object_size
+                                 << ", error=" << dfs_results[i].error();
                     if (dfs_metric) {
                         dfs_metric->RecordReadErrors(
                             toString(dfs_results[i].error()));
@@ -1786,16 +1785,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = {};
             }
         }
-    if (dfs_metric && dfs_success_keys > 0) {
+        if (dfs_metric && dfs_success_keys > 0) {
             dfs_metric->ObserveRead(dfs_success_keys,
                                     static_cast<int64_t>(dfs_success_bytes),
                                     dfs_read_latency_us);
         }
-    VLOG(1) << "DFS batch read finished, action=batch_read, requested="
-            << dfs_read_requests.size()
-            << ", succeeded=" << dfs_success_keys
-            << ", bytes=" << dfs_success_bytes
-            << ", latency_us=" << dfs_read_latency_us;
+        VLOG(1) << "DFS batch read finished, action=batch_read, requested="
+                << dfs_read_requests.size()
+                << ", succeeded=" << dfs_success_keys
+                << ", bytes=" << dfs_success_bytes
+                << ", latency_us=" << dfs_read_latency_us;
     }
 
     // Wait for all transfers to complete
@@ -2682,7 +2681,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     requests.reserve(keys.size());
     request_indices.reserve(keys.size());
     request_bytes.reserve(keys.size());
-    
+
     // Staging is the device-to-host copy below; it is timed separately from the
     // BatchWrite call so a slow put can be attributed to the right side of the
     // boundary between them.
@@ -2793,7 +2792,7 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
             << requests.size() << ", succeeded=" << success_keys
             << ", bytes=" << success_bytes
             << ", latency_us=" << write_latency_us;
-    
+
     for (auto& buffer : staging_buffers) {
         pinned_buffer_pool_->Release(std::move(buffer));
     }

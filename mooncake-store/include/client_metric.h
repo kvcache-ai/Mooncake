@@ -787,10 +787,10 @@ struct DfsMetric {
         const auto write_bytes = dfs_write_bytes.value();
         const auto read_ops = dfs_read_ops.value();
         const auto write_ops = dfs_write_ops.value();
-        const auto elapsed_s = std::chrono::duration<double>(
-                                   std::chrono::steady_clock::now() -
-                                   start_time_)
-                                   .count();
+        const auto elapsed_s =
+            std::chrono::duration<double>(std::chrono::steady_clock::now() -
+                                          start_time_)
+                .count();
 
         ss << format_io_line("DFS Read", read_bytes, read_ops, elapsed_s);
         ss << format_io_line("DFS Write", write_bytes, write_ops, elapsed_s);
