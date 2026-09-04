@@ -852,6 +852,33 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
     return nullptr;
 }
 
+void PrintBackendStorageStats(
+    const std::shared_ptr<mooncake::StorageBackendInterface>& backend) {
+    const auto stats = backend->SnapshotStats();
+    if (!stats) return;
+    const double physical_amplification =
+        stats->logical_value_bytes == 0
+            ? 0.0
+            : static_cast<double>(stats->physical_bytes) /
+                  static_cast<double>(stats->logical_value_bytes);
+    std::cout << "\n  --- BACKEND STORAGE STATE ---\n";
+    std::cout << "  Physical bytes:   " << stats->physical_bytes << "\n";
+    std::cout << "  Live record bytes:" << stats->live_record_bytes << "\n";
+    std::cout << "  Logical bytes:    " << stats->logical_value_bytes << "\n";
+    std::cout << "  Reclaimable bytes:" << stats->reclaimable_bytes << "\n";
+    std::cout << "  Physical amp:     " << std::fixed << std::setprecision(2)
+              << physical_amplification << "x\n";
+    std::cout << "  Segments A/S/R:   " << stats->active_segments << "/"
+              << stats->sealed_segments << "/" << stats->retired_segments
+              << "\n";
+    std::cout << "  Compaction runs:  " << stats->compaction_runs << "\n";
+    std::cout << "  Compaction bytes: " << stats->compaction_input_bytes
+              << " input, " << stats->compaction_output_bytes << " output, "
+              << stats->compaction_reclaimed_bytes << " reclaimed\n";
+    std::cout << "  WAL/checkpoint:   " << stats->wal_sequence << "/"
+              << stats->checkpoint_sequence << "\n";
+}
+
 // ============================================================================
 // Utility Functions
 // ============================================================================
@@ -2147,6 +2174,7 @@ void BenchChurn(BackendType type, const std::string& storage_path,
     stats.StopTimer();
     stats.Finalize();
     stats.PrintStatistics("CHURN");
+    PrintBackendStorageStats(backend);
 }
 
 // ============================================================================
@@ -2280,6 +2308,7 @@ void BenchRestart(BackendType type, const std::string& storage_path,
     std::cout << "  Samples:          " << first_load_latencies.size() << "\n";
     std::cout << "  Average:          " << avg_first_load << " ms\n";
     std::cout << "  First:            " << first_load_latencies[0] << " ms\n";
+    PrintBackendStorageStats(backend);
 }
 
 // ============================================================================
