@@ -858,8 +858,13 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
             auto read_res = SharedUringRing::instance().read(
                 fd_, bounce, aligned_len, aligned_off);
             if (!read_res) {
-                std::memset(bounce, 0, aligned_len);
-            } else if (read_res.value() < aligned_len) {
+                // A real read error must not proceed with a zero-filled
+                // bounce buffer — that would silently corrupt neighbors.
+                free_aligned_buffer(bounce);
+                return make_error<size_t>(ErrorCode::FILE_READ_FAIL);
+            }
+            if (read_res.value() < aligned_len) {
+                // EOF / short read: only zero the unread suffix.
                 std::memset(static_cast<char*>(bounce) + read_res.value(), 0,
                             aligned_len - read_res.value());
             }
