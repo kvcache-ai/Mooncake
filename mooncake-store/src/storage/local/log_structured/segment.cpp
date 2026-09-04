@@ -98,6 +98,25 @@ SegmentWriter::~SegmentWriter() {
     }
 }
 
+SegmentReader::SegmentReader(std::string path, uint64_t segment_id, int fd)
+    : path_(std::move(path)), segment_id_(segment_id), fd_(fd) {}
+
+SegmentReader::~SegmentReader() {
+    if (fd_ >= 0) {
+        close(fd_);
+    }
+}
+
+tl::expected<std::shared_ptr<SegmentReader>, SegmentError> SegmentReader::Open(
+    std::string path, uint64_t segment_id) {
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return tl::unexpected(SegmentError::kOpenFailed);
+    }
+    return std::shared_ptr<SegmentReader>(
+        new SegmentReader(std::move(path), segment_id, fd));
+}
+
 void SegmentWriter::SetWriteFailurePredicateForTest(
     std::function<bool(std::string_view, uint64_t, size_t)> predicate) {
     std::lock_guard lock(write_failure_mutex);
@@ -454,6 +473,16 @@ tl::expected<SegmentScanResult, SegmentError> ScanSegment(
 
 tl::expected<DecodedRecord, SegmentError> ReadRecord(
     const std::string& path, const PhysicalRecord& physical) {
+    auto reader = SegmentReader::Open(path, physical.segment_id);
+    if (!reader) return tl::unexpected(reader.error());
+    return reader.value()->Read(physical);
+}
+
+tl::expected<DecodedRecord, SegmentError> SegmentReader::Read(
+    const PhysicalRecord& physical) const {
+    if (physical.segment_id != segment_id_) {
+        return tl::unexpected(SegmentError::kInvalidArgument);
+    }
     if (physical.total_length < kRecordHeaderSize + kRecordFooterSize ||
         physical.total_length >
             static_cast<uint64_t>(std::numeric_limits<size_t>::max()) ||
@@ -462,17 +491,9 @@ tl::expected<DecodedRecord, SegmentError> ReadRecord(
                 physical.total_length) {
         return tl::unexpected(SegmentError::kInvalidArgument);
     }
-    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        return tl::unexpected(SegmentError::kOpenFailed);
-    }
-    struct FdGuard {
-        int fd;
-        ~FdGuard() { close(fd); }
-    } fd_guard{fd};
-
     std::string encoded(static_cast<size_t>(physical.total_length), '\0');
-    if (!PreadAll(fd, encoded.data(), encoded.size(), physical.record_offset)) {
+    if (!PreadAll(fd_, encoded.data(), encoded.size(),
+                  physical.record_offset)) {
         return tl::unexpected(SegmentError::kIoError);
     }
     auto decoded = DecodeRecord(encoded);
@@ -489,6 +510,31 @@ tl::expected<DecodedRecord, SegmentError> ReadRecord(
         return tl::unexpected(SegmentError::kInvalidArgument);
     }
     return decoded.value();
+}
+
+tl::expected<void, SegmentError> SegmentReader::ReadValue(
+    const PhysicalRecord& physical, char* value, size_t value_size) const {
+    if (physical.segment_id != segment_id_ ||
+        physical.total_length < kRecordHeaderSize + kRecordFooterSize ||
+        physical.value_length != value_size ||
+        (value_size != 0 && value == nullptr) ||
+        physical.record_offset >
+            static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+                physical.total_length ||
+        physical.value_offset < physical.record_offset + kRecordHeaderSize ||
+        physical.value_offset >
+            physical.record_offset + physical.total_length -
+                kRecordFooterSize ||
+        physical.value_length >
+            physical.record_offset + physical.total_length -
+                kRecordFooterSize - physical.value_offset) {
+        return tl::unexpected(SegmentError::kInvalidArgument);
+    }
+    if (value_size != 0 &&
+        !PreadAll(fd_, value, value_size, physical.value_offset)) {
+        return tl::unexpected(SegmentError::kIoError);
+    }
+    return {};
 }
 
 tl::expected<void, SegmentError> TruncateSegment(const std::string& path,

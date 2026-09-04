@@ -450,6 +450,7 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
             auto removed = RemoveFileDurably(segments_path_, filename);
             if (!removed) return tl::unexpected(StoreError::kIoError);
             segment_paths_.erase(path);
+            ForgetSegmentReaderLocked(it->first);
         }
         it = segments_.erase(it);
     }
@@ -1108,6 +1109,7 @@ void LogStructuredStore::CleanupRetiredSegmentsLocked() {
                 continue;
             }
             segment_paths_.erase(path);
+            ForgetSegmentReaderLocked(it->first);
         }
         it = segments_.erase(it);
     }
@@ -1470,6 +1472,7 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             static_cast<void>(index_.Restore(index_before));
             for (const auto& target : targets) {
                 segment_paths_.erase(target.segment_id);
+                ForgetSegmentReaderLocked(target.segment_id);
                 segments_.erase(target.segment_id);
             }
             for (const auto& source : sources) {
@@ -1502,41 +1505,112 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                             .reclaimed_bytes = input_bytes - output_bytes};
 }
 
-tl::expected<std::string, StoreError> LogStructuredStore::ReadEntryLocked(
-    const IndexSnapshotEntry& entry) const {
-    auto path = segment_paths_.find(entry.version.physical.segment_id);
+tl::expected<std::shared_ptr<SegmentReader>, StoreError>
+LogStructuredStore::GetSegmentReaderLocked(uint64_t segment_id) const {
+    auto cached = segment_readers_.find(segment_id);
+    if (cached != segment_readers_.end()) {
+        auto reader = cached->second.lock();
+        if (reader) return reader;
+    }
+    auto path = segment_paths_.find(segment_id);
     if (path == segment_paths_.end()) {
         return tl::unexpected(StoreError::kCorruptData);
     }
-    auto record = ReadRecord(path->second, entry.version.physical);
-    if (!record || record->identity != entry.identity ||
-        record->kind == RecordKind::kTombstone) {
+    auto opened = SegmentReader::Open(path->second, segment_id);
+    if (!opened) return tl::unexpected(StoreError::kIoError);
+    constexpr size_t kReaderCacheCapacity = 128;
+    if (reader_cache_.size() >= kReaderCacheCapacity) {
+        reader_cache_.pop_front();
+    }
+    segment_readers_[segment_id] = *opened;
+    reader_cache_.emplace_back(segment_id, *opened);
+    return *opened;
+}
+
+void LogStructuredStore::ForgetSegmentReaderLocked(uint64_t segment_id) {
+    segment_readers_.erase(segment_id);
+    std::erase_if(reader_cache_, [segment_id](const auto& cached) {
+        return cached.first == segment_id;
+    });
+}
+
+tl::expected<LogStructuredStore::PinnedEntry, StoreError>
+LogStructuredStore::PinEntryLocked(IndexSnapshotEntry entry) const {
+    auto reader = GetSegmentReaderLocked(entry.version.physical.segment_id);
+    if (!reader) return tl::unexpected(reader.error());
+    return PinnedEntry{.entry = std::move(entry), .reader = std::move(*reader)};
+}
+
+tl::expected<void, StoreError> LogStructuredStore::ReadPinnedEntryInto(
+    const PinnedEntry& pinned, char* value, size_t value_size) {
+    auto read = pinned.reader->ReadValue(pinned.entry.version.physical, value,
+                                         value_size);
+    if (!read) {
+        return tl::unexpected(read.error() == SegmentError::kIoError
+                                  ? StoreError::kIoError
+                                  : StoreError::kCorruptData);
+    }
+    return {};
+}
+
+tl::expected<std::string, StoreError> LogStructuredStore::ReadPinnedEntry(
+    const PinnedEntry& pinned) {
+    const uint64_t value_length = pinned.entry.version.physical.value_length;
+    if (value_length >
+        static_cast<uint64_t>(std::numeric_limits<size_t>::max())) {
         return tl::unexpected(StoreError::kCorruptData);
     }
-    return std::move(record->value);
+    std::string value(static_cast<size_t>(value_length), '\0');
+    auto read = ReadPinnedEntryInto(pinned, value.data(), value.size());
+    if (!read) return tl::unexpected(read.error());
+    return value;
 }
 
 tl::expected<std::string, StoreError> LogStructuredStore::Get(
     const RecordIdentity& identity) const {
-    std::lock_guard lock(mutex_);
-    if (recovery_required_) {
-        return tl::unexpected(StoreError::kRecoveryRequired);
-    }
-    auto version = index_.LookupCommitted(identity);
-    if (!version) return tl::unexpected(StoreError::kNotFound);
-    return ReadEntryLocked(
-        IndexSnapshotEntry{.identity = identity, .version = *version});
+    auto pinned = [&]() -> tl::expected<PinnedEntry, StoreError> {
+        std::lock_guard lock(mutex_);
+        if (recovery_required_) {
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        auto version = index_.LookupCommitted(identity);
+        if (!version) return tl::unexpected(StoreError::kNotFound);
+        return PinEntryLocked(
+            IndexSnapshotEntry{.identity = identity, .version = *version});
+    }();
+    if (!pinned) return tl::unexpected(pinned.error());
+    return ReadPinnedEntry(*pinned);
 }
 
 tl::expected<std::string, StoreError> LogStructuredStore::GetLatest(
     std::string_view tenant_id, std::string_view object_key) const {
-    std::lock_guard lock(mutex_);
-    if (recovery_required_) {
-        return tl::unexpected(StoreError::kRecoveryRequired);
-    }
-    auto entry = index_.LookupCurrent(tenant_id, object_key);
-    if (!entry) return tl::unexpected(StoreError::kNotFound);
-    return ReadEntryLocked(*entry);
+    auto pinned = [&]() -> tl::expected<PinnedEntry, StoreError> {
+        std::lock_guard lock(mutex_);
+        if (recovery_required_) {
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        auto entry = index_.LookupCurrent(tenant_id, object_key);
+        if (!entry) return tl::unexpected(StoreError::kNotFound);
+        return PinEntryLocked(std::move(*entry));
+    }();
+    if (!pinned) return tl::unexpected(pinned.error());
+    return ReadPinnedEntry(*pinned);
+}
+
+tl::expected<void, StoreError> LogStructuredStore::GetLatestInto(
+    std::string_view tenant_id, std::string_view object_key, char* value,
+    size_t value_size) const {
+    auto pinned = [&]() -> tl::expected<PinnedEntry, StoreError> {
+        std::lock_guard lock(mutex_);
+        if (recovery_required_) {
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        auto entry = index_.LookupCurrent(tenant_id, object_key);
+        if (!entry) return tl::unexpected(StoreError::kNotFound);
+        return PinEntryLocked(std::move(*entry));
+    }();
+    if (!pinned) return tl::unexpected(pinned.error());
+    return ReadPinnedEntryInto(*pinned, value, value_size);
 }
 
 bool LogStructuredStore::ContainsLatest(std::string_view tenant_id,

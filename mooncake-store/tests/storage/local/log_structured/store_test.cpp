@@ -78,6 +78,72 @@ TEST(LogStructuredStoreTest, PutIsInvisibleUntilMasterCommit) {
     EXPECT_EQ((*store)->Get(identity).value(), "value");
 }
 
+TEST(LogStructuredStoreTest, ReadsCommittedRecordWhileActiveSegmentGrows) {
+    StoreTempDirectory temp;
+    auto config = Config(temp, 16 * 1024 * 1024);
+    config.sync_data = false;
+    config.sync_wal = false;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    auto initial = (*store)->PreparePut("tenant-a", "stable", "stable-value");
+    ASSERT_TRUE(initial.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(initial->identity, initial->sequence).has_value());
+
+    std::atomic<bool> stop{false};
+    std::atomic<uint64_t> errors{0};
+    std::vector<std::thread> readers;
+    for (size_t index = 0; index < 8; ++index) {
+        readers.emplace_back([&]() {
+            while (!stop.load(std::memory_order_acquire)) {
+                auto value = (*store)->GetLatest("tenant-a", "stable");
+                if (!value || *value != "stable-value") {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+
+    for (size_t index = 0; index < 256; ++index) {
+        auto prepared = (*store)->PreparePut(
+            "tenant-a", "growing-" + std::to_string(index),
+            std::string(8 * 1024, static_cast<char>('a' + index % 26)));
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE((*store)
+                        ->CommitPut(prepared->identity, prepared->sequence)
+                        .has_value());
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& reader : readers) reader.join();
+
+    EXPECT_EQ(errors.load(std::memory_order_relaxed), uint64_t{0});
+}
+
+TEST(LogStructuredStoreTest, ReadsLatestValueIntoCallerBuffer) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(store.has_value());
+
+    auto prepared = (*store)->PreparePut("tenant-a", "direct", "value");
+    ASSERT_TRUE(prepared.has_value());
+    ASSERT_TRUE((*store)
+                    ->CommitPut(prepared->identity, prepared->sequence)
+                    .has_value());
+
+    std::string value(prepared->physical.value_length, '\0');
+    ASSERT_TRUE(
+        (*store)
+            ->GetLatestInto("tenant-a", "direct", value.data(), value.size())
+            .has_value());
+    EXPECT_EQ(value, "value");
+    EXPECT_EQ((*store)
+                  ->GetLatestInto("tenant-a", "direct", value.data(),
+                                  value.size() - 1)
+                  .error(),
+              StoreError::kCorruptData);
+}
+
 TEST(LogStructuredStoreTest, MaintainsLiveBytesAcrossVersionTransitions) {
     StoreTempDirectory temp;
     auto store = LogStructuredStore::Open(Config(temp));

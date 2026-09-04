@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <limits>
@@ -129,6 +130,10 @@ class LogStructuredStore {
         const RecordIdentity& identity) const;
     tl::expected<std::string, StoreError> GetLatest(
         std::string_view tenant_id, std::string_view object_key) const;
+    tl::expected<void, StoreError> GetLatestInto(std::string_view tenant_id,
+                                                 std::string_view object_key,
+                                                 char* value,
+                                                 size_t value_size) const;
     bool ContainsLatest(std::string_view tenant_id,
                         std::string_view object_key) const;
 
@@ -142,6 +147,11 @@ class LogStructuredStore {
         std::function<bool(CompactionCrashPoint)> predicate);
 
    private:
+    struct PinnedEntry {
+        IndexSnapshotEntry entry;
+        std::shared_ptr<SegmentReader> reader;
+    };
+
     explicit LogStructuredStore(LogStructuredStoreConfig config);
 
     tl::expected<void, StoreError> Recover();
@@ -162,8 +172,15 @@ class LogStructuredStore {
     tl::expected<void, StoreError> RotateActiveSegmentLocked();
     tl::expected<PreparedWrite, StoreError> PreparePutLocked(
         const RecordIdentity& identity, std::string_view value);
-    tl::expected<std::string, StoreError> ReadEntryLocked(
-        const IndexSnapshotEntry& entry) const;
+    tl::expected<PinnedEntry, StoreError> PinEntryLocked(
+        IndexSnapshotEntry entry) const;
+    tl::expected<std::shared_ptr<SegmentReader>, StoreError>
+    GetSegmentReaderLocked(uint64_t segment_id) const;
+    void ForgetSegmentReaderLocked(uint64_t segment_id);
+    static tl::expected<std::string, StoreError> ReadPinnedEntry(
+        const PinnedEntry& pinned);
+    static tl::expected<void, StoreError> ReadPinnedEntryInto(
+        const PinnedEntry& pinned, char* value, size_t value_size);
     tl::expected<void, StoreError> CheckpointLocked();
     void CleanupRetiredSegmentsLocked();
     std::string SegmentPath(uint64_t segment_id) const;
@@ -176,6 +193,10 @@ class LogStructuredStore {
     std::unique_ptr<StorageDirectory> directory_;
     VersionIndex index_;
     std::unordered_map<uint64_t, std::string> segment_paths_;
+    mutable std::unordered_map<uint64_t, std::weak_ptr<SegmentReader>>
+        segment_readers_;
+    mutable std::deque<std::pair<uint64_t, std::shared_ptr<SegmentReader>>>
+        reader_cache_;
     std::map<uint64_t, SegmentMetadata> segments_;
     std::unique_ptr<SegmentWriter> active_segment_;
     std::unique_ptr<WalWriter> wal_;

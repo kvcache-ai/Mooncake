@@ -109,6 +109,83 @@ TEST(LogStructuredStorageBackendTest, OffloadLoadAndScanPreserveTenantKey) {
     EXPECT_EQ(scanned_keys, std::vector<std::string>{storage_key});
 }
 
+TEST(LogStructuredStorageBackendTest, BatchLoadsRecordsAcrossSegments) {
+    BackendTempDirectory temp;
+    const auto config = BackendConfig(temp);
+    LogStructuredBackendConfig backend_config;
+    backend_config.segment_size_bytes = 256;
+    backend_config.sync_policy = LogStructuredSyncPolicy::kNone;
+    backend_config.compaction_policy = LogStructuredCompactionPolicy::kNone;
+
+    LogStructuredStorageBackend backend(config, backend_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    const auto commit = [](const std::vector<std::string>&,
+                           std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+
+    std::unordered_map<std::string, std::string> values;
+    for (size_t index = 0; index < 4; ++index) {
+        const std::string key =
+            TenantId("tenant-batch")
+                .MakeScopedKey("key-" + std::to_string(index));
+        auto [it, inserted] = values.emplace(
+            key, std::string(96, static_cast<char>('a' + index)));
+        ASSERT_TRUE(inserted);
+        ASSERT_TRUE(
+            backend
+                .BatchOffload(SingleValueBatch(it->first, it->second), commit)
+                .has_value());
+    }
+
+    std::unordered_map<std::string, std::string> loaded;
+    std::unordered_map<std::string, Slice> slices;
+    for (const auto& [key, value] : values) {
+        auto [it, inserted] =
+            loaded.emplace(key, std::string(value.size(), '\0'));
+        ASSERT_TRUE(inserted);
+        slices.emplace(key, Slice{it->second.data(), it->second.size()});
+    }
+    ASSERT_TRUE(backend.BatchLoad(slices).has_value());
+    EXPECT_EQ(loaded, values);
+}
+
+TEST(LogStructuredStorageBackendTest, SupportsConcurrentBatchLoads) {
+    BackendTempDirectory temp;
+    const auto config = BackendConfig(temp);
+    const std::string storage_key = TenantId("tenant-a").MakeScopedKey("key");
+    std::string value(128 * 1024, 'v');
+
+    LogStructuredStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+    ASSERT_TRUE(backend
+                    .BatchOffload(SingleValueBatch(storage_key, value),
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+
+    std::atomic<uint64_t> errors{0};
+    std::vector<std::thread> readers;
+    for (size_t index = 0; index < 8; ++index) {
+        readers.emplace_back([&]() {
+            for (size_t iteration = 0; iteration < 64; ++iteration) {
+                std::string loaded(value.size(), '\0');
+                std::unordered_map<std::string, Slice> slices{
+                    {storage_key, Slice{loaded.data(), loaded.size()}}};
+                auto result = backend.BatchLoad(slices);
+                if (!result || loaded != value) {
+                    errors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+        });
+    }
+    for (auto& reader : readers) reader.join();
+
+    EXPECT_EQ(errors.load(std::memory_order_relaxed), uint64_t{0});
+}
+
 TEST(LogStructuredStorageBackendTest,
      CallbackFailureAbortsNewVersionAndPreservesCommittedValue) {
     BackendTempDirectory temp;

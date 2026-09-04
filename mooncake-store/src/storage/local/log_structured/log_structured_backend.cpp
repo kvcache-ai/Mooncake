@@ -303,21 +303,17 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> LogStructuredStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batched_slices) {
-    std::lock_guard lock(mutex_);
     if (!initialized_.load(std::memory_order_acquire) || !store_) {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     for (const auto& [key, slice] : batched_slices) {
-        const auto [tenant_id, object_key] = SplitStorageKey(key);
-        auto value = store_->GetLatest(tenant_id, object_key);
-        if (!value) return tl::make_unexpected(ToReadError(value.error()));
-        if (value->size() != slice.size ||
-            (slice.size != 0 && slice.ptr == nullptr)) {
+        if (slice.size != 0 && slice.ptr == nullptr) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        if (!value->empty()) {
-            std::memcpy(slice.ptr, value->data(), value->size());
-        }
+        const auto [tenant_id, object_key] = SplitStorageKey(key);
+        auto read = store_->GetLatestInto(
+            tenant_id, object_key, static_cast<char*>(slice.ptr), slice.size);
+        if (!read) return tl::make_unexpected(ToReadError(read.error()));
     }
     return {};
 }

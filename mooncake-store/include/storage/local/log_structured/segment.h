@@ -102,6 +102,33 @@ class SegmentWriter {
     uint64_t tail_;
 };
 
+class SegmentReader {
+   public:
+    static tl::expected<std::shared_ptr<SegmentReader>, SegmentError> Open(
+        std::string path, uint64_t segment_id);
+
+    ~SegmentReader();
+
+    SegmentReader(const SegmentReader&) = delete;
+    SegmentReader& operator=(const SegmentReader&) = delete;
+
+    tl::expected<DecodedRecord, SegmentError> Read(
+        const PhysicalRecord& physical) const;
+    tl::expected<void, SegmentError> ReadValue(const PhysicalRecord& physical,
+                                               char* value,
+                                               size_t value_size) const;
+
+    uint64_t segment_id() const { return segment_id_; }
+    const std::string& path() const { return path_; }
+
+   private:
+    SegmentReader(std::string path, uint64_t segment_id, int fd);
+
+    std::string path_;
+    uint64_t segment_id_;
+    int fd_;
+};
+
 tl::expected<SegmentScanResult, SegmentError> ScanSegment(
     const std::string& path, uint64_t segment_id);
 

@@ -139,6 +139,56 @@ TEST(LogStructuredSegmentTest, AppendsAndScansRecords) {
     EXPECT_EQ(scan->valid_bytes, first->total_length + second->total_length);
 }
 
+TEST(LogStructuredSegmentTest, ReadsValueDirectlyFromPhysicalLocation) {
+    TempDirectory temp;
+    const auto path = temp.File("segment-direct-read.log");
+    auto writer = SegmentWriter::Create(path.string(), 9);
+    ASSERT_TRUE(writer.has_value());
+    const auto identity = Identity("direct", 3);
+    auto physical =
+        (*writer)->Append(identity, "payload", RecordKind::kValue, 17, true);
+    ASSERT_TRUE(physical.has_value());
+
+    auto reader = SegmentReader::Open(path.string(), 9);
+    ASSERT_TRUE(reader.has_value());
+    std::string value(physical->value_length, '\0');
+    ASSERT_TRUE((*reader)
+                    ->ReadValue(*physical, value.data(), value.size())
+                    .has_value());
+    EXPECT_EQ(value, "payload");
+
+    EXPECT_EQ(
+        (*reader)->ReadValue(*physical, value.data(), value.size() - 1).error(),
+        SegmentError::kInvalidArgument);
+
+    auto invalid_physical = *physical;
+    invalid_physical.value_offset = invalid_physical.record_offset;
+    EXPECT_EQ((*reader)
+                  ->ReadValue(invalid_physical, value.data(), value.size())
+                  .error(),
+              SegmentError::kInvalidArgument);
+}
+
+TEST(LogStructuredSegmentTest, ReaderKeepsUnlinkedSegmentReadable) {
+    TempDirectory temp;
+    const auto path = temp.File("segment-7.log");
+    auto writer = SegmentWriter::Create(path.string(), 7);
+    ASSERT_TRUE(writer.has_value());
+    auto physical = (*writer)->Append(Identity("pinned", 1), "value",
+                                      RecordKind::kValue, 1, true);
+    ASSERT_TRUE(physical.has_value());
+    writer.value().reset();
+
+    auto reader = SegmentReader::Open(path.string(), 7);
+    ASSERT_TRUE(reader.has_value());
+    ASSERT_EQ(unlink(path.c_str()), 0);
+
+    auto record = (*reader)->Read(*physical);
+    ASSERT_TRUE(record.has_value());
+    EXPECT_EQ(record->identity, Identity("pinned", 1));
+    EXPECT_EQ(record->value, "value");
+}
+
 TEST(LogStructuredSegmentTest, DetectsAndRepairsIncompleteTail) {
     TempDirectory temp;
     const auto path = temp.File("segment-2.log");
