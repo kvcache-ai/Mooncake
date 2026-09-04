@@ -395,6 +395,7 @@ inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
 // SelectBestReplica and the replica-scoring helpers live in
 // replica_selection.h (included above) so they can be unit-tested directly.
 using mooncake::SelectBestReplica;
+using mooncake::SelectCompleteMemoryReplica;
 
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
@@ -411,25 +412,6 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
 // execute_ranged_read / session ranged get-put).
 inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
     return size > limit || offset > limit - size;
-}
-
-inline const Replica::Descriptor *SelectCompleteMemoryReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
-            continue;
-        }
-        if (local_endpoints.count(r.get_memory_descriptor()
-                                      .buffer_descriptor.transport_endpoint_)) {
-            return &r;
-        }
-        if (!first_memory) {
-            first_memory = &r;
-        }
-    }
-    return first_memory;
 }
 
 inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
@@ -5478,10 +5460,15 @@ std::vector<int> RealClient::batch_get_session_start(
             continue;
         }
 
+        // The session range-read path (batch_get_into_multi_buffer_ranges ->
+        // Client::BatchTransferReadRanges) only reads MEMORY replicas, so the
+        // session must be started against a complete MEMORY replica. Selecting
+        // a NOF_SSD replica here would let the session start and then fail the
+        // actual transfer (BatchTransferReadRanges rejects non-MEMORY entries).
         const auto *replica =
-            SelectBestReplica(query_result.replicas, local_endpoints);
+            SelectCompleteMemoryReplica(query_result.replicas, local_endpoints);
         if (!replica) {
-            LOG(ERROR) << "No complete replica for key: " << keys[i];
+            LOG(ERROR) << "No complete memory replica for key: " << keys[i];
             results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
             get_sessions_.erase(keys[i]);
             continue;
@@ -5539,16 +5526,14 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
                 continue;
             }
-            // start cached a single complete replica via FilterQueryResult.
-            // SelectBestReplica may return a MEMORY or NOF replica; both
-            // support range reads via RDMA. Extract the object size from
-            // whichever descriptor is present so overflow detection works.
+            // start cached a single complete MEMORY replica via
+            // FilterQueryResult. The session range-read path only reads
+            // MEMORY replicas, so the cached replica is always MEMORY here;
+            // extract its object size for overflow detection.
             const auto &replica = it->second.replicas.front();
             const size_t replica_limit =
                 replica.is_memory_replica()
                     ? replica.get_memory_descriptor().buffer_descriptor.size_
-                : replica.is_nof_replica()
-                    ? replica.get_nof_descriptor().buffer_descriptor.size_
                     : 0;
             bool overflow = false;
             std::vector<Slice> entry_slices;

@@ -177,4 +177,33 @@ inline const Replica::Descriptor *SelectBestReplica(
     return best;
 }
 
+// Select a complete MEMORY replica for the session range-read path. The
+// session ranged-get path (Client::BatchTransferReadRanges) only ever reads
+// MEMORY replicas: it rejects every non-MEMORY entry, so selecting a NOF_SSD
+// replica here would let a session start and then fail the actual transfer.
+// Among complete MEMORY replicas, a local one is preferred; otherwise the
+// first complete MEMORY replica is returned (nullptr if there is none).
+//
+// Unlike SelectBestReplica this deliberately does NOT consider NOF_SSD: the
+// session path cannot read it. Local MEMORY is still preferred over a remote
+// MEMORY replica regardless of the order the master returned them in.
+inline const Replica::Descriptor *SelectCompleteMemoryReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints) {
+    const Replica::Descriptor *first_memory = nullptr;
+    for (const auto &r : replicas) {
+        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
+            continue;
+        }
+        if (local_endpoints.count(r.get_memory_descriptor()
+                                      .buffer_descriptor.transport_endpoint_)) {
+            return &r;
+        }
+        if (!first_memory) {
+            first_memory = &r;
+        }
+    }
+    return first_memory;
+}
+
 }  // namespace mooncake
