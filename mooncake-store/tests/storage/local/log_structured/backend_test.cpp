@@ -315,6 +315,12 @@ TEST(LogStructuredStorageBackendTest,
     EXPECT_TRUE(evicted->empty());
     EXPECT_LT(disk_bytes(), before);
     EXPECT_TRUE(backend.IsEnableOffloading().value());
+    const auto stats = backend.SnapshotStats();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_GE(stats->compaction_runs, uint64_t{1});
+    EXPECT_GT(stats->compaction_input_bytes, uint64_t{0});
+    EXPECT_GT(stats->compaction_reclaimed_bytes, uint64_t{0});
+    EXPECT_EQ(stats->compaction_errors, uint64_t{0});
 
     std::string loaded(96, '\0');
     std::unordered_map<std::string, Slice> slices{
@@ -400,6 +406,8 @@ TEST(LogStructuredStorageBackendTest, ExposesPhysicalStorageStats) {
     EXPECT_EQ(stats->active_segments, 1);
     EXPECT_EQ(stats->sealed_segments, 0);
     EXPECT_EQ(stats->retired_segments, 0);
+    EXPECT_GT(stats->wal_sequence, uint64_t{0});
+    EXPECT_LE(stats->checkpoint_sequence, stats->wal_sequence);
 }
 
 }  // namespace

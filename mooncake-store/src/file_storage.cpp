@@ -812,6 +812,26 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 static_cast<int64_t>(stats->sealed_segments));
             ssd_metric_->backend_retired_segments.update(
                 static_cast<int64_t>(stats->retired_segments));
+            ssd_metric_->backend_compaction_runs.update(
+                static_cast<int64_t>(stats->compaction_runs));
+            ssd_metric_->backend_compaction_input_bytes.update(
+                static_cast<int64_t>(stats->compaction_input_bytes));
+            ssd_metric_->backend_compaction_output_bytes.update(
+                static_cast<int64_t>(stats->compaction_output_bytes));
+            ssd_metric_->backend_compaction_reclaimed_bytes.update(
+                static_cast<int64_t>(stats->compaction_reclaimed_bytes));
+            ssd_metric_->backend_compaction_conflicts.update(
+                static_cast<int64_t>(stats->compaction_conflicts));
+            ssd_metric_->backend_compaction_cancellations.update(
+                static_cast<int64_t>(stats->compaction_cancellations));
+            ssd_metric_->backend_compaction_errors.update(
+                static_cast<int64_t>(stats->compaction_errors));
+            ssd_metric_->backend_compaction_last_duration_us.update(
+                static_cast<int64_t>(stats->compaction_last_duration_us));
+            ssd_metric_->backend_wal_sequence.update(
+                static_cast<int64_t>(stats->wal_sequence));
+            ssd_metric_->backend_checkpoint_sequence.update(
+                static_cast<int64_t>(stats->checkpoint_sequence));
         }
     }
     return {};

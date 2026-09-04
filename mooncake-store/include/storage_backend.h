@@ -167,6 +167,16 @@ struct StorageBackendStats {
     uint64_t active_segments{0};
     uint64_t sealed_segments{0};
     uint64_t retired_segments{0};
+    uint64_t compaction_runs{0};
+    uint64_t compaction_input_bytes{0};
+    uint64_t compaction_output_bytes{0};
+    uint64_t compaction_reclaimed_bytes{0};
+    uint64_t compaction_conflicts{0};
+    uint64_t compaction_cancellations{0};
+    uint64_t compaction_errors{0};
+    uint64_t compaction_last_duration_us{0};
+    uint64_t wal_sequence{0};
+    uint64_t checkpoint_sequence{0};
 };
 
 enum class FileMode { Read, Write };

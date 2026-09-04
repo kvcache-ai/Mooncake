@@ -372,6 +372,41 @@ LogStructuredStorageBackend::MakeCompactionOptions(
         .stop_token = stop_token};
 }
 
+tl::expected<logstructured::CompactionResult, logstructured::StoreError>
+LogStructuredStorageBackend::RunCompaction(
+    const logstructured::CompactionOptions& options) {
+    const auto started = std::chrono::steady_clock::now();
+    auto result = store_->CompactOnce(options);
+    const auto duration_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count();
+    compaction_last_duration_us_.store(static_cast<uint64_t>(duration_us),
+                                       std::memory_order_relaxed);
+    if (!result) {
+        if (result.error() == logstructured::StoreError::kCancelled) {
+            compaction_cancellations_.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            compaction_errors_.fetch_add(1, std::memory_order_relaxed);
+            if (result.error() ==
+                logstructured::StoreError::kInvalidTransition) {
+                compaction_conflicts_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return result;
+    }
+    if (result->source_segments != 0) {
+        compaction_runs_.fetch_add(1, std::memory_order_relaxed);
+        compaction_input_bytes_.fetch_add(result->input_bytes,
+                                          std::memory_order_relaxed);
+        compaction_output_bytes_.fetch_add(result->output_bytes,
+                                           std::memory_order_relaxed);
+        compaction_reclaimed_bytes_.fetch_add(result->reclaimed_bytes,
+                                              std::memory_order_relaxed);
+    }
+    return result;
+}
+
 void LogStructuredStorageBackend::CompactionLoop(std::stop_token stop_token) {
     std::mutex wait_mutex;
     std::unique_lock wait_lock(wait_mutex);
@@ -381,7 +416,7 @@ void LogStructuredStorageBackend::CompactionLoop(std::stop_token stop_token) {
             std::chrono::milliseconds(backend_config_.compaction_interval_ms),
             [] { return false; });
         if (stop_token.stop_requested()) break;
-        auto compacted = store_->CompactOnce(MakeCompactionOptions(stop_token));
+        auto compacted = RunCompaction(MakeCompactionOptions(stop_token));
         if (!compacted &&
             compacted.error() != logstructured::StoreError::kCancelled) {
             LOG(ERROR) << "Log-structured compaction failed";
@@ -434,7 +469,7 @@ LogStructuredStorageBackend::EvictAboveDiskWatermark(
     options.enable_tiering = false;
     while (stats.physical_bytes > low_watermark_bytes &&
            stats.reclaimable_bytes != 0) {
-        auto compacted = store_->CompactOnce(options);
+        auto compacted = RunCompaction(options);
         if (!compacted) {
             return tl::make_unexpected(ToWriteError(compacted.error()));
         }
@@ -475,7 +510,7 @@ void LogStructuredStorageBackend::RemoveAll() {
         .enable_tiering = false,
         .stop_token = {}};
     while (true) {
-        auto compacted = store_->CompactOnce(options);
+        auto compacted = RunCompaction(options);
         if (!compacted) {
             LOG(ERROR) << "Failed to reclaim segments during RemoveAll";
             return;
@@ -495,13 +530,30 @@ std::optional<StorageBackendStats> LogStructuredStorageBackend::SnapshotStats()
     std::lock_guard lock(mutex_);
     if (!store_) return std::nullopt;
     const auto stats = store_->SnapshotStats();
-    return StorageBackendStats{.physical_bytes = stats.physical_bytes,
-                               .live_record_bytes = stats.live_record_bytes,
-                               .logical_value_bytes = stats.logical_value_bytes,
-                               .reclaimable_bytes = stats.reclaimable_bytes,
-                               .active_segments = stats.active_segments,
-                               .sealed_segments = stats.sealed_segments,
-                               .retired_segments = stats.retired_segments};
+    return StorageBackendStats{
+        .physical_bytes = stats.physical_bytes,
+        .live_record_bytes = stats.live_record_bytes,
+        .logical_value_bytes = stats.logical_value_bytes,
+        .reclaimable_bytes = stats.reclaimable_bytes,
+        .active_segments = stats.active_segments,
+        .sealed_segments = stats.sealed_segments,
+        .retired_segments = stats.retired_segments,
+        .compaction_runs = compaction_runs_.load(std::memory_order_relaxed),
+        .compaction_input_bytes =
+            compaction_input_bytes_.load(std::memory_order_relaxed),
+        .compaction_output_bytes =
+            compaction_output_bytes_.load(std::memory_order_relaxed),
+        .compaction_reclaimed_bytes =
+            compaction_reclaimed_bytes_.load(std::memory_order_relaxed),
+        .compaction_conflicts =
+            compaction_conflicts_.load(std::memory_order_relaxed),
+        .compaction_cancellations =
+            compaction_cancellations_.load(std::memory_order_relaxed),
+        .compaction_errors = compaction_errors_.load(std::memory_order_relaxed),
+        .compaction_last_duration_us =
+            compaction_last_duration_us_.load(std::memory_order_relaxed),
+        .wal_sequence = stats.wal_sequence,
+        .checkpoint_sequence = stats.checkpoint_sequence};
 }
 
 void LogStructuredStorageBackend::SetTestFailurePredicate(

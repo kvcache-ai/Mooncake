@@ -1093,6 +1093,8 @@ StoreStats LogStructuredStore::SnapshotStats() const {
         stats.logical_value_bytes += entry.version.physical.value_length;
     }
     stats.reclaimable_bytes = stats.physical_bytes - stats.live_record_bytes;
+    stats.wal_sequence = next_sequence_ - 1;
+    stats.checkpoint_sequence = checkpoint_sequence_;
     return stats;
 }
 

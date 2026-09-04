@@ -74,6 +74,8 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
     void CompactionLoop(std::stop_token stop_token);
     logstructured::CompactionOptions MakeCompactionOptions(
         std::stop_token stop_token = {}) const;
+    tl::expected<logstructured::CompactionResult, logstructured::StoreError>
+    RunCompaction(const logstructured::CompactionOptions& options);
 
     LogStructuredBackendConfig backend_config_;
     mutable std::mutex mutex_;
@@ -82,6 +84,14 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
     uint64_t committed_since_checkpoint_{0};
     std::unique_ptr<logstructured::LogStructuredStore> store_;
     std::function<bool(const std::string& key)> test_failure_predicate_;
+    std::atomic<uint64_t> compaction_runs_{0};
+    std::atomic<uint64_t> compaction_input_bytes_{0};
+    std::atomic<uint64_t> compaction_output_bytes_{0};
+    std::atomic<uint64_t> compaction_reclaimed_bytes_{0};
+    std::atomic<uint64_t> compaction_conflicts_{0};
+    std::atomic<uint64_t> compaction_cancellations_{0};
+    std::atomic<uint64_t> compaction_errors_{0};
+    std::atomic<uint64_t> compaction_last_duration_us_{0};
     std::atomic<bool> initialized_{false};
 };
 

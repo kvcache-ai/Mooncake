@@ -64,6 +64,8 @@ struct StoreStats {
     size_t active_segments{0};
     size_t sealed_segments{0};
     size_t retired_segments{0};
+    uint64_t wal_sequence{0};
+    uint64_t checkpoint_sequence{0};
 };
 
 struct CompactionResult {
