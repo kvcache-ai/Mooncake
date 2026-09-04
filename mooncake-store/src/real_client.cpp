@@ -3332,62 +3332,91 @@ RealClient::batch_get_buffer_internal(
 
     // 5. Execute batch get for LOCAL_DISK replicas via SSD RPC
     if (!disk_ops.empty()) {
-        // Group by transport endpoint
-        std::unordered_map<std::string,
-                           std::unordered_map<std::string, std::vector<Slice>>>
-            offload_objects;
-        // Build key -> disk_ops index for result lookup
-        std::unordered_map<std::string, size_t> disk_key_to_idx;
-
-        for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
-            auto &op = disk_ops[idx];
-            // Find the LOCAL_DISK replica — replicas may be in any order.
-            const Replica::Descriptor *replica_ptr = nullptr;
-            for (const auto &r : op.query_result.replicas) {
-                if (r.is_local_disk_replica()) {
-                    replica_ptr = &r;
-                    break;
-                }
-            }
-            if (!replica_ptr) {
-                LOG(ERROR) << "No LOCAL_DISK replica found for key: " << op.key;
-                continue;
-            }
-            const auto &replica = *replica_ptr;
-            offload_objects[replica.get_local_disk_descriptor()
-                                .transport_endpoint]
-                .emplace(op.key, std::vector<Slice>{
-                                     {op.buffer_handle->ptr(), op.total_size}});
-            disk_key_to_idx[op.key] = idx;
+        // Same duplicate-key hazard as the memory path above: offload_objects
+        // (emplace keeps the first occurrence's buffer) and disk_key_to_idx
+        // (assignment keeps the last occurrence's index) are both keyed by
+        // object key, so a key repeated within one batch collapses — the SSD
+        // read fills the first occurrence's buffer while the result is resolved
+        // to the last occurrence, whose own buffer is returned unwritten.
+        // Process the ops in rounds where each round holds at most one
+        // occurrence of any key, so every occurrence's own buffer is filled.
+        // The common, duplicate-free case runs in a single round.
+        std::vector<size_t> pending_disk_ops;
+        pending_disk_ops.reserve(disk_ops.size());
+        for (size_t i = 0; i < disk_ops.size(); ++i) {
+            pending_disk_ops.push_back(i);
         }
 
-        for (auto &[endpoint, objects] : offload_objects) {
-            if (objects.empty()) continue;
-            auto read_result =
-                batch_get_into_offload_object_internal(endpoint, objects);
-            for (auto &[key, slices] : objects) {
-                auto idx_it = disk_key_to_idx.find(key);
-                if (idx_it == disk_key_to_idx.end()) continue;
-                auto &op = disk_ops[idx_it->second];
-                if (read_result) {
-                    auto checksum_result = client_->VerifyObjectChecksum(
-                        key, slices, op.total_size,
-                        op.query_result.object_checksum);
-                    if (!checksum_result) {
-                        LOG(ERROR)
-                            << "SSD checksum verification failed for key '"
-                            << key
-                            << "': " << toString(checksum_result.error());
-                        continue;
+        while (!pending_disk_ops.empty()) {
+            // Group by transport endpoint
+            std::unordered_map<
+                std::string,
+                std::unordered_map<std::string, std::vector<Slice>>>
+                offload_objects;
+            // key -> disk_ops index for this round's result lookup
+            std::unordered_map<std::string, size_t> disk_key_to_idx;
+            std::vector<size_t> deferred_disk_ops;
+
+            for (size_t idx : pending_disk_ops) {
+                auto &op = disk_ops[idx];
+                // A key already claimed this round waits for the next round so
+                // it gets its own destination buffer.
+                if (disk_key_to_idx.find(op.key) != disk_key_to_idx.end()) {
+                    deferred_disk_ops.push_back(idx);
+                    continue;
+                }
+                // Find the LOCAL_DISK replica — replicas may be in any order.
+                const Replica::Descriptor *replica_ptr = nullptr;
+                for (const auto &r : op.query_result.replicas) {
+                    if (r.is_local_disk_replica()) {
+                        replica_ptr = &r;
+                        break;
                     }
-                    final_results[op.original_index] =
-                        std::make_shared<BufferHandle>(
-                            std::move(*op.buffer_handle));
-                } else {
-                    LOG(ERROR) << "SSD read failed for key '" << key
-                               << "': " << toString(read_result.error());
+                }
+                if (!replica_ptr) {
+                    LOG(ERROR)
+                        << "No LOCAL_DISK replica found for key: " << op.key;
+                    continue;
+                }
+                const auto &replica = *replica_ptr;
+                offload_objects[replica.get_local_disk_descriptor()
+                                    .transport_endpoint]
+                    .emplace(op.key,
+                             std::vector<Slice>{
+                                 {op.buffer_handle->ptr(), op.total_size}});
+                disk_key_to_idx[op.key] = idx;
+            }
+
+            for (auto &[endpoint, objects] : offload_objects) {
+                if (objects.empty()) continue;
+                auto read_result =
+                    batch_get_into_offload_object_internal(endpoint, objects);
+                for (auto &[key, slices] : objects) {
+                    auto idx_it = disk_key_to_idx.find(key);
+                    if (idx_it == disk_key_to_idx.end()) continue;
+                    auto &op = disk_ops[idx_it->second];
+                    if (read_result) {
+                        auto checksum_result = client_->VerifyObjectChecksum(
+                            key, slices, op.total_size,
+                            op.query_result.object_checksum);
+                        if (!checksum_result) {
+                            LOG(ERROR)
+                                << "SSD checksum verification failed for key '"
+                                << key
+                                << "': " << toString(checksum_result.error());
+                            continue;
+                        }
+                        final_results[op.original_index] =
+                            std::make_shared<BufferHandle>(
+                                std::move(*op.buffer_handle));
+                    } else {
+                        LOG(ERROR) << "SSD read failed for key '" << key
+                                   << "': " << toString(read_result.error());
+                    }
                 }
             }
+
+            pending_disk_ops.swap(deferred_disk_ops);
         }
     }
 
