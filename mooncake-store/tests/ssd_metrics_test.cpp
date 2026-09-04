@@ -37,6 +37,13 @@ TEST_F(SsdMetricsTest, SerializeTest) {
     metrics.ssd_write_latency_summary.observe(1000);
     metrics.ssd_total_latency_summary.observe(200);
     metrics.ssd_total_latency_summary.observe(1000);
+    metrics.backend_physical_bytes.update(8192);
+    metrics.backend_live_record_bytes.update(4096);
+    metrics.backend_logical_value_bytes.update(3072);
+    metrics.backend_reclaimable_bytes.update(4096);
+    metrics.backend_active_segments.update(1);
+    metrics.backend_sealed_segments.update(2);
+    metrics.backend_retired_segments.update(3);
 
     std::string serialized;
     metrics.serialize(serialized);
@@ -61,6 +68,23 @@ TEST_F(SsdMetricsTest, SerializeTest) {
     EXPECT_TRUE(serialized.find("mooncake_ssd_total_latency_us") !=
                 std::string::npos);
     EXPECT_TRUE(serialized.find("mooncake_ssd_read_latency_summary_us") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_backend_physical_bytes 8192") !=
+                std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_ssd_backend_live_record_bytes 4096") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_ssd_backend_logical_value_bytes 3072") !=
+        std::string::npos);
+    EXPECT_TRUE(
+        serialized.find("mooncake_ssd_backend_reclaimable_bytes 4096") !=
+        std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_backend_active_segments 1") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_backend_sealed_segments 2") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_ssd_backend_retired_segments 3") !=
                 std::string::npos);
 
     std::cout << "Serialized SSD Metrics:\n" << serialized << std::endl;

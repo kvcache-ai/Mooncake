@@ -364,5 +364,43 @@ TEST(LogStructuredStorageBackendTest, RemoveAllSurvivesRestart) {
     EXPECT_EQ(scanned, size_t{0});
 }
 
+TEST(LogStructuredStorageBackendTest, ExposesPhysicalStorageStats) {
+    BackendTempDirectory temp;
+    const auto config = BackendConfig(temp);
+    const std::string storage_key =
+        TenantId("tenant-stats").MakeScopedKey("key");
+    std::string old_value = "old-value";
+    std::string new_value = "new-value-with-more-bytes";
+
+    LogStructuredStorageBackend backend(config);
+    EXPECT_FALSE(backend.SnapshotStats().has_value());
+    ASSERT_TRUE(backend.Init().has_value());
+    ASSERT_TRUE(backend
+                    .BatchOffload(SingleValueBatch(storage_key, old_value),
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+    ASSERT_TRUE(backend
+                    .BatchOffload(SingleValueBatch(storage_key, new_value),
+                                  [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
+                                      return ErrorCode::OK;
+                                  })
+                    .has_value());
+
+    const auto stats = backend.SnapshotStats();
+    ASSERT_TRUE(stats.has_value());
+    EXPECT_EQ(stats->logical_value_bytes, new_value.size());
+    EXPECT_GT(stats->live_record_bytes, stats->logical_value_bytes);
+    EXPECT_GT(stats->physical_bytes, stats->live_record_bytes);
+    EXPECT_EQ(stats->reclaimable_bytes,
+              stats->physical_bytes - stats->live_record_bytes);
+    EXPECT_EQ(stats->active_segments, 1);
+    EXPECT_EQ(stats->sealed_segments, 0);
+    EXPECT_EQ(stats->retired_segments, 0);
+}
+
 }  // namespace
 }  // namespace mooncake

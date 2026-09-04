@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_set>
@@ -156,6 +157,16 @@ struct OffloadMetadata {
     int64_t total_size;
     OffloadMetadata(std::size_t keys, int64_t size)
         : total_keys(keys), total_size(size) {}
+};
+
+struct StorageBackendStats {
+    uint64_t physical_bytes{0};
+    uint64_t live_record_bytes{0};
+    uint64_t logical_value_bytes{0};
+    uint64_t reclaimable_bytes{0};
+    uint64_t active_segments{0};
+    uint64_t sealed_segments{0};
+    uint64_t retired_segments{0};
 };
 
 enum class FileMode { Read, Write };
@@ -382,6 +393,10 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual std::optional<StorageBackendStats> SnapshotStats() const {
+        return std::nullopt;
     }
 
     FileStorageConfig file_storage_config_;

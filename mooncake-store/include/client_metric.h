@@ -12,6 +12,7 @@
 #include <unordered_set>
 #include <vector>
 #include <ylt/metric/counter.hpp>
+#include <ylt/metric/gauge.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "environ.h"
@@ -537,6 +538,27 @@ struct SsdMetric {
           ssd_total_latency_summary("mooncake_ssd_total_latency_summary_us",
                                     "SSD total latency quantiles (us)",
                                     {0.5, 0.9, 0.99}, labels),
+          backend_physical_bytes(
+              "mooncake_ssd_backend_physical_bytes",
+              "Physical bytes occupied by the selected SSD backend", labels),
+          backend_live_record_bytes(
+              "mooncake_ssd_backend_live_record_bytes",
+              "Physical record bytes referenced by the current backend index",
+              labels),
+          backend_logical_value_bytes(
+              "mooncake_ssd_backend_logical_value_bytes",
+              "Logical value bytes referenced by the current backend index",
+              labels),
+          backend_reclaimable_bytes(
+              "mooncake_ssd_backend_reclaimable_bytes",
+              "Physical backend bytes eligible for reclamation", labels),
+          backend_active_segments("mooncake_ssd_backend_active_segments",
+                                  "Number of active backend segments", labels),
+          backend_sealed_segments("mooncake_ssd_backend_sealed_segments",
+                                  "Number of sealed backend segments", labels),
+          backend_retired_segments(
+              "mooncake_ssd_backend_retired_segments",
+              "Number of retired backend segments pending cleanup", labels),
           start_time_(std::chrono::steady_clock::now()) {}
 
     ylt::metric::counter_t ssd_read_bytes;
@@ -551,6 +573,13 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_read_latency_summary;
     ylt::metric::summary_t ssd_write_latency_summary;
     ylt::metric::summary_t ssd_total_latency_summary;
+    ylt::metric::gauge_t backend_physical_bytes;
+    ylt::metric::gauge_t backend_live_record_bytes;
+    ylt::metric::gauge_t backend_logical_value_bytes;
+    ylt::metric::gauge_t backend_reclaimable_bytes;
+    ylt::metric::gauge_t backend_active_segments;
+    ylt::metric::gauge_t backend_sealed_segments;
+    ylt::metric::gauge_t backend_retired_segments;
     std::chrono::steady_clock::time_point start_time_;
 
     void serialize(std::string& str) {
@@ -566,6 +595,13 @@ struct SsdMetric {
         ssd_read_latency_summary.serialize(str);
         ssd_write_latency_summary.serialize(str);
         ssd_total_latency_summary.serialize(str);
+        backend_physical_bytes.serialize(str);
+        backend_live_record_bytes.serialize(str);
+        backend_logical_value_bytes.serialize(str);
+        backend_reclaimable_bytes.serialize(str);
+        backend_active_segments.serialize(str);
+        backend_sealed_segments.serialize(str);
+        backend_retired_segments.serialize(str);
     }
 
     std::string summary_metrics() {

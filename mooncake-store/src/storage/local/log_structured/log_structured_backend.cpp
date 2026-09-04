@@ -487,6 +487,23 @@ void LogStructuredStorageBackend::RemoveAll() {
     }
 }
 
+std::optional<StorageBackendStats> LogStructuredStorageBackend::SnapshotStats()
+    const {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+    std::lock_guard lock(mutex_);
+    if (!store_) return std::nullopt;
+    const auto stats = store_->SnapshotStats();
+    return StorageBackendStats{.physical_bytes = stats.physical_bytes,
+                               .live_record_bytes = stats.live_record_bytes,
+                               .logical_value_bytes = stats.logical_value_bytes,
+                               .reclaimable_bytes = stats.reclaimable_bytes,
+                               .active_segments = stats.active_segments,
+                               .sealed_segments = stats.sealed_segments,
+                               .retired_segments = stats.retired_segments};
+}
+
 void LogStructuredStorageBackend::SetTestFailurePredicate(
     std::function<bool(const std::string& key)> predicate) {
     std::lock_guard lock(mutex_);

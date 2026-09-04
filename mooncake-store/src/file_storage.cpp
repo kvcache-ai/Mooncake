@@ -795,6 +795,25 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         LOG(WARNING) << "Disk watermark eviction failed: "
                      << disk_eviction_result.error();
     }
+
+    if (ssd_metric_) {
+        if (const auto stats = storage_backend_->SnapshotStats()) {
+            ssd_metric_->backend_physical_bytes.update(
+                static_cast<int64_t>(stats->physical_bytes));
+            ssd_metric_->backend_live_record_bytes.update(
+                static_cast<int64_t>(stats->live_record_bytes));
+            ssd_metric_->backend_logical_value_bytes.update(
+                static_cast<int64_t>(stats->logical_value_bytes));
+            ssd_metric_->backend_reclaimable_bytes.update(
+                static_cast<int64_t>(stats->reclaimable_bytes));
+            ssd_metric_->backend_active_segments.update(
+                static_cast<int64_t>(stats->active_segments));
+            ssd_metric_->backend_sealed_segments.update(
+                static_cast<int64_t>(stats->sealed_segments));
+            ssd_metric_->backend_retired_segments.update(
+                static_cast<int64_t>(stats->retired_segments));
+        }
+    }
     return {};
 }
 

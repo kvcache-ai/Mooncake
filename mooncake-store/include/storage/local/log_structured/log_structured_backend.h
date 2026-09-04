@@ -64,6 +64,7 @@ class LogStructuredStorageBackend final : public StorageBackendInterface {
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
+    std::optional<StorageBackendStats> SnapshotStats() const override;
 
    private:
     static ErrorCode ToWriteError(logstructured::StoreError error);
