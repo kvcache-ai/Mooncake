@@ -168,6 +168,37 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
+    // Distinguishes a nil reply (key absent — kNotFound) from a connection
+    // or command error (kUnavailable) so syncSegmentCache does not purge the
+    // cache during a Redis outage.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        std::lock_guard<std::mutex> lock(access_client_mutex_);
+        if (!client_) return GetResult::kUnavailable;
+
+        redisReply *resp =
+            (redisReply *)redisCommand(client_, "GET %s", key.c_str());
+        if (!resp) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
+                       << " from " << metadata_uri_;
+            return GetResult::kUnavailable;
+        }
+        if (!resp->str) {
+            freeReplyObject(resp);
+            return GetResult::kNotFound;
+        }
+
+        auto json_file = std::string(resp->str);
+        freeReplyObject(resp);
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
+    }
+
     virtual bool set(const std::string &key, const Json::Value &value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
@@ -303,6 +334,54 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         return true;
+    }
+
+    // Distinguishes HTTP 404 (key absent — kNotFound) from curl/network
+    // errors and server-side 5xx (kUnavailable) so syncSegmentCache does not
+    // purge the cache during an etcd/master outage.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
+
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
+
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        CURLcode rc = curl_easy_perform(h);
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
+            return GetResult::kUnavailable;
+        }
+
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (code == 404) return GetResult::kNotFound;
+        if (!is_200(code)) {
+            LOG(ERROR) << "GET " << url << " http=" << code
+                       << " body: " << readBody;
+            return GetResult::kUnavailable;
+        }
+
+        Json::CharReaderBuilder b;
+        std::string errs;
+        std::unique_ptr<Json::CharReader> r(b.newCharReader());
+        if (!r->parse(readBody.data(), readBody.data() + readBody.size(),
+                      &value, &errs)) {
+            LOG(ERROR) << "GET " << url << " json parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
     }
 
     bool set(const std::string &key, const Json::Value &value) override {

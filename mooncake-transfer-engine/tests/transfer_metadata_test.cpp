@@ -576,6 +576,22 @@ class FakeMetadataStoragePlugin : public MetadataStoragePlugin {
         value = it->second;
         return true;
     }
+
+    // Error-aware variant: forced failures report kUnavailable (the key may
+    // still live in the backend), missing keys report kNotFound (the master
+    // removed them), and present keys report kFound.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return GetResult::kUnavailable;
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return GetResult::kNotFound;
+        value = it->second;
+        return GetResult::kFound;
+    }
     bool set(const std::string &key, const Json::Value &value) override {
         store_[key] = value;
         return true;
@@ -686,6 +702,37 @@ TEST_F(TransferMetadataStaleSegmentInvalidationTest,
 
     // Next cycle the blip clears: get() succeeds again, the streak resets to
     // zero, and the cached entry survives.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+}
+
+// Backend-outage guard: a sustained transient failure (kUnavailable) must NOT
+// advance the invalidation streak, so the cached entry survives even after
+// many consecutive sync cycles -- only an authoritative key removal
+// (kNotFound) can invalidate. Guards against a metadata-service outage
+// purging the entire live cache.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       BackendOutageDoesNotInvalidateCache) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "D";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Sustained backend outage: every get() fails for 5 sync cycles (well
+    // past the invalidation threshold of 2), but the key still lives in
+    // the backend -- this is kUnavailable, not kNotFound.
+    plugin->failNext("mooncake/ram/D", 5);
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(client.syncSegmentCache(""), 0);
+        EXPECT_NE(client.getSegmentDescByName(name), nullptr)
+            << "entry purged after " << (i + 1) << " transient failures";
+    }
+
+    // Outage clears: get() succeeds again, the entry was never invalidated.
     ASSERT_EQ(client.syncSegmentCache(""), 0);
     EXPECT_NE(client.getSegmentDescByName(name), nullptr);
 }
