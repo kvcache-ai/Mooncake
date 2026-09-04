@@ -1097,14 +1097,17 @@ TEST_F(MasterServiceHATest, FailedRestoreDoesNotAdvanceReplicaIdCounter) {
         ReplicaDescriptorsForTesting(service, kDefaultTenant, first_key);
     ASSERT_EQ(first.size(), 1);
 
-    auto valid =
-        MakeStandbyObject("replica_id_counter_valid", "replica_id_counter");
+    // With the tolerant restore, a whole-restore failure only happens when
+    // nothing lands at all. Give both entries unknown endpoints so neither
+    // can land, then the counter must stay exactly where it was.
+    auto valid = MakeStandbyObject("replica_id_counter_valid",
+                                   "unknown_replica_id_endpoint_a");
     valid.metadata.replicas.front().id = first.front().id + 1000;
     valid.metadata.replicas.front()
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
     auto invalid = MakeStandbyObject("replica_id_counter_invalid",
-                                     "unknown_replica_id_endpoint");
+                                     "unknown_replica_id_endpoint_b");
     invalid.metadata.replicas.front().id = first.front().id + 2000;
     auto result = service.RestoreFromStandbySnapshot(
         {valid, invalid}, 7, {MakeStandbyMemorySegment("replica_id_counter")});
@@ -1804,6 +1807,7 @@ TEST_F(MasterServiceHATest, RestoreKeepsIndependentReplicaOfConflictedObject) {
     // The survivor carries two memory replicas: one collides with the other
     // object's only replica, the second is independent of the conflict.
     survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
     survivor.metadata.replicas[0]
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
@@ -1889,8 +1893,9 @@ TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     // The first replica records a valid range, then the second descriptor
     // fails validation and the object is rejected mid-loop.
-    rejected.metadata.replicas.push_back(
-        MakeStandbyMemoryReplica("unknown_endpoint"));
+    auto stale_unknown = MakeStandbyMemoryReplica("unknown_endpoint");
+    stale_unknown.id = 2;
+    rejected.metadata.replicas.push_back(std::move(stale_unknown));
     auto clean = MakeStandbyObject("standby_stale_range_clean", endpoint);
     clean.metadata.replicas.front()
         .get_memory_descriptor()
@@ -1923,6 +1928,8 @@ TEST_F(MasterServiceHATest, RestoreRollsBackAccountingOfRejectedObject) {
     // construction, after the first two have already accumulated bytes.
     rejected.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
     rejected.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    rejected.metadata.replicas[1].id = 2;
+    rejected.metadata.replicas[2].id = 3;
     rejected.metadata.replicas[0]
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
