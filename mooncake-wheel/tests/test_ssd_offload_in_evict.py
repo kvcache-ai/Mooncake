@@ -583,7 +583,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         # Phase 3: Cleanup (still using single remove for simplicity)
         # --------------------------
         time.sleep(default_kv_lease_ttl / 1000)
-        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer registration should succeed")
+        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
         index = 0
         while index < MAX_REQUESTS:
             key = KEY_PREFIX + str(index)
