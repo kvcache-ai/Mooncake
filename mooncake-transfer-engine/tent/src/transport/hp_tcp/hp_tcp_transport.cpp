@@ -610,9 +610,17 @@ Status HighPerformanceTcpTransport::planTask(
                 };
         } else {
             operation.complete =
-                [task](TransferStatusEnum terminal, size_t,
-                       std::optional<HighPerformanceTcpStatus> remote_status) {
-                    (void)task->completeSlice(terminal, remote_status);
+                [this, task](
+                    TransferStatusEnum terminal, size_t,
+                    std::optional<HighPerformanceTcpStatus> remote_status) {
+                    const bool cancel_siblings =
+                        terminal != COMPLETED && task->requestCancel();
+                    const bool finished =
+                        task->completeSlice(terminal, remote_status);
+                    if (cancel_siblings && !finished &&
+                        !stopping_.load(std::memory_order_acquire)) {
+                        (void)client_->cancelRequest(task->requestId());
+                    }
                 };
         }
 
@@ -769,7 +777,7 @@ Status HighPerformanceTcpTransport::cancelTransferTask(SubBatchRef batch,
     const TransferStatusEnum state = task->snapshot().s;
     if (state != INITIAL && state != PENDING) return Status::OK();
 
-    task->requestCancel();
+    if (!task->requestCancel()) return Status::OK();
     if (client_ == nullptr || workers_ == nullptr) return Status::OK();
     const Status canceled = client_->cancelRequest(task->requestId());
     // A request still in the worker dispatch queue has no client lane yet;

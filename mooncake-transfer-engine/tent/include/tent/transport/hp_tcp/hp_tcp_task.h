@@ -55,8 +55,8 @@ class HighPerformanceTcpTaskState {
     }
     uint64_t requestId() const noexcept { return request_id_; }
 
-    void requestCancel() noexcept {
-        cancel_requested_.store(true, std::memory_order_release);
+    bool requestCancel() noexcept {
+        return !cancel_requested_.exchange(true, std::memory_order_acq_rel);
     }
     bool cancelRequested() const noexcept {
         return cancel_requested_.load(std::memory_order_acquire);
