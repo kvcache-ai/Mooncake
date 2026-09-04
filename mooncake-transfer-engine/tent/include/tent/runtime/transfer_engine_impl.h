@@ -326,8 +326,9 @@ class TransferEngineImpl {
 
     void publishRuntimeConfigForTest(
         std::shared_ptr<const RuntimeConfigSnapshot> snapshot) {
-        runtime_config_snapshot_.store(std::move(snapshot),
-                                       std::memory_order_release);
+        std::atomic_store_explicit(&runtime_config_snapshot_,
+                                   std::move(snapshot),
+                                   std::memory_order_release);
     }
 
     // Test-only hook: how many batches are still alive. Lets a test assert
@@ -540,8 +541,7 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
-    std::atomic<std::shared_ptr<const RuntimeConfigSnapshot>>
-        runtime_config_snapshot_;
+    std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;

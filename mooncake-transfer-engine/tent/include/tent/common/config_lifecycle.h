@@ -129,6 +129,8 @@ class RuntimeConfig final : public LifecycleConfigView {
 struct RuntimeConfigSnapshot {
     uint64_t generation{0};
     std::shared_ptr<const RuntimeConfig> config;
+    int max_failover_attempts{3};
+    bool enable_auto_failover_on_poll{true};
 };
 
 struct TentConfigBundle {

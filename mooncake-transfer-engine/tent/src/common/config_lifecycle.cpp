@@ -224,8 +224,11 @@ TentConfigBundle buildTentConfigBundle(const Config& effective_config,
     bundle.bootstrap = std::make_shared<const BootstrapConfig>(frozen);
 
     auto runtime_config = std::make_shared<const RuntimeConfig>(frozen);
-    bundle.runtime = std::make_shared<const RuntimeConfigSnapshot>(
-        RuntimeConfigSnapshot{generation, std::move(runtime_config)});
+    bundle.runtime =
+        std::make_shared<const RuntimeConfigSnapshot>(RuntimeConfigSnapshot{
+            generation, runtime_config,
+            runtime_config->get("max_failover_attempts", 3),
+            runtime_config->get("enable_auto_failover_on_poll", true)});
 
     for (const auto& path : frozen->paths()) {
         if (path.empty()) {

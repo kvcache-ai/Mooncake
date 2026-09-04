@@ -336,8 +336,9 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
-    runtime_config_snapshot_.store(buildTentConfigBundle(*conf_).runtime,
-                                   std::memory_order_relaxed);
+    std::atomic_store_explicit(&runtime_config_snapshot_,
+                               buildTentConfigBundle(*conf_).runtime,
+                               std::memory_order_relaxed);
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
@@ -1736,13 +1737,13 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared = PreparedSubmit{};
-    auto runtime_config =
-        runtime_config_snapshot_.load(std::memory_order_acquire);
+    auto runtime_config = std::atomic_load_explicit(&runtime_config_snapshot_,
+                                                    std::memory_order_acquire);
     prepared.runtime_policy.config_generation = runtime_config->generation;
     prepared.runtime_policy.max_failover_attempts =
-        runtime_config->config->get("max_failover_attempts", 3);
+        runtime_config->max_failover_attempts;
     prepared.runtime_policy.enable_auto_failover_on_poll =
-        runtime_config->config->get("enable_auto_failover_on_poll", true);
+        runtime_config->enable_auto_failover_on_poll;
     const size_t start_task_id = batch->task_list.size();
     prepared.submit_time = std::chrono::steady_clock::now();
     auto merge_boundaries =
