@@ -53,9 +53,9 @@ LogStructuredBackendConfig LogStructuredBackendConfig::FromEnvironment() {
         "MOONCAKE_LOG_COMPACTION_MAX_LEVELS", config.compaction_max_levels));
     config.compaction_max_sources = static_cast<size_t>(Environ::GetUInt64(
         "MOONCAKE_LOG_COMPACTION_MAX_SOURCES", config.compaction_max_sources));
-    config.compaction_max_bytes_per_round =
-        Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND",
-                           config.compaction_max_bytes_per_round);
+    config.compaction_max_input_bytes =
+        Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_INPUT_BYTES",
+                           config.compaction_max_input_bytes);
     config.compaction_max_target_bytes =
         Environ::GetUInt64("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES",
                            config.compaction_max_target_bytes);
@@ -94,7 +94,7 @@ LogStructuredBackendConfig LogStructuredBackendConfig::FromEnvironment() {
 bool LogStructuredBackendConfig::Validate() const {
     return segment_size_bytes > 0 && compaction_interval_ms > 0 &&
            compaction_fanout >= 2 && compaction_max_levels > 0 &&
-           compaction_max_sources > 0 && compaction_max_bytes_per_round > 0 &&
+           compaction_max_sources > 0 && compaction_max_input_bytes > 0 &&
            compaction_max_target_bytes >= segment_size_bytes &&
            compaction_min_reclaim_ratio >= 0.0 &&
            compaction_min_reclaim_ratio <= 1.0;
@@ -181,6 +181,10 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::Init() {
         {.root_path = root.string(),
          .max_segment_bytes = backend_config_.segment_size_bytes,
          .max_physical_bytes = max_physical_bytes,
+         .max_total_physical_bytes =
+             file_storage_config_.total_size_limit > 0
+                 ? static_cast<uint64_t>(file_storage_config_.total_size_limit)
+                 : std::numeric_limits<uint64_t>::max(),
          .sync_data =
              backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
          .sync_wal =
@@ -385,7 +389,7 @@ LogStructuredStorageBackend::MakeCompactionOptions(
     }
     return {
         .max_source_segments = backend_config_.compaction_max_sources,
-        .max_input_bytes = backend_config_.compaction_max_bytes_per_round,
+        .max_input_bytes = backend_config_.compaction_max_input_bytes,
         .max_target_bytes = backend_config_.compaction_max_target_bytes,
         .max_temporary_bytes = max_temporary_bytes,
         .fanout = backend_config_.compaction_fanout,

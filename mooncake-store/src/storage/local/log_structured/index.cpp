@@ -10,6 +10,27 @@ size_t HashCombine(size_t seed, size_t value) {
     return seed ^ (value + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
+bool IsKnownVersionState(VersionState state) {
+    switch (state) {
+        case VersionState::kPrepared:
+        case VersionState::kCommitted:
+        case VersionState::kAborted:
+        case VersionState::kObsolete:
+        case VersionState::kTombstoned:
+        case VersionState::kReclaimable:
+            return true;
+    }
+    return false;
+}
+
+bool IsValidPhysicalRecord(const PhysicalRecord& physical) {
+    const bool empty = physical.total_length == 0;
+    if (empty) return physical == PhysicalRecord{};
+    return physical.segment_id != 0 &&
+           physical.value_offset >= physical.record_offset &&
+           physical.value_length <= physical.total_length;
+}
+
 }  // namespace
 
 size_t VersionIndex::IdentityHash::operator()(
@@ -216,9 +237,21 @@ void VersionIndex::ReclaimNonCurrentVersionsInSegments(
         static_cast<void>(identity);
         if (version.physical.total_length == 0 ||
             !segment_ids.contains(version.physical.segment_id) ||
-            version.state == VersionState::kCommitted) {
+            version.state == VersionState::kCommitted ||
+            version.state == VersionState::kPrepared) {
             continue;
         }
+        version.physical = {};
+        version.state = VersionState::kReclaimable;
+        ++version.mutation_epoch;
+    }
+}
+
+void VersionIndex::ReclaimNonCommittedVersionsAfterRecovery() {
+    std::unique_lock lock(mutex_);
+    for (auto& [identity, version] : versions_) {
+        static_cast<void>(identity);
+        if (version.state == VersionState::kCommitted) continue;
         version.physical = {};
         version.state = VersionState::kReclaimable;
         ++version.mutation_epoch;
@@ -294,6 +327,14 @@ tl::expected<void, IndexError> VersionIndex::Restore(
     std::unordered_map<RecordIdentity, VersionEntry, IdentityHash> versions;
     std::unordered_map<LogicalKey, RecordIdentity, LogicalKeyHash> current;
     for (const auto& item : snapshot) {
+        if (!IsKnownVersionState(item.version.state) ||
+            item.version.sequence == 0 || item.version.mutation_epoch == 0 ||
+            !IsValidPhysicalRecord(item.version.physical) ||
+            ((item.version.state == VersionState::kPrepared ||
+              item.version.state == VersionState::kCommitted) &&
+             item.version.physical.total_length == 0)) {
+            return tl::unexpected(IndexError::kInvalidTransition);
+        }
         if (!versions.emplace(item.identity, item.version).second) {
             return tl::unexpected(IndexError::kInvalidTransition);
         }
@@ -304,14 +345,7 @@ tl::expected<void, IndexError> VersionIndex::Restore(
             current.emplace(logical_key, item.identity);
             continue;
         }
-        const auto old = versions.find(current_it->second);
-        if (old == versions.end() ||
-            old->second.sequence == item.version.sequence) {
-            return tl::unexpected(IndexError::kInvalidTransition);
-        }
-        if (old->second.sequence < item.version.sequence) {
-            current_it->second = item.identity;
-        }
+        return tl::unexpected(IndexError::kInvalidTransition);
     }
     versions_ = std::move(versions);
     current_ = std::move(current);

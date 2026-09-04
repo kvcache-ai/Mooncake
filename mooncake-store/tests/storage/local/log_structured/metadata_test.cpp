@@ -60,6 +60,13 @@ CheckpointState Checkpoint() {
     return checkpoint;
 }
 
+TEST(LogStructuredMetadataTest, RejectsZeroCheckpointGeneration) {
+    MetadataTempDirectory temp;
+    auto checkpoint = WriteCheckpoint(temp.path().string(), 0, Checkpoint());
+    ASSERT_FALSE(checkpoint.has_value());
+    EXPECT_EQ(checkpoint.error(), MetadataError::kInvalidArgument);
+}
+
 TEST(LogStructuredMetadataTest, PublishesAndLoadsCheckpointManifest) {
     MetadataTempDirectory temp;
     auto checkpoint_file =
@@ -93,6 +100,32 @@ TEST(LogStructuredMetadataTest, PublishesAndLoadsCheckpointManifest) {
               VersionState::kCommitted);
 }
 
+TEST(LogStructuredMetadataTest, ReportsUncertainCurrentPublication) {
+    MetadataTempDirectory temp;
+    auto checkpoint_file =
+        WriteCheckpoint(temp.path().string(), 1, Checkpoint());
+    ASSERT_TRUE(checkpoint_file.has_value());
+    ManifestState manifest{
+        .format_version = 1,
+        .generation = 1,
+        .checkpoint_sequence = 7,
+        .next_sequence = 8,
+        .next_segment_id = 3,
+        .active_segment_id = 1,
+        .checkpoint_file = *checkpoint_file,
+        .wal_file = "WAL-000002",
+        .segments = Checkpoint().segments,
+    };
+
+    auto published = PublishManifest(temp.path().string(), manifest, {},
+                                     [] { return true; });
+    ASSERT_FALSE(published.has_value());
+    EXPECT_EQ(published.error(), MetadataError::kPublicationUncertain);
+    auto loaded = LoadCurrentManifest(temp.path().string());
+    ASSERT_TRUE(loaded.has_value());
+    EXPECT_EQ(loaded->generation, uint64_t{1});
+}
+
 TEST(LogStructuredMetadataTest, CurrentIgnoresUnpublishedManifest) {
     MetadataTempDirectory temp;
     auto checkpoint_file =
@@ -119,6 +152,53 @@ TEST(LogStructuredMetadataTest, CurrentIgnoresUnpublishedManifest) {
     auto loaded = LoadCurrentManifest(temp.path().string());
     ASSERT_TRUE(loaded.has_value());
     EXPECT_EQ(loaded->generation, uint64_t{1});
+}
+
+TEST(LogStructuredMetadataTest, RejectsMismatchedManifestGeneration) {
+    MetadataTempDirectory temp;
+    auto checkpoint_file =
+        WriteCheckpoint(temp.path().string(), 1, Checkpoint());
+    ASSERT_TRUE(checkpoint_file.has_value());
+    ManifestState manifest{
+        .format_version = 1,
+        .generation = 1,
+        .checkpoint_sequence = 7,
+        .next_sequence = 8,
+        .next_segment_id = 3,
+        .active_segment_id = 1,
+        .checkpoint_file = *checkpoint_file,
+        .wal_file = "WAL-00000000000000000001",
+        .segments = Checkpoint().segments,
+    };
+    ASSERT_TRUE(PublishManifest(temp.path().string(), manifest).has_value());
+
+    std::filesystem::copy_file(temp.path() / "MANIFEST-00000000000000000001",
+                               temp.path() / "MANIFEST-00000000000000000002");
+    std::ofstream(temp.path() / "CURRENT", std::ios::binary | std::ios::trunc)
+        << "MANIFEST-00000000000000000002\n";
+
+    auto loaded = LoadCurrentManifest(temp.path().string());
+    ASSERT_FALSE(loaded.has_value());
+    EXPECT_EQ(loaded.error(), MetadataError::kCorruptData);
+}
+
+TEST(LogStructuredMetadataTest, RejectsMismatchedManifestReferences) {
+    MetadataTempDirectory temp;
+    ManifestState manifest{
+        .format_version = 1,
+        .generation = 2,
+        .checkpoint_sequence = 7,
+        .next_sequence = 8,
+        .next_segment_id = 3,
+        .active_segment_id = 1,
+        .checkpoint_file = "CHECKPOINT-00000000000000000001",
+        .wal_file = "WAL-00000000000000000002",
+        .segments = Checkpoint().segments,
+    };
+
+    auto published = PublishManifest(temp.path().string(), manifest);
+    ASSERT_FALSE(published.has_value());
+    EXPECT_EQ(published.error(), MetadataError::kInvalidArgument);
 }
 
 TEST(LogStructuredMetadataTest, CleansUnreferencedMetadataArtifacts) {

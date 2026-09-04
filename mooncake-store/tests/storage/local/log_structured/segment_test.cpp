@@ -94,6 +94,17 @@ TEST(LogStructuredRecordTest, RejectsCorruptedHeaderAndFooter) {
     EXPECT_EQ(decoded_footer.error(), DecodeError::kFooterMismatch);
 }
 
+TEST(LogStructuredRecordTest, RejectsNonzeroReservedHeaderField) {
+    auto encoded =
+        EncodeRecord(Identity("key-d", 6), "payload", RecordKind::kValue, 8);
+    ASSERT_TRUE(encoded.has_value());
+    (*encoded)[60] = 1;
+
+    auto decoded = DecodeRecord(*encoded);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error(), DecodeError::kInvalidFlags);
+}
+
 TEST(LogStructuredRecordTest, RejectsTombstoneWithValue) {
     auto encoded = EncodeRecord(Identity("key-d", 6), "not-empty",
                                 RecordKind::kTombstone, 8);

@@ -25,7 +25,7 @@ struct LogStructuredBackendConfig {
     size_t compaction_fanout{4};
     uint32_t compaction_max_levels{4};
     size_t compaction_max_sources{8};
-    uint64_t compaction_max_bytes_per_round{1024ULL * 1024 * 1024};
+    uint64_t compaction_max_input_bytes{1024ULL * 1024 * 1024};
     uint64_t compaction_max_target_bytes{4ULL * 1024 * 1024 * 1024};
     uint64_t compaction_max_bytes_per_second{0};
     uint64_t compaction_reserve_bytes{0};

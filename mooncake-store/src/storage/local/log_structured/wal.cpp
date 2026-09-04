@@ -37,6 +37,7 @@ constexpr size_t kPhysicalLengthOffset = 72;
 constexpr size_t kTenantLengthOffset = 80;
 constexpr size_t kKeyLengthOffset = 84;
 constexpr size_t kHeaderChecksumOffset = 88;
+constexpr size_t kHeaderReservedOffset = 92;
 constexpr size_t kHeaderChecksumInputSize = kHeaderChecksumOffset;
 constexpr size_t kFooterPayloadChecksumOffset = 0;
 constexpr size_t kFooterChecksumOffset = 4;
@@ -67,8 +68,7 @@ bool IsKnownType(WalRecordType type) {
     return type == WalRecordType::kPrepareValue ||
            type == WalRecordType::kCommitValue ||
            type == WalRecordType::kAbortValue ||
-           type == WalRecordType::kApplyTombstone ||
-           type == WalRecordType::kCheckpoint;
+           type == WalRecordType::kApplyTombstone;
 }
 
 bool HasPhysicalRecord(const PhysicalRecord& physical) {
@@ -83,12 +83,6 @@ bool IsValidRecord(const WalRecord& record) {
     }
     if (record.type == WalRecordType::kPrepareValue) {
         return HasPhysicalRecord(record.physical);
-    }
-    if (record.type == WalRecordType::kCheckpoint) {
-        return record.identity.tenant_id.empty() &&
-               record.identity.object_key.empty() &&
-               record.identity.incarnation == ObjectIncarnation{} &&
-               !HasPhysicalRecord(record.physical);
     }
     return !HasPhysicalRecord(record.physical);
 }
@@ -197,7 +191,8 @@ tl::expected<WalRecord, WalError> DecodeWalRecord(std::span<const char> bytes) {
         ReadLittleEndian<uint16_t>(bytes.data() + kVersionOffset) !=
             kWalVersion ||
         Crc32cValue(bytes.data(), kHeaderChecksumInputSize) !=
-            ReadLittleEndian<uint32_t>(bytes.data() + kHeaderChecksumOffset)) {
+            ReadLittleEndian<uint32_t>(bytes.data() + kHeaderChecksumOffset) ||
+        ReadLittleEndian<uint32_t>(bytes.data() + kHeaderReservedOffset) != 0) {
         return tl::unexpected(WalError::kCorruptRecord);
     }
 
@@ -413,9 +408,6 @@ tl::expected<void, WalError> ReplayWal(const std::vector<WalRecord>& records,
             case WalRecordType::kApplyTombstone:
                 success = index.ApplyTombstone(record.identity, record.sequence)
                               .has_value();
-                break;
-            case WalRecordType::kCheckpoint:
-                success = true;
                 break;
         }
         if (!success) return tl::unexpected(WalError::kReplayFailed);

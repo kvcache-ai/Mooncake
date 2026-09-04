@@ -15,7 +15,6 @@ enum class WalRecordType : uint16_t {
     kCommitValue = 2,
     kAbortValue = 3,
     kApplyTombstone = 4,
-    kCheckpoint = 5,
 };
 
 enum class WalError {

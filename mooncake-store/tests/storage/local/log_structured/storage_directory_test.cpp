@@ -45,6 +45,19 @@ TEST(LogStructuredDirectoryTest, CreatesAndReusesStableIdentity) {
     EXPECT_EQ((*reopened)->identity(), identity);
 }
 
+TEST(LogStructuredDirectoryTest, RecoversStaleIdentityTemporaryFile) {
+    DirectoryTempPath temp;
+    std::filesystem::create_directories(temp.path());
+    std::ofstream(temp.path() / "IDENTITY.tmp", std::ios::binary)
+        << "incomplete";
+
+    auto directory = StorageDirectory::Open(temp.path().string());
+    ASSERT_TRUE(directory.has_value());
+    EXPECT_NE((*directory)->identity(), StorageIdentity{});
+    EXPECT_TRUE(std::filesystem::exists(temp.path() / "IDENTITY"));
+    EXPECT_FALSE(std::filesystem::exists(temp.path() / "IDENTITY.tmp"));
+}
+
 TEST(LogStructuredDirectoryTest, RejectsConcurrentMount) {
     DirectoryTempPath temp;
     auto first = StorageDirectory::Open(temp.path().string());

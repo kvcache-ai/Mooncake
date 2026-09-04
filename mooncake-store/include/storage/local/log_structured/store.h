@@ -30,12 +30,14 @@ enum class StoreError {
     kInvalidTransition,
     kNoSpace,
     kCancelled,
+    kRecoveryRequired,
 };
 
 struct LogStructuredStoreConfig {
     std::string root_path;
     uint64_t max_segment_bytes{256ULL * 1024 * 1024};
     uint64_t max_physical_bytes{std::numeric_limits<uint64_t>::max()};
+    uint64_t max_total_physical_bytes{std::numeric_limits<uint64_t>::max()};
     bool sync_data{true};
     bool sync_wal{true};
 };
@@ -85,6 +87,7 @@ enum class CompactionCrashPoint {
     kAfterTargetRename,
     kBeforeManifestWrite,
     kAfterManifestWrite,
+    kAfterCurrentRenameBeforeDirectorySync,
     kAfterManifestPublication,
     kAfterSourceUnlink,
 };
@@ -136,6 +139,7 @@ class LogStructuredStore {
         const std::unordered_map<uint64_t, std::vector<ScannedRecord>>&
             scanned_segments) const;
     void RefreshSegmentLiveBytes();
+    uint64_t PhysicalBytesLocked() const;
     tl::expected<void, StoreError> RotateSegmentIfNeeded(
         uint64_t next_record_bytes);
     tl::expected<void, StoreError> RotateActiveSegmentLocked();
@@ -164,6 +168,8 @@ class LogStructuredStore {
     uint64_t wal_generation_{1};
     uint64_t checkpoint_sequence_{0};
     uint64_t applied_delete_watermark_{0};
+    uint64_t compaction_reserved_bytes_{0};
+    bool recovery_required_{false};
 };
 
 }  // namespace mooncake::logstructured

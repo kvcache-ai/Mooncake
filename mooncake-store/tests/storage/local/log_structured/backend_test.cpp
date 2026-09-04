@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <future>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -179,7 +180,7 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     setenv("MOONCAKE_LOG_COMPACTION_FANOUT", "3", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MAX_LEVELS", "5", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MAX_SOURCES", "6", 1);
-    setenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND", "8192", 1);
+    setenv("MOONCAKE_LOG_COMPACTION_MAX_INPUT_BYTES", "8192", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES", "16384", 1);
     setenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_SEC", "32768", 1);
     setenv("MOONCAKE_LOG_COMPACTION_RESERVE_BYTES", "2048", 1);
@@ -195,7 +196,7 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     unsetenv("MOONCAKE_LOG_COMPACTION_FANOUT");
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_LEVELS");
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_SOURCES");
-    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_ROUND");
+    unsetenv("MOONCAKE_LOG_COMPACTION_MAX_INPUT_BYTES");
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_TARGET_BYTES");
     unsetenv("MOONCAKE_LOG_COMPACTION_MAX_BYTES_PER_SEC");
     unsetenv("MOONCAKE_LOG_COMPACTION_RESERVE_BYTES");
@@ -210,7 +211,7 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     EXPECT_EQ(config.compaction_fanout, size_t{3});
     EXPECT_EQ(config.compaction_max_levels, uint32_t{5});
     EXPECT_EQ(config.compaction_max_sources, size_t{6});
-    EXPECT_EQ(config.compaction_max_bytes_per_round, uint64_t{8192});
+    EXPECT_EQ(config.compaction_max_input_bytes, uint64_t{8192});
     EXPECT_EQ(config.compaction_max_target_bytes, uint64_t{16384});
     EXPECT_EQ(config.compaction_max_bytes_per_second, uint64_t{32768});
     EXPECT_EQ(config.compaction_reserve_bytes, uint64_t{2048});
@@ -271,6 +272,74 @@ TEST(LogStructuredStorageBackendTest, BackgroundTieringKeepsObjectsReadable) {
 }
 
 TEST(LogStructuredStorageBackendTest,
+     BatchLoadCompletesWhileBackgroundCompactionCopies) {
+    BackendTempDirectory temp;
+    auto config = BackendConfig(temp);
+    LogStructuredBackendConfig backend_config;
+    backend_config.segment_size_bytes = 512;
+    backend_config.sync_policy = LogStructuredSyncPolicy::kBatch;
+    backend_config.checkpoint_interval_records = 1000;
+    backend_config.compaction_policy =
+        LogStructuredCompactionPolicy::kReclaimOnly;
+    backend_config.compaction_interval_ms = 5;
+    backend_config.compaction_min_reclaim_ratio = 0.0;
+
+    std::promise<void> target_ready;
+    std::promise<void> allow_publication;
+    auto allow_publication_future = allow_publication.get_future().share();
+    std::atomic<bool> blocked{false};
+    logstructured::LogStructuredStore::SetCompactionCrashPredicateForTest(
+        [&](logstructured::CompactionCrashPoint point) {
+            if (point !=
+                    logstructured::CompactionCrashPoint::kAfterTargetRename ||
+                blocked.exchange(true)) {
+                return false;
+            }
+            target_ready.set_value();
+            allow_publication_future.wait();
+            return false;
+        });
+
+    LogStructuredStorageBackend backend(config, backend_config);
+    ASSERT_TRUE(backend.Init().has_value());
+    const std::string stale_key =
+        TenantId("tenant-peer").MakeScopedKey("stale");
+    const std::string live_key = TenantId("tenant-peer").MakeScopedKey("live");
+    std::string stale_value(96, 'a');
+    std::string live_value(96, 'b');
+    std::string replacement_value(96, 'c');
+    const auto commit = [](const std::vector<std::string>&,
+                           std::vector<StorageObjectMetadata>&) {
+        return ErrorCode::OK;
+    };
+    ASSERT_TRUE(
+        backend.BatchOffload(SingleValueBatch(stale_key, stale_value), commit)
+            .has_value());
+    ASSERT_TRUE(
+        backend.BatchOffload(SingleValueBatch(live_key, live_value), commit)
+            .has_value());
+    ASSERT_TRUE(backend
+                    .BatchOffload(
+                        SingleValueBatch(stale_key, replacement_value), commit)
+                    .has_value());
+
+    ASSERT_EQ(target_ready.get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+    std::string loaded(live_value.size(), '\0');
+    std::unordered_map<std::string, Slice> slices{
+        {live_key, Slice{loaded.data(), loaded.size()}}};
+    auto read = std::async(std::launch::async,
+                           [&]() { return backend.BatchLoad(slices); });
+    ASSERT_EQ(read.wait_for(std::chrono::seconds(1)),
+              std::future_status::ready);
+    ASSERT_TRUE(read.get().has_value());
+    EXPECT_EQ(loaded, live_value);
+
+    allow_publication.set_value();
+    logstructured::LogStructuredStore::SetCompactionCrashPredicateForTest({});
+}
+
+TEST(LogStructuredStorageBackendTest,
      CapacityLimitRejectsAppendAndPreservesCommittedValue) {
     BackendTempDirectory temp;
     auto config = BackendConfig(temp);
@@ -317,7 +386,7 @@ TEST(LogStructuredStorageBackendTest,
     backend_config.compaction_policy = LogStructuredCompactionPolicy::kNone;
     backend_config.compaction_reserve_bytes = 256;
     backend_config.compaction_max_sources = 8;
-    backend_config.compaction_max_bytes_per_round = 4096;
+    backend_config.compaction_max_input_bytes = 4096;
     backend_config.compaction_max_target_bytes = 4096;
 
     LogStructuredStorageBackend backend(config, backend_config);

@@ -174,5 +174,36 @@ TEST(LogStructuredIndexTest, ReclaimClearsOnlyDeadPhysicalMappings) {
     EXPECT_TRUE(index.LookupCommitted(current_identity).has_value());
 }
 
+TEST(LogStructuredIndexTest, RestoreRejectsUnknownVersionState) {
+    VersionIndex index;
+    auto version = VersionEntry{.physical = Physical(1, 0),
+                                .state = static_cast<VersionState>(255),
+                                .sequence = 1,
+                                .mutation_epoch = 1};
+    auto restored =
+        index.Restore({{.identity = Identity("key", 1), .version = version}});
+    ASSERT_FALSE(restored.has_value());
+    EXPECT_EQ(restored.error(), IndexError::kInvalidTransition);
+}
+
+TEST(LogStructuredIndexTest, RestoreRejectsMultipleCommittedIncarnations) {
+    VersionIndex index;
+    const auto first = IndexSnapshotEntry{
+        .identity = Identity("key", 1),
+        .version = VersionEntry{.physical = Physical(1, 0),
+                                .state = VersionState::kCommitted,
+                                .sequence = 1,
+                                .mutation_epoch = 1}};
+    const auto second = IndexSnapshotEntry{
+        .identity = Identity("key", 2),
+        .version = VersionEntry{.physical = Physical(1, 128),
+                                .state = VersionState::kCommitted,
+                                .sequence = 2,
+                                .mutation_epoch = 1}};
+    auto restored = index.Restore({first, second});
+    ASSERT_FALSE(restored.has_value());
+    EXPECT_EQ(restored.error(), IndexError::kInvalidTransition);
+}
+
 }  // namespace
 }  // namespace mooncake::logstructured

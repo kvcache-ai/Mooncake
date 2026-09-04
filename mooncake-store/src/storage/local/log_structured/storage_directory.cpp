@@ -139,13 +139,15 @@ tl::expected<StorageIdentity, StorageDirectoryError> CreateIdentity(
     const std::string temporary_path = root_path + "/IDENTITY.tmp";
     const std::string final_path = root_path + "/IDENTITY";
     const int fd = open(temporary_path.c_str(),
-                        O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0644);
+                        O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
     if (fd < 0) return tl::unexpected(StorageDirectoryError::kIoError);
     const bool data_written = WriteAll(fd, bytes.data(), bytes.size());
     const bool data_synced = data_written && fsync(fd) == 0;
     const int close_result = close(fd);
     if (!data_synced || close_result != 0) {
+        const int saved_errno = errno;
         unlink(temporary_path.c_str());
+        errno = saved_errno;
         return tl::unexpected(StorageDirectoryError::kIoError);
     }
     if (rename(temporary_path.c_str(), final_path.c_str()) != 0) {

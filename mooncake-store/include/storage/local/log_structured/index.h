@@ -73,6 +73,7 @@ class VersionIndex {
         const std::vector<CompactionIndexUpdate>& updates);
     void ReclaimNonCurrentVersionsInSegments(
         const std::unordered_set<uint64_t>& segment_ids);
+    void ReclaimNonCommittedVersionsAfterRecovery();
 
     std::optional<VersionEntry> LookupCommitted(
         const RecordIdentity& identity) const;

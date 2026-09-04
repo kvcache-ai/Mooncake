@@ -56,6 +56,7 @@ struct ManifestState {
 enum class MetadataError {
     kInvalidArgument,
     kIoError,
+    kPublicationUncertain,
     kCorruptData,
     kNotFound,
 };
@@ -67,7 +68,8 @@ tl::expected<CheckpointState, MetadataError> LoadCheckpoint(
     const std::string& root_path, const std::string& checkpoint_file);
 tl::expected<void, MetadataError> PublishManifest(
     const std::string& root_path, const ManifestState& manifest,
-    std::function<bool()> fail_before_current = {});
+    std::function<bool()> fail_before_current = {},
+    std::function<bool()> fail_after_current_rename = {});
 tl::expected<ManifestState, MetadataError> LoadCurrentManifest(
     const std::string& root_path);
 tl::expected<void, MetadataError> RemoveFileDurably(

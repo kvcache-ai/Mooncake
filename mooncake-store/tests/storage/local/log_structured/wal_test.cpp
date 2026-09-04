@@ -89,6 +89,31 @@ TEST(LogStructuredWalTest, AppendsScansAndReplaysTransitions) {
     EXPECT_EQ(committed->physical, WalPhysical(1, 0));
 }
 
+TEST(LogStructuredWalTest, RejectsNonzeroReservedHeaderField) {
+    WalTempDirectory temp;
+    const auto path = temp.File("WAL-reserved");
+    auto writer = WalWriter::Create(path.string());
+    ASSERT_TRUE(writer.has_value());
+    ASSERT_TRUE(
+        (*writer)
+            ->Append(Transition(WalRecordType::kPrepareValue,
+                                WalIdentity("key", 1), 1, WalPhysical(1, 0)),
+                     true)
+            .has_value());
+    writer.value().reset();
+
+    const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    const char reserved = 1;
+    ASSERT_EQ(pwrite(fd, &reserved, 1, 92), 1);
+    ASSERT_EQ(close(fd), 0);
+
+    auto scan = ScanWal(path.string());
+    ASSERT_TRUE(scan.has_value());
+    EXPECT_EQ(scan->termination, WalScanTermination::kCorruptRecord);
+    EXPECT_EQ(scan->valid_bytes, uint64_t{0});
+}
+
 TEST(LogStructuredWalTest, IncompleteTailIsTruncatedBeforeAppend) {
     WalTempDirectory temp;
     const auto path = temp.File("WAL-000002");

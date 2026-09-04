@@ -23,8 +23,12 @@ std::mutex compaction_crash_mutex;
 std::function<bool(CompactionCrashPoint)> compaction_crash_predicate;
 
 bool HitCompactionCrashPoint(CompactionCrashPoint point) {
-    std::lock_guard lock(compaction_crash_mutex);
-    return compaction_crash_predicate && compaction_crash_predicate(point);
+    std::function<bool(CompactionCrashPoint)> predicate;
+    {
+        std::lock_guard lock(compaction_crash_mutex);
+        predicate = compaction_crash_predicate;
+    }
+    return predicate && predicate(point);
 }
 
 std::optional<uint64_t> ParseSegmentId(std::string_view name) {
@@ -85,12 +89,83 @@ bool SyncDirectory(const std::string& path) {
     return synced && closed;
 }
 
+class ScopeExit {
+   public:
+    explicit ScopeExit(std::function<void()> callback)
+        : callback_(std::move(callback)) {}
+    ~ScopeExit() { callback_(); }
+
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+
+   private:
+    std::function<void()> callback_;
+};
+
 bool IsCompactionOnly(const SegmentScanResult& scan) {
     return !scan.records.empty() &&
            std::all_of(scan.records.begin(), scan.records.end(),
                        [](const ScannedRecord& record) {
                            return record.kind == RecordKind::kCompactionCopy;
                        });
+}
+
+bool IsKnownSegmentLifecycle(SegmentLifecycle state) {
+    switch (state) {
+        case SegmentLifecycle::kCreating:
+        case SegmentLifecycle::kActive:
+        case SegmentLifecycle::kSealing:
+        case SegmentLifecycle::kSealed:
+        case SegmentLifecycle::kCompacting:
+        case SegmentLifecycle::kRetired:
+            return true;
+    }
+    return false;
+}
+
+bool ValidatePersistentMetadata(const CheckpointState& checkpoint,
+                                const ManifestState& manifest) {
+    if (checkpoint.next_sequence == 0 || checkpoint.next_segment_id == 0 ||
+        checkpoint.checkpoint_sequence != checkpoint.next_sequence - 1 ||
+        checkpoint.applied_delete_watermark > checkpoint.checkpoint_sequence ||
+        manifest.active_segment_id == 0) {
+        return false;
+    }
+
+    std::unordered_set<uint64_t> segment_ids;
+    size_t active_segments = 0;
+    bool declared_active_found = false;
+    for (const auto& segment : checkpoint.segments) {
+        if (!IsKnownSegmentLifecycle(segment.state) ||
+            segment.segment_id == 0 ||
+            segment.segment_id >= checkpoint.next_segment_id ||
+            segment.state == SegmentLifecycle::kCreating ||
+            segment.live_bytes > segment.valid_bytes ||
+            segment.mutation_epoch == 0 ||
+            !segment_ids.insert(segment.segment_id).second) {
+            return false;
+        }
+        if (segment.state == SegmentLifecycle::kActive) {
+            ++active_segments;
+            if (segment.segment_id != manifest.active_segment_id) return false;
+        }
+        if (segment.segment_id == manifest.active_segment_id) {
+            declared_active_found = true;
+            if (segment.state != SegmentLifecycle::kActive &&
+                segment.state != SegmentLifecycle::kSealing) {
+                return false;
+            }
+        }
+    }
+    if (!declared_active_found || active_segments > 1) return false;
+
+    for (const auto& item : checkpoint.index) {
+        if (item.version.sequence == 0 ||
+            item.version.sequence > checkpoint.checkpoint_sequence) {
+            return false;
+        }
+    }
+    return true;
 }
 
 }  // namespace
@@ -108,7 +183,8 @@ void LogStructuredStore::SetCompactionCrashPredicateForTest(
 
 tl::expected<std::unique_ptr<LogStructuredStore>, StoreError>
 LogStructuredStore::Open(LogStructuredStoreConfig config) {
-    if (config.root_path.empty() || config.max_segment_bytes == 0) {
+    if (config.root_path.empty() || config.max_segment_bytes == 0 ||
+        config.max_physical_bytes > config.max_total_physical_bytes) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
     auto store = std::unique_ptr<LogStructuredStore>(
@@ -162,7 +238,8 @@ tl::expected<void, StoreError> LogStructuredStore::Recover() {
             checkpoint->checkpoint_sequence != manifest->checkpoint_sequence ||
             checkpoint->next_sequence != manifest->next_sequence ||
             checkpoint->next_segment_id != manifest->next_segment_id ||
-            checkpoint->segments != manifest->segments) {
+            checkpoint->segments != manifest->segments ||
+            !ValidatePersistentMetadata(*checkpoint, *manifest)) {
             return tl::unexpected(StoreError::kCorruptData);
         }
         auto restored = index_.Restore(checkpoint->index);
@@ -175,7 +252,9 @@ tl::expected<void, StoreError> LogStructuredStore::Recover() {
         expected_segments = manifest->segments;
         expected_active_segment = manifest->active_segment_id;
         auto wal_generation = ParseNumberedName(manifest->wal_file, "WAL-");
-        if (!wal_generation) return tl::unexpected(StoreError::kCorruptData);
+        if (!wal_generation || *wal_generation == 0) {
+            return tl::unexpected(StoreError::kCorruptData);
+        }
         wal_generation_ = *wal_generation;
         wal_path_ = config_.root_path + "/" + manifest->wal_file;
     } else if (error) {
@@ -198,6 +277,7 @@ tl::expected<void, StoreError> LogStructuredStore::Recover() {
         }
         auto replayed = ReplayWal(scan->records, index_);
         if (!replayed) return tl::unexpected(StoreError::kCorruptData);
+        index_.ReclaimNonCommittedVersionsAfterRecovery();
         auto opened = WalWriter::OpenForAppend(wal_path_, scan->valid_bytes);
         if (!opened) return tl::unexpected(StoreError::kIoError);
         wal_ = std::move(opened.value());
@@ -206,7 +286,10 @@ tl::expected<void, StoreError> LogStructuredStore::Recover() {
             return tl::unexpected(StoreError::kCorruptData);
         }
         auto created = WalWriter::Create(wal_path_);
-        if (!created) return tl::unexpected(StoreError::kIoError);
+        if (!created || !(*created)->Sync() ||
+            !SyncDirectory(config_.root_path)) {
+            return tl::unexpected(StoreError::kIoError);
+        }
         wal_ = std::move(created.value());
     }
 
@@ -242,7 +325,19 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
 
     for (const auto& segment : expected_segments) {
         if (segment.segment_id == 0 ||
-            !segments_.emplace(segment.segment_id, segment).second) {
+            segment.state == SegmentLifecycle::kCreating) {
+            return tl::unexpected(StoreError::kCorruptData);
+        }
+        auto recovered_segment = segment;
+        if (recovered_segment.state == SegmentLifecycle::kSealing ||
+            recovered_segment.state == SegmentLifecycle::kCompacting) {
+            recovered_segment.state = SegmentLifecycle::kSealed;
+            ++recovered_segment.mutation_epoch;
+        }
+        if (!segments_
+                 .emplace(recovered_segment.segment_id,
+                          std::move(recovered_segment))
+                 .second) {
             return tl::unexpected(StoreError::kCorruptData);
         }
         if (!ordered_segments.contains(segment.segment_id) &&
@@ -250,31 +345,26 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
             return tl::unexpected(StoreError::kCorruptData);
         }
     }
-    for (const auto& [segment_id, path] : ordered_segments) {
-        static_cast<void>(path);
-        if (!expected_segments.empty() && !segments_.contains(segment_id) &&
-            segment_id < post_checkpoint_segment_floor) {
-            return tl::unexpected(StoreError::kCorruptData);
-        }
-    }
-
     for (auto it = ordered_segments.begin(); it != ordered_segments.end();) {
-        if (segments_.contains(it->first) ||
-            it->first < post_checkpoint_segment_floor) {
+        if (segments_.contains(it->first)) {
             ++it;
             continue;
         }
         auto scan = ScanSegment(it->second, it->first);
         if (!scan) return tl::unexpected(StoreError::kCorruptData);
-        if (scan->termination != ScanTermination::kCleanEof ||
-            !IsCompactionOnly(*scan)) {
-            ++it;
+        if (scan->termination == ScanTermination::kCleanEof &&
+            IsCompactionOnly(*scan)) {
+            const auto filename = fs::path(it->second).filename().string();
+            auto removed = RemoveFileDurably(segments_path_, filename);
+            if (!removed) return tl::unexpected(StoreError::kIoError);
+            it = ordered_segments.erase(it);
             continue;
         }
-        const auto filename = fs::path(it->second).filename().string();
-        auto removed = RemoveFileDurably(segments_path_, filename);
-        if (!removed) return tl::unexpected(StoreError::kIoError);
-        it = ordered_segments.erase(it);
+        if (!expected_segments.empty() &&
+            it->first < post_checkpoint_segment_floor) {
+            return tl::unexpected(StoreError::kCorruptData);
+        }
+        ++it;
     }
 
     uint64_t active_segment_id = checkpoint_active_segment_id;
@@ -291,6 +381,12 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
 
     std::unordered_map<uint64_t, std::vector<ScannedRecord>> scanned_segments;
     for (const auto& [segment_id, path] : ordered_segments) {
+        auto metadata = segments_.find(segment_id);
+        if (metadata != segments_.end() &&
+            metadata->second.state == SegmentLifecycle::kRetired) {
+            segment_paths_.emplace(segment_id, path);
+            continue;
+        }
         auto scan = ScanSegment(path, segment_id);
         if (!scan) return tl::unexpected(StoreError::kCorruptData);
         if (scan->termination == ScanTermination::kCorruptRecord ||
@@ -303,7 +399,7 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
             if (!truncated) return tl::unexpected(StoreError::kIoError);
         }
 
-        auto metadata = segments_.find(segment_id);
+        metadata = segments_.find(segment_id);
         if (metadata == segments_.end()) {
             segments_.emplace(
                 segment_id,
@@ -359,10 +455,13 @@ tl::expected<void, StoreError> LogStructuredStore::RecoverSegments(
     }
 
     if (active_segment_id == 0) {
-        const uint64_t segment_id = next_segment_id_++;
+        const uint64_t segment_id = next_segment_id_;
         const std::string path = SegmentPath(segment_id);
         auto created = SegmentWriter::Create(path, segment_id);
-        if (!created) return tl::unexpected(StoreError::kIoError);
+        if (!created || !SyncDirectory(segments_path_)) {
+            return tl::unexpected(StoreError::kIoError);
+        }
+        ++next_segment_id_;
         segment_paths_.emplace(segment_id, path);
         segments_.emplace(segment_id,
                           SegmentMetadata{.segment_id = segment_id,
@@ -395,7 +494,10 @@ tl::expected<void, StoreError> LogStructuredStore::ValidateIndexRecords(
     const std::unordered_map<uint64_t, std::vector<ScannedRecord>>&
         scanned_segments) const {
     for (const auto& snapshot : index_.Snapshot()) {
-        if (snapshot.version.physical.total_length == 0) continue;
+        if (snapshot.version.state != VersionState::kCommitted) continue;
+        if (snapshot.version.physical.total_length == 0) {
+            return tl::unexpected(StoreError::kCorruptData);
+        }
         auto segment =
             scanned_segments.find(snapshot.version.physical.segment_id);
         if (segment == scanned_segments.end()) {
@@ -415,13 +517,29 @@ tl::expected<void, StoreError> LogStructuredStore::ValidateIndexRecords(
     return {};
 }
 
+uint64_t LogStructuredStore::PhysicalBytesLocked() const {
+    uint64_t physical_bytes = 0;
+    for (const auto& [segment_id, segment] : segments_) {
+        static_cast<void>(segment_id);
+        if (segment.valid_bytes >
+            std::numeric_limits<uint64_t>::max() - physical_bytes) {
+            return std::numeric_limits<uint64_t>::max();
+        }
+        physical_bytes += segment.valid_bytes;
+    }
+    return physical_bytes;
+}
+
 void LogStructuredStore::RefreshSegmentLiveBytes() {
     for (auto& [segment_id, segment] : segments_) {
         static_cast<void>(segment_id);
         segment.live_bytes = 0;
     }
     for (const auto& item : index_.Snapshot()) {
-        if (item.version.state != VersionState::kCommitted) continue;
+        if (item.version.state != VersionState::kCommitted &&
+            item.version.state != VersionState::kPrepared) {
+            continue;
+        }
         auto segment = segments_.find(item.version.physical.segment_id);
         if (segment != segments_.end()) {
             segment->second.live_bytes += item.version.physical.total_length;
@@ -446,12 +564,15 @@ tl::expected<void, StoreError> LogStructuredStore::RotateActiveSegmentLocked() {
     if (old_metadata == segments_.end()) {
         return tl::unexpected(StoreError::kCorruptData);
     }
-    old_metadata->second.state = SegmentLifecycle::kSealed;
-    ++old_metadata->second.mutation_epoch;
-    const uint64_t segment_id = next_segment_id_++;
+    const uint64_t segment_id = next_segment_id_;
     const std::string path = SegmentPath(segment_id);
     auto created = SegmentWriter::Create(path, segment_id);
-    if (!created) return tl::unexpected(StoreError::kIoError);
+    if (!created || !SyncDirectory(segments_path_)) {
+        return tl::unexpected(StoreError::kIoError);
+    }
+    old_metadata->second.state = SegmentLifecycle::kSealed;
+    ++old_metadata->second.mutation_epoch;
+    ++next_segment_id_;
     segment_paths_.emplace(segment_id, path);
     segments_.emplace(segment_id,
                       SegmentMetadata{.segment_id = segment_id,
@@ -483,6 +604,9 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePut(
 
 tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
     const RecordIdentity& identity, std::string_view value) {
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     if (identity.tenant_id.size() > kMaxTenantLength ||
         identity.object_key.size() > kMaxKeyLength) {
         return tl::unexpected(StoreError::kInvalidArgument);
@@ -493,15 +617,14 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
     if (record_bytes == 0) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
-    uint64_t physical_bytes = 0;
-    for (const auto& [segment_id, segment] : segments_) {
-        static_cast<void>(segment_id);
-        if (segment.valid_bytes > config_.max_physical_bytes - physical_bytes) {
-            return tl::unexpected(StoreError::kNoSpace);
-        }
-        physical_bytes += segment.valid_bytes;
-    }
-    if (record_bytes > config_.max_physical_bytes - physical_bytes) {
+    const uint64_t physical_bytes = PhysicalBytesLocked();
+    if (physical_bytes > config_.max_physical_bytes ||
+        record_bytes > config_.max_physical_bytes - physical_bytes ||
+        physical_bytes > config_.max_total_physical_bytes ||
+        compaction_reserved_bytes_ >
+            config_.max_total_physical_bytes - physical_bytes ||
+        record_bytes > config_.max_total_physical_bytes - physical_bytes -
+                           compaction_reserved_bytes_) {
         return tl::unexpected(StoreError::kNoSpace);
     }
     auto rotated = RotateSegmentIfNeeded(record_bytes);
@@ -531,6 +654,9 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
 tl::expected<void, StoreError> LogStructuredStore::CommitPut(
     const RecordIdentity& identity, uint64_t sequence) {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     auto current = index_.Lookup(identity);
     if (!current) return tl::unexpected(StoreError::kNotFound);
     if (current->state == VersionState::kCommitted &&
@@ -556,6 +682,9 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
 tl::expected<void, StoreError> LogStructuredStore::AbortPut(
     const RecordIdentity& identity, uint64_t sequence) {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     auto current = index_.Lookup(identity);
     if (!current) return tl::unexpected(StoreError::kNotFound);
     if (current->state == VersionState::kAborted &&
@@ -580,6 +709,9 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPut(
 tl::expected<void, StoreError> LogStructuredStore::Delete(
     const RecordIdentity& identity) {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     if (identity.tenant_id.size() > kMaxTenantLength ||
         identity.object_key.size() > kMaxKeyLength) {
         return tl::unexpected(StoreError::kInvalidArgument);
@@ -587,6 +719,15 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
     const uint64_t record_bytes =
         AlignedRecordSize(static_cast<uint32_t>(identity.tenant_id.size()),
                           static_cast<uint32_t>(identity.object_key.size()), 0);
+    const uint64_t physical_bytes = PhysicalBytesLocked();
+    if (record_bytes == 0 ||
+        physical_bytes > config_.max_total_physical_bytes ||
+        compaction_reserved_bytes_ >
+            config_.max_total_physical_bytes - physical_bytes ||
+        record_bytes > config_.max_total_physical_bytes - physical_bytes -
+                           compaction_reserved_bytes_) {
+        return tl::unexpected(StoreError::kNoSpace);
+    }
     auto rotated = RotateSegmentIfNeeded(record_bytes);
     if (!rotated) return tl::unexpected(rotated.error());
     const uint64_t sequence = next_sequence_++;
@@ -615,6 +756,9 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
 
 tl::expected<void, StoreError> LogStructuredStore::Sync() {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     if (!active_segment_->Sync() || !wal_->Sync()) {
         return tl::unexpected(StoreError::kIoError);
     }
@@ -623,6 +767,9 @@ tl::expected<void, StoreError> LogStructuredStore::Sync() {
 
 tl::expected<void, StoreError> LogStructuredStore::SealActiveSegment() {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     if (active_segment_->tail() == 0) return {};
     return RotateActiveSegmentLocked();
 }
@@ -633,6 +780,9 @@ tl::expected<void, StoreError> LogStructuredStore::Checkpoint() {
 }
 
 tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     if (!active_segment_->Sync() || !wal_->Sync()) {
         return tl::unexpected(StoreError::kIoError);
     }
@@ -643,7 +793,15 @@ tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
     segment_snapshot.reserve(segments_.size());
     for (const auto& [segment_id, segment] : segments_) {
         static_cast<void>(segment_id);
-        segment_snapshot.push_back(segment);
+        if (segment.state == SegmentLifecycle::kCreating) {
+            return tl::unexpected(StoreError::kInvalidTransition);
+        }
+        auto stable_segment = segment;
+        if (stable_segment.state == SegmentLifecycle::kSealing ||
+            stable_segment.state == SegmentLifecycle::kCompacting) {
+            stable_segment.state = SegmentLifecycle::kSealed;
+        }
+        segment_snapshot.push_back(std::move(stable_segment));
     }
     CheckpointState checkpoint{
         .format_version = 1,
@@ -678,12 +836,22 @@ tl::expected<void, StoreError> LogStructuredStore::CheckpointLocked() {
     if (HitCompactionCrashPoint(CompactionCrashPoint::kBeforeManifestWrite)) {
         return tl::unexpected(StoreError::kIoError);
     }
-    auto published = PublishManifest(config_.root_path, manifest, [] {
-        return HitCompactionCrashPoint(
-            CompactionCrashPoint::kAfterManifestWrite);
-    });
+    auto published = PublishManifest(
+        config_.root_path, manifest,
+        [] {
+            return HitCompactionCrashPoint(
+                CompactionCrashPoint::kAfterManifestWrite);
+        },
+        [] {
+            return HitCompactionCrashPoint(
+                CompactionCrashPoint::kAfterCurrentRenameBeforeDirectorySync);
+        });
     if (!published) {
-        RemoveFileDurably(config_.root_path, next_wal_file);
+        if (published.error() == MetadataError::kPublicationUncertain) {
+            recovery_required_ = true;
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
+        static_cast<void>(RemoveFileDurably(config_.root_path, next_wal_file));
         return tl::unexpected(StoreError::kIoError);
     }
 
@@ -744,14 +912,25 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
 
     {
         std::lock_guard lock(mutex_);
+        if (recovery_required_) {
+            return tl::unexpected(StoreError::kRecoveryRequired);
+        }
         CleanupRetiredSegmentsLocked();
         RefreshSegmentLiveBytes();
+        std::unordered_set<uint64_t> prepared_segments;
+        for (const auto& entry : index_.Snapshot()) {
+            if (entry.version.state == VersionState::kPrepared &&
+                entry.version.physical.total_length != 0) {
+                prepared_segments.insert(entry.version.physical.segment_id);
+            }
+        }
         std::vector<SegmentMetadata> sealed;
         for (const auto& [segment_id, segment] : segments_) {
             static_cast<void>(segment_id);
             if (segment.state != SegmentLifecycle::kSealed ||
                 segment.valid_bytes == 0 ||
-                segment.live_bytes > segment.valid_bytes) {
+                segment.live_bytes > segment.valid_bytes ||
+                prepared_segments.contains(segment.segment_id)) {
                 continue;
             }
             sealed.push_back(segment);
@@ -795,6 +974,13 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 break;
             }
         }
+        const uint64_t physical_bytes = PhysicalBytesLocked();
+        const uint64_t available_total_bytes =
+            physical_bytes < config_.max_total_physical_bytes
+                ? config_.max_total_physical_bytes - physical_bytes
+                : 0;
+        const uint64_t temporary_budget =
+            std::min(options.max_temporary_bytes, available_total_bytes);
         std::vector<SegmentMetadata> bounded_sources;
         bounded_sources.reserve(
             std::min(sources.size(), options.max_source_segments));
@@ -808,9 +994,8 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                      options.max_input_bytes - selected_bytes)) {
                 break;
             }
-            if (selected_live_bytes > options.max_temporary_bytes ||
-                source.live_bytes >
-                    options.max_temporary_bytes - selected_live_bytes) {
+            if (selected_live_bytes > temporary_budget ||
+                source.live_bytes > temporary_budget - selected_live_bytes) {
                 continue;
             }
             bounded_sources.push_back(source);
@@ -822,7 +1007,7 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         if (sources.empty()) return CompactionResult{};
 
         std::unordered_set<uint64_t> source_ids;
-        for (auto& source : sources) {
+        for (const auto& source : sources) {
             source_ids.insert(source.segment_id);
             input_bytes += source.valid_bytes;
             const uint32_t next_level =
@@ -833,6 +1018,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
                 return tl::unexpected(StoreError::kCorruptData);
             }
             source_paths.emplace(source.segment_id, path->second);
+        }
+        compaction_reserved_bytes_ = selected_live_bytes;
+        for (auto& source : sources) {
             auto& current = segments_.at(source.segment_id);
             current.state = SegmentLifecycle::kCompacting;
             ++current.mutation_epoch;
@@ -848,6 +1036,11 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
             reserved_target_ids.push_back(next_segment_id_++);
         }
     }
+
+    const ScopeExit release_reservation([this] {
+        std::lock_guard lock(mutex_);
+        compaction_reserved_bytes_ = 0;
+    });
 
     target_level = std::min(target_level, options.max_levels - 1);
     uint64_t target_bytes = config_.max_segment_bytes;
@@ -1048,6 +1241,9 @@ tl::expected<CompactionResult, StoreError> LogStructuredStore::CompactOnce(
         RefreshSegmentLiveBytes();
         auto checkpointed = CheckpointLocked();
         if (!checkpointed) {
+            if (checkpointed.error() == StoreError::kRecoveryRequired) {
+                return tl::unexpected(StoreError::kRecoveryRequired);
+            }
             static_cast<void>(index_.Restore(index_before));
             for (const auto& target : targets) {
                 segment_paths_.erase(target.segment_id);
@@ -1100,6 +1296,9 @@ tl::expected<std::string, StoreError> LogStructuredStore::ReadEntryLocked(
 tl::expected<std::string, StoreError> LogStructuredStore::Get(
     const RecordIdentity& identity) const {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     auto version = index_.LookupCommitted(identity);
     if (!version) return tl::unexpected(StoreError::kNotFound);
     return ReadEntryLocked(
@@ -1109,6 +1308,9 @@ tl::expected<std::string, StoreError> LogStructuredStore::Get(
 tl::expected<std::string, StoreError> LogStructuredStore::GetLatest(
     std::string_view tenant_id, std::string_view object_key) const {
     std::lock_guard lock(mutex_);
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
     auto entry = index_.LookupCurrent(tenant_id, object_key);
     if (!entry) return tl::unexpected(StoreError::kNotFound);
     return ReadEntryLocked(*entry);

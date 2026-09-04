@@ -203,6 +203,9 @@ tl::expected<RecordHeader, DecodeError> DecodeRecordHeader(
         expected_header_checksum) {
         return tl::unexpected(DecodeError::kHeaderChecksumMismatch);
     }
+    if (ReadLittleEndian<uint32_t>(bytes.data() + kHeaderReservedOffset) != 0) {
+        return tl::unexpected(DecodeError::kInvalidFlags);
+    }
 
     RecordHeader header;
     header.kind = kind;

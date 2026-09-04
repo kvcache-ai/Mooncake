@@ -351,7 +351,66 @@ TEST(LogStructuredStoreTest, PreparedValueRemainsInvisibleAfterRestart) {
     const auto snapshot = (*recovered)->SnapshotIndex();
     ASSERT_EQ(snapshot.size(), size_t{1});
     EXPECT_EQ(snapshot[0].identity, identity);
-    EXPECT_EQ(snapshot[0].version.state, VersionState::kPrepared);
+    EXPECT_EQ(snapshot[0].version.state, VersionState::kReclaimable);
+    EXPECT_EQ(snapshot[0].version.physical, PhysicalRecord{});
+    ASSERT_TRUE((*recovered)->SealActiveSegment().has_value());
+    auto compacted = (*recovered)
+                         ->CompactOnce({.max_source_segments = 1,
+                                        .max_input_bytes = 4096,
+                                        .max_target_bytes = 4096,
+                                        .fanout = 2,
+                                        .max_levels = 2,
+                                        .min_reclaim_ratio = 0.0,
+                                        .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_GT(compacted->reclaimed_bytes, uint64_t{0});
+}
+
+TEST(LogStructuredStoreTest, TornPreparedValueIsDiscardedOnRecovery) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("prepared", 1);
+    PhysicalRecord physical;
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        auto prepared = (*store)->PreparePut(identity, std::string(96, 'a'));
+        ASSERT_TRUE(prepared.has_value());
+        physical = prepared->physical;
+    }
+    std::filesystem::resize_file(
+        SegmentFile(temp, physical.segment_id),
+        physical.record_offset + physical.total_length / 2);
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(identity).error(), StoreError::kNotFound);
+    const auto snapshot = (*recovered)->SnapshotIndex();
+    ASSERT_EQ(snapshot.size(), size_t{1});
+    EXPECT_EQ(snapshot[0].version.state, VersionState::kReclaimable);
+    EXPECT_EQ(snapshot[0].version.physical, PhysicalRecord{});
+}
+
+TEST(LogStructuredStoreTest, PreparedValuePinsSealedSegmentUntilResolved) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 4096));
+    ASSERT_TRUE(store.has_value());
+    const auto identity = StoreIdentity("prepared", 1);
+    auto prepared = (*store)->PreparePut(identity, std::string(96, 'a'));
+    ASSERT_TRUE(prepared.has_value());
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                            .max_input_bytes = 4096,
+                                            .max_target_bytes = 4096,
+                                            .fanout = 2,
+                                            .max_levels = 2,
+                                            .min_reclaim_ratio = 0.0,
+                                            .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{0});
+    ASSERT_TRUE((*store)->CommitPut(identity, prepared->sequence).has_value());
+    EXPECT_EQ((*store)->Get(identity).value(), std::string(96, 'a'));
 }
 
 TEST(LogStructuredStoreTest, MissingCommittedCompactionTargetFailsClosed) {
@@ -393,6 +452,83 @@ TEST(LogStructuredStoreTest, MissingCommittedCompactionTargetFailsClosed) {
     auto recovered = LogStructuredStore::Open(Config(temp, 512));
     ASSERT_FALSE(recovered.has_value());
     EXPECT_EQ(recovered.error(), StoreError::kCorruptData);
+}
+
+TEST(LogStructuredStoreTest, RejectsSemanticallyInvalidCheckpoint) {
+    StoreTempDirectory temp;
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        const auto identity = StoreIdentity("key", 1);
+        auto prepared = (*store)->PreparePut(identity, "value");
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(identity, prepared->sequence).has_value());
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+    }
+
+    auto manifest = LoadCurrentManifest(temp.path().string());
+    ASSERT_TRUE(manifest.has_value());
+    auto checkpoint =
+        LoadCheckpoint(temp.path().string(), manifest->checkpoint_file);
+    ASSERT_TRUE(checkpoint.has_value());
+    checkpoint->next_sequence = checkpoint->checkpoint_sequence;
+    manifest->next_sequence = checkpoint->next_sequence;
+    ASSERT_TRUE(
+        WriteCheckpoint(temp.path().string(), manifest->generation, *checkpoint)
+            .has_value());
+    ASSERT_TRUE(PublishManifest(temp.path().string(), *manifest).has_value());
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_FALSE(recovered.has_value());
+    EXPECT_EQ(recovered.error(), StoreError::kCorruptData);
+}
+
+TEST(LogStructuredStoreTest, IgnoresCorruptRetiredSourceAfterPublication) {
+    StoreTempDirectory temp;
+    const auto old_identity = StoreIdentity("key", 1);
+    const auto new_identity = StoreIdentity("key", 2);
+    uint64_t source_segment_id = 0;
+    {
+        auto store = LogStructuredStore::Open(Config(temp, 1024));
+        ASSERT_TRUE(store.has_value());
+        auto old_write =
+            (*store)->PreparePut(old_identity, std::string(96, 'a'));
+        ASSERT_TRUE(old_write.has_value());
+        source_segment_id = old_write->physical.segment_id;
+        ASSERT_TRUE(
+            (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+        auto new_write =
+            (*store)->PreparePut(new_identity, std::string(96, 'b'));
+        ASSERT_TRUE(new_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(new_identity, new_write->sequence).has_value());
+        ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+        LogStructuredStore::SetCompactionCrashPredicateForTest(
+            [](CompactionCrashPoint point) {
+                return point == CompactionCrashPoint::kAfterManifestPublication;
+            });
+        auto interrupted = (*store)->CompactOnce({.max_source_segments = 1,
+                                                  .max_input_bytes = 4096,
+                                                  .max_target_bytes = 4096,
+                                                  .fanout = 2,
+                                                  .max_levels = 2,
+                                                  .min_reclaim_ratio = 0.0,
+                                                  .stop_token = {}});
+        LogStructuredStore::SetCompactionCrashPredicateForTest({});
+        ASSERT_FALSE(interrupted.has_value());
+        EXPECT_EQ(interrupted.error(), StoreError::kIoError);
+    }
+
+    const auto source_path = SegmentFile(temp, source_segment_id);
+    ASSERT_TRUE(std::filesystem::exists(source_path));
+    std::filesystem::resize_file(source_path, 1);
+
+    auto recovered = LogStructuredStore::Open(Config(temp, 1024));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(new_identity).value(), std::string(96, 'b'));
+    EXPECT_FALSE(std::filesystem::exists(source_path));
 }
 
 TEST(LogStructuredStoreTest, CorruptCommittedCompactionTargetFailsClosed) {
@@ -487,6 +623,28 @@ TEST(LogStructuredStoreTest, ReportsPhysicalAndReclaimableBytes) {
     EXPECT_EQ(stats.logical_value_bytes, uint64_t{96});
     EXPECT_EQ(stats.active_segments, size_t{1});
     EXPECT_GE(stats.sealed_segments, size_t{1});
+}
+
+TEST(LogStructuredStoreTest, DeleteHonorsTotalCapacity) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("key", 1);
+    const std::string value(96, 'a');
+    const uint64_t value_record_bytes = AlignedRecordSize(
+        identity.tenant_id.size(), identity.object_key.size(), value.size());
+
+    auto config = Config(temp, 4096);
+    config.max_physical_bytes = value_record_bytes;
+    config.max_total_physical_bytes = value_record_bytes;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+    auto write = (*store)->PreparePut(identity, value);
+    ASSERT_TRUE(write.has_value());
+    ASSERT_TRUE((*store)->CommitPut(identity, write->sequence).has_value());
+
+    auto deleted = (*store)->Delete(identity);
+    ASSERT_FALSE(deleted.has_value());
+    EXPECT_EQ(deleted.error(), StoreError::kNoSpace);
+    EXPECT_EQ((*store)->Get(identity).value(), value);
 }
 
 TEST(LogStructuredStoreTest, CompactionHonorsTemporarySpaceBudget) {
@@ -817,6 +975,73 @@ TEST(LogStructuredStoreTest,
               std::string(96, 'b'));
 }
 
+TEST(LogStructuredStoreTest,
+     ConcurrentCheckpointDoesNotPersistCompactingSegmentState) {
+    StoreTempDirectory temp;
+    const auto old_identity = StoreIdentity("key", 1);
+    const auto new_identity = StoreIdentity("key", 2);
+    {
+        auto store = LogStructuredStore::Open(Config(temp, 1024));
+        ASSERT_TRUE(store.has_value());
+        auto old_write =
+            (*store)->PreparePut(old_identity, std::string(96, 'a'));
+        ASSERT_TRUE(old_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+        auto new_write =
+            (*store)->PreparePut(new_identity, std::string(96, 'b'));
+        ASSERT_TRUE(new_write.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(new_identity, new_write->sequence).has_value());
+        ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+
+        std::promise<void> target_ready;
+        std::promise<void> allow_crash;
+        auto allow_crash_future = allow_crash.get_future().share();
+        LogStructuredStore::SetCompactionCrashPredicateForTest(
+            [&](CompactionCrashPoint point) {
+                if (point != CompactionCrashPoint::kAfterTargetRename) {
+                    return false;
+                }
+                target_ready.set_value();
+                allow_crash_future.wait();
+                return true;
+            });
+        auto compaction = std::async(std::launch::async, [&]() {
+            return (*store)->CompactOnce({.max_source_segments = 1,
+                                          .max_input_bytes = 4096,
+                                          .max_target_bytes = 4096,
+                                          .fanout = 2,
+                                          .max_levels = 2,
+                                          .min_reclaim_ratio = 0.0,
+                                          .stop_token = {}});
+        });
+        ASSERT_EQ(target_ready.get_future().wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+        allow_crash.set_value();
+        auto interrupted = compaction.get();
+        LogStructuredStore::SetCompactionCrashPredicateForTest({});
+        ASSERT_FALSE(interrupted.has_value());
+        EXPECT_EQ(interrupted.error(), StoreError::kIoError);
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp, 1024));
+    ASSERT_TRUE(recovered.has_value());
+    auto compacted = (*recovered)
+                         ->CompactOnce({.max_source_segments = 1,
+                                        .max_input_bytes = 4096,
+                                        .max_target_bytes = 4096,
+                                        .fanout = 2,
+                                        .max_levels = 2,
+                                        .min_reclaim_ratio = 0.0,
+                                        .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_EQ((*recovered)->GetLatest("tenant-a", "key").value(),
+              std::string(96, 'b'));
+}
+
 TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
     constexpr std::array crash_points{
         CompactionCrashPoint::kBeforeTargetSync,
@@ -824,6 +1049,7 @@ TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
         CompactionCrashPoint::kAfterTargetRename,
         CompactionCrashPoint::kBeforeManifestWrite,
         CompactionCrashPoint::kAfterManifestWrite,
+        CompactionCrashPoint::kAfterCurrentRenameBeforeDirectorySync,
         CompactionCrashPoint::kAfterManifestPublication,
         CompactionCrashPoint::kAfterSourceUnlink,
     };
@@ -862,7 +1088,20 @@ TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
                                                       .stop_token = {}});
             LogStructuredStore::SetCompactionCrashPredicateForTest({});
             ASSERT_FALSE(interrupted.has_value());
-            EXPECT_EQ(interrupted.error(), StoreError::kIoError);
+            const auto expected_error =
+                crash_point == CompactionCrashPoint::
+                                   kAfterCurrentRenameBeforeDirectorySync
+                    ? StoreError::kRecoveryRequired
+                    : StoreError::kIoError;
+            EXPECT_EQ(interrupted.error(), expected_error);
+            if (expected_error == StoreError::kRecoveryRequired) {
+                EXPECT_EQ((*store)->GetLatest("tenant-a", "key").error(),
+                          StoreError::kRecoveryRequired);
+                EXPECT_EQ((*store)
+                              ->PreparePut(StoreIdentity("later", 1), "x")
+                              .error(),
+                          StoreError::kRecoveryRequired);
+            }
         }
 
         for (int restart = 0; restart < 3; ++restart) {
@@ -878,6 +1117,86 @@ TEST(LogStructuredStoreTest, RecoversAcrossCompactionPublicationCrashPoints) {
                 << "restart=" << restart;
         }
     }
+}
+
+TEST(LogStructuredStoreTest, ForegroundPutHonorsCompactionReservation) {
+    StoreTempDirectory temp;
+    const auto old_identity = StoreIdentity("stale", 1);
+    const auto live_identity = StoreIdentity("live", 1);
+    const auto replacement_identity = StoreIdentity("stale", 2);
+    const auto foreground_identity = StoreIdentity("foreground", 1);
+    const std::string source_value(128, 'a');
+    const std::string replacement_value(128, 'b');
+    const std::string foreground_value(200, 'c');
+    const uint64_t old_record_bytes =
+        AlignedRecordSize(old_identity.tenant_id.size(),
+                          old_identity.object_key.size(), source_value.size());
+    const uint64_t live_record_bytes =
+        AlignedRecordSize(live_identity.tenant_id.size(),
+                          live_identity.object_key.size(), source_value.size());
+    const uint64_t replacement_record_bytes = AlignedRecordSize(
+        replacement_identity.tenant_id.size(),
+        replacement_identity.object_key.size(), replacement_value.size());
+    const uint64_t foreground_record_bytes = AlignedRecordSize(
+        foreground_identity.tenant_id.size(),
+        foreground_identity.object_key.size(), foreground_value.size());
+    const uint64_t physical_before_compaction =
+        old_record_bytes + live_record_bytes + replacement_record_bytes;
+
+    auto config = Config(temp, 4096);
+    config.max_physical_bytes =
+        physical_before_compaction + foreground_record_bytes;
+    config.max_total_physical_bytes = physical_before_compaction +
+                                      live_record_bytes +
+                                      foreground_record_bytes - 1;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    for (const auto& identity : {old_identity, live_identity}) {
+        auto write = (*store)->PreparePut(identity, source_value);
+        ASSERT_TRUE(write.has_value());
+        ASSERT_TRUE((*store)->CommitPut(identity, write->sequence).has_value());
+    }
+    ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+    auto replacement =
+        (*store)->PreparePut(replacement_identity, replacement_value);
+    ASSERT_TRUE(replacement.has_value());
+    ASSERT_TRUE((*store)
+                    ->CommitPut(replacement_identity, replacement->sequence)
+                    .has_value());
+
+    std::promise<void> target_ready;
+    std::promise<void> allow_publication;
+    auto allow_publication_future = allow_publication.get_future().share();
+    LogStructuredStore::SetCompactionCrashPredicateForTest(
+        [&](CompactionCrashPoint point) {
+            if (point != CompactionCrashPoint::kAfterTargetRename) return false;
+            target_ready.set_value();
+            allow_publication_future.wait();
+            return false;
+        });
+    auto compaction = std::async(std::launch::async, [&]() {
+        return (*store)->CompactOnce({.max_source_segments = 1,
+                                      .max_input_bytes = 4096,
+                                      .max_target_bytes = 4096,
+                                      .max_temporary_bytes = 4096,
+                                      .fanout = 2,
+                                      .max_levels = 2,
+                                      .min_reclaim_ratio = 0.0,
+                                      .stop_token = {}});
+    });
+    ASSERT_EQ(target_ready.get_future().wait_for(std::chrono::seconds(2)),
+              std::future_status::ready);
+
+    auto rejected = (*store)->PreparePut(foreground_identity, foreground_value);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), StoreError::kNoSpace);
+
+    allow_publication.set_value();
+    auto compacted = compaction.get();
+    LogStructuredStore::SetCompactionCrashPredicateForTest({});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ((*store)->Get(live_identity).value(), source_value);
 }
 
 TEST(LogStructuredStoreTest, GetCompletesWhileCompactionWaitsToPublish) {

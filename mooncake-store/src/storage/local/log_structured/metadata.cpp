@@ -179,9 +179,10 @@ tl::expected<std::string, MetadataError> ReadFile(const std::string& path) {
     return contents;
 }
 
-tl::expected<void, MetadataError> AtomicWrite(const std::string& root_path,
-                                              const std::string& filename,
-                                              std::string_view contents) {
+tl::expected<void, MetadataError> AtomicWrite(
+    const std::string& root_path, const std::string& filename,
+    std::string_view contents, bool publication_pointer = false,
+    std::function<bool()> fail_after_rename = {}) {
     if (!IsSafeFilename(filename)) {
         return tl::unexpected(MetadataError::kInvalidArgument);
     }
@@ -190,11 +191,11 @@ tl::expected<void, MetadataError> AtomicWrite(const std::string& root_path,
     const int fd = open(temporary_path.c_str(),
                         O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC, 0644);
     if (fd < 0) return tl::unexpected(MetadataError::kIoError);
-    bool success = WriteAll(fd, contents.data(), contents.size()) &&
-                   fsync(fd) == 0 && close(fd) == 0;
-    if (!success) {
+    const bool data_written = WriteAll(fd, contents.data(), contents.size());
+    const bool data_synced = data_written && fsync(fd) == 0;
+    const int close_result = close(fd);
+    if (!data_synced || close_result != 0) {
         const int saved_errno = errno;
-        close(fd);
         unlink(temporary_path.c_str());
         errno = saved_errno;
         return tl::unexpected(MetadataError::kIoError);
@@ -203,7 +204,16 @@ tl::expected<void, MetadataError> AtomicWrite(const std::string& root_path,
         unlink(temporary_path.c_str());
         return tl::unexpected(MetadataError::kIoError);
     }
-    return SyncDirectory(root_path);
+    if (fail_after_rename && fail_after_rename()) {
+        return tl::unexpected(publication_pointer
+                                  ? MetadataError::kPublicationUncertain
+                                  : MetadataError::kIoError);
+    }
+    auto synced = SyncDirectory(root_path);
+    if (!synced && publication_pointer) {
+        return tl::unexpected(MetadataError::kPublicationUncertain);
+    }
+    return synced;
 }
 
 }  // namespace
@@ -211,7 +221,7 @@ tl::expected<void, MetadataError> AtomicWrite(const std::string& root_path,
 tl::expected<std::string, MetadataError> WriteCheckpoint(
     const std::string& root_path, uint64_t generation,
     const CheckpointState& checkpoint) {
-    if (checkpoint.format_version != 1) {
+    if (checkpoint.format_version != 1 || generation == 0) {
         return tl::unexpected(MetadataError::kInvalidArgument);
     }
     const std::string filename = NumberedFilename("CHECKPOINT", generation);
@@ -240,10 +250,14 @@ tl::expected<CheckpointState, MetadataError> LoadCheckpoint(
 
 tl::expected<void, MetadataError> PublishManifest(
     const std::string& root_path, const ManifestState& manifest,
-    std::function<bool()> fail_before_current) {
+    std::function<bool()> fail_before_current,
+    std::function<bool()> fail_after_current_rename) {
     if (manifest.format_version != 1 || manifest.generation == 0 ||
         !IsSafeFilename(manifest.checkpoint_file) ||
-        !IsSafeFilename(manifest.wal_file)) {
+        !IsSafeFilename(manifest.wal_file) ||
+        manifest.checkpoint_file !=
+            NumberedFilename("CHECKPOINT", manifest.generation) ||
+        !IsNumberedArtifact(manifest.wal_file, "WAL-")) {
         return tl::unexpected(MetadataError::kInvalidArgument);
     }
     const std::string manifest_file =
@@ -255,7 +269,8 @@ tl::expected<void, MetadataError> PublishManifest(
     if (fail_before_current && fail_before_current()) {
         return tl::unexpected(MetadataError::kIoError);
     }
-    return AtomicWrite(root_path, "CURRENT", manifest_file + "\n");
+    return AtomicWrite(root_path, "CURRENT", manifest_file + "\n", true,
+                       std::move(fail_after_current_rename));
 }
 
 tl::expected<ManifestState, MetadataError> LoadCurrentManifest(
@@ -275,7 +290,12 @@ tl::expected<ManifestState, MetadataError> LoadCurrentManifest(
     auto manifest = DecodeArtifact<ManifestState>(
         std::span<const char>(contents->data(), contents->size()),
         ArtifactKind::kManifest);
-    if (!manifest || manifest->format_version != 1) {
+    if (!manifest || manifest->format_version != 1 ||
+        manifest->generation == 0 ||
+        *current != NumberedFilename("MANIFEST", manifest->generation) ||
+        manifest->checkpoint_file !=
+            NumberedFilename("CHECKPOINT", manifest->generation) ||
+        !IsNumberedArtifact(manifest->wal_file, "WAL-")) {
         return tl::unexpected(MetadataError::kCorruptData);
     }
     return manifest.value();
@@ -284,7 +304,8 @@ tl::expected<ManifestState, MetadataError> LoadCurrentManifest(
 tl::expected<void, MetadataError> CleanupMetadataArtifacts(
     const std::string& root_path, uint64_t current_generation,
     const std::string& current_wal_file) {
-    if (!IsSafeFilename(current_wal_file)) {
+    if (!IsSafeFilename(current_wal_file) ||
+        !IsNumberedArtifact(current_wal_file, "WAL-")) {
         return tl::unexpected(MetadataError::kInvalidArgument);
     }
     const std::string current_manifest =
