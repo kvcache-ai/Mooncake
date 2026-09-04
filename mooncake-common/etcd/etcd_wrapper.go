@@ -324,7 +324,6 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cancelAllStoreKeepAlives()
 	closeAllStoreMaintenanceSessions()
 	cancelAllStoreWatches()
 	cancelAllStorePrefixWatches()
@@ -593,20 +592,6 @@ func cancelAndDeleteWatch(k string) int {
 	return -1
 }
 
-func cancelAllStoreKeepAlives() {
-	storeKeepAliveMutex.Lock()
-	cancels := make([]context.CancelFunc, 0, len(storeKeepAliveCtx))
-	for leaseId, cancel := range storeKeepAliveCtx {
-		cancels = append(cancels, cancel)
-		delete(storeKeepAliveCtx, leaseId)
-	}
-	storeKeepAliveMutex.Unlock()
-
-	for _, cancel := range cancels {
-		cancel()
-	}
-}
-
 func closeAllStoreMaintenanceSessions() {
 	storeMaintenanceMutex.Lock()
 	sessions := make([]*maintenanceSession, 0, len(storeMaintenanceSessions))
@@ -768,11 +753,19 @@ func hasKeepAliveContext(leaseId int64) bool {
 
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-	cli := getStoreClient()
-	if cli == nil {
+	storeCli := getStoreClient()
+	if storeCli == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
+	// Keep lease traffic separate from Store traffic. A Store client reset or
+	// a busy Store connection must not stop leadership keep-alive.
+	cli, err := clientv3.New(newStoreClientConfig(storeCli.Endpoints()))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	defer cli.Close()
 
 	// Create a context with cancel function
 	ctx, cancel := context.WithCancel(context.Background())
