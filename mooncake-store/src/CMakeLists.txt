@@ -1,5 +1,6 @@
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
+add_subdirectory(storage/local/log_structured)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
