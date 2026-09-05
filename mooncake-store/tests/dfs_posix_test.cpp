@@ -801,8 +801,9 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     EXPECT_TRUE(results[0].has_value());
     ASSERT_FALSE(results[1].has_value());
     EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
-    ASSERT_FALSE(results[2].has_value());
-    EXPECT_EQ(results[2].error(), ErrorCode::FILE_WRITE_FAIL);
+    // A short WriteAt is retried by the backend and completes successfully;
+    // only the explicitly failed request is reported as failed.
+    EXPECT_TRUE(results[2].has_value());
 }
 
 TEST_F(DfsBackendTest, BatchReadUsesExplicitDescriptorsAndMultipleSlices) {
@@ -867,6 +868,11 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     distributed_config.shard_count = 4;
     distributed_config.shard_capacity = 64 * 1024 * 1024;
     distributed_config.alignment = 4096;
+    // Keep fault-call ordering deterministic and exercise the regular adapter
+    // path; direct-read error propagation is covered by the O_DIRECT tests.
+    distributed_config.batch_read_threads = 1;
+    distributed_config.direct_read_enabled = false;
+    distributed_config.batch_read_merge_enabled = true;
 
     auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
@@ -903,8 +909,9 @@ TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
     EXPECT_TRUE(read_results[0].has_value());
     ASSERT_FALSE(read_results[1].has_value());
     EXPECT_EQ(read_results[1].error(), ErrorCode::FILE_OPEN_FAIL);
-    ASSERT_FALSE(read_results[2].has_value());
-    EXPECT_EQ(read_results[2].error(), ErrorCode::FILE_READ_FAIL);
+    // A short ReadAt is retried and completes; the explicit failure remains
+    // isolated to the request that triggered it.
+    EXPECT_TRUE(read_results[2].has_value());
     EXPECT_TRUE(read_results[3].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), out3.data(), write_buf.size()), 0);
 }

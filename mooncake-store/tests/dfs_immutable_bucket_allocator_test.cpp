@@ -302,6 +302,31 @@ TEST(ImmutableBucketAllocatorTest, MaxBucketCountIsEnforced) {
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
 }
 
+TEST(ImmutableBucketAllocatorTest, MaxBucketCountUpdatesAreValidated) {
+    TempDir tmp("bucket_dynamic_max_count");
+    ImmutableBucketAllocator alloc;
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kAlignment, 1)));
+
+    ASSERT_TRUE(alloc.Allocate("first", 100).has_value());
+    auto exhausted = alloc.Allocate("second", 100);
+    ASSERT_FALSE(exhausted.has_value());
+    EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    auto changed = alloc.SetMaxBucketCount(2);
+    ASSERT_TRUE(changed.has_value());
+    EXPECT_EQ(*changed, 1);
+    EXPECT_EQ(alloc.GetTotalCapacity(), 2u * kAlignment);
+    EXPECT_TRUE(alloc.Allocate("second", 100).has_value());
+
+    auto zero = alloc.SetMaxBucketCount(0);
+    ASSERT_FALSE(zero.has_value());
+    EXPECT_EQ(zero.error(), ErrorCode::INVALID_PARAMS);
+    auto too_large = alloc.SetMaxBucketCount(kMaxBucketId + 1);
+    ASSERT_FALSE(too_large.has_value());
+    EXPECT_EQ(too_large.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(alloc.GetTotalCapacity(), 2u * kAlignment);
+}
+
 // ---------------------------------------------------------------------------
 // ImmutableBucketAllocator: BatchAllocate
 // ---------------------------------------------------------------------------
@@ -1731,4 +1756,3 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
 }
 
 }  // namespace mooncake::test
-

@@ -3,12 +3,16 @@
 
 #include <chrono>
 #include <csignal>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/struct_json/json_reader.h>
@@ -86,6 +90,52 @@ struct HttpSegmentsDetailResponse {
     uint64_t total_segments{0};
 };
 YLT_REFL(HttpSegmentsDetailResponse, total_segments);
+
+struct HttpDfsMaxBucketCountResponse {
+    bool success{false};
+    int64_t old_value{0};
+    int64_t new_value{0};
+};
+YLT_REFL(HttpDfsMaxBucketCountResponse, success, old_value, new_value);
+
+class ScopedBucketDfsAdminEnv {
+   public:
+    explicit ScopedBucketDfsAdminEnv(const std::string& root) {
+        Set("MOONCAKE_ENABLE_DFS", "1");
+        Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+        Set("MOONCAKE_DFS_ROOT_DIR", root);
+        Set("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket");
+        Set("MOONCAKE_DFS_BUCKET_CAPACITY", "4096");
+        Set("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+        Set("MOONCAKE_DFS_ALIGNMENT", "4096");
+        Set("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+        Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+        Set("MOONCAKE_DFS_SINGLE_TENANT", "true");
+        Set("MOONCAKE_DFS_SHARD_COUNT", "1");
+        Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    }
+
+    ~ScopedBucketDfsAdminEnv() {
+        for (auto it = saved_.rbegin(); it != saved_.rend(); ++it) {
+            if (it->second.has_value()) {
+                ::setenv(it->first.c_str(), it->second->c_str(), 1);
+            } else {
+                ::unsetenv(it->first.c_str());
+            }
+        }
+    }
+
+   private:
+    void Set(const std::string& name, const std::string& value) {
+        const char* previous = ::getenv(name.c_str());
+        saved_.emplace_back(
+            name, previous ? std::optional<std::string>(previous)
+                           : std::nullopt);
+        ::setenv(name.c_str(), value.c_str(), 1);
+    }
+
+    std::vector<std::pair<std::string, std::optional<std::string>>> saved_;
+};
 
 std::string WriteTenantQuotaPolicyForTest(
     const std::map<std::string, uint64_t>& tenant_quotas) {
@@ -505,6 +555,11 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     EXPECT_EQ(tenant_quotas.http_status, 503);
     EXPECT_NE(tenant_quotas.body.find(unavailable_msg), std::string::npos);
 
+    auto dfs_limit = HttpPutJson(port, "/api/v1/dfs/max_bucket_count",
+                                 "{\"max_bucket_count\":8}");
+    EXPECT_EQ(dfs_limit.http_status, 503);
+    EXPECT_NE(dfs_limit.body.find(unavailable_msg), std::string::npos);
+
     auto drain_create = HttpPostJson(port, "/api/v1/drain_jobs", "{}");
     EXPECT_EQ(drain_create.http_status, 503);
 
@@ -518,6 +573,75 @@ TEST_F(MasterAdminServerTest, ServiceEndpointsReturn503WhenServiceUnavailable) {
     auto drain_cancel = HttpPostJson(
         port, "/api/v1/drain_jobs/cancel?job_id=" + valid_uuid, "");
     EXPECT_EQ(drain_cancel.http_status, 503);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, DfsMaxBucketCountEndpointValidatesAndUpdates) {
+    const auto root =
+        (std::filesystem::temp_directory_path() /
+         ("mooncake_admin_dfs_bucket_" + UuidToString(generate_uuid())))
+            .string();
+    std::filesystem::create_directories(root);
+    ScopedBucketDfsAdminEnv env(root);
+
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 5000;
+    service_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(service_config);
+
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto updated = HttpPutJson(port, "/api/v1/dfs/max_bucket_count",
+                               "{\"max_bucket_count\":8}");
+    ASSERT_EQ(updated.http_status, 200) << updated.body;
+    HttpDfsMaxBucketCountResponse payload;
+    struct_json::from_json(payload, updated.body);
+    EXPECT_TRUE(payload.success);
+    EXPECT_EQ(payload.old_value, 4);
+    EXPECT_EQ(payload.new_value, 8);
+
+    for (const std::string body : {
+             "{}", "{\"max_bucket_count\":0}",
+             "{\"max_bucket_count\":-1}",
+             "{\"max_bucket_count\":2147483648}", "not-json"}) {
+        auto invalid = HttpPutJson(port, "/api/v1/dfs/max_bucket_count", body);
+        EXPECT_EQ(invalid.http_status, 400) << body << ": " << invalid.body;
+        HttpErrorResponse error;
+        struct_json::from_json(error, invalid.body);
+        EXPECT_FALSE(error.success);
+        EXPECT_EQ(error.error_code, toInt(ErrorCode::INVALID_PARAMS));
+    }
+
+    admin.Stop();
+    service.reset();
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterAdminServerTest, DfsMaxBucketCountEndpointRejectsShardMode) {
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 5000;
+    service_config.enable_metric_reporting = false;
+    auto service = std::make_shared<WrappedMasterService>(service_config);
+
+    const int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+    admin.SetServiceDelegate(service);
+    admin.SetServiceAvailable(true);
+
+    auto response = HttpPutJson(port, "/api/v1/dfs/max_bucket_count",
+                                "{\"max_bucket_count\":8}");
+    EXPECT_EQ(response.http_status, 409);
+    EXPECT_NE(response.body.find("UNAVAILABLE_IN_CURRENT_MODE"),
+              std::string::npos);
 
     admin.Stop();
 }

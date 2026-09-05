@@ -716,6 +716,10 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     // descriptors: recovery must restore usable descriptors, not just bookkeeping.
     BucketTempDir dir("dfs_bucket_recover_io");
     auto config = MakeBucketConfig(dir.path());
+    // Recovery intentionally restores sealed buckets only. Two aligned
+    // entries fill this tiny bucket; the third reservation rolls over to a
+    // fresh active bucket and seals the bucket containing the test data.
+    config.bucket_capacity = 2 * kAlignment;
 
     std::vector<std::string> keys{"rec_a", "rec_b"};
     std::vector<std::string> values{std::string(300, 'p'),
@@ -740,6 +744,8 @@ TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
             ASSERT_TRUE(results[0].has_value());
             ASSERT_TRUE(allocator.MarkCommitted(keys[i], *desc));
         }
+        auto rollover = allocator.Allocate("rollover", 1);
+        ASSERT_TRUE(rollover.has_value());
     }
 
     ImmutableBucketAllocator recovered;

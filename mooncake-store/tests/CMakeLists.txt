@@ -186,6 +186,8 @@ add_store_test(dfs_immutable_bucket_allocator_test
                dfs_immutable_bucket_allocator_test.cpp)
 add_store_test(dfs_immutable_bucket_backend_test
                dfs_immutable_bucket_backend_test.cpp)
+add_store_test(dfs_immutable_bucket_client_test
+               dfs_immutable_bucket_client_test.cpp)
 add_store_test(distributed_storage_config_test
                distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)

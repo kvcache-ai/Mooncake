@@ -973,6 +973,349 @@ TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
              {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
 }
 
+namespace {
+
+class ScopedBucketDfsEnv {
+   public:
+    ScopedBucketDfsEnv(const std::string& root, const char* bucket_capacity,
+                       const char* max_bucket_count,
+                       const char* eviction_enabled = "0",
+                       const char* high_watermark = "0.9",
+                       const char* low_watermark = "0.7")
+        : enable_dfs_("MOONCAKE_ENABLE_DFS", "1"),
+          fs_adapter_("MOONCAKE_DFS_FS_ADAPTER", "posix"),
+          root_dir_("MOONCAKE_DFS_ROOT_DIR", root.c_str()),
+          allocator_type_("MOONCAKE_DFS_ALLOCATOR_TYPE", "bucket"),
+          bucket_capacity_("MOONCAKE_DFS_BUCKET_CAPACITY", bucket_capacity),
+          max_bucket_count_("MOONCAKE_DFS_MAX_BUCKET_COUNT", max_bucket_count),
+          alignment_("MOONCAKE_DFS_ALIGNMENT", "4096"),
+          eviction_("MOONCAKE_DFS_EVICTION_ENABLED", eviction_enabled),
+          high_watermark_("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK",
+                          high_watermark),
+          low_watermark_("MOONCAKE_DFS_EVICTION_LOW_WATERMARK",
+                         low_watermark),
+          deferred_free_("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0"),
+          single_tenant_("MOONCAKE_DFS_SINGLE_TENANT", "true"),
+          shard_count_("MOONCAKE_DFS_SHARD_COUNT", "1"),
+          shard_capacity_("MOONCAKE_DFS_SHARD_CAPACITY", "1048576") {}
+
+   private:
+    ScopedEnvVar enable_dfs_;
+    ScopedEnvVar fs_adapter_;
+    ScopedEnvVar root_dir_;
+    ScopedEnvVar allocator_type_;
+    ScopedEnvVar bucket_capacity_;
+    ScopedEnvVar max_bucket_count_;
+    ScopedEnvVar alignment_;
+    ScopedEnvVar eviction_;
+    ScopedEnvVar high_watermark_;
+    ScopedEnvVar low_watermark_;
+    ScopedEnvVar deferred_free_;
+    ScopedEnvVar single_tenant_;
+    ScopedEnvVar shard_count_;
+    ScopedEnvVar shard_capacity_;
+};
+
+std::string MakeBucketDfsTestRoot(const std::string& suffix) {
+    static std::atomic<int> counter{0};
+    auto path = std::filesystem::temp_directory_path() /
+                ("master_dfs_bucket_" + std::to_string(::getpid()) + "_" +
+                 suffix + "_" + std::to_string(++counter));
+    std::filesystem::create_directories(path);
+    return path.string();
+}
+
+const Replica::Descriptor* FindDfsDescriptor(
+    const std::vector<Replica::Descriptor>& replicas) {
+    for (const auto& replica : replicas) {
+        if (replica.is_dfs_replica()) return &replica;
+    }
+    return nullptr;
+}
+
+}  // namespace
+
+TEST_F(MasterServiceTest, DfsBucketBatchPutCommitsAndRollsBackPerKey) {
+    const auto root = MakeBucketDfsTestRoot("batch");
+    ScopedBucketDfsEnv env(root, "1048576", "16");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        std::vector<std::string> keys{"batch_a", "batch_b", "batch_c"};
+        std::vector<uint64_t> lengths(keys.size(), 4096);
+        auto results = service.BatchPutStart(
+            context.client_id, keys, TenantId::Default(), lengths, config);
+        ASSERT_EQ(results.size(), keys.size());
+
+        std::vector<DistributedFSDescriptor> descriptors;
+        for (size_t i = 0; i < results.size(); ++i) {
+            ASSERT_TRUE(results[i].has_value())
+                << "key " << keys[i] << ": " << toString(results[i].error());
+            const auto* dfs = FindDfsDescriptor(*results[i]);
+            ASSERT_NE(dfs, nullptr);
+            descriptors.push_back(dfs->get_dfs_descriptor());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, keys[i],
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+
+        for (size_t i = 1; i < descriptors.size(); ++i) {
+            EXPECT_EQ(descriptors[i].shard_idx, descriptors[0].shard_idx);
+            const uint64_t previous_start =
+                descriptors[i - 1].offset - 8 - keys[i - 1].size();
+            EXPECT_EQ(descriptors[i].offset - 8 - keys[i].size(),
+                      previous_start + descriptors[i - 1].aligned_size);
+        }
+
+        std::vector<std::string> mixed{"fresh_a", "batch_a", "fresh_b"};
+        auto mixed_results = service.BatchPutStart(
+            context.client_id, mixed, TenantId::Default(),
+            std::vector<uint64_t>(mixed.size(), 4096), config);
+        ASSERT_EQ(mixed_results.size(), mixed.size());
+        EXPECT_TRUE(mixed_results[0].has_value());
+        ASSERT_FALSE(mixed_results[1].has_value());
+        EXPECT_EQ(mixed_results[1].error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+        EXPECT_TRUE(mixed_results[2].has_value());
+
+        auto original =
+            service.GetReplicaList("batch_a", TenantId::Default());
+        ASSERT_TRUE(original.has_value());
+        EXPECT_NE(FindDfsDescriptor(original->replicas), nullptr);
+
+        std::vector<std::string> duplicates{"batch_duplicate",
+                                            "batch_duplicate"};
+        auto duplicate_results = service.BatchPutStart(
+            context.client_id, duplicates, TenantId::Default(),
+            std::vector<uint64_t>(duplicates.size(), 4096), config);
+        ASSERT_EQ(duplicate_results.size(), duplicates.size());
+        ASSERT_FALSE(duplicate_results[1].has_value());
+        ASSERT_FALSE(duplicate_results[0].has_value());
+        EXPECT_EQ(duplicate_results[0].error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(duplicate_results[1].error(), ErrorCode::INVALID_PARAMS);
+        auto duplicate_retry = service.PutStart(
+            context.client_id, duplicates[0], TenantId::Default(), 4096,
+            config);
+        ASSERT_TRUE(duplicate_retry.has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id,
+                                ObjectMeta{duplicates[0], std::nullopt},
+                                TenantId::Default(),
+                                ReplicaType::ALL)
+                        .has_value());
+        auto duplicate =
+            service.GetReplicaList(duplicates[0], TenantId::Default());
+        ASSERT_TRUE(duplicate.has_value());
+        EXPECT_NE(FindDfsDescriptor(duplicate->replicas), nullptr);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketRestartRestoresOnlySealedCommittedKeys) {
+    const auto root = MakeBucketDfsTestRoot("restart");
+    ScopedBucketDfsEnv env(root, "4096", "8");
+    DistributedFSDescriptor sealed_descriptor;
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        const UUID client_id = context.client_id;
+
+        auto sealed = service.PutStart(client_id, "sealed", TenantId::Default(),
+                                       100, config);
+        ASSERT_TRUE(sealed.has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(client_id, "sealed", TenantId::Default(),
+                                ReplicaType::DFS)
+                        .has_value());
+        const auto* dfs = FindDfsDescriptor(*sealed);
+        ASSERT_NE(dfs, nullptr);
+        sealed_descriptor = dfs->get_dfs_descriptor();
+
+        auto active = service.PutStart(client_id, "active", TenantId::Default(),
+                                       100, config);
+        ASSERT_TRUE(active.has_value());
+        ASSERT_TRUE(service
+                        .PutEnd(client_id, "active", TenantId::Default(),
+                                ReplicaType::DFS)
+                        .has_value());
+    }
+
+    {
+        MasterService service;
+        auto recovered = service.GetReplicaList("sealed", TenantId::Default());
+        ASSERT_TRUE(recovered.has_value());
+        const auto* dfs = FindDfsDescriptor(recovered->replicas);
+        ASSERT_NE(dfs, nullptr);
+        EXPECT_EQ(dfs->status, ReplicaStatus::COMPLETE);
+        EXPECT_EQ(dfs->get_dfs_descriptor().file_path,
+                  sealed_descriptor.file_path);
+        EXPECT_EQ(dfs->get_dfs_descriptor().offset, sealed_descriptor.offset);
+
+        auto active = service.GetReplicaList("active", TenantId::Default());
+        EXPECT_FALSE(active.has_value());
+        EXPECT_EQ(active.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
+    const auto root = MakeBucketDfsTestRoot("evict");
+    ScopedBucketDfsEnv env(root, "4096", "4", "0", "0.5", "0.25");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        std::vector<std::string> keys;
+        for (int i = 0; i < 3; ++i) {
+            keys.push_back("evict_" + std::to_string(i));
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, keys.back(),
+                                      TenantId::Default(), 100, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, keys.back(),
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+
+        service.RunDfsEvictionForTesting();
+
+        auto evicted = service.GetReplicaList(keys.front(), TenantId::Default());
+        ASSERT_TRUE(evicted.has_value());
+        EXPECT_EQ(FindDfsDescriptor(evicted->replicas), nullptr);
+        auto newest = service.GetReplicaList(keys.back(), TenantId::Default());
+        ASSERT_TRUE(newest.has_value());
+        EXPECT_NE(FindDfsDescriptor(newest->replicas), nullptr);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketEvictionHonorsLeaseAndPins) {
+    const auto root = MakeBucketDfsTestRoot("protected");
+    ScopedBucketDfsEnv env(root, "4096", "5", "0", "0.5", "0.2");
+
+    {
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_default_kv_soft_pin_ttl(10000)
+                                  .set_allow_evict_soft_pinned_objects(false)
+                                  .build();
+        MasterService service(service_config);
+        const auto context = PrepareSimpleSegment(service);
+        auto put = [&](const std::string& key, ReplicateConfig config) {
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, key,
+                                      TenantId::Default(), 100, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key,
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        };
+
+        ReplicateConfig hard_pin;
+        hard_pin.with_hard_pin = true;
+        put("hard_pin", hard_pin);
+
+        ReplicateConfig soft_pin;
+        soft_pin.soft_pin_action = SoftPinAction::ENABLE;
+        soft_pin.soft_pin_ttl_ms = 10000;
+        put("soft_pin", soft_pin);
+
+        put("leased", {});
+        put("plain", {});
+        put("tail", {});
+        ASSERT_TRUE(
+            service.GetReplicaList("leased", TenantId::Default()).has_value());
+
+        service.RunDfsEvictionForTesting();
+
+        for (const std::string key : {"hard_pin", "soft_pin", "leased"}) {
+            auto protected_key =
+                service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(protected_key.has_value()) << key;
+            EXPECT_NE(FindDfsDescriptor(protected_key->replicas), nullptr)
+                << key;
+        }
+        auto plain = service.GetReplicaList("plain", TenantId::Default());
+        ASSERT_TRUE(plain.has_value());
+        EXPECT_EQ(FindDfsDescriptor(plain->replicas), nullptr);
+        auto tail = service.GetReplicaList("tail", TenantId::Default());
+        ASSERT_TRUE(tail.has_value());
+        EXPECT_NE(FindDfsDescriptor(tail->replicas), nullptr);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsBucketMaxCountCanChangeWithinDescriptorRange) {
+    const auto root = MakeBucketDfsTestRoot("dynamic_limit");
+    ScopedBucketDfsEnv env(root, "4096", "4");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        auto changed = service.SetDfsMaxBucketCount(2);
+        ASSERT_TRUE(changed.has_value());
+        EXPECT_EQ(*changed, 4);
+        EXPECT_EQ(service.SetDfsMaxBucketCount(0).error(),
+                  ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(service
+                      .SetDfsMaxBucketCount(
+                          static_cast<int64_t>(
+                              std::numeric_limits<int32_t>::max()) +
+                          1)
+                      .error(),
+                  ErrorCode::INVALID_PARAMS);
+
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+        const UUID client_id = context.client_id;
+        for (int i = 0; i < 2; ++i) {
+            ASSERT_TRUE(service
+                            .PutStart(client_id, "limited_" + std::to_string(i),
+                                      TenantId::Default(), 100, config)
+                            .has_value());
+        }
+        auto exhausted = service.PutStart(client_id, "limited_2",
+                                          TenantId::Default(), 100, config);
+        ASSERT_FALSE(exhausted.has_value());
+        EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsMaxBucketCountRejectsShardMode) {
+    MasterService service;
+    auto result = service.SetDfsMaxBucketCount(2);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+}
+
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     const TenantId tenant_a("tenant_restore_a");
     const TenantId tenant_b("tenant_restore_b");
