@@ -31,12 +31,25 @@
 
 #include "cuda_alike.h"
 
+// CUDA Fabric Memory was added to the driver API after the CUDA 12.0
+// headers. Keep the Fabric-only implementation out of builds that use an
+// older toolkit; regular CUDA IPC remains available in those builds.
+#if defined(USE_CUDA)
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 12040
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
+#else
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
+#endif
+#else
+#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
+#endif
+
 namespace mooncake {
 namespace device {
 
 namespace {
 
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
 bool supportFabricMem() {
     const char* nvlink_ipc = std::getenv("MC_USE_NVLINK_IPC");
     if (nvlink_ipc == nullptr || std::strcmp(nvlink_ipc, "0") != 0)
@@ -246,13 +259,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
         cudaMalloc(&peer_ptrs_dev_, num_ranks_ * sizeof(void*));
         for (int i = 0; i < num_ranks_; ++i) peer_ptrs_host_[i] = nullptr;
         cudaMemset(peer_ptrs_dev_, 0, num_ranks_ * sizeof(void*));
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         fabric_peer_mappings_.resize(num_ranks_);
 #endif
     }
 
     ~P2pDeviceTransportImpl() override {
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         cleanupFabricPeerMappings();
         cleanupFabricAllocations();
 #endif
@@ -270,7 +283,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
 
     void* allocateBuffer(size_t bytes) override {
         void* ptr = nullptr;
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         if (use_fabric_mem_) {
             int device_id = 0;
             if (cudaGetDevice(&device_id) != cudaSuccess) {
@@ -386,7 +399,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     }
 
     void freeBuffer(void* ptr) override {
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         if (ptr == nullptr) return;
         if (use_fabric_mem_) {
             auto it = fabric_allocations_.find(ptr);
@@ -410,7 +423,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     }
 
     std::vector<int32_t> exportIpcHandle(void* ptr) override {
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         if (use_fabric_mem_) {
             auto it = fabric_allocations_.find(ptr);
             if (it == fabric_allocations_.end()) {
@@ -503,7 +516,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         available[rank] = 1;
         peer_ptrs_host_[rank] = local_ptr;
 
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         if (use_fabric_mem_) {
             cleanupFabricPeerMappings();
             all_peers_accessible_ = true;
@@ -794,7 +807,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     }
 
    private:
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
     struct FabricPeerMapping {
         void* ptr = nullptr;
         size_t size = 0;
@@ -837,7 +850,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     void** peer_ptrs_host_ = nullptr;
     void** peer_ptrs_dev_ = nullptr;
     bool all_peers_accessible_ = false;
-#if defined(USE_CUDA)
+#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
     std::vector<FabricPeerMapping> fabric_peer_mappings_;
     std::unordered_map<void*, FabricAllocation> fabric_allocations_;
 #endif

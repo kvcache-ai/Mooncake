@@ -192,8 +192,15 @@ std::optional<ParsedWriterShardManifest> parse_writer_shard_manifest(
     }
 
     ParsedWriterShardManifest parsed{};
-    std::memcpy(&parsed.manifest, buffer_handle->ptr(),
-                sizeof(WriterShardManifest));
+    // Manifests normally live in host/SHM memory, but a client may expose a
+    // device-backed BufferHandle. Route the fixed header through the runtime
+    // accelerator so parsing never dereferences a device pointer on the host.
+    if (!mooncake::device::GetAcceleratorRegistry()
+             .RuntimeAccelerators()
+             .CopyToHost(&parsed.manifest, buffer_handle->ptr(),
+                         sizeof(WriterShardManifest))) {
+        return std::nullopt;
+    }
     if (parsed.manifest.header.magic != kWriterShardManifestMagic ||
         parsed.manifest.header.version != kWriterShardManifestVersion ||
         parsed.manifest.header.header_size != sizeof(WriterShardManifest) ||
@@ -211,6 +218,10 @@ std::optional<ParsedWriterShardManifest> parse_writer_shard_manifest(
         if (dim < 0) {
             return std::nullopt;
         }
+    }
+    if (!checked_shape_numel(parsed.global_shape, "parse_writer_shard_manifest")
+             .has_value()) {
+        return std::nullopt;
     }
     return parsed;
 }
@@ -1347,9 +1358,12 @@ std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
         return {0, 0};
     }
 
-    const int64_t start = (dim_size * static_cast<int64_t>(rank)) / shard_count;
-    const int64_t end =
-        (dim_size * static_cast<int64_t>(rank + 1)) / shard_count;
+    const __int128 start_numerator =
+        static_cast<__int128>(dim_size) * static_cast<int64_t>(rank);
+    const __int128 end_numerator = static_cast<__int128>(dim_size) *
+                                   static_cast<int64_t>(rank + 1);
+    const int64_t start = static_cast<int64_t>(start_numerator / shard_count);
+    const int64_t end = static_cast<int64_t>(end_numerator / shard_count);
     return {start, end - start};
 }
 
@@ -1404,12 +1418,32 @@ std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_raw_buffer(
         LOG(ERROR) << operation_name << ": buffer pointer cannot be null";
         return std::nullopt;
     }
-    auto parsed =
-        ParseTensorMetadata(reinterpret_cast<const char *>(buffer_ptr), size);
-    if (!parsed.has_value()) {
+    if (size < sizeof(TensorMetadata)) {
+        LOG(ERROR) << operation_name << ": buffer is too small for metadata";
+        return std::nullopt;
+    }
+    // A raw tensor object may live in CUDA device memory. Read only the
+    // fixed-size metadata header through the accelerator abstraction instead
+    // of dereferencing the address on the host. For ordinary host pointers
+    // CopyToHost is a memcpy, so this keeps the host path unchanged.
+    TensorMetadata metadata{};
+    auto runtime_accelerator =
+        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(
+            &metadata, reinterpret_cast<const void *>(buffer_ptr),
+            sizeof(TensorMetadata))) {
+        LOG(ERROR) << operation_name
+                   << ": failed to copy tensor metadata to host";
+        return std::nullopt;
+    }
+    if (!ValidateTensorMetadata(metadata, size)) {
         LOG(ERROR) << operation_name << ": invalid tensor object metadata";
         return std::nullopt;
     }
+    ParsedTensorMetadata parsed{};
+    parsed.metadata = metadata;
+    parsed.data_offset = static_cast<size_t>(metadata.header.data_offset);
+    parsed.data_bytes = static_cast<size_t>(metadata.header.data_bytes);
     return parsed;
 }
 
@@ -1427,15 +1461,15 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
         return std::nullopt;
     }
 
-    int64_t global_numel = 1;
-    int64_t local_numel = 1;
+    auto local_numel = checked_shape_numel(local_shape, operation_name);
+    if (!local_numel.has_value()) {
+        return std::nullopt;
+    }
     for (size_t dim = 0; dim < global_shape.size(); ++dim) {
         if (global_shape[dim] < 0 || local_shape[dim] < 0) {
             LOG(ERROR) << operation_name << ": invalid tensor shape";
             return std::nullopt;
         }
-        global_numel *= global_shape[dim];
-        local_numel *= local_shape[dim];
         if (static_cast<int>(dim) != split_dim &&
             global_shape[dim] != local_shape[dim]) {
             LOG(ERROR) << operation_name
@@ -1443,35 +1477,34 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
             return std::nullopt;
         }
     }
-    if (local_numel < 0 || global_numel < 0) {
-        LOG(ERROR) << operation_name << ": invalid tensor numel";
-        return std::nullopt;
-    }
-    if ((local_numel == 0 && parsed.data_bytes != 0) ||
-        (local_numel > 0 &&
-         parsed.data_bytes % static_cast<size_t>(local_numel) != 0)) {
+    if ((*local_numel == 0 && parsed.data_bytes != 0) ||
+        (*local_numel > 0 &&
+         parsed.data_bytes % *local_numel != 0)) {
         LOG(ERROR) << operation_name << ": invalid tensor byte size";
         return std::nullopt;
     }
 
     const size_t element_size =
-        local_numel == 0 ? 0
-                         : parsed.data_bytes / static_cast<size_t>(local_numel);
+        *local_numel == 0 ? 0 : parsed.data_bytes / *local_numel;
     const auto [shard_start, shard_extent] =
         calculate_shard_range(global_shape[split_dim], rank, shard_count);
 
     std::vector<int64_t> shard_shape = global_shape;
     shard_shape[split_dim] = shard_extent;
-    int64_t shard_numel = 1;
-    for (auto dim : shard_shape) {
-        shard_numel *= dim;
+    auto shard_numel = checked_shape_numel(shard_shape, operation_name);
+    if (!shard_numel.has_value()) {
+        return std::nullopt;
     }
-    const size_t shard_bytes = static_cast<size_t>(shard_numel) * element_size;
+    auto shard_bytes = checked_size_mul(*shard_numel, element_size,
+                                       operation_name);
+    if (!shard_bytes.has_value()) {
+        return std::nullopt;
+    }
 
     TensorMetadata metadata =
         BuildTensorMetadata(parsed.metadata.header.dtype, global_shape,
                             shard_shape, TensorLayoutKind::SHARD);
-    metadata.header.data_bytes = shard_bytes;
+    metadata.header.data_bytes = *shard_bytes;
 
     RawTensorShardWritePlan plan;
     plan.metadata = metadata;
@@ -1479,25 +1512,52 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
         return plan;
     }
 
-    int64_t elements_before = 1;
-    for (int i = 0; i < split_dim; ++i) {
-        elements_before *= global_shape[i];
-    }
-    int64_t elements_after = 1;
-    for (size_t i = split_dim + 1; i < global_shape.size(); ++i) {
-        elements_after *= global_shape[i];
+    auto elements_before = checked_shape_numel_range(
+        global_shape, 0, static_cast<size_t>(split_dim), operation_name);
+    auto elements_after = checked_shape_numel_range(
+        global_shape, static_cast<size_t>(split_dim + 1), global_shape.size(),
+        operation_name);
+    if (!elements_before.has_value() || !elements_after.has_value()) {
+        return std::nullopt;
     }
 
-    const size_t row_bytes = static_cast<size_t>(shard_extent) *
-                             static_cast<size_t>(elements_after) * element_size;
-    plan.data_ranges.reserve(static_cast<size_t>(elements_before));
-    for (int64_t slice_idx = 0; slice_idx < elements_before; ++slice_idx) {
-        const size_t src_offset =
-            parsed.data_offset +
-            static_cast<size_t>(slice_idx * global_shape[split_dim] +
-                                shard_start) *
-                static_cast<size_t>(elements_after) * element_size;
-        plan.data_ranges.emplace_back(src_offset, row_bytes);
+    auto row_elements = checked_size_mul(static_cast<size_t>(shard_extent),
+                                         *elements_after, operation_name);
+    auto row_bytes = row_elements.has_value()
+                         ? checked_size_mul(*row_elements, element_size,
+                                            operation_name)
+                         : std::nullopt;
+    if (!row_bytes.has_value()) {
+        return std::nullopt;
+    }
+    plan.data_ranges.reserve(*elements_before);
+    for (size_t slice_idx = 0; slice_idx < *elements_before; ++slice_idx) {
+        auto row_index = checked_size_mul(
+            slice_idx, static_cast<size_t>(global_shape[split_dim]),
+            operation_name);
+        if (!row_index.has_value()) {
+            return std::nullopt;
+        }
+        row_index = checked_size_add(*row_index,
+                                     static_cast<size_t>(shard_start),
+                                     operation_name);
+        auto byte_offset = row_index.has_value()
+                               ? checked_size_mul(*row_index, *elements_after,
+                                                  operation_name)
+                               : std::nullopt;
+        byte_offset = byte_offset.has_value()
+                          ? checked_size_mul(*byte_offset, element_size,
+                                             operation_name)
+                          : std::nullopt;
+        if (!byte_offset.has_value()) {
+            return std::nullopt;
+        }
+        auto src_offset = checked_size_add(parsed.data_offset, *byte_offset,
+                                           operation_name);
+        if (!src_offset.has_value()) {
+            return std::nullopt;
+        }
+        plan.data_ranges.emplace_back(*src_offset, *row_bytes);
     }
     return plan;
 }

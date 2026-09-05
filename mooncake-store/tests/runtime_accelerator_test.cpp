@@ -38,6 +38,7 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
     bool Copy(void* dst, const void* src, size_t size,
               CopyDirection direction) const override {
         last_direction_ = direction;
+        copy_device_id_ = current_device_id_;
         std::memcpy(dst, src, size);
         return copy_succeeds_;
     }
@@ -49,6 +50,7 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
 
     void set_copy_succeeds(bool succeeds) { copy_succeeds_ = succeeds; }
     int32_t current_device_id() const { return current_device_id_; }
+    int32_t copy_device_id() const { return copy_device_id_; }
     CopyDirection last_direction() const { return last_direction_; }
     int query_count() const { return query_count_; }
 
@@ -57,6 +59,7 @@ class FakeAcceleratorDevice final : public AcceleratorDevice {
     const void* device_ptr_;
     int32_t device_id_;
     mutable int32_t current_device_id_ = -1;
+    mutable int32_t copy_device_id_ = -1;
     mutable CopyDirection last_direction_ = CopyDirection::kAuto;
     mutable bool copy_succeeds_ = true;
     mutable int query_count_ = 0;
@@ -89,11 +92,13 @@ TEST(RuntimeAcceleratorTest, CopyToHostUsesDeviceToHostCopy) {
     char dst[sizeof(src)] = {};
     FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, src, 3);
     RuntimeAccelerator runtime_accelerator({&device});
+    device.SetContext(1);
 
     EXPECT_TRUE(runtime_accelerator.CopyToHost(dst, src, sizeof(src)));
 
     EXPECT_STREQ(dst, src);
-    EXPECT_EQ(device.current_device_id(), 3);
+    EXPECT_EQ(device.copy_device_id(), 3);
+    EXPECT_EQ(device.current_device_id(), 1);
     EXPECT_EQ(device.last_direction(), CopyDirection::kDeviceToHost);
 }
 
@@ -102,12 +107,28 @@ TEST(RuntimeAcceleratorTest, CopyFromHostUsesHostToDeviceCopy) {
     char dst[sizeof(src)] = {};
     FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, dst, 4);
     RuntimeAccelerator runtime_accelerator({&device});
+    device.SetContext(2);
 
     EXPECT_TRUE(runtime_accelerator.CopyFromHost(dst, src, sizeof(src)));
 
     EXPECT_STREQ(dst, src);
-    EXPECT_EQ(device.current_device_id(), 4);
+    EXPECT_EQ(device.copy_device_id(), 4);
+    EXPECT_EQ(device.current_device_id(), 2);
     EXPECT_EQ(device.last_direction(), CopyDirection::kHostToDevice);
+}
+
+TEST(RuntimeAcceleratorTest, CopyFailureStillRestoresPreviousDevice) {
+    char src[] = "abc";
+    char dst[sizeof(src)] = {};
+    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, src, 5);
+    RuntimeAccelerator runtime_accelerator({&device});
+    device.SetContext(2);
+    device.set_copy_succeeds(false);
+
+    EXPECT_FALSE(runtime_accelerator.CopyToHost(dst, src, sizeof(src)));
+
+    EXPECT_EQ(device.copy_device_id(), 5);
+    EXPECT_EQ(device.current_device_id(), 2);
 }
 
 }  // namespace

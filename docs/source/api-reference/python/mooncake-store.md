@@ -351,7 +351,7 @@ Legacy code may still import `RegisteredBufferPool`, but new examples should pre
 
 #### Complete Zero-Copy Workflow
 
-⚠️ **Critical**: Always register buffers before zero-copy operations. Failure to register buffers will cause undefined behavior and potential memory corruption.
+⚠️ **Critical for a RealClient**: Always register buffers before true zero-copy operations. Failure to register buffers will cause undefined behavior and potential memory corruption. A DummyClient also accepts external host/pinned CPU and CUDA pointers; those non-shared pointers are adapted through staging or CUDA IPC as described in [`setup_dummy()`](#setup_dummy).
 
 Here's a complete example showing the full zero-copy workflow with proper buffer management:
 
@@ -1219,8 +1219,29 @@ client's local SHM buffer keep their allocation alive until completion through
 the real-side active buffer handle and dummy-side RAII release path.
 
 Full materialized reconstruction reads for writer-sharded or reconstructed
-parallel tensors are still conservative for dummy clients. Use the corresponding
-`*_into` APIs, or read stored shards directly, when using dummy clients.
+parallel tensors are supported for dummy clients. The reconstruction uses the
+same external-pointer staging path and returns an owned tensor buffer.
+
+**Dummy pointer adaptation:**
+
+- Pointers inside the dummy client's shared-memory mapping keep the existing
+  zero-copy path.
+- CUDA pointers use CUDA IPC when the allocation can be exported. If CUDA IPC
+  is unavailable (for example, for an unsupported allocation), the dummy
+  client copies through a real-client-owned shared-memory staging buffer.
+- Arbitrary host pointers, including PyTorch pinned CPU tensors, are accepted
+  by `register_buffer()`, `put_from()`, `get_into()`, the batch/multi-buffer
+  variants, and tensor `*_from`/`*_into` variants. These pointers use staging;
+  reads copy the returned bytes back to the original pointer.
+- `register_buffer()` tracks the external pointer and its size for the dummy
+  client's registration/unregistration bookkeeping. It does not make a
+  non-shared pointer directly dereferenceable by the real client.
+- Serialized `put_tensor_from()` accepts a host buffer or a serialized tensor
+  object in addressable device memory. Metadata and payload bytes are copied
+  through the runtime accelerator; CUDA IPC is used when available and a
+  RealClient-owned staging buffer is used otherwise. `put_tensor()` and
+  `upsert_tensor()` remain the higher-level alternatives when the caller
+  already has a Tensor object.
 
 ---
 
@@ -2239,6 +2260,13 @@ These methods provide direct support for storing and retrieving PyTorch tensors.
 
 ⚠️ **Note**: These methods require `torch` to be installed and available in the environment.
 
+**Buffer registration:** A `RealClient` destination/source must be Store-managed
+registered memory for true zero-copy transfers. A `DummyClient` also accepts
+unregistered host, pinned-CPU, and CUDA tensor addresses: it uses CUDA IPC when
+available and otherwise stages through the RealClient-owned shared-memory
+buffer. Explicit registration remains supported but is optional for these
+DummyClient external pointers.
+
 #### put_tensor_with_tp()
 
 Put a PyTorch tensor into the store, optionally splitting it into shards for tensor parallelism.
@@ -2682,7 +2710,7 @@ def get_tensor_into(self, key: str, buffer_ptr: int, size: int) -> torch.Tensor
 **Parameters:**
 
   - `key` (str): Base identifier of the tensor.
-  - `buffer_ptr` (int): The buffer pointer pre-allocated for tensor, and the buffer should be registered.
+  - `buffer_ptr` (int): The pre-allocated tensor buffer pointer. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `size` (int): The size of buffer.
 
 **Returns:**
@@ -2700,7 +2728,7 @@ def batch_get_tensor_into(self, base_keys: List[str], buffer_ptrs: List[int], si
 **Parameters:**
 
   - `base_keys` (List[str]): List of base identifiers.
-  - `buffer_ptrs` (List[int]): List of buffer pointers pre-allocated for tensor; buffers should be registered.
+  - `buffer_ptrs` (List[int]): List of pre-allocated tensor buffer pointers. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `sizes` (List[int]): List of buffer sizes.
 
 **Returns:**
@@ -2718,7 +2746,7 @@ def get_tensor_with_tp_into(self, key: str, buffer_ptr: int, size: int, tp_rank:
 **Parameters:**
 
   - `key` (str): Base identifier of the tensor.
-  - `buffer_ptr` (int): The buffer pointer pre-allocated for tensor, and the buffer should be registered.
+  - `buffer_ptr` (int): The pre-allocated tensor buffer pointer. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `size` (int): The size of buffer.
   - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0). Fetches key `key_tp_{rank}` if `tp_size > 1`.
   - `tp_size` (int): Total tensor parallel size (default: 1).
@@ -2739,7 +2767,7 @@ def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[
 **Parameters:**
 
   - `base_keys` (List[str]): List of base identifiers.
-  - `buffer_ptrs` (List[int]): List of buffer pointers pre-allocated for tensor; buffers should be registered.
+  - `buffer_ptrs` (List[int]): List of pre-allocated tensor buffer pointers. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `sizes` (List[int]): List of buffer sizes.
   - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0).
   - `tp_size` (int): Total tensor parallel size (default: 1).
@@ -2759,7 +2787,7 @@ def put_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
 **Parameters:**
 
   - `key` (str): Object identifier for the tensor.
-  - `buffer_ptr` (int): The buffer pointer; the buffer should be registered. Layout must be \[TensorMetadata\]\[tensor data\].
+  - `buffer_ptr` (int): The buffer pointer. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers. Layout must be \[TensorMetadata\]\[tensor data\].
   - `size` (int): **Actual serialized byte length** of the data in the buffer (metadata + tensor bytes), not the buffer capacity.
 
 **Returns:**
@@ -2777,7 +2805,7 @@ def batch_put_tensor_from(self, keys: List[str], buffer_ptrs: List[int], sizes: 
 **Parameters:**
 
   - `keys` (List[str]): List of object identifiers.
-  - `buffer_ptrs` (List[int]): List of buffer pointers; buffers should be registered.
+  - `buffer_ptrs` (List[int]): List of buffer pointers. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `sizes` (List[int]): List of **actual serialized byte lengths** for each buffer (metadata + tensor bytes), not buffer capacities.
 
 **Returns:**
@@ -2795,7 +2823,7 @@ def put_tensor_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank:
 **Parameters:**
 
   - `key` (str): Base identifier for the tensor.
-  - `buffer_ptr` (int): The buffer pointer; the buffer should be registered.
+  - `buffer_ptr` (int): The buffer pointer. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `size` (int): **Actual serialized byte length** of the full tensor in the buffer.
   - `tp_rank` (int): Kept for signature compatibility with `put_tensor_with_tp()` (default: 0). It does **not** mean "only write one shard".
   - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `put_tensor_from(key, buffer_ptr, size)`.
@@ -2816,7 +2844,7 @@ def batch_put_tensor_with_tp_from(self, base_keys: List[str], buffer_ptrs: List[
 **Parameters:**
 
   - `base_keys` (List[str]): List of base identifiers.
-  - `buffer_ptrs` (List[int]): List of buffer pointers; buffers should be registered.
+  - `buffer_ptrs` (List[int]): List of buffer pointers. Registration is required for a `RealClient` zero-copy transfer and optional for external `DummyClient` pointers.
   - `sizes` (List[int]): List of **actual serialized byte lengths** for each full-tensor buffer.
   - `tp_rank` (int): Kept for signature compatibility with `batch_put_tensor_with_tp()` (default: 0). It does **not** select a single shard to write.
   - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `batch_put_tensor_from(base_keys, buffer_ptrs, sizes)`.
