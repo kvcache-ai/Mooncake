@@ -7,7 +7,9 @@
 #include <thread>
 
 #include "etcd_helper.h"
+#ifdef STORE_USE_ETCD
 #include "ha/kv/etcd_ha_kv_backend.h"
+#endif
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_standby_reader.h"
@@ -105,8 +107,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     cluster_id_ = cluster_id;
 
     if (config_.enable_oplog_following) {
-#ifdef STORE_USE_ETCD
+        // Injected test backends exercise the production Start/replication
+        // path without a live etcd cluster (and without STORE_USE_ETCD).
         if (!catch_up_batch_kv_backend_for_testing_) {
+#ifdef STORE_USE_ETCD
             ErrorCode err =
                 EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
             if (err != ErrorCode::OK) {
@@ -114,16 +118,14 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
                 state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
                 return err;
             }
-        }
 #else
-        // Without STORE_USE_ETCD, the following loop needs an injected test
-        // backend.
-        if (!catch_up_batch_kv_backend_for_testing_) {
+            // Without STORE_USE_ETCD, the following loop needs an injected
+            // test backend.
             state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
             LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
             return ErrorCode::INTERNAL_ERROR;
-        }
 #endif
+        }
     }
 
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
@@ -294,7 +296,13 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     if (catch_up_batch_kv_backend_for_testing_) {
         batch_standby_kv_backend_ = catch_up_batch_kv_backend_for_testing_;
     } else {
+#ifdef STORE_USE_ETCD
         batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
+#else
+        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
+        return ErrorCode::INTERNAL_ERROR;
+#endif
     }
     batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
@@ -519,8 +527,13 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
             *catch_up_batch_kv_backend_for_testing_);
     }
 
+#ifdef STORE_USE_ETCD
     EtcdHaKvBackend batch_backend;
     return FinalCatchUpBatchRecordsLocked(batch_backend);
+#else
+    LOG(ERROR) << "Final OpLog catch-up requires STORE_USE_ETCD";
+    return ErrorCode::INTERNAL_ERROR;
+#endif
 }
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(

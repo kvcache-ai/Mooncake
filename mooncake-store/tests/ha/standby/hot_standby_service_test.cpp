@@ -3,17 +3,22 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 
 #include <xxhash.h>
 
+#include "ha_metric_manager.h"
 #include "master_service.h"
+#include "metadata_store.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
@@ -83,6 +88,127 @@ class FakeCaptureHaKvBackend final : public HaKvBackend {
     std::map<std::string, std::string> values_;
 };
 
+OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
+                     const std::string& payload) {
+    OpLogEntry e;
+    e.sequence_id = seq;
+    e.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    e.op_type = type;
+    e.object_key = key;
+    e.payload = payload;
+    e.checksum =
+        static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
+    e.prefix_hash =
+        key.empty() ? 0
+                    : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
+    return e;
+}
+
+std::string MakeValidPayload(uint64_t client_id_first = 1,
+                             uint64_t client_id_second = 2,
+                             uint64_t size = 1024) {
+    mooncake::MetadataPayload payload;
+    payload.client_id = {client_id_first, client_id_second};
+    payload.size = size;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+class FakeHaKvBackend : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (next_get_error_ != ErrorCode::OK) {
+            auto error = next_get_error_;
+            next_get_error_ = ErrorCode::OK;
+            return error;
+        }
+        if (get_error_ != ErrorCode::OK) {
+            return get_error_;
+        }
+        auto it = values_.find(std::string(key));
+        if (it == values_.end()) {
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        }
+        value = it->second;
+        return ErrorCode::OK;
+    }
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        values_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (range_error_ != ErrorCode::OK) {
+            return range_error_;
+        }
+        kvs.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin_key && key < end_key) {
+                kvs.push_back({.key = key, .value = value});
+                if (kvs.size() >= limit) break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+    bool SupportsTxn() const override { return true; }
+    ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& compare : txn.compares) {
+            auto it = values_.find(compare.key);
+            if (compare.kind == KvCompareKind::kKeyNotExists) {
+                if (it != values_.end()) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else if (it == values_.end() ||
+                       it->second != compare.expected_value) {
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+        }
+        for (const auto& put : txn.puts) {
+            values_[put.key] = put.value;
+        }
+        return ErrorCode::OK;
+    }
+    void SetGetError(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        get_error_ = err;
+    }
+    void SetRangeError(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        range_error_ = err;
+    }
+    void FailNextGet(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        next_get_error_ = err;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::map<std::string, std::string> values_;
+    ErrorCode get_error_{ErrorCode::OK};
+    ErrorCode range_error_{ErrorCode::OK};
+    ErrorCode next_get_error_{ErrorCode::OK};
+};
+
+OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
+                           uint64_t last_seq) {
+    OpLogBatchRecord batch;
+    batch.batch_id = batch_id;
+    batch.first_seq = first_seq;
+    batch.last_seq = last_seq;
+    for (uint64_t seq = first_seq; seq <= last_seq; ++seq) {
+        batch.entries.push_back(MakeEntry(seq, OpType::PUT_END,
+                                          "batch_key_" + std::to_string(seq),
+                                          MakeValidPayload()));
+    }
+    return batch;
+}
+
 OpLogBatchRecord MakeCaptureBatch(uint64_t batch_id, uint64_t sequence_id,
                                   OpType op_type = OpType::REMOVE,
                                   std::string object_key = "key",
@@ -119,6 +245,112 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     return snapshot;
 }
 
+std::shared_ptr<FakeHaKvBackend> MakeBackendWithBatch(
+    const std::string& cluster_id, uint64_t batch_id, uint64_t first_seq,
+    uint64_t last_seq) {
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    EXPECT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id),
+                           EncodeDurablePrefix(
+                               {.batch_id = batch_id, .last_seq = last_seq})));
+    EXPECT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id, batch_id),
+                           EncodeOpLogBatchRecord(
+                               MakeBatch(batch_id, first_seq, last_seq))));
+    return backend;
+}
+
+bool WaitForAppliedSequence(HotStandbyService& service, uint64_t seq,
+                            int max_attempts = 200) {
+    for (int i = 0;
+         i < max_attempts && service.GetLatestAppliedSequenceId() < seq; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return service.GetLatestAppliedSequenceId() >= seq;
+}
+
+bool WaitForState(HotStandbyService& service, StandbyState state,
+                  int max_attempts = 200) {
+    for (int i = 0; i < max_attempts && service.GetState() != state; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return service.GetState() == state;
+}
+
+#ifdef STORE_USE_ETCD
+// Independent in-process integration fixture for live unreachable-endpoint
+// coverage.
+//
+// HotStandbyService's production path can only use the process-global store
+// etcd client (Go singleton via cgo), so a separate client instance is not
+// available. Fork/subprocess isolation is also unsafe once the Go runtime is
+// multi-threaded in this process.
+//
+// This fixture is therefore the strongest isolation the current API allows:
+// it takes exclusive ownership of the global store client for the test
+// duration (Reset onto unreachable endpoints), owns the HotStandbyService
+// under test, and on release always Stop()s that service before Reset-ing
+// back to a conventional endpoint. Reset itself cancels keepalives/watches,
+// waits for prefix-watch goroutines to exit, and closes the old client.
+class LiveUnreachableEtcdIntegrationFixture {
+   public:
+    static constexpr const char* kUnreachableEndpoints = "http://127.0.0.1:1";
+    static constexpr const char* kRestoreEndpoints = "http://127.0.0.1:2379";
+
+    // Returns nullopt on success, or a skip reason if the global client cannot
+    // be acquired onto the unreachable endpoints.
+    static std::optional<std::string> TryCreate(
+        std::unique_ptr<LiveUnreachableEtcdIntegrationFixture>* out) {
+        const ErrorCode err =
+            EtcdHelper::ResetEtcdStoreClient(kUnreachableEndpoints);
+        if (err != ErrorCode::OK) {
+            return std::string(
+                       "Unable to acquire "
+                       "LiveUnreachableEtcdIntegrationFixture: ") +
+                   toString(err);
+        }
+        out->reset(new LiveUnreachableEtcdIntegrationFixture());
+        return std::nullopt;
+    }
+
+    ~LiveUnreachableEtcdIntegrationFixture() { Release(); }
+
+    LiveUnreachableEtcdIntegrationFixture(
+        const LiveUnreachableEtcdIntegrationFixture&) = delete;
+    LiveUnreachableEtcdIntegrationFixture& operator=(
+        const LiveUnreachableEtcdIntegrationFixture&) = delete;
+
+    HotStandbyService& CreateService(HotStandbyConfig config) {
+        config.enable_oplog_following = true;
+        config.enable_verification = false;
+        config.oplog_poll_interval_ms = 1;
+        config.batch_oplog_retry_timeout_sec = 0;
+        service_ = std::make_unique<HotStandbyService>(std::move(config));
+        return *service_;
+    }
+
+    const char* unreachable_endpoints() const { return kUnreachableEndpoints; }
+
+    void Release() {
+        if (released_) {
+            return;
+        }
+        released_ = true;
+        if (service_) {
+            service_->Stop();
+            service_.reset();
+        }
+        (void)EtcdHelper::ResetEtcdStoreClient(kRestoreEndpoints);
+    }
+
+   private:
+    LiveUnreachableEtcdIntegrationFixture() = default;
+
+    std::unique_ptr<HotStandbyService> service_;
+    bool released_ = false;
+};
+#endif
+
 }  // namespace
 
 class HotStandbyServiceTest : public ::testing::Test {
@@ -150,9 +382,6 @@ class HotStandbyServiceTest : public ::testing::Test {
 
 namespace {
 
-constexpr char kEtcdBehaviorCoverageIssue[] =
-    "https://github.com/kvcache-ai/Mooncake/issues/3496";
-
 std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     HotStandbyConfig config, const std::string& cluster_id) {
     config.enable_snapshot_bootstrap = true;
@@ -175,13 +404,32 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     return service;
 }
 
+std::unique_ptr<HotStandbyService> CreateOplogFollowingStandby(
+    HotStandbyConfig config, const std::string& cluster_id,
+    std::shared_ptr<HaKvBackend> backend) {
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms =
+        config.oplog_poll_interval_ms > 0 ? config.oplog_poll_interval_ms : 1;
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(std::move(backend));
+    return service;
+}
+
 }  // namespace
 
 // ========== 6.1.1 Start/Stop tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStart) {
-    GTEST_SKIP() << "Requires deterministic etcd-backed Start coverage; see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+    EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
@@ -193,8 +441,33 @@ TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
-    GTEST_SKIP() << "Requires deterministic invalid-endpoint coverage; see "
-                 << kEtcdBehaviorCoverageIssue;
+#ifdef STORE_USE_ETCD
+    // Empty endpoints fail synchronously in NewStoreEtcdClient (no dial).
+    // Unreachable hosts such as 127.0.0.1:1 only fail later on Get/watch.
+    config_.enable_oplog_following = true;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    const ErrorCode err = service_->Start("primary", "", cluster_id_);
+    EXPECT_NE(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+#else
+    GTEST_SKIP() << "Invalid etcd endpoint coverage requires STORE_USE_ETCD";
+#endif
+}
+
+TEST_F(HotStandbyServiceTest,
+       TestStart_OpLogFollowingRequiresEtcdWithoutInjectedBackend) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Feature-gate coverage applies when STORE_USE_ETCD is OFF";
+#else
+    config_.enable_oplog_following = true;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    const ErrorCode err =
+        service_->Start("primary", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
@@ -208,19 +481,74 @@ TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
 // ========== 6.1.2 State transition tests ==========
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
-    GTEST_SKIP() << "Requires deterministic etcd-backed state coverage; see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
-    GTEST_SKIP() << "Requires deterministic connection-failure coverage; see "
-                 << kEtcdBehaviorCoverageIssue;
+#ifdef STORE_USE_ETCD
+    // Live dial failures are asynchronous: client construction succeeds, then
+    // replication Get() times out. Owned by a dedicated integration fixture so
+    // the global store client is exclusively claimed and restored.
+    std::unique_ptr<LiveUnreachableEtcdIntegrationFixture> fixture;
+    if (auto skip_reason =
+            LiveUnreachableEtcdIntegrationFixture::TryCreate(&fixture)) {
+        GTEST_SKIP() << *skip_reason;
+    }
+
+    // Only the fixture owns HotStandbyService for this case.
+    service_.reset();
+
+    HotStandbyService& service = fixture->CreateService(config_);
+    const ErrorCode err =
+        service.Start("primary", fixture->unreachable_endpoints(), cluster_id_);
+    ASSERT_EQ(ErrorCode::OK, err)
+        << "Start should succeed once the etcd client object exists; dial "
+           "failure is expected asynchronously from the replication loop";
+
+    // Store Get() uses a ~5s context timeout; allow headroom beyond that.
+    ASSERT_TRUE(WaitForState(service, StandbyState::FAILED,
+                             /*max_attempts=*/4000))
+        << "Expected FAILED after unreachable etcd Get/dial timeout";
+    EXPECT_EQ(StandbyState::FAILED, service.GetState());
+
+    fixture->Release();
+#else
+    GTEST_SKIP()
+        << "Live etcd connection-failure coverage requires STORE_USE_ETCD";
+#endif
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
-    GTEST_SKIP() << "Requires deterministic synchronization-failure coverage; "
-                    "see "
-                 << kEtcdBehaviorCoverageIssue;
+    // Start successfully, then publish an unreadable batch so the replication
+    // loop (not snapshot restore) drives the FAILED transition.
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                                          "not-a-valid-batch-record"));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+
+    ASSERT_TRUE(WaitForState(*service_, StandbyState::FAILED));
+    EXPECT_NE(ErrorCode::OK, service_->GetSyncStatus().last_error);
 }
 
 // ========== 6.1.3 Sync status tests ==========
@@ -236,8 +564,22 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_InitialState) {
 }
 
 TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
-    GTEST_SKIP() << "Requires deterministic post-sync status coverage; see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+
+    StandbySyncStatus status = service_->GetSyncStatus();
+    EXPECT_EQ(StandbyState::WATCHING, status.state);
+    EXPECT_TRUE(status.is_connected);
+    EXPECT_TRUE(status.is_syncing);
+    EXPECT_EQ(1u, status.applied_seq_id);
+    EXPECT_GE(status.primary_seq_id, status.applied_seq_id);
+    EXPECT_EQ(ErrorCode::OK, status.last_error);
 }
 
 // ========== 6.1.4 Promotion tests ==========
@@ -301,21 +643,62 @@ TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
 // ========== 6.1.5 Warm start tests ==========
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
-    GTEST_SKIP() << "Requires deterministic local-state warm-start coverage; "
-                    "see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+    EXPECT_GE(service_->GetMetadataCount(), 1u);
+    service_->Stop();
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
+    EXPECT_GE(service_->GetMetadataCount(), 1u);
 }
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
-    GTEST_SKIP() << "Requires deterministic empty-state warm-start coverage; "
-                    "see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    config_.enable_oplog_following = true;
+    config_.enable_snapshot_bootstrap = false;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(0u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(0u, service_->GetMetadataCount());
 }
 
 TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
-    GTEST_SKIP() << "Requires deterministic etcd-backed snapshot warm-start "
-                    "coverage; see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("warm-start-snapshot", 42, "key-1", 4096))));
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
@@ -574,163 +957,65 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureRejectsInconsistentSequence) {
 // ========== 6.1.7 Replication loop tests ==========
 
 TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
-    GTEST_SKIP() << "Requires deterministic replication-loop metric coverage; "
-                    "see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    // Shared so Stop()/TearDown callbacks cannot outlive a stack atomic.
+    auto observed_applied = std::make_shared<std::atomic<uint64_t>>(0);
+    service_->SetSyncStatusCallback(
+        [observed_applied](const StandbySyncStatus& status) {
+            observed_applied->store(status.applied_seq_id,
+                                    std::memory_order_relaxed);
+        });
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+    EXPECT_EQ(static_cast<int64_t>(StandbyState::WATCHING),
+              HAMetricManager::instance().get_standby_state());
+    for (int i = 0; i < 100 && observed_applied->load() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_GE(observed_applied->load(), 1u);
+    service_->Stop();
+    service_->SetSyncStatusCallback({});
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
 }
 
 TEST_F(HotStandbyServiceTest, TestReplicationLoop_HandlesDisconnect) {
-    GTEST_SKIP() << "Requires deterministic replication disconnect coverage; "
-                    "see "
-                 << kEtcdBehaviorCoverageIssue;
+    auto backend = std::make_shared<FakeHaKvBackend>();
+    backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForState(*service_, StandbyState::FAILED));
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              service_->GetSyncStatus().last_error);
 }
 
 // ========== 6.1.8 Verification loop tests ==========
+// Production verification is not implemented yet (loop only VLOG-skips), so
+// these cases stay skipped until checksum comparison has an observable effect.
 
 TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
-    GTEST_SKIP()
-        << "Requires deterministic enabled verification-loop coverage; "
-           "see "
-        << kEtcdBehaviorCoverageIssue;
+    GTEST_SKIP() << "Verification has no observable effect yet (loop only "
+                    "VLOG-skips); re-enable when checksum comparison is "
+                    "implemented";
 }
 
 TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
-    GTEST_SKIP()
-        << "Requires deterministic disabled verification-loop coverage; see "
-        << kEtcdBehaviorCoverageIssue;
+    GTEST_SKIP() << "Verification has no observable effect yet (loop only "
+                    "VLOG-skips); re-enable when checksum comparison is "
+                    "implemented";
 }
 
 // ========== Issue 2 fail-closed catch-up ==========
-
-#ifdef STORE_USE_ETCD
-namespace {
-
-// Helper to create a valid OpLogEntry with checksum (mirrors the helper in
-// oplog_applier_test.cpp).
-OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
-                     const std::string& payload) {
-    OpLogEntry e;
-    e.sequence_id = seq;
-    e.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                         std::chrono::steady_clock::now().time_since_epoch())
-                         .count();
-    e.op_type = type;
-    e.object_key = key;
-    e.payload = payload;
-    // Compute checksum and prefix_hash using the production algorithm.
-    e.checksum =
-        static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
-    e.prefix_hash =
-        key.empty() ? 0
-                    : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
-    return e;
-}
-
-// Helper to create a valid struct_pack payload for PUT_END
-std::string MakeValidPayload(uint64_t client_id_first = 1,
-                             uint64_t client_id_second = 2,
-                             uint64_t size = 1024) {
-    mooncake::MetadataPayload payload;
-    payload.client_id = {client_id_first, client_id_second};
-    payload.size = size;
-    auto result = struct_pack::serialize(payload);
-    return std::string(result.begin(), result.end());
-}
-
-class FakeHaKvBackend : public HaKvBackend {
-   public:
-    ErrorCode Get(std::string_view key, std::string& value) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (next_get_error_ != ErrorCode::OK) {
-            auto error = next_get_error_;
-            next_get_error_ = ErrorCode::OK;
-            return error;
-        }
-        if (get_error_ != ErrorCode::OK) {
-            return get_error_;
-        }
-        auto it = values_.find(std::string(key));
-        if (it == values_.end()) {
-            return ErrorCode::ETCD_KEY_NOT_EXIST;
-        }
-        value = it->second;
-        return ErrorCode::OK;
-    }
-    ErrorCode Put(std::string_view key, std::string_view value) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        values_[std::string(key)] = std::string(value);
-        return ErrorCode::OK;
-    }
-    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
-                    size_t limit, std::vector<KvPair>& kvs) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (range_error_ != ErrorCode::OK) {
-            return range_error_;
-        }
-        kvs.clear();
-        for (const auto& [key, value] : values_) {
-            if (key >= begin_key && key < end_key) {
-                kvs.push_back({.key = key, .value = value});
-                if (kvs.size() >= limit) break;
-            }
-        }
-        return ErrorCode::OK;
-    }
-    bool SupportsTxn() const override { return true; }
-    ErrorCode Txn(const KvTxn& txn) override {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (const auto& compare : txn.compares) {
-            auto it = values_.find(compare.key);
-            if (compare.kind == KvCompareKind::kKeyNotExists) {
-                if (it != values_.end()) {
-                    return ErrorCode::ETCD_TRANSACTION_FAIL;
-                }
-            } else if (it == values_.end() ||
-                       it->second != compare.expected_value) {
-                return ErrorCode::ETCD_TRANSACTION_FAIL;
-            }
-        }
-        for (const auto& put : txn.puts) {
-            values_[put.key] = put.value;
-        }
-        return ErrorCode::OK;
-    }
-    void SetGetError(ErrorCode err) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        get_error_ = err;
-    }
-    void SetRangeError(ErrorCode err) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        range_error_ = err;
-    }
-    void FailNextGet(ErrorCode err) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        next_get_error_ = err;
-    }
-
-   private:
-    mutable std::mutex mutex_;
-    std::map<std::string, std::string> values_;
-    ErrorCode get_error_{ErrorCode::OK};
-    ErrorCode range_error_{ErrorCode::OK};
-    ErrorCode next_get_error_{ErrorCode::OK};
-};
-
-OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
-                           uint64_t last_seq) {
-    OpLogBatchRecord batch;
-    batch.batch_id = batch_id;
-    batch.first_seq = first_seq;
-    batch.last_seq = last_seq;
-    for (uint64_t seq = first_seq; seq <= last_seq; ++seq) {
-        batch.entries.push_back(MakeEntry(seq, OpType::PUT_END,
-                                          "batch_key_" + std::to_string(seq),
-                                          MakeValidPayload()));
-    }
-    return batch;
-}
-
-}  // namespace
 
 TEST_F(HotStandbyServiceTest,
        BatchRecordStandbyPollsInjectedBackendWithoutNotifier) {
@@ -923,11 +1208,8 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
               batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
                                   EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
 
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state; "
-                        "skipping promotion test";
-    }
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
     EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot out;
@@ -1015,11 +1297,9 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
     }
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
-    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
-    if (err != ErrorCode::OK) {
-        GTEST_SKIP() << "Service could not reach WATCHING state; "
-                        "skipping promotion test";
-    }
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
@@ -1051,7 +1331,6 @@ TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
     EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
-#endif
 
 }  // namespace mooncake::test
 

@@ -202,8 +202,9 @@ class HotStandbyService {
     void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
-     * @brief Test seam: when set, promotion final catch-up first tries
-     *        batch-record durable prefix/batches from this backend.
+     * @brief Test seam: inject a HaKvBackend used for Start()/replication and
+     *        promotion catch-up. When set, Start() skips live etcd connection
+     *        (and works even when STORE_USE_ETCD is OFF).
      */
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
