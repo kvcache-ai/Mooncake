@@ -15,6 +15,7 @@
 package tests
 
 import (
+	"os"
 	"testing"
 
 	store "github.com/kvcache-ai/Mooncake/mooncake-store/go/mooncakestore"
@@ -25,6 +26,18 @@ import (
 // To run:
 //   mooncake_master --enable_http_metadata_server=true
 //   go test -v ./tests/...
+//
+// The endpoints default to a master with its embedded HTTP metadata server
+// on the standard ports and can be overridden for other environments:
+//   MC_METADATA_SERVER (default "http://localhost:8080/metadata")
+//   MOONCAKE_MASTER    (default "localhost:50051")
+
+func envOrDefault(key, fallback string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return fallback
+}
 
 func setupStore(t *testing.T) *store.Store {
 	t.Helper()
@@ -34,12 +47,12 @@ func setupStore(t *testing.T) *store.Store {
 	}
 	err = s.Setup(
 		"localhost",
-		"http://localhost:8080/metadata",
+		envOrDefault("MC_METADATA_SERVER", "http://localhost:8080/metadata"),
 		512*1024*1024, // 512 MB global segment
 		128*1024*1024, // 128 MB local buffer
 		"tcp",
 		"",
-		"localhost:50051",
+		envOrDefault("MOONCAKE_MASTER", "localhost:50051"),
 	)
 	if err != nil {
 		s.Close()
