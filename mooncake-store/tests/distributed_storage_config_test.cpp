@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "config/distributed_storage_config.h"
+#include "storage/distributed/bucket_entry_layout.h"
 
 namespace mooncake {
 
@@ -60,6 +61,9 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar deferred_free_seconds{"MOONCAKE_DFS_DEFERRED_FREE_SECONDS"};
     ScopedEnvVar eviction_check_interval{
         "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL"};
+    ScopedEnvVar allocator_type{"MOONCAKE_DFS_ALLOCATOR_TYPE"};
+    ScopedEnvVar bucket_capacity{"MOONCAKE_DFS_BUCKET_CAPACITY"};
+    ScopedEnvVar max_bucket_count{"MOONCAKE_DFS_MAX_BUCKET_COUNT"};
 };
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {
@@ -75,6 +79,10 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.7);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(30));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(5));
+    EXPECT_EQ(config.allocator_type, DfsAllocatorType::SHARD);
+    EXPECT_TRUE(config.allocator_type_valid);
+    EXPECT_EQ(config.bucket_capacity, 256ULL * 1024 * 1024);
+    EXPECT_EQ(config.max_bucket_count, 256);
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -119,6 +127,9 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     env.eviction_low_watermark.Set("0.65");
     env.deferred_free_seconds.Set("12");
     env.eviction_check_interval.Set("3");
+    env.allocator_type.Set("bucket");
+    env.bucket_capacity.Set("8388608");
+    env.max_bucket_count.Set("32");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
@@ -134,14 +145,30 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
     EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
     EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_EQ(config.allocator_type, DfsAllocatorType::BUCKET);
+    EXPECT_EQ(config.bucket_capacity, 8388608);
+    EXPECT_EQ(config.max_bucket_count, 32);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
+    EXPECT_TRUE(config.ValidateForBucketAllocator());
 
     const std::string formatted = config.FormatStr();
     EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
     EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
     EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
               std::string::npos);
+    EXPECT_NE(formatted.find("allocator_type=bucket"), std::string::npos);
+    EXPECT_NE(formatted.find("max_bucket_count=32"), std::string::npos);
+}
+
+TEST_F(DistributedStorageConfigTest, RejectsUnknownAllocatorType) {
+    env.allocator_type.Set("unknown");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.allocator_type, DfsAllocatorType::SHARD);
+    EXPECT_FALSE(config.allocator_type_valid);
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
 }
 
 TEST_F(DistributedStorageConfigTest, PreservesAliasPrecedence) {
@@ -290,6 +317,25 @@ TEST(DistributedStorageConfigValidationTest, RejectsInvalidAllocatorSettings) {
     eviction_disabled.eviction_enabled = false;
     eviction_disabled.eviction_check_interval = std::chrono::seconds(0);
     EXPECT_TRUE(eviction_disabled.ValidateForAllocator());
+}
+
+TEST(DistributedStorageConfigValidationTest, RejectsInvalidBucketSettings) {
+    auto config = ValidConfig();
+    config.allocator_type = DfsAllocatorType::BUCKET;
+    config.bucket_capacity = 64 * 1024;
+    config.max_bucket_count = 8;
+    EXPECT_TRUE(config.ValidateForBucketAllocator());
+
+    config.bucket_capacity = 0;
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
+    config.bucket_capacity = 64 * 1024 + 1;
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
+    config.bucket_capacity = 64 * 1024;
+
+    config.max_bucket_count = 0;
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
+    config.max_bucket_count = kMaxBucketId + 1;
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
 }
 
 }  // namespace

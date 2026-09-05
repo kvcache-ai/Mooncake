@@ -1,8 +1,11 @@
 #pragma once
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
+#include <unistd.h>
 
+#include <cerrno>
 #include <span>
 #include <string>
 #include <vector>
@@ -123,6 +126,46 @@ class FileSystemAdapter {
                                                    int /*iovcnt*/,
                                                    int64_t /*offset*/) {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    // Metadata snapshots are written through the filesystem namespace. These
+    // defaults also work for FUSE-mounted distributed filesystems.
+    virtual tl::expected<void, ErrorCode> SyncFile(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            return tl::make_unexpected(errno == ENOENT
+                                           ? ErrorCode::FILE_NOT_FOUND
+                                           : ErrorCode::FILE_OPEN_FAIL);
+        }
+        const int rc = ::fsync(fd);
+        const int saved_errno = errno;
+        ::close(fd);
+        if (rc != 0) {
+            errno = saved_errno;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
+    }
+
+    virtual tl::expected<void, ErrorCode> SyncDirectory(
+        const std::string& dir) {
+        const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (fd < 0) {
+            if (errno == EACCES || errno == EPERM || errno == EINVAL) {
+                return {};
+            }
+            return tl::make_unexpected(errno == ENOENT
+                                           ? ErrorCode::FILE_NOT_FOUND
+                                           : ErrorCode::FILE_OPEN_FAIL);
+        }
+        const int rc = ::fsync(fd);
+        const int saved_errno = errno;
+        ::close(fd);
+        if (rc != 0 && saved_errno != EINVAL) {
+            errno = saved_errno;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        return {};
     }
 
     // === Lifecycle ===

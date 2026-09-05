@@ -4,6 +4,8 @@
 #include <cstdint>
 #include <string>
 
+#include "storage/distributed/global_allocator_interface.h"
+
 namespace mooncake {
 
 struct DistributedStorageConfig {
@@ -20,8 +22,14 @@ struct DistributedStorageConfig {
     std::chrono::seconds deferred_free_duration{30};
     std::chrono::seconds eviction_check_interval{5};
 
+    DfsAllocatorType allocator_type = DfsAllocatorType::SHARD;
+    uint64_t bucket_capacity = 256ULL * 1024 * 1024;
+    int64_t max_bucket_count = 256;
+    bool allocator_type_valid = true;
+
     bool Validate() const;
     bool ValidateForAllocator() const;
+    bool ValidateForBucketAllocator() const;
     static DistributedStorageConfig FromEnvironment();
     std::string FormatStr() const;
 };

@@ -3,12 +3,30 @@
 #include <glog/logging.h>
 #include <chrono>
 #include <filesystem>
+#include <limits>
 #include <sstream>
 
 #include "environ.h"
 #include "environment_variables.h"
+#include "storage/distributed/bucket_entry_layout.h"
 
 namespace mooncake {
+
+std::optional<DfsAllocatorType> ParseDfsAllocatorType(std::string_view name) {
+    if (name == "shard" || name == "SHARD") return DfsAllocatorType::SHARD;
+    if (name == "bucket" || name == "BUCKET") return DfsAllocatorType::BUCKET;
+    return std::nullopt;
+}
+
+const char* ToString(DfsAllocatorType type) {
+    switch (type) {
+        case DfsAllocatorType::SHARD:
+            return "shard";
+        case DfsAllocatorType::BUCKET:
+            return "bucket";
+    }
+    return "unknown";
+}
 
 bool DistributedStorageConfig::Validate() const {
     if (fsdir.empty()) {
@@ -77,6 +95,37 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
     return true;
 }
 
+bool DistributedStorageConfig::ValidateForBucketAllocator() const {
+    if (!ValidateForAllocator()) return false;
+    if (!allocator_type_valid) {
+        LOG(ERROR) << "DistributedStorageConfig: invalid allocator type";
+        return false;
+    }
+    if (bucket_capacity == 0 ||
+        bucket_capacity <= BucketEntryLayout::kHeaderSize) {
+        LOG(ERROR) << "DistributedStorageConfig: bucket_capacity is too small, "
+                   << "bucket_capacity=" << bucket_capacity;
+        return false;
+    }
+    if (bucket_capacity % alignment != 0) {
+        LOG(ERROR) << "DistributedStorageConfig: bucket_capacity must align";
+        return false;
+    }
+    if (max_bucket_count <= 0 || max_bucket_count > kMaxBucketId) {
+        LOG(ERROR) << "DistributedStorageConfig: max_bucket_count must be in "
+                      "[1, "
+                   << kMaxBucketId << "], max_bucket_count="
+                   << max_bucket_count;
+        return false;
+    }
+    if (static_cast<uint64_t>(max_bucket_count) >
+        std::numeric_limits<uint64_t>::max() / bucket_capacity) {
+        LOG(ERROR) << "DistributedStorageConfig: bucket capacity overflow";
+        return false;
+    }
+    return true;
+}
+
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     DistributedStorageConfig config;
     using Variables = DistributedStorageEnvironmentVariables;
@@ -122,6 +171,22 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.eviction_check_interval = std::chrono::seconds(Environ::ReadOr(
         Variables::MOONCAKE_DFS_EVICTION_CHECK_INTERVAL,
         static_cast<int>(config.eviction_check_interval.count())));
+
+    const std::string allocator_type_name = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_ALLOCATOR_TYPE,
+        std::string(ToString(config.allocator_type)));
+    if (auto parsed = ParseDfsAllocatorType(allocator_type_name)) {
+        config.allocator_type = *parsed;
+    } else {
+        LOG(ERROR) << "Unknown MOONCAKE_DFS_ALLOCATOR_TYPE '"
+                   << allocator_type_name << "', expected 'shard' or 'bucket'";
+        config.allocator_type_valid = false;
+    }
+    config.bucket_capacity = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BUCKET_CAPACITY, config.bucket_capacity);
+    config.max_bucket_count = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT,
+        static_cast<int>(config.max_bucket_count));
     return config;
 }
 
@@ -137,7 +202,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_low_watermark=" << eviction_low_watermark
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
-        << eviction_check_interval.count();
+        << eviction_check_interval.count()
+        << ", allocator_type=" << ToString(allocator_type)
+        << ", bucket_capacity=" << bucket_capacity
+        << ", max_bucket_count=" << max_bucket_count;
     return oss.str();
 }
 
