@@ -604,6 +604,19 @@ target_include_directories(tent_rpc_handler_isolation_test
 add_test(NAME tent_rpc_handler_isolation_test
          COMMAND tent_rpc_handler_isolation_test)
 
+# warmupSegment routing/aggregation semantics across transports, plus the
+# RDMA pass result rule. Driven through fake transports; the RDMA pair path
+# needs a NIC and is not exercised here, and TCP is not warmed at all.
+add_executable(tent_warmup_segment_test warmup_segment_test.cpp)
+target_link_libraries(tent_warmup_segment_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_warmup_segment_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_warmup_segment_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_warmup_segment_test COMMAND tent_warmup_segment_test)
+
 add_executable(tent_runtime_queue_dispatch_test runtime_queue_dispatch_test.cpp)
 target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE gtest gtest_main
                                                                tent_link_group)

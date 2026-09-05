@@ -157,6 +157,10 @@ class FaultProxyTransport : public Transport {
         return real_->freeLocalMemory(addr, size);
     }
 
+    Status warmupSegment(SegmentID target_id) override {
+        return real_->warmupSegment(target_id);
+    }
+
     bool warmupMemory(void* addr, size_t length) override {
         return real_->warmupMemory(addr, length);
     }

@@ -147,6 +147,16 @@ class Transport {
     // prefault). Default: no-op, returns false.
     virtual bool warmupMemory(void* addr, size_t length) { return false; }
 
+    // Eagerly establish this transport's connection state towards the target
+    // segment, so the first transfer does not pay the connection setup cost
+    // (endpoint bootstrap, QP transitions, TCP/RPC dial). Best effort and
+    // idempotent: connections that already exist are left alone, and a pair
+    // that cannot connect yet stays on the lazy path. Default: not
+    // implemented, which callers treat as "nothing to warm".
+    virtual Status warmupSegment(SegmentID target_id) {
+        return Status::NotImplemented("warmupSegment not implemented" LOC_MARK);
+    }
+
     virtual Status addMemoryBuffer(BufferDesc& desc,
                                    const MemoryOptions& options) {
         return Status::NotImplemented(

@@ -792,6 +792,139 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
     return endpoint;
 }
 
+Status RdmaTransport::warmupSegment(SegmentID target_id) {
+    std::string rpc_server_addr, target_seg_name, target_nic_path_name;
+    std::vector<std::string> target_dev_names;
+
+    auto status = metadata_->segmentManager().withCachedSegment(
+        target_id, [&](SegmentDesc* segment) {
+            // withCachedSegment reruns this on NeedsRefreshCache, so start
+            // from a clean list rather than appending to the first pass.
+            target_dev_names.clear();
+            if (segment->type != SegmentType::Memory) {
+                // File and other non-memory segments carry no RDMA endpoint
+                // state. Nothing to warm is not a failure.
+                return Status::NotImplemented(
+                    "Segment type is not Memory" LOC_MARK);
+            }
+            if (target_id != LOCAL_SEGMENT_ID) {
+                rpc_server_addr = segment->rpc_server_addr;
+            }
+            auto topo = &std::get<MemorySegmentDesc>(segment->detail).topology;
+            target_seg_name = segment->name;
+            target_nic_path_name = segment->nicPathServerName();
+            for (size_t id = 0; id < topo->getNicCount(); ++id) {
+                if (topo->getNicType(id) != Topology::NIC_RDMA) continue;
+                auto dev_name = topo->getNicName(id);
+                if (!dev_name.empty()) target_dev_names.push_back(dev_name);
+            }
+            if (target_seg_name.empty()) {
+                return Status::NeedsRefreshCache(
+                    "Empty target segment name" LOC_MARK);
+            }
+            if (target_dev_names.empty()) {
+                // A TCP-only or CPU-only peer advertises no RDMA NIC. There
+                // is nothing to warm towards it, which is not a failure -
+                // and it must not look like a stale cache, or every warmup
+                // of such a peer would refetch the whole segment desc.
+                return Status::NotImplemented(
+                    "Target advertises no RDMA device" LOC_MARK);
+            }
+            return Status::OK();
+        });
+    if (!status.ok()) return status;
+
+    // All enabled local contexts x all remote RDMA NICs: the data plane may
+    // route a slice over any of these pairs, and bootstrapping also brings
+    // up the notification QP that rides on the same endpoint.
+    struct WarmupPair {
+        std::string peer_name;
+        std::string dev_name;
+        std::shared_ptr<RdmaEndPoint> endpoint;
+        bool ready = false;
+        Status error = Status::OK();
+    };
+    std::vector<WarmupPair> pairs;
+    for (auto& ctx : context_set_) {
+        if (!ctx || ctx->status() != RdmaContext::DEVICE_ENABLED) continue;
+        for (const auto& dev_name : target_dev_names) {
+            WarmupPair pair;
+            pair.dev_name = dev_name;
+            pair.peer_name = MakeNicPath(target_nic_path_name, dev_name);
+            pair.endpoint = ctx->endpointStore()->getOrInsert(pair.peer_name);
+            if (!pair.endpoint) {
+                pair.error = Status::InternalError("Cannot allocate endpoint " +
+                                                   pair.peer_name + LOC_MARK);
+            } else if (pair.endpoint->status() == RdmaEndPoint::EP_READY) {
+                pair.ready = true;
+            }
+            pairs.push_back(std::move(pair));
+        }
+    }
+
+    // Each cold pair is a full endpoint and queue pair bootstrap, tens of
+    // milliseconds on the fabric these numbers came from, so handshaking them
+    // one after another costs the sum over every pair and just moves the stall
+    // the caller asked to avoid into this call. Hand the cold ones out at once
+    // and collect them; a pair that is already up starts nothing.
+    std::vector<std::pair<size_t, std::future<Status>>> pending;
+    for (size_t index = 0; index < pairs.size(); ++index) {
+        const auto& pair = pairs[index];
+        if (pair.ready || !pair.endpoint) continue;
+        pending.emplace_back(
+            index,
+            std::async(
+                std::launch::async,
+                [endpoint = pair.endpoint, seg_name = target_seg_name,
+                 dev_name = pair.dev_name, server_addr = rpc_server_addr]() {
+                    return endpoint->connect(seg_name, dev_name, server_addr);
+                }));
+    }
+    for (auto& [index, result] : pending) {
+        auto connect_status = result.get();
+        if (connect_status.ok()) {
+            pairs[index].ready = true;
+        } else {
+            pairs[index].error = connect_status;
+            LOG(WARNING) << "RDMA warmup: endpoint " << pairs[index].peer_name
+                         << " not ready: " << connect_status.ToString();
+        }
+    }
+
+    // Fold in pair order, so a partial warmup reports the first pair that was
+    // left cold rather than whichever handshake happened to finish first.
+    size_t attempted = pairs.size(), ready = 0;
+    Status first_error = Status::OK();
+    for (const auto& pair : pairs) {
+        if (pair.ready) {
+            ++ready;
+        } else if (first_error.ok()) {
+            first_error = pair.error;
+        }
+    }
+    LOG(INFO) << "RDMA warmup towards segment " << target_seg_name << ": "
+              << ready << "/" << attempted << " endpoints ready";
+    return warmupPassResult(attempted, ready, first_error);
+}
+
+Status RdmaTransport::warmupPassResult(size_t attempted, size_t ready,
+                                       const Status& first_error) {
+    if (attempted == 0) {
+        // No enabled local context, so there was no pair to warm. Nothing to
+        // warm is not a failure, the same answer a peer that advertises no
+        // RDMA device gets.
+        return Status::NotImplemented("No enabled RDMA context" LOC_MARK);
+    }
+    if (ready == attempted) return Status::OK();
+    // Some pairs are still cold. Reporting OK here would hand back a target
+    // whose first transfer can still stall - the data path may route a slice
+    // over any pair, so one warm pair does not stand for the rest, and that
+    // stall is exactly what the caller paid this call to avoid. The engine
+    // level aggregates transports by the same rule.
+    if (!first_error.ok()) return first_error;
+    return Status::InternalError("RDMA warmup left endpoints cold" LOC_MARK);
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
     auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);

@@ -107,6 +107,23 @@ class RdmaTransport : public Transport {
     virtual Status receiveNotification(
         std::vector<Notification>& notify_list) override;
 
+    // Pre-establish endpoints towards every RDMA NIC advertised by the
+    // target segment, from every enabled local context. Bootstrapping an
+    // endpoint on first use has been observed to stall first batches for
+    // seconds; warming moves that cost to an explicit call site. A pass that
+    // leaves any pair cold is reported: the data path may route a later
+    // slice over any of them, so a partly warmed target is still one whose
+    // first transfer can stall. The cold pairs keep the lazy path either
+    // way, so the target stays usable.
+    Status warmupSegment(SegmentID target_id) override;
+
+    // What such a pass reports, given how many of the pairs it attempted came
+    // back ready and the first failure it saw. Enumerating the pairs needs a
+    // NIC and a peer; deciding what the result means does not, so the rule
+    // lives here where a test can reach it.
+    static Status warmupPassResult(size_t attempted, size_t ready,
+                                   const Status& first_error);
+
     // Process notification completions (call from worker threads)
     int processNotifyCompletions();
 
