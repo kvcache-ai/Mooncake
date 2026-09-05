@@ -43,6 +43,19 @@ class RdmaEndPoint;
 class EndpointStore;
 class RdmaTransport;
 
+// A dma_buf handle exported once for a buffer and shared across every NIC's
+// registration of that buffer. Exporting a single fd (instead of one per NIC)
+// collapses the per-NIC dma_buf objects into one kernel object, so the GPU
+// driver reserves a single BAR1 window for the buffer rather than one window
+// per NIC. Host memory (and the nvidia-peermem path) yields kHostReg with no
+// fd, taking the plain ibv_reg_mr path.
+struct DmabufExport {
+    enum class Method { kHostReg, kDmabufReg };
+    Method method = Method::kHostReg;
+    int fd = -1;          // live dma_buf fd; -1 when not applicable
+    uint64_t offset = 0;  // offset of addr within the exported allocation
+};
+
 class RdmaContext {
     friend class RdmaCQ;
     friend class RdmaEndPoint;
@@ -83,6 +96,32 @@ class RdmaContext {
     using MemReg = void *;
 
     MemReg registerMemReg(void *addr, size_t length, int access);
+
+    // Shared-fd variant: the caller exports a single dma_buf fd for the buffer
+    // via exportDmabuf(), passes the same handle to every NIC's registration,
+    // then closes the fd once via closeDmabufExport() AFTER all registrations
+    // have completed. This keeps one dma_buf object alive across all NICs so
+    // the GPU driver reserves a single BAR1 window for the buffer.
+    MemReg registerMemReg(void *addr, size_t length, int access,
+                          const DmabufExport &exp);
+
+    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // memory yields kDmabufReg with a live fd unless with_nvidia_peermem is
+    // set; host memory and the nvidia-peermem path yield kHostReg with no fd.
+    // Any fd placed in out.fd MUST be closed by the caller (via
+    // closeDmabufExport) AFTER every registerMemReg() call consuming it has
+    // returned — each successful registration takes its own reference, so
+    // closing earlier would invalidate the fd for the remaining NICs.
+    static int exportDmabuf(void *addr, DmabufExport &out,
+                            bool with_nvidia_peermem);
+
+    // Closes the fd held by a DmabufExport, if any. Idempotent.
+    static void closeDmabufExport(DmabufExport &exp);
+
+    // True when libibverbs has ibv_reg_dmabuf_mr and at least one CUDA
+    // device reports CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED. Used to enable
+    // gpu_to_gpu without nvidia-peermem.
+    static bool dmaBufRegistrationAvailable();
 
     // Warm up RDMA MR registration by temporarily registering/deregistering.
     // This targets RDMA driver-side pinning/metadata and differs from CPU

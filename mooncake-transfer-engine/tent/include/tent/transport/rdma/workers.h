@@ -57,6 +57,12 @@ class Workers {
 
     Status stop();
 
+    // Stop accepting new submits and wait until every worker's inflight
+    // count hits 0. Workers keep polling CQ so in-flight GPUDirect writes
+    // can complete. timeout_ns bounds the wait so teardown cannot hang.
+    static constexpr uint64_t kDefaultQuiesceTimeoutNs = 10000000000ull;
+    Status quiesce(uint64_t timeout_ns = kDefaultQuiesceTimeoutNs);
+
     Status submit(RdmaSlice* slice);
 
     Status submit(RdmaSliceList& slice_list, int worker_id = -1);
@@ -171,6 +177,7 @@ class Workers {
     std::thread monitor_;
 
     std::atomic<bool> running_;
+    std::atomic<bool> accepting_submits_{true};
 
     struct PostPath {
         int local_device_id;

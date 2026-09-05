@@ -26,6 +26,15 @@ on:
         # Used by nightly builds to stamp date-based dev versions.
         type: string
         default: ''
+      use-tent:
+        # Build the TENT runtime into the wheel. Runtime behavior is unchanged
+        # unless a process opts in via MC_USE_TENT=1 (classic engine is the
+        # default facade path), so callers can enable this purely to ship the
+        # capability. Currently opted in by the PR CI cuda13 build that feeds
+        # the T-One e2e pipeline; release callers stay false until TENT is
+        # validated on arm64.
+        type: boolean
+        default: false
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -111,6 +120,12 @@ jobs:
               exit 1
               ;;
           esac
+
+          # TENT runtime (off unless activated via MC_USE_TENT=1 at runtime).
+          # liburing is provided by dependencies.sh / mooncake_provide_liburing().
+          if [ "${{ inputs.use-tent }}" = "true" ]; then
+            cmake_args="$cmake_args -DUSE_TENT=ON -DTENT_METRICS_ENABLED=ON"
+          fi
 
           {
             echo "VARIANT_FLAG=$variant_flag"

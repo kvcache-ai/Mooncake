@@ -61,6 +61,10 @@ struct IbvSymbols {
                                   int access);
     ibv_mr* (*ibv_reg_mr_iova2)(struct ibv_pd* pd, void* addr, size_t length,
                                 uint64_t iova, unsigned int access);
+    // Optional (IBVERBS_1.12). GPU DMA-BUF registration; nullptr on older
+    // libibverbs, which then stays on ibv_reg_mr / nvidia-peermem.
+    ibv_mr* (*ibv_reg_dmabuf_mr)(ibv_pd* pd, uint64_t offset, size_t length,
+                                 uint64_t iova, int fd, int access);
     int (*ibv_dereg_mr)(ibv_mr* mr);
 
     int (*ibv_fork_init)(void);

@@ -522,22 +522,194 @@ int RdmaContext::resume() {
     return 0;
 }
 
+int RdmaContext::exportDmabuf(void* addr, DmabufExport& out,
+                              bool with_nvidia_peermem) {
+    out = DmabufExport{};
+    (void)addr;
+    (void)with_nvidia_peermem;
+#ifdef USE_CUDA
+    // Host memory uses ibv_reg_mr. GPU memory is exported once as a dma_buf
+    // fd that every NIC then imports, so the driver keeps a single BAR1
+    // window for the buffer instead of one per NIC. WITH_NVIDIA_PEERMEM
+    // skips the export and uses nvidia-peermem ibv_reg_mr, same as classic.
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+        out.method = DmabufExport::Method::kHostReg;
+    } else if (memType == CU_MEMORYTYPE_DEVICE && with_nvidia_peermem) {
+        out.method = DmabufExport::Method::kHostReg;
+    } else if (memType == CU_MEMORYTYPE_DEVICE) {
+        unsigned int devOrd = 0;
+        cuPointerGetAttribute(&devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL,
+                              (CUdeviceptr)addr);
+        CUdevice cuDev;
+        CUcontext cuCtx;
+        result = cuDeviceGet(&cuDev, static_cast<int>(devOrd));
+        if (result != CUDA_SUCCESS) {
+            const char* errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to get CUDA device " << devOrd
+                       << " for dmabuf export of " << (uintptr_t)addr
+                       << " cuda error=" << (errStr ? errStr : "unknown");
+            return -1;
+        }
+        result = cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+        if (result != CUDA_SUCCESS) {
+            const char* errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to retain CUDA primary context for dmabuf "
+                          "export of "
+                       << (uintptr_t)addr
+                       << " cuda error=" << (errStr ? errStr : "unknown");
+            return -1;
+        }
+        result = cuCtxSetCurrent(cuCtx);
+        if (result != CUDA_SUCCESS) {
+            const char* errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to set CUDA context current for dmabuf "
+                          "export of "
+                       << (uintptr_t)addr
+                       << " cuda error=" << (errStr ? errStr : "unknown");
+            cuDevicePrimaryCtxRelease(cuDev);
+            return -1;
+        }
+
+        // addr may sit at an offset within a larger cudaMalloc block (PyTorch
+        // caching allocator). cuMemGetHandleForAddressRange needs the exact
+        // allocation boundaries.
+        CUdeviceptr allocBase = 0;
+        size_t allocSize = 0;
+        result =
+            cuMemGetAddressRange(&allocBase, &allocSize, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            const char* errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to call cuMemGetAddressRange for "
+                       << (uintptr_t)addr << " cuda error=" << errStr;
+            cuDevicePrimaryCtxRelease(cuDev);
+            return -1;
+        }
+
+        int dmabuf_fd = -1;
+        // flags must be 0: the PCIE-BAR1 mapping flag is rejected (error 801)
+        // on some GPU/driver combinations (e.g. B200). Some GPUs (H20 here)
+        // report DMA_BUF_SUPPORTED=0 and also return 801; fall back to
+        // ibv_reg_mr so GDR still works through nvidia-peermem.
+        result = cuMemGetHandleForAddressRange(
+            &dmabuf_fd, allocBase, allocSize,
+            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+        if (result != CUDA_SUCCESS) {
+            const char* errStr = nullptr;
+            cuGetErrorString(result, &errStr);
+            LOG_FIRST_N(WARNING, 1)
+                << "DMA-BUF export failed for " << (uintptr_t)addr
+                << " base=" << (uintptr_t)allocBase << " size=" << allocSize
+                << " cuda error=" << (errStr ? errStr : "unknown")
+                << "; falling back to ibv_reg_mr (nvidia-peermem)";
+            cuDevicePrimaryCtxRelease(cuDev);
+            out.method = DmabufExport::Method::kHostReg;
+            return 0;
+        }
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
+        out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
+        cuDevicePrimaryCtxRelease(cuDev);
+        LOG_FIRST_N(INFO, 1)
+            << "RDMA GPU memory will use DMA-BUF (ibv_reg_dmabuf_mr)";
+    }
+#else
+    out.method = DmabufExport::Method::kHostReg;
+#endif
+    return 0;
+}
+
+void RdmaContext::closeDmabufExport(DmabufExport& exp) {
+    if (exp.fd >= 0) {
+        if (close(exp.fd) != 0) {
+            PLOG(WARNING) << "Failed to close dmabuf fd";
+        }
+        exp.fd = -1;
+    }
+}
+
+bool RdmaContext::dmaBufRegistrationAvailable() {
+    if (!IbvLoader::Instance().available() ||
+        IbvLoader::Instance().sym().ibv_reg_dmabuf_mr == nullptr) {
+        return false;
+    }
+#ifdef USE_CUDA
+    CUresult result = cuInit(0);
+    if (result != CUDA_SUCCESS) return false;
+    int device_count = 0;
+    result = cuDeviceGetCount(&device_count);
+    if (result != CUDA_SUCCESS || device_count <= 0) return false;
+    for (int i = 0; i < device_count; ++i) {
+        CUdevice cuDevice;
+        result = cuDeviceGet(&cuDevice, i);
+        if (result != CUDA_SUCCESS) continue;
+        int dma_buf_supported = 0;
+        result = cuDeviceGetAttribute(&dma_buf_supported,
+                                      CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED,
+                                      cuDevice);
+        if (result == CUDA_SUCCESS && dma_buf_supported) return true;
+    }
+#endif
+    return false;
+}
+
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
                                                 int access) {
+    bool with_peermem = params_ && params_->with_nvidia_peermem;
+    DmabufExport exp;
+    if (exportDmabuf(addr, exp, with_peermem) != 0) {
+        return nullptr;
+    }
+    MemReg mr = registerMemReg(addr, length, access, exp);
+    closeDmabufExport(exp);
+    return mr;
+}
+
+RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
+                                                int access,
+                                                const DmabufExport& exp) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
     }
 
+    ibv_mr* entry = nullptr;
+    if (exp.method == DmabufExport::Method::kDmabufReg) {
+        if (!verbs_.ibv_reg_dmabuf_mr) {
+            LOG(ERROR) << "ibv_reg_dmabuf_mr is unavailable on " << device_name_
+                       << "; GPU DMA-BUF registration cannot proceed";
+            return nullptr;
+        }
+        entry = verbs_.ibv_reg_dmabuf_mr(native_pd_, exp.offset, length,
+                                         reinterpret_cast<uintptr_t>(addr),
+                                         exp.fd, access);
+        if (!entry) {
+            const void* end = static_cast<const char*>(addr) + length;
+            PLOG(ERROR) << "Failed to register GPU dma_buf memory from " << addr
+                        << " to " << end << " in RDMA device " << device_name_;
+            return nullptr;
+        }
+        mr_set_mutex_.lock();
+        mr_set_.insert(entry);
+        mr_set_mutex_.unlock();
+        return entry;
+    }
+
 #ifdef USE_CUDA
-    // Ensure CUDA context is current for GPU memory registration
-    // This is needed for worker threads or callers from non-CUDA threads
+    // nvidia-peermem / host-fallback path: ibv_reg_mr on the GPU VA needs a
+    // current CUDA context on worker threads.
     CUmemorytype memType;
     CUresult result = cuPointerGetAttribute(
         &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
 
     if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
-        // Get device ordinal and set primary context current
         unsigned int devOrd = 0;
         result = cuPointerGetAttribute(
             &devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)addr);
@@ -547,7 +719,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
         }
 
         CUdevice cuDev;
-        result = cuDeviceGet(&cuDev, devOrd);
+        result = cuDeviceGet(&cuDev, static_cast<int>(devOrd));
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "Failed to get CUDA device: " << result;
             return nullptr;
@@ -567,11 +739,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
             return nullptr;
         }
 
-        // Register GPU memory
-        ibv_mr* entry =
-            verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
-
-        // Release primary context reference
+        entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
         cuDevicePrimaryCtxRelease(cuDev);
 
         if (!entry) {
@@ -587,8 +755,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     }
 #endif
 
-    // Standard CPU memory registration
-    ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
+    entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
         const void* end = static_cast<const char*>(addr) + length;
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
