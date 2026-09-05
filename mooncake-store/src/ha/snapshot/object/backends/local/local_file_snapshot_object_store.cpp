@@ -1,52 +1,19 @@
 #include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <fstream>
 #include <sstream>
 
 #include <fmt/format.h>
 #include <glog/logging.h>
 
+#include "config/local_file_snapshot_config.h"
+
 namespace mooncake {
 
-namespace {
-
-constexpr const char* kEnvLocalPath = "MOONCAKE_SNAPSHOT_LOCAL_PATH";
-
-}  // namespace
-
-LocalFileSnapshotObjectStore::LocalFileSnapshotObjectStore() {
-    const char* env_path = std::getenv(kEnvLocalPath);
-    if (!env_path || !*env_path) {
-        throw std::runtime_error(
-            "MOONCAKE_SNAPSHOT_LOCAL_PATH environment variable is not set. "
-            "Please set it to a persistent directory path for snapshot "
-            "storage. Example: export "
-            "MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots");
-    }
-
-    std::error_code ec;
-    fs::create_directories(env_path, ec);
-    if (ec) {
-        throw std::runtime_error(
-            fmt::format("Failed to create base_path directory '{}': {}",
-                        env_path, ec.message()));
-    }
-
-    base_path_ = fs::canonical(env_path, ec);
-    if (ec) {
-        throw std::runtime_error(fmt::format(
-            "Failed to resolve base_path '{}': {}", env_path, ec.message()));
-    }
-    if (!fs::is_directory(base_path_)) {
-        throw std::runtime_error(fmt::format(
-            "base_path '{}' is not a directory", base_path_.string()));
-    }
-
-    LOG(INFO) << "LocalFileSnapshotObjectStore initialized with path: "
-              << base_path_;
-}
+LocalFileSnapshotObjectStore::LocalFileSnapshotObjectStore()
+    : LocalFileSnapshotObjectStore(
+          LocalFileSnapshotConfig::FromEnvironment().base_path) {}
 
 LocalFileSnapshotObjectStore::LocalFileSnapshotObjectStore(
     const std::string& base_path) {

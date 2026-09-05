@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/local_file_snapshot_config.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
@@ -385,8 +386,9 @@ add_library(mooncake_store_master_objects OBJECT
             ${MOONCAKE_STORE_MASTER_SOURCES})
 set_target_properties(mooncake_store_master_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_master_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_master_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
