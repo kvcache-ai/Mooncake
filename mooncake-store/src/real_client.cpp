@@ -3816,6 +3816,20 @@ RealClient::get_into_ranges_internal(
         return results;
     }
 
+    {
+        size_t total_keys = 0;
+        size_t total_fragments = 0;
+        for (size_t i = 0; i < buffer_count; ++i) {
+            total_keys += all_keys[i].size();
+            for (const auto &sizes : all_sizes[i]) {
+                total_fragments += sizes.size();
+            }
+        }
+        LOG(INFO) << "[Store] get_into_ranges_internal, buffer_count="
+                  << buffer_count << ", key_count=" << total_keys
+                  << ", fragment_count=" << total_fragments;
+    }
+
     std::vector<size_t> capacities = buffer_capacities
                                          ? *buffer_capacities
                                          : std::vector<size_t>(buffer_count);
@@ -5553,6 +5567,15 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         keys.size() != all_src_offsets.size()) {
         LOG(ERROR) << "Invalid get ranges args";
         return results;
+    }
+
+    {
+        size_t fragment_count = 0;
+        for (const auto &sizes : all_sizes) {
+            fragment_count += sizes.size();
+        }
+        LOG(INFO) << "[Store] batch_get_into_multi_buffer_ranges, key_count="
+                  << keys.size() << ", fragment_count=" << fragment_count;
     }
 
     // No Master RPC here: use cached QueryResult from session start.

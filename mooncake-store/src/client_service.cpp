@@ -1465,6 +1465,12 @@ std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
         LOG(ERROR) << "TransferSubmitter not initialized";
         return std::nullopt;
     }
+    size_t fragment_count = 0;
+    for (const auto& transfer : transfers) {
+        fragment_count += transfer.lengths.size();
+    }
+    LOG(INFO) << "[Store] SubmitScatter, range_count=" << transfers.size()
+              << ", fragment_count=" << fragment_count;
     return transfer_submitter_->submitScatter(transfers);
 }
 
