@@ -807,6 +807,56 @@ std::string mtuLengthToString(ibv_mtu mtu) {
         return "UNKNOWN";
 }
 
+uint32_t mtuLengthToBytes(ibv_mtu mtu) {
+    switch (mtu) {
+        case IBV_MTU_256:
+            return 256;
+        case IBV_MTU_512:
+            return 512;
+        case IBV_MTU_1024:
+            return 1024;
+        case IBV_MTU_2048:
+            return 2048;
+        case IBV_MTU_4096:
+            return 4096;
+        default:
+            return 0;
+    }
+}
+
+static bool mtuLengthFromBytes(uint32_t bytes, ibv_mtu& mtu) {
+    switch (bytes) {
+        case 256:
+            mtu = IBV_MTU_256;
+            return true;
+        case 512:
+            mtu = IBV_MTU_512;
+            return true;
+        case 1024:
+            mtu = IBV_MTU_1024;
+            return true;
+        case 2048:
+            mtu = IBV_MTU_2048;
+            return true;
+        case 4096:
+            mtu = IBV_MTU_4096;
+            return true;
+        default:
+            return false;
+    }
+}
+
+ibv_mtu localPathMtu(ibv_mtu active_mtu) {
+    return globalConfig().mtu_length < active_mtu ? globalConfig().mtu_length
+                                                  : active_mtu;
+}
+
+ibv_mtu negotiatePathMtu(ibv_mtu local_mtu, uint32_t peer_mtu_bytes) {
+    ibv_mtu peer_mtu;
+    if (!mtuLengthFromBytes(peer_mtu_bytes, peer_mtu)) return local_mtu;
+    return peer_mtu < local_mtu ? peer_mtu : local_mtu;
+}
+
 void updateGlobalConfig(ibv_device_attr& device_attr) {
     auto& config = globalConfig();
     if (config.max_ep_per_ctx * config.num_qp_per_ep >

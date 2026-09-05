@@ -189,6 +189,20 @@ GlobalConfig& globalConfig();
 
 uint16_t getDefaultHandshakePort();
 
+// Byte length of a path MTU enum, or 0 when the value names no path MTU.
+uint32_t mtuLengthToBytes(ibv_mtu mtu);
+
+// Path MTU this side is able to use on a port whose active MTU is
+// `active_mtu`, lowered by MC_MTU when the operator configured a smaller one.
+ibv_mtu localPathMtu(ibv_mtu active_mtu);
+
+// Path MTU to program into an RC QP. Both ends of an RC connection must agree
+// on it, so each side advertises its own localPathMtu() during the handshake
+// and both keep the smaller. `peer_mtu_bytes` of 0, or any value that names no
+// path MTU, means the peer does not advertise one (older build): keep the
+// local choice, as before.
+ibv_mtu negotiatePathMtu(ibv_mtu local_mtu, uint32_t peer_mtu_bytes);
+
 // Validates a port range. Returns {default_min, default_max} on invalid input.
 // Rejects: min > max, well-known ports (0-1023), ephemeral ports (32768-60999).
 std::pair<int, int> ValidatePortRange(int min_port, int max_port,

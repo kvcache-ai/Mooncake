@@ -72,6 +72,10 @@ struct TransferHandshakeUtil {
         root["local_nic_path"] = desc.local_nic_path;
         root["local_lid"] = desc.local_lid;
         root["local_gid"] = desc.local_gid;
+        // Emitted only by transports that negotiate it; absence tells the peer
+        // to keep its own path MTU.
+        if (desc.local_mtu_bytes != 0)
+            root["local_mtu_bytes"] = Json::UInt(desc.local_mtu_bytes);
         root["peer_nic_path"] = desc.peer_nic_path;
 #ifdef USE_BAREX
         root["barex_port"] = desc.barex_port;
@@ -117,6 +121,12 @@ struct TransferHandshakeUtil {
             desc.local_gid = root["local_gid"].asString();
         } else {
             desc.local_gid.clear();
+        }
+        if (root.isMember("local_mtu_bytes") &&
+            root["local_mtu_bytes"].isUInt()) {
+            desc.local_mtu_bytes = root["local_mtu_bytes"].asUInt();
+        } else {
+            desc.local_mtu_bytes = 0;
         }
         desc.peer_nic_path = root["peer_nic_path"].asString();
 #ifdef USE_BAREX
