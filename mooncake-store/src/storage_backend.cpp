@@ -3762,6 +3762,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 
         // Open/truncate data file in read-write mode
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             LOG(ERROR) << "Failed to open data file: " << data_file_path_;
@@ -4537,6 +4542,11 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         // Open data file without truncation
         data_file_path_ = GetDataFilePath();
         int flags = O_CLOEXEC | O_RDWR;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             const int open_errno = errno;
@@ -5485,8 +5495,13 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
     if (!data_file_path_.empty()) {
-        int fd = open(data_file_path_.c_str(),
-                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
+        int fd = open(data_file_path_.c_str(), flags, 0644);
         if (fd >= 0) {
 #ifdef USE_URING
             if (file_storage_config_.use_uring) {

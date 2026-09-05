@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <csignal>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <fcntl.h>
 #include <sys/resource.h>
@@ -405,6 +406,130 @@ TEST_F(PosixFileTest, UringBatchReadDrainsErrorsBeforeNextOperation) {
     EXPECT_EQ(desc.error, ErrorCode::OK);
     EXPECT_EQ(desc.bytes_read, data.size());
     EXPECT_EQ(std::string_view(output.data(), output.size()), data);
+}
+
+TEST_F(PosixFileTest, UringVectorIoHandlesUnalignedDirectIo) {
+    const std::string direct_filename = "direct_vector_test.bin";
+    remove(direct_filename.c_str());
+
+    int direct_fd = open(direct_filename.c_str(),
+                         O_CREAT | O_RDWR | O_DIRECT | O_CLOEXEC, 0644);
+    ASSERT_GE(direct_fd, 0) << strerror(errno);
+    ASSERT_EQ(ftruncate(direct_fd, 16384), 0);
+
+    UringFile uring_file(direct_filename, direct_fd, 32, true);
+
+    // Neighboring data in the same 4KiB block must survive RMW writes.
+    const std::string neighbor = "keep-me";
+    iovec neighbor_iov;
+    neighbor_iov.iov_base = const_cast<char*>(neighbor.data());
+    neighbor_iov.iov_len = neighbor.size();
+    auto neighbor_write = uring_file.vector_write(&neighbor_iov, 1, 0);
+    ASSERT_TRUE(neighbor_write.has_value()) << toString(neighbor_write.error());
+
+    char header[48] = {};
+    std::memcpy(header, "HDR", 3);
+    const std::string key = "object-key";
+    const std::string payload = "payload-bytes-for-direct-io";
+
+    iovec write_iov[3];
+    write_iov[0].iov_base = header;
+    write_iov[0].iov_len = sizeof(header);
+    write_iov[1].iov_base = const_cast<char*>(key.data());
+    write_iov[1].iov_len = key.size();
+    write_iov[2].iov_base = const_cast<char*>(payload.data());
+    write_iov[2].iov_len = payload.size();
+
+    constexpr off_t kOffset = 513;
+    auto write_result = uring_file.vector_write(write_iov, 3, kOffset);
+    ASSERT_TRUE(write_result.has_value()) << toString(write_result.error());
+    const size_t expected = sizeof(header) + key.size() + payload.size();
+    EXPECT_EQ(*write_result, expected);
+
+    char out_header[sizeof(header)] = {};
+    std::string out_key(key.size(), '\0');
+    std::string out_payload(payload.size(), '\0');
+    iovec read_iov[3];
+    read_iov[0].iov_base = out_header;
+    read_iov[0].iov_len = sizeof(out_header);
+    read_iov[1].iov_base = out_key.data();
+    read_iov[1].iov_len = out_key.size();
+    read_iov[2].iov_base = out_payload.data();
+    read_iov[2].iov_len = out_payload.size();
+
+    auto read_result = uring_file.vector_read(read_iov, 3, kOffset);
+    ASSERT_TRUE(read_result.has_value()) << toString(read_result.error());
+    EXPECT_EQ(*read_result, expected);
+    EXPECT_EQ(std::string_view(out_header, 3), "HDR");
+    EXPECT_EQ(out_key, key);
+    EXPECT_EQ(out_payload, payload);
+
+    std::string out_neighbor(neighbor.size(), '\0');
+    iovec neighbor_read_iov;
+    neighbor_read_iov.iov_base = out_neighbor.data();
+    neighbor_read_iov.iov_len = out_neighbor.size();
+    auto neighbor_read = uring_file.vector_read(&neighbor_read_iov, 1, 0);
+    ASSERT_TRUE(neighbor_read.has_value()) << toString(neighbor_read.error());
+    EXPECT_EQ(out_neighbor, neighbor);
+
+    remove(direct_filename.c_str());
+}
+
+TEST_F(PosixFileTest, UringVectorWriteAbortsWhenPreservationReadFails) {
+    const std::string direct_filename = "direct_vector_preserve_fail.bin";
+    remove(direct_filename.c_str());
+
+    {
+        int setup_fd = open(direct_filename.c_str(),
+                            O_CREAT | O_RDWR | O_DIRECT | O_CLOEXEC, 0644);
+        ASSERT_GE(setup_fd, 0) << strerror(errno);
+        ASSERT_EQ(ftruncate(setup_fd, 16384), 0);
+        UringFile setup_file(direct_filename, setup_fd, 32, true);
+
+        const std::string neighbor = "keep-neighbor-bytes";
+        iovec neighbor_iov;
+        neighbor_iov.iov_base = const_cast<char*>(neighbor.data());
+        neighbor_iov.iov_len = neighbor.size();
+        auto neighbor_write = setup_file.vector_write(&neighbor_iov, 1, 0);
+        ASSERT_TRUE(neighbor_write.has_value())
+            << toString(neighbor_write.error());
+    }
+
+    // Re-open write-only so the RMW preservation read must fail. The write
+    // must abort without clobbering the already-written neighbor bytes.
+    int write_only_fd =
+        open(direct_filename.c_str(), O_WRONLY | O_DIRECT | O_CLOEXEC);
+    ASSERT_GE(write_only_fd, 0) << strerror(errno);
+    {
+        UringFile write_only_file(direct_filename, write_only_fd, 32, true);
+        char payload[64];
+        std::memset(payload, 'X', sizeof(payload));
+        iovec write_iov;
+        write_iov.iov_base = payload;
+        write_iov.iov_len = sizeof(payload);
+
+        constexpr off_t kOffset = 513;
+        auto write_result =
+            write_only_file.vector_write(&write_iov, 1, kOffset);
+        ASSERT_FALSE(write_result.has_value());
+        EXPECT_EQ(write_result.error(), ErrorCode::FILE_READ_FAIL);
+    }
+
+    int verify_fd =
+        open(direct_filename.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    ASSERT_GE(verify_fd, 0) << strerror(errno);
+    UringFile verify_file(direct_filename, verify_fd, 32, true);
+
+    const std::string neighbor = "keep-neighbor-bytes";
+    std::string out_neighbor(neighbor.size(), '\0');
+    iovec neighbor_read_iov;
+    neighbor_read_iov.iov_base = out_neighbor.data();
+    neighbor_read_iov.iov_len = out_neighbor.size();
+    auto neighbor_read = verify_file.vector_read(&neighbor_read_iov, 1, 0);
+    ASSERT_TRUE(neighbor_read.has_value()) << toString(neighbor_read.error());
+    EXPECT_EQ(out_neighbor, neighbor);
+
+    remove(direct_filename.c_str());
 }
 #endif
 
