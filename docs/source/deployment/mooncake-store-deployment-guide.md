@@ -724,20 +724,31 @@ guarantees.
 ```
 
 Mooncake Store can place an additional replica in a shared distributed
-filesystem. The master allocates aligned ranges in pre-created shard files and
-publishes a descriptor containing the shard, offset, and object size. Clients
-use that descriptor to access the same files through either regular POSIX I/O
-or the HF3FS USRBIO adapter.
+filesystem. The master publishes a descriptor containing a file path, offset,
+object size, aligned allocation size, and integer allocator ID. Clients use the
+descriptor to access the same files through either regular POSIX I/O or the
+HF3FS USRBIO adapter.
+
+Two allocator modes are available:
+
+- `shard` is the default and preserves the original behavior. It pre-creates a
+  fixed set of shard files and allocates reusable ranges within the key-selected
+  shard.
+- `bucket` selects `ImmutableBucketAllocator`. It creates bucket files on
+  demand, appends immutable entries, persists sealed-bucket metadata, and
+  reclaims whole buckets in LRU order. In this mode the descriptor's existing
+  `shard_idx` field carries the bucket ID; the serialized descriptor format is
+  unchanged.
 
 DFS replicas are separate from `LOCAL_DISK` SSD-offload replicas. They do not
 use the legacy `--root_fs_dir` persistence path or the master's asynchronous
 offload task queue.
 
 ```{note}
-DFS allocator state is not yet restored after a master restart or HA leader
-failover. Do not enable descriptor-based DFS in a deployment that requires
-master recovery, HA continuity, or multiple tenants. See the complete list of
-limitations below.
+Bucket mode restores committed entries from sealed-bucket metadata after a
+standalone master restart. Shard mode remains in-memory only, and neither mode
+is compatible with master snapshot/oplog recovery or HA leader failover. See
+the complete list of limitations below.
 ```
 
 #### Master configuration
@@ -749,6 +760,7 @@ shard layout. For example, to use HF3FS:
 export MOONCAKE_ENABLE_DFS=1
 export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
 export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_ALLOCATOR_TYPE=shard
 export MOONCAKE_DFS_SHARD_COUNT=64
 export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
 export MOONCAKE_DFS_ALIGNMENT=4096
@@ -762,6 +774,25 @@ preallocates each file to `MOONCAKE_DFS_SHARD_CAPACITY`. The example therefore
 configures 256 GiB of total logical shard capacity (`64 * 4 GiB`). Ensure the
 shared filesystem has sufficient capacity; whether all backing space is
 reserved immediately depends on the selected filesystem adapter.
+
+To use immutable buckets instead, select `bucket` and configure the per-bucket
+and total capacity limits:
+
+```bash
+export MOONCAKE_ENABLE_DFS=1
+export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
+export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_ALLOCATOR_TYPE=bucket
+export MOONCAKE_DFS_BUCKET_CAPACITY=268435456
+export MOONCAKE_DFS_MAX_BUCKET_COUNT=256
+export MOONCAKE_DFS_ALIGNMENT=4096
+export MOONCAKE_DFS_SINGLE_TENANT=true
+```
+
+Bucket files are created when needed. Each object, including its key header and
+alignment padding, must fit in one bucket. Reducing `max_bucket_count` below the
+number of existing buckets does not delete them immediately; it prevents new
+buckets from being created until the count is again below the limit.
 
 The `hf3fs` adapter requires Mooncake to be built with `USE_3FS=ON`. Use
 `MOONCAKE_DFS_FS_ADAPTER=posix` for development and integration testing on a
@@ -782,6 +813,7 @@ export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/data/file_storage
 export MOONCAKE_MASTER=127.0.0.1:50051
 export MOONCAKE_DFS_ROOT_DIR=/mnt/3fs/mooncake
 export MOONCAKE_DFS_FS_ADAPTER=hf3fs
+export MOONCAKE_DFS_ALLOCATOR_TYPE=shard
 export MOONCAKE_DFS_SHARD_COUNT=64
 export MOONCAKE_DFS_SHARD_CAPACITY=4294967296
 export MOONCAKE_DFS_ALIGNMENT=4096
@@ -812,10 +844,13 @@ is required.
 | Variable | Scope | Default | Description |
 |----------|-------|---------|-------------|
 | `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
-| `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
+| `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared DFS root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
 | `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
+| `MOONCAKE_DFS_ALLOCATOR_TYPE` | Master and clients | `shard` | Allocator mode: `shard` or `bucket`. All participants must use the same mode. |
 | `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
 | `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
+| `MOONCAKE_DFS_BUCKET_CAPACITY` | Master and clients | `268435456` (256 MiB) | Bucket file capacity in bytes. Must be aligned and large enough for the entry header. Used only in `bucket` mode. |
+| `MOONCAKE_DFS_MAX_BUCKET_COUNT` | Master | `256` | Maximum number of bucket files. Must be in `[1, INT32_MAX]`; total logical capacity is this value times bucket capacity. |
 | `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
 | `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
 | `MOONCAKE_DFS_EVICTION_ENABLED` | Master | `true` | Enable DFS allocator eviction. |
@@ -823,6 +858,22 @@ is required.
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
 | `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+| `MOONCAKE_DFS_BATCH_READ_THREADS` | Clients | `128` | Worker count for reads spanning multiple buckets. Must be in `[1, 256]`. |
+| `MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED` | Clients | `false` | Merge adjacent entries from the same bucket into bounded reads. |
+| `MOONCAKE_DFS_DIRECT_READ_ENABLED` | Clients | `true` | Use page-cache-bypassing reads where the adapter supports them. POSIX falls back to buffered reads when `O_DIRECT` is unavailable. |
+
+The master admin HTTP endpoint can change the bucket count limit without a
+restart:
+
+```bash
+curl -X PUT http://MASTER_HOST:METRICS_PORT/api/v1/dfs/max_bucket_count \
+  -H 'Content-Type: application/json' \
+  -d '{"max_bucket_count":512}'
+```
+
+The response reports `old_value` and `new_value`. Non-positive values and
+values above `INT32_MAX` return HTTP 400. The endpoint returns HTTP 409 unless
+the active master uses the Bucket allocator.
 
 #### Requesting and accessing DFS replicas
 
@@ -841,21 +892,30 @@ store.put("key", b"value", config)
 with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
 not supported.
 
-Each key hashes to exactly one DFS shard. Allocation does not fall back to a
-different shard, so a request may return `NO_AVAILABLE_HANDLE` when its selected
-shard is full even if other shards have free space. A DFS object is never
-striped across shards. The selected shard must have room for the object rounded
-up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
-padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
-therefore lower than the shard file's
-logical size.
+In shard mode each key hashes to exactly one DFS shard. Allocation does not fall
+back to a different shard, so a request may return `NO_AVAILABLE_HANDLE` when
+its selected shard is full even if other shards have free space.
+
+In Bucket mode batches are packed in request order across as many buckets as
+needed. A Bucket entry contains a key-length header, the key bytes, the value,
+and zero padding to `MOONCAKE_DFS_ALIGNMENT`. Entries are append-only and values
+are never overwritten in place. Removing an object creates an in-memory
+tombstone; physical space is recovered when the complete Bucket is evicted.
 
 For `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`, the client writes requested
 memory and NoF replicas, stages device buffers to host memory when necessary,
-and then performs positional DFS writes. A successful request means the
-requested DFS `WriteAt` operations completed. It does **not** imply that an
-additional `fsync` completed. Batch operations isolate failures by key; a
-failed key is revoked without downgrading successful keys.
+and then performs positional DFS writes. Shard writes and upserts remain
+synchronous. Bucket puts copy caller-owned CPU or GPU payloads into owned
+staging and may return after queuing a batch write; the DFS replica remains
+`PROCESSING` until the background write succeeds and `PutEnd(DFS)` commits it.
+A failed asynchronous write calls `PutRevoke(DFS)` so incomplete replicas do not
+become readable. Requests combining NoF and DFS remain synchronous.
+
+Bucket reads validate descriptor paths and entry layouts before I/O. BatchRead
+groups work by bucket and can run buckets in parallel. With direct POSIX reads,
+aligned pooled staging buffers absorb unaligned caller buffers and ranges;
+short reads and partial failures are reported as `FILE_READ_FAIL` rather than
+returning partial data.
 
 For a same-size `Upsert`, if either the existing object or the new request has
 a DFS replica, the requested memory, NoF, and DFS replica counts must match the
@@ -876,17 +936,19 @@ reads for that descriptor.
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
-- A DFS object must fit in its key-selected shard after alignment and allocator
-  padding; objects are not striped and allocation does not fall back to another
-  shard.
-- DFS allocator state is currently in memory. A master restart or HA leader
-  failover does not reconstruct existing DFS allocations, so DFS cannot provide
-  continuity across those events.
+- A DFS object is never striped. In shard mode it must fit in the key-selected
+  shard; in Bucket mode the complete entry must fit in one bucket.
+- Shard allocator state is in memory and is not restored after restart.
+- Bucket recovery restores only committed entries in sealed buckets. The active
+  bucket has no metadata snapshot by design and is discarded after a crash.
+  Sealing happens when allocation rolls over to a new bucket or eviction freezes
+  a bucket.
 - DFS cannot be enabled with snapshot generation, snapshot restore, oplog
-  recovery, or standby restore until DFS allocator state restoration is
-  implemented.
-- There is currently no background DFS retry queue or configurable
-  asynchronous acknowledgement policy.
+  recovery, or standby restore. Bucket metadata recovery is local standalone
+  restart recovery, not HA metadata replication.
+- Asynchronous Bucket writes use a fixed client worker pool and retry only the
+  completion RPC. There is no persistent retry queue or configurable
+  acknowledgement policy.
 - DFS writes currently have no DFS-specific timeout, request cancellation, or
   `fsync` durability guarantee.
 
