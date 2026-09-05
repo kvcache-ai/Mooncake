@@ -13,6 +13,7 @@ PGResult<bool> payloadWriterRequiresStaging(
     switch (route_type) {
         case DeviceRouteType::P2p:
             return false;
+        case DeviceRouteType::Rdma:
         case DeviceRouteType::HostProxy:
             return true;
         case DeviceRouteType::Unreachable:
