@@ -31,8 +31,9 @@ class EtcdHelper {
 
     /*
      * @brief Reset the global store etcd client and reconnect to the given
-     *        endpoints. This cancels active store watches/keepalives in the Go
-     *        wrapper and creates a fresh clientv3.Client.
+     *        endpoints. This cancels active store watches and maintenance
+     *        sessions. Each lease keep-alive uses an independent client and
+     *        continues.
      * @param etcd_endpoints: The endpoints of the etcd store client.
      * @return: Error code.
      */
