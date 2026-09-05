@@ -535,6 +535,21 @@ class MasterServiceHATest : public ::testing::Test {
         return replica;
     }
 
+    Replica::Descriptor MakeStandbyNoFReplica(const std::string& endpoint,
+                                              uintptr_t offset,
+                                              size_t size = 1024) const {
+        Replica::Descriptor replica;
+        replica.id = 1;
+        replica.status = ReplicaStatus::COMPLETE;
+
+        NoFDescriptor nof_desc;
+        nof_desc.buffer_descriptor.transport_endpoint_ = endpoint;
+        nof_desc.buffer_descriptor.buffer_address_ = offset;
+        nof_desc.buffer_descriptor.size_ = size;
+        replica.descriptor_variant = std::move(nof_desc);
+        return replica;
+    }
+
     StandbyObjectEntry MakeStandbyObject(const std::string& key,
                                          const std::string& endpoint,
                                          size_t size = 1024) const {
@@ -542,6 +557,18 @@ class MasterServiceHATest : public ::testing::Test {
         metadata.client_id = generate_uuid();
         metadata.size = size;
         metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint, size));
+        return StandbyObjectEntry{"default", key, std::move(metadata)};
+    }
+
+    StandbyObjectEntry MakeStandbyNoFObject(const std::string& key,
+                                            const std::string& endpoint,
+                                            uintptr_t offset,
+                                            size_t size = 1024) const {
+        StandbyObjectMetadata metadata;
+        metadata.client_id = generate_uuid();
+        metadata.size = size;
+        metadata.replicas.push_back(
+            MakeStandbyNoFReplica(endpoint, offset, size));
         return StandbyObjectEntry{"default", key, std::move(metadata)};
     }
 
@@ -713,6 +740,22 @@ class MasterServiceHATest : public ::testing::Test {
         }
         for (const auto& replica : accessor.Get().GetAllReplicas()) {
             if (replica.has_invalid_mem_handle()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static bool HasInvalidNoFHandleForTesting(MasterService& service,
+                                              const TenantId& tenant_id,
+                                              const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        if (!accessor.Exists()) {
+            return true;
+        }
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            if (replica.has_invalid_nof_handle()) {
                 return true;
             }
         }
@@ -999,6 +1042,34 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "tcp");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
+}
+
+TEST_F(MasterServiceHATest, RestoreDoesNotKeepNoFReplicasUsable) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string key = "standby_nof_restore_key";
+    const std::string endpoint = "standby_nof_restore_endpoint";
+    constexpr uintptr_t offset = 4096;
+    constexpr size_t size = 1024;
+
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot(
+                {MakeStandbyNoFObject(key, endpoint, offset, size)}, 7, {})
+            .has_value());
+
+    // The namespace allocator state is not part of the snapshot, so a later
+    // NoF mount may hand `offset` to another object. The restored replica
+    // must therefore never be served.
+    auto get_result = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_TRUE(HasInvalidNoFHandleForTesting(service, kDefaultTenant, key));
+
+    // And it is reclaimed by the regular invalid-handle sweep.
+    ClearInvalidHandlesForTesting(service);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0);
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesReplicaIds) {
