@@ -1,5 +1,9 @@
 #include "ha/standby_metadata_store.h"
 
+#include <algorithm>
+#include <limits>
+#include <unordered_set>
+
 namespace mooncake {
 
 bool StandbyMetadataStore::PutMetadata(const std::string& tenant_id,
@@ -87,6 +91,48 @@ void StandbyMetadataStore::Snapshot(
             out.push_back({tenant_id, key, metadata});
         }
     }
+}
+
+bool StandbyMetadataStore::ValidateReplicaIds(ReplicaID& max_replica_id) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    max_replica_id = 0;
+    for (const auto& [tenant_id, objects] : store_) {
+        (void)tenant_id;
+        for (const auto& [key, metadata] : objects) {
+            (void)key;
+            std::unordered_set<ReplicaID> object_ids;
+            for (const auto& replica : metadata.replicas) {
+                if (replica.id == 0 ||
+                    replica.id == std::numeric_limits<ReplicaID>::max() ||
+                    !object_ids.insert(replica.id).second) {
+                    return false;
+                }
+                max_replica_id = std::max(max_replica_id, replica.id);
+            }
+        }
+    }
+    return true;
+}
+
+bool StandbyMetadataStore::DrainChunk(size_t count,
+                                      std::vector<StandbyObjectEntry>& out) {
+    out.clear();
+    if (count == 0) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    out.reserve(count);
+    while (!store_.empty() && out.size() < count) {
+        auto tenant = store_.begin();
+        auto object = tenant->second.extract(tenant->second.begin());
+        out.push_back({tenant->first, std::move(object.key()),
+                       std::move(object.mapped())});
+        if (tenant->second.empty()) {
+            store_.erase(tenant);
+        }
+    }
+    return true;
 }
 
 StandbyMetadataStore::SnapshotCursor

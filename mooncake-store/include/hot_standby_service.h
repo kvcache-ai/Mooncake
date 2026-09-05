@@ -17,6 +17,7 @@
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/capture.h"
+#include "ha/snapshot/batch_oplog/promotion.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
@@ -141,6 +142,10 @@ class HotStandbyService {
      */
     ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
 
+    bool IsBatchOpLogSnapshotMode() const;
+    tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
+    PromoteAndDetachBatchOpLogStore();
+
     /**
      * @brief Get the number of metadata entries in the local store
      */
@@ -236,11 +241,8 @@ class HotStandbyService {
     void NotifySnapshotPromotion();
     void NotifySnapshotStop();
 
-    // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
-    // promotion sequence machine transitions + gap resolution + final
-    // catch-up + post catch-up gap check + success transition. Returns
-    // ErrorCode::OK on success or any fail-closed error code.
-    ErrorCode PromoteLockedInternal(uint64_t current_applied_seq_id);
+    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id);
+    ErrorCode CompletePromotionLocked();
 
     void NotifySyncStatus();
 
@@ -266,6 +268,7 @@ class HotStandbyService {
     std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
     std::optional<DurablePrefix> batch_snapshot_baseline_;
+    ViewVersionId batch_snapshot_producer_view_version_{0};
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 

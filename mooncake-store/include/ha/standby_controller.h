@@ -8,6 +8,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "ha/ha_types.h"
+#include "ha/snapshot/batch_oplog/promotion.h"
 #include "master_config.h"
 #include "metadata_store.h"
 #include "types.h"
@@ -20,9 +21,19 @@ namespace ha {
  * Contains everything needed to restore primary's state.
  */
 struct PromotionContext {
+    PromotionContext() = default;
+    PromotionContext(PromotionContext&&) = default;
+    PromotionContext& operator=(PromotionContext&&) = default;
+    PromotionContext(const PromotionContext&) = delete;
+    PromotionContext& operator=(const PromotionContext&) = delete;
+
     uint64_t applied_seq_id{0};
     std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
+    std::unique_ptr<StandbyMetadataStore> metadata_store;
+    DurablePrefix applied_cursor;
+    ViewVersionId producer_view_version{0};
+    ReplicaID max_replica_id{0};
 };
 
 class StandbyController {
