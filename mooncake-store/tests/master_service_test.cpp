@@ -3970,4 +3970,28 @@ TEST_F(MasterServiceTest, AgentDiscardHintDoesNotAddRetention) {
         service_->GetReplicaListForAdmin(pinned_key, TenantId::Default())
             .has_value());
 }
+
+TEST_F(MasterServiceTest, AgentTtlWithoutKeepHintDoesNotAddRetention) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    AgentHints hints;
+    hints.cache_ttl_ms = 1000;
+    config.agent_hints = hints;
+    PutCompletedObject(*service_, client_id, "agent_neutral_ttl", config,
+                       1024);
+    EXPECT_FALSE(
+        GetSoftPinDeadline(*service_, "agent_neutral_ttl").has_value());
+
+    hints.reuse_hint = "discard";
+    config.agent_hints = hints;
+    PutCompletedObject(*service_, client_id, "agent_discard_ttl", config,
+                       1024);
+    EXPECT_FALSE(
+        GetSoftPinDeadline(*service_, "agent_discard_ttl").has_value());
+}
 }  // namespace mooncake::test
