@@ -85,6 +85,7 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
 struct nof_seg_handle {
     struct spdk_nvme_qpair *qpair;
     struct spdk_nvme_ns *ns;
+    ctrlr_info *owner;
 };
 
 struct tr_info {
@@ -355,11 +356,64 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         auto new_seg = std::make_unique<nof_seg_handle>();
         new_seg->qpair = qpair;
         new_seg->ns = ns;
+        new_seg->owner = info;
         seg_handle = new_seg.get();
         ns_seg[tr.ns] = std::move(new_seg);
     }
 
     return seg_handle;
+}
+
+bool SpdkWrapper::IsNofSegmentFailed(const nof_seg_handle *seg_handle) {
+    if (!seg_handle || !seg_handle->qpair) {
+        return true;
+    }
+
+    return spdk_nvme_qpair_get_failure_reason(seg_handle->qpair) !=
+           SPDK_NVME_QPAIR_FAILURE_NONE;
+}
+
+bool SpdkWrapper::ReconnectNofSegment(nof_seg_handle *seg_handle) {
+    if (!seg_handle || !seg_handle->qpair || !seg_handle->owner ||
+        !seg_handle->owner->ctrlr) {
+        return false;
+    }
+
+    ctrlr_info *info = seg_handle->owner;
+    std::lock_guard<std::mutex> lock(info->ns_mutex);
+    if (spdk_nvme_qpair_get_failure_reason(seg_handle->qpair) ==
+        SPDK_NVME_QPAIR_FAILURE_NONE) {
+        // Another segment of the same controller already recovered it.
+        return true;
+    }
+
+    int ret = spdk_nvme_ctrlr_reconnect_io_qpair(seg_handle->qpair);
+    if (ret == 0) {
+        LOG(INFO) << "NoF io qpair reconnected";
+        return true;
+    }
+
+    // Only the io connection can be reconnected on its own. When the target
+    // restarts, the whole nvme association is gone and the controller has to
+    // be reset before its io qpairs can be connected again.
+    LOG(WARNING) << "reconnect NoF io qpair failed, ret " << ret
+                 << ", resetting controller";
+    ret = spdk_nvme_ctrlr_reset(info->ctrlr);
+    if (ret != 0) {
+        LOG(ERROR) << "reset NoF controller failed, ret " << ret;
+        return false;
+    }
+
+    ret = spdk_nvme_ctrlr_reconnect_io_qpair(seg_handle->qpair);
+    if (ret != 0) {
+        LOG(ERROR) << "reconnect NoF io qpair after controller reset failed, "
+                      "ret "
+                   << ret;
+        return false;
+    }
+
+    LOG(INFO) << "NoF controller reset, io qpair reconnected";
+    return true;
 }
 
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
@@ -434,6 +488,16 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     if (!seg_handle) {
         if (error_reason) {
             *error_reason = "open_fail";
+        }
+        return false;
+    }
+
+    // OpenNofSegment caches one qpair per namespace, so a qpair that failed
+    // while the target was down would otherwise be reused forever and the
+    // segment would never be probed successfully again.
+    if (IsNofSegmentFailed(seg_handle) && !ReconnectNofSegment(seg_handle)) {
+        if (error_reason) {
+            *error_reason = "reconnect_fail";
         }
         return false;
     }
