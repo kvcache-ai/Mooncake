@@ -1,0 +1,232 @@
+{
+  "description": "Golden vectors for the supported vLLM v1 sha256_cbor seed-derived root and block-hash profile.",
+  "generator": "vLLM 0.22.0 hash_block_tokens semantics with cbor2 6.1.1 canonical=True",
+  "profile": {
+    "strategy": "vllm_v1",
+    "algorithm": "sha256_cbor",
+    "python_hash_seed": "0",
+    "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e",
+    "index_projection": "low64_be"
+  },
+  "seed_root_vectors": [
+    {
+      "python_hash_seed": "0",
+      "canonical_cbor_hex": "6130",
+      "root_digest": "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e"
+    },
+    {
+      "python_hash_seed": "00",
+      "canonical_cbor_hex": "623030",
+      "root_digest": "8d912e4e62b3cc377b1d1c7a14ef61dffbdaa0990237035c05401c29414c4172"
+    }
+  ],
+  "cases": [
+    {
+      "name": "spec_unsalted",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "c9d58ba695280d69b243e1e0df813136ca9196b286fb1a021e0b2e028ef071cb",
+          "projected_hex": "1e0b2e028ef071cb",
+          "projected_decimal": "2164874634404590027"
+        },
+        {
+          "digest": "24125b23e68883b5c2141db2959d48433fe6bde2f26bd914efad121d154ab2d6",
+          "projected_hex": "efad121d154ab2d6",
+          "projected_decimal": "17270480062156288726"
+        }
+      ],
+      "incorrect_low64_parent_digest": "067bc227e5aa13cb174be22cd7016b7b21b663eddba6241928d7a7d1ffc0aa1e"
+    },
+    {
+      "name": "lora_every_block",
+      "block_size": 4,
+      "lora_name": "adapter-A",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "1424c0ec536f82188b592f263601d4e48c0255081c5f1e9225163c6d611a5222",
+          "projected_hex": "25163c6d611a5222",
+          "projected_decimal": "2672389869369184802"
+        },
+        {
+          "digest": "4a2ec941640a8f2470869ec2b3cf6bdd90e2be83b21807b628ac9abe9341eea9",
+          "projected_hex": "28ac9abe9341eea9",
+          "projected_decimal": "2930887600816385705"
+        }
+      ]
+    },
+    {
+      "name": "salt_first_block",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": "tenant-salt",
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "3be45574566e2f3c51c9f254d9627cf113382b627aeaefe8b661d66cfa089359",
+          "projected_hex": "b661d66cfa089359",
+          "projected_decimal": "13142020951183496025"
+        },
+        {
+          "digest": "22dea68f80ff7f40243dfb906a33db02571905c78a3b42153a56de5ad08c661a",
+          "projected_hex": "3a56de5ad08c661a",
+          "projected_decimal": "4203791783824221722"
+        }
+      ]
+    },
+    {
+      "name": "lora_then_salt",
+      "block_size": 4,
+      "lora_name": "adapter-A",
+      "cache_salt": "tenant-salt",
+      "token_ids": [1, 2, 3, 4, 5, 6, 7, 8],
+      "expected": [
+        {
+          "digest": "22977da6c71098507264dbf4161d451c2d98494c5c146717f36787e184b36040",
+          "projected_hex": "f36787e184b36040",
+          "projected_decimal": "17539136676481425472"
+        },
+        {
+          "digest": "6a3cd7de2626c2d2982eb5bc9d4878a49745c3784bde8a2334ffac47286bb866",
+          "projected_hex": "34ffac47286bb866",
+          "projected_decimal": "3818960430654273638"
+        }
+      ]
+    },
+    {
+      "name": "signed_integer_boundaries",
+      "block_size": 12,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [
+        -2147483648,
+        -257,
+        -256,
+        -25,
+        -24,
+        -1,
+        0,
+        23,
+        24,
+        255,
+        256,
+        2147483647
+      ],
+      "expected": [
+        {
+          "digest": "d4e5cc975a84b5ae7299d36910284bf256ea1eade2689dba6391b08d86e006d7",
+          "projected_hex": "6391b08d86e006d7",
+          "projected_decimal": "7174709803277616855"
+        }
+      ]
+    },
+    {
+      "name": "utf8_length_23",
+      "block_size": 4,
+      "lora_name": "aaaaaaaaaaaaaaaaaaaaaaa",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4],
+      "expected": [
+        {
+          "digest": "3cc96f507898959352d1d123c849d0ab4b11846c8de3c67123d72e78957adb07",
+          "projected_hex": "23d72e78957adb07",
+          "projected_decimal": "2582584006759078663"
+        }
+      ]
+    },
+    {
+      "name": "utf8_length_24",
+      "block_size": 4,
+      "lora_name": "aaaaaaaaaaaaaaaaaaaaaaaa",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4],
+      "expected": [
+        {
+          "digest": "553263ebbf33660ecba67f9fcabea06d20cca3a71c79abf6e1894d39c7fa8ff8",
+          "projected_hex": "e1894d39c7fa8ff8",
+          "projected_decimal": "16251605640906706936"
+        }
+      ]
+    },
+    {
+      "name": "utf8_multibyte",
+      "block_size": 4,
+      "lora_name": "\u6a21\u578b-\u9002\u914d\u5668",
+      "cache_salt": "\u76d0\u503c-\ud83d\ude80",
+      "token_ids": [1, 2, 3, 4],
+      "expected": [
+        {
+          "digest": "69af00b1b180a366c69003a00527c2baf6bbc71880abc3b1d3b60fa2f553cdca",
+          "projected_hex": "d3b60fa2f553cdca",
+          "projected_decimal": "15255397980339162570"
+        }
+      ]
+    },
+    {
+      "name": "definite_array_length_24",
+      "block_size": 24,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23
+      ],
+      "expected": [
+        {
+          "digest": "792917e681c347b21bebfdd57cabcca6b79c865f83ccd2cfbd9cb56ffed2b088",
+          "projected_hex": "bd9cb56ffed2b088",
+          "projected_decimal": "13662994862156460168"
+        }
+      ]
+    },
+    {
+      "name": "incomplete_tail",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3, 4, 5, 6],
+      "expected": [
+        {
+          "digest": "c9d58ba695280d69b243e1e0df813136ca9196b286fb1a021e0b2e028ef071cb",
+          "projected_hex": "1e0b2e028ef071cb",
+          "projected_decimal": "2164874634404590027"
+        }
+      ]
+    },
+    {
+      "name": "no_complete_block",
+      "block_size": 4,
+      "lora_name": "",
+      "cache_salt": null,
+      "token_ids": [1, 2, 3],
+      "expected": []
+    }
+  ]
+}
