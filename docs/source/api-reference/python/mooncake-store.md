@@ -1184,6 +1184,56 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 
 </details>
 
+The class also accepts a configuration dictionary:
+
+```python
+# EGM Provider
+store.setup({
+    "local_hostname": "provider:12345",
+    "metadata_server": "http://metadata:8080/metadata",
+    "master_server_addr": "master:50051",
+    "protocol": "nvlink",
+    "global_segment_size": str(64 * 1024**3),
+    "local_buffer_size": "0",
+    "enable_egm_store_pool": "true",
+    "egm_numa_nodes": "auto",  # or, for example, "0,1"
+})
+```
+
+`enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
+`auto`. These controls apply only to this dictionary overload. The EGM pool
+requires the exact `nvlink`/nonzero-global/zero-local combination shown above.
+
+An ordinary Consumer does not enable the EGM pool. Its `nvlink` transport uses
+the existing auto-discovery path, so set both variables before calling
+`setup()`:
+
+```bash
+# Enter the auto-discovery path for an ordinary nvlink Consumer.
+export MC_MS_AUTO_DISC=1
+# Select MNNVL even when an RDMA HCA is present.
+export MC_FORCE_MNNVL=1
+```
+
+```python
+# EGM Consumer using direct remote-EGM-to-HBM reads
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+With `MC_MS_AUTO_DISC=0`, or with the variable unset, an ordinary
+`protocol="nvlink"` Consumer has no manual-install path and setup can return
+`unsupported_protocol`. This is existing NVLink initialization behavior; the
+Provider EGM pool uses its own forced manual NVLink installation.
+
 ---
 #### setup_dummy()
 Initialize the store with a dummy client for testing purposes.
@@ -2133,18 +2183,22 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Clean up all resources and terminate connections. If cleanup fails, the object
+is retained so the same `close()` call can retry EGM unmount, unregister, and
+release work without repeating completed stages.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = cleanup is still pending)
 
 **Example:**
 ```python
-store.close()
+if store.close() != 0:
+    # Keep `store` alive and retry after the blocking condition clears.
+    store.close()
 ```
 
 ---
