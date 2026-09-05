@@ -17,8 +17,10 @@
 #include <vector>
 
 #include "real_client.h"
+#include "client_internal.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
+#include "egm_store_pool.h"
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
@@ -444,6 +446,73 @@ inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
 
 }  // namespace
 
+tl::expected<std::shared_ptr<TransferEngine>, ErrorCode>
+RealClient::CreateManualNvlinkTransferEngine(
+    const std::string &local_hostname, const std::string &metadata_server,
+    const TransferEngineSetupOperations *operations) {
+    auto transfer_engine = std::make_shared<TransferEngine>();
+    const bool use_tent = operations
+                              ? operations->is_using_tent(*transfer_engine)
+                              : transfer_engine->isUsingTent();
+    if (use_tent) {
+        LOG(ERROR) << "EGM Store Pool does not support TENT Transfer Engine";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const AutoDiscoverConfig auto_discover{.enabled = false,
+                                           .protocol = "nvlink"};
+    if (operations) {
+        operations->set_auto_discover(*transfer_engine, auto_discover);
+    } else {
+        transfer_engine->setAutoDiscover(auto_discover);
+    }
+
+    const auto [hostname, port] = parseHostNameWithPort(local_hostname);
+    const int init_result =
+        operations ? operations->init(*transfer_engine, metadata_server,
+                                      local_hostname, hostname, port)
+                   : transfer_engine->init(metadata_server, local_hostname,
+                                           hostname, port);
+    if (init_result != 0) {
+        LOG(ERROR) << "Failed to initialize Transfer Engine for EGM Store "
+                      "Pool";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    try {
+        const bool installed =
+            operations
+                ? operations->install_transport(*transfer_engine, "nvlink")
+                : transfer_engine->installTransport("nvlink", nullptr) !=
+                      nullptr;
+        if (!installed) {
+            LOG(ERROR) << "Failed to install NVLink transport for EGM Store "
+                          "Pool; ensure Mooncake is built with USE_MNNVL";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    } catch (const std::exception &error) {
+        LOG(ERROR) << "nvlink_transport_install_failed error_message=\""
+                   << error.what() << "\"";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return transfer_engine;
+}
+
+tl::expected<std::shared_ptr<TransferEngine>, ErrorCode>
+RealClient::ResolveTransferEngineForSetup(
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const TransferEngineFactory &transfer_engine_factory,
+    const std::string &endpoint) {
+    if (transfer_engine) return transfer_engine;
+    if (transfer_engine_factory) {
+        auto result = transfer_engine_factory(endpoint);
+        if (!result) return tl::unexpected(result.error());
+        if (!*result) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return *result;
+    }
+    return std::shared_ptr<TransferEngine>{};
+}
+
 PyClient::~PyClient() {}
 
 bool RealClient::map_dummy_range_in_shm(const MappedShm &shm,
@@ -729,7 +798,12 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    auto teardown = tearDownAll_internal();
+    if (!teardown && egm_store_pool_) {
+        LOG(ERROR) << "EGM Store Pool cleanup is incomplete; retaining its "
+                      "owners for process lifetime";
+        (void)egm_store_pool_.release();
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -762,6 +836,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    return setup_internal_impl(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        start_offload_rpc_server, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, {});
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal_impl(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    const TransferEngineFactory &transfer_engine_factory) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -804,10 +897,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_hostname = local_hostname;
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(hostname), local_rpc_port);
+        auto selected_transfer_engine = ResolveTransferEngineForSetup(
+            transfer_engine, transfer_engine_factory, this->local_hostname);
+        if (!selected_transfer_engine) {
+            return tl::unexpected(selected_transfer_engine.error());
+        }
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
-            master_server_addr, transfer_engine, {{"client_mode", "real"}},
-            tenant_id);
+            master_server_addr, *selected_transfer_engine,
+            {{"client_mode", "real"}}, tenant_id);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -835,10 +933,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             this->local_hostname = buildHostNameWithPort(hostname, port);
             this->local_rpc_addr =
                 buildHostNameWithPort(hostname, local_rpc_port);
+            auto selected_transfer_engine = ResolveTransferEngineForSetup(
+                transfer_engine, transfer_engine_factory, this->local_hostname);
+            if (!selected_transfer_engine) {
+                LOG(WARNING) << "Failed to configure Transfer Engine on port "
+                             << port << ", retry " << (retry + 1) << "/"
+                             << auto_port_config.max_retries;
+                port_binder_.reset();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
-                master_server_addr, transfer_engine, {{"client_mode", "real"}},
-                tenant_id);
+                master_server_addr, *selected_transfer_engine,
+                {{"client_mode", "real"}}, tenant_id);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1251,8 +1359,68 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
 }
 }  // namespace
 
+tl::expected<void, ErrorCode> RealClient::setup_egm_store_pool(
+    const EgmStorePoolOptions &options, size_t global_segment_size) {
+    if (!client_ || egm_store_pool_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    EgmStorePoolHooks hooks;
+    hooks.mount = [client = client_](
+                      const UUID &segment_id, void *base,
+                      size_t length) -> EgmStorePoolResult<void> {
+        auto result = internal::ClientAccess::MountSegmentWithId(
+            *client, segment_id, base, length, "nvlink");
+        if (!result) {
+            return tl::make_unexpected(toString(result.error()));
+        }
+        return {};
+    };
+    hooks.unmount =
+        [client = client_](const UUID &segment_id) -> EgmStorePoolResult<void> {
+        auto result = internal::ClientAccess::CleanupSegmentByIdIfPresent(
+            *client, segment_id);
+        if (!result) {
+            return tl::make_unexpected(toString(result.error()));
+        }
+        return {};
+    };
+
+    auto pool = std::make_unique<EgmStorePool>(
+        MakeNvlinkHostNumaHooks(std::move(hooks)));
+    auto setup = pool->Setup(options, protocol, global_segment_size, 0,
+                             static_cast<size_t>(globalConfig().max_mr_size));
+    if (!setup) {
+        // The underlying Client is already initialized even if the pool
+        // rolled back completely. Retain the pool marker so another setup is
+        // rejected until close() tears down that Client.
+        egm_store_pool_ = std::move(pool);
+        LOG(ERROR) << "EGM Store Pool setup failed: " << setup.error();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    egm_store_pool_ = std::move(pool);
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::teardown_egm_store_pool() {
+    if (!egm_store_pool_) return {};
+    auto teardown = egm_store_pool_->Teardown();
+    if (!teardown) {
+        LOG(ERROR) << "EGM Store Pool teardown failed: " << teardown.error();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    egm_store_pool_.reset();
+    return {};
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
+    if (egm_store_pool_) {
+        LOG(ERROR) << "Refusing setup while EGM Store Pool ownership is active "
+                      "or cleanup-pending; close the client first";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Extract required parameters (no defaults)
     std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
     std::string metadata_server =
@@ -1330,11 +1498,36 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    auto egm_options = ParseEgmStorePoolOptions(config);
+    if (!egm_options) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_options.error();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto egm_validation = ValidateEgmStorePoolOptions(
+        *egm_options, protocol, global_segment_size, local_buffer_size);
+    if (!egm_validation) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_validation.error();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    TransferEngineFactory transfer_engine_factory;
+    if (egm_options->enabled) {
+        transfer_engine_factory = [metadata_server](
+                                      const std::string &endpoint) {
+            return CreateManualNvlinkTransferEngine(endpoint, metadata_server);
+        };
+    }
+
+    auto setup = setup_internal_impl(
+        local_hostname, metadata_server,
+        egm_options->enabled ? 0 : global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, transfer_engine_factory);
+    if (!setup || !egm_options->enabled) return setup;
+    return setup_egm_store_pool(*egm_options, global_segment_size);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1358,6 +1551,9 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    auto egm_teardown = teardown_egm_store_pool();
+    if (!egm_teardown) return egm_teardown;
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
@@ -3472,6 +3668,24 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                            void *buffer, size_t size) const {
+    if (!replica.is_memory_replica()) return false;
+    // The selected replica's descriptor controls Transfer Engine routing.
+    // NVLink accepts ordinary CUDA allocations as local endpoints, while RDMA
+    // requires the destination range to have a local memory registration.
+    const std::string &replica_protocol =
+        replica.get_memory_descriptor().buffer_descriptor.protocol_;
+    if (replica_protocol == "nvlink") {
+        return true;
+    }
+    if (replica_protocol != "rdma") {
+        return false;
+    }
+    auto region = resolve_writable_buffer_region(buffer);
+    return region.has_value() && size <= region->size - region->offset;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache) {
@@ -3577,7 +3791,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            (!client_->CanUseLocalMemcpy(replica) ||
+            ((!client_->CanUseLocalMemcpy(replica) &&
+              !can_use_direct_memory_read(replica, dst, total_size)) ||
              client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
@@ -3719,7 +3934,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     void *dst = static_cast<char *>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
-        !client_->CanUseLocalMemcpy(replica)) {
+        !client_->CanUseLocalMemcpy(replica) &&
+        !can_use_direct_memory_read(replica, dst, size)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);

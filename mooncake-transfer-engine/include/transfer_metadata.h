@@ -226,6 +226,10 @@ class TransferMetadata {
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                              bool update_metadata);
 
+    // Removes the local descriptor entry before optional metadata publication.
+    // If publication fails, the local removal remains committed; a retry must
+    // publish the updated descriptor rather than remove the entry again.
+    // ERR_ADDRESS_NOT_REGISTERED means no matching local entry was present.
     int removeLocalMemoryBuffer(void *addr, bool update_metadata);
 
     int addLocalSegment(SegmentID segment_id, const std::string &segment_name,
