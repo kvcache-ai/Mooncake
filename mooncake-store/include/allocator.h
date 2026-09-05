@@ -20,6 +20,10 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
+namespace ha {
+class AllocatorSnapshotCodec;
+}
+
 /**
  * @brief Type of buffer allocator used in the system
  */
@@ -348,6 +352,7 @@ class OffsetBufferAllocator
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 
     friend class Serializer<OffsetBufferAllocator>;
+    friend class ha::AllocatorSnapshotCodec;
 };
 
 struct RestoredOffsetBufferAllocator {

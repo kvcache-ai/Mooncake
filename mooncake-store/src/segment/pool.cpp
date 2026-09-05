@@ -2,6 +2,7 @@
 
 #include "segment/pool_write_access.h"
 #include "segment/pool_read_access.h"
+#include "segment/snapshot_view.h"
 
 #include "master_metric_manager.h"
 
@@ -24,6 +25,10 @@ ScopedPlacementReadAccess SegmentPool::AcquirePlacementAccess() const {
     return ScopedPlacementReadAccess(
         placement_index_, catalog_.regions_by_host_,
         catalog_.owner_client_by_group_name_, pool_mutex_);
+}
+
+SegmentPoolSnapshotView SegmentPool::GetSnapshotView() const noexcept {
+    return SegmentPoolSnapshotView(this);
 }
 
 StorageUsageSnapshot SegmentPool::GetMemoryUsageSnapshot() const {
