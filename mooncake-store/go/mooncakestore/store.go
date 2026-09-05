@@ -139,15 +139,15 @@ func (s *Store) toCConfig(cfg *ReplicateConfig) (C.mooncake_replicate_config_t, 
 	if cfg.SoftPinAction < SoftPinPreserve || cfg.SoftPinAction > SoftPinDisable {
 		return cc, nil, ErrInvalidArgument
 	}
-	if cfg.SoftPinTTLMS != nil && cfg.SoftPinAction != SoftPinEnable {
+	if cfg.SoftPinTTLMs != nil && cfg.SoftPinAction != SoftPinEnable {
 		return cc, nil, ErrInvalidArgument
 	}
 
 	cc.replica_num = C.size_t(cfg.ReplicaNum)
 	cc.soft_pin_action = C.int(cfg.SoftPinAction)
-	if cfg.SoftPinTTLMS != nil {
+	if cfg.SoftPinTTLMs != nil {
 		cc.has_soft_pin_ttl = 1
-		cc.soft_pin_ttl_ms = C.uint64_t(*cfg.SoftPinTTLMS)
+		cc.soft_pin_ttl_ms = C.uint64_t(*cfg.SoftPinTTLMs)
 	}
 	if cfg.WithHardPin {
 		cc.with_hard_pin = 1

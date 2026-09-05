@@ -208,7 +208,7 @@ func TestReplicateConfigSoftPinTTL(t *testing.T) {
 	cfg := &store.ReplicateConfig{
 		ReplicaNum:    1,
 		SoftPinAction: store.SoftPinEnable,
-		SoftPinTTLMS:  &ttl,
+		SoftPinTTLMs:  &ttl,
 	}
 
 	key := "test_go_softpin_ttl"
@@ -233,7 +233,7 @@ func TestReplicateConfigSoftPinValidation(t *testing.T) {
 
 	ttl := uint64(60000)
 	invalidConfigs := []store.ReplicateConfig{
-		{ReplicaNum: 1, SoftPinAction: store.SoftPinDisable, SoftPinTTLMS: &ttl},
+		{ReplicaNum: 1, SoftPinAction: store.SoftPinDisable, SoftPinTTLMs: &ttl},
 		{ReplicaNum: 1, SoftPinAction: store.SoftPinAction(7)},
 	}
 	for i, cfg := range invalidConfigs {

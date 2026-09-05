@@ -35,9 +35,9 @@ const (
 type ReplicateConfig struct {
 	ReplicaNum    int
 	SoftPinAction SoftPinAction
-	// SoftPinTTLMS overrides the master's default soft-pin TTL in
+	// SoftPinTTLMs overrides the master's default soft-pin TTL in
 	// milliseconds. Only valid with SoftPinEnable.
-	SoftPinTTLMS      *uint64
+	SoftPinTTLMs      *uint64
 	WithHardPin       bool
 	PreferredSegments []string
 }
