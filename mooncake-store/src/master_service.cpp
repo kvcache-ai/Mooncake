@@ -214,6 +214,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
+      tenant_quota_reject_on_exceed_(config.tenant_quota_reject_on_exceed),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
@@ -1514,6 +1515,64 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     std::lock_guard<std::mutex> recompute_lock(tenant_quota_recompute_mutex_);
     const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
     tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
+    MaybeWarnTenantQuotaConfig(capacity);
+}
+
+void MasterService::MaybeWarnTenantQuotaConfig(
+    uint64_t allocatable_capacity_bytes) {
+    if (allocatable_capacity_bytes == 0) {
+        return;
+    }
+    const uint64_t watermark_bytes =
+        GetEvictionHighWatermarkBytes(allocatable_capacity_bytes);
+    for (const auto& snap : tenant_quota_table_.ListTenantSnapshots()) {
+        if (!snap.has_explicit_policy) {
+            continue;
+        }
+        if (snap.effective_quota_bytes <= watermark_bytes) {
+            LOG(WARNING)
+                << "[TENANT-QUOTA] tenant=" << snap.tenant_id
+                << " effective_quota_bytes=" << snap.effective_quota_bytes
+                << " <= eviction_high_watermark_bytes=" << watermark_bytes
+                << " (eviction_high_watermark_ratio="
+                << eviction_high_watermark_ratio_
+                << "). Tenant admission eviction may bind while BatchEvict "
+                   "stays idle; consider raising the tenant share or lowering "
+                   "the watermark, or rely on need_mem_eviction_ arming.";
+        }
+        if (snap.charged_bytes > 0 &&
+            snap.effective_quota_bytes >= snap.charged_bytes * 100) {
+            LOG(WARNING)
+                << "[TENANT-QUOTA] tenant=" << snap.tenant_id
+                << " effective_quota_bytes=" << snap.effective_quota_bytes
+                << " is far above charged_bytes=" << snap.charged_bytes
+                << "; requested weights may be oversized relative to usage.";
+        }
+    }
+}
+
+uint64_t MasterService::GetEvictionHighWatermarkBytes(
+    uint64_t allocatable_capacity_bytes) const {
+    return static_cast<uint64_t>(
+        static_cast<double>(allocatable_capacity_bytes) *
+        eviction_high_watermark_ratio_);
+}
+
+void MasterService::HandleTenantQuotaAdmissionEviction(
+    const TenantId& tenant_id, uint64_t deficit_bytes) {
+    // Only arm the global BatchEvict path when this tenant is large enough
+    // that its effective quota can pin used_ratio at/above the watermark.
+    // Otherwise a small over-quota tenant would keep need_mem_eviction_ armed
+    // while BatchEvict picks other tenants' objects and still cannot admit.
+    if (auto snap = GetTenantQuotaSnapshot(tenant_id)) {
+        const uint64_t capacity = GetTenantQuotaAllocatableCapacityBytes();
+        const uint64_t watermark_bytes =
+            GetEvictionHighWatermarkBytes(capacity);
+        if (snap->effective_quota_bytes >= watermark_bytes) {
+            need_mem_eviction_.store(true, std::memory_order_relaxed);
+        }
+    }
+    EvictTenantMemoryForQuota(tenant_id, deficit_bytes);
 }
 
 MasterService::TenantState& MasterService::GetOrCreateTenantState(
@@ -4676,12 +4735,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
             return result;
         }
-        if (attempt == kMaxTenantQuotaEvictionRetries) {
+        const bool final_attempt = tenant_quota_reject_on_exceed_ ||
+                                   attempt == kMaxTenantQuotaEvictionRetries;
+        if (final_attempt) {
             MasterMetricManager::instance().inc_tenant_quota_reject(
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+        // Scoped BatchEvict arming + tenant eviction (see helper).
+        HandleTenantQuotaAdmissionEviction(object_id.tenant_id,
+                                           quota_deficit_bytes);
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -5569,12 +5632,16 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
             return result;
         }
-        if (attempt == kMaxTenantQuotaEvictionRetries) {
+        const bool final_attempt = tenant_quota_reject_on_exceed_ ||
+                                   attempt == kMaxTenantQuotaEvictionRetries;
+        if (final_attempt) {
             MasterMetricManager::instance().inc_tenant_quota_reject(
                 object_id.tenant_id.value(), "quota_exceeded");
             return result;
         }
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+        // Scoped BatchEvict arming + tenant eviction (see helper).
+        HandleTenantQuotaAdmissionEviction(object_id.tenant_id,
+                                           quota_deficit_bytes);
     }
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
@@ -10000,6 +10067,28 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     }
 
     const TenantId normalized_tenant(tenant_id);
+    // Free the admission deficit plus tenant-scoped headroom so concurrent
+    // writers do not immediately re-enter the eviction treadmill (#3741).
+    uint64_t eviction_target = target_bytes;
+    if (eviction_ratio_ > 0.0) {
+        if (auto snap = GetTenantQuotaSnapshot(normalized_tenant)) {
+            const double headroom_d =
+                static_cast<double>(snap->effective_quota_bytes) *
+                eviction_ratio_;
+            const uint64_t headroom =
+                headroom_d >= static_cast<double>(
+                                  std::numeric_limits<uint64_t>::max())
+                    ? std::numeric_limits<uint64_t>::max()
+                    : static_cast<uint64_t>(headroom_d);
+            if (eviction_target >
+                std::numeric_limits<uint64_t>::max() - headroom) {
+                eviction_target = std::numeric_limits<uint64_t>::max();
+            } else {
+                eviction_target += headroom;
+            }
+        }
+    }
+
     auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
@@ -10210,7 +10299,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto pass = [&](bool allow_soft_pinned) {
         const size_t start_shard = randomIndex(kNumShards);
         for (size_t scanned = 0;
-             scanned < kNumShards && total.freed_bytes < target_bytes;
+             scanned < kNumShards && total.freed_bytes < eviction_target;
              ++scanned) {
             const size_t shard_idx = (start_shard + scanned) % kNumShards;
             std::vector<std::vector<Replica>> deferred_replicas;
@@ -10240,7 +10329,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 }
             }
             for (const auto& key : candidate_keys) {
-                if (total.freed_bytes >= target_bytes) {
+                if (total.freed_bytes >= eviction_target) {
                     break;
                 }
                 auto evict_result = try_evict_group_or_object(
@@ -10252,16 +10341,29 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     pass(/*allow_soft_pinned=*/false);
-    if (allow_evict_soft_pinned_objects_ && total.freed_bytes < target_bytes) {
+    if (allow_evict_soft_pinned_objects_ &&
+        total.freed_bytes < eviction_target) {
         pass(/*allow_soft_pinned=*/true);
     }
 
     if (total.freed_bytes > 0) {
+        const int64_t freed_i64 = static_cast<int64_t>(std::min<uint64_t>(
+            total.freed_bytes,
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
+        const int64_t keys_i64 = static_cast<int64_t>(std::min<uint64_t>(
+            total.evicted_objects,
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())));
         MasterMetricManager::instance().inc_tenant_evict_bytes(
-            normalized_tenant.value(),
-            static_cast<int64_t>(std::min<uint64_t>(
-                total.freed_bytes,
-                static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))));
+            normalized_tenant.value(), freed_i64);
+        // Also count on the global eviction series so
+        // master_attempted_evictions_total covers the tenant path (#3741).
+        MasterMetricManager::instance().inc_eviction_success(keys_i64,
+                                                             freed_i64);
+        MasterMetricManager::instance().inc_mem_eviction_success(keys_i64,
+                                                                 freed_i64);
+    } else {
+        MasterMetricManager::instance().inc_eviction_fail();
+        MasterMetricManager::instance().inc_mem_eviction_fail();
     }
     if (offload_on_evict_ && total.freed_bytes == 0 &&
         offload_deferred_count > 0) {
