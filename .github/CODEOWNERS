@@ -18,6 +18,8 @@
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/shared_segment.py @ShangmingCai @alogfans
+/python/tests/engine/ @ShangmingCai @alogfans
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc

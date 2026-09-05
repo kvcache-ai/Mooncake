@@ -32,8 +32,14 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import torch
-import torch.distributed as dist
+try:
+    import torch
+    import torch.distributed as dist
+except ModuleNotFoundError as exc:
+    if exc.name != "torch":
+        raise
+    torch = None
+    dist = None
 
 from .engine import SharedSegment as _CppSharedSegment
 
@@ -49,6 +55,15 @@ _ALIGN = 4096
 
 class SharedSegmentError(RuntimeError):
     """Raised when a shared segment cannot be created or addressed."""
+
+
+def _require_torch() -> Any:
+    if torch is None:
+        raise SharedSegmentError(
+            "PyTorch is required to create shared-segment tensor views; "
+            "install mooncake-transfer-engine[hardware]"
+        )
+    return torch
 
 
 def create_shared_segment(
@@ -84,6 +99,7 @@ def create_shared_segment(
     comm_group = _select_comm_group(comm_group, tp_group)
     if host_register and not mmap:
         raise SharedSegmentError("host_register requires mmap=True")
+    _require_torch()
     if not shared_segment_supported(mmap=mmap, host_register=host_register):
         if not mmap:
             raise SharedSegmentError(
@@ -127,9 +143,7 @@ def create_shared_segment(
     except RuntimeError as exc:
         create_error = str(exc)
 
-    _raise_if_any_rank_failed(
-        create_error, world_size, rank_id, comm_group, "create"
-    )
+    _raise_if_any_rank_failed(create_error, world_size, rank_id, comm_group, "create")
     if segment is None:
         raise SharedSegmentError("Shared segment create returned no segment")
 
@@ -150,7 +164,10 @@ def create_shared_segment(
 
 
 class SharedSegment:
-    """Handle to one shared host segment. Alive for as long as the mapping is needed."""
+    """Handle to one shared host segment.
+
+    The handle must remain alive for as long as its mapping is needed.
+    """
 
     def __init__(
         self,
@@ -248,7 +265,7 @@ def _parse_block(name: str, spec: Mapping[str, Any]) -> _BlockSpec:
     if not shape or any(dim <= 0 for dim in shape):
         raise SharedSegmentError(f"Block {name!r} needs a positive shape")
 
-    element_size = torch.empty(0, dtype=dtype).element_size()
+    element_size = _require_torch().empty(0, dtype=dtype).element_size()
     nbytes = element_size
     for dim in shape:
         nbytes *= dim
@@ -272,14 +289,15 @@ def _build_layout(
 
 def _current_device_index() -> int:
     """The accelerator this rank runs on, whatever vendor it is."""
-    accelerator = getattr(torch, "accelerator", None)
+    torch_module = _require_torch()
+    accelerator = getattr(torch_module, "accelerator", None)
     if accelerator is not None:
         try:
             return int(accelerator.current_device_index())
         except (RuntimeError, AttributeError):
             pass
     for backend in ("npu",):
-        module = getattr(torch, backend, None)
+        module = getattr(torch_module, backend, None)
         if module is not None and module.is_available():
             return int(module.current_device())
     return 0
@@ -335,8 +353,9 @@ def _raise_if_any_rank_failed(
 
 
 def _all_gather_blob(blob: bytes, world_size: int, comm_group: Any) -> list[bytes]:
-    local = torch.frombuffer(bytearray(blob), dtype=torch.uint8)
-    gathered = [torch.empty_like(local) for _ in range(world_size)]
+    torch_module = _require_torch()
+    local = torch_module.frombuffer(bytearray(blob), dtype=torch_module.uint8)
+    gathered = [torch_module.empty_like(local) for _ in range(world_size)]
     dist.all_gather(gathered, local, group=_resolve_cpu_group(comm_group))
     return [bytes(tensor.numpy()) for tensor in gathered]
 
@@ -357,6 +376,7 @@ def _tensor_from_device_ptr(
     holder: Any,
 ) -> torch.Tensor:
     """Wrap a device-accessible VA (HostRegister or Ascend VMM) as an NPU tensor."""
+    torch_module = _require_torch()
     try:
         import torch_npu
     except ImportError as exc:
@@ -364,11 +384,11 @@ def _tensor_from_device_ptr(
             "torch_npu is required to expose device-mapped shared-segment tensors"
         ) from exc
 
-    device = torch.device(f"npu:{device_id}")
+    device = torch_module.device(f"npu:{device_id}")
     storage = torch_npu._C._construct_storage_from_data_pointer(
         int(device_ptr), device, int(nbytes)
     )
-    view = torch.empty(0, dtype=dtype, device=device)
+    view = torch_module.empty(0, dtype=dtype, device=device)
     view.set_(storage, 0, shape, _contiguous_strides(shape))
     view._mooncake_segment = holder
     return view
@@ -378,6 +398,6 @@ def _tensor_from_host_addr(
     host_addr: int, nbytes: int, shape: tuple[int, ...], dtype: torch.dtype, holder: Any
 ) -> torch.Tensor:
     buffer = (ctypes.c_int8 * nbytes).from_address(host_addr)
-    view = torch.frombuffer(buffer, dtype=dtype).view(shape)
+    view = _require_torch().frombuffer(buffer, dtype=dtype).view(shape)
     view._mooncake_segment = holder
     return view
