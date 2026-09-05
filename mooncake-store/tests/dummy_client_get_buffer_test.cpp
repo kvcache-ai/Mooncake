@@ -618,6 +618,87 @@ TEST_F(DummyClientGetBufferTest, Perf_BatchHotVsCold) {
         << "Batch hot cache path should be faster than fallback";
 }
 
+// ---- Regression: duplicate keys in one batch must each be filled ----
+//
+// Bug (pre-fix): RealClient::batch_get_buffer_internal built Client::BatchGet's
+// destination slice map keyed by object key. When the same key appeared more
+// than once in a single batch, those entries collapsed onto one destination:
+// every occurrence transferred into the last op's buffer, while the other
+// occurrences' separately-allocated buffers were left unwritten yet still
+// reported successful, surfacing uninitialized/recycled allocator memory as
+// valid data. The fix processes the ops in rounds so each occurrence gets its
+// own destination and is actually filled.
+//
+// The key is deliberately NOT warmed into the hot cache, so every occurrence
+// misses hot cache and flows through the allocator-fallback batch path
+// (DummyClient::batch_get_buffer -> RealClient::batch_acquire_buffer_dummy ->
+// RealClient::batch_get_buffer_internal), which is exactly where duplicate keys
+// used to collapse.
+TEST_F(DummyClientGetBufferTest, BatchGetBufferDuplicateKeysAllFilled) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "duplicate_key_regression";
+
+    // Distinctive, non-zero, position-dependent payload so an unwritten buffer
+    // (typically zero-filled or recycled allocator memory) is clearly
+    // detectable rather than coincidentally matching.
+    const size_t kSize = 256 * 1024;  // 256 KB
+    std::string data(kSize, '\0');
+    for (size_t i = 0; i < kSize; ++i) {
+        data[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    PutData(key, data);
+
+    // Request the SAME key several times in a single batch.
+    const size_t kOccurrences = 3;
+    std::vector<std::string> keys(kOccurrences, key);
+
+    auto results = dummy_client_->batch_get_buffer(keys);
+    ASSERT_EQ(results.size(), kOccurrences);
+
+    for (size_t i = 0; i < kOccurrences; ++i) {
+        // Every occurrence is reported successful (non-null handle)...
+        ASSERT_NE(results[i], nullptr)
+            << "batch_get_buffer returned nullptr for duplicate occurrence "
+            << i;
+        ASSERT_EQ(results[i]->size(), data.size())
+            << "size mismatch for duplicate occurrence " << i;
+
+        // ...and every occurrence's own buffer must actually hold the object's
+        // bytes. Pre-fix, all but the last occurrence's buffer was left
+        // unwritten (stale/recycled memory) despite the success status.
+        const char *got = static_cast<const char *>(results[i]->ptr());
+        if (std::memcmp(got, data.data(), data.size()) != 0) {
+            size_t first_bad = 0;
+            while (first_bad < data.size() &&
+                   got[first_bad] == data[first_bad]) {
+                ++first_bad;
+            }
+            ADD_FAILURE()
+                << "Duplicate occurrence " << i << " of key '" << key
+                << "' was reported successful but its buffer holds stale data "
+                << "(first mismatch at byte " << first_bad << ": got "
+                << (static_cast<unsigned>(got[first_bad]) & 0xFFu)
+                << ", expected "
+                << (static_cast<unsigned>(data[first_bad]) & 0xFFu)
+                << "). This is the batch-get duplicate-key bug: "
+                << "the destination slice map collapsed duplicate "
+                << "keys onto one buffer, leaving this occurrence's "
+                << "buffer unwritten.";
+        }
+    }
+
+    // Each occurrence must also receive its own distinct destination buffer,
+    // not a shared/aliased one.
+    for (size_t i = 0; i < kOccurrences; ++i) {
+        for (size_t j = i + 1; j < kOccurrences; ++j) {
+            EXPECT_NE(results[i]->ptr(), results[j]->ptr())
+                << "duplicate occurrences " << i << " and " << j
+                << " unexpectedly share the same buffer pointer";
+        }
+    }
+}
+
 }  // namespace testing
 }  // namespace mooncake
 
