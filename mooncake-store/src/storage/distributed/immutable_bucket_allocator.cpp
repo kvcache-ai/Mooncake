@@ -933,13 +933,13 @@ void ImmutableBucketAllocator::UpdateAccess(
 }
 
 uint64_t ImmutableBucketAllocator::GetTotalCapacity() const {
+    std::lock_guard<std::mutex> lock(mutex_);
     // A fixed denominator: watermarks must not move as buckets come and go,
     // or deleting a bucket would shrink capacity in lockstep with usage and
     // eviction would never converge.
     if (max_bucket_count_ > 0) {
         return static_cast<uint64_t>(max_bucket_count_) * bucket_capacity_;
     }
-    std::lock_guard<std::mutex> lock(mutex_);
     return static_cast<uint64_t>(buckets_.size()) * bucket_capacity_;
 }
 
@@ -959,10 +959,14 @@ uint64_t ImmutableBucketAllocator::GetUsedBytes() const {
     return UsedBytesLocked();
 }
 
-int64_t ImmutableBucketAllocator::SetMaxBucketCount(
+tl::expected<int64_t, ErrorCode>
+ImmutableBucketAllocator::SetMaxBucketCount(
     int64_t new_max_bucket_count) {
+    if (new_max_bucket_count <= 0 || new_max_bucket_count > kMaxBucketId) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::lock_guard<std::mutex> lock(mutex_);
-    int64_t old = max_bucket_count_;
+    const int64_t old = max_bucket_count_;
     max_bucket_count_ = new_max_bucket_count;
     LOG(INFO) << "Dynamic max_bucket_count changed from "
               << old << " to " << new_max_bucket_count;
@@ -1491,4 +1495,3 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
 }
 
 }  // namespace mooncake
-

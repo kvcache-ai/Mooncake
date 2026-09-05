@@ -51,6 +51,7 @@
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
 #include "metadata_store.h"
+#include "storage/distributed/global_allocator_interface.h"
 
 namespace mooncake {
 
@@ -67,6 +68,8 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
+class ImmutableBucketAllocator;
+class GlobalAllocatorInterface;
 
 // Forward declarations
 class AllocationStrategy;
@@ -200,6 +203,8 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
+        int64_t new_max_bucket_count);
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -498,6 +503,12 @@ class MasterService {
                   const TenantId& tenant_id, const uint64_t slice_length,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const TenantId& tenant_id,
+                  const std::vector<uint64_t>& slice_lengths,
+                  const ReplicateConfig& config);
 
     /**
      * @brief Complete a put operation, replica_type indicates the type of
@@ -2116,8 +2127,22 @@ class MasterService {
         const ResolvedSoftPinRequest& soft_pin_request,
         uint64_t& quota_deficit_bytes,
         std::optional<std::chrono::system_clock::time_point>
-            committed_soft_pin_timeout = std::nullopt)
+            committed_soft_pin_timeout = std::nullopt,
+        const std::optional<DistributedFSDescriptor>& preallocated_dfs =
+            std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    auto PutStartInternal(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id, uint64_t slice_length,
+        const ReplicateConfig& config,
+        const std::optional<DistributedFSDescriptor>& preallocated_dfs)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
+    std::vector<BatchAllocateResult> ReserveDfsSpaceForBatch(
+        const std::vector<std::string>& keys,
+        const std::vector<uint64_t>& value_lengths,
+        const std::vector<bool>& needs_dfs);
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -2128,6 +2153,11 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
+    void RunShardDfsEviction();
+    void RestoreRecoveredDfsReplicas();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2809,7 +2839,8 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<GlobalAllocatorInterface> dfs_allocator_;
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
 
     // Segment management
     SegmentManager segment_manager_;

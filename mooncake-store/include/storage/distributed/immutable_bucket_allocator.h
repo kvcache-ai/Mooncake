@@ -175,7 +175,8 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
      *
      * @return the previous value of max_bucket_count_.
      */
-    int64_t SetMaxBucketCount(int64_t new_max_bucket_count);
+    tl::expected<int64_t, ErrorCode> SetMaxBucketCount(
+        int64_t new_max_bucket_count);
 
     /**
      * @brief Mark a reservation as durable so restart recovery may revive it.

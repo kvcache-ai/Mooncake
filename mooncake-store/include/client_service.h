@@ -897,7 +897,8 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
-    void SubmitDfsWrites(std::vector<PutOperation>& ops);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops,
+                         bool is_upsert = false, bool allow_async = true);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -909,6 +910,25 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
+
+    struct AsyncDfsWriteContext {
+        std::vector<std::string> keys;
+        std::vector<DistributedFSDescriptor> descriptors;
+        std::vector<std::vector<Slice>> slices;
+        std::vector<PinnedBufferPool::Buffer> staging;
+        std::vector<std::vector<char>> host_staging;
+        std::shared_ptr<DistributedStorageBackend> backend;
+        std::shared_ptr<PinnedBufferPool> pinned_pool;
+        bool is_upsert = false;
+
+        ~AsyncDfsWriteContext();
+    };
+
+    bool StageDfsWriteData(
+        AsyncDfsWriteContext& context,
+        const std::vector<const std::vector<Slice>*>& slice_lists);
+    void RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context);
+    void DrainAsyncDfsWrites();
 
     std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
         std::vector<PutOperation>& ops, bool is_upsert);
@@ -966,10 +986,15 @@ class Client {
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive
     // write_thread_pool_)
-    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    std::shared_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    std::mutex dfs_inflight_mutex_;
+    std::condition_variable dfs_inflight_cv_;
+    size_t dfs_inflight_writes_{0};
+    std::atomic<bool> dfs_writes_shutting_down_{false};
 
     // Probe used by healDanglingLocalDiskReplica to prove a completed
     // LOCAL_DISK replica's backing file is gone. Installed by the owner of
