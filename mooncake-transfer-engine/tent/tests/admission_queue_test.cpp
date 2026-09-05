@@ -586,6 +586,160 @@ TEST(AdmissionQueueTest, Step3DropsInfeasibleAndKeepsFeasible) {
     EXPECT_EQ(queue.outstandingBytes(), 16u);
 }
 
+// The deadline is absolute, so an owner dispatched now still has to wait
+// behind everything already dispatched and not yet completed. That wait is
+// an additive delay charged from the queue's own dispatch accounting, not a
+// slower bandwidth.
+TEST(AdmissionQueueTest, Step3DropCountsBytesAlreadyDispatched) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.0));
+    // now = 1e9 ns; bandwidth 1e9 B/s: 1 MB takes 1 ms.
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    // owner 1: 1 MB, loose deadline; dispatched and still in flight.
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 1'000'000, 5'000'000'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    ASSERT_EQ(queue.pickForDispatch(4, 1 << 20), std::vector<QueueOwnerId>{1});
+
+    // owner 2: 16 B with a 500 us window. Alone it would take 16 ns
+    // (MLU ~3e-5); behind the 1 MB it completes at ~1 ms → MLU ~2 → drop.
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(2, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'500'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_TRUE(queue.pickForDispatch(4, 1 << 20, &dropped).empty());
+    EXPECT_EQ(dropped, std::vector<QueueOwnerId>{2});
+
+    // Once owner 1 completes nothing is ahead: the same request is feasible.
+    ASSERT_EQ(queue.complete(1, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(3, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'500'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    dropped.clear();
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{3});
+    EXPECT_TRUE(dropped.empty());
+}
+
+// Only provider-governed bytes wait ahead of an eligible owner: an owner on
+// another transport is neither counted when dispatched nor subtracted when
+// it completes.
+TEST(AdmissionQueueTest, Step3QueueAheadCountsOnlyProviderGovernedBytes) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.0));
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    // owner 1: 1 MB, not eligible (not governed by the provider); dispatched.
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(
+                    1, 1, {makeOwnerWithDeadline(0, 1'000'000, 5'000'000'000)}),
+                ids)
+            .code(),
+        Status::Code::kOk);
+    ASSERT_EQ(queue.pickForDispatch(4, 1 << 20), std::vector<QueueOwnerId>{1});
+
+    // owner 2: 16 B with a 500 us window, eligible. Nothing ahead of it is
+    // on the NIC, so it is feasible.
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(2, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'500'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{2});
+    EXPECT_TRUE(dropped.empty());
+
+    // Completing the ungoverned owner must not disturb the count either:
+    // afterwards an eligible 1 MB owner still drops a tight owner behind it.
+    ASSERT_EQ(queue.complete(1, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);
+    ASSERT_EQ(queue.complete(2, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(3, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 1'000'000, 5'000'000'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    dropped.clear();
+    ASSERT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{3});
+    EXPECT_TRUE(dropped.empty());
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(4, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'500'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    dropped.clear();
+    EXPECT_TRUE(queue.pickForDispatch(4, 1 << 20, &dropped).empty());
+    EXPECT_EQ(dropped, std::vector<QueueOwnerId>{4});
+}
+
+// Within one pick, `bytes_ahead` for a later owner is exactly the eligible
+// bytes picked before it: an ungoverned owner ahead adds nothing, and an
+// eligible one is counted once (dispatching_bytes_ already grows as owners
+// are picked).
+TEST(AdmissionQueueTest, Step3QueueAheadWithinOnePickIsExact) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.0));
+    // now = 1e9 ns; bandwidth 1e9 B/s: 1 MB takes 1 ms.
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    // EDF order: N (400 KB, not eligible, 560 us), A (400 KB, eligible,
+    // 600 us), B (16 B, eligible, 640 us); 400 KB takes 400 us.
+    //   A: nothing governed ahead -> 400 / 600 = 0.67 -> dispatch
+    //      (counting N: 800 / 600 = 1.33 -> drop)
+    //   B: A ahead -> ~400 / 640 = 0.63 -> dispatch
+    //      (counting A twice: 800 / 640 = 1.25 -> drop)
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(
+                makeSubmit(1, 3,
+                           {makeOwnerWithDeadline(0, 400'000, 1'000'560'000),
+                            makeDegradationEligibleOwnerWithDeadline(
+                                1, 400'000, 1'000'600'000),
+                            makeDegradationEligibleOwnerWithDeadline(
+                                2, 16, 1'000'640'000)}),
+                ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    const std::vector<QueueOwnerId> all{1, 2, 3};
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped), all);
+    EXPECT_TRUE(dropped.empty());
+}
+
 TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
     LocalTransferAdmissionQueue queue(step3Limits(1.5));
     queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
@@ -642,6 +796,67 @@ TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
     auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
     ASSERT_EQ(picked.size(), 1u);
     EXPECT_TRUE(dropped.empty());
+}
+
+// A provider that cannot report bandwidth (<= 0, e.g. every RDMA NIC is
+// unavailable) disables the prediction outright: nothing is dropped, not
+// even an owner whose deadline has already passed, because "no estimate"
+// must not be read as "infeasible".
+TEST(AdmissionQueueTest, Step3NoDropWhenBandwidthIsUnknown) {
+    for (const double reported : {0.0, -1.0}) {
+        LocalTransferAdmissionQueue queue(step3Limits(1.5));
+        int hook_calls = 0;
+        DegradationHooks hooks;
+        hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+        queue.setDegradationPolicy([reported] { return reported; }, hooks,
+                                   [] { return uint64_t{2'000'000'000}; });
+
+        std::vector<QueueOwnerId> admitted_ids;
+        // Deadline 1e9 is already behind now = 2e9.
+        ASSERT_EQ(
+            queue
+                .tryAdmit(makeSubmit(1, 1,
+                                     {makeDegradationEligibleOwnerWithDeadline(
+                                         0, 16, 1'000'000'000)}),
+                          admitted_ids)
+                .code(),
+            Status::Code::kOk);
+
+        std::vector<QueueOwnerId> dropped;
+        auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+        EXPECT_EQ(picked.size(), 1u) << "bandwidth " << reported;
+        EXPECT_TRUE(dropped.empty()) << "bandwidth " << reported;
+        EXPECT_EQ(hook_calls, 0) << "bandwidth " << reported;
+    }
+}
+
+// Drop enabled with a healthy bandwidth: an eligible owner that carries no
+// deadline has nothing to miss and is dispatched, whatever the threshold.
+TEST(AdmissionQueueTest, Step3NoDropWithoutDeadline) {
+    for (const double theta : {1.5, 1e-9}) {
+        LocalTransferAdmissionQueue queue(step3Limits(theta));
+        int hook_calls = 0;
+        DegradationHooks hooks;
+        hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+        queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                                   [] { return uint64_t{1'000'000'000}; });
+
+        std::vector<QueueOwnerId> admitted_ids;
+        ASSERT_EQ(
+            queue
+                .tryAdmit(makeSubmit(1, 1,
+                                     {makeDegradationEligibleOwnerWithDeadline(
+                                         0, 1 << 20, /*deadline_ns=*/0)}),
+                          admitted_ids)
+                .code(),
+            Status::Code::kOk);
+
+        std::vector<QueueOwnerId> dropped;
+        auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+        EXPECT_EQ(picked.size(), 1u) << "theta " << theta;
+        EXPECT_TRUE(dropped.empty()) << "theta " << theta;
+        EXPECT_EQ(hook_calls, 0) << "theta " << theta;
+    }
 }
 
 TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {

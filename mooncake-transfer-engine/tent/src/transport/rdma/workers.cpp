@@ -38,12 +38,6 @@ namespace tent {
 thread_local int tl_wid = -1;
 
 namespace {
-struct ArbitrationEntry {
-    RdmaSlice* slice;
-    double mlu;
-    size_t order;
-};
-
 // Look up (or create) the RailMonitor for `machine_id` on this worker's
 // map. Returning a stable reference is safe because the map stores values
 // via unique_ptr -- rehashes move the pointer slot, not the RailMonitor.
@@ -122,6 +116,20 @@ Workers::Workers(RdmaTransport* transport)
     // Learning rate: 0.0 = full adaptation, 1.0 = no adaptation
     params.bandwidth_learning_rate =
         conf->get("transports/rdma/bandwidth_learning_rate", 0.01);
+
+    // Same convention for the transmit estimate the deadline predictors read
+    params.transmit_bandwidth_learning_rate =
+        conf->get("transports/rdma/transmit_bandwidth_learning_rate",
+                  params.transmit_bandwidth_learning_rate);
+
+    // How often that estimate is metered, and how stale an interval may be
+    // before it is re-baselined instead of learned from.
+    params.transmit_meter_interval_ns =
+        conf->get("transports/rdma/transmit_meter_interval_ns",
+                  params.transmit_meter_interval_ns);
+    params.transmit_meter_max_interval_ns =
+        conf->get("transports/rdma/transmit_meter_max_interval_ns",
+                  params.transmit_meter_max_interval_ns);
 
     // EWMA bounds as multipliers of theoretical bandwidth
     params.ewma_min_multiplier =
@@ -288,6 +296,16 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
     }
     auto& worker = worker_context_[worker_id];
 
+    // This lane's set and counter now account for the slices, wherever they
+    // are later swept from. First entry only: a slice arriving here has
+    // never been counted, so there is nothing to move.
+    auto* owned = slice_list.first;
+    for (int i = 0; i < slice_list.num_slices && owned; ++i) {
+        owned->owner_worker.store(worker_id, std::memory_order_relaxed);
+        owned->counted_lane.store(worker_id, std::memory_order_relaxed);
+        owned = owned->next;
+    }
+
     // Get priority from first slice (all slices in list have same priority)
     int priority = PRIO_HIGH;
     if (slice_list.first && slice_list.first->task) {
@@ -317,6 +335,22 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
     if (slice && slice->task) {
         priority = slice->priority;
     }
+    // This lane's queue and counter are about to account for the slice, so
+    // move the count here before it is visible on the queue. With a shared
+    // queue pair the lane re-queueing the slice is the one that polled the
+    // completion, not necessarily the one that first enqueued it: whichever
+    // lane still counts it is paid back in the same exchange, so the slice
+    // is never in two counts or in none. A sweep that already discounted it
+    // left -1 behind and there is nothing to pay.
+    if (slice) {
+        const int lane = laneIndex(worker);
+        slice->owner_worker.store(lane, std::memory_order_relaxed);
+        const int prev =
+            slice->counted_lane.exchange(lane, std::memory_order_acq_rel);
+        if (prev >= 0 && prev != lane && prev < (int)num_workers_)
+            worker_context_[prev].inflight_slices.fetch_sub(1);
+        if (prev != lane) worker.inflight_slices.fetch_add(1);
+    }
     // The worker must never block on its own queue (issue #3637): a full
     // queue parks the slice in requeue_overflow and the next tick retries.
     // Either way it stays counted as inflight, which keeps the worker from
@@ -324,7 +358,6 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
     if (!worker.queues[priority].try_push(slice_list)) {
         worker.requeue_overflow.emplace_back(priority, slice_list);
     }
-    worker.inflight_slices.fetch_add(1);
 }
 
 Status Workers::cancel(RdmaTask* task) {
@@ -347,82 +380,184 @@ Status Workers::cancel(RdmaTask* task) {
     return Status::OK();
 }
 
-bool Workers::cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice) {
-    if (!slice || !slice->task ||
+void Workers::orderByDeadline(std::vector<RdmaSlice*>& slices, int dev_id,
+                              uint64_t now_ns) {
+    if (!device_selector_ || slices.size() < 2) return;
+    // This NIC's transmit estimate answers "how fast do these bytes move";
+    // <= 0 means nothing to predict from, so the order stays as it is.
+    const double bw_bps = device_selector_->getTransmitBandwidth(dev_id);
+    if (bw_bps <= 0.0) return;
+
+    thread_local std::vector<ArbFlow> flows;
+    flows.clear();
+    flows.reserve(slices.size());
+    bool any_deadline = false;
+    for (const RdmaSlice* s : slices) {
+        flows.push_back(s && s->task
+                            ? ArbFlow{s->task->request.deadline_ns, s->length}
+                            : ArbFlow{0, 0});
+        any_deadline |= flows.back().deadline_ns != 0;
+    }
+    // Without a deadline anywhere every MLU is 0 and the order would come
+    // out as it went in; skip the greedy pass rather than run it for that.
+    if (!any_deadline) return;
+
+    // What actually precedes these slices: bytes already posted to the NIC.
+    // None of the candidates is in it -- they are about to be posted -- and
+    // neither is work still sitting in a worker queue.
+    const size_t bytes_ahead = device_selector_->getPostedBytes(dev_id);
+    const auto order = OrderByUrgency(flows, now_ns, bw_bps, bytes_ahead);
+
+    thread_local std::vector<RdmaSlice*> ordered;
+    ordered.clear();
+    ordered.reserve(order.size());
+    for (size_t i : order) ordered.push_back(slices[i]);
+    std::copy(ordered.begin(), ordered.end(), slices.begin());
+}
+
+void Workers::rechargeSlice(RdmaSlice* slice, int dev_id) {
+    if (!device_selector_ || !slice || dev_id < 0) return;
+    if (slice->charged_dev.load(std::memory_order_relaxed) == dev_id) return;
+    if (auto status = device_selector_->chargeDevice(dev_id, slice->length);
+        !status.ok()) {
+        // A device the selector does not track (a topology/quota mismatch).
+        // The transfer can still go, so the slice is not failed; it keeps
+        // the charge it has, if any, so the release stays balanced -- but
+        // this NIC's load is under-counted, so say so (rate-limited).
+        LOG_EVERY_N(WARNING, 100)
+            << "rechargeSlice: device " << dev_id
+            << " is not tracked by DeviceSelector; slice " << slice
+            << " keeps its previous charge: " << status.ToString();
+        return;
+    }
+    // Charge the new device before letting go of the old one, so a release
+    // racing in between pays back whichever device is on record and never
+    // both, and never one that has not been charged. No latency sample --
+    // this is not a completion.
+    const int prev =
+        slice->charged_dev.exchange(dev_id, std::memory_order_acq_rel);
+    if (prev >= 0) device_selector_->release(prev, slice->length, 0.0);
+}
+
+bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
+    if (!slice || !slice->task) return false;
+    // Two reasons not to post. The caller cancelled the transfer; or another
+    // lane already resolved this slice while it waited here for a re-post --
+    // with a shared queue pair that lane's timeout sweep can still reach it
+    // through a set entry it has not drained. Posting a resolved slice would
+    // move bytes for a transfer that is already over.
+    if (slice->word == PENDING &&
         !slice->task->cancel_requested.load(std::memory_order_acquire))
         return false;
-    if (slice->word == PENDING) {
-        releaseSliceQuota(device_selector_.get(), slice);
-        updateSliceStatus(slice, CANCELED);
-    }
-    worker.inflight_slices.fetch_sub(1);
+    // Retire it the way a sweep would -- charge, count and set entry all go
+    // back where they came from, each idempotently, since whichever path
+    // resolved the slice may already have run them -- and updateSliceStatus
+    // is a no-op once the slice is terminal.
+    retireSweptSlice(worker, slice, getCurrentTimeInNano(), nullptr);
+    updateSliceStatus(slice, CANCELED);
     return true;
 }
 
-void Workers::releaseSliceQuota(DeviceSelector* selector, RdmaSlice* slice,
+void Workers::releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
                                 double latency) {
-    if (!slice || !slice->quota_charged || !selector) return;
-    // Release against the device the bytes were actually charged on, and unwind
-    // exactly the bytes that were charged, not the current routing NIC or the
-    // slice length: a fallback re-route can leave source_dev_id pointing at a
-    // different device, and the allocator's per-slice estimate can differ from
-    // slice->length.
-    selector->release(slice->charged_dev_id, slice->charged_bytes, latency);
-    slice->quota_charged = false;
-    slice->charged_dev_id = -1;
-    slice->charged_bytes = 0;
+    if (!slice || !device_selector_) return;
+    // Each field names the device it was charged to, so the release goes
+    // there even if a fallback has since rewritten source_dev_id.
+    const int posted =
+        slice->posted_dev.exchange(-1, std::memory_order_acq_rel);
+    if (posted >= 0)
+        device_selector_->notePostEnded(posted, slice->length, now_ns);
+    const int charged =
+        slice->charged_dev.exchange(-1, std::memory_order_acq_rel);
+    if (charged >= 0)
+        device_selector_->release(charged, slice->length, latency);
 }
 
-void Workers::chargeSliceQuota(DeviceSelector* selector, RdmaSlice* slice) {
-    // Reconcile the inflight charge so it lands on the device the slice will
-    // actually post on (slice->source_dev_id) and reflects the slice's real
-    // length. This keeps DeviceSelector's per-NIC inflight view both symmetric
-    // with releaseSliceQuota and an accurate load signal, across three paths
-    // that would otherwise skew local telemetry:
-    //   - initial allocate: the aggregated allocator charges a per-slice
-    //     estimate (ceil(total/num_slices)); convert it to the exact length so
-    //     inflight equals the bytes really put on the wire.
-    //   - fallback re-route: the charge was made on the originally selected NIC
-    //     but the slice now posts on a different one -> migrate the charge.
-    //   - retry: the previous attempt released the quota, so re-enter the
-    //     inflight view instead of running uncounted.
-    if (!selector || slice->source_dev_id < 0) return;
-    if (slice->quota_charged && slice->charged_dev_id == slice->source_dev_id &&
-        slice->charged_bytes == slice->length)
-        return;  // already charged exactly this slice's length on the right NIC
-    if (slice->quota_charged) {
-        // Stale device and/or estimate -> unwind exactly what was charged
-        // first. Order is deliberate: releasing before charging makes inflight
-        // dip slightly below reality for the instant between the two calls,
-        // whereas charging first would transiently double-count during a
-        // fallback migration. inflight is only a scoring signal (not an
-        // admission gate), so a momentary dip merely perturbs one selection,
-        // while a double-count would over-penalize the NIC -- the dip is the
-        // lesser, intended bias.
-        selector->release(slice->charged_dev_id, slice->charged_bytes, 0.0);
-        slice->quota_charged = false;
-        slice->charged_dev_id = -1;
-        slice->charged_bytes = 0;
+Workers::WorkerContext* Workers::ownerContext(const RdmaSlice* slice) {
+    if (!worker_context_ || !slice) return nullptr;
+    const int lane = slice->owner_worker.load(std::memory_order_relaxed);
+    if (lane < 0 || lane >= (int)num_workers_) return nullptr;
+    return &worker_context_[lane];
+}
+
+int Workers::laneIndex(const WorkerContext& worker) const {
+    if (!worker_context_) return -1;
+    return static_cast<int>(&worker - worker_context_);
+}
+
+bool Workers::routeSetRemoval(WorkerContext& self, RdmaSlice* slice) {
+    // Two sets can hold an entry for one slice: a retry re-queued by another
+    // lane moves ownership while the lane it left still holds the old
+    // entry. So this lane takes out whatever it holds itself, and the
+    // owning lane, if it is somebody else, is handed the slice regardless --
+    // a hand-over for an entry it does not hold costs one erase of nothing.
+    const bool mine = self.inflight_slice_set.count(slice) > 0;
+    auto* owner = ownerContext(slice);
+    if (owner && owner != &self) {
+        std::lock_guard<std::mutex> lock(owner->reclaim_mutex);
+        owner->reclaimed.push_back(slice);
     }
-    // Charge this slice's real length on the routing NIC. Only commit the
-    // bookkeeping if the charge actually succeeded, so a failed charge is never
-    // released later (which would underflow the counter).
-    Status status = selector->chargeDevice(slice->source_dev_id, slice->length);
-    if (status.ok()) {
-        slice->charged_dev_id = slice->source_dev_id;
-        slice->charged_bytes = slice->length;
-        slice->quota_charged = true;
-    } else {
-        // The routing NIC is not tracked by DeviceSelector (a topology/quota
-        // mismatch, e.g. a device that never entered devices_). The data
-        // transfer can still proceed, so we do not fail the slice, but the
-        // slice runs without inflight accounting -- surface it (rate-limited on
-        // the hot path) instead of silently under-counting the device's load.
-        LOG_EVERY_N(WARNING, 100)
-            << "chargeSliceQuota: source_dev_id " << slice->source_dev_id
-            << " is not tracked by DeviceSelector; slice " << slice
-            << " proceeds without inflight accounting: " << status.ToString();
+    return mine || !owner || owner == &self;
+}
+
+void Workers::retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
+                               uint64_t now_ns,
+                               std::vector<RdmaSlice*>* deferred,
+                               bool bytes_moved) {
+    if (!slice) return;
+    const int posted_dev = slice->posted_dev.load(std::memory_order_relaxed);
+    releaseSliceQuota(slice, now_ns);
+    // A slice swept off with FAILED or TIMEOUT leaves the hardware without
+    // its bytes being counted, so the stretch it was part of cannot be
+    // divided into the next sample. One swept with COMPLETED did move them;
+    // its own completion, still to be polled, credits them.
+    if (posted_dev >= 0 && !bytes_moved && device_selector_)
+        device_selector_->resetTransmitMeter(posted_dev);
+    discountFromOwner(self, slice);
+    if (!routeSetRemoval(self, slice)) return;
+    if (deferred)
+        deferred->push_back(slice);
+    else
+        self.inflight_slice_set.erase(slice);
+}
+
+void Workers::discountFromOwner(WorkerContext& self, RdmaSlice* slice) {
+    if (!slice) return;
+    // Several paths can reach one slice -- its own completion, another
+    // lane's sweep of a shared queue pair, this lane's timeout pass -- and
+    // only the first of them takes it out of the count: the field says
+    // which lane's, and comes back -1 for everyone after.
+    const int lane =
+        slice->counted_lane.exchange(-1, std::memory_order_acq_rel);
+    if (lane < 0) return;
+    const bool known = worker_context_ && lane < (int)num_workers_;
+    (known ? worker_context_[lane] : self).inflight_slices.fetch_sub(1);
+}
+
+void Workers::drainReclaimed(WorkerContext& worker) {
+    std::vector<RdmaSlice*> taken;
+    {
+        std::lock_guard<std::mutex> lock(worker.reclaim_mutex);
+        if (worker.reclaimed.empty()) return;
+        taken.swap(worker.reclaimed);
     }
+    for (auto* slice : taken) worker.inflight_slice_set.erase(slice);
+}
+
+void Workers::notePostedSlice(RdmaSlice* slice) {
+    if (!slice || !device_selector_) return;
+    int none = -1;
+    if (slice->posted_dev.compare_exchange_strong(none, slice->source_dev_id,
+                                                  std::memory_order_acq_rel))
+        device_selector_->notePosted(slice->source_dev_id, slice->length,
+                                     slice->submit_ts);
+}
+
+void Workers::markPosted(WorkerContext& worker, RdmaSlice* slice,
+                         uint64_t post_ts) {
+    slice->submit_ts = post_ts;
+    notePostedSlice(slice);
+    worker.inflight_slice_set.insert(slice);
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
@@ -532,7 +667,7 @@ void Workers::asyncPostSend() {
         if (slice_list.num_slices == 0) continue;
         auto slice = slice_list.first;
         for (int id = 0; id < slice_list.num_slices; ++id) {
-            if (cancelUnpostedSlice(worker, slice)) {
+            if (dropUnpostableSlice(worker, slice)) {
                 slice = slice->next;
                 continue;
             }
@@ -540,13 +675,13 @@ void Workers::asyncPostSend() {
             if (!status.ok()) {
                 LOG(ERROR) << "Failed to generate post path for slice " << slice
                            << ": " << status.ToString();
-                releaseSliceQuota(device_selector_.get(), slice);
+                releaseSliceQuota(slice, getCurrentTimeInNano());
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
                                              ? CANCELED
                                              : FAILED);
-                worker.inflight_slices.fetch_sub(1);
-            } else if (cancelUnpostedSlice(worker, slice)) {
+                discountFromOwner(worker, slice);
+            } else if (dropUnpostableSlice(worker, slice)) {
                 slice = slice->next;
                 continue;
             } else {
@@ -566,7 +701,7 @@ void Workers::asyncPostSend() {
         if (slices.empty()) continue;
         slices.erase(std::remove_if(slices.begin(), slices.end(),
                                     [&](RdmaSlice* slice) {
-                                        return cancelUnpostedSlice(worker,
+                                        return dropUnpostableSlice(worker,
                                                                    slice);
                                     }),
                      slices.end());
@@ -576,20 +711,20 @@ void Workers::asyncPostSend() {
             std::vector<RdmaSlice*> clone;
             slices.swap(clone);
             for (auto slice : clone) {
-                if (cancelUnpostedSlice(worker, slice)) continue;
+                if (dropUnpostableSlice(worker, slice)) continue;
                 slice->retry_count++;
+                releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
                     LOG(WARNING)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
-                    releaseSliceQuota(device_selector_.get(), slice);
                     updateSliceStatus(slice, FAILED);
+                    discountFromOwner(worker, slice);
                 } else {
-                    releaseSliceQuota(device_selector_.get(), slice);
+                    // The re-submit moves the count to the lane it lands on.
                     submitFromTick(worker, slice);
                 }
-                worker.inflight_slices.fetch_sub(1);
             }
             continue;
         }
@@ -601,66 +736,42 @@ void Workers::asyncPostSend() {
         // its deadline claims the shared NIC's QP slots ahead of looser flows.
         // Default (deadline_bw_arbitration_ == false) leaves order untouched,
         // so behavior is byte-identical to today's FIFO / equal split.
-        if (deadline_bw_arbitration_ && slices.size() > 1) {
-            const uint64_t now_ns = getCurrentTimeInNano();
-            const double bw_bps = device_selector_
-                                      ? device_selector_->getSchedulingParams()
-                                                .default_bandwidth_gbps *
-                                            1e9 / 8.0
-                                      : 0.0;
-            if (bw_bps > 0.0) {
-                thread_local std::vector<ArbitrationEntry> scratch;
-                scratch.clear();
-                scratch.reserve(slices.size());
-
-                for (size_t i = 0; i < slices.size(); ++i) {
-                    const RdmaSlice* s = slices[i];
-                    ArbFlow flow{0, 0};
-                    if (s && s->task) {
-                        flow = ArbFlow{s->task->request.deadline_ns, s->length};
-                    }
-                    scratch.push_back(ArbitrationEntry{
-                        slices[i], PredictedMlu(flow, now_ns, bw_bps), i});
-                }
-
-                std::sort(
-                    scratch.begin(), scratch.end(),
-                    [](const ArbitrationEntry& a, const ArbitrationEntry& b) {
-                        if (a.mlu > b.mlu) return true;
-                        if (a.mlu < b.mlu) return false;
-                        return a.order < b.order;
-                    });
-                for (size_t i = 0; i < scratch.size(); ++i) {
-                    slices[i] = scratch[i].slice;
-                }
-            }
+        if (deadline_bw_arbitration_) {
+            orderByDeadline(slices, path.local_device_id,
+                            getCurrentTimeInNano());
         }
 
-        int num_submitted = endpoint->submitSlices(slices, tl_wid);
+        // Everything a completion's poller must find is written before the
+        // work request can reach the wire: with a shared queue pair another
+        // lane may poll the completion before submitSlices returns, and a
+        // poller that finds no posted device on the slice would leave the
+        // device's backlog holding these bytes for good.
+        const uint64_t post_ts = getCurrentTimeInNano();
+        int num_submitted = endpoint->submitSlices(
+            slices, tl_wid,
+            [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
-            if (slice->failed) {
-                releaseSliceQuota(device_selector_.get(), slice);
-                if (slice->task->cancel_requested.load(
-                        std::memory_order_acquire)) {
-                    updateSliceStatus(slice, CANCELED);
-                    worker.inflight_slices.fetch_sub(1);
-                    continue;
-                }
-                slice->retry_count++;
-                if (slice->retry_count >=
-                    transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
-                    disableEndpoint(slice);
-                    updateSliceStatus(slice, FAILED);
-                } else {
-                    submitFromTick(worker, slice);
-                }
-                worker.inflight_slices.fetch_sub(1);
+            if (!slice->failed) continue;
+            // Rejected by the hardware: it never went on the wire, so take
+            // back what the hook put in place.
+            worker.inflight_slice_set.erase(slice);
+            releaseSliceQuota(slice, post_ts);
+            if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
+                updateSliceStatus(slice, CANCELED);
+                discountFromOwner(worker, slice);
+                continue;
+            }
+            slice->retry_count++;
+            if (slice->retry_count >=
+                transport_->params_->workers.max_retry_count) {
+                LOG(WARNING)
+                    << "Slice " << slice << " failed: retry count exceeded";
+                disableEndpoint(slice);
+                updateSliceStatus(slice, FAILED);
+                discountFromOwner(worker, slice);
             } else {
-                slice->submit_ts = getCurrentTimeInNano();
-                worker.inflight_slice_set.insert(slice);
+                submitFromTick(worker, slice);
             }
         }
 
@@ -734,38 +845,227 @@ void Workers::promoteTimedOutRequests(WorkerContext& worker) {
     promote_level(PRIO_LOW, PRIO_MEDIUM);
 }
 
+void Workers::expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns) {
+    drainReclaimed(worker);
+    std::vector<RdmaSlice*> slice_to_remove;
+    // Erasing from this lane's set has to wait until the loop below is done
+    // with it; slices belonging to another lane are handed over instead.
+    // One captured reference keeps the std::function inside its small-buffer
+    // storage, so a sweep does not allocate.
+    struct Sweep {
+        Workers* self;
+        WorkerContext* worker;
+        uint64_t now_ns;
+        std::vector<RdmaSlice*>* deferred;
+    } sweep{this, &worker, now_ns, &slice_to_remove};
+    auto retire = [&sweep](RdmaSlice* swept) {
+        sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                     sweep.deferred);
+    };
+    for (auto& slice : worker.inflight_slice_set) {
+        if (slice->word != PENDING) {
+            // Terminal but still counted here: an endpoint teardown cancels
+            // whatever is queued on it without going through a sweep, so
+            // nothing has given this lane its slice back. Do it now, or the
+            // charge, the NIC's posted bytes and this lane's count carry it
+            // for the life of the process.
+            retire(slice);
+            continue;
+        }
+        if (now_ns - slice->enqueue_ts > slice_timeout_ns_) {
+            auto ep = slice->ep_weak_ptr.lock();
+            LOG(WARNING) << "Slice " << slice
+                         << " failed: transfer timeout (software)";
+            // The slice turns terminal here, not on the CQ. Its flush
+            // completion may never be polled (acknowledge() zeroes wr_depth,
+            // so the endpoint destroys the QP and its unpolled CQEs), so
+            // return the selector charge now for it and every slice swept
+            // with it; releaseSliceQuota() is idempotent.
+            if (!ep) {
+                retire(slice);
+                updateSliceStatus(slice, TIMEOUT);
+                continue;
+            }
+            auto num_slices = ep->acknowledge(slice, TIMEOUT, retire);
+            disableEndpoint(slice);
+            if (num_slices == 0) {
+                // A neighbour's retry already popped it off the queue pair
+                // and discounted it there, so only its charge and its set
+                // entry are still outstanding.
+                releaseSliceQuota(slice, now_ns);
+                if (routeSetRemoval(worker, slice))
+                    slice_to_remove.push_back(slice);
+                updateSliceStatus(slice, TIMEOUT);
+            }
+        }
+    }
+    for (auto& slice : slice_to_remove) worker.inflight_slice_set.erase(slice);
+}
+
+void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
+                               const ibv_wc& wc, uint64_t poll_ts,
+                               bool last_in_pass) {
+    auto slice = (RdmaSlice*)wc.wr_id;
+    // What the acknowledge callbacks below need, behind one reference so
+    // the std::function stays in its small-buffer storage (no allocation
+    // per completion).
+    struct Sweep {
+        Workers* self;
+        WorkerContext* worker;
+        uint64_t now_ns;
+    } sweep{this, &worker, poll_ts};
+    // The lane that enqueued this slice owns its set entry; with a
+    // shared queue pair that is not necessarily this one.
+    if (routeSetRemoval(worker, slice)) worker.inflight_slice_set.erase(slice);
+    auto ep = slice->ep_weak_ptr.lock();
+    double enqueue_lat = (slice->submit_ts - slice->enqueue_ts) / 1000.0;
+    double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
+    // The selection EWMA learns only from a successful transfer, and only
+    // from this attempt's own post->completion time (#3511): the time since
+    // first enqueue folds in queueing and earlier failed attempts on other
+    // NICs. A failed or flushed work request, or a slice another path has
+    // already resolved, contributes no sample and only returns its charge.
+    const bool ewma_sample =
+        ep && slice->word == PENDING && wc.status == IBV_WC_SUCCESS;
+    const double sample_lat_sec =
+        ewma_sample ? (poll_ts - slice->submit_ts) / 1e9 : 0.0;
+    const int dev_id = slice->source_dev_id;
+    const uint64_t moved = slice->length;
+    releaseSliceQuota(slice, poll_ts, sample_lat_sec);
+    // The transmit estimate is metered from bytes completed over the time
+    // the NIC spent busy, so it needs the release above to have taken this
+    // slice out of the backlog first -- that is what closes the stretch.
+    // Only successful bytes moved on the wire.
+    if (device_selector_) {
+        if (wc.status == IBV_WC_SUCCESS) {
+            device_selector_->noteCompleted(dev_id, moved);
+            // Only once the whole poll pass has been counted. Every work
+            // request it reaps carries the same timestamp, so a sample taken
+            // partway through would end its interval at that timestamp while
+            // leaving the rest of the pass's bytes to the next one -- which
+            // then gets them for free. The estimate is an average of
+            // per-interval rates, so the short interval that is paid twice
+            // and the long one that is paid once do not cancel: at 2 GB/s
+            // with sixteen-deep polling that read 8% high.
+            if (last_in_pass)
+                device_selector_->maybeSampleTransmit(dev_id, poll_ts);
+        } else {
+            // The bytes of a failed or flushed work request never moved, but
+            // the stretch the NIC held it for did. Start over here rather
+            // than divide that time into whatever completes next.
+            device_selector_->resetTransmitMeter(dev_id);
+        }
+    }
+    if (slice->word != PENDING) {
+        // Resolved before its completion was polled -- swept off the queue
+        // pair by a neighbour, timed out, or cancelled by a teardown. The
+        // charge came back above; the lane count is settled here in case
+        // that path could not (idempotent, so a path that did is unharmed).
+        discountFromOwner(worker, slice);
+        return;
+    }
+    if (!ep) {
+        updateSliceStatus(slice, FAILED);
+        discountFromOwner(worker, slice);
+        return;
+    }
+    if (wc.status != IBV_WC_SUCCESS) {
+        if (wc.status != IBV_WC_WR_FLUSH_ERR) {
+            // TE handles them automatically
+            LOG(INFO) << "Detected error WQE for slice " << slice
+                      << " (opcode: " << slice->task->request.opcode
+                      << ", source_addr: " << (void*)slice->source_addr
+                      << ", dest_addr: " << (void*)slice->target_addr
+                      << ", length: " << slice->length
+                      << ", local_nic: " << context.name()
+                      << "): " << ibv_wc_status_str(wc.status);
+        }
+        // GPUDirect reachability learning: a protection/access error
+        // on a GPU buffer means the chosen NIC cannot P2P-DMA to that
+        // GPU (ibv_reg_mr succeeded but the PCIe path is unusable).
+        // Record it so selection avoids that NIC and converges onto a
+        // reachable rail instead of exhausting retries. The local side
+        // (source NIC -> source GPU) surfaces as LOC_PROT; the remote
+        // side (target NIC -> target GPU) as REM_ACCESS or, for a
+        // remote GDR-read failure, REM_OP (observed on strict fabrics).
+        bool local_gdr_err = (wc.status == IBV_WC_LOC_PROT_ERR);
+        bool remote_gdr_err = (wc.status == IBV_WC_REM_ACCESS_ERR ||
+                               wc.status == IBV_WC_REM_OP_ERR);
+        if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
+            slice->source_nic_name) {
+            GdrReachability::instance().reportLocalFailure(
+                slice->source_nic_name, slice->source_gpu_ordinal);
+        } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
+                   slice->target_nic_name && slice->target_machine_id) {
+            GdrReachability::instance().reportRemoteFailure(
+                *slice->target_machine_id, slice->target_nic_name,
+                slice->target_gpu_ordinal);
+        }
+        slice->retry_count++;
+        if (slice->retry_count >=
+            transport_->params_->workers.max_retry_count) {
+            LOG(WARNING) << "Slice " << slice
+                         << " failed: retry count exceeded";
+            ep->acknowledge(slice, FAILED, [&sweep](RdmaSlice* swept) {
+                sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                             nullptr);
+            });
+            disableEndpoint(slice);
+        } else {
+            // Popped but still in flight: their work requests are
+            // live and their completions are still coming, so only
+            // the owning lane's count stops tracking them here.
+            ep->acknowledge(slice, PENDING, [&](RdmaSlice* swept) {
+                discountFromOwner(worker, swept);
+            });
+            disableEndpoint(slice);
+            if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
+                updateSliceStatus(slice, CANCELED);
+            } else {
+                submitFromTick(worker, slice);
+            }
+        }
+    } else {
+        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
+            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                         nullptr, /*bytes_moved=*/true);
+        });
+        // A successful GPU transfer re-admits any learned GDR
+        // unreachability for the (GPU, NIC) pair(s) it used, so a
+        // transient exclusion (or a recovered path) heals. Skipped
+        // entirely until something has actually been excluded.
+        if (GdrReachability::hasAnyExclusion()) {
+            auto& gdr = GdrReachability::instance();
+            if (slice->source_gpu_ordinal >= 0 && slice->source_nic_name)
+                gdr.reportLocalSuccess(slice->source_nic_name,
+                                       slice->source_gpu_ordinal);
+            if (slice->target_gpu_ordinal >= 0 && slice->target_nic_name &&
+                slice->target_machine_id)
+                gdr.reportRemoteSuccess(*slice->target_machine_id,
+                                        slice->target_nic_name,
+                                        slice->target_gpu_ordinal);
+        }
+        // A successful transfer proves this rail is healthy; clear
+        // any accumulated error count so a previously-cooled-down
+        // rail can be used again without waiting for the full
+        // cooldown to expire. The monitor pointer is resolved once
+        // in generatePostPath, so no map lookup is needed here.
+        if (auto* rail = slice->rail_monitor; rail && rail->ready())
+            rail->markRecovered(slice->source_dev_id, slice->target_dev_id);
+        if (transport_->params_->workers.show_latency_info) {
+            worker.perf.inflight_lat.add(inflight_lat);
+            worker.perf.enqueue_lat.add(enqueue_lat);
+        }
+    }
+}
+
 void Workers::asyncPollCq() {
     auto& worker = worker_context_[tl_wid];
     const static size_t kPollCount = 64;
     int num_contexts = (int)transport_->context_set_.size();
     int num_cq_list = transport_->params_->device.num_cq_list;
-    int num_slices = 0;
 
-    uint64_t current_ts = getCurrentTimeInNano();
-    std::vector<RdmaSlice*> slice_to_remove;
-    for (auto& slice : worker.inflight_slice_set) {
-        if (slice->word != PENDING) continue;
-        if (current_ts - slice->enqueue_ts > slice_timeout_ns_) {
-            auto ep = slice->ep_weak_ptr.lock();
-            LOG(WARNING) << "Slice " << slice
-                         << " failed: transfer timeout (software)";
-            // A software timeout is terminal (no retry), so release the
-            // inflight charge here or it leaks on charged_dev_id forever. No
-            // latency sample: a timeout is not a valid bandwidth observation.
-            releaseSliceQuota(device_selector_.get(), slice);
-            if (!ep) {
-                updateSliceStatus(slice, TIMEOUT);
-                slice_to_remove.push_back(slice);
-                worker.inflight_slices.fetch_sub(1);
-                continue;
-            }
-            auto num_slices = ep->acknowledge(slice, TIMEOUT);
-            disableEndpoint(slice);
-            worker.inflight_slices.fetch_sub(num_slices);
-            slice_to_remove.push_back(slice);
-        }
-    }
-    for (auto& slice : slice_to_remove) worker.inflight_slice_set.erase(slice);
+    expireTimedOutSlices(worker, getCurrentTimeInNano());
 
     for (int index = 0; index < num_contexts; index++) {
         auto& context = transport_->context_set_[index];
@@ -775,115 +1075,9 @@ void Workers::asyncPollCq() {
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) continue;
         auto poll_ts = getCurrentTimeInNano();
-        for (int i = 0; i < nr_poll; ++i) {
-            auto slice = (RdmaSlice*)wc[i].wr_id;
-            worker.inflight_slice_set.erase(slice);
-            auto ep = slice->ep_weak_ptr.lock();
-            double enqueue_lat =
-                (slice->submit_ts - slice->enqueue_ts) / 1000.0;
-            double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
-            // EWMA bandwidth must learn only from successful transfers, and
-            // only from the current NIC attempt's inflight time -- not the
-            // cumulative time since first enqueue, which folds in queueing
-            // delay and prior failed attempts on other NICs and would bias the
-            // estimate low. A failed/flushed WC or an already-resolved slice
-            // contributes no sample (latency 0), so releaseSliceQuota only
-            // frees the charge.
-            bool ewma_sample =
-                ep && slice->word == PENDING && wc[i].status == IBV_WC_SUCCESS;
-            double sample_lat_sec =
-                ewma_sample ? (poll_ts - slice->submit_ts) / 1e9 : 0.0;
-            releaseSliceQuota(device_selector_.get(), slice, sample_lat_sec);
-            if (slice->word != PENDING) continue;
-            if (!ep) {
-                updateSliceStatus(slice, FAILED);
-                num_slices++;
-                continue;
-            }
-            if (wc[i].status != IBV_WC_SUCCESS) {
-                if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
-                    // TE handles them automatically
-                    LOG(INFO) << "Detected error WQE for slice " << slice
-                              << " (opcode: " << slice->task->request.opcode
-                              << ", source_addr: " << (void*)slice->source_addr
-                              << ", dest_addr: " << (void*)slice->target_addr
-                              << ", length: " << slice->length
-                              << ", local_nic: " << context->name()
-                              << "): " << ibv_wc_status_str(wc[i].status);
-                }
-                // GPUDirect reachability learning: a protection/access error
-                // on a GPU buffer means the chosen NIC cannot P2P-DMA to that
-                // GPU (ibv_reg_mr succeeded but the PCIe path is unusable).
-                // Record it so selection avoids that NIC and converges onto a
-                // reachable rail instead of exhausting retries. The local side
-                // (source NIC -> source GPU) surfaces as LOC_PROT; the remote
-                // side (target NIC -> target GPU) as REM_ACCESS or, for a
-                // remote GDR-read failure, REM_OP (observed on strict fabrics).
-                bool local_gdr_err = (wc[i].status == IBV_WC_LOC_PROT_ERR);
-                bool remote_gdr_err = (wc[i].status == IBV_WC_REM_ACCESS_ERR ||
-                                       wc[i].status == IBV_WC_REM_OP_ERR);
-                if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
-                    slice->source_nic_name) {
-                    GdrReachability::instance().reportLocalFailure(
-                        slice->source_nic_name, slice->source_gpu_ordinal);
-                } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
-                           slice->target_nic_name && slice->target_machine_id) {
-                    GdrReachability::instance().reportRemoteFailure(
-                        *slice->target_machine_id, slice->target_nic_name,
-                        slice->target_gpu_ordinal);
-                }
-                slice->retry_count++;
-                if (slice->retry_count >=
-                    transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
-                    num_slices += ep->acknowledge(slice, FAILED);
-                    disableEndpoint(slice);
-                } else {
-                    num_slices += ep->acknowledge(slice, PENDING);
-                    disableEndpoint(slice);
-                    if (slice->task->cancel_requested.load(
-                            std::memory_order_acquire)) {
-                        updateSliceStatus(slice, CANCELED);
-                    } else {
-                        submitFromTick(worker, slice);
-                    }
-                }
-            } else {
-                num_slices += ep->acknowledge(slice, COMPLETED);
-                // A successful GPU transfer re-admits any learned GDR
-                // unreachability for the (GPU, NIC) pair(s) it used, so a
-                // transient exclusion (or a recovered path) heals. Skipped
-                // entirely until something has actually been excluded.
-                if (GdrReachability::hasAnyExclusion()) {
-                    auto& gdr = GdrReachability::instance();
-                    if (slice->source_gpu_ordinal >= 0 &&
-                        slice->source_nic_name)
-                        gdr.reportLocalSuccess(slice->source_nic_name,
-                                               slice->source_gpu_ordinal);
-                    if (slice->target_gpu_ordinal >= 0 &&
-                        slice->target_nic_name && slice->target_machine_id)
-                        gdr.reportRemoteSuccess(*slice->target_machine_id,
-                                                slice->target_nic_name,
-                                                slice->target_gpu_ordinal);
-                }
-                // A successful transfer proves this rail is healthy; clear
-                // any accumulated error count so a previously-cooled-down
-                // rail can be used again without waiting for the full
-                // cooldown to expire. The monitor pointer is resolved once
-                // in generatePostPath, so no map lookup is needed here.
-                if (auto* rail = slice->rail_monitor; rail && rail->ready())
-                    rail->markRecovered(slice->source_dev_id,
-                                        slice->target_dev_id);
-                if (transport_->params_->workers.show_latency_info) {
-                    worker.perf.inflight_lat.add(inflight_lat);
-                    worker.perf.enqueue_lat.add(enqueue_lat);
-                }
-            }
-        }
-    }
-    if (num_slices) {
-        worker.inflight_slices.fetch_sub(num_slices);
+        for (int i = 0; i < nr_poll; ++i)
+            handleCompletion(worker, *context, wc[i], poll_ts,
+                             i + 1 == nr_poll);
     }
 }
 
@@ -1183,11 +1377,7 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         CHECK_STATUS(device_selector_->allocate(
             slice->length, source.buffer->location, slice->source_dev_id,
             slice->priority, slice->task->device_mask));
-        slice->quota_charged = true;
-        slice->charged_dev_id = slice->source_dev_id;
-        // Single-slice allocate charges exactly slice->length on the chosen
-        // device.
-        slice->charged_bytes = slice->length;
+        slice->charged_dev = slice->source_dev_id;
     }
 
     if (slice->source_dev_id < 0)
@@ -1380,6 +1570,11 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
             reachable = false;
 
         if (reachable) {
+            // A retry gets here after the failure path returned the slice's
+            // charge, so charge the device this attempt will actually use:
+            // otherwise the NIC's inflight bytes miss it and its completion
+            // teaches neither bandwidth estimate.
+            rechargeSlice(slice, sdev);
             slice->source_dev_id = sdev;
             slice->target_dev_id = tdev;
             // Keys are assigned by generatePostPath() once the device pair is
@@ -1418,10 +1613,6 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
-    // The routing NIC is now final for this (re)submit. Reconcile the inflight
-    // charge onto it so a fallback re-route or a retry does not leave the
-    // original NIC charged (residue) or run uncounted.
-    chargeSliceQuota(device_selector_.get(), slice);
     // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
     // update rail state without a segment lookup or string-keyed map
     // lookup on the hot path.

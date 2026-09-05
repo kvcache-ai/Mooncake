@@ -35,8 +35,9 @@ Status DeviceSelector::loadTopology(std::shared_ptr<Topology>& local_topology) {
         info.dev_id = dev_id;
         info.bw_gbps.store(0.0, std::memory_order_relaxed);  // unknown
         info.numa_id = entry->numa_node;
-        info.ewma_bandwidth_bps.store(theoreticalBandwidth(info),
-                                      std::memory_order_relaxed);
+        const double seed = theoreticalBandwidth(info);
+        info.ewma_bandwidth_bps.store(seed, std::memory_order_relaxed);
+        info.ewma_transmit_bps.store(seed, std::memory_order_relaxed);
     }
     // Initialize device base priorities after all devices are loaded
     fillDevicePriorities();
@@ -64,10 +65,11 @@ Status DeviceSelector::setDeviceBandwidth(int dev_id, double gbps) {
                      << ", assuming " << p.default_bandwidth_gbps << " Gbps";
     }
     dev.bw_gbps.store(gbps, std::memory_order_relaxed);
-    // A worker completing between these two stores clamps the old EWMA
-    // against the new rate once; the seed below overwrites it.
-    dev.ewma_bandwidth_bps.store(theoreticalBandwidth(dev),
-                                 std::memory_order_relaxed);
+    // A worker completing between these stores clamps the old EWMA against
+    // the new rate once; the seeds below overwrite it.
+    const double seed = theoreticalBandwidth(dev);
+    dev.ewma_bandwidth_bps.store(seed, std::memory_order_relaxed);
+    dev.ewma_transmit_bps.store(seed, std::memory_order_relaxed);
     return Status::OK();
 }
 
@@ -96,14 +98,9 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                 uint64_t slice_bytes,
                                 const std::string& location,
                                 std::vector<int>& slice_dev_ids, int priority,
-                                uint64_t device_mask,
-                                std::vector<uint64_t>* slice_charged_bytes) {
+                                uint64_t device_mask) {
     slice_dev_ids.clear();
     slice_dev_ids.reserve(num_slices);
-    if (slice_charged_bytes) {
-        slice_charged_bytes->clear();
-        slice_charged_bytes->reserve(num_slices);
-    }
     auto entry = local_topology_->getMemEntry(location);
     if (!entry) return Status::InvalidArgument("Unknown location" LOC_MARK);
 
@@ -148,10 +145,10 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                 uint64_t this_slice_bytes =
                     std::min(slice_bytes, total_length - offset);
                 offset += this_slice_bytes;
+                // Baseline mode does not track inflight (release() and
+                // chargeDevice() skip it too); only lifetime traffic counts.
                 devices_[dev_id].total_bytes.fetch_add(
                     this_slice_bytes, std::memory_order_relaxed);
-                // Baseline mode does not track inflight, so nothing is charged.
-                if (slice_charged_bytes) slice_charged_bytes->push_back(0);
             }
             return Status::OK();
         }
@@ -163,15 +160,15 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                                     tl_candidates, priority);
     if (!status.ok()) return status;
     if (num_slices == 1) {
-        selectSinglePath(tl_candidates, num_slices, total_length, slice_dev_ids,
-                         slice_charged_bytes);
+        selectSinglePath(tl_candidates, num_slices, total_length,
+                         slice_dev_ids);
     } else {
         // Probe mode: every 100th call uses round-robin distribution
         // to ensure all devices are sampled for EWMA updates
         thread_local uint64_t tl_call_count = 0;
         bool probe_mode = ((++tl_call_count % 100) == 0);
-        selectMultiPath(tl_candidates, num_slices, total_length, slice_dev_ids,
-                        probe_mode, slice_charged_bytes);
+        selectMultiPath(tl_candidates, num_slices, total_length, slice_bytes,
+                        slice_dev_ids, probe_mode);
     }
     return Status::OK();
 }
@@ -290,10 +287,10 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
     return Status::OK();
 }
 
-void DeviceSelector::selectSinglePath(
-    const std::vector<Candidate>& candidates, uint32_t num_slices,
-    uint64_t total_length, std::vector<int>& slice_dev_ids,
-    std::vector<uint64_t>* slice_charged_bytes) {
+void DeviceSelector::selectSinglePath(const std::vector<Candidate>& candidates,
+                                      uint32_t num_slices,
+                                      uint64_t total_length,
+                                      std::vector<int>& slice_dev_ids) {
     if (candidates.empty()) return;
 
     const Candidate& best = candidates[0];
@@ -303,33 +300,24 @@ void DeviceSelector::selectSinglePath(
     dev.addInflight(total_length);
     dev.total_bytes.fetch_add(total_length, std::memory_order_relaxed);
 
-    // Single path is only used for num_slices == 1, so the whole request's
-    // inflight charge belongs to that one slice.
     for (uint32_t i = 0; i < num_slices; ++i) {
         slice_dev_ids.push_back(dev_id);
-        if (slice_charged_bytes) slice_charged_bytes->push_back(total_length);
     }
 }
 
-void DeviceSelector::selectMultiPath(
-    const std::vector<Candidate>& candidates, uint32_t num_slices,
-    uint64_t total_length, std::vector<int>& slice_dev_ids, bool probe_mode,
-    std::vector<uint64_t>* slice_charged_bytes) {
+void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
+                                     uint32_t num_slices, uint64_t total_length,
+                                     uint64_t slice_bytes,
+                                     std::vector<int>& slice_dev_ids,
+                                     bool probe_mode) {
     if (candidates.empty()) return;
-    uint64_t slice_bytes = (total_length + num_slices - 1) / num_slices;
-    // Each slice is charged `slice_bytes` of inflight, so record that per slice
-    // for a precise release later.
+    const size_t first = slice_dev_ids.size();
     if (probe_mode) {
         // Probe mode: round-robin distribution to ensure all devices are
         // sampled Activates every 100th call to prevent EWMA starvation
         for (uint32_t i = 0; i < num_slices; ++i) {
             const Candidate& c = candidates[i % candidates.size()];
             slice_dev_ids.push_back(c.dev_id);
-            if (slice_charged_bytes)
-                slice_charged_bytes->push_back(slice_bytes);
-            devices_[c.dev_id].addInflight(slice_bytes);
-            devices_[c.dev_id].total_bytes.fetch_add(slice_bytes,
-                                                     std::memory_order_relaxed);
         }
     } else {
         // Normal mode: weighted distribution based on inverse score
@@ -360,29 +348,26 @@ void DeviceSelector::selectMultiPath(
                 const Candidate& c = candidates[i];
                 for (uint32_t s = 0; s < assigned; ++s) {
                     slice_dev_ids.push_back(c.dev_id);
-                    if (slice_charged_bytes)
-                        slice_charged_bytes->push_back(slice_bytes);
                 }
-                uint64_t total_assigned_bytes =
-                    static_cast<uint64_t>(slice_bytes) * assigned;
-                devices_[c.dev_id].addInflight(total_assigned_bytes);
-                devices_[c.dev_id].total_bytes.fetch_add(
-                    total_assigned_bytes, std::memory_order_relaxed);
             }
         }
         if (remaining_slices > 0) {
             const Candidate& c = candidates[best_dev_idx];
             for (uint32_t s = 0; s < remaining_slices; ++s) {
                 slice_dev_ids.push_back(c.dev_id);
-                if (slice_charged_bytes)
-                    slice_charged_bytes->push_back(slice_bytes);
             }
-            uint64_t total_assigned_bytes =
-                static_cast<uint64_t>(slice_bytes) * remaining_slices;
-            devices_[c.dev_id].addInflight(total_assigned_bytes);
-            devices_[c.dev_id].total_bytes.fetch_add(total_assigned_bytes,
-                                                     std::memory_order_relaxed);
         }
+    }
+    // Charge each device what its slices actually carry, in the caller's
+    // slice order, so release() (which returns the slice's length) balances
+    // per device; ceil(total / n) per slice would not.
+    uint64_t offset = 0;
+    for (size_t i = first; i < slice_dev_ids.size(); ++i) {
+        const uint64_t bytes = std::min(slice_bytes, total_length - offset);
+        offset += bytes;
+        auto& dev = devices_[slice_dev_ids[i]];
+        dev.addInflight(bytes);
+        dev.total_bytes.fetch_add(bytes, std::memory_order_relaxed);
     }
 }
 
@@ -406,17 +391,139 @@ Status DeviceSelector::allocate(uint64_t length, const std::string& location,
 }
 
 Status DeviceSelector::chargeDevice(int dev_id, uint64_t length) {
-    // Baseline mode does not track inflight, so a charge here would never be
-    // matched by a release -- skip it to keep the inflight counter consistent.
-    if (!smart_selection_enabled_) return Status::OK();
     auto it = devices_.find(dev_id);
     if (it == devices_.end())
         return Status::InvalidArgument("device not found");
-    // Only inflight is (re)charged here. total_bytes is cumulative traffic and
-    // is already counted once at allocation time; re-adding it on a fallback
-    // re-route or retry would double-count.
-    it->second.addInflight(length);
+    // Inflight is only tracked in smart mode; see allocate() and release().
+    if (smart_selection_enabled_) it->second.addInflight(length);
+    // Each attempt is bytes this NIC is asked to move, so a retry -- or a
+    // first attempt that fell back to another NIC -- counts again here:
+    // total_bytes is a lifetime traffic figure, not a request count.
+    it->second.total_bytes.fetch_add(length, std::memory_order_relaxed);
     return Status::OK();
+}
+
+void DeviceSelector::learnRate(const DeviceInfo& dev,
+                               std::atomic<double>& series, double alpha,
+                               double observed_bps) const {
+    // EWMA update: new = α × old + (1-α) × observed
+    // α = 0: always use observed (full adaptation)
+    // α = 1: never update (no learning)
+    // Clamped to [min_multiplier, max_multiplier] of theoretical bandwidth.
+    const double theoretical_bw = theoreticalBandwidth(dev);
+    const double current = series.load(std::memory_order_relaxed);
+    double updated = alpha * current + (1.0 - alpha) * observed_bps;
+    updated = std::max(
+        sched_params_.ewma_min_multiplier * theoretical_bw,
+        std::min(sched_params_.ewma_max_multiplier * theoretical_bw, updated));
+    series.store(updated, std::memory_order_relaxed);
+}
+
+void DeviceSelector::notePosted(int dev_id, uint64_t bytes, uint64_t now_ns) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    auto& dev = it->second;
+    // The read-modify-write picks exactly one thread to see each transition,
+    // so a busy stretch is opened once however many workers post at once.
+    if (dev.posted_bytes.fetch_add(bytes, std::memory_order_relaxed) == 0)
+        dev.busy_since.store(now_ns, std::memory_order_relaxed);
+}
+
+void DeviceSelector::notePostEnded(int dev_id, uint64_t bytes,
+                                   uint64_t now_ns) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    auto& dev = it->second;
+    if (dev.posted_bytes.fetch_sub(bytes, std::memory_order_relaxed) != bytes)
+        return;  // still busy
+    // Bank the stretch that just ended. A neighbour opening the next stretch
+    // between the subtraction above and this read would leave `since` ahead
+    // of `now_ns`; bank nothing rather than an underflowed interval. It
+    // costs one burst's busy time and reads the link fast, so it is bounded
+    // and the smoothing absorbs it.
+    const uint64_t since = dev.busy_since.load(std::memory_order_relaxed);
+    if (now_ns > since)
+        dev.busy_ns.fetch_add(now_ns - since, std::memory_order_relaxed);
+}
+
+uint64_t DeviceSelector::getBusyNs(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return 0;
+    return it->second.busy_ns.load(std::memory_order_relaxed);
+}
+
+uint64_t DeviceSelector::getPostedBytes(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return 0;
+    return it->second.getPostedBytes();
+}
+
+void DeviceSelector::noteCompleted(int dev_id, uint64_t bytes) {
+    auto it = devices_.find(dev_id);
+    if (it != devices_.end())
+        it->second.completed_bytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+uint64_t DeviceSelector::busyNsAt(const DeviceInfo& dev, uint64_t now_ns) {
+    uint64_t busy = dev.busy_ns.load(std::memory_order_relaxed);
+    if (dev.posted_bytes.load(std::memory_order_relaxed) > 0) {
+        const uint64_t since = dev.busy_since.load(std::memory_order_relaxed);
+        if (now_ns > since) busy += now_ns - since;
+    }
+    return busy;
+}
+
+void DeviceSelector::resetTransmitMeter(int dev_id) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    // One store, so it cannot interleave with a sampler's two baseline
+    // exchanges: the next maybeSampleTransmit sees prev == 0, takes both
+    // baselines itself under its CAS, and learns nothing from them.
+    it->second.meter_ts.store(0, std::memory_order_relaxed);
+}
+
+void DeviceSelector::maybeSampleTransmit(int dev_id, uint64_t now_ns) {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return;
+    auto& dev = it->second;
+
+    uint64_t prev = dev.meter_ts.load(std::memory_order_relaxed);
+    // `now_ns <= prev`: a lane whose poll timestamp predates another lane's
+    // sample; letting it through would move the baseline backwards.
+    if (prev != 0 && (now_ns <= prev ||
+                      now_ns - prev < sched_params_.transmit_meter_interval_ns))
+        return;
+    // One sampler per interval: the loser leaves the counters alone.
+    if (!dev.meter_ts.compare_exchange_strong(
+            prev, now_ns, std::memory_order_acq_rel, std::memory_order_relaxed))
+        return;
+
+    const uint64_t completed =
+        dev.completed_bytes.load(std::memory_order_relaxed);
+    const uint64_t before =
+        dev.meter_completed.exchange(completed, std::memory_order_relaxed);
+
+    // Busy time up to now: what has been banked by the stretches that ended,
+    // plus the one still open. Charging the bytes to this instead of to
+    // elapsed wall time is what keeps a NIC that bursts and then waits from
+    // reading as a slow link -- the gap between bursts is not the link, and
+    // asking whether the NIC was busy when the interval opened cannot see it
+    // (a burst's first completion always has the rest of that burst behind
+    // it, so every interval opens busy).
+    const uint64_t busy = busyNsAt(dev, now_ns);
+    const uint64_t busy_before =
+        dev.meter_busy_ns.exchange(busy, std::memory_order_relaxed);
+
+    if (prev == 0) return;  // first sample: it only sets the baseline
+    // A sample spanning this much wall time describes a link too far back to
+    // attribute to the link as it is now, however busy it was.
+    if (now_ns - prev > sched_params_.transmit_meter_max_interval_ns) return;
+    if (completed <= before || busy <= busy_before) return;
+
+    learnRate(
+        dev, dev.ewma_transmit_bps,
+        sched_params_.transmit_bandwidth_learning_rate,
+        static_cast<double>(completed - before) / ((busy - busy_before) / 1e9));
 }
 
 Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
@@ -427,31 +534,16 @@ Status DeviceSelector::release(int dev_id, uint64_t length, double latency) {
     auto& dev = it->second;
     // Inflight is only ever charged in smart mode; releasing in baseline mode
     // would drive the unsigned counter below zero.
-    if (smart_selection_enabled_) dev.releaseInflight(length);
+    if (!smart_selection_enabled_) return Status::OK();
+    dev.releaseInflight(length);
 
-    // Cancellation of an unposted slice must release its inflight charge but
-    // has no latency sample from which to learn bandwidth.
-    if (!smart_selection_enabled_ || latency <= 0.0) {
-        return Status::OK();
-    }
+    // A release with no latency sample -- cancelled, timed out, failed,
+    // swept off a queue pair, or moved to another device -- learns nothing.
+    if (latency <= 0.0) return Status::OK();
 
-    // Update EWMA bandwidth: new = α × old + (1-α) × observed
-    // α = 0: always use observed (full adaptation)
-    // α = 1: never update (no learning)
-    double observed_bw = static_cast<double>(length) / latency;
-    double current_ewma = dev.getEwmaBandwidth();
-
-    double alpha = sched_params_.bandwidth_learning_rate;
-    double new_ewma = alpha * current_ewma + (1.0 - alpha) * observed_bw;
-
-    // Clamp to [min_multiplier, max_multiplier] of theoretical bandwidth
-    double theoretical_bw = theoreticalBandwidth(dev);
-    new_ewma = std::max(
-        sched_params_.ewma_min_multiplier * theoretical_bw,
-        std::min(sched_params_.ewma_max_multiplier * theoretical_bw, new_ewma));
-
-    dev.ewma_bandwidth_bps.store(new_ewma, std::memory_order_relaxed);
-
+    learnRate(dev, dev.ewma_bandwidth_bps,
+              sched_params_.bandwidth_learning_rate,
+              static_cast<double>(length) / latency);
     return Status::OK();
 }
 
@@ -520,6 +612,27 @@ double DeviceSelector::getAggregateEwmaBandwidth() const {
     for (const auto& [id, dev] : devices_) {
         if (!dev.available.load(std::memory_order_relaxed)) continue;
         total += dev.getEwmaBandwidth();
+    }
+    return total > 0.0 ? total : -1.0;
+}
+
+uint64_t DeviceSelector::getInflightBytes(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return 0;
+    return it->second.getInflightBytes();
+}
+
+double DeviceSelector::getTransmitBandwidth(int dev_id) const {
+    auto it = devices_.find(dev_id);
+    if (it == devices_.end()) return -1.0;
+    return it->second.getTransmitBandwidth();
+}
+
+double DeviceSelector::getAggregateTransmitBandwidth() const {
+    double total = 0.0;
+    for (const auto& [id, dev] : devices_) {
+        if (!dev.available.load(std::memory_order_relaxed)) continue;
+        total += dev.getTransmitBandwidth();
     }
     return total > 0.0 ? total : -1.0;
 }

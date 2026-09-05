@@ -432,8 +432,8 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
-# DeviceSelector inflight quota accounting: estimate->exact reconcile, fallback
-# migration, retry recharge, baseline no-underflow, EWMA gating, charge-failure.
+# DeviceSelector inflight quota accounting: per-slice charge/release balance,
+# chargeDevice, baseline no-underflow, EWMA gating, charge-failure.
 add_executable(tent_quota_accounting_test quota_accounting_test.cpp)
 target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
                                                          tent_link_group)
