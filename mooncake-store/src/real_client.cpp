@@ -3457,7 +3457,13 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
             };
         }
     }
-    if (local_buffer_region_.has_value()) {
+    // A CUDA/UVA address can numerically fall inside the host-side local
+    // buffer range.  Only treat that range as an implicit writable region for
+    // host pointers; device destinations must be explicitly registered.
+    const bool is_device_pointer = device::GetAcceleratorRegistry()
+                                       .RuntimeAccelerators()
+                                       .FindDeviceForPointer(buffer) != nullptr;
+    if (!is_device_pointer && local_buffer_region_.has_value()) {
         const auto base =
             reinterpret_cast<uintptr_t>(local_buffer_region_->base);
         if (target >= base) {

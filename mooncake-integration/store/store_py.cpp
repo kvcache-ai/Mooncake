@@ -334,6 +334,8 @@ bool tensor_destination_matches_metadata(const PyTensorInfo &target,
                                stored.metadata.header.ndim);
 }
 
+// Read tensor payloads directly into caller-owned CUDA buffers.  Metadata is
+// fetched separately so no complete-object host staging buffer is needed.
 template <typename ResultType>
 bool apply_indexed_results(const char *context,
                            const std::vector<ResultType> &op_results,
@@ -814,8 +816,68 @@ class MooncakeStorePyWrapper {
         }
 
         if (!use_dummy_client_) {
-            LOG(ERROR) << context
-                       << ": CUDA IPC tensor read requires a dummy client";
+            auto metadata = batch_get_tensor_metadata_prefixes(keys, context);
+            std::vector<void *> buffers;
+            std::vector<std::vector<std::string>> all_keys;
+            std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_sizes;
+            std::vector<size_t> original_indices;
+            buffers.reserve(keys.size());
+            all_keys.reserve(keys.size());
+            all_dst_offsets.reserve(keys.size());
+            all_src_offsets.reserve(keys.size());
+            all_sizes.reserve(keys.size());
+            original_indices.reserve(keys.size());
+
+            for (size_t i = 0; i < keys.size(); ++i) {
+                PyTensorInfo target = extract_tensor_destination_info(
+                    tensors_list[i].cast<py::object>(), keys[i]);
+                if (!target.valid() || !metadata[i].has_value() ||
+                    !tensor_destination_matches_metadata(target, *metadata[i],
+                                                         keys[i], context)) {
+                    continue;
+                }
+                const auto &stored = *metadata[i];
+                if (stored.data_offset >
+                    std::numeric_limits<size_t>::max() - stored.data_bytes) {
+                    LOG(ERROR)
+                        << context << " : tensor range overflows for key "
+                        << keys[i];
+                    continue;
+                }
+                if (stored.data_bytes == 0) {
+                    results[i] = 0;
+                    continue;
+                }
+
+                buffers.push_back(reinterpret_cast<void *>(target.data_ptr));
+                all_keys.push_back({keys[i]});
+                all_dst_offsets.push_back({{0}});
+                all_src_offsets.push_back({{stored.data_offset}});
+                all_sizes.push_back({{stored.data_bytes}});
+                original_indices.push_back(i);
+            }
+
+            if (buffers.empty()) return results;
+
+            std::vector<std::vector<std::vector<int64_t>>> range_results;
+            {
+                py::gil_scoped_release release_gil;
+                range_results = store_->get_into_ranges(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes, nullptr);
+            }
+            for (size_t i = 0; i < original_indices.size(); ++i) {
+                const size_t original_index = original_indices[i];
+                if (i < range_results.size() && range_results[i].size() == 1 &&
+                    range_results[i][0].size() == 1 &&
+                    range_results[i][0][0] >= 0 &&
+                    static_cast<size_t>(range_results[i][0][0]) ==
+                        metadata[original_index]->data_bytes) {
+                    results[original_index] = range_results[i][0][0];
+                }
+            }
             return results;
         }
 
