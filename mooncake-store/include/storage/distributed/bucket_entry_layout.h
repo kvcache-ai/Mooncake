@@ -139,4 +139,3 @@ inline constexpr int64_t kMaxBucketId =
     static_cast<int64_t>(std::numeric_limits<int32_t>::max());
 
 }  // namespace mooncake
-
