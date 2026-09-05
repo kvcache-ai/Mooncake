@@ -15,6 +15,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "config/file_per_key_config.h"
 #include "config/offset_allocator_backend_config.h"
 #include "file_interface.h"
 #include "mutex.h"
@@ -171,16 +172,6 @@ enum class StorageBackendType {
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
 static constexpr size_t kGB = kMB * 1024;
-
-struct FilePerKeyConfig {
-    std::string fsdir = "file_per_key_dir";  // Subdirectory name
-
-    bool enable_eviction = true;  // Enable eviction for storage
-
-    bool Validate() const;
-
-    static FilePerKeyConfig FromEnvironment();
-};
 
 enum class BucketEvictionPolicy {
     NONE,  // No eviction (default)
