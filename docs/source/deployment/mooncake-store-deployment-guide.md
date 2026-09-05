@@ -437,6 +437,7 @@ Multi-Tenant Deployment <multi-tenancy>
 :maxdepth: 1
 :hidden:
 
+Securing the etcd Metadata Service (RBAC + TLS)<etcd-security>
 KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
 SSD Storage<ssd/index>
 HF3FS USRBIO Adapter (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>

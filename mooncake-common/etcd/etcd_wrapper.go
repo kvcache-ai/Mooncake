@@ -35,6 +35,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,15 +137,29 @@ const (
 	maintenanceStartupTimeout = 5 * time.Second
 )
 
-func newStoreClientConfig(validEndpoints []string) clientv3.Config {
-	return clientv3.Config{
+// newStoreClientConfig builds the base clientv3.Config for the store etcd client
+// and applies any security configuration (RBAC / TLS) from environment variables.
+// The caller must check the returned error and abort client creation on failure:
+// falling back to an unauthenticated connection when credentials are configured
+// would be a security issue.
+func newStoreClientConfig(validEndpoints []string) (clientv3.Config, error) {
+	cfg := clientv3.Config{
 		Endpoints:            validEndpoints,
 		DialTimeout:          5 * time.Second,
 		DialKeepAliveTime:    storeDialKeepAliveTime,
 		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
 	}
+	if err := applySecurityConfig(&cfg); err != nil {
+		return cfg, err
+	}
+	return cfg, nil
 }
 
+// parseEtcdEndpoints converts the C endpoint string into a []string suitable
+// for clientv3.Config.Endpoints. It normalises comma separators to semicolons,
+// trims whitespace, and filters empty entries. The scheme prefixes (etcd://,
+// http://) are handled by the C++ callers, which already pass bare host:port
+// endpoints, so no stripping is done here.
 func parseEtcdEndpoints(endpoints *C.char) []string {
 	if endpoints == nil {
 		return nil
@@ -173,29 +188,23 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	MaxMsgSize := 32 * 1024 * 1024
-	endpointStr := C.GoString(endpoints)
-	// Support multiple endpoints separated by comma or semicolon
-	// Normalize separators to semicolon first, then split
-	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
-	parts := strings.Split(endpointStr, ";")
-	var validEndpoints []string
-	for _, ep := range parts {
-		ep = strings.TrimSpace(ep)
-		if ep != "" {
-			validEndpoints = append(validEndpoints, ep)
-		}
-	}
+	validEndpoints := parseEtcdEndpoints(endpoints)
 	if len(validEndpoints) == 0 {
 		*errMsg = C.CString("no valid endpoints provided")
 		return -1
 	}
 
-	cli, err := clientv3.New(clientv3.Config{
+	cfg := clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        5 * time.Second,
 		MaxCallSendMsgSize: MaxMsgSize,
 		MaxCallRecvMsgSize: MaxMsgSize,
-	})
+	}
+	if err := applySecurityConfig(&cfg); err != nil {
+		*errMsg = C.CString(fmt.Sprintf("security config error: %v", err))
+		return -1
+	}
+	cli, err := clientv3.New(cfg)
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -299,7 +308,12 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	cfg, cfgErr := newStoreClientConfig(validEndpoints)
+	if cfgErr != nil {
+		*errMsg = C.CString(fmt.Sprintf("etcd store client config error: %v", cfgErr))
+		return -1
+	}
+	cli, err := clientv3.New(cfg)
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -310,18 +324,22 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	return 0
 }
 
-//export EtcdStoreResetClientWrapper
-func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
-	validEndpoints := parseEtcdEndpoints(endpoints)
-	if len(validEndpoints) == 0 {
-		*errMsg = C.CString("no valid endpoints provided")
-		return -1
+// rebuildStoreClient creates a brand-new store etcd client and atomically
+// swaps it into storeClient. All keep-alive goroutines, per-key watches and
+// prefix watches bound to the old client are torn down first; prefix watches
+// are marked broken so their C++ owners receive a WATCH_BROKEN callback and
+// re-arm against the new client. The old client is closed only after the swap.
+//
+// This helper is used by the exported reset wrapper so the reset path and the
+// initial client creation path share the same security configuration handling.
+func rebuildStoreClient(endpoints []string) error {
+	cfg, cfgErr := newStoreClientConfig(endpoints)
+	if cfgErr != nil {
+		return cfgErr
 	}
-
-	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	cli, err := clientv3.New(cfg)
 	if err != nil {
-		*errMsg = C.CString(err.Error())
-		return -1
+		return err
 	}
 
 	cancelAllStoreKeepAlives()
@@ -337,7 +355,21 @@ func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
 	if oldClient != nil {
 		oldClient.Close()
 	}
+	return nil
+}
 
+//export EtcdStoreResetClientWrapper
+func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
+	validEndpoints := parseEtcdEndpoints(endpoints)
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	if err := rebuildStoreClient(validEndpoints); err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 	return 0
 }
 
@@ -350,31 +382,23 @@ func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -2
 	}
 
-	endpointStr := C.GoString(endpoints)
-	// Support multiple endpoints separated by comma or semicolon
-	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
-	endpointList := strings.Split(endpointStr, ";")
-
-	// Filter out any empty strings that might result from splitting
-	var validEndpoints []string
-	for _, ep := range endpointList {
-		ep = strings.TrimSpace(ep)
-		if ep != "" {
-			validEndpoints = append(validEndpoints, ep)
-		}
-	}
-
+	validEndpoints := parseEtcdEndpoints(endpoints)
 	if len(validEndpoints) == 0 {
 		*errMsg = C.CString("no valid endpoints provided")
 		return -1
 	}
 
-	cli, err := clientv3.New(clientv3.Config{
+	cfg := clientv3.Config{
 		Endpoints:          validEndpoints,
 		DialTimeout:        10 * time.Second,
 		MaxCallSendMsgSize: snapshotMaxMsgSize,
 		MaxCallRecvMsgSize: snapshotMaxMsgSize,
-	})
+	}
+	if err := applySecurityConfig(&cfg); err != nil {
+		*errMsg = C.CString(fmt.Sprintf("security config error: %v", err))
+		return -1
+	}
+	cli, err := clientv3.New(cfg)
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
