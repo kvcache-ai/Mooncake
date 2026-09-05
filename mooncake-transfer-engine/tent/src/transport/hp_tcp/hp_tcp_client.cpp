@@ -176,6 +176,13 @@ class HighPerformanceTcpClient::Lane
                     self->finishIoError(error);
                     return;
                 }
+                std::error_code option_error;
+                self->socket_.set_option(asio::ip::tcp::no_delay(true),
+                                         option_error);
+                if (option_error) {
+                    self->finishIoError(option_error);
+                    return;
+                }
                 self->cancelTimer();
                 self->parent_->connections_created_.fetch_add(
                     1, std::memory_order_relaxed);
