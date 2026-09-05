@@ -43,15 +43,25 @@ struct BoundedMPSCQueue {
 
     ~BoundedMPSCQueue() = default;
 
-    void push(T &slice_list) {
-        while (!try_push(slice_list)) {
-            std::this_thread::yield();
-        }
+    // Best-effort free-slot estimate for admission pre-checks (issue #3661).
+    // head/tail are monotonic counters, so (tail - head) is the occupancy.
+    // This is an MPSC queue, so the value can go stale the instant it is read
+    // (another producer may push, or the consumer may pop); callers must treat
+    // a positive result as "had room a moment ago", not a reservation, and
+    // still handle a failing try_push. It is used only to avoid *starting* a
+    // multi-queue admission that cannot complete, so no list is pushed — and
+    // thus no slice is posted — before every target queue is known to have had
+    // room.
+    bool has_free_slot() const {
+        uint64_t t = tail.load(std::memory_order_acquire);
+        uint64_t h = head.load(std::memory_order_acquire);
+        return (t - h) < Capacity;
     }
 
-    // Non-blocking push: returns false when the queue is full. The worker
-    // thread re-enqueues through this so a full queue parks the entry in a
-    // local overflow instead of wedging the only consumer (issue #3637).
+    // Non-blocking push: returns false when the queue is full. Both the
+    // producer (RdmaTransport::submitTransferTasks) and the worker thread
+    // (submitFromTick) enqueue through this so a full queue is reported to
+    // the caller instead of wedging the only consumer (issues #3636/#3637).
     bool try_push(T &slice_list) {
         if (slice_list.num_slices == 0) return true;
         uint64_t pos = tail.load(std::memory_order_relaxed);
@@ -59,14 +69,22 @@ struct BoundedMPSCQueue {
 
         uint64_t seq = cell->sequence.load(std::memory_order_acquire);
         intptr_t dif = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-        if (dif != 0) return false;
-        if (!tail.compare_exchange_weak(pos, pos + 1, std::memory_order_acq_rel,
-                                        std::memory_order_relaxed)) {
-            return false;
+        if (dif == 0) {
+            if (tail.compare_exchange_weak(pos, pos + 1,
+                                           std::memory_order_acq_rel,
+                                           std::memory_order_relaxed)) {
+                cell->data = slice_list;
+                cell->sequence.store(pos + 1, std::memory_order_release);
+                return true;
+            }
         }
-        cell->data = slice_list;
-        cell->sequence.store(pos + 1, std::memory_order_release);
-        return true;
+        return false;
+    }
+
+    void push(T &slice_list) {
+        while (!try_push(slice_list)) {
+            std::this_thread::yield();
+        }
     }
 
     T pop() {

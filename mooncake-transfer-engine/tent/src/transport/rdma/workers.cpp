@@ -294,7 +294,16 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
-    worker.queues[priority].push(slice_list);
+    // Non-blocking admission (issue #3636): if the worker queue is full we
+    // must NOT block here. The initial submit runs on the caller's thread, so
+    // spinning on a full queue would wedge that thread while the sole consumer
+    // drains. Report the rejection so submitTransferTasks() can cancel the
+    // task instead of leaving the batch PENDING forever. inflight_slices is
+    // incremented only after a successful admission, so a rejected submit
+    // leaves no phantom inflight count.
+    if (!worker.queues[priority].try_push(slice_list)) {
+        return Status::TooManyRequests("Worker queue full" LOC_MARK);
+    }
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
@@ -307,6 +316,60 @@ Status Workers::submit(RdmaSlice* slice) {
     slice_list.first = slice;
     slice_list.num_slices = 1;
     return submit(slice_list);
+}
+
+Status Workers::admitBatch(std::vector<RdmaSliceList>& lists) {
+    // Phase 1 — pre-check. Verify every target queue has a free slot before
+    // pushing anything. Each list occupies exactly one queue cell regardless
+    // of num_slices (the whole list is stored in one Cell), so a worker with
+    // a non-empty list needs one slot in its priority queue. If any target is
+    // full we admit NONE: no worker observes a partial batch, so nothing is
+    // posted to a QP, nothing has to be drained, and the sub-batch stays in
+    // its pre-call state for the caller to fail cleanly (issue #3661).
+    const int n =
+        static_cast<int>(std::min<size_t>(lists.size(), num_workers_));
+    for (int i = 0; i < n; ++i) {
+        if (lists[i].num_slices == 0) continue;
+        int priority = PRIO_HIGH;
+        if (lists[i].first && lists[i].first->task) {
+            priority = lists[i].first->priority;
+        }
+        if (!worker_context_[i].queues[priority].has_free_slot()) {
+            return Status::TooManyRequests(
+                "Worker queue full; whole-batch admission rejected" LOC_MARK);
+        }
+    }
+
+    // Phase 2 — commit. Push every non-empty list. has_free_slot() is only
+    // best-effort under MPSC, so a try_push can still lose the last slot to a
+    // concurrent producer between phase 1 and here. That window is narrow and,
+    // crucially, when it triggers no slice from THIS batch has been posted to
+    // a QP yet: a worker only posts a list after it pops it and passes the
+    // cancel_requested check, and the caller (submitTransferTasks) terminalizes
+    // the whole batch — setting cancel_requested on every task — the moment
+    // this returns failure. So the lists already pushed at indices < i drain
+    // as CANCELED instead of posting. Report the rare failure and let the
+    // caller do the whole-batch cancel; do not partially cancel here, because
+    // the round-robin scatter means a pushed list can share tasks with a not-
+    // yet-pushed one, and only the caller holds the complete task_list.
+    for (int i = 0; i < n; ++i) {
+        if (lists[i].num_slices == 0) continue;
+        int priority = PRIO_HIGH;
+        if (lists[i].first && lists[i].first->task) {
+            priority = lists[i].first->priority;
+        }
+        if (!worker_context_[i].queues[priority].try_push(lists[i])) {
+            return Status::TooManyRequests(
+                "Worker queue lost slot during commit; batch "
+                "rejected" LOC_MARK);
+        }
+        auto& worker = worker_context_[i];
+        if (!worker.inflight_slices.fetch_add(lists[i].num_slices)) {
+            std::lock_guard<std::mutex> lock(worker.mutex);
+            if (worker.in_suspend) worker.cv.notify_all();
+        }
+    }
+    return Status::OK();
 }
 
 void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {

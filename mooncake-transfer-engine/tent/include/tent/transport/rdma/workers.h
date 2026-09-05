@@ -45,7 +45,7 @@ class Workers {
     friend class WorkersQuotaTestAccessor;
 
    public:
-    static constexpr size_t kCapacity = 1024 * 8;
+    static constexpr size_t kCapacity = 1024 * 64;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
 
    public:
@@ -60,6 +60,16 @@ class Workers {
     Status submit(RdmaSlice* slice);
 
     Status submit(RdmaSliceList& slice_list, int worker_id = -1);
+
+    // Atomically admit a whole batch's per-worker slice lists (issue #3661).
+    // lists[i] is destined for worker i (empty entries are skipped). Every
+    // target queue is checked for room BEFORE any list is pushed; if any is
+    // full, nothing is pushed and TooManyRequests is returned, so no worker
+    // ever observes — and therefore never posts — a partially-admitted batch.
+    // This avoids the async-cancel / posted-WR lifetime hazard of admitting
+    // some lists and then trying to recall them. On success every non-empty
+    // list has been pushed and its slices counted inflight.
+    Status admitBatch(std::vector<RdmaSliceList>& lists);
 
     Status cancel(RdmaTask* task);
 
