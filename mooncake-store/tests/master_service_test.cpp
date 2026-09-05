@@ -3982,15 +3982,13 @@ TEST_F(MasterServiceTest, AgentTtlWithoutKeepHintDoesNotAddRetention) {
     AgentHints hints;
     hints.cache_ttl_ms = 1000;
     config.agent_hints = hints;
-    PutCompletedObject(*service_, client_id, "agent_neutral_ttl", config,
-                       1024);
+    PutCompletedObject(*service_, client_id, "agent_neutral_ttl", config, 1024);
     EXPECT_FALSE(
         GetSoftPinDeadline(*service_, "agent_neutral_ttl").has_value());
 
     hints.reuse_hint = "discard";
     config.agent_hints = hints;
-    PutCompletedObject(*service_, client_id, "agent_discard_ttl", config,
-                       1024);
+    PutCompletedObject(*service_, client_id, "agent_discard_ttl", config, 1024);
     EXPECT_FALSE(
         GetSoftPinDeadline(*service_, "agent_discard_ttl").has_value());
 }

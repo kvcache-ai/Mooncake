@@ -591,7 +591,7 @@ The `ReplicateConfig` class allows you to control data replication behavior when
 ### Class Definition
 
 ```python
-from mooncake.store import ReplicateConfig
+from mooncake.store import AgentHints, ReplicateConfig
 
 # Create a configuration instance
 config = ReplicateConfig()
@@ -730,6 +730,12 @@ config.group_ids = ["session-a"]
 
 store.put("key-a", b"value-a", config)
 ```
+
+#### agent_hints
+**Type:** `AgentHints | None`
+**Default:** `None`
+**Description:** Optional agent retention hint (`reuse_hint`, `cache_ttl_ms`).
+See the Store Agent Hints design section for retention behavior and validation.
 
 ---
 
