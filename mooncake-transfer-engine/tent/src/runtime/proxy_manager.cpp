@@ -372,7 +372,7 @@ Status ProxyManager::waitCrossStage(const Request& request,
 
 Status ProxyManager::submit(TaskInfo* task, BatchID batch,
                             const std::vector<std::string>& params) {
-    if (!task || batch == 0) {
+    if (!task) {
         return Status::InvalidArgument("invalid staging task" LOC_MARK);
     }
     StagingTask staging_task;
