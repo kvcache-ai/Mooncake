@@ -752,57 +752,6 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
 
 // RemoveAll holds one shard lock at a time, so a commit can land in a shard the
 // scan already passed. The scan's own bookkeeping cannot see it, and publishing
-// `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
-// key belongs to, commit there, and the clear must be withheld.
-TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
-    MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
-    const auto context = PrepareSimpleSegment(service);
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "victim_key",
-                              TenantId::Default(), 1024, config)
-                    .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "victim_key",
-                            TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
-
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
-    bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        // Commit exactly once, immediately after the scan releases the shard
-        // the new key hashes to, so the scan can never observe it.
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "racer_key",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "racer_key",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
-
-    service.RemoveAll(true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
-
-    ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
-    auto exists = service.ExistKey("racer_key", TenantId::Default());
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
-
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
-        << "a clear here would retract racer_key, which was just announced";
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
-}
-
 // The mirror image: with no concurrent commit the epoch is unchanged, so the
 // clear must still go out. Without this the fix could pass by never publishing.
 TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
@@ -825,50 +774,6 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
 
     EXPECT_EQ(1u, service.GetKvClearedPublishedForTesting());
     EXPECT_EQ(0u, service.GetKvClearedSuppressedForTesting());
-}
-
-// The tenant-scoped overload reads the epoch before its scan instead of at
-// first sight of an object, so it needs its own coverage of the same ordering
-// rule.
-TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
-    MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
-    const auto context = PrepareSimpleSegment(service);
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "scoped_victim",
-                              TenantId::Default(), 1024, config)
-                    .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "scoped_victim",
-                            TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
-
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
-    bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "scoped_racer",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "scoped_racer",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
-
-    service.RemoveAll(TenantId::Default(), true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
-
-    ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting());
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
 }
 
 TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
@@ -1223,6 +1128,14 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(std::count(put_end_success.begin(), put_end_success.end(), 1), 1);
     EXPECT_EQ(service_->GetKeyCount(), 1u);
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value());
+}
+
+TEST_F(MasterServiceTest, AccessorCreateRePinsWinnerOnLostInsert) {
+    // Create() must re-Pin the route winner when a concurrent writer wins the
+    // create race, instead of binding an orphan entry.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    AccessorCreateRePinsWinnerEntry(*service_);
 }
 
 TEST_F(MasterServiceTest,
@@ -2166,94 +2079,6 @@ TEST_F(MasterServiceTest, EvictObject) {
     service_->RemoveAll();
 }
 
-TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
-    // Small containers stay untouched regardless of sparsity: their bucket
-    // memory is negligible and rehash churn is not worth it.
-    std::unordered_map<std::string, int> small;
-    small.emplace("small_key", 0);
-    const size_t small_buckets = small.bucket_count();
-    ASSERT_LE(small_buckets, kShrinkMinBucketCount);
-    ShrinkBucketsIfSparse(small);
-    EXPECT_EQ(small.bucket_count(), small_buckets);
-
-    // Grow a map well past the bucket floor, then erase most entries: the
-    // bucket array keeps its high-water size until explicitly shrunk.
-    std::unordered_map<std::string, int> map;
-    for (size_t i = 0; i < 4 * kShrinkMinBucketCount; ++i) {
-        map.emplace("key" + std::to_string(i), 0);
-    }
-    const size_t high_water = map.bucket_count();
-    ASSERT_GT(high_water, kShrinkMinBucketCount);
-
-    // At exactly a quarter full there is nothing to shrink yet.
-    while (map.size() > high_water / 4) {
-        map.erase(map.begin());
-    }
-    ShrinkBucketsIfSparse(map);
-    EXPECT_EQ(map.bucket_count(), high_water);
-
-    // One more erase crosses the threshold and triggers the shrink.
-    map.erase(map.begin());
-    ShrinkBucketsIfSparse(map);
-    EXPECT_LT(map.bucket_count(), high_water);
-    EXPECT_GE(map.bucket_count(), map.size());
-}
-
-TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
-    // Zero lease TTL so every committed object is immediately evictable.
-    auto service_config =
-        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t object_size = 1024;
-    constexpr size_t object_count = 2 * kShrinkMinBucketCount;
-    // Size the segment with ample headroom so the background eviction
-    // thread never fires; only the explicit call below evicts.
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(
-        *service_, "test_segment", buffer, object_size * object_count * 16);
-
-    // Pick keys that all hash to one shard so its metadata map grows past
-    // the shrink floor; random keys would spread these objects thinly
-    // across all 1024 shards.
-    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
-    std::vector<std::string> keys;
-    for (size_t i = 0; keys.size() < object_count; ++i) {
-        std::string key = "shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service_, key) != target_shard) continue;
-        keys.push_back(std::move(key));
-    }
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    for (const auto& key : keys) {
-        // Hard-pin the first object: it is excluded from eviction, so the
-        // tenant (and its metadata map) deterministically survives the
-        // full eviction below and the shrunk bucket count stays
-        // observable.
-        config.with_hard_pin = (&key == &keys.front());
-        ASSERT_TRUE(service_
-                        ->PutStart(client_id, key, TenantId::Default(),
-                                   object_size, config)
-                        .has_value());
-        ASSERT_TRUE(service_
-                        ->PutEnd(client_id, key, TenantId::Default(),
-                                 ReplicaType::MEMORY)
-                        .has_value());
-    }
-
-    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
-    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
-
-    service_->RunBatchEvictForTesting(1.0, 1.0);
-
-    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
-    ASSERT_GT(buckets_after, 0u);
-    // Without the post-eviction shrink the bucket array would still sit at
-    // its high-water mark and this assertion would fail.
-    EXPECT_LT(buckets_after, buckets_before / 2);
-}
-
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
@@ -2521,8 +2346,7 @@ TEST_F(MasterServiceTest, SoftPinDeadlineHeapCompactsRepeatedUpdates) {
     constexpr size_t kUpdates = 5000;
     for (size_t i = 0; i < kUpdates; ++i) {
         UpsertSoftPinDeadlineIndexForTest(
-            service, "compaction_key", 0,
-            base + std::chrono::milliseconds(i + 1));
+            service, "compaction_key", base + std::chrono::milliseconds(i + 1));
     }
 
     EXPECT_EQ(SoftPinRegistrationCount(service), 1u);

@@ -12,7 +12,7 @@
 #include "client_metric.h"
 #include "file_storage.h"
 #include "storage_backend.h"
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 #include "test_server_helpers.h"
 #include "utils.h"
 #include "utils/common.h"

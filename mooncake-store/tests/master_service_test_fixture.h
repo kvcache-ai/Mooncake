@@ -84,17 +84,17 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
-        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
-        const auto tenant_it = shard->tenants.find(normalized_tenant);
-        if (tenant_it == shard->tenants.end()) {
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(normalized_tenant);
+        if (!tenant_handle) {
             return std::nullopt;
         }
-        const auto metadata_it = tenant_it->second.metadata.find(key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
+        auto entry = tenant_handle->Pin(key);
+        if (!entry || !entry->has_metadata()) {
             return std::nullopt;
         }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+        return entry->metadata()->GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -103,36 +103,24 @@ class MasterServiceTest : public ::testing::Test {
         service.CleanupExpiredSoftPins(now);
     }
 
-    size_t MetadataShardIndex(MasterService& service, const std::string& key,
-                              const TenantId& tenant_id = TenantId::Default()) {
-        return service.getShardIndex(tenant_id, key);
-    }
-
-    size_t MetadataBucketCount(
-        MasterService& service, size_t shard_idx,
-        const TenantId& tenant_id = TenantId::Default()) {
-        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
-        const auto tenant_it = shard->tenants.find(tenant_id);
-        return tenant_it == shard->tenants.end()
-                   ? 0
-                   : tenant_it->second.metadata.bucket_count();
-    }
-
     void SetSoftPinDeadlineForTest(
         MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        const size_t shard_idx = service.getShardIndex(normalized_tenant, key);
-        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
-        auto& metadata = shard->tenants.at(normalized_tenant).metadata.at(key);
+        auto tenant_handle =
+            service.GetOrCreateTenantStateHandle(normalized_tenant);
+        auto entry = tenant_handle->Pin(key);
+        ASSERT_TRUE(entry != nullptr && entry->has_metadata());
+        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+        auto& metadata = *entry->metadata();
         {
             SpinLocker locker(&metadata.lock);
             metadata.soft_pin_timeout = deadline;
         }
         service.soft_pin_deadline_index_.Upsert(
-            normalized_tenant.MakeScopedKey(key), shard_idx, deadline);
+            normalized_tenant.MakeScopedKey(key), deadline);
     }
 
     size_t SoftPinDeadlineHeapSize(MasterService& service) {
@@ -196,12 +184,54 @@ class MasterServiceTest : public ::testing::Test {
         return service.getShardIndex(tenant_id, key);
     }
 
+    // Regression: MetadataAccessorRW::Create() used to ignore InsertObject()'s
+    // return value. If a concurrent writer inserted the key first, Create()
+    // would bind to an orphan entry not in the route. It must re-Pin the
+    // existing entry instead. Lives on the fixture (a MasterService friend) so
+    // it can reach the private MetadataAccessorRW.
+    void AccessorCreateRePinsWinnerEntry(MasterService& service) {
+        const UUID client_id = generate_uuid();
+        const std::string key = "accessor_create_repin_winner";
+        const TenantId tenant_id("tenant_accessor_create_repin");
+        const MasterService::ObjectIdentity object_id =
+            service.MakeObjectIdentityForRequest(key, tenant_id);
+        const TenantId normalized = object_id.tenant_id;
+
+        // Build the accessor while the object does not yet exist.
+        MasterService::MetadataAccessorRW accessor(&service, object_id);
+        ASSERT_FALSE(accessor.Exists());
+
+        // A concurrent writer wins and publishes the key first, with valid
+        // metadata (a LOCAL_DISK replica keeps IsValid() true).
+        auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
+        std::vector<Replica> winner_replicas;
+        winner_replicas.emplace_back(
+            Replica(client_id, 4096, "host:port", ReplicaStatus::COMPLETE));
+        winner->SetMetadata(std::make_unique<ObjectMetadata>(
+            client_id, std::chrono::system_clock::now(), 4096,
+            std::move(winner_replicas)));
+        auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized);
+        ASSERT_TRUE(tenant_handle->InsertObject(key, winner));
+
+        // Create() must re-Pin the route winner, not bind the orphan.
+        accessor.Create(client_id, 4096, std::vector<Replica>{});
+
+        EXPECT_TRUE(accessor.Exists());
+        EXPECT_EQ(accessor.GetEntry(), winner);
+        EXPECT_EQ(accessor.Get().GetAllReplicas().size(), 1u);
+        // The route holds exactly one entry for the key (the winner).
+        auto pinned = tenant_handle->Pin(key);
+        ASSERT_NE(pinned, nullptr);
+        EXPECT_EQ(pinned, winner);
+        EXPECT_EQ(tenant_handle->ObjectCount(), 1u);
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
-        MasterService& service, const std::string& key, size_t shard_idx,
+        MasterService& service, const std::string& key,
         const std::chrono::system_clock::time_point& deadline,
         const std::string& tenant_id = "default") {
         service.soft_pin_deadline_index_.Upsert(
-            TenantId(tenant_id).MakeScopedKey(key), shard_idx, deadline);
+            TenantId(tenant_id).MakeScopedKey(key), deadline);
     }
 
     size_t PopExpiredSoftPinDeadlinesForTest(
@@ -467,17 +497,35 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        MasterService::GroupDomainAccessorRO gs(&service);
-        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
-        if (it == gs->groups.end()) {
+        // Group membership is single-sourced in the tenant's own object_route,
+        // so read it there (there is no global table).
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(normalized_tenant);
+        if (!tenant_handle) {
             return {};
         }
-        return {it->second.member_keys.begin(), it->second.member_keys.end()};
+        return service.GetGroupMemberKeys(*tenant_handle, group_id);
     }
 
     void ClearGroupStateForTest(MasterService& service) {
-        MasterService::GroupDomainAccessorRW gs(&service);
-        gs->groups.clear();
+        // Drop group membership from each tenant's object_route. Removing the
+        // last member erases the (now-empty) group.
+        service.tenant_directory_.Visit(
+            [&](const TenantId&,
+                const std::shared_ptr<MasterService::TenantState>& handle) {
+                auto& tenant_state = *handle;
+                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
+                    objs;
+                tenant_state.VisitObjects(
+                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
+                            entry) { objs.push_back(entry); });
+                for (const auto& entry : objs) {
+                    if (!entry->group_id().empty()) {
+                        tenant_state.object_route.RemoveMember(
+                            entry->group_id(), entry->key());
+                    }
+                }
+            });
     }
 
     void RebuildGroupStateForTest(MasterService& service) {
@@ -489,9 +537,14 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        MasterService::GroupDomainAccessorRO gs(&service);
-        auto it = gs->groups.find(normalized_tenant.MakeScopedKey(group_id));
-        return it == gs->groups.end() ? nullptr : it->second.lease;
+        auto tenant_handle =
+            service.tenant_directory_.Lookup(normalized_tenant);
+        if (!tenant_handle) {
+            return nullptr;
+        }
+        // The shared group Lease is single-sourced in the tenant's
+        // object_route.
+        return tenant_handle->object_route.LeaseFor(group_id);
     }
 
     void ReRouteRestoredObjectsMigrationForTest(MasterService& service) {
@@ -510,52 +563,17 @@ class MasterServiceTest : public ::testing::Test {
         PutCompletedObject(service, client_id, ungrouped_key, ungrouped_config);
 
         const TenantId tenant = TenantId::Default();
-        const size_t grouped_correct =
-            service.getShardIndex(tenant, grouped_key);
-        const size_t wrong = (grouped_correct + 1) %
-                             static_cast<size_t>(MasterService::kNumShards);
 
-        // Reachable initially (placed on the correct hash(tenant, key) shard).
+        // Objects live in the tenant container keyed by tenant_id; there is no
+        // cross-shard object routing to migrate. A grouped object is therefore
+        // reachable via the same object lookup as a singleton, and
+        // ReRouteRestoredObjectsByKey() is a safe no-op.
         EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
 
-        // Simulate an old snapshot that placed grouped_key on a stale shard.
-        {
-            MasterService::MetadataShardAccessorRW src(&service,
-                                                       grouped_correct);
-            auto tenant_it = src->tenants.find(tenant);
-            ASSERT_NE(tenant_it, src->tenants.end());
-            auto obj_it = tenant_it->second.metadata.find(grouped_key);
-            ASSERT_NE(obj_it, tenant_it->second.metadata.end());
-            auto node = tenant_it->second.metadata.extract(obj_it);
-            ASSERT_FALSE(node.empty());
-            MasterService::MetadataShardAccessorRW dst(&service, wrong);
-            auto& dst_tenant =
-                service.GetOrCreateTenantState(dst.get(), tenant);
-            dst_tenant.metadata.insert(std::move(node));
-        }
-
-        // Now unreachable via hash(tenant, key) lookup (the old-snapshot
-        // problem).
-        EXPECT_FALSE(service.ExistKey(grouped_key, tenant).value_or(true));
-
-        // Run the migration.
+        // Run the (no-op) migration; the grouped object stays reachable.
         service.ReRouteRestoredObjectsByKey();
 
-        // Reachable again, and back on the correct shard.
         EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
-        MasterService::MetadataShardAccessorRW shard(&service, grouped_correct);
-        auto tenant_it = shard->tenants.find(tenant);
-        ASSERT_NE(tenant_it, shard->tenants.end());
-        EXPECT_NE(tenant_it->second.metadata.find(grouped_key),
-                  tenant_it->second.metadata.end());
-        // The stale shard no longer holds it.
-        MasterService::MetadataShardAccessorRW stale(&service, wrong);
-        auto stale_it = stale->tenants.find(tenant);
-        if (stale_it != stale->tenants.end()) {
-            EXPECT_EQ(stale_it->second.metadata.find(grouped_key),
-                      stale_it->second.metadata.end());
-        }
-        // The correctly-placed ungrouped object is unaffected.
         EXPECT_TRUE(service.ExistKey(ungrouped_key, tenant).value_or(false));
     }
 };

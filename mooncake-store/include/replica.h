@@ -422,7 +422,9 @@ class Replica {
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
-            return !mem_data.buffer->isAllocatorValid();
+            // A null buffer (freed before full teardown) is an invalid handle;
+            // guard the deref that a bare ->isAllocatorValid() would hit.
+            return !mem_data.buffer || !mem_data.buffer->isAllocatorValid();
         }
         return false;  // DiskReplicaData does not have handles
     }

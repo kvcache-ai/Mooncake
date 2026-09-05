@@ -85,21 +85,14 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitPutStartFailed = 3;  // scenario setup broken
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
-    // Friend access: find a key that routes to the SAME metadata shard as
-    // `key` (getShardIndex hashes tenant+key, so a naive second key
-    // lands in a different shard's TenantState and cannot keep THIS shard's
-    // tenant non-empty).
+    // Friend access: any second live key in the same tenant (Default) keeps
+    // the TenantState non-empty. All of a tenant's keys live in a single
+    // TenantState regardless of shard (there is no per-key shard to share), so
+    // a simple suffix suffices instead of a shard-index probe.
     std::string FindKeyOnSameShard(MasterService& service,
                                    const std::string& key) {
-        const size_t target = service.getShardIndex(TenantId::Default(), key);
-        for (int i = 0; i < 100000; ++i) {
-            std::string candidate = key + "_keepalive_" + std::to_string(i);
-            if (service.getShardIndex(TenantId::Default(), candidate) ==
-                target) {
-                return candidate;
-            }
-        }
-        return key + "_keepalive_fallback";
+        (void)service;
+        return key + "_keepalive";
     }
 
     // Builds the incident state and fires the trigger. Only returns on

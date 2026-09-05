@@ -10,7 +10,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 
 #include <ylt/util/tl/expected.hpp>
 

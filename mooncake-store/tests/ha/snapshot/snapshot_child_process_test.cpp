@@ -231,13 +231,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
-        size_t shard_idx = svc->getShardIndex(key);
-        auto& shard = svc->metadata_shards_[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        auto tenant_it = shard.tenants.find(TenantId::Default());
-        return tenant_it != shard.tenants.end() &&
-               tenant_it->second.metadata.find(key) !=
-                   tenant_it->second.metadata.end();
+        auto handle = svc->tenant_directory_.Lookup(TenantId::Default());
+        if (handle == nullptr) {
+            return false;
+        }
+        return handle->ContainsObject(key);
     }
 
     size_t SoftPinRegistrationCount(MasterService* svc) {
@@ -246,17 +244,15 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        const size_t shard_idx = svc->getShardIndex(TenantId::Default(), key);
-        MasterService::MetadataShardAccessorRO shard(svc, shard_idx);
-        const auto tenant_it = shard->tenants.find(TenantId::Default());
-        if (tenant_it == shard->tenants.end()) {
+        auto handle = svc->tenant_directory_.Lookup(TenantId::Default());
+        if (handle == nullptr) {
             return std::nullopt;
         }
-        const auto metadata_it = tenant_it->second.metadata.find(key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
+        auto entry = handle->Pin(key);
+        if (!entry || !entry->has_metadata()) {
             return std::nullopt;
         }
-        return metadata_it->second.GetCommittedSoftPinTimeout();
+        return entry->metadata()->GetCommittedSoftPinTimeout();
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -270,15 +266,14 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
-        auto& shard = service_->metadata_shards_[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
-        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-            auto it = tenant_state.metadata.find(key);
-            if (it != tenant_state.metadata.end()) {
-                return it->second.IsGrouped();
-            }
+        (void)shard_idx;
+        auto handle = service_->tenant_directory_.Lookup(TenantId::Default());
+        if (handle == nullptr) {
+            return false;
         }
-        return false;
+        auto entry = handle->Pin(key);
+        return entry != nullptr && entry->has_metadata() &&
+               entry->metadata()->IsGrouped();
     }
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,
