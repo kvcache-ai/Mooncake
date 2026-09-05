@@ -17,6 +17,7 @@
 #include <cstring>
 #include <memory>
 #include <new>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -38,15 +39,23 @@ inline const char *c_str_or(const char *s, const char *fallback) {
     return s ? s : fallback;
 }
 
-mooncake::ReplicateConfig to_replicate_config(
+std::optional<mooncake::ReplicateConfig> to_replicate_config(
     const mooncake_replicate_config_t *c_config) {
     mooncake::ReplicateConfig config;
     if (!c_config) return config;
 
+    const int action = c_config->soft_pin_action;
+    // Reject before casting: the enum's uint8_t underlying type would
+    // otherwise wrap out-of-range values into valid actions.
+    if (action < static_cast<int>(mooncake::SoftPinAction::PRESERVE) ||
+        action > static_cast<int>(mooncake::SoftPinAction::DISABLE)) {
+        return std::nullopt;
+    }
     config.replica_num = c_config->replica_num;
-    config.soft_pin_action = c_config->with_soft_pin != 0
-                                 ? mooncake::SoftPinAction::ENABLE
-                                 : mooncake::SoftPinAction::PRESERVE;
+    config.soft_pin_action = static_cast<mooncake::SoftPinAction>(action);
+    if (c_config->has_soft_pin_ttl) {
+        config.soft_pin_ttl_ms = c_config->soft_pin_ttl_ms;
+    }
     config.with_hard_pin = c_config->with_hard_pin != 0;
     if (c_config->preferred_segments &&
         c_config->preferred_segments_count > 0) {
@@ -151,8 +160,9 @@ int mooncake_store_put(mooncake_store_t store, const char *key,
     if (!value && size > 0) return -1;
     try {
         auto rc = to_replicate_config(config);
+        if (!rc) return -1;
         std::span<const char> data(static_cast<const char *>(value), size);
-        return as_client(store)->put(key, data, rc);
+        return as_client(store)->put(key, data, *rc);
     } catch (...) {
         return -1;
     }
@@ -165,7 +175,8 @@ int mooncake_store_put_from(mooncake_store_t store, const char *key,
     if (!buffer && size > 0) return -1;
     try {
         auto rc = to_replicate_config(config);
-        return as_client(store)->put_from(key, buffer, size, rc);
+        if (!rc) return -1;
+        return as_client(store)->put_from(key, buffer, size, *rc);
     } catch (...) {
         return -1;
     }
@@ -190,8 +201,9 @@ int mooncake_store_batch_put_from(mooncake_store_t store, const char **keys,
         std::vector<size_t> size_vec(sizes, sizes + count);
 
         auto rc = to_replicate_config(config);
+        if (!rc) return -1;
         auto results =
-            as_client(store)->batch_put_from(key_vec, buf_vec, size_vec, rc);
+            as_client(store)->batch_put_from(key_vec, buf_vec, size_vec, *rc);
 
         for (size_t i = 0; i < count; ++i) {
             results_out[i] = (i < results.size()) ? results[i] : -1;
