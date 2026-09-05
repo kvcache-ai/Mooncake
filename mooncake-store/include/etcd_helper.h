@@ -101,6 +101,7 @@ class EtcdHelper {
     struct TxnPut {
         std::string key;
         std::string value;
+        bool preserve_lease{false};
     };
 
     /*

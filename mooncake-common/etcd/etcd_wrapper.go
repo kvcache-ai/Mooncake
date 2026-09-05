@@ -938,7 +938,7 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 }
 
 //export EtcdStoreTxnCompareAndPutWrapper
-func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareRevisions *int64, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putPreserveLeases *C.int, putCount C.int, errMsg **C.char) int {
 	cli := getStoreClient()
 	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
@@ -979,10 +979,15 @@ func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.i
 		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
 		putValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putValues))[:putN:putN]
 		putValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(putValueSizes))[:putN:putN]
+		putPreserveLeaseList := (*[1 << 28]C.int)(unsafe.Pointer(putPreserveLeases))[:putN:putN]
 		for i := 0; i < putN; i++ {
 			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
 			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
-			ops = append(ops, clientv3.OpPut(k, v))
+			if putPreserveLeaseList[i] != 0 {
+				ops = append(ops, clientv3.OpPut(k, v, clientv3.WithIgnoreLease()))
+			} else {
+				ops = append(ops, clientv3.OpPut(k, v))
+			}
 		}
 	}
 
