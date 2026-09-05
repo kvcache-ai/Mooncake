@@ -647,6 +647,10 @@ class Client {
         return metrics_ ? &metrics_->ssd_metric : nullptr;
     }
 
+    DfsMetric* GetDfsMetricPtr() {
+        return metrics_ ? &metrics_->dfs_metric : nullptr;
+    }
+
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
