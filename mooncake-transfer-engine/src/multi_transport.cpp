@@ -529,6 +529,10 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
 
+    // Intel XPU: no dedicated transport yet; XPU memory uses RDMA (via
+    // DMA-BUF) or TCP (via host staging) — both handled automatically
+    // through the cuda-alike shim in gpu_vendor/xpu.h.
+
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
                    << ", please rebuild Mooncake";

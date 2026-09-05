@@ -131,9 +131,14 @@ else
     echo "Skipping ubshmem_fabric_allocator.so (not built - likely CUDA or non-NPU build)"
 fi
 
-echo "Copying transfer_engine_bench..."
-# Copy transfer_engine_bench
-cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+# Copy transfer_engine_bench (only built when BUILD_EXAMPLES=ON; guard it so
+# `set -e` does not abort the wheel for an examples-off build)
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench" ]; then
+    echo "Copying transfer_engine_bench..."
+    cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+else
+    echo "Skipping transfer_engine_bench (not built - likely BUILD_EXAMPLES=OFF)"
+fi
 
 if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
     cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/

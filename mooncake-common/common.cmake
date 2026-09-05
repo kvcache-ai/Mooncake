@@ -121,6 +121,8 @@ option(
   OFF)
 option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 option(USE_MPCOMM "option for using MPComm transport in TENT" OFF)
+option(USE_XPU "option for enabling gpu features for Intel XPU (Level Zero)"
+       OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -458,6 +460,33 @@ if(USE_HIP)
         "hipify-perl not found.\n"
         "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
   endif()
+endif()
+
+if(USE_XPU)
+  # Find Level Zero headers and library
+  find_path(
+    LEVEL_ZERO_INCLUDE_DIR level_zero/ze_api.h
+    HINTS $ENV{CONDA_PREFIX}/include /usr/include
+    PATH_SUFFIXES include)
+  find_library(
+    LEVEL_ZERO_LIBRARY ze_loader
+    HINTS $ENV{CONDA_PREFIX}/lib /usr/lib64 /usr/lib
+    PATH_SUFFIXES lib lib64)
+
+  if(NOT LEVEL_ZERO_INCLUDE_DIR OR NOT LEVEL_ZERO_LIBRARY)
+    message(
+      FATAL_ERROR
+        "Level Zero not found. Install level-zero-devel or set LEVEL_ZERO_INCLUDE_DIR/LEVEL_ZERO_LIBRARY."
+    )
+  endif()
+
+  get_filename_component(LEVEL_ZERO_LIB_DIR ${LEVEL_ZERO_LIBRARY} DIRECTORY)
+  include_directories(${LEVEL_ZERO_INCLUDE_DIR})
+  link_directories(${LEVEL_ZERO_LIB_DIR})
+  add_compile_definitions(USE_XPU)
+  message(STATUS "Intel XPU (Level Zero) support is enabled")
+  message(STATUS "  Level Zero include: ${LEVEL_ZERO_INCLUDE_DIR}")
+  message(STATUS "  Level Zero library: ${LEVEL_ZERO_LIBRARY}")
 endif()
 
 # This function converts given CUDA source files into HIP-compatible files using

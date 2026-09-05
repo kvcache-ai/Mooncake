@@ -178,6 +178,12 @@ if(USE_MLU)
   target_link_libraries(transfer_engine PUBLIC cnrt cndrv)
 endif()
 
+if(USE_XPU)
+  target_sources(transfer_engine
+                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/gpu_vendor/xpu.cpp)
+  target_link_libraries(transfer_engine PUBLIC ze_loader rt)
+endif()
+
 if(USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
                                                MPI::MPI)
