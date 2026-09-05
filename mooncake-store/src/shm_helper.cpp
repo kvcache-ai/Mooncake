@@ -14,6 +14,9 @@
 #if defined(USE_ASCEND_DIRECT)
 #include "ascend_allocator.h"
 #endif
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
+#endif
 
 #ifndef MOONCAKE_SHM_NAME
 #define MOONCAKE_SHM_NAME "mooncake_shm"
@@ -59,6 +62,12 @@ bool ShmHelper::cleanup() {
                 continue;
             }
 #endif
+#ifdef USE_NOF
+            // SPDK DMA buffers are released through the SPDK allocator.
+            SpdkWrapper::GetInstance().Free(shm->base_addr);
+            shm->base_addr = nullptr;
+            continue;
+#endif
             if (munmap(shm->base_addr, shm->size) == -1) {
                 LOG(ERROR) << "Failed to unmap shared memory: "
                            << strerror(errno);
@@ -96,6 +105,24 @@ void* ShmHelper::allocate(size_t size) {
         }
         // ascend_agent_mode && !ascend_use_fabric_mem: fall through to memfd
     }
+#endif
+
+#ifdef USE_NOF
+    // NoF (SPDK DMA) memory: allocate via SPDK hugepage/DMA buffer, which is
+    // required for NVMe-oF transfers to/from this host memory segment.
+    void* spdk_addr =
+        SpdkWrapper::GetInstance().Alloc(size, 0x1000, /*socket_id=*/-1);
+    if (spdk_addr == nullptr) {
+        throw std::runtime_error("Failed to allocate SPDK DMA memory");
+    }
+    auto spdk_shm = std::make_shared<ShmSegment>();
+    spdk_shm->fd = -1;
+    spdk_shm->base_addr = spdk_addr;
+    spdk_shm->size = size;
+    spdk_shm->name = MOONCAKE_SHM_NAME;
+    spdk_shm->registered = false;
+    shms_.push_back(spdk_shm);
+    return spdk_addr;
 #endif
 
     unsigned int flags = MFD_CLOEXEC;
@@ -153,11 +180,18 @@ int ShmHelper::free(void* addr) {
                     free_memory("ascend", (*it)->base_addr);
                 } else
 #endif
-                    if (munmap((*it)->base_addr, (*it)->size) == -1) {
+#ifdef USE_NOF
+                {
+                    // SPDK DMA buffers are released through the SPDK allocator.
+                    SpdkWrapper::GetInstance().Free((*it)->base_addr);
+                }
+#else
+                if (munmap((*it)->base_addr, (*it)->size) == -1) {
                     LOG(ERROR) << "Failed to unmap shared memory during free: "
                                << strerror(errno);
                     return -1;
                 }
+#endif
             }
             LOG(INFO) << "Freed shared memory at " << addr
                       << ", size: " << (*it)->size;
