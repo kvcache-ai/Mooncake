@@ -167,8 +167,8 @@ func TestReplicateConfig(t *testing.T) {
 	defer s.Close()
 
 	cfg := &store.ReplicateConfig{
-		ReplicaNum:  2,
-		WithSoftPin: true,
+		ReplicaNum:    2,
+		SoftPinAction: store.SoftPinEnable,
 	}
 
 	key := "test_go_replicated"
@@ -185,4 +185,47 @@ func TestReplicateConfig(t *testing.T) {
 	}
 
 	_ = s.Remove(key, true)
+}
+
+func TestReplicateConfigSoftPinTTL(t *testing.T) {
+	s := setupStore(t)
+	defer s.Close()
+
+	ttl := uint64(60000)
+	cfg := &store.ReplicateConfig{
+		ReplicaNum:    1,
+		SoftPinAction: store.SoftPinEnable,
+		SoftPinTTLMS:  &ttl,
+	}
+
+	key := "test_go_softpin_ttl"
+	if err := s.Put(key, []byte("pinned data"), cfg); err != nil {
+		t.Fatalf("Put with soft pin TTL failed: %v", err)
+	}
+
+	exists, err := s.Exists(key)
+	if err != nil {
+		t.Fatalf("Exists() failed: %v", err)
+	}
+	if !exists {
+		t.Fatal("expected soft-pinned key to exist")
+	}
+
+	_ = s.Remove(key, true)
+}
+
+func TestReplicateConfigSoftPinValidation(t *testing.T) {
+	s := setupStore(t)
+	defer s.Close()
+
+	ttl := uint64(60000)
+	invalidConfigs := []store.ReplicateConfig{
+		{ReplicaNum: 1, SoftPinAction: store.SoftPinDisable, SoftPinTTLMS: &ttl},
+		{ReplicaNum: 1, SoftPinAction: store.SoftPinAction(7)},
+	}
+	for i, cfg := range invalidConfigs {
+		if err := s.Put("test_go_softpin_invalid", []byte("v"), &cfg); err != store.ErrInvalidArgument {
+			t.Fatalf("config %d: expected ErrInvalidArgument, got %v", i, err)
+		}
+	}
 }

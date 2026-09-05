@@ -44,9 +44,11 @@ mooncake::ReplicateConfig to_replicate_config(
     if (!c_config) return config;
 
     config.replica_num = c_config->replica_num;
-    config.soft_pin_action = c_config->with_soft_pin != 0
-                                 ? mooncake::SoftPinAction::ENABLE
-                                 : mooncake::SoftPinAction::PRESERVE;
+    config.soft_pin_action =
+        static_cast<mooncake::SoftPinAction>(c_config->soft_pin_action);
+    if (c_config->has_soft_pin_ttl) {
+        config.soft_pin_ttl_ms = c_config->soft_pin_ttl_ms;
+    }
     config.with_hard_pin = c_config->with_hard_pin != 0;
     if (c_config->preferred_segments &&
         c_config->preferred_segments_count > 0) {

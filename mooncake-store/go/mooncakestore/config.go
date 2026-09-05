@@ -14,10 +14,30 @@
 
 package mooncakestore
 
+// SoftPinAction selects the soft-pin intent of a put operation. A soft pin
+// guards an object from eviction until a deadline fixed at write time;
+// reads never extend it.
+type SoftPinAction int
+
+const (
+	// SoftPinPreserve keeps an existing unexpired soft-pin deadline. It is
+	// the zero value, so plain puts commit ordinary cache.
+	SoftPinPreserve SoftPinAction = iota
+	// SoftPinEnable commits a new soft-pin lifetime when the write
+	// becomes readable.
+	SoftPinEnable
+	// SoftPinDisable removes an existing soft pin when the write
+	// becomes readable.
+	SoftPinDisable
+)
+
 // ReplicateConfig controls replica placement for put operations.
 type ReplicateConfig struct {
-	ReplicaNum        int
-	WithSoftPin       bool
+	ReplicaNum    int
+	SoftPinAction SoftPinAction
+	// SoftPinTTLMS overrides the master's default soft-pin TTL in
+	// milliseconds. Only valid with SoftPinEnable.
+	SoftPinTTLMS      *uint64
 	WithHardPin       bool
 	PreferredSegments []string
 }
@@ -26,7 +46,6 @@ type ReplicateConfig struct {
 func DefaultReplicateConfig() ReplicateConfig {
 	return ReplicateConfig{
 		ReplicaNum:  1,
-		WithSoftPin: false,
 		WithHardPin: false,
 	}
 }
