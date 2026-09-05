@@ -166,6 +166,10 @@ For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../
 ### Data Transfer
 Transfer Engine provides batch-based read/write transfers between segments (DRAM/VRAM/NVMeof). A typical flow is: register local memory, open a target segment, submit a batch, and poll status. Detailed function signatures and usage are documented in the C++ API reference.
 
+For asynchronous scatter transfers that must respect a caller deadline without
+reusing buffers still owned by DMA or RDMA, see
+[Deadline-safe scatter lifecycle](deadline-safe-scatter.md).
+
 ### Multi-Transport Management
 
 The `TransferEngine` class internally manages multiple backend `Transport` classes.
@@ -521,6 +525,14 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 ## C++ API Reference
 
 For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
+
+## Deadline-safe Operations
+
+:::{toctree}
+:maxdepth: 1
+
+deadline-safe-scatter
+:::
 
 ## Supported Protocols
 
