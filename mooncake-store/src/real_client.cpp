@@ -13,11 +13,13 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <new>
 #include <optional>
 #include <vector>
 
 #include "real_client.h"
 #include "registered_pinned_memory.h"
+#include "pinned_buffer_pool.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "common.h"
@@ -433,6 +435,33 @@ inline const Replica::Descriptor *SelectCompleteMemoryReplica(
     return first_memory;
 }
 
+struct SessionStagingBacking {
+    std::shared_ptr<PinnedBufferPool> pool;
+    PinnedBufferPool::Buffer buffer;
+
+    ~SessionStagingBacking() {
+        if (pool && buffer.data) pool->Release(std::move(buffer));
+    }
+};
+
+std::shared_ptr<BufferHandle> AcquireSessionStaging(
+    const std::shared_ptr<PinnedBufferPool> &pool, size_t size) {
+    if (!pool || size == 0) return nullptr;
+
+    try {
+        auto backing = std::make_shared<SessionStagingBacking>();
+        backing->pool = pool;
+        backing->buffer = pool->Acquire(size);
+        if (!backing->buffer.data || backing->buffer.capacity < size) {
+            return nullptr;
+        }
+        return std::make_shared<BufferHandle>(
+            backing->buffer.data, size, [backing]() { (void)backing; });
+    } catch (const std::bad_alloc &) {
+        return nullptr;
+    }
+}
+
 inline bool HasMemoryReplica(const std::vector<Replica::Descriptor> &replicas) {
     for (const auto &r : replicas) {
         if (r.is_memory_replica()) {
@@ -720,6 +749,7 @@ RealClient::RealClient() {
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
     use_hugepage_ = (hp != nullptr);
+    session_staging_pool_ = std::make_shared<PinnedBufferPool>();
 }
 
 RealClient::~RealClient() {
