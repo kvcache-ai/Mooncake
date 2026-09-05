@@ -425,6 +425,16 @@ target_include_directories(tent_fault_proxy_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_fault_proxy_test COMMAND tent_fault_proxy_test)
 
+add_executable(tent_proxy_manager_test proxy_manager_test.cpp)
+target_link_libraries(tent_proxy_manager_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_proxy_manager_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_proxy_manager_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_proxy_manager_test COMMAND tent_proxy_manager_test)
+
 add_executable(tent_rail_monitor_test rail_monitor_test.cpp)
 target_link_libraries(tent_rail_monitor_test PRIVATE gtest gtest_main
                                                      tent_link_group)

@@ -17,14 +17,16 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
-#include <set>
 #include <utility>
 
 namespace mooncake {
 namespace tent {
 namespace {
 
-using PublicTaskKey = std::pair<uint64_t, size_t>;
+struct PendingPublicTask {
+    size_t task_id{0};
+    size_t owner_index{0};
+};
 
 // Sort key for EDF: owners without a deadline (0) sort after all deadlined
 // owners, so they never jump ahead of a real deadline.
@@ -45,6 +47,16 @@ bool isSupportedOwnerKind(QueueOwnerKind kind) {
     switch (kind) {
         case QueueOwnerKind::User:
         case QueueOwnerKind::StagingInternal:
+            return true;
+    }
+    return false;
+}
+
+bool isSupportedRequestPriority(int priority) {
+    switch (priority) {
+        case PRIO_HIGH:
+        case PRIO_MEDIUM:
+        case PRIO_LOW:
             return true;
     }
     return false;
@@ -73,6 +85,107 @@ Status validateLimits(const QueueLimits& limits) {
 
 }  // namespace
 
+size_t LocalTransferAdmissionQueue::DispatchScheduler::laneForKind(
+    QueueOwnerKind kind) {
+    return kind == QueueOwnerKind::StagingInternal
+               ? static_cast<size_t>(KindLane::StagingInternal)
+               : static_cast<size_t>(KindLane::User);
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::enqueue(
+    QueueOwnerId owner_id, int priority, QueueOwnerKind kind,
+    bool deadline_aware, const OwnerMap& owners) {
+    auto& queue = classes_[priority].lanes[laneForKind(kind)].queue;
+    if (!deadline_aware) {
+        queue.push_back(owner_id);
+        return;
+    }
+
+    const auto owner_it = owners.find(owner_id);
+    const uint64_t key =
+        owner_it == owners.end()
+            ? std::numeric_limits<uint64_t>::max()
+            : deadlineKey(owner_it->second.request.deadline_ns);
+    const auto pos = std::upper_bound(
+        queue.begin(), queue.end(), key, [&owners](uint64_t deadline,
+                                                   QueueOwnerId queued_id) {
+            const auto queued_it = owners.find(queued_id);
+            const uint64_t queued_deadline =
+                queued_it == owners.end()
+                    ? std::numeric_limits<uint64_t>::max()
+                    : deadlineKey(queued_it->second.request.deadline_ns);
+            return deadline < queued_deadline;
+        });
+    queue.insert(pos, owner_id);
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::promoteDeadlineUrgentOwners(
+    uint64_t now_ns, uint64_t promotion_slack_ns, const OwnerMap& owners) {
+    if (promotion_slack_ns == 0) return;
+
+    for (auto& priority_class : classes_) {
+        for (auto& lane : priority_class.lanes) {
+            std::stable_partition(
+                lane.queue.begin(), lane.queue.end(), [&](QueueOwnerId id) {
+                    const auto owner_it = owners.find(id);
+                    if (owner_it == owners.end() ||
+                        owner_it->second.state != QueueState::Queued) {
+                        return false;
+                    }
+                    const uint64_t deadline =
+                        owner_it->second.request.deadline_ns;
+                    return deadline > now_ns &&
+                           deadline - now_ns < promotion_slack_ns;
+                });
+        }
+    }
+}
+
+LocalTransferAdmissionQueue::DispatchScheduler::Candidate
+LocalTransferAdmissionQueue::DispatchScheduler::next(
+    size_t remaining_bytes, const OwnerMap& owners) {
+    for (size_t priority = PRIO_HIGH; priority < classes_.size(); ++priority) {
+        auto& priority_class = classes_[priority];
+        bool has_queued_owner = false;
+        for (size_t offset = 0; offset < priority_class.lanes.size(); ++offset) {
+            const size_t lane =
+                (priority_class.next_kind_lane + offset) %
+                priority_class.lanes.size();
+            auto& queue = priority_class.lanes[lane].queue;
+            while (!queue.empty()) {
+                const auto owner_it = owners.find(queue.front());
+                if (owner_it != owners.end() &&
+                    owner_it->second.state == QueueState::Queued) {
+                    has_queued_owner = true;
+                    if (owner_it->second.request.length <= remaining_bytes) {
+                        return Candidate{queue.front(), priority, lane, true};
+                    }
+                    break;
+                }
+                queue.pop_front();
+            }
+        }
+        if (has_queued_owner) return Candidate{0, priority, 0, true};
+    }
+    return {};
+}
+
+void LocalTransferAdmissionQueue::DispatchScheduler::consume(
+    const Candidate& candidate) {
+    if (!candidate.found || candidate.priority >= classes_.size() ||
+        candidate.lane >= classes_[candidate.priority].lanes.size()) {
+        return;
+    }
+
+    auto& priority_class = classes_[candidate.priority];
+    auto& queue = priority_class.lanes[candidate.lane].queue;
+    if (!queue.empty() && queue.front() == candidate.owner_id) {
+        queue.pop_front();
+        priority_class.next_kind_lane =
+            (candidate.lane + 1) % priority_class.lanes.size();
+    }
+}
+
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
     : limits_(limits), limits_status_(validateLimits(limits)) {}
 
@@ -83,37 +196,36 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     if (submit.batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
-    if (submit.owners.empty()) return Status::OK();
 
-    std::set<PublicTaskKey> public_keys;
+    std::vector<PendingPublicTask> public_tasks;
+    size_t public_task_extent = 0;
     size_t byte_charge = 0;
     size_t user_owner_charge = 0;
     size_t user_byte_charge = 0;
 
-    for (const auto& owner : submit.owners) {
+    for (size_t owner_index = 0; owner_index < submit.owners.size();
+         ++owner_index) {
+        const auto& owner = submit.owners[owner_index];
         if (!isSupportedOwnerKind(owner.kind)) {
             return Status::InvalidArgument(
                 "unsupported queue owner kind" LOC_MARK);
+        }
+        if (!isSupportedRequestPriority(owner.request.priority)) {
+            return Status::InvalidArgument(
+                "unsupported queue request priority" LOC_MARK);
         }
         if (owner.request.length == 0) {
             return Status::InvalidArgument("empty transfer request" LOC_MARK);
         }
 
-        const PublicTaskKey owner_key{submit.batch_token, owner.owner_task_id};
-        if (!public_keys.insert(owner_key).second) {
-            return Status::InvalidArgument("duplicate public task id" LOC_MARK);
-        }
+        size_t task_extent = 0;
+        CHECK_STATUS(checkedAdd(owner.owner_task_id, 1, task_extent));
+        public_task_extent = std::max(public_task_extent, task_extent);
+        public_tasks.push_back({owner.owner_task_id, owner_index});
         for (const auto derived_task_id : owner.derived_task_ids) {
-            if (derived_task_id == owner.owner_task_id) {
-                return Status::InvalidArgument(
-                    "owner task id appears in derived task ids" LOC_MARK);
-            }
-            const PublicTaskKey derived_key{submit.batch_token,
-                                            derived_task_id};
-            if (!public_keys.insert(derived_key).second) {
-                return Status::InvalidArgument(
-                    "duplicate public task id" LOC_MARK);
-            }
+            CHECK_STATUS(checkedAdd(derived_task_id, 1, task_extent));
+            public_task_extent = std::max(public_task_extent, task_extent);
+            public_tasks.push_back({derived_task_id, owner_index});
         }
 
         CHECK_STATUS(
@@ -125,15 +237,15 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         }
     }
 
-    if (public_keys.size() > submit.batch_slots_left) {
-        return Status::TooManyRequests(
-            "batch public task capacity exceeded" LOC_MARK);
-    }
-
-    for (const auto& key : public_keys) {
-        if (public_to_owner_.count(key)) {
-            return Status::InvalidEntry(
-                "public task id already admitted" LOC_MARK);
+    auto batch_it = batch_index_.find(submit.batch_token);
+    if (batch_it != batch_index_.end()) {
+        for (const auto& public_task : public_tasks) {
+            if (public_task.task_id <
+                    batch_it->second.public_task_owners.size() &&
+                batch_it->second.public_task_owners[public_task.task_id] != 0) {
+                return Status::InvalidEntry(
+                    "public task id already admitted" LOC_MARK);
+            }
         }
     }
 
@@ -171,6 +283,9 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     }
 
     admitted_owner_ids.reserve(submit.owners.size());
+    auto& batch_index =
+        batch_index_.try_emplace(submit.batch_token).first->second;
+
     for (const auto& owner_input : submit.owners) {
         const QueueOwnerId owner_id = next_owner_id_++;
         QueueOwner owner;
@@ -179,34 +294,17 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.kind = owner_input.kind;
         owner.degradation_eligible = owner_input.degradation_eligible;
         owners_.emplace(owner_id, owner);
-
-        public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
-            owner_id;
-        for (const auto derived_task_id : owner_input.derived_task_ids) {
-            public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
-        }
-        // RFC #2519 step 2: keep fifo_ ordered on admission so pickForDispatch
-        // never has to re-sort. Default (deadline_aware == false) appends in
-        // strict FIFO. When deadline-aware, insert at the earliest-deadline-
-        // first position; upper_bound places a new owner *after* existing
-        // owners with the same deadline, preserving FIFO order among ties.
-        if (limits_.deadline_aware) {
-            const uint64_t key = deadlineKey(owner.request.deadline_ns);
-            auto pos = std::upper_bound(
-                fifo_.begin(), fifo_.end(), key,
-                [this](uint64_t k, QueueOwnerId id) {
-                    auto it = owners_.find(id);
-                    uint64_t d =
-                        (it == owners_.end())
-                            ? std::numeric_limits<uint64_t>::max()
-                            : deadlineKey(it->second.request.deadline_ns);
-                    return k < d;
-                });
-            fifo_.insert(pos, owner_id);
-        } else {
-            fifo_.push_back(owner_id);
-        }
+        batch_index.owner_ids.push_back(owner_id);
+        scheduler_.enqueue(owner_id, owner_input.request.priority,
+                           owner_input.kind, limits_.deadline_aware, owners_);
         admitted_owner_ids.push_back(owner_id);
+    }
+    if (batch_index.public_task_owners.size() < public_task_extent) {
+        batch_index.public_task_owners.resize(public_task_extent, 0);
+    }
+    for (const auto& public_task : public_tasks) {
+        batch_index.public_task_owners[public_task.task_id] =
+            admitted_owner_ids[public_task.owner_index];
     }
 
     outstanding_owners_ = next_outstanding_owners;
@@ -231,12 +329,9 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
 
-    // RFC #2519 step 2 (opt-in): earliest-deadline-first dispatch. When
-    // deadline_aware, fifo_ is kept EDF-ordered at admission time (see
-    // tryAdmit's ordered insert), so there is nothing to sort here — we just
-    // consume from the front. This keeps the hot dispatch path O(picked)
-    // instead of re-sorting the whole queue on every call. Default
-    // (deadline_aware == false) is plain FIFO.
+    // RFC #2519 step 2 (opt-in): each priority/kind lane is kept EDF-ordered
+    // at admission time, so the scheduler only consumes lane fronts here.
+    // Request priority remains the outer ordering rule.
     //
     // RFC #2519 step 3 (opt-in): drop is active only when a positive threshold,
     // deadline awareness, and a bandwidth provider are all present.
@@ -258,20 +353,11 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
                              .count()))
             : 0;
 
-    // Deadline proximity promotion: partition fifo_ so owners with critical
-    // slack (deadline approaching within promotion_slack_ns) appear before
-    // owners with comfortable slack or no deadline. stable_partition preserves
-    // relative EDF order within each group.
+    // Deadline proximity promotion runs within each priority/kind lane.
     if (promotion_enabled) {
-        std::stable_partition(fifo_.begin(), fifo_.end(), [&](QueueOwnerId id) {
-            auto it = owners_.find(id);
-            if (it == owners_.end() || it->second.state != QueueState::Queued) {
-                return false;
-            }
-            const uint64_t dl = it->second.request.deadline_ns;
-            if (dl == 0 || dl <= now_ns) return false;
-            return (dl - now_ns) < limits_.promotion_slack_ns;
-        });
+        scheduler_.promoteDeadlineUrgentOwners(now_ns,
+                                               limits_.promotion_slack_ns,
+                                               owners_);
     }
 
     // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
@@ -305,37 +391,27 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
-    while (!fifo_.empty() && used_owners < max_owners) {
-        auto owner_id = fifo_.front();
-        auto owner_it = owners_.find(owner_id);
-        // Non-queued entries should not normally remain in fifo_, but stale
-        // entries are skipped defensively so retireBatch() does not need to
-        // scan the dispatch queue.
-        if (owner_it == owners_.end() ||
-            owner_it->second.state != QueueState::Queued) {
-            fifo_.pop_front();
-            continue;
-        }
+    while (used_owners < max_owners && used_bytes < max_bytes) {
+        const auto candidate =
+            scheduler_.next(max_bytes - used_bytes, owners_);
+        if (!candidate.found || candidate.owner_id == 0) break;
 
-        // Step 3: an owner predicted to miss its deadline is dropped (not
-        // dispatched) and does not consume the dispatch budget. Because the
-        // queue is EDF-ordered, later owners have looser deadlines, so we keep
-        // scanning rather than stopping.
+        auto owner_it = owners_.find(candidate.owner_id);
+        if (owner_it == owners_.end()) continue;
+
+        // Step 3: a dropped owner does not consume dispatch budget. Continue
+        // at the same priority so an infeasible head cannot block its lane.
         if (shouldDrop(owner_it->second)) {
-            fifo_.pop_front();
-            dropOwner(owner_id, owner_it->second);
+            scheduler_.consume(candidate);
+            dropOwner(candidate.owner_id, owner_it->second);
             continue;
         }
 
-        const auto& owner = owner_it->second;
-        const size_t remaining_bytes = max_bytes - used_bytes;
-        if (owner.request.length > remaining_bytes) break;
-
-        fifo_.pop_front();
+        scheduler_.consume(candidate);
         owner_it->second.state = QueueState::Dispatching;
-        picked.push_back(owner_id);
+        picked.push_back(candidate.owner_id);
         ++used_owners;
-        used_bytes += owner.request.length;
+        used_bytes += owner_it->second.request.length;
     }
     return picked;
 }
@@ -405,17 +481,10 @@ Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
 
-    const PublicTaskKey batch_begin{batch_token, 0};
-    auto public_begin = public_to_owner_.lower_bound(batch_begin);
-    auto public_end = public_to_owner_.upper_bound(
-        {batch_token, std::numeric_limits<size_t>::max()});
+    auto batch_it = batch_index_.find(batch_token);
+    if (batch_it == batch_index_.end()) return Status::OK();
 
-    std::set<QueueOwnerId> owner_ids;
-    for (auto it = public_begin; it != public_end; ++it) {
-        owner_ids.insert(it->second);
-    }
-
-    for (const auto owner_id : owner_ids) {
+    for (const auto owner_id : batch_it->second.owner_ids) {
         auto owner_it = owners_.find(owner_id);
         if (owner_it == owners_.end()) {
             return Status::InternalError(
@@ -433,10 +502,10 @@ Status LocalTransferAdmissionQueue::retireBatch(uint64_t batch_token) {
         }
     }
 
-    for (const auto owner_id : owner_ids) {
+    for (const auto owner_id : batch_it->second.owner_ids) {
         owners_.erase(owner_id);
     }
-    public_to_owner_.erase(public_begin, public_end);
+    batch_index_.erase(batch_it);
     return Status::OK();
 }
 
@@ -446,11 +515,15 @@ Status LocalTransferAdmissionQueue::resolveOwner(uint64_t batch_token,
     if (batch_token == 0) {
         return Status::InvalidArgument("invalid batch token" LOC_MARK);
     }
-    auto it = public_to_owner_.find({batch_token, public_task_id});
-    if (it == public_to_owner_.end()) {
+    auto batch_it = batch_index_.find(batch_token);
+    if (batch_it == batch_index_.end()) {
         return Status::InvalidEntry("public task id not found" LOC_MARK);
     }
-    owner_id = it->second;
+    if (public_task_id >= batch_it->second.public_task_owners.size() ||
+        batch_it->second.public_task_owners[public_task_id] == 0) {
+        return Status::InvalidEntry("public task id not found" LOC_MARK);
+    }
+    owner_id = batch_it->second.public_task_owners[public_task_id];
     return Status::OK();
 }
 
