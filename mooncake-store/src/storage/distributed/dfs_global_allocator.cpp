@@ -155,6 +155,70 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
     };
 }
 
+std::vector<BatchAllocateResult> DfsGlobalAllocator::BatchAllocate(
+    const std::vector<BatchAllocateRequest>& requests) {
+    std::vector<BatchAllocateResult> results;
+    results.reserve(requests.size());
+    for (const auto& request : requests) {
+        results.push_back(
+            BatchAllocateResult{request.key, {}, false, ErrorCode::OK});
+    }
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        auto descriptor = Allocate(requests[i].key, requests[i].size);
+        if (descriptor) {
+            results[i].descriptor = std::move(*descriptor);
+            results[i].success = true;
+            continue;
+        }
+
+        const ErrorCode error = descriptor.error();
+        for (size_t j = 0; j < i; ++j) {
+            if (results[j].success) {
+                Free(results[j].key, results[j].descriptor);
+            }
+        }
+        for (auto& result : results) {
+            result.descriptor = {};
+            result.success = false;
+            result.error = error;
+        }
+        return results;
+    }
+    return results;
+}
+
+void DfsGlobalAllocator::Free(
+    const std::string& key, const DistributedFSDescriptor& descriptor) {
+    Free(descriptor.offset, descriptor.aligned_size, descriptor.shard_idx, key);
+}
+
+void DfsGlobalAllocator::UpdateAccess(
+    const std::string& key, const DistributedFSDescriptor& descriptor) {
+    UpdateAccess(key, descriptor.shard_idx, descriptor.offset);
+}
+
+uint64_t DfsGlobalAllocator::GetTotalCapacity() const {
+    uint64_t total = 0;
+    for (const auto& shard : shards_) {
+        if (shard) total += shard->capacity;
+    }
+    return total;
+}
+
+uint64_t DfsGlobalAllocator::GetUsedBytes() const {
+    uint64_t used = 0;
+    for (const auto& shard : shards_) {
+        if (!shard) continue;
+        std::shared_lock lock(shard->handle_mutex);
+        const auto report = shard->allocator->storageReport();
+        const uint64_t free_space =
+            std::min<uint64_t>(report.totalFreeSpace, shard->capacity);
+        used += shard->capacity - free_space;
+    }
+    return used;
+}
+
 void DfsGlobalAllocator::Free(uint64_t offset, uint64_t /*aligned_size*/,
                               int shard_idx, const std::string& key) {
     if (!initialized_.load(std::memory_order_acquire)) return;

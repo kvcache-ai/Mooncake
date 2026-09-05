@@ -17,13 +17,14 @@
 #include "offset_allocator/offset_allocator.h"
 #include "replica.h"
 #include "storage/distributed/fs_adapter.h"
+#include "storage/distributed/global_allocator_interface.h"
 #include "types.h"
 
 namespace mooncake {
 
 struct DistributedStorageConfig;
 
-class DfsGlobalAllocator {
+class DfsGlobalAllocator final : public GlobalAllocatorInterface {
    public:
     struct EvictionCandidate {
         std::string key;
@@ -66,18 +67,30 @@ class DfsGlobalAllocator {
     };
 
     DfsGlobalAllocator() = default;
-    ~DfsGlobalAllocator();
+    ~DfsGlobalAllocator() override;
 
     DfsGlobalAllocator(const DfsGlobalAllocator&) = delete;
     DfsGlobalAllocator& operator=(const DfsGlobalAllocator&) = delete;
 
-    tl::expected<void, ErrorCode> Init(const DistributedStorageConfig& config);
-    bool IsInitialized() const {
+    DfsAllocatorType Type() const override { return DfsAllocatorType::SHARD; }
+
+    tl::expected<void, ErrorCode> Init(
+        const DistributedStorageConfig& config) override;
+    bool IsInitialized() const override {
         return initialized_.load(std::memory_order_acquire);
     }
 
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
-        const std::string& key, uint64_t size);
+        const std::string& key, uint64_t size) override;
+    std::vector<BatchAllocateResult> BatchAllocate(
+        const std::vector<BatchAllocateRequest>& requests) override;
+
+    void Free(const std::string& key,
+              const DistributedFSDescriptor& descriptor) override;
+    void UpdateAccess(
+        const std::string& key,
+        const DistributedFSDescriptor& descriptor) override;
+
     void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
               const std::string& key);
     void UpdateAccess(const std::string& key, int shard_idx, uint64_t offset);
@@ -87,10 +100,13 @@ class DfsGlobalAllocator {
     void ResolvePreparedEviction(PendingEviction&& pending,
                                  const std::vector<bool>& accepted);
 
-    bool IsEvictionEnabled() const { return eviction_enabled_; }
-    std::chrono::seconds GetEvictionCheckInterval() const {
+    bool IsEvictionEnabled() const override { return eviction_enabled_; }
+    std::chrono::seconds GetEvictionCheckInterval() const override {
         return eviction_check_interval_;
     }
+
+    uint64_t GetTotalCapacity() const override;
+    uint64_t GetUsedBytes() const override;
 
     static std::string FormatShardIdx(int idx, int shard_count);
 
