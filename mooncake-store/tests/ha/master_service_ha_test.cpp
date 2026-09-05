@@ -3240,6 +3240,124 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(2u, prefix.last_seq);
 }
 
+TEST_F(MasterServiceHATest,
+       PutEndFailsBeforeMutationWhenBatchReservationUnavailable) {
+    const std::string cluster_id = "test_put_end_reservation_failure";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "put_end_reservation_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "put_end_reservation_key";
+    ASSERT_TRUE(
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config)
+            .has_value());
+
+    {
+        auto held_reservation = ReserveBatchSlotForTesting(service);
+        ASSERT_TRUE(held_reservation.has_value())
+            << toString(held_reservation.error());
+
+        auto put_end = service.PutEnd(mounted.client_id, key, kDefaultTenant,
+                                      ReplicaType::MEMORY);
+        EXPECT_FALSE(put_end.has_value());
+        if (!put_end) {
+            EXPECT_EQ(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, put_end.error());
+        }
+
+        auto descriptors =
+            ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+        ASSERT_EQ(1u, descriptors.size());
+        EXPECT_EQ(ReplicaStatus::PROCESSING, descriptors.front().status);
+
+        auto replicas = service.GetReplicaList(key, kDefaultTenant);
+        EXPECT_FALSE(replicas.has_value());
+        if (!replicas) {
+            EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, replicas.error());
+        }
+        auto exists = service.ExistKey(key, kDefaultTenant);
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(exists.value());
+    }
+
+    // Releasing capacity lets the same primary write finish normally.
+    EXPECT_TRUE(
+        service
+            .PutEnd(mounted.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
+}
+
+TEST_F(MasterServiceHATest, PutEndCommitFailureLeavesReplicasProcessing) {
+    const std::string cluster_id = "test_put_end_commit_failure";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectingWriter(service, backend);
+    ASSERT_NE(nullptr, writer);
+
+    auto mounted = PrepareSimpleSegment(service, "put_end_commit_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::string key = "put_end_commit_key";
+    ASSERT_TRUE(
+        service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config)
+            .has_value());
+
+    writer->RejectCommitsWith(ErrorCode::INVALID_PARAMS);
+    auto put_end = service.PutEnd(mounted.client_id, key, kDefaultTenant,
+                                  ReplicaType::MEMORY);
+    EXPECT_FALSE(put_end.has_value());
+    if (!put_end) {
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_end.error());
+    }
+    EXPECT_EQ(1u, writer->rejected_commits());
+
+    auto descriptors =
+        ReplicaDescriptorsForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(1u, descriptors.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, descriptors.front().status);
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    EXPECT_FALSE(replicas.has_value());
+    if (!replicas) {
+        EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, replicas.error());
+    }
+    auto exists = service.ExistKey(key, kDefaultTenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
+
+    // A rejected Commit releases its reservation and preserves retryability.
+    writer->RejectCommitsWith(ErrorCode::OK);
+    EXPECT_TRUE(
+        service
+            .PutEnd(mounted.client_id, key, kDefaultTenant, ReplicaType::MEMORY)
+            .has_value());
+    EXPECT_TRUE(service.GetReplicaList(key, kDefaultTenant).has_value());
+    EXPECT_EQ(1u, writer->rejected_commits());
+}
+
 TEST_F(MasterServiceHATest, PutEndVisibleBeforeBatchRecordDurable) {
     const std::string cluster_id = "test_batch_record_put_end_visible";
     auto backend = std::make_shared<BlockingBatchHaKvBackend>();
