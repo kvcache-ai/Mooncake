@@ -1019,6 +1019,12 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
+    // Background pass: evict any tenant that is over its own watermark down to
+    // (watermark - eviction_ratio) of its effective quota. Called from
+    // EvictionThreadFunc, and a no-op unless multi-tenancy and
+    // tenant_eviction_high_watermark_ratio are both enabled.
+    void EvictTenantsOverWatermark();
+
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
@@ -2243,6 +2249,11 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
+    // 0.0 disables, which is the historical behaviour. See
+    // EvictTenantsOverWatermark for why the pool-wide ratio above is not
+    // sufficient once quotas partition the pool.
+    const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
@@ -2251,6 +2262,12 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // The eviction thread wakes every 10 ms, but the tenant pass has to walk
+    // every registered tenant and lock every quota shard, so it is throttled
+    // rather than run on each tick. Quota pressure builds over seconds, not
+    // milliseconds, and admission still has its own synchronous fallback in
+    // between.
+    static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
