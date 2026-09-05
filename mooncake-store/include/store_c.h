@@ -41,7 +41,8 @@ struct mooncake_replicate_config {
     int with_hard_pin;
     const char **preferred_segments;
     size_t preferred_segments_count;
-    /* One of enum mooncake_soft_pin_action. */
+    /* One of enum mooncake_soft_pin_action; put functions return -1
+     * for any other value. */
     int soft_pin_action;
     /* TTL override in milliseconds; meaningful only with
      * MOONCAKE_SOFT_PIN_ENABLE. When unset, the master default TTL
