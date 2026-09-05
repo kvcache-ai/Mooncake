@@ -1,35 +1,13 @@
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
 
-#include <cstring>
 #include <utility>
 
 #include <transport/device/device_transport.h>
 
 #include "gpu_runtime.h"
+#include "pg_utils.h"
 
 namespace mooncake {
-namespace {
-
-std::vector<uint8_t> encodeHandle(const std::vector<int32_t>& handle) {
-    std::vector<uint8_t> metadata(handle.size() * sizeof(int32_t));
-    if (!metadata.empty()) {
-        std::memcpy(metadata.data(), handle.data(), metadata.size());
-    }
-    return metadata;
-}
-
-PGResult<std::vector<int32_t>> decodeHandle(const RouteEndpoint& endpoint) {
-    PG_VALIDATE_ARG(!endpoint.metadata.empty() &&
-                        endpoint.metadata.size() % sizeof(int32_t) == 0,
-                    "P2P route endpoint metadata is invalid");
-
-    std::vector<int32_t> handle(endpoint.metadata.size() / sizeof(int32_t));
-    std::memcpy(handle.data(), endpoint.metadata.data(),
-                endpoint.metadata.size());
-    return handle;
-}
-
-}  // namespace
 
 P2pRoute::P2pRoute(device::P2pTransport& transport, void* local_region,
                    int device_index, GlobalRank self_rank,
@@ -58,7 +36,7 @@ std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
-        .metadata = encodeHandle(handle),
+        .metadata = pgSerialize(handle),
     };
 }
 
@@ -82,7 +60,10 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
          ++rank) {
         PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
         if (!endpoint) continue;
-        PG_TRY(handles[rank], decodeHandle(*endpoint));
+        PG_TRY(handles[rank],
+               pgDeserialize<std::vector<int32_t>>(endpoint->metadata));
+        PG_VALIDATE_ARG(!handles[rank].empty(),
+                        "P2P route endpoint handle is empty");
         active[rank] = 1;
     }
 

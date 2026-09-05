@@ -6,9 +6,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
-#include <vector>
 
 #include "control_plane/control_types.h"
+#include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
+#include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
+#include "device_comm/device_transfer/routes/rdma_route/rdma_route.h"
 #include "device_comm/device_transfer/transfer_region.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "error_types.h"
@@ -18,6 +20,12 @@ namespace mooncake {
 class LinkManager;
 class TransferEngine;
 struct DeviceTransferHandle;
+
+struct DeviceRouteConfig {
+    P2pRouteOptions p2p;
+    RdmaRouteOptions rdma;
+    HostProxyRouteOptions host_proxy;
+};
 
 class DeviceTransferService {
    public:
@@ -31,7 +39,8 @@ class DeviceTransferService {
                               int device_index, TransferEngine& transfer_engine,
                               LinkManager& link_manager,
                               size_t peer_accessible_capacity,
-                              size_t local_staging_capacity);
+                              size_t local_staging_capacity,
+                              const DeviceRouteConfig& config = {});
 
     // Allocate a slice from the stable peer-accessible region. The backing
     // region is published once through DeviceTransferEndpoint; individual

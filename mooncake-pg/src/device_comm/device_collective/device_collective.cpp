@@ -279,9 +279,13 @@ PGResult<void> DeviceCollectiveRuntime::prepareFailureResume() {
     auto& mailbox = *control_mailbox_;
 
     // The last channel CTA of the failed invocation remains resident while the
-    // host-proxy worker can still make progress, so drain outstanding route
-    // work before replacing protocol state.
-    PG_TRY(transfer_service_.waitUntilIdle());
+    // host-proxy worker can still make progress. Drain best-effort: failure
+    // should not prevent recovery from acknowledging that CTA.
+    auto drain_result = transfer_service_.waitUntilIdle();
+    if (!drain_result.has_value()) {
+        LOG(WARNING) << "device collective drain failed; continuing recovery: "
+                     << drain_result.error().message;
+    }
 
     const auto failed_rank = mailbox.failed_rank;
     if (mailbox.failed_hint_address != 0) {

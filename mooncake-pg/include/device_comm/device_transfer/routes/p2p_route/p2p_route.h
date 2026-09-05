@@ -17,6 +17,10 @@ namespace device {
 class P2pTransport;
 }
 
+struct P2pRouteOptions {
+    bool enabled = true;
+};
+
 class P2pRoute : public RouteProvider {
    public:
     static constexpr std::string_view kRouteKey = "p2p";

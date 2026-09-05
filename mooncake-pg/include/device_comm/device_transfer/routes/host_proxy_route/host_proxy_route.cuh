@@ -77,19 +77,25 @@ __device__ __forceinline__ void publishHostProxyCommand(
 }
 
 __device__ __forceinline__ HostProxyTransferTicket
-hostProxyPut(HostProxyCommandSlot* command_slots,
-             uint64_t remote_region_address, GlobalRank target_rank,
+hostProxyPut(const DeviceHostProxyRoute& route,
+             const DeviceHostProxyContext& context, GlobalRank target_rank,
              const void* source, uint64_t remote_payload_offset, uint64_t size,
              const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
              uint64_t* wait_result, cooperative_groups::thread_block block) {
     HostProxyTransferTicket ticket(wait_result);
+
+    // Every producer publishes its source writes to system scope before the
+    // leader hands the device address to the host worker.
+    __threadfence_system();
+    block.sync();
+
     // Submission is leader-only. Other threads only carry wait_result; wait()
     // reads the leader's private ticket state and broadcasts its result.
     if (block.thread_rank() != 0) return ticket;
 
-    PG_DEVICE_ASSERT(command_slots && lane < kTransferLaneCount &&
-                     remote_region_address != 0 && wait_result);
-    auto* const slot = command_slots + lane;
+    PG_DEVICE_ASSERT(context.command_slots && lane < kTransferLaneCount &&
+                     route.remote_region_address != 0 && wait_result);
+    auto* const slot = context.command_slots + lane;
     const uint64_t start_ticks = clock64();
 
     const uint64_t submitted =
@@ -106,7 +112,7 @@ hostProxyPut(HostProxyCommandSlot* command_slots,
     const uint64_t sequence = submitted + 1;
     HostProxyCommand command;
     command.local_addr = reinterpret_cast<uint64_t>(source);
-    command.remote_region_addr = remote_region_address;
+    command.remote_region_addr = route.remote_region_address;
     command.remote_offset = remote_payload_offset;
     command.size = size;
     command.signal = signal;
@@ -118,12 +124,11 @@ hostProxyPut(HostProxyCommandSlot* command_slots,
 }
 
 __device__ __forceinline__ HostProxyTransferTicket hostProxySignal(
-    HostProxyCommandSlot* command_slots, uint64_t remote_region_address,
+    const DeviceHostProxyRoute& route, const DeviceHostProxyContext& context,
     GlobalRank target_rank, const SignalAction& signal, uint64_t timeout_ticks,
     uint32_t lane, uint64_t* wait_result,
     cooperative_groups::thread_block block) {
-    device::mc_fence_barrier_fence();
-    return hostProxyPut(command_slots, remote_region_address, target_rank,
+    return hostProxyPut(route, context, target_rank,
                         /*source=*/nullptr, /*remote_payload_offset=*/0,
                         /*size=*/0, signal, timeout_ticks, lane, wait_result,
                         block);

@@ -236,16 +236,41 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return 0;
     }
 
-    int registerMemory(void* ptr, size_t bytes) override {
-        mr_ =
+    int registerMemory(void* ptr, size_t bytes,
+                       RdmaMemoryRegion& region) override {
+        ibv_mr* mr =
             ibv_reg_mr(pd_, ptr, bytes,
                        IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
                            IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_ATOMIC);
-        if (!mr_) {
+        if (!mr) {
             LOG(ERROR) << "[EP IBGDA] ibv_reg_mr failed";
             return -1;
         }
-        mr_ptr_ = ptr;
+        region = RdmaMemoryRegion{
+            .addr = ptr,
+            .size = bytes,
+            .lkey = static_cast<uint32_t>(mr->lkey),
+            .rkey = static_cast<uint32_t>(mr->rkey),
+        };
+        memory_regions_.push_back(RegisteredMemory{mr, region});
+        return 0;
+    }
+
+    int unregisterMemory(const RdmaMemoryRegion& region) override {
+        const auto current = std::find_if(
+            memory_regions_.begin(), memory_regions_.end(),
+            [&region](const RegisteredMemory& registered) {
+                return registered.region == region;
+            });
+        if (current == memory_regions_.end()) {
+            LOG(ERROR) << "[EP IBGDA] unknown memory registration";
+            return -1;
+        }
+        if (ibv_dereg_mr(current->mr)) {
+            LOG(ERROR) << "[EP IBGDA] ibv_dereg_mr failed";
+            return -1;
+        }
+        memory_regions_.erase(current);
         return 0;
     }
 
@@ -360,7 +385,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return createQueuePairs(stream_ptr);
     }
 
-    int connectPeers(int local_rank, bool is_roce,
+    int connectPeers(int local_rank, bool is_roce, uint32_t local_lkey,
                      const std::vector<int64_t>& remote_addrs,
                      const std::vector<int32_t>& remote_keys,
                      const std::vector<int32_t>& remote_qpns,
@@ -412,7 +437,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             if (active_ranks_mask[i] == 0) continue;
             uint64_t raddr = static_cast<uint64_t>(remote_addrs[i]);
             uint32_t rkey = (i == local_rank)
-                                ? static_cast<uint32_t>(mr_->lkey)
+                                ? local_lkey
                                 : static_cast<uint32_t>(remote_keys[i]);
             cudaMemcpy(static_cast<char*>(raddrs_) + i * sizeof(uint64_t),
                        &raddr, sizeof(uint64_t), cudaMemcpyHostToDevice);
@@ -422,10 +447,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return 0;
     }
 
-    RdmaLocalMetadata localMetadata() const override {
+    RdmaLocalMetadata localMetadata(
+        const RdmaMemoryRegion& region_to_publish) const override {
         RdmaLocalMetadata meta;
-        meta.raddr = mr_ ? reinterpret_cast<int64_t>(mr_->addr) : 0;
-        meta.rkey = mr_ ? static_cast<int32_t>(mr_->rkey) : 0;
+        meta.raddr = reinterpret_cast<int64_t>(region_to_publish.addr);
+        meta.rkey = static_cast<int32_t>(region_to_publish.rkey);
         meta.subnet_prefix = static_cast<int64_t>(gid_.global.subnet_prefix);
         meta.interface_id = static_cast<int64_t>(gid_.global.interface_id);
         for (auto* qp : qps_) {
@@ -886,10 +912,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     void teardown() {
         destroyQueuePairs();
         freeControlBuffer();
-        if (mr_) {
-            ibv_dereg_mr(mr_);
-            mr_ = nullptr;
+        for (const auto& registered : memory_regions_) {
+            ibv_dereg_mr(registered.mr);
         }
+        memory_regions_.clear();
         if (raddrs_) {
             cudaFree(raddrs_);
             raddrs_ = nullptr;
@@ -913,11 +939,15 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     // IB resources
+    struct RegisteredMemory {
+        ibv_mr* mr = nullptr;
+        RdmaMemoryRegion region;
+    };
+
     ibv_context* ctx_ = nullptr;
     ibv_pd* pd_ = nullptr;
     mlx5dv_pd mpd_{};
-    ibv_mr* mr_ = nullptr;
-    void* mr_ptr_ = nullptr;
+    std::vector<RegisteredMemory> memory_regions_;
     ibv_gid gid_{};
     int gid_index_ = -1;
     uint16_t lid_ = 0;
