@@ -1034,7 +1034,12 @@ class MasterService {
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Shard walk shared by the two sweeps above; removes completed replicas
-    // matching is_stale, erasing a key when no valid replica remains.
+    // matching is_stale, erasing a key when no valid replica remains. Each
+    // shard is first scanned under its shared lock to pick the keys that
+    // match, and only those are cleaned, in bounded batches under the write
+    // lock: a mass client expiry marks handles stale table-wide, and walking
+    // a whole shard while holding it exclusively blocked every RPC for that
+    // shard until the sweep moved on.
     void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
 
     std::string FormatTimestamp(
