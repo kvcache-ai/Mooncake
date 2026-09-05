@@ -18,6 +18,10 @@ class HostTransferProxy;
 class LinkManager;
 class TransferEngine;
 
+struct HostProxyRouteOptions {
+    bool enabled = true;
+};
+
 class HostProxyRoute : public RouteProvider {
    public:
     static constexpr std::string_view kRouteKey = "host-proxy";
@@ -27,8 +31,8 @@ class HostProxyRoute : public RouteProvider {
                    uint32_t max_world_size);
     ~HostProxyRoute() noexcept override;
 
-    PGResult<void> initialize(int device_index);
-    [[nodiscard]] HostProxyCommandSlot* deviceCommandSlots() const noexcept;
+    [[nodiscard]] PGResult<void> initialize(int device_index);
+    [[nodiscard]] DeviceHostProxyContext deviceContext() const noexcept;
 
     [[nodiscard]] std::string_view routeKey() const noexcept override;
     [[nodiscard]] uint32_t routeVersion() const noexcept override;

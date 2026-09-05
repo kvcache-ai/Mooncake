@@ -12,6 +12,7 @@
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cuh"
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.cuh"
+#include "device_comm/device_transfer/routes/rdma_route/rdma_route.cuh"
 
 namespace mooncake {
 
@@ -20,6 +21,23 @@ namespace mooncake {
 __device__ __forceinline__ bool signalReached(uint64_t observed,
                                               uint64_t least) {
     return observed - least < (uint64_t{1} << 63);
+}
+
+__device__ __forceinline__ void validateRemoteSignal(
+    const SignalAction& signal, uint64_t remote_region_size) {
+    PG_DEVICE_ASSERT(signal.kind == SignalAction::Kind::None ||
+                     signal.kind == SignalAction::Kind::Add ||
+                     signal.kind == SignalAction::Kind::Set);
+    if (signal.kind == SignalAction::Kind::None) return;
+
+    PG_DEVICE_ASSERT(signal.remote_offset % alignof(uint64_t) == 0);
+    PG_DEVICE_ASSERT(signal.remote_offset <= remote_region_size &&
+                     sizeof(uint64_t) <=
+                         remote_region_size - signal.remote_offset);
+    if (signal.kind == SignalAction::Kind::Add) {
+        PG_DEVICE_ASSERT(signal.add.delta != 0 &&
+                         signal.add.delta < (uint64_t{1} << 63));
+    }
 }
 
 class TransferTicket {
@@ -32,6 +50,8 @@ class TransferTicket {
         switch (route_) {
             case DeviceRouteType::P2p:
                 return p2p_.wait(block);
+            case DeviceRouteType::Rdma:
+                return rdma_.wait(block);
             case DeviceRouteType::HostProxy:
                 return host_proxy_.wait(block);
             case DeviceRouteType::Unreachable:
@@ -44,18 +64,25 @@ class TransferTicket {
    private:
     friend class TransferLane;
 
-    __device__ __forceinline__ TransferTicket() = default;
+    __device__ __forceinline__ TransferTicket() : p2p_{} {}
 
     __device__ __forceinline__ explicit TransferTicket(P2pTransferTicket ticket)
         : route_(DeviceRouteType::P2p), p2p_(ticket) {}
+
+    __device__ __forceinline__ explicit TransferTicket(
+        RdmaTransferTicket ticket)
+        : route_(DeviceRouteType::Rdma), rdma_(ticket) {}
 
     __device__ __forceinline__ explicit TransferTicket(
         HostProxyTransferTicket ticket)
         : route_(DeviceRouteType::HostProxy), host_proxy_(ticket) {}
 
     DeviceRouteType route_ = DeviceRouteType::Unreachable;
-    P2pTransferTicket p2p_;
-    HostProxyTransferTicket host_proxy_;
+    union {
+        P2pTransferTicket p2p_;
+        RdmaTransferTicket rdma_;
+        HostProxyTransferTicket host_proxy_;
+    };
 };
 
 class TransferLane {
@@ -63,32 +90,39 @@ class TransferLane {
     __device__ __forceinline__ TransferTicket
     put(GlobalRank rank, const PutRequest& request,
         cooperative_groups::thread_block block) const {
+        PG_DEVICE_ASSERT(rank >= 0 && static_cast<uint32_t>(rank) <
+                                          service_->max_world_size);
         const auto& route = service_->routes[rank];
         PG_DEVICE_ASSERT(service_->peer_accessible_region.contains(
                              request.local_ptr, request.size) ||
                          service_->local_staging_region.contains(
                              request.local_ptr, request.size));
+        if (route.type != DeviceRouteType::Unreachable) {
+            PG_DEVICE_ASSERT(request.remote_offset <= route.region_size &&
+                             request.size <=
+                                 route.region_size - request.remote_offset);
+            validateRemoteSignal(request.signal, route.region_size);
+        }
 
         switch (route.type) {
             case DeviceRouteType::P2p:
                 return TransferTicket(
-                    p2pPut(route.p2p.mapped_region_address, request.local_ptr,
-                           request.remote_offset, request.size, request.signal,
-                           block));
+                    p2pPut(route.p2p, request.local_ptr, request.remote_offset,
+                           request.size, request.signal, block));
 
-            case DeviceRouteType::HostProxy: {
-                // The source buffer may have been filled cooperatively. Every
-                // writer publishes its bytes to system scope before the leader
-                // hands the device address to the host worker.
-                __threadfence_system();
-                block.sync();
+            case DeviceRouteType::Rdma:
+                return TransferTicket(rdmaPut(
+                    route.rdma, service_->route_context.rdma, request.local_ptr,
+                    request.remote_offset, request.size, request.signal,
+                    request.timeout_ticks, lane_index_,
+                    service_->lane_results + lane_index_, block));
+
+            case DeviceRouteType::HostProxy:
                 return TransferTicket(hostProxyPut(
-                    service_->host_proxy_command_slots,
-                    route.host_proxy.remote_region_address, rank,
+                    route.host_proxy, service_->route_context.host_proxy, rank,
                     request.local_ptr, request.remote_offset, request.size,
                     request.signal, request.timeout_ticks, lane_index_,
                     service_->lane_results + lane_index_, block));
-            }
 
             case DeviceRouteType::Unreachable:
                 return TransferTicket();
@@ -100,16 +134,26 @@ class TransferLane {
     __device__ __forceinline__ TransferTicket
     signal(GlobalRank rank, const SignalRequest& request,
            cooperative_groups::thread_block block) const {
+        PG_DEVICE_ASSERT(rank >= 0 && static_cast<uint32_t>(rank) <
+                                          service_->max_world_size);
         const auto& route = service_->routes[rank];
+        if (route.type != DeviceRouteType::Unreachable) {
+            validateRemoteSignal(request.signal, route.region_size);
+        }
         switch (route.type) {
             case DeviceRouteType::P2p:
-                return TransferTicket(p2pSignal(route.p2p.mapped_region_address,
-                                                request.signal, block));
+                return TransferTicket(
+                    p2pSignal(route.p2p, request.signal, block));
+
+            case DeviceRouteType::Rdma:
+                return TransferTicket(rdmaSignal(
+                    route.rdma, service_->route_context.rdma, request.signal,
+                    request.timeout_ticks, lane_index_,
+                    service_->lane_results + lane_index_, block));
 
             case DeviceRouteType::HostProxy:
                 return TransferTicket(hostProxySignal(
-                    service_->host_proxy_command_slots,
-                    route.host_proxy.remote_region_address, rank,
+                    route.host_proxy, service_->route_context.host_proxy, rank,
                     request.signal, request.timeout_ticks, lane_index_,
                     service_->lane_results + lane_index_, block));
 
@@ -159,7 +203,9 @@ class TransferLane {
 
     __device__ __forceinline__ TransferLane(const DeviceTransferHandle* service,
                                             uint32_t lane_index)
-        : service_(service), lane_index_(lane_index) {}
+        : service_(service), lane_index_(lane_index) {
+        PG_DEVICE_ASSERT(service_ && lane_index_ < kTransferLaneCount);
+    }
 
     const DeviceTransferHandle* service_ = nullptr;
     uint32_t lane_index_ = 0;

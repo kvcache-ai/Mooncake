@@ -26,8 +26,8 @@ PGResult<void> HostProxyRoute::initialize(int device_index) {
     return {};
 }
 
-HostProxyCommandSlot* HostProxyRoute::deviceCommandSlots() const noexcept {
-    return device_slots_;
+DeviceHostProxyContext HostProxyRoute::deviceContext() const noexcept {
+    return DeviceHostProxyContext{.command_slots = device_slots_};
 }
 
 std::string_view HostProxyRoute::routeKey() const noexcept { return kRouteKey; }
