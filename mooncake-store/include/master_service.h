@@ -2235,6 +2235,10 @@ class MasterService {
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
     const uint64_t max_kv_soft_pin_ttl_;      // in milliseconds
     const bool allow_evict_soft_pinned_objects_;
+    // When false, ExistKey/BatchExistKey hits do not grant a read lease.
+    // Default true (upstream behavior); real reads still lease via
+    // GetReplicaList. See master_config.h exist_key_grant_lease.
+    const bool exist_key_grant_lease_;
 
     // Eviction related members
     std::atomic<bool> need_mem_eviction_{

@@ -141,6 +141,13 @@ struct MasterConfig {
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
 
+    // Grant a read lease on ExistKey/BatchExistKey hits (upstream default).
+    // Set false for read-heavy workloads (e.g. vLLM KV-offload lookup) where
+    // high-rate existence probes would otherwise pin the working set and
+    // starve eviction. Actual reads stay protected: GetReplicaList grants its
+    // own lease.
+    bool exist_key_grant_lease = true;
+
     // Dynamic MEMORY replica fanout for hot read-only objects.
     // Kept intentionally small: mode + frequency window + max replicas.
     std::string dynamic_replication_mode = "off";
@@ -249,6 +256,7 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    bool exist_key_grant_lease = true;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -309,6 +317,7 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        exist_key_grant_lease = config.exist_key_grant_lease;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -505,6 +514,7 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    bool exist_key_grant_lease = true;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -599,6 +609,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        exist_key_grant_lease = config.exist_key_grant_lease;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -723,6 +734,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        exist_key_grant_lease = config.exist_key_grant_lease;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -796,6 +808,7 @@ class MasterServiceConfigBuilder {
     uint64_t max_kv_soft_pin_ttl_ = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool exist_key_grant_lease_ = true;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -872,6 +885,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_exist_key_grant_lease(bool grant) {
+        exist_key_grant_lease_ = grant;
         return *this;
     }
 
@@ -1184,6 +1202,7 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    bool exist_key_grant_lease = true;
     std::string dynamic_replication_mode = "off";
     uint32_t dynamic_replication_heat_window_seconds = 10;
     double dynamic_replication_admission_qps_threshold = 0.8;
@@ -1274,6 +1293,7 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        exist_key_grant_lease = config.exist_key_grant_lease;
         dynamic_replication_mode = config.dynamic_replication_mode;
         dynamic_replication_heat_window_seconds =
             config.dynamic_replication_heat_window_seconds;
@@ -1350,6 +1370,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.max_kv_soft_pin_ttl = max_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
+    config.exist_key_grant_lease = exist_key_grant_lease_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.nof_eviction_ratio = nof_eviction_ratio_;

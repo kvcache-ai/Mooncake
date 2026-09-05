@@ -226,6 +226,12 @@ DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
 DEFINE_bool(promotion_on_hit, false,
             "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
             "offload_on_evict)");
+DEFINE_bool(
+    exist_key_grant_lease, true,
+    "Grant a read lease on ExistKey/BatchExistKey hits (upstream "
+    "default). Set false for read-heavy workloads (e.g. vLLM KV-offload "
+    "lookup) where high-rate existence probes would otherwise pin the "
+    "working set and starve eviction");
 DEFINE_uint32(promotion_admission_threshold, 2,
               "Min CountMinSketch count for a key before promotion fires "
               "(set 1 to disable second-touch gating)");
@@ -537,6 +543,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_offload_cap_ratio);
     default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
                            FLAGS_promotion_on_hit);
+    default_config.GetBool("exist_key_grant_lease",
+                           &master_config.exist_key_grant_lease,
+                           FLAGS_exist_key_grant_lease);
     default_config.GetUInt32("promotion_admission_threshold",
                              &master_config.promotion_admission_threshold,
                              FLAGS_promotion_admission_threshold);
@@ -917,6 +926,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.promotion_on_hit = FLAGS_promotion_on_hit;
+    }
+    if ((google::GetCommandLineFlagInfo("exist_key_grant_lease", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.exist_key_grant_lease = FLAGS_exist_key_grant_lease;
     }
     if ((google::GetCommandLineFlagInfo("promotion_admission_threshold",
                                         &info) &&
