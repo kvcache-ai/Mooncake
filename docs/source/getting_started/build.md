@@ -155,8 +155,9 @@ device-code model, which is not cross-version compatible.
 ```{admonition} GPU-Direct RDMA
 :class: note
 Mooncake can use the DMA-BUF path for GPU-Direct RDMA, which does **not**
-require the `nvidia-peermem` kernel module. Set `WITH_NVIDIA_PEERMEM=0` before
-starting Mooncake to use DMA-BUF. Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
+require the `nvidia-peermem` kernel module. Classic Transfer Engine and TENT
+both default to DMA-BUF. Set `WITH_NVIDIA_PEERMEM=0` before starting Mooncake
+to use DMA-BUF (the default). Set `WITH_NVIDIA_PEERMEM=1` to use the legacy
 `ibv_reg_mr` path, which requires `nvidia-peermem`. See Section 3.7 of
 https://docs.nvidia.com/cuda/gpudirect-rdma/ for `nvidia-peermem` installation
 instructions.

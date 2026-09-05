@@ -163,6 +163,9 @@ struct RdmaParams {
     WorkerParams workers;
     bool verbose = false;
     bool log_slice_affinity = false;
+    // Classic TE: WITH_NVIDIA_PEERMEM=1 uses ibv_reg_mr (nvidia-peermem).
+    // Unset/false uses cuMemGetHandleForAddressRange + ibv_reg_dmabuf_mr.
+    bool with_nvidia_peermem = false;
 };
 }  // namespace tent
 }  // namespace mooncake

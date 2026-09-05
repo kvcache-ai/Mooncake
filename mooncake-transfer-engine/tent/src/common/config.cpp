@@ -176,6 +176,10 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/workers/max_retry_count");
     setConfig(config, "MC_DISABLE_GPU_DIRECT_RDMA",
               "transports/rdma/disable_gpu_direct_rdma");
+    // Shared with classic TE. Must be setBoolConfig: setFromString stores "1"
+    // as int, so get(..., false) would miss it.
+    setBoolConfig(config, "WITH_NVIDIA_PEERMEM",
+                  "transports/rdma/with_nvidia_peermem");
     setBoolConfig(config, "MC_FLUSH_GPU_DIRECT_RDMA_WRITES",
                   "transports/rdma/flush_gpu_direct_rdma_writes");
     setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
