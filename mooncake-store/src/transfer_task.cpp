@@ -149,6 +149,41 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 
     sub_task->sub_task_pool->push(sub_task);
 }
+
+// A reconnect attempt goes over the fabric and blocks for up to the fabrics
+// connect timeout, so back off between attempts while the target is still
+// down.
+constexpr int kSpdkNofReconnectIntervalMs = 1000;
+
+// Heal a segment whose io qpair failed, e.g. because the NoF target went away.
+// SpdkWrapper caches one qpair per namespace, so without this the worker would
+// keep submitting to the failed qpair and never recover once the target is
+// back. The reconnect must happen on the worker thread that owns the qpair.
+static void MaybeReconnectSpdkNofSegment(
+    mooncake::nof_seg_handle* seg_handle,
+    std::map<mooncake::nof_seg_handle*, std::chrono::steady_clock::time_point>&
+        next_reconnect_at,
+    int work_idx) {
+    auto& wrapper = mooncake::SpdkWrapper::GetInstance();
+    if (!wrapper.IsNofSegmentFailed(seg_handle)) {
+        next_reconnect_at.erase(seg_handle);
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    auto it = next_reconnect_at.find(seg_handle);
+    if (it != next_reconnect_at.end() && now < it->second) {
+        return;
+    }
+    next_reconnect_at[seg_handle] =
+        now + std::chrono::milliseconds(kSpdkNofReconnectIntervalMs);
+
+    if (wrapper.ReconnectNofSegment(seg_handle)) {
+        LOG(INFO) << "work " << work_idx << ", seg " << seg_handle
+                  << " io qpair reconnected";
+        next_reconnect_at.erase(seg_handle);
+    }
+}
 #endif
 namespace mooncake {
 
@@ -413,6 +448,8 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     int64_t total_outstanding_io = 0;
     // std::set<nof_seg_handle *> seg_set;
     std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
+    std::map<nof_seg_handle*, std::chrono::steady_clock::time_point>
+        seg_next_reconnect_at;
     std::stack<SpdkNofSubTask*> sub_task_pool;
     std::vector<SpdkNofSubTask*> sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
@@ -484,6 +521,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (!nof_qos->Empty()) {
+                MaybeReconnectSpdkNofSegment(seg_handle, seg_next_reconnect_at,
+                                             work_idx);
+            }
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
             for (int i = 0; i < kSpdkNofOpNum; ++i) {
