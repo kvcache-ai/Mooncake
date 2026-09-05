@@ -6,6 +6,11 @@
 #include <cstring>
 #include <cstdlib>
 #include <thread>
+
+#if defined(__linux__)
+#include <pthread.h>
+#endif
+
 #include "spdk/spdk_wrapper.h"
 
 namespace mooncake {
@@ -122,7 +127,26 @@ bool SpdkWrapper::InitializeEnv() {
     spdk_env_opts_init(&opts);
     opts.name = "mooncake";
 
+    // spdk_env_init pins the calling thread to the first core in core_mask
+    // (CPU0 by default) as the DPDK main lcore. Mooncake runs in-process, so
+    // that silently overrides the host application's own affinity; hand the
+    // caller's mask back once DPDK is done with the thread.
+#if defined(__linux__)
+    cpu_set_t caller_mask;
+    const bool have_caller_mask =
+        pthread_getaffinity_np(pthread_self(), sizeof(caller_mask),
+                               &caller_mask) == 0;
+#endif
+
     int rc = spdk_env_init(&opts);
+
+#if defined(__linux__)
+    if (have_caller_mask) {
+        pthread_setaffinity_np(pthread_self(), sizeof(caller_mask),
+                               &caller_mask);
+    }
+#endif
+
     if (rc != 0) {
         fprintf(stderr, "SPDK init failed: %d\n", rc);
         return false;
