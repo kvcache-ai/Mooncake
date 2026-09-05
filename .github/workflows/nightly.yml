@@ -93,6 +93,17 @@ jobs:
       artifact_name: nightly-cuda13-x86-py312
     secrets: inherit
 
+  build-wheel-rocm:
+    needs: version-stamp
+    uses: ./.github/workflows/ci_rocm.yml
+
+  rocm-integration-test:
+    needs: build-wheel-rocm
+    uses: ./.github/workflows/integration-test-rocm.yml
+    with:
+      checkout_ref: ${{ github.sha }}
+    secrets: inherit
+
   build-musa:
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
@@ -630,6 +641,8 @@ jobs:
       - version-stamp
       - build-wheels
       - tone-sglang-integration
+      - build-wheel-rocm
+      - rocm-integration-test
       - build-musa
       - build-docker
       - ascend-test

@@ -23,6 +23,15 @@ This directory contains end-to-end (E2E) test cases for the Mooncake project. Th
 
 **Description**: Prefill-Decode disaggregation test with different TP configurations
 
+### 4. test_vllm_1p1d_erdma.sh
+
+**Description**: vLLM Prefill-Decode disaggregation test with the Mooncake connector
+
+The ROCm core tier runs this as serialized smoke coverage with
+`num_workers=1`. It validates basic connector and transfer behavior, but it
+does not validate concurrent sender workers while
+[vLLM issue #44238](https://github.com/vllm-project/vllm/issues/44238) remains unresolved.
+
 ## T-One/tone-cli Support
 
 [tone-cli](https://gitee.com/anolis/tone-cli/tree/master/tests/mooncake-ci-test) provides the following automation features:
@@ -184,7 +193,7 @@ run_test()
     ${docker_exec} "\
         cd /test_workspace && \
         python3 -m pytest test_demo.py -v -s --tb=long" | tee "$log_file"
-    
+
     return ${PIPESTATUS[0]}
 }
 
@@ -210,7 +219,7 @@ if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
     if ! run_test; then
         exit_code=1
     fi
-    
+
     parse $exit_code
     exit $?
 fi

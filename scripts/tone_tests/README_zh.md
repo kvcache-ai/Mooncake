@@ -23,6 +23,15 @@
 
 **用例说明**：不同 TP 配置的 Prefill-Decode 分离架构测试
 
+### 4. test_vllm_1p1d_erdma.sh
+
+**用例说明**：使用 Mooncake connector 的 vLLM Prefill-Decode 分离测试
+
+ROCm core tier 使用 `num_workers=1` 运行串行 smoke test。该用例验证基础的
+connector 和传输行为，但在
+[vLLM issue #44238](https://github.com/vllm-project/vllm/issues/44238)
+解决前，不覆盖并发 sender worker 场景。
+
 
 ## T-One/tone-cli 支持
 
@@ -185,7 +194,7 @@ run_test()
     ${docker_exec} "\
         cd /test_workspace && \
         python3 -m pytest test_demo.py -v -s --tb=long" | tee "$log_file"
-    
+
     return ${PIPESTATUS[0]}
 }
 
@@ -211,7 +220,7 @@ if [ "${BASH_SOURCE[0]}" == "${0}" ]; then
     if ! run_test; then
         exit_code=1
     fi
-    
+
     parse $exit_code
     exit $?
 fi

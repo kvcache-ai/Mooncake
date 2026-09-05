@@ -592,6 +592,21 @@ jobs:
         python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
       shell: bash
 
+  tone-script-tests:
+    name: Test external CI lifecycle helpers
+    if: *run-ci
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Run focused shell regression tests
+      run: |
+        bash scripts/tone_tests/tests/test_common_cleanup.sh
+        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+      shell: bash
+
   clang-format:
     name: Check code format
     if: *run-ci
@@ -965,6 +980,7 @@ jobs:
       - docs-check
       - reshard-type-check
       - release-gate-tests
+      - tone-script-tests
       - build-wheel
       - unit-tests
       - build-flags
