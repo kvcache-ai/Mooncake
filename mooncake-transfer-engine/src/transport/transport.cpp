@@ -49,10 +49,11 @@ Status Transport::freeBatchID(BatchID batch_id) {
                 "BatchID cannot be freed until all tasks are done");
         }
     }
-    delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
     RWSpinlock::WriteGuard guard(batch_desc_lock_);
     batch_desc_set_.erase(batch_id);
+#else
+    delete &batch_desc;
 #endif
     return Status::OK();
 }
