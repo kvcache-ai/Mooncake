@@ -355,6 +355,20 @@ class MasterServiceTest : public ::testing::Test {
                         .has_value());
     }
 
+    // An oversized PutStart fails with NO_AVAILABLE_HANDLE, which triggers
+    // an eviction pass; unpinned objects get evicted.
+    void TriggerMemoryEviction(MasterService& service, const UUID& client_id,
+                               const std::string& trigger_key,
+                               uint64_t slice_length) const {
+        ReplicateConfig trigger_config;
+        trigger_config.replica_num = 1;
+        auto trigger_result =
+            service.PutStart(client_id, trigger_key, TenantId::Default(),
+                             slice_length, trigger_config);
+        ASSERT_FALSE(trigger_result.has_value());
+        EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
+    }
+
     void PutCompletedObject(MasterService& service, const UUID& client_id,
                             const std::string& key, const TenantId& tenant_id,
                             const ReplicateConfig& config,

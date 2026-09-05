@@ -2577,19 +2577,53 @@ size_t MasterService::SoftPinDeadlineIndex::RegistrationCountForTest() const {
 
 auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
     -> tl::expected<ResolvedSoftPinRequest, ErrorCode> {
+    // Every write path resolves its soft-pin request before touching metadata,
+    // so this is also where agent hints are validated.
+    if (config.agent_hints.has_value() && !config.agent_hints->IsValid()) {
+        LOG(ERROR) << "reuse_hint=" << config.agent_hints->reuse_hint
+                   << ", cache_ttl_ms=" << config.agent_hints->cache_ttl_ms
+                   << ", error=invalid_agent_hints";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const uint64_t agent_ttl =
+        (config.agent_hints.has_value() &&
+         config.agent_hints->RequestsRetention())
+            ? static_cast<uint64_t>(config.agent_hints->cache_ttl_ms)
+            : 0;
+
+    // An explicit TTL is only meaningful together with ENABLE.
+    if (config.soft_pin_action != SoftPinAction::ENABLE &&
+        config.soft_pin_ttl_ms.has_value()) {
+        LOG(ERROR) << "soft_pin_action=" << config.soft_pin_action
+                   << ", soft_pin_ttl_ms=" << *config.soft_pin_ttl_ms
+                   << ", error=ttl_requires_enable";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     switch (config.soft_pin_action) {
-        case SoftPinAction::PRESERVE:
-        case SoftPinAction::DISABLE:
-            if (config.soft_pin_ttl_ms.has_value()) {
-                LOG(ERROR) << "soft_pin_action=" << config.soft_pin_action
-                           << ", soft_pin_ttl_ms=" << *config.soft_pin_ttl_ms
-                           << ", error=ttl_requires_enable";
+        case SoftPinAction::PRESERVE: {
+            if (!config.agent_hints.has_value() ||
+                !config.agent_hints->RequestsRetention()) {
+                return ResolvedSoftPinRequest{SoftPinAction::PRESERVE, 0};
+            }
+            // A keep hint upgrades PRESERVE to ENABLE; cache_ttl_ms only
+            // raises the deadline beyond the default.
+            const uint64_t ttl_ms =
+                std::max(default_kv_soft_pin_ttl_, agent_ttl);
+            if (ttl_ms > max_kv_soft_pin_ttl_) {
+                LOG(ERROR) << "soft_pin_ttl_ms=" << ttl_ms
+                           << ", max_kv_soft_pin_ttl=" << max_kv_soft_pin_ttl_
+                           << ", error=soft_pin_ttl_exceeds_limit";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
+            return ResolvedSoftPinRequest{SoftPinAction::ENABLE, ttl_ms};
+        }
+        case SoftPinAction::DISABLE:
             return ResolvedSoftPinRequest{config.soft_pin_action, 0};
         case SoftPinAction::ENABLE: {
-            const uint64_t ttl_ms =
-                config.soft_pin_ttl_ms.value_or(default_kv_soft_pin_ttl_);
+            const uint64_t ttl_ms = std::max(
+                config.soft_pin_ttl_ms.value_or(default_kv_soft_pin_ttl_),
+                agent_ttl);
             if (ttl_ms > max_kv_soft_pin_ttl_) {
                 LOG(ERROR) << "soft_pin_ttl_ms=" << ttl_ms
                            << ", max_kv_soft_pin_ttl=" << max_kv_soft_pin_ttl_
