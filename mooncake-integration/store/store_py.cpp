@@ -1932,6 +1932,21 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
+        .def_property(
+            "preferred_numa_node",
+            [](const ReplicateConfig &config) -> py::object {
+                if (!config.preferred_numa_node.has_value()) {
+                    return py::none();
+                }
+                return py::int_(config.preferred_numa_node.value());
+            },
+            [](ReplicateConfig &config, const py::object &value) {
+                if (value.is_none()) {
+                    config.preferred_numa_node.reset();
+                } else {
+                    config.preferred_numa_node = value.cast<int32_t>();
+                }
+            })
         .def_readwrite("data_type", &ReplicateConfig::data_type)
         .def_readwrite("group_ids", &ReplicateConfig::group_ids)
         .def("__str__", [](const ReplicateConfig &config) {

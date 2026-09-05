@@ -367,6 +367,7 @@ class MasterService {
         uint64_t size_bytes{0};
         std::string te_endpoint;
         std::string protocol;
+        int32_t numa_node{-1};
         SegmentStatus status{SegmentStatus::UNDEFINED};
         uint64_t allocator_used_bytes{0};
         uint64_t allocator_capacity_bytes{0};

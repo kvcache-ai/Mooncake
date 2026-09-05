@@ -439,9 +439,11 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    struct_pack::compatible<int32_t, 1> numa_node;
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
+         numa_node);
 
 /**
  * @brief Allocation strategy type for segment allocation

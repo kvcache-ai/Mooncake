@@ -111,6 +111,54 @@ TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
+TEST_F(AllocationStrategyTest, PreferredNumaNodeSelectsMatchingAllocator) {
+    AllocatorManager allocator_manager;
+    auto node0 = std::make_shared<OffsetBufferAllocator>("host", 0x100000000ULL,
+                                                         64 * MiB, "node0");
+    auto node1 = std::make_shared<OffsetBufferAllocator>("host", 0x110000000ULL,
+                                                         64 * MiB, "node1");
+    node0->SetNumaNode(0);
+    node1->SetNumaNode(1);
+    allocator_manager.addAllocator("host", node0);
+    allocator_manager.addAllocator("host", node1);
+
+    auto result = strategy_->Allocate(allocator_manager, 1024, 1, {}, {},
+                                      ReplicaType::MEMORY, 1);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1u);
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "node1");
+}
+
+TEST_F(AllocationStrategyTest, PreferredNumaNodeFallsBackToUnknownAllocator) {
+    AllocatorManager allocator_manager;
+    auto matching = std::make_shared<OffsetBufferAllocator>(
+        "host", 0x100000000ULL, 64 * MiB, "matching");
+    auto unknown = std::make_shared<OffsetBufferAllocator>(
+        "host", 0x110000000ULL, 64 * MiB, "unknown");
+    auto mismatch = std::make_shared<OffsetBufferAllocator>(
+        "host", 0x120000000ULL, 64 * MiB, "mismatch");
+    matching->SetNumaNode(1);
+    mismatch->SetNumaNode(0);
+    allocator_manager.addAllocator("host", matching);
+    allocator_manager.addAllocator("host", unknown);
+    allocator_manager.addAllocator("host", mismatch);
+    auto occupied = matching->allocate(matching->capacity());
+    ASSERT_NE(occupied, nullptr);
+
+    auto result = strategy_->Allocate(allocator_manager, 1024, 1, {}, {},
+                                      ReplicaType::MEMORY, 1);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->front()
+                  .get_descriptor()
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "unknown");
+}
+
 // Test preferred segment behavior with empty allocators (non-parameterized)
 TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
     AllocatorManager allocator_manager;

@@ -194,7 +194,8 @@ class AllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) = 0;
+        const ReplicaType replica_type = ReplicaType::MEMORY,
+        const int32_t preferred_numa_node = -1) = 0;
 
     virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const ScopedAllocatorAccess& placement, const size_t slice_length,
@@ -203,7 +204,8 @@ class AllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY);
+        const ReplicaType replica_type = ReplicaType::MEMORY,
+        const int32_t preferred_numa_node = -1);
 
     /**
      * @brief Allocate one replica from the specified segment.
@@ -249,7 +251,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        const ReplicaType replica_type = ReplicaType::MEMORY,
+        const int32_t preferred_numa_node = -1) override {
         // Validate input parameters
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -270,8 +273,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
 
-            auto buffer =
-                allocateSingle(allocator_manager, names[0], slice_length);
+            auto buffer = allocateSingle(allocator_manager, names[0],
+                                         slice_length, preferred_numa_node);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -291,7 +294,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             }
 
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length);
+                                         slice_length, preferred_numa_node);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -322,8 +325,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 continue;
             }
 
-            auto buffer =
-                allocateSingle(allocator_manager, names[index], slice_length);
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, preferred_numa_node);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -364,7 +367,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
     std::unique_ptr<AllocatedBuffer> allocateSingle(
         const AllocatorManager& allocator_manager, const std::string& name,
-        const size_t slice_length) {
+        const size_t slice_length, const int32_t preferred_numa_node = -1) {
         const auto allocators = allocator_manager.getAllocators(name);
         if (allocators == nullptr || allocators->size() == 0) {
             return nullptr;
@@ -376,14 +379,24 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return (*allocators)[0]->allocate(slice_length);
         }
 
-        // Randomly select a start point to distribute
-        // allocations across all segments
-        // Select a start segment to place the replica.
-        size_t seg_offset = randomIndex(num_segs);
-        for (size_t i = 0; i < num_segs; i++) {  // only allocate one replica
-            auto& allocator = (*allocators)[(i + seg_offset) % num_segs];
-            if (auto buffer = allocator->allocate(slice_length)) {
-                return buffer;
+        // Randomize within locality tiers, then prefer matching NUMA domains,
+        // unknown legacy domains, and finally known mismatches.
+        const size_t seg_offset = randomIndex(num_segs);
+        for (int tier = 0; tier < (preferred_numa_node >= 0 ? 3 : 1); ++tier) {
+            for (size_t i = 0; i < num_segs; ++i) {
+                auto& allocator = (*allocators)[(i + seg_offset) % num_segs];
+                const int32_t numa_node = allocator->getNumaNode();
+                const int allocator_tier =
+                    preferred_numa_node < 0 ? 0
+                                            : (numa_node == preferred_numa_node
+                                                   ? 0
+                                                   : (numa_node < 0 ? 1 : 2));
+                if (allocator_tier != tier) {
+                    continue;
+                }
+                if (auto buffer = allocator->allocate(slice_length)) {
+                    return buffer;
+                }
             }
         }
 
@@ -407,7 +420,8 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
         const size_t replica_num,
         const std::vector<std::string>& preferred_segments,
         const std::set<std::string>& excluded_segments,
-        const ReplicaType replica_type, ScoreFn&& score) {
+        const ReplicaType replica_type, const int32_t preferred_numa_node,
+        ScoreFn&& score) {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -427,7 +441,7 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
             auto buffer = allocateSingle(allocator_manager, preferred_segment,
-                                         slice_length);
+                                         slice_length, preferred_numa_node);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -468,7 +482,8 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
                 break;
             }
             const auto& name = names[candidate.name_idx];
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         preferred_numa_node);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -492,7 +507,8 @@ class RankedAllocationStrategy : public RandomAllocationStrategy {
                 used_segments.contains(name)) {
                 continue;
             }
-            auto buffer = allocateSingle(allocator_manager, name, slice_length);
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         preferred_numa_node);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
@@ -520,10 +536,12 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        const ReplicaType replica_type = ReplicaType::MEMORY,
+        const int32_t preferred_numa_node = -1) override {
         return AllocateRanked(
             allocator_manager, slice_length, replica_num, preferred_segments,
-            excluded_segments, replica_type, [&](const std::string& name) {
+            excluded_segments, replica_type, preferred_numa_node,
+            [&](const std::string& name) {
                 return GetSegmentFreeRatio(allocator_manager, name);
             });
     }
@@ -568,7 +586,8 @@ class SsdFreeRatioFirstAllocationStrategy final
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) override;
+        const ReplicaType replica_type = ReplicaType::MEMORY,
+        const int32_t preferred_numa_node = -1) override;
 
     using RandomAllocationStrategy::Allocate;
 
@@ -586,7 +605,9 @@ class CxlAllocationStrategy : public AllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>(),
-        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        const ReplicaType replica_type = ReplicaType::MEMORY,
+        const int32_t preferred_numa_node = -1) override {
+        (void)preferred_numa_node;
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }

@@ -3123,6 +3123,7 @@ auto MasterService::GetSegmentsDetail()
         info.size_bytes = segment.size;
         info.te_endpoint = segment.te_endpoint;
         info.protocol = segment.protocol;
+        info.numa_node = segment.numa_node.value_or(-1);
 
         // Query segment status
         segment_access.GetSegmentStatusByName(segment.name, info.status);
@@ -4296,7 +4297,8 @@ auto MasterService::AllocateAndInsertMetadata(
 
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_access, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
+            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
+            config.preferred_numa_node.value_or(-1));
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key

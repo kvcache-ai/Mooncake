@@ -190,6 +190,33 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
     ValidateMountedSegment(segment_manager, segment, client_id);
 }
 
+TEST_F(SegmentTest, MountSegmentCopiesNumaNodeToAllocator) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "numa_segment";
+    segment.size = 16 * 1024 * 1024;
+    segment.base = 0x100000000;
+    segment.numa_node = 1;
+    const UUID client_id = generate_uuid();
+
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountSegment(segment, client_id), ErrorCode::OK);
+    auto allocator = segment_access.GetAllocator(segment.id);
+    ASSERT_NE(allocator, nullptr);
+    EXPECT_EQ(allocator->getNumaNode(), 1);
+
+    Segment conflicting = segment;
+    conflicting.numa_node = 0;
+    EXPECT_EQ(segment_access.ValidateRemountSegment(conflicting, client_id),
+              ErrorCode::INVALID_PARAMS);
+
+    Segment legacy = segment;
+    legacy.numa_node.reset();
+    EXPECT_EQ(segment_access.ValidateRemountSegment(legacy, client_id),
+              ErrorCode::OK);
+}
+
 TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;

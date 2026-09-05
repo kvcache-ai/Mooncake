@@ -175,6 +175,7 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     original.segment.size = 1024 * 1024;
     original.segment.te_endpoint = "segment_host1";
     original.segment.host_id = "host1";
+    original.segment.numa_node = 1;
     original.status = SegmentStatus::OK;
 
     msgpack::sbuffer buffer;
@@ -189,6 +190,8 @@ TEST_F(SerializerTest, MountedSegmentSerializationPreservesHostId) {
     EXPECT_EQ(restored->segment.id, original.segment.id);
     EXPECT_EQ(restored->segment.name, original.segment.name);
     EXPECT_EQ(restored->segment.host_id, original.segment.host_id);
+    ASSERT_TRUE(restored->segment.numa_node.has_value());
+    EXPECT_EQ(restored->segment.numa_node.value(), 1);
     EXPECT_EQ(restored->status, original.status);
 }
 
@@ -214,6 +217,7 @@ TEST_F(SerializerTest, MountedSegmentDeserializesLegacyFormatWithoutHostId) {
     EXPECT_EQ(restored->segment.id, segment_id);
     EXPECT_EQ(restored->segment.name, "legacy_segment");
     EXPECT_TRUE(restored->segment.host_id.empty());
+    EXPECT_FALSE(restored->segment.numa_node.has_value());
     EXPECT_EQ(restored->status, SegmentStatus::OK);
 }
 
