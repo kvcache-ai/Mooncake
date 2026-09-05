@@ -53,6 +53,21 @@ class SpdkWrapper {
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
 
+    /** @brief Whether the io qpair of a NoF segment has entered a failed
+     * state, e.g. because the target went away. */
+    bool IsNofSegmentFailed(const nof_seg_handle *seg_handle);
+
+    /**
+     * @brief Reconnect the io qpair of a NoF segment after a transport
+     * failure, resetting the controller when the whole nvme association is
+     * gone.
+     *
+     * SPDK requires the io qpair to be reconnected from the same thread that
+     * submits requests to and polls completions of that qpair, so callers
+     * must invoke this from their own submit/poll thread.
+     */
+    bool ReconnectNofSegment(nof_seg_handle *seg_handle);
+
    private:
     struct ProbeBuffer {
         void *ptr{nullptr};

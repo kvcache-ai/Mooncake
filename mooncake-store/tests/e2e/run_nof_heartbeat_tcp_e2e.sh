@@ -61,6 +61,39 @@ count_pattern() {
   grep -c "$pattern" "$file" 2>/dev/null || true
 }
 
+start_target() {
+  local log_suffix=$1
+  "$REPO_ROOT/extern/spdk/build/bin/nvmf_tgt" -m 0x1 -u --iova-mode=va --wait-for-rpc >"$LOG_DIR/target$log_suffix.log" 2>&1 &
+  TARGET_PID=$!
+  sleep 3
+
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_start_init >/dev/null
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_wait_init >/dev/null
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" bdev_malloc_create -b Malloc0 64 4096 >/dev/null
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_transport -t TCP >/dev/null || true
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_subsystem "$TARGET_NQN" -a -s SPDK00000000000001 >/dev/null || true
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
+  python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
+}
+
+register_nof_segment() {
+  local log_suffix=$1
+  PYTHONPATH="$BUILD_DIR/mooncake-integration" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register$log_suffix.log" 2>&1
+import store
+ret = store.MooncakeDistributedNoFRegister().real_register(
+    "$TARGET_NQN",
+    1,
+    "$TARGET_HOST",
+    int("$TARGET_PORT"),
+    0,
+    int("$NOF_SIZE"),
+    "$MASTER_RPC",
+)
+print(f"register_ret {ret}", flush=True)
+raise SystemExit(0 if ret == 0 else 1)
+PY
+}
+
 rm -rf "$LOG_DIR"
 mkdir -p "$LOG_DIR"
 
@@ -75,17 +108,7 @@ pkill -f 'mooncake_master' >/dev/null 2>&1 || true
 pkill -f 'http_metadata_server.py' >/dev/null 2>&1 || true
 sleep 1
 
-"$REPO_ROOT/extern/spdk/build/bin/nvmf_tgt" -m 0x1 -u --iova-mode=va --wait-for-rpc >"$LOG_DIR/target.log" 2>&1 &
-TARGET_PID=$!
-sleep 3
-
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_start_init >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" framework_wait_init >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" bdev_malloc_create -b Malloc0 64 4096 >/dev/null
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_transport -t TCP >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_subsystem "$TARGET_NQN" -a -s SPDK00000000000001 >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
-python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
+start_target ""
 
 python3 "$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
 META_PID=$!
@@ -102,20 +125,7 @@ sleep 2
 MASTER_PID=$!
 sleep 3
 
-PYTHONPATH="$BUILD_DIR/mooncake-integration" MC_NOF_TRTYPE=TCP python3 - <<PY >"$LOG_DIR/register.log" 2>&1
-import store
-ret = store.MooncakeDistributedNoFRegister().real_register(
-    "$TARGET_NQN",
-    1,
-    "$TARGET_HOST",
-    int("$TARGET_PORT"),
-    0,
-    int("$NOF_SIZE"),
-    "$MASTER_RPC",
-)
-print(f"register_ret {ret}", flush=True)
-raise SystemExit(0 if ret == 0 else 1)
-PY
+register_nof_segment ""
 
 PYTHONPATH="$BUILD_DIR/mooncake-integration" python3 "$SCRIPT_DIR/store_client_e2e.py" \
   --local-hostname "127.0.0.1:50071" \
@@ -151,6 +161,7 @@ fi
 pre_fault_line_count=$(wc -l <"$LOG_DIR/client.log")
 
 kill "$TARGET_PID" >/dev/null 2>&1 || true
+wait "$TARGET_PID" >/dev/null 2>&1 || true
 TARGET_PID=""
 
 if ! wait_for_pattern "$LOG_DIR/master.log" 'action=unmount_nof_segment_by_heartbeat' $((HEARTBEAT_INTERVAL * HEARTBEAT_FAILURES + 20)); then
@@ -178,6 +189,39 @@ while (( SECONDS < observation_deadline )); do
   fi
   sleep 1
 done
+
+# The target comes back and the segment is registered again. Both the master and
+# the still running client cached the nvme qpair of the dead target, so they
+# only recover if that qpair is reconnected instead of reused.
+pre_recovery_unmounts=$(count_pattern "$LOG_DIR/master.log" 'action=unmount_nof_segment_by_heartbeat')
+post_recovery_line_count=$(wc -l <"$LOG_DIR/client.log")
+
+start_target "_restart"
+if ! register_nof_segment "_restart"; then
+  echo "failed to register nof segment after target recovery"
+  exit 1
+fi
+
+# A segment whose heartbeat still probes the stale qpair is unmounted again
+# after the failure threshold, so staying mounted proves the probe recovered.
+recovery_observation_sec=$((HEARTBEAT_INTERVAL * (HEARTBEAT_FAILURES + 2) + 5))
+sleep "$recovery_observation_sec"
+
+post_recovery_unmounts=$(count_pattern "$LOG_DIR/master.log" 'action=unmount_nof_segment_by_heartbeat')
+if (( post_recovery_unmounts > pre_recovery_unmounts )); then
+  echo "nof segment was unmounted again after target recovery"
+  exit 1
+fi
+
+post_recovery_successes=$(awk -v start="$post_recovery_line_count" '
+  NR > start && ($0 ~ /put_ok/ || $0 ~ /get_ok/) { count++ }
+  END { print count + 0 }
+' "$LOG_DIR/client.log")
+
+if [[ "$CLIENT_GLOBAL_SEGMENT_SIZE" -eq 0 ]] && (( post_recovery_successes <= 0 )); then
+  echo "client did not recover nof IO after target recovery"
+  exit 1
+fi
 
 kill "$CLIENT_PID" >/dev/null 2>&1 || true
 wait "$CLIENT_PID" >/dev/null 2>&1 || true
@@ -220,6 +264,8 @@ fi
   cat "$LOG_DIR/hugepages.log"
   echo "=== register ==="
   cat "$LOG_DIR/register.log"
+  echo "=== register after recovery ==="
+  cat "$LOG_DIR/register_restart.log"
   echo "=== client ==="
   cat "$LOG_DIR/client.log"
   echo "=== master tail ==="
@@ -228,11 +274,14 @@ fi
   tail -n 80 "$LOG_DIR/metadata.log"
   echo "=== target tail ==="
   tail -n 120 "$LOG_DIR/target.log"
+  echo "=== target after recovery tail ==="
+  tail -n 120 "$LOG_DIR/target_restart.log"
   echo "=== verdict ==="
   echo "post_fault_successes=$post_fault_successes"
   echo "post_fault_failures=$post_fault_failures"
   echo "post_unmount_successes=$post_unmount_successes"
   echo "post_unmount_failures=$post_unmount_failures"
+  echo "post_recovery_successes=$post_recovery_successes"
   echo "pre_fault_put_ok=$put_ok_count"
   echo "pre_fault_get_ok=$get_ok_count"
   echo "pre_fault_line_count=$pre_fault_line_count"
