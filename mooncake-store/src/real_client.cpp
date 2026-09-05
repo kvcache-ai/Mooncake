@@ -6991,7 +6991,8 @@ ClientRequester::ClientRequester() {
     // peer which is gone blocks for connect_retry_count * 30s plus the waits
     // between retries -- 91s with the defaults above -- and no configuration
     // can shorten it. Defaults are unchanged when the variables are unset.
-    detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
+    detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
+                                     RpcTimeoutConfig::FromEnvironment());
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
