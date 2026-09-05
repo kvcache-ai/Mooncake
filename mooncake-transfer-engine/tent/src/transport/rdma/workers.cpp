@@ -857,7 +857,7 @@ void Workers::asyncPollCq() {
                 }
                 // GPUDirect reachability learning: a protection/access error
                 // on a GPU buffer means the chosen NIC cannot P2P-DMA to that
-                // GPU (ibv_reg_mr succeeded but the PCIe path is unusable).
+                // GPU (the MR was created but the PCIe path is unusable).
                 // Record it so selection avoids that NIC and converges onto a
                 // reachable rail instead of exhausting retries. The local side
                 // (source NIC -> source GPU) surfaces as LOC_PROT; the remote

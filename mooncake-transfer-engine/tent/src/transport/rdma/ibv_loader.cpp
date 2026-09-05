@@ -93,6 +93,8 @@ IbvLoader::IbvLoader() {
 
     ok &= LoadSymbol(handle_, "ibv_reg_mr", symbols_.ibv_reg_mr_default);
     ok &= LoadSymbol(handle_, "ibv_reg_mr_iova2", symbols_.ibv_reg_mr_iova2);
+    LoadOptionalSymbol(handle_, "ibv_reg_dmabuf_mr",
+                       symbols_.ibv_reg_dmabuf_mr);
     ok &= LoadSymbol(handle_, "ibv_dereg_mr", symbols_.ibv_dereg_mr);
 
     ok &= LoadSymbol(handle_, "ibv_fork_init", symbols_.ibv_fork_init);

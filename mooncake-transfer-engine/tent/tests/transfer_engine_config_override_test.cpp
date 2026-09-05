@@ -338,6 +338,21 @@ TEST(TransferEngineConfigOverrideTest, FlushGpuDirectWritesEnvLoadsAsBool) {
     }
 }
 
+TEST(TransferEngineConfigOverrideTest, WithNvidiaPeermemEnvLoadsAsBool) {
+    {
+        EnvVarGuard guard("WITH_NVIDIA_PEERMEM", "1");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_TRUE(config.get("transports/rdma/with_nvidia_peermem", false));
+    }
+    {
+        EnvVarGuard guard("WITH_NVIDIA_PEERMEM", "0");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_FALSE(config.get("transports/rdma/with_nvidia_peermem", true));
+    }
+}
+
 TEST(TransferEngineConfigOverrideTest, FilterNicEnvLoadsRdmaWhitelist) {
     EnvVarGuard guard("MC_TE_FILTERS", "mlx5_0,mlx5_1");
 
