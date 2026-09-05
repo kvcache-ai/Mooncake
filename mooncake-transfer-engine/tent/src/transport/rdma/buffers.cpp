@@ -104,9 +104,31 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     BufferEntryForRdma staging;
     assert(desc.rkey.empty());
     size_t context_count = 0;
+    bool with_nvidia_peermem = false;
     for (auto* context : context_list_) {
-        if (context) ++context_count;
+        if (context) {
+            ++context_count;
+            with_nvidia_peermem = context->params().with_nvidia_peermem;
+        }
     }
+
+    // Export a single dma_buf fd for the whole buffer and import it into every
+    // NIC's PD (one dma_buf object shared across NICs keeps a single BAR1
+    // window). Host memory yields kHostReg (plain ibv_reg_mr). The fd stays
+    // open across every registration that consumes it, then the RAII guard
+    // closes it.
+    DmabufExport dmabuf_exp;
+    if (context_count > 0) {
+        if (RdmaContext::exportDmabuf((void*)desc.addr, dmabuf_exp,
+                                      with_nvidia_peermem) != 0) {
+            return Status::RdmaError(
+                "Unable to export dma_buf for local memory segment" LOC_MARK);
+        }
+    }
+    struct DmabufCloser {
+        DmabufExport& exp;
+        ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
+    } dmabuf_closer{dmabuf_exp};
 
     std::vector<RdmaContext::MemReg> mem_reg_list(context_list_.size(),
                                                   nullptr);
@@ -119,14 +141,13 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         for (size_t id = 0; id < context_list_.size(); ++id) {
             auto* context = context_list_[id];
             if (!context) continue;
-            // Calculate access flags per context (for relaxed ordering support)
             int access = getAccessFlags(options.perm,
                                         context->isRelaxedOrderingEnabled());
             tasks.emplace_back(std::async(
-                std::launch::async,
-                [context, &mem_reg_list, id, addr, length, access]() {
-                    mem_reg_list[id] =
-                        context->registerMemReg(addr, length, access);
+                std::launch::async, [context, &mem_reg_list, id, addr, length,
+                                     access, dmabuf_exp]() {
+                    mem_reg_list[id] = context->registerMemReg(
+                        addr, length, access, dmabuf_exp);
                 }));
         }
         for (auto& task : tasks) task.get();
@@ -134,11 +155,10 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         for (size_t id = 0; id < context_list_.size(); ++id) {
             auto* context = context_list_[id];
             if (!context) continue;
-            // Calculate access flags per context (for relaxed ordering support)
             int access = getAccessFlags(options.perm,
                                         context->isRelaxedOrderingEnabled());
-            mem_reg_list[id] =
-                context->registerMemReg((void*)desc.addr, desc.length, access);
+            mem_reg_list[id] = context->registerMemReg(
+                (void*)desc.addr, desc.length, access, dmabuf_exp);
         }
     }
     // The buffer is usable only if every enabled NIC registered it: slice
