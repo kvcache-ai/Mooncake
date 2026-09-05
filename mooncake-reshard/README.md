@@ -18,6 +18,8 @@ The public Python API is split by responsibility:
   contracts for resource-neutral identity and lifecycle;
 - `mooncake.reshard.weight` defines model-weight placement, runtime-binding
   input contracts, and address-free N-D planning.
+- `mooncake.reshard.kv_cache` defines KV-cache topology, placement, runtime
+  binding, serialization, and logical transfer planning.
 
 ## Weight Placement Model
 
@@ -107,9 +109,29 @@ the plan.
 - `planner.py` exposes both logical planning and runtime-binding APIs.
 - `manifest.py` preserves the public import surface.
 
-`kv_cache` remains reserved as a resource discriminator. This change does not
-define a KVCache manifest; a future KVCache reshard adapter can reuse the
-resource/placement/binding boundary without changing the model-weight planner.
+## KV Cache Placement Model
+
+`KVCachePlacementManifest` describes an address-free KV-cache placement over a
+selected topology. Each participant contributes a `KVCachePlacementPart`, and
+`KVCacheRuntimeBindingManifest` supplies operation-scoped live buffers. Runtime
+bindings contain no lease or eviction state; the framework owns pinning and
+lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
+semantics. Runtime-to-Runtime callers may omit it when the runtimes already own
+that semantic agreement, while Store paths require it.
+
+The KV-cache implementation is split by responsibility:
+
+- `snapshot.py` defines optional content identity;
+- `topology.py`, `part.py`, and `placement.py` define logical placement;
+- `runtime.py` and `binding.py` define and validate live buffer bindings;
+- `planner.py` defines semantically validated logical and prepared plans;
+- `serde.py`, `snapshot_serde.py`, and `plan_serde.py` define strict JSON
+  boundaries.
+
+KV planning is source/target-role agnostic. A placement may expose one or more
+complete DP replicas, and each local-target plan selects exactly one source DP
+replica. Callers may choose that source rank explicitly; otherwise the planner
+maps target DP ranks round-robin over the source placement's available DP ranks.
 
 `weight_placement_to_json` and `weight_placement_from_json` are the explicit
 public JSON APIs. Their wire format contains only canonical fields, and
