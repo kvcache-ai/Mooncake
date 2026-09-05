@@ -194,14 +194,14 @@ class ElasticBuffer:
         torch.cuda.synchronize()
 
     def _active_ranks_mask(self) -> list:
-        # `mooncake.ep.get_active_ranks` is a Mooncake PG helper and performs a
+        # `mooncake.pg.get_active_ranks` is a Mooncake PG helper and performs a
         # native static cast to MooncakeBackend. ElasticBuffer transport
         # bootstrap can also be driven by a regular NCCL/Gloo ProcessGroup; in
         # that case every rank in the supplied group is active by definition.
         if "Mooncake" not in type(self.backend).__name__:
             return [1] * self.num_ranks
 
-        from mooncake.ep import get_active_ranks
+        from mooncake.pg import get_active_ranks
 
         return get_active_ranks(self.backend).tolist()
 

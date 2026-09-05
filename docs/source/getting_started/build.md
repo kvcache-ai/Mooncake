@@ -289,7 +289,7 @@ The following options can be passed to `cmake ..`.
 | `-DWITH_P2P_STORE=ON/OFF` | `OFF` | Enable Golang support and build the P2P Store component. Requires Go 1.23+. |
 | `-DWITH_RUST_EXAMPLE=ON/OFF` | `OFF` | Build the Transfer Engine Rust library (`transfer_engine_rust`), tests, and sample benchmark. |
 | `-DWITH_STORE_RUST=ON/OFF` | `ON` | Build Mooncake Store Rust bindings and CMake Rust targets. |
-| `-DWITH_EP=ON/OFF` | `OFF` | Build the EP and PG Python extensions for CUDA. Requires CUDA toolkit and PyTorch. Use `-DEP_TORCH_VERSIONS="2.13.0"` to build for specific PyTorch versions, or leave empty to use the currently installed torch. The CUDA version is detected automatically. |
+| `-DWITH_EP=ON/OFF` | `OFF` | Build Mooncake EP and the native Mooncake PG core/device libraries. The Torch-facing PG adapter is compiled by the installed package at first `import mooncake.pg`. |
 
 ### Build Behavior Options
 

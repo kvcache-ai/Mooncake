@@ -109,6 +109,8 @@ jobs:
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
+        # The runner has CUDA headers/nvcc but no usable GPU for arch detection.
+        TORCH_CUDA_ARCH_LIST: "8.0"
       run: |
         source test_env/bin/activate
         export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
