@@ -652,6 +652,22 @@ Status HipTransport::submitTransferTask(
     return Status::OK();
 }
 
+namespace {
+
+// Matches the descs this transport published into the shared local buffer
+// list. Under multi-protocol the protocol field is authoritative; without it,
+// the serialized IPC/fabric handle is the discriminator (only GPU-IPC
+// transports fill shm_name, and they never coexist with HIP in one build).
+bool isOwnDesc(const TransferMetadata::BufferDesc& desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol == "hip";
+#else
+    return !desc.shm_name.empty();
+#endif
+}
+
+}  // namespace
+
 int HipTransport::registerLocalMemory(void* addr, size_t length,
                                       const std::string& location,
                                       bool remote_accessible,
@@ -680,27 +696,65 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
                 LOG(INFO) << "HipTransport: skipping non-device memory " << addr
                           << ", leaving it to other transports";
             }
+            skipped_addrs_.insert((uint64_t)addr);
+            return 0;
+        }
+
+        // Resolve the true hipMalloc base address. Framework caching
+        // allocators (PyTorch, etc.) sub-allocate tensors within larger
+        // hipMalloc segments. hipIpcGetMemHandle always returns a handle for
+        // the entire segment, so we must register at segment granularity or
+        // relocateSharedMemoryAddress() maps every sub-range back onto the
+        // segment base and the peer silently reads the wrong bytes.
+        void* base_ptr = nullptr;
+        size_t alloc_size = 0;
+        if (!checkHip(hipMemGetAddressRange((hipDeviceptr_t*)&base_ptr,
+                                            &alloc_size, (hipDeviceptr_t)addr),
+                      "HipTransport: hipMemGetAddressRange failed")) {
+            return -1;
+        }
+
+        // Re-registering the same address is idempotent; a new sub-range of
+        // an already exported allocation just takes another reference.
+        uint64_t base = (uint64_t)base_ptr;
+        if (!registered_addr_to_base_.emplace((uint64_t)addr, base).second) {
+            return 0;
+        }
+        auto it = registered_base_refs_.find(base);
+        if (it != registered_base_refs_.end()) {
+            it->second++;
             return 0;
         }
 
         // Get IPC handle
         hipIpcMemHandle_t handle;
-        if (!checkHip(hipIpcGetMemHandle(&handle, addr),
+        if (!checkHip(hipIpcGetMemHandle(&handle, base_ptr),
                       "HipTransport: hipIpcGetMemHandle failed")) {
+            registered_addr_to_base_.erase((uint64_t)addr);
             return -1;
         }
 
         // Register buffer with metadata
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)addr;
-        desc.length = length;
+        desc.addr = (uint64_t)base_ptr;
+        desc.length = alloc_size;
         desc.name = location;
         desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
 #ifdef ENABLE_MULTI_PROTOCOL
         desc.protocol = "hip";
 #endif
-        return metadata_->addLocalMemoryBuffer(desc, true);
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_base_refs_[base] = 1;
+        } else {
+            // addLocalMemoryBuffer appends the desc before publishing it;
+            // drop the leftover so a failed registration leaves nothing
+            // behind for a later rollback or unregister to miss.
+            metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc, false);
+            registered_addr_to_base_.erase((uint64_t)addr);
+        }
+        return rc;
     }
 
     // Fabric memory registration
@@ -712,6 +766,7 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             LOG(WARNING) << "Memory region " << addr
                          << " is not allocated by hipMemCreate, "
                          << "but it can be used as local buffer";
+            skipped_addrs_.insert((uint64_t)addr);
             return 0;
         }
 
@@ -728,15 +783,38 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
             real_size = (length + granularity - 1) & ~(granularity - 1);
         }
 
+        // Sub-ranges of one allocation share its page-granular registration.
+        // Track aliases and reference-count them like the IPC path so an
+        // unregister cannot consume another alias's registration. The
+        // shareable handle for the page is exported only once, so drop the
+        // retained allocation handle on these fast paths.
+        uint64_t page = (uint64_t)real_addr;
+        if (!registered_addr_to_base_.emplace((uint64_t)addr, page).second) {
+            (void)hipMemRelease(handle);
+            return 0;
+        }
+        auto refs_it = registered_base_refs_.find(page);
+        if (refs_it != registered_base_refs_.end()) {
+            refs_it->second++;
+            (void)hipMemRelease(handle);
+            return 0;
+        }
+
         // Export shareable handle
         hipxFabricHandle export_handle_raw = {};
         if (!checkHip(
                 hipMemExportToShareableHandle(&export_handle_raw, handle,
                                               HIPX_MEM_HANDLE_TYPE_FABRIC, 0),
                 "HipTransport: hipMemExportToShareableHandle failed")) {
+            registered_addr_to_base_.erase((uint64_t)addr);
+            (void)hipMemRelease(handle);
             return -1;
         }
         export_handle_raw.pid = getpid();
+        // The shareable handle keeps the allocation alive on its own; drop
+        // the reference taken above so registrations do not accumulate
+        // retains over the process lifetime.
+        (void)hipMemRelease(handle);
 
         (void)remote_accessible;
         BufferDesc desc;
@@ -745,12 +823,54 @@ int HipTransport::registerLocalMemory(void* addr, size_t length,
         desc.name = location;
         desc.shm_name = serializeBinaryData((const void*)&export_handle_raw,
                                             sizeof(hipxFabricHandle));
-        return metadata_->addLocalMemoryBuffer(desc, true);
+#ifdef ENABLE_MULTI_PROTOCOL
+        desc.protocol = "hip";
+#endif
+        int rc = metadata_->addLocalMemoryBuffer(desc, true);
+        if (rc == 0) {
+            registered_base_refs_[page] = 1;
+        } else {
+            // addLocalMemoryBuffer appends the desc before publishing it;
+            // drop the leftover so a failed registration leaves nothing
+            // behind for a later rollback or unregister to miss.
+            metadata_->removeLocalMemoryBuffer(real_addr, isOwnDesc, false);
+            registered_addr_to_base_.erase((uint64_t)addr);
+        }
+        return rc;
     }
 }
 
 int HipTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
-    return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    // Hold register_mutex_ through the metadata removal, mirroring the
+    // register path, so a concurrent register of another sub-range cannot
+    // republish the buffer in between.
+    std::lock_guard<std::mutex> lock(register_mutex_);
+    auto alias_it = registered_addr_to_base_.find((uint64_t)addr);
+    if (alias_it == registered_addr_to_base_.end()) {
+        // The address is not one we registered. If it equals a live base or
+        // page, slab-level cleanup must not drop the shared registration
+        // while its aliases are still alive.
+        if (registered_base_refs_.count((uint64_t)addr)) {
+            return ERR_ADDRESS_NOT_REGISTERED;
+        }
+        // Skipped registrations belong to another transport; addresses we
+        // never saw are invalid or repeated unregisters.
+        if (skipped_addrs_.erase((uint64_t)addr) > 0) {
+            return 0;
+        }
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+    uint64_t base = alias_it->second;
+    registered_addr_to_base_.erase(alias_it);
+    skipped_addrs_.erase((uint64_t)addr);
+    // Both maps are updated in pairs under this mutex, so the base always
+    // has a refcount entry here. Only the last alias removes the shared
+    // registration, whether it is keyed by IPC allocation base or fabric
+    // physical page.
+    if (--registered_base_refs_[base] > 0) return 0;
+    registered_base_refs_.erase(base);
+    return metadata_->removeLocalMemoryBuffer((void*)base, isOwnDesc,
+                                              update_metadata);
 }
 
 int HipTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
