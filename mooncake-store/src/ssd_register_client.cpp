@@ -1,9 +1,50 @@
+// Mooncake NoF SSD register/unregister client.
 #include "ssd_register_client.h"
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
 
 namespace mooncake {
+
+// Normalize and validate the MC_NOF_TRTYPE environment variable.
+//
+// Behaviour:
+//   - None / empty / whitespace-only -> default to "RDMA"
+//   - Trims surrounding whitespace from the env value
+//   - Uppercases the result so callers can compare against "RDMA"/"TCP"
+//   - Anything that is not "RDMA" or "TCP" after normalization is replaced
+//     with "RDMA" and a warning is logged.
+//
+// The previous implementation validated the raw value before normalizing,
+// which silently dropped common lower-case spellings like "tcp" and made
+// set_register and set_unregister_by_endpoint disagree on the endpoint
+// string they built.
+static std::string NormalizeTrType(const char *env) {
+    std::string trtype = env ? env : "RDMA";
+
+    // Trim surrounding whitespace so "tcp " / " tcp" behave as "tcp".
+    auto not_space = [](unsigned char c) { return !std::isspace(c); };
+    trtype.erase(trtype.begin(),
+                 std::find_if(trtype.begin(), trtype.end(), not_space));
+    trtype.erase(std::find_if(trtype.rbegin(), trtype.rend(), not_space).base(),
+                 trtype.end());
+
+    if (trtype.empty()) {
+        return "RDMA";
+    }
+
+    // Case-fold to upper so callers can compare against "RDMA"/"TCP".
+    std::transform(
+        trtype.begin(), trtype.end(), trtype.begin(),
+        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+    if (trtype != "RDMA" && trtype != "TCP") {
+        LOG(WARNING) << "Invalid MC_NOF_TRTYPE=\"" << (env ? env : "")
+                     << "\", fallback to RDMA";
+        trtype = "RDMA";
+    }
+    return trtype;
+}
 
 NoFRegisterClient::NoFRegisterClient()
     : master_client_(generate_uuid(), nullptr) {}
@@ -26,15 +67,7 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
     }
 
     const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
-    std::string trtype = trtype_env ? trtype_env : "RDMA";
-    std::transform(
-        trtype.begin(), trtype.end(), trtype.begin(),
-        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (trtype != "RDMA" && trtype != "TCP") {
-        LOG(WARNING) << "Invalid MC_NOF_TRTYPE=" << trtype
-                     << ", fallback to RDMA";
-        trtype = "RDMA";
-    }
+    std::string trtype = NormalizeTrType(trtype_env);
 
     std::string te_endpoint = "traddr:" + traddr +
                               " trsvcid:" + std::to_string(trsvcid) +
@@ -71,15 +104,7 @@ int NoFRegisterClient::set_unregister_by_endpoint(
     }
 
     const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
-    std::string trtype = trtype_env ? trtype_env : "RDMA";
-    std::transform(
-        trtype.begin(), trtype.end(), trtype.begin(),
-        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (trtype != "RDMA" && trtype != "TCP") {
-        LOG(WARNING) << "Invalid MC_NOF_TRTYPE=" << trtype
-                     << ", fallback to RDMA";
-        trtype = "RDMA";
-    }
+    std::string trtype = NormalizeTrType(trtype_env);
 
     // Build the te_endpoint string to match registered segments
     std::string te_endpoint = "traddr:" + traddr +

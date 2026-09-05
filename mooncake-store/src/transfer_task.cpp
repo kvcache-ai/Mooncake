@@ -93,6 +93,25 @@ static int GetSpdkNofWorkerCount() {
     return value;
 }
 
+// Read MC_NOF_MAX_QUEUE_DEPTH to cap the per-worker task queue depth.
+// Default: 256.  Set to 0 to disable the limit (no backpressure).
+// Uses a dedicated parser that allows zero (GetPositiveEnvOrDefault rejects
+// zero, which would silently fall back to the default).
+static int GetSpdkNofMaxQueueDepth() {
+    static const int value = []() -> int {
+        const char* raw = std::getenv("MC_NOF_MAX_QUEUE_DEPTH");
+        if (!raw || raw[0] == '\0') return 256;
+        errno = 0;
+        char* end = nullptr;
+        long parsed = std::strtol(raw, &end, 10);
+        if (errno != 0 || end == raw || (end && *end != '\0') || parsed < 0 ||
+            parsed > 4096)
+            return 256;
+        return static_cast<int>(parsed);
+    }();
+    return value;
+}
+
 static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     int count = 0;
     const mooncake::SpdkNofTask* cursor = head;
@@ -104,13 +123,33 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
 }
 
 static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
-        task->state->set_completed(task->failed
-                                       ? mooncake::ErrorCode::TRANSFER_FAIL
-                                       : mooncake::ErrorCode::OK);
-        if (!task->on_chain) {
-            delete task;
-        }
+    // Terminal pre-conditions: remaining_lba == 0 (worker has submitted
+    // all blocks, or the trampoline wrote 0 on error CQE) and
+    // outstanding_sub_io == 0 (every sub-IO CQE has been processed).
+    // A DRAINING-short-circuited CQE leaves outstanding_sub_io > 0,
+    // so FinalizeAfterDrain is responsible for that case instead.
+    int rem_lba = task->remaining_lba.load(std::memory_order_acquire);
+    int outstanding = task->outstanding_sub_io.load(std::memory_order_acquire);
+    if (rem_lba != 0 || outstanding != 0) return;
+
+    // Single-completion CAS: set_completed + delete happen exactly
+    // once across all callers.
+    if (!task->try_complete()) return;
+
+    if (task->nof_qos) {
+        task->nof_qos->active_tasks.erase(task);
+    }
+
+    // Acquire fence so the previous loads (remaining_lba,
+    // outstanding_sub_io, failed) are visible to set_completed and
+    // subsequent observers.
+    std::atomic_thread_fence(std::memory_order_acquire);
+
+    bool is_failed = task->failed.load(std::memory_order_acquire);
+    task->state->set_completed(is_failed ? mooncake::ErrorCode::TRANSFER_FAIL
+                                         : mooncake::ErrorCode::OK);
+    if (!task->on_chain) {
+        delete task;
     }
 }
 
@@ -123,29 +162,71 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     mooncake::SpdkNofSubTask* sub_task =
         reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
     mooncake::SpdkNofTask* task = sub_task->task;
+    if (!task) {
+        // Defensive: sub_task->task is always initialised by the worker
+        // before SubmitRequest, but a callback racing task deletion
+        // (FinalizeAfterDrain or destructor teardown) must not UAF.
+        sub_task->sub_task_pool->push(sub_task);
+        return;
+    }
+
+    // Resolve connection/pool with UAF protection.  seg_handle may be
+    // null/dangling if the worker has already deleted the task via
+    // SpdkNofTaskCompletion before SPDK fired this CQE.
+    mooncake::NofConnection* conn = nullptr;
+    mooncake::NofQpairPool* pool = nullptr;
+    if (task->seg_handle && task->seg_handle->segment) {
+        conn = task->seg_handle->segment->GetConnection();
+        if (conn) pool = &conn->GetQpairPool();
+    }
+
+    // DRAINING short-circuit: skip task-level counters and route
+    // finalisation through FinalizeAfterDrain (single source of
+    // truth).  DecrementInflight is still required to balance the
+    // submit-side Increment and to release the WaitForInflightCompletion
+    // synchronises-with edge.
+    if (pool && pool->IsDraining()) {
+        pool->DecrementInflight();
+        sub_task->sub_task_pool->push(sub_task);
+        return;
+    }
+
     mooncake::SpdkNofQos* nof_qos = task->nof_qos;
     int op = task->op;
-    if (--(*task->io_count) < 0) {
-        LOG(ERROR) << "total outstanding io < 0";
+
+    // Normal path: monotonic decrements via fetch_sub (exactly
+    // submit_lba_count per CQE; no clamp-to-zero needed because
+    // FinalizeAfterDrain does not touch these counters).
+    if (task->io_count) {
+        task->io_count->fetch_sub(1, std::memory_order_acq_rel);
     }
 
-    if (--(task->outstanding_sub_io) < 0) {
-        LOG(ERROR) << "task outstanding io < 0";
+    task->outstanding_sub_io.fetch_sub(1, std::memory_order_acq_rel);
+
+    if (nof_qos) {
+        nof_qos->inflight_blocks[op].fetch_sub(sub_task->submit_lba_count,
+                                               std::memory_order_acq_rel);
     }
 
-    nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
-    if (nof_qos->inflight_blocks[op] < 0) {
-        LOG(ERROR) << "task outstanding io < 0";
-    }
+    task->inflight_block_count.fetch_sub(sub_task->submit_lba_count,
+                                         std::memory_order_acq_rel);
 
     if (spdk_nvme_cpl_is_error(cpl)) {
         LOG(ERROR) << "task_complete: I/O failed"
                    << spdk_nvme_cpl_get_status_string(&cpl->status);
-        task->remaining_lba = 0;
-        task->failed = true;
+        task->remaining_lba.store(0, std::memory_order_release);
+        task->failed.store(true, std::memory_order_release);
     }
 
     SpdkNofTaskCompletion(task);
+
+    // Refcount fence: paired with the IncrementInflight the worker
+    // performed right before spdk_nvme_ns_cmd_*.  Safe to run after
+    // SpdkNofTaskCompletion (which may delete the task) because
+    // inflight_count_ lives on the pool, not on the task.
+    if (pool) {
+        pool->DecrementInflight();
+    }
 
     sub_task->sub_task_pool->push(sub_task);
 }
@@ -161,12 +242,78 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 
     blocks_per_chunk =
         std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
-    inflight_blocks_limit =
+    // Save the absolute cap from MC_NOF_INFLIGHT_BYTES_LIMIT so that
+    // UpdateInflightLimit can shrink the inflight limit (degradation) but
+    // never RAISE it past the originally-configured ceiling.  Without this,
+    // a partially-degraded pool could compute a pool-derived limit larger
+    // than the absolute one — see UpdateInflightLimit for the formula.
+    absolute_inflight_limit =
         std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
+    inflight_blocks_limit = absolute_inflight_limit;
     for (int i = 0; i < kSpdkNofOpNum; ++i) {
-        inflight_blocks[i] = 0;
+        inflight_blocks[i].store(0, std::memory_order_relaxed);
         head[i] = nullptr;
         tail[i] = nullptr;
+    }
+}
+
+// Finalise head/tail tasks whose outstanding_sub_io == 0.  These tasks
+// have already received all their CQE callbacks (nvmf_io_complete
+// decremented outstanding_sub_io to 0) but the worker has not yet
+// called SpdkNofTaskCompletion because the chain was non-empty when
+// the pool entered DRAINING.  Off-chain tasks in active_tasks still
+// have outstanding_sub_io > 0 and are finalised by
+// FinalizeAfterDrain once the pool reaches inflight == 0.
+//
+// Safe to call from the worker thread.
+void SpdkNofQos::FailQueuedTasks() {
+    for (int op = 0; op < kSpdkNofOpNum; ++op) {
+        while (head[op]) {
+            SpdkNofTask* task = head[op];
+            // A chain-head task with outstanding_sub_io > 0 means its
+            // CQEs are still in flight on a live qpair — leave it for
+            // the drain protocol to finish.
+            if (task->outstanding_sub_io.load(std::memory_order_acquire) > 0) {
+                break;
+            }
+            PopTask(op);
+            task->on_chain = false;
+            SpdkNofTaskCompletion(task);
+        }
+        tail[op] = nullptr;
+    }
+}
+
+// Finalise the off-chain tasks in active_tasks once the qpair pool's
+// inflight_blocks have reached 0 (verified by
+// WaitForInflightCompletion).  outstanding_sub_io must be zeroed here
+// because the trampoline skipped it on the DRAINING short-circuit;
+// inflight_block_count and inflight_blocks[op] are NOT touched —
+// those values already reflect the trampoline's normal-path
+// decrements, which WaitForInflightCompletion guarantees have all
+// run.  try_complete() arbitrates set_completed + delete so it
+// happens exactly once across all callers.
+//
+// Safe to call from the worker thread.
+void SpdkNofQos::FinalizeAfterDrain() {
+    // Snapshot active_tasks first because SpdkNofTaskCompletion
+    // erases each task from the set as it runs.
+    std::vector<SpdkNofTask*> to_finalize(active_tasks.begin(),
+                                          active_tasks.end());
+    for (SpdkNofTask* task : to_finalize) {
+        if (!task) continue;
+
+        task->on_chain = false;
+        task->failed.store(true, std::memory_order_release);
+        task->remaining_lba.store(0, std::memory_order_release);
+        task->outstanding_sub_io.store(0, std::memory_order_release);
+
+        SpdkNofTaskCompletion(task);
+    }
+
+    for (int op = 0; op < kSpdkNofOpNum; ++op) {
+        head[op] = nullptr;
+        tail[op] = nullptr;
     }
 }
 #endif
@@ -300,9 +447,17 @@ SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
+      // Backpressure condition variable for flow control.
+      queue_not_full_cv_(
+          std::make_unique<std::condition_variable[]>(worker_count_)),
+      max_queue_depth_(GetSpdkNofMaxQueueDepth()),
       shutdown_(false) {
     VLOG(1) << "Creating SpdkNofWorkerPool with " << worker_count_
-            << " workers";
+            << " workers, max_queue_depth=" << max_queue_depth_;
+
+    // Diagnostic: register with SpdkWrapper so Cleanup() can detect premature
+    // destruction (static destruction order fiasco).
+    SpdkNoF_RegisterWorkerPool();
 
     // Start worker threads
     workers_.reserve(worker_count_);
@@ -316,8 +471,15 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
         return;
     }
 
+    // Wake workers AND any submitters blocked on queue_not_full_cv_.
+    // If a submitter is waiting because a worker queue is full, it checks
+    // shutdown_ in its wait predicate but will never observe it unless we
+    // explicitly notify queue_not_full_cv_.  Without this notification
+    // the destructor would join workers while the submitter remains
+    // blocked, causing a deadlock.
     for (int i = 0; i < worker_count_; ++i) {
         queue_cv_[i].notify_all();
+        queue_not_full_cv_[i].notify_all();
     }
 
     for (auto& worker : workers_) {
@@ -325,6 +487,10 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
             worker.join();
         }
     }
+
+    // Diagnostic: all workers joined — safe for SpdkWrapper::Cleanup() to free
+    // qpairs.
+    SpdkNoF_UnregisterWorkerPool();
 
     VLOG(1) << "SpdkNofWorkerPool destroyed";
 }
@@ -366,7 +532,38 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        // Flow control: block the caller when the worker's task queue is
+        // full, creating backpressure that prevents unbounded growth
+        // in task_queue_ under degraded conditions.  Per-segment
+        // seg_to_qos chains remain bounded only by the inflight cap
+        // (see SpdkNofQos::inflight_blocks_limit); they are NOT
+        // controlled by this backpressure check.
+        // When max_queue_depth_ == 0 the check is skipped (no limit).
+        std::unique_lock<std::mutex> lock(queue_mutex_[worker_idx]);
+        if (max_queue_depth_ > 0 &&
+            static_cast<int>(task_queue_[worker_idx].size()) >=
+                max_queue_depth_) {
+            auto wait_start = std::chrono::steady_clock::now();
+            queue_not_full_cv_[worker_idx].wait(lock, [&] {
+                return shutdown_.load() ||
+                       static_cast<int>(task_queue_[worker_idx].size()) <
+                           max_queue_depth_;
+            });
+            if (shutdown_.load()) {
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - wait_start)
+                              .count();
+            if (waited > 1000) {
+                LOG(WARNING)
+                    << "[SpdkNofWorkerPool] submitTask blocked for " << waited
+                    << "ms (queue full, depth=" << max_queue_depth_
+                    << ", worker=" << worker_idx
+                    << ") — target may be overloaded or qpair pool degraded";
+            }
+        }
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
@@ -380,6 +577,52 @@ static bool HasBufferedTask(
         }
     }
     return false;
+}
+
+// Sum a single seg's inflight_blocks across all op types.  Used as the
+// per-segment quiescence barrier — FinalizeAfterDrain requires this to
+// reach 0 before it is safe to delete off-chain tasks.
+static int SegmentInflightBlocks(const SpdkNofQos& qos) {
+    int total = 0;
+    for (int op = 0; op < kSpdkNofOpNum; ++op) {
+        total += qos.inflight_blocks[op].load(std::memory_order_relaxed);
+    }
+    return total;
+}
+
+// For every DRAINING pool, wait on WaitForInflightCompletion() until
+// the pool-level inflight_count_ reaches 0.  That counter is the
+// release/acquire synchronises-with edge paired with the
+// IncrementInflight the worker performed before spdk_nvme_ns_cmd_*:
+// when WaitForInflightCompletion returns, every trampoline that was
+// in flight before has finished, and no new trampoline can start
+// because EnterDraining has flipped state to kDraining (GetNextQpair
+// returns nullptr, blocking further submits).
+//
+// After every pool reaches quiescence, FinalizeAfterDrain walks
+// active_tasks and routes each one through SpdkNofTaskCompletion
+// (try_complete() arbitrates set_completed + delete).
+static void DrainDrainingPoolsUntilQuiescent(
+    const std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>>& seg_to_qos) {
+    for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
+        auto* conn = seg_handle->segment->GetConnection();
+        auto& pool = conn->GetQpairPool();
+        if (!pool.IsDraining()) continue;
+        bool quiescent = pool.WaitForInflightCompletion();
+        if (!quiescent) {
+            // Forward-compatibility guard: a false return would race
+            // outstanding trampolines against FinalizeAfterDrain.
+            LOG(FATAL) << "[DrainDrainingPoolsUntilQuiescent] pool did not "
+                          "reach quiescence — refusing to finalize tasks "
+                          "to avoid double-free";
+        }
+    }
+
+    for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+        auto* conn = seg_handle->segment->GetConnection();
+        if (!conn->GetQpairPool().IsDraining()) continue;
+        nof_qos->FinalizeAfterDrain();
+    }
 }
 
 constexpr int kSpdkNofSubTaskChunkSize = 4096;
@@ -410,7 +653,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
     VLOG(2) << "SpdkNofWorkerPool worker thread started";
 
-    int64_t total_outstanding_io = 0;
+    // Shared with every SpdkNofTask via task->io_count so the counter
+    // outlives workerThread's stack frame (shared_ptr keeps it alive
+    // until the last referencing task is destroyed).
+    auto total_outstanding_io = std::make_shared<std::atomic<int64_t>>(0);
     // std::set<nof_seg_handle *> seg_set;
     std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
     std::stack<SpdkNofSubTask*> sub_task_pool;
@@ -420,6 +666,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
 
+    // Timers for periodic rebalance and queue-backlog diagnostics.
+    auto last_rebalance = std::chrono::steady_clock::now();
+    auto last_queue_depth_log = std::chrono::steady_clock::now();
+
     if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
         return;
     }
@@ -428,14 +678,16 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
-                    return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
-                });
+            queue_cv.wait(lock, [this, &task_queue, &total_outstanding_io,
+                                 &seg_to_qos] {
+                return shutdown_.load() || !task_queue.empty() ||
+                       total_outstanding_io->load(std::memory_order_acquire) ||
+                       HasBufferedTask(seg_to_qos);
+            });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                (total_outstanding_io->load(std::memory_order_acquire) == 0) &&
+                !HasBufferedTask(seg_to_qos)) {
                 break;
             }
 
@@ -445,6 +697,17 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 if (task == nullptr) {
                     LOG(ERROR)
                         << "alloc SpdkNofTask failed, worker " << work_idx;
+                    // Signal failure to the submitter before dropping
+                    // the task — otherwise TransferFuture::wait() hangs
+                    // forever on a task that was silently discarded.
+                    if (task_queue.front().state) {
+                        task_queue.front().state->set_completed(
+                            ErrorCode::TRANSFER_FAIL);
+                    }
+                    task_queue.pop();
+                    if (max_queue_depth_ > 0) {
+                        queue_not_full_cv_[work_idx].notify_one();
+                    }
                     continue;
                 }
 
@@ -454,14 +717,26 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                     auto qos = std::make_unique<SpdkNofQos>(
                         SpdkWrapper::GetInstance().GetBlockSize(
                             task->seg_handle));
-                    if (qos == nullptr) {
-                        LOG(ERROR)
-                            << "alloc SpdkNofQos failed, worker " << work_idx;
-                        delete task;
-                        continue;
-                    }
                     nof_qos = qos.get();
                     seg_to_qos[task->seg_handle] = std::move(qos);
+
+                    // Adaptive inflight: shrink the inflight cap only
+                    // when the pool is degraded (Size < target) to
+                    // prevent excessive in-flight I/O on a single qpair.
+                    // Full-capacity pools keep the original 32 MiB limit
+                    // to ensure maximum throughput.
+                    auto* seg_conn = task->seg_handle->segment->GetConnection();
+                    const auto& seg_cfg = seg_conn->GetConfig();
+                    if (seg_cfg.adaptive_inflight) {
+                        auto& pool = seg_conn->GetQpairPool();
+                        if (pool.Size() < pool.GetTargetCount()) {
+                            nof_qos->UpdateInflightLimit(
+                                static_cast<int>(pool.Size()),
+                                static_cast<int>(
+                                    seg_cfg.max_inflight_per_qpair));
+                        }
+                    }
+
                     if (IsSpdkNofDebugEnabled()) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
@@ -475,11 +750,16 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 } else {
                     nof_qos = it->second.get();
                 }
-                task->io_count = &total_outstanding_io;
+                task->io_count = total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
                 nof_qos->PushTask(task);
                 task_queue.pop();
+
+                // Notify producers that a queue slot is available.
+                if (max_queue_depth_ > 0) {
+                    queue_not_full_cv_[work_idx].notify_one();
+                }
             }
         }
 
@@ -487,16 +767,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
             for (int i = 0; i < kSpdkNofOpNum; ++i) {
-                int avail_blocks = nof_qos->inflight_blocks_limit -
-                                   nof_qos->inflight_blocks[i];
+                int avail_blocks =
+                    nof_qos->inflight_blocks_limit -
+                    nof_qos->inflight_blocks[i].load(std::memory_order_relaxed);
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     SpdkNofTask* task = nof_qos->head[i];
                     SpdkNofSubTask* sub_task;
-                    while (task->remaining_lba > 0 && avail_blocks > 0) {
-                        uint32_t submit_lba_count = std::min(
-                            avail_blocks, std::min(task->remaining_lba,
-                                                   nof_qos->blocks_per_chunk));
-                        int lba_off = task->lba_count - task->remaining_lba;
+                    while (task->remaining_lba.load(std::memory_order_acquire) >
+                               0 &&
+                           avail_blocks > 0) {
+                        uint32_t submit_lba_count =
+                            std::min(avail_blocks,
+                                     std::min(task->remaining_lba.load(
+                                                  std::memory_order_relaxed),
+                                              nof_qos->blocks_per_chunk));
+                        int lba_off =
+                            task->lba_count -
+                            task->remaining_lba.load(std::memory_order_relaxed);
                         uint64_t submit_lba = task->lba + lba_off;
                         void* submit_ptr = reinterpret_cast<void*>(
                             reinterpret_cast<char*>(task->ptr) +
@@ -504,14 +791,23 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
 
                         if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks,
                                               work_idx)) {
-                            task->failed = true;
-                            task->remaining_lba = 0;
+                            task->failed.store(true, std::memory_order_release);
+                            task->remaining_lba.store(
+                                0, std::memory_order_release);
                             break;
                         }
                         sub_task = sub_task_pool.top();
                         sub_task_pool.pop();
                         sub_task->task = task;
                         sub_task->submit_lba_count = submit_lba_count;
+
+                        // Increment BEFORE spdk_nvme_ns_cmd_* so the
+                        // trampoline's DecrementInflight pairs with
+                        // ~NofQpairPool's WaitForInflightCompletion.
+                        // Synchronous submit failure rolls it back below.
+                        auto* submit_conn =
+                            task->seg_handle->segment->GetConnection();
+                        submit_conn->GetQpairPool().IncrementInflight();
 
                         int ret = SpdkWrapper::GetInstance().SubmitRequest(
                             task->seg_handle, submit_ptr, submit_lba,
@@ -520,18 +816,53 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         if (ret != 0) {
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
-                            task->failed = true;
-                            task->remaining_lba = 0;
+                            // No CQE will fire for a failed submission —
+                            // roll back the increment and recycle the
+                            // sub_task.
+                            submit_conn->GetQpairPool().DecrementInflight();
+                            sub_task->sub_task_pool->push(sub_task);
+                            task->failed.store(true, std::memory_order_release);
+                            task->remaining_lba.store(
+                                0, std::memory_order_release);
                         } else {
                             task->idx++;
-                            task->remaining_lba -= submit_lba_count;
-                            nof_qos->inflight_blocks[i] += submit_lba_count;
+                            task->remaining_lba.fetch_sub(
+                                submit_lba_count, std::memory_order_acq_rel);
+                            int prev_blocks = nof_qos->inflight_blocks[i].load(
+                                std::memory_order_relaxed);
+                            while (true) {
+                                if (nof_qos->inflight_blocks[i]
+                                        .compare_exchange_weak(
+                                            prev_blocks,
+                                            prev_blocks + submit_lba_count,
+                                            std::memory_order_acq_rel)) {
+                                    break;
+                                }
+                            }
+                            // Per-task inflight count, mirrored against
+                            // nof_qos->inflight_blocks[op] via
+                            // nvmf_io_complete.
+                            int prev_task_blocks =
+                                task->inflight_block_count.load(
+                                    std::memory_order_relaxed);
+                            while (true) {
+                                if (task->inflight_block_count
+                                        .compare_exchange_weak(
+                                            prev_task_blocks,
+                                            prev_task_blocks + submit_lba_count,
+                                            std::memory_order_acq_rel)) {
+                                    break;
+                                }
+                            }
                             avail_blocks -= submit_lba_count;
-                            task->outstanding_sub_io++;
-                            total_outstanding_io++;
+                            task->outstanding_sub_io.fetch_add(
+                                1, std::memory_order_acq_rel);
+                            total_outstanding_io->fetch_add(
+                                1, std::memory_order_acq_rel);
                         }
                     }
-                    if (task->remaining_lba == 0) {
+                    if (task->remaining_lba.load(std::memory_order_acquire) ==
+                        0) {
                         nof_qos->PopTask(i);
                         task->on_chain = false;
                         SpdkNofTaskCompletion(task);
@@ -540,14 +871,28 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
             }
         }
 
-        if (total_outstanding_io > 0) {
-            int64_t ret = 0;
-            for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
+        if (total_outstanding_io->load(std::memory_order_acquire) > 0) {
+            bool poll_failed = false;
+            for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+                auto* conn = seg_handle->segment->GetConnection();
+                auto& pool = conn->GetQpairPool();
+
+                int64_t ret =
+                    SpdkWrapper::GetInstance().NvmePollProcessCompletion(
+                        seg_handle, 0);
                 if (ret < 0) {
-                    LOG(ERROR) << "poll completion error: ret " << ret;
+                    poll_failed = true;
+                    LOG(ERROR)
+                        << "poll completion error: ret " << ret
+                        << " — entering pool DRAINING for seg " << seg_handle;
+
+                    pool.EnterDraining("poll_err");
+                    nof_qos->FailQueuedTasks();
                 }
+            }
+            if (poll_failed) {
+                DrainDrainingPoolsUntilQuiescent(seg_to_qos);
+                continue;
             }
         }
 
@@ -560,17 +905,80 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
-                        << " seg_handle=" << seg_handle
-                        << " inflight_read=" << nof_qos->inflight_blocks[0]
-                        << " inflight_write=" << nof_qos->inflight_blocks[1]
+                        << " seg_handle=" << seg_handle << " inflight_read="
+                        << nof_qos->inflight_blocks[0].load(
+                               std::memory_order_relaxed)
+                        << " inflight_write="
+                        << nof_qos->inflight_blocks[1].load(
+                               std::memory_order_relaxed)
                         << " inflight_limit=" << nof_qos->inflight_blocks_limit
                         << " queued_read="
                         << CountSpdkNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
                         << CountSpdkNofQueuedTasks(nof_qos->head[1])
-                        << " total_outstanding_io=" << total_outstanding_io;
+                        << " total_outstanding_io="
+                        << total_outstanding_io->load(
+                               std::memory_order_relaxed);
                 }
                 last_debug_snapshot = now;
+            }
+        }
+
+        // Periodic rebalance: scan every segment's qpair pool and
+        // attempt TryGrow on degraded pools.  Update the inflight
+        // limit to reflect the recovered qpair capacity.
+        {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_rebalance);
+            if (elapsed.count() >= kRebalanceIntervalSeconds) {
+                last_rebalance = now;
+                for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+                    auto* conn = seg_handle->segment->GetConnection();
+                    auto& pool = conn->GetQpairPool();
+                    uint32_t target = pool.GetTargetCount();
+                    if (pool.Size() < target) {
+                        uint32_t added = pool.TryGrow(target);
+                        if (added > 0) {
+                            // Update inflight cap to reflect expanded pool.
+                            const auto& seg_cfg = conn->GetConfig();
+                            if (seg_cfg.adaptive_inflight) {
+                                nof_qos->UpdateInflightLimit(
+                                    static_cast<int>(pool.Size()),
+                                    static_cast<int>(
+                                        seg_cfg.max_inflight_per_qpair));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Queue-backlog diagnostics: every ~10 s check the number
+        // of queued tasks across all segments and emit a warning if
+        // backlog is significant (early warning for degradation).
+        {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                now - last_queue_depth_log);
+            if (elapsed.count() >= 10) {
+                last_queue_depth_log = now;
+                int total_queued = 0;
+                for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
+                    for (int i = 0; i < kSpdkNofOpNum; ++i) {
+                        total_queued +=
+                            CountSpdkNofQueuedTasks(nof_qos->head[i]);
+                    }
+                }
+                if (total_queued > 16) {
+                    // Log only on significant backlog to reduce noise.
+                    LOG(WARNING)
+                        << "[SpdkNofWorkerPool] task backlog: queued="
+                        << total_queued << " queue_depth=" << task_queue.size()
+                        << " worker=" << work_idx
+                        << " — target throughput may be degraded"
+                        << " (check qpair allocation count)";
+                }
             }
         }
     }
@@ -986,6 +1394,28 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
             << memcpy_enabled_;
+}
+
+// Release cached NoF handles so that QIDs are recycled when a client is
+// closed, rather than lingering until process exit.
+//
+// Ordering: spdk_nvmf_pool_ must be stopped and joined BEFORE cached NoF
+// handles are closed.  Worker threads may still own queued/inflight
+// SpdkNofTasks that dereference these handles and qpairs.  We explicitly
+// reset the pool here (destructor body runs before member destruction) so
+// that workers are joined first, then handles are released.
+TransferSubmitter::~TransferSubmitter() {
+#ifdef USE_NOF
+    spdk_nvmf_pool_.reset();
+    for (auto& [endpoint, handle] : nof_handle_cache_) {
+        if (handle) {
+            VLOG(1) << "TransferSubmitter releasing NoF handle for "
+                    << endpoint;
+            SpdkWrapper::GetInstance().CloseNofSegment(handle);
+        }
+    }
+    nof_handle_cache_.clear();
+#endif
 }
 
 std::optional<TransferFuture> TransferSubmitter::submit(
@@ -1432,12 +1862,88 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    nof_seg_handle* seg_handle =
-        SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
-    if (!seg_handle) {
-        LOG(ERROR) << "Failed to open NoF segment endpoint="
-                   << handle.transport_endpoint_;
-        return std::nullopt;
+    // Per-TransferSubmitter handle cache — reuses the connection
+    // across multiple put() calls from the same client to avoid
+    // exhausting QIDs and SPDK internal state with new connections.
+    // First-open is single-flight per endpoint so concurrent submitters
+    // for the same endpoint wait for the designated opener instead of
+    // racing to OpenNofSegment (which can fail spuriously when one
+    // caller loses QIDs while another succeeds and populates the cache).
+    const std::string& endpoint = handle.transport_endpoint_;
+    nof_seg_handle* seg_handle = nullptr;
+    bool became_opener = false;
+    {
+        std::unique_lock<std::mutex> open_lock(nof_open_inflight_mutex_);
+
+        // Wait while another thread is opening this endpoint.  The
+        // predicate is "this endpoint is NOT in flight" — once cleared
+        // by the prior opener, either the cache is populated (so we
+        // become a cache-hit caller) or the slot is free for a new
+        // opener.
+        nof_open_done_cv_.wait(open_lock, [this, &endpoint] {
+            return nof_open_inflight_.find(endpoint) ==
+                   nof_open_inflight_.end();
+        });
+
+        // Re-check cache after the wait (populated by a prior opener).
+        {
+            std::lock_guard<std::mutex> cache_lock(nof_cache_mutex_);
+            auto cache_it = nof_handle_cache_.find(endpoint);
+            if (cache_it != nof_handle_cache_.end()) {
+                seg_handle = cache_it->second;
+            }
+        }
+
+        if (!seg_handle) {
+            // Designated opener: mark in-flight and release open_lock
+            // before the slow OpenNofSegment call so concurrent
+            // submitters for OTHER endpoints are not blocked.
+            nof_open_inflight_.insert(endpoint);
+            became_opener = true;
+        }
+    }
+
+    if (became_opener) {
+        // Slow path: open without holding any lock so backoff/retry
+        // does not block cache lookups for other endpoints or waiters
+        // for this one.
+        auto* new_handle = SpdkWrapper::GetInstance().OpenNofSegment(endpoint);
+
+        // Publish: populate cache on success, drop on failure.  Then
+        // clear in-flight so waiters can proceed.
+        nof_seg_handle* handle_to_discard = nullptr;
+        {
+            std::lock_guard<std::mutex> cache_lock(nof_cache_mutex_);
+            if (new_handle) {
+                auto cache_it = nof_handle_cache_.find(endpoint);
+                if (cache_it != nof_handle_cache_.end()) {
+                    // Another opener won the race while we were
+                    // opening (possible across TransferSubmitters
+                    // sharing this handle map — currently impossible
+                    // since each TransferSubmitter owns its own cache,
+                    // but kept defensively in case that changes).
+                    handle_to_discard = new_handle;
+                    seg_handle = cache_it->second;
+                } else {
+                    nof_handle_cache_[endpoint] = new_handle;
+                    seg_handle = new_handle;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> open_lock(nof_open_inflight_mutex_);
+            nof_open_inflight_.erase(endpoint);
+        }
+        nof_open_done_cv_.notify_all();
+
+        if (handle_to_discard) {
+            SpdkWrapper::GetInstance().CloseNofSegment(handle_to_discard);
+        }
+
+        if (!seg_handle) {
+            LOG(ERROR) << "Failed to open NoF segment endpoint=" << endpoint;
+            return std::nullopt;
+        }
     }
 
     uint32_t block_size = SpdkWrapper::GetInstance().GetBlockSize(seg_handle);

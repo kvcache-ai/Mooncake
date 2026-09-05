@@ -115,6 +115,88 @@ add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+  # nof_segment_pipeline_test covers the PipelineIO UAF fix.  Compiles the test
+  # target with -DMOONCAKE_TEST_PIPELINE_IO=1 so the file- scope pipeline_io_cb
+  # can be driven from gtest via the mooncake::detail test hook.
+  #
+  # We also compile ../src/spdk/nof_segment.cpp directly into the test target so
+  # the test gets a private copy of mooncake::detail::InvokePipelineIoCbForTest.
+  # Without this, the test depends on the OBJECT library having been built with
+  # MOONCAKE_TEST_PIPELINE_IO=1, which only happens when both BUILD_UNIT_TESTS
+  # and USE_NOF are on at the OBJECT library's CMake configure time.  Any
+  # configuration drift between the OBJECT library and the test target yields
+  # the linker error "undefined reference to InvokePipelineIoCbForTest".
+  #
+  # --allow-multiple-definition lets the test executable carry its own copy of
+  # nof_segment.cpp symbols (OpenNofSegment, PipelineRead, ...) alongside the
+  # copies already inside the linked mooncake_store library.  The test
+  # executable only ever *calls* the test hook, which is the only symbol with
+  # the -DMOONCAKE_TEST_PIPELINE_IO flag in this build, so the duplicates are
+  # benign.
+  add_store_test(nof_segment_pipeline_test nof_segment_pipeline_test.cpp)
+  target_compile_definitions(nof_segment_pipeline_test
+                             PRIVATE MOONCAKE_TEST_PIPELINE_IO=1)
+  target_sources(
+    nof_segment_pipeline_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/spdk/nof_segment.cpp)
+  target_link_options(nof_segment_pipeline_test PRIVATE
+                      -Wl,--allow-multiple-definition)
+  # nof_qpair_inflight_test verifies the NofQpairPool counter semantics in
+  # isolation using a stubbed pool with no real qpairs, so no SPDK target is
+  # required at runtime.
+  add_store_test(nof_qpair_inflight_test nof_qpair_inflight_test.cpp)
+  # nof_qpair_drain_protocol_test exercises the drain-protocol primitives
+  # (EnterDraining / IsDraining, FailQueuedTasks, FinalizeAfterDrain, PushTask /
+  # PopTask chain mechanics, Increment/DecrementInflight pair) without of any
+  # real SPDK qpair — the unit tests stub the pool with an empty qpair vector
+  # and drive the state machine manually.
+  #
+  # Compiles with -DMOONCAKE_TEST_DRAIN=1 so the Layer-1 DRAIN-7 sibling-failure
+  # regression cases (SiblingQpairFailure_*) gain access to
+  # NofQpairPool::TestInjectPollErrorOnce and the corresponding PollAll hook.
+  # See nof_connection.h:188-235 for the test-only API surface.
+  #
+  # Important: NofQpairPool's layout MUST be identical between the
+  # mooncake_store static library and the test binary, otherwise the
+  # `pending_inject_error_idx_` field is missing from the static library's copy
+  # of the class and ASan reports a heap-buffer-overflow (8-byte write past the
+  # 56-byte object).  To guarantee identical To guarantee identical layout we
+  # compile a private copy of nof_connection.cpp into the test target — same
+  # pattern as nof_segment_pipeline_test above (see comments at lines 94-119).
+  # --allow-multiple-definition lets the test executable carry its own
+  # NofQpairPool/NofConnection symbols alongside the copies already in
+  # mooncake_store; the duplicates are benign because the test code only ever
+  # interacts with the test-side copy.
+  add_store_test(nof_qpair_drain_protocol_test
+                 nof_qpair_drain_protocol_test.cpp)
+  target_compile_definitions(nof_qpair_drain_protocol_test
+                             PRIVATE MOONCAKE_TEST_DRAIN=1)
+  target_sources(
+    nof_qpair_drain_protocol_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/spdk/nof_connection.cpp)
+  target_link_options(nof_qpair_drain_protocol_test PRIVATE
+                      -Wl,--allow-multiple-definition)
+  # nof_qpair_sibling_failure_test is the Layer-2 end-to-end counterpart to the
+  # DRAIN-7 sibling-failure regression cases.  Drives the real worker thread
+  # path against a real SPDK target (gated by MC_TEST_NOF_TARGET, GTEST_SKIP
+  # when unset).  Uses TestInjectPollErrorOnce to synthesise a transport error
+  # on one qpair while sibling qpairs hold pending CQEs. The MOONCAKE_TEST_DRAIN
+  # define exposes the test-only injection hook; we compile a private copy of
+  # nof_connection.cpp into the test target so the class layout is consistent
+  # across the static library and the test binary.
+  add_store_test(nof_qpair_sibling_failure_test
+                 nof_qpair_sibling_failure_test.cpp)
+  target_compile_definitions(nof_qpair_sibling_failure_test
+                             PRIVATE MOONCAKE_TEST_DRAIN=1)
+  target_sources(
+    nof_qpair_sibling_failure_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/spdk/nof_connection.cpp)
+  target_link_options(nof_qpair_sibling_failure_test PRIVATE
+                      -Wl,--allow-multiple-definition)
+  # nof_qpair_inflight_real_test verifies the NofQpairPool root-cause fix
+  # against a real NVMe-oF target.  Gated by MC_TEST_NOF_TARGET (SPDK transport
+  # string); tests GTEST_SKIP when unset so the build is no-op without infra.
+  add_store_test(nof_qpair_inflight_real_test nof_qpair_inflight_real_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
 add_test(

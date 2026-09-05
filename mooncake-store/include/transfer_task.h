@@ -13,6 +13,7 @@
 #include <stack>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -363,16 +364,33 @@ struct SpdkNofTask {
     void* ptr;
     uint64_t lba;
     uint32_t lba_count;
-    int remaining_lba;
-    int outstanding_sub_io;
+    // Decremented by the worker during submit and reset to 0 on error
+    // CQE; read on both threads.  Atomic<RMW.
+    std::atomic<int> remaining_lba{0};
+    // Decremented by the SPDK reactor thread (trampoline normal path);
+    // read by the worker (SpdkNofTaskCompletion / FailQueuedTasks).
+    std::atomic<int> outstanding_sub_io{0};
     int op;   // kSpdkNofOpRead or kSpdkNofOpWrite
     int idx;  // subop idx
-    bool failed;
+    // Written by the worker (FinalizeAfterDrain) and by the SPDK
+    // reactor thread (trampoline on error CQE).
+    std::atomic<bool> failed{false};
     bool on_chain;
+    // Sum of submit_lba_count across this task's currently outstanding
+    // sub-IOs.  Decremented by the SPDK reactor thread (normal path).
+    std::atomic<int> inflight_block_count{0};
     std::shared_ptr<SpdkNofOperationState> state;
-    int64_t* io_count;
+    // Owned by the worker but referenced by the SPDK reactor thread
+    // trampoline.  shared_ptr keeps the atomic alive across worker
+    // shutdown (worker join + WaitForInflightCompletion fence).
+    std::shared_ptr<std::atomic<int64_t>> io_count;
     SpdkNofQos* nof_qos;
     SpdkNofTask* nxt;
+
+    // Single-completion token: 0 = not finalised, 1 = finalised.
+    // try_complete() arbitrates set_completed + delete so exactly one
+    // caller wins.
+    std::atomic<uint8_t> completion_token{0};
 
     SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
                 int op_code, std::shared_ptr<SpdkNofOperationState> s)
@@ -380,8 +398,7 @@ struct SpdkNofTask {
           ptr(buf),
           lba(off),
           lba_count(len),
-          remaining_lba(lba_count),
-          outstanding_sub_io(0),
+          remaining_lba(static_cast<int>(len)),
           op(op_code),
           idx(0),
           failed(false),
@@ -389,7 +406,76 @@ struct SpdkNofTask {
           state(std::move(s)),
           io_count(nullptr),
           nof_qos(nullptr),
-          nxt(nullptr) {}
+          nxt(nullptr),
+          completion_token(0) {}
+
+    // Explicit move constructor: std::atomic members are non-movable,
+    // so we transfer each atomic by load + store.  Trampoline /
+    // FinalizeAfterDrain paths do not run concurrently with a move, so
+    // relaxed ordering is sufficient.
+    SpdkNofTask(SpdkNofTask&& other) noexcept
+        : seg_handle(other.seg_handle),
+          ptr(other.ptr),
+          lba(other.lba),
+          lba_count(other.lba_count),
+          remaining_lba(other.remaining_lba.load(std::memory_order_relaxed)),
+          outstanding_sub_io(
+              other.outstanding_sub_io.load(std::memory_order_relaxed)),
+          op(other.op),
+          idx(other.idx),
+          failed(other.failed.load(std::memory_order_relaxed)),
+          on_chain(other.on_chain),
+          inflight_block_count(
+              other.inflight_block_count.load(std::memory_order_relaxed)),
+          state(std::move(other.state)),
+          io_count(std::move(other.io_count)),
+          nof_qos(other.nof_qos),
+          nxt(other.nxt),
+          completion_token(
+              other.completion_token.load(std::memory_order_relaxed)) {}
+
+    SpdkNofTask& operator=(SpdkNofTask&& other) noexcept {
+        if (this != &other) {
+            seg_handle = other.seg_handle;
+            ptr = other.ptr;
+            lba = other.lba;
+            lba_count = other.lba_count;
+            remaining_lba.store(
+                other.remaining_lba.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            outstanding_sub_io.store(
+                other.outstanding_sub_io.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            op = other.op;
+            idx = other.idx;
+            failed.store(other.failed.load(std::memory_order_relaxed),
+                         std::memory_order_relaxed);
+            on_chain = other.on_chain;
+            inflight_block_count.store(
+                other.inflight_block_count.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            state = std::move(other.state);
+            io_count = std::move(other.io_count);
+            nof_qos = other.nof_qos;
+            nxt = other.nxt;
+            completion_token.store(
+                other.completion_token.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
+    // Non-copyable: std::atomic members are non-copyable.
+    SpdkNofTask(const SpdkNofTask&) = delete;
+    SpdkNofTask& operator=(const SpdkNofTask&) = delete;
+
+    // Single-completion CAS.  Returns true iff this caller won the
+    // race and is responsible for set_completed + delete.
+    bool try_complete() {
+        uint8_t expected = 0;
+        return completion_token.compare_exchange_strong(
+            expected, 1, std::memory_order_acq_rel, std::memory_order_acquire);
+    }
 };
 
 struct SpdkNofSubTask {
@@ -401,17 +487,61 @@ struct SpdkNofSubTask {
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
 constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
 struct SpdkNofQos {
-    int inflight_blocks[kSpdkNofOpNum];
+    // RMW on two threads (SPDK reactor: trampoline normal-path;
+    // worker: FinalizeAfterDrain).  Atomic<RMW.
+    std::atomic<int> inflight_blocks[kSpdkNofOpNum];
     int blocks_per_chunk;
+    // Saved at construction from GetSpdkNofInflightBytesLimit / block_size.
+    // UpdateInflightLimit applies min(this, pool_capacity) when the qpair
+    // pool shrinks (degradation) or grows (recovery) so the inflight cap
+    // never exceeds the originally-configured absolute ceiling.
+    int absolute_inflight_limit = 0;
     int inflight_blocks_limit;
     SpdkNofTask* head[kSpdkNofOpNum];
     SpdkNofTask* tail[kSpdkNofOpNum];
+    // All tasks currently tracked by this qos (queued in head/tail
+    // chains OR off-chain waiting for callbacks).  Populated by PushTask
+    // and drained by SpdkNofTaskCompletion.
+    std::unordered_set<SpdkNofTask*> active_tasks;
 
     explicit SpdkNofQos(uint32_t block_size);
 
     bool Empty() const {
         return (head[kSpdkNofOpRead] == nullptr &&
                 head[kSpdkNofOpWrite] == nullptr);
+    }
+
+    /**
+     * @brief Update the inflight limit based on the qpair pool capacity.
+     *
+     * When the number of qpairs changes (degradation or TryGrow recovery),
+     * adjust the inflight cap accordingly.
+     *
+     * Formula:
+     *   pool_limit = num_qpairs * max_inflight_per_qpair * blocks_per_chunk
+     *   new_limit  = min(absolute_inflight_limit, pool_limit)
+     *   applied    = max(blocks_per_chunk, new_limit)
+     *
+     * The min against absolute_inflight_limit guarantees degradation never
+     * RAISES the cap above the originally-configured ceiling under partial
+     * degradation.  blocks_per_chunk remains the lower bound so at least
+     * one chunk can be submitted.
+     *
+     * @param num_qpairs              Current number of qpairs.
+     * @param max_inflight_per_qpair  Maximum inflight I/Os per qpair.
+     */
+    void UpdateInflightLimit(int num_qpairs, int max_inflight_per_qpair) {
+        // num_qpairs * max_inflight_per_qpair yields an I/O count, but
+        // inflight_blocks_limit is compared against block counts later in
+        // the worker loop.  Multiply by blocks_per_chunk to convert from
+        // "max concurrent I/Os" to "max concurrent blocks", matching the
+        // unit used by the constructor (GetSpdkNofInflightBytesLimit /
+        // block_size).  Without this conversion, a degraded 4‑qpair pool
+        // would be throttled at 256 blocks (~1 MiB) instead of the intended
+        // 8192 blocks (~32 MiB).
+        int pool_limit = num_qpairs * max_inflight_per_qpair * blocks_per_chunk;
+        int pool_capped = std::min(absolute_inflight_limit, pool_limit);
+        inflight_blocks_limit = std::max(blocks_per_chunk, pool_capped);
     }
 
     void PushTask(SpdkNofTask* task) {
@@ -423,13 +553,32 @@ struct SpdkNofQos {
             tail[op]->nxt = task;
             tail[op] = task;
         }
+        active_tasks.insert(task);
     }
 
     void PopTask(int op) {
         if (head[op]) {
             head[op] = head[op]->nxt;
+            if (head[op] == nullptr) {
+                tail[op] = nullptr;
+            }
         }
     }
+
+    // Drain-protocol primitives — split terminal cleanup into two
+    // phases matched to the actual quiescent sequence:
+    //
+    // FailQueuedTasks runs first and finalises head/tail tasks whose
+    // outstanding_sub_io == 0 (no outstanding CQE).
+    //
+    // FinalizeAfterDrain runs once the qpair pool's inflight_blocks
+    // reach 0 and finalises the remaining off-chain tasks in
+    // active_tasks.  Each task gets outstanding_sub_io zeroed
+    // (the trampoline skipped this on the DRAINING short-circuit),
+    // then routes through SpdkNofTaskCompletion — the try_complete()
+    // CAS guarantees set_completed + delete happen exactly once.
+    void FailQueuedTasks();
+    void FinalizeAfterDrain();
 };
 
 /**
@@ -465,11 +614,22 @@ class SpdkNofWorkerPool {
     std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
+
+    // When task_queue_ depth reaches max_queue_depth_, submitTask blocks.
+    // Prevents unbounded request accumulation from causing memory
+    // exhaustion in degradation scenarios.
+    std::unique_ptr<std::condition_variable[]> queue_not_full_cv_;
+    int max_queue_depth_;
+
     std::atomic<bool> shutdown_;
     std::mutex seg_mutex_;
     int seg_num = 0;
     std::map<nof_seg_handle*, int> seg_to_worker_;
 };
+
+/// Rebalance check interval (seconds). Worker threads check at this interval
+/// whether a degraded qpair pool can be recovered via TryGrow.
+constexpr int kRebalanceIntervalSeconds = 30;
 #endif
 
 /**
@@ -538,6 +698,10 @@ class TransferSubmitter {
                                const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr,
                                int numa_socket_id = 0);
+
+    // Release cached NoF handles via CloseNofSegment so QIDs are
+    // recycled when client is closed.
+    ~TransferSubmitter();
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -608,6 +772,33 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
+    // Per-TransferSubmitter handle cache.  Each client independently caches
+    // its nof_seg_handle, so multiple put() calls from the same client
+    // reuse the same connection. Not shared across TransferSubmitters,
+    // to avoid multiple WorkerPools concurrently accessing the same
+    // SPDK qpair pool.
+    // Protected by nof_cache_mutex_ — concurrent submissions on the same
+    // TransferSubmitter must not race on the first-use cache-insertion
+    // path.
+    std::map<std::string, nof_seg_handle*> nof_handle_cache_;
+    mutable std::mutex nof_cache_mutex_;
+    // Per-endpoint single-flight state for the slow path.  Tracks
+    // endpoints currently being opened so concurrent submitters for
+    // the same endpoint wait for the designated opener instead of
+    // racing to OpenNofSegment.  Without this, two submitters for the
+    // same endpoint could both attempt the slow path: if one loses
+    // QIDs and fails while the other succeeds and populates the
+    // cache, the failed caller would return nullopt unnecessarily
+    // even though a valid handle is now cached.
+    //
+    // Lock ordering (avoids deadlock):
+    //   nof_open_inflight_mutex_ -> nof_cache_mutex_
+    // A waiter briefly holds both (open_lock for the cv wait, then
+    // cache_lock for re-check).  An opener publishes with cache_lock
+    // alone, then acquires open_lock only after releasing cache_lock.
+    std::unordered_set<std::string> nof_open_inflight_;
+    std::mutex nof_open_inflight_mutex_;
+    std::condition_variable nof_open_done_cv_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
