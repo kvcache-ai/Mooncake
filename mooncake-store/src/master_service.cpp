@@ -4748,6 +4748,33 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
+    if (enable_oplog_ && ordered_oplog_writer_) {
+        // Admit the post-state before changing live metadata. Commit can
+        // still fail after Reserve; durability remains asynchronous.
+        std::vector<Replica::Descriptor> post;
+        post.reserve(metadata.GetAllReplicas().size());
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            auto descriptor = replica.get_descriptor();
+            if (replica.is_processing() && is_target_replica(replica)) {
+                descriptor.status = ReplicaStatus::COMPLETE;
+            }
+            post.push_back(std::move(descriptor));
+        }
+
+        auto reservation = ReserveBatchOpLogSlot();
+        if (!reservation) {
+            return tl::make_unexpected(reservation.error());
+        }
+        auto persist_result = AppendReservedOpLogWithDurableFinalize(
+            std::move(reservation.value()), OpType::PUT_END,
+            object_id.tenant_id.value(), key,
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
+            nullptr);
+        if (!persist_result) {
+            return tl::make_unexpected(persist_result.error());
+        }
+    }
+
     const bool had_completed_replica =
         metadata.HasReplica(&Replica::fn_is_completed);
     bool completed_pending_replica = false;
@@ -4827,15 +4854,6 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     metadata.GrantReadLease(std::chrono::milliseconds::zero());
     PublishKvStored(key, metadata, object_id.tenant_id);
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        std::string payload = SerializeMetadataForOpLog(metadata);
-        auto result = AppendOpLogVisibleBeforeDurable(
-            OpType::PUT_END, object_id.tenant_id.value(), key, payload);
-        if (!result) {
-            LOG(WARNING) << "PutEnd: OpLog queue failed for key=" << key
-                         << ", err=" << static_cast<int>(result.error());
-        }
-    }
     return {};
 }
 
