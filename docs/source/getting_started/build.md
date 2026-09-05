@@ -6,7 +6,7 @@ This document describes how to build Mooncake.
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.20.x
+- cmake: 4.x
 - gcc: 9.4+
 
 ### Default Build
@@ -22,11 +22,9 @@ sudo bash dependencies.sh
 Then build and install Mooncake:
 
 ```bash
-mkdir build
-cd build
-cmake ..
-make -j
-sudo make install
+cmake -B build -G Ninja
+cmake --build build
+sudo cmake --install build
 ```
 
 ### Build with VRAM Segment
@@ -37,11 +35,9 @@ To enable VRAM Segment, install CUDA toolkit and build Mooncake with
 ```bash
 sudo bash dependencies.sh
 
-mkdir build
-cd build
-cmake .. -DUSE_VRAM_SEGMENT=ON
-make -j
-sudo make install
+cmake -B build -G Ninja -DUSE_VRAM_SEGMENT=ON
+cmake --build build
+sudo cmake --install build
 ```
 
 If NVLink is available in your environment, you can also enable it
@@ -50,11 +46,9 @@ with `-DUSE_INTRA_NVLINK=ON`:
 ```bash
 sudo bash dependencies.sh
 
-mkdir build
-cd build
-cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
-make -j
-sudo make install
+cmake -B build -G Ninja -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
+cmake --build build
+sudo cmake --install build
 ```
 
 ### Build with NVMe-oF SSD Pool
@@ -65,11 +59,9 @@ Mooncake with `USE_NOF` enabled:
 ```bash
 sudo bash dependencies.sh --with-spdk
 
-mkdir build
-cd build
-cmake .. -DUSE_NOF=ON
-make -j
-sudo make install
+cmake -B build -G Ninja -DUSE_NOF=ON
+cmake --build build
+sudo cmake --install build
 ```
 
 `-DUSE_NOF=ON` builds the NoF registration APIs and deployment tools. Use
@@ -222,7 +214,7 @@ eager population behavior; set `MC_DISABLE_MMAP_ARENA=1` if an arena was
 otherwise enabled and deferred direct-mmap population is desired.
 
 ## Advanced Compile Options
-The following options can be passed to `cmake ..`.
+The following options can be passed to `cmake`.
 
 ### Accelerator and Hardware Options
 

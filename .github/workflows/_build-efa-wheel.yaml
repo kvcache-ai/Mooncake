@@ -19,7 +19,6 @@ on:
         type: string
         required: true
       build-profile:
-        # ci uses Ninja and CI diagnostics; release preserves the release make build.
         type: string
         required: true
       cmake-args:
@@ -113,23 +112,14 @@ jobs:
         run: |
           sudo apt update -y
           packages=(libfabric-dev libfabric1)
-          if [ "$BUILD_PROFILE" = ci ]; then
-            packages=(ninja-build "${packages[@]}")
-          fi
           sudo apt install -y "${packages[@]}"
           sudo bash -x dependencies.sh -y
-          if [ "$BUILD_PROFILE" = ci ]; then
-            df -h
-          fi
+          echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
+          df -h
         shell: bash
 
       - name: Configure project
         run: |
-          generator=()
-          if [ "$BUILD_PROFILE" = ci ]; then
-            generator=(-G Ninja)
-          fi
-
           cuda_args=(-DUSE_CUDA=OFF)
           if [ "$USE_CUDA" = true ]; then
             cuda_args=(
@@ -139,9 +129,7 @@ jobs:
           fi
 
           read -r -a profile_args <<< "$CMAKE_ARGS"
-          mkdir build
-          cd build
-          cmake "${generator[@]}" .. \
+          cmake -B build -G Ninja \
             -DUSE_EFA=ON \
             -DLIBFABRIC_INCLUDE_DIR=/usr/include \
             -DLIBFABRIC_LIBRARY=/usr/lib/x86_64-linux-gnu/libfabric.so \
@@ -157,16 +145,9 @@ jobs:
             export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
             export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           fi
-
-          cd build
-          if [ "$BUILD_PROFILE" = release ]; then
-            make -j3
-            sudo make install
-          else
-            cmake --build .
-            sudo cmake --install .
-            df -h
-          fi
+          cmake --build build
+          sudo cmake --install build
+          df -h build
         shell: bash
 
       - name: Run sccache stat for check

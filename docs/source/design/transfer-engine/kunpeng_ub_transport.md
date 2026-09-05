@@ -30,10 +30,9 @@ yum install umdk-urma-devel
 # Or build from source
 git clone https://atomgit.com/openeuler/umdk.git
 cd umdk
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
-sudo make install
+cmake -B build -G Ninja
+cmake --build build
+sudo cmake --install build
 ```
 
 ### 3. Build Dependencies
@@ -43,7 +42,6 @@ sudo make install
 sudo apt-get update
 sudo apt-get install -y \
     build-essential \
-    cmake \
     git \
     libgflags-dev \
     libgoogle-glog-dev \
@@ -73,15 +71,12 @@ git submodule update --init --recursive
 ### 2. Build with UB Enabled
 
 ```bash
-mkdir build && cd build
-
-cmake .. \
+cmake -B build -G Ninja \
     -DUSE_UB=ON \
     -DURMA_INCLUDE_DIR=/usr/include \
     -DURMA_LIBRARY=/usr/lib64/liburma.so \
     -DCMAKE_BUILD_TYPE=RelWithDebInfo
-
-make -j$(nproc)
+cmake --build build
 ```
 
 ### 3. Install Python Package

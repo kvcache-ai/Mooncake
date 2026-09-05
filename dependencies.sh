@@ -23,7 +23,6 @@ NC="\033[0m" # No Color
 # Configuration
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
-GOVER=1.25.9
 OS_RELEASE_FILE=${OS_RELEASE_FILE:-/etc/os-release}
 
 # Function to print section headers
@@ -109,9 +108,9 @@ done
 echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
-echo -e "  - System packages (build tools, libraries)"
+echo -e "  - System packages (libraries)"
 echo -e "  - Git submodules (pybind11)"
-echo -e "  - Go $GOVER"
+echo -e "  - Toolchain (build tools)"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  - SPDK (for NVMe-oF support)"
 fi
@@ -151,8 +150,6 @@ echo -e "${YELLOW}This may take a few minutes...${NC}"
 
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     SYSTEM_PACKAGES="build-essential \
-                     cmake \
-                     ninja-build \
                      git \
                      wget \
                      unzip \
@@ -176,10 +173,10 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libmsgpack-dev \
                      libzmq3-dev \
                      libzstd-dev \
-                     libasio-dev \
                      libxxhash-dev \
                      pkg-config \
                      patchelf \
+                     python3-venv \
                      libc6-dev \
                      libc-bin"
 
@@ -188,8 +185,6 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
 
 elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS" = "almalinux" ] || [ "$OS" = "euleros" ] || [ "$OS" = "openeuler" ]; then
     SYSTEM_PACKAGES="@development \
-                     cmake \
-                     ninja-build \
                      git \
                      wget \
                      rdma-core-devel \
@@ -258,91 +253,12 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     print_success "ldd found: $(ldd --version 2>&1 | head -1)"
 fi
 
-print_section "Installing Go $GOVER"
+print_section "Installing Toolchain: CMake, Ninja and Go"
 
-USED_CN_MIRROR=false
+sh ${REPO_ROOT}/scripts/install_toolchain.sh
+check_success "Failed to install toolchain"
 
-install_go() {
-    ARCH=$(uname -m)
-    if [ "$ARCH" = "aarch64" ]; then
-        ARCH="arm64"
-    elif [ "$ARCH" = "x86_64" ]; then
-        ARCH="amd64"
-    else
-        echo "Unsupported architecture: $ARCH"
-        exit 1
-    fi
-
-    GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
-
-    # Try multiple download mirrors with fallback
-    GO_DOWNLOAD_URLS=(
-        "https://go.dev/dl/${GO_TARBALL}"
-        "https://golang.google.cn/dl/${GO_TARBALL}"
-        "https://mirrors.aliyun.com/golang/${GO_TARBALL}"
-    )
-
-    DOWNLOAD_SUCCESS=false
-    for url in "${GO_DOWNLOAD_URLS[@]}"; do
-        echo "Downloading Go $GOVER from ${url}..."
-        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
-            DOWNLOAD_SUCCESS=true
-            if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
-                USED_CN_MIRROR=true
-            fi
-            print_success "Downloaded Go $GOVER from ${url}"
-            break
-        else
-            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
-            rm -f "${GO_TARBALL}"
-        fi
-    done
-
-    if [ "$DOWNLOAD_SUCCESS" = false ]; then
-        print_error "Failed to download Go $GOVER from all mirrors"
-    fi
-
-    echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf "${GO_TARBALL}"
-    check_success "Failed to install Go $GOVER"
-
-    rm -f "${GO_TARBALL}"
-    check_success "Failed to clean up Go installation file"
-
-    print_success "Go $GOVER installed successfully"
-}
-
-if command -v go &> /dev/null; then
-    GO_VERSION=$(go version | awk '{print $3}')
-    if [[ "$GO_VERSION" == "go$GOVER" ]]; then
-        echo -e "${YELLOW}Go $GOVER is already installed. Skipping...${NC}"
-    else
-        echo -e "${YELLOW}Found Go $GO_VERSION. Will install Go $GOVER...${NC}"
-        install_go
-    fi
-else
-    install_go
-fi
-
-# Add Go to PATH if not already there
-if ! grep -q "export PATH=\$PATH:/usr/local/go/bin" ~/.bashrc; then
-    echo -e "${YELLOW}Adding Go to your PATH in ~/.bashrc${NC}"
-    echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-    echo -e "${YELLOW}Please run 'source ~/.bashrc' or start a new terminal to use Go${NC}"
-fi
-
-# Set GOPROXY only if Go download fell back to a CN mirror
-if [ "$USED_CN_MIRROR" = true ] && [ -z "$GOPROXY" ]; then
-    export GOPROXY=https://goproxy.cn,https://goproxy.io,direct
-    echo -e "${YELLOW}Detected restricted network (Go was downloaded from a CN mirror).${NC}"
-    echo -e "${YELLOW}GOPROXY set to: ${GOPROXY}${NC}"
-    if ! grep -q "export GOPROXY=" ~/.bashrc; then
-        echo 'export GOPROXY=https://goproxy.cn,https://goproxy.io,direct' >> ~/.bashrc
-        echo -e "${YELLOW}GOPROXY added to ~/.bashrc for future sessions${NC}"
-    fi
-elif [ -n "$GOPROXY" ]; then
-    echo -e "${GREEN}GOPROXY already set to: ${GOPROXY}${NC}"
-fi
+print_success "Toolchain installed successfully"
 
 # Install SPDK if requested
 if [ "$INSTALL_SPDK" = true ]; then
@@ -416,13 +332,13 @@ echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
 echo -e "  ${GREEN}✓${NC} Git submodules"
-echo -e "  ${GREEN}✓${NC} Go $GOVER"
+echo -e "  ${GREEN}✓${NC} Toolchain"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"
 fi
 echo
 echo -e "You can now build and run Mooncake."
-echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use Go.${NC}"
+echo -e "${YELLOW}Note: You may need to restart your terminal or run 'source ~/.bashrc' to use toolchain.${NC}"
 
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "${YELLOW}Note: SPDK requires hugepages and RDMA configuration. Please refer to SPDK documentation for setup.${NC}"

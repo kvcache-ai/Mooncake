@@ -49,7 +49,7 @@ def import_store_module():
     if not BUILD_STORE.is_dir():
         raise ImportError(
             f"{BUILD_STORE} not found. Build Mooncake with store support: "
-            "cd build && cmake .. -DWITH_STORE=ON && make -j 128"
+            "cmake -B build -G Ninja -DWITH_STORE=ON && cmake --build build"
         )
 
     store_module = importlib.import_module("store")

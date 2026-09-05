@@ -761,18 +761,16 @@ Mooncake Store 与其它相关组件（Transfer Engine等）一同编译。
 
 默认模式:
 ```
-mkdir build && cd build
-cmake .. # 默认模式
-make
-sudo make install # 安装 Python 接口支持包
+cmake -B build -G Ninja # 默认模式
+cmake --build build
+sudo cmake --install build # 安装 Python 接口支持包
 ```
 
 高可用模式:
 ```
-mkdir build && cd build
-cmake .. -DSTORE_USE_ETCD # 编译 etcd 客户端接口封装模块，依赖 go
-make
-sudo make install # 安装 Python 接口支持包
+cmake -B build -G Ninja -DSTORE_USE_ETCD # 编译 etcd 客户端接口封装模块，依赖 go
+cmake --build build
+sudo cmake --install build # 安装 Python 接口支持包
 ```
 
 **注意：** 使用高可用模式只需要开启 `-DSTORE_USE_ETCD`。`-DUSE_ETCD` 是 **Transfer Engine** 的编译选项，与高可用模式**无关**。

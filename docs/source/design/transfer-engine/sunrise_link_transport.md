@@ -41,17 +41,16 @@ git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 
 # Enable TENT + Sunrise Link
-mkdir build && cd build
-cmake .. -DUSE_TENT=ON -DUSE_SUNRISE=ON
+cmake -B build -G Ninja -DUSE_TENT=ON -DUSE_SUNRISE=ON
 
 # Build
-make -j$(nproc)
+cmake --build build
 ```
 
 If Tang Runtime is installed at a non-default location:
 
 ```bash
-cmake .. -DUSE_TENT=ON -DUSE_SUNRISE=ON -DMC_TANGRT_ROOT=/opt/tangrt
+cmake -B build -G Ninja -DUSE_TENT=ON -DUSE_SUNRISE=ON -DMC_TANGRT_ROOT=/opt/tangrt
 ```
 
 ---

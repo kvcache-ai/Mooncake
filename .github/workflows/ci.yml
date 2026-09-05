@@ -497,20 +497,17 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt update -y
-        sudo apt install -y ninja-build
         sudo bash -x dependencies.sh -y
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
         df -h
       shell: bash
 
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
-        mkdir build
-        cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake -G Ninja .. \
+        cmake -B build -G Ninja \
           -DUSE_ETCD=OFF \
           -DUSE_CXL=ON \
           -DUSE_REDIS=ON \
@@ -526,10 +523,9 @@ jobs:
           "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
           "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
           -DENABLE_DEBUG_SYMBOLS=OFF
-        cmake --build .
-        sudo cmake --install .
-        df -h
-        cd ..
+        cmake --build build
+        sudo cmake --install build
+        df -h build
         rm -rf build
         df -h
       shell: bash
@@ -858,9 +854,8 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo apt update -y
-        sudo apt install -y ninja-build
         sudo bash -x dependencies.sh -y
+        echo "/opt/mooncake-toolchain/bin" >> "$GITHUB_PATH"
         df -h
       shell: bash
 
@@ -869,9 +864,15 @@ jobs:
 
     - name: Configure project with TENT
       run: |
-        mkdir build-tent
-        cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
+        cmake -B build-tent -G Ninja \
+          -DUSE_TENT=ON \
+          -DUSE_HTTP=ON \
+          -DENABLE_SCCACHE=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=ON \
+          -DENABLE_DEBUG_SYMBOLS=OFF \
+          ${{ matrix.cmake_flags }} \
+          ${{ matrix.metrics_flags }}
       shell: bash
 
     - name: Build project with TENT
@@ -880,9 +881,8 @@ jobs:
           export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         fi
-        cd build-tent
-        cmake --build .
-        sudo cmake --install .
+        cmake --build build-tent
+        sudo cmake --install build-tent
       shell: bash
 
     # Check the Transfer Engine Rust crate against the freshly built C++
