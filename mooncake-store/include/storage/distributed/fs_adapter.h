@@ -128,6 +128,29 @@ class FileSystemAdapter {
         return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
     }
 
+    /**
+     * @brief Open a page-cache-bypassing read handle when supported.
+     *
+     * Adapters whose data path already bypasses the page cache may return a
+     * read-only handle. Callers fall back to OpenFile on NOT_SUPPORTED.
+     */
+    virtual tl::expected<int, ErrorCode> OpenFileDirect(
+        const std::string& /*path*/) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+
+    /**
+     * @brief Read through a handle returned by OpenFileDirect.
+     *
+     * Implementations absorb any alignment restrictions and preserve the
+     * caller's scatter buffers. The default is suitable for adapters whose
+     * direct handles accept ordinary vectored I/O.
+     */
+    virtual tl::expected<size_t, ErrorCode> DirectReadAt(
+        int fd, iovec* iov, int iovcnt, int64_t offset) {
+        return ReadAt(fd, iov, iovcnt, offset);
+    }
+
     // Metadata snapshots are written through the filesystem namespace. These
     // defaults also work for FUSE-mounted distributed filesystems.
     virtual tl::expected<void, ErrorCode> SyncFile(const std::string& path) {

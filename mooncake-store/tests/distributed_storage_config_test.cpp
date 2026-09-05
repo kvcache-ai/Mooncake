@@ -64,6 +64,10 @@ struct DistributedStorageEnvironment {
     ScopedEnvVar allocator_type{"MOONCAKE_DFS_ALLOCATOR_TYPE"};
     ScopedEnvVar bucket_capacity{"MOONCAKE_DFS_BUCKET_CAPACITY"};
     ScopedEnvVar max_bucket_count{"MOONCAKE_DFS_MAX_BUCKET_COUNT"};
+    ScopedEnvVar batch_read_threads{"MOONCAKE_DFS_BATCH_READ_THREADS"};
+    ScopedEnvVar batch_read_merge_enabled{
+        "MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED"};
+    ScopedEnvVar direct_read_enabled{"MOONCAKE_DFS_DIRECT_READ_ENABLED"};
 };
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {
@@ -83,6 +87,9 @@ void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_TRUE(config.allocator_type_valid);
     EXPECT_EQ(config.bucket_capacity, 256ULL * 1024 * 1024);
     EXPECT_EQ(config.max_bucket_count, 256);
+    EXPECT_EQ(config.batch_read_threads, 128);
+    EXPECT_FALSE(config.batch_read_merge_enabled);
+    EXPECT_TRUE(config.direct_read_enabled);
 }
 
 DistributedStorageConfig ValidConfig() {
@@ -130,6 +137,9 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     env.allocator_type.Set("bucket");
     env.bucket_capacity.Set("8388608");
     env.max_bucket_count.Set("32");
+    env.batch_read_threads.Set("4");
+    env.batch_read_merge_enabled.Set("true");
+    env.direct_read_enabled.Set("false");
 
     const auto config = DistributedStorageConfig::FromEnvironment();
 
@@ -148,6 +158,9 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
     EXPECT_EQ(config.allocator_type, DfsAllocatorType::BUCKET);
     EXPECT_EQ(config.bucket_capacity, 8388608);
     EXPECT_EQ(config.max_bucket_count, 32);
+    EXPECT_EQ(config.batch_read_threads, 4);
+    EXPECT_TRUE(config.batch_read_merge_enabled);
+    EXPECT_FALSE(config.direct_read_enabled);
     EXPECT_TRUE(config.Validate());
     EXPECT_TRUE(config.ValidateForAllocator());
     EXPECT_TRUE(config.ValidateForBucketAllocator());
@@ -159,6 +172,7 @@ TEST_F(DistributedStorageConfigTest, ReadsValidEnvironmentValues) {
               std::string::npos);
     EXPECT_NE(formatted.find("allocator_type=bucket"), std::string::npos);
     EXPECT_NE(formatted.find("max_bucket_count=32"), std::string::npos);
+    EXPECT_NE(formatted.find("batch_read_threads=4"), std::string::npos);
 }
 
 TEST_F(DistributedStorageConfigTest, RejectsUnknownAllocatorType) {
@@ -335,6 +349,12 @@ TEST(DistributedStorageConfigValidationTest, RejectsInvalidBucketSettings) {
     config.max_bucket_count = 0;
     EXPECT_FALSE(config.ValidateForBucketAllocator());
     config.max_bucket_count = kMaxBucketId + 1;
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
+    config.max_bucket_count = 8;
+
+    config.batch_read_threads = 0;
+    EXPECT_FALSE(config.ValidateForBucketAllocator());
+    config.batch_read_threads = kMaxDfsBatchReadThreads + 1;
     EXPECT_FALSE(config.ValidateForBucketAllocator());
 }
 

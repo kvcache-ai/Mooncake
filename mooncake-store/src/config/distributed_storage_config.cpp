@@ -123,6 +123,14 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
         LOG(ERROR) << "DistributedStorageConfig: bucket capacity overflow";
         return false;
     }
+    if (batch_read_threads < 1 ||
+        batch_read_threads > kMaxDfsBatchReadThreads) {
+        LOG(ERROR) << "DistributedStorageConfig: batch_read_threads must be in "
+                      "[1, "
+                   << kMaxDfsBatchReadThreads
+                   << "], batch_read_threads=" << batch_read_threads;
+        return false;
+    }
     return true;
 }
 
@@ -187,6 +195,15 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.max_bucket_count = Environ::ReadOr(
         Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT,
         static_cast<int>(config.max_bucket_count));
+    config.batch_read_threads = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BATCH_READ_THREADS,
+        config.batch_read_threads);
+    config.batch_read_merge_enabled = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED,
+        config.batch_read_merge_enabled);
+    config.direct_read_enabled = Environ::ReadOr(
+        Variables::MOONCAKE_DFS_DIRECT_READ_ENABLED,
+        config.direct_read_enabled);
     return config;
 }
 
@@ -205,7 +222,10 @@ std::string DistributedStorageConfig::FormatStr() const {
         << eviction_check_interval.count()
         << ", allocator_type=" << ToString(allocator_type)
         << ", bucket_capacity=" << bucket_capacity
-        << ", max_bucket_count=" << max_bucket_count;
+        << ", max_bucket_count=" << max_bucket_count
+        << ", batch_read_threads=" << batch_read_threads
+        << ", batch_read_merge_enabled=" << batch_read_merge_enabled
+        << ", direct_read_enabled=" << direct_read_enabled;
     return oss.str();
 }
 

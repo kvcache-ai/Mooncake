@@ -52,6 +52,9 @@ class Hf3fsAdapter : public FileSystemAdapter {
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override;
 
+    tl::expected<int, ErrorCode> OpenFileDirect(
+        const std::string& path) override;
+
     tl::expected<void, ErrorCode> Init(const std::string& mount_path) override;
 
     tl::expected<void, ErrorCode> Shutdown() override;

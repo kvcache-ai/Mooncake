@@ -8,6 +8,8 @@
 
 namespace mooncake {
 
+inline constexpr int kMaxDfsBatchReadThreads = 256;
+
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
     std::string fs_adapter_type = "hf3fs";
@@ -25,6 +27,9 @@ struct DistributedStorageConfig {
     DfsAllocatorType allocator_type = DfsAllocatorType::SHARD;
     uint64_t bucket_capacity = 256ULL * 1024 * 1024;
     int64_t max_bucket_count = 256;
+    int batch_read_threads = 128;
+    bool batch_read_merge_enabled = false;
+    bool direct_read_enabled = true;
     bool allocator_type_valid = true;
 
     bool Validate() const;
