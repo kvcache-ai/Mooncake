@@ -568,6 +568,33 @@ int RdmaContext::exportDmabuf(void *addr, DmabufExport &out) {
         // allocation base, plus any offset hsa returned for the export.
         out.offset = (uintptr_t)addr - (uintptr_t)allocBase + hsa_dmabuf_offset;
     }
+#elif defined(USE_XPU)
+    // Intel XPU: export a dma_buf fd from the Level Zero allocation so the
+    // caller can register it with ibv_reg_dmabuf_mr (GPU-direct RDMA). Host
+    // memory falls through to the plain ibv_reg_mr path.
+    if (mooncake::xpu::isDeviceMemory(addr)) {
+        // `addr` may sit at an offset inside a larger allocation (PyTorch's
+        // caching allocator packs several tensors into one block), and the
+        // exported dma_buf always covers the whole allocation. Resolve the
+        // allocation base so the MR is registered at the right offset —
+        // assuming zero here would register the wrong bytes.
+        void *allocBase = nullptr;
+        size_t allocSize = 0;
+        if (mooncake::xpu::getAllocBase(addr, &allocBase, &allocSize) != 0) {
+            LOG(ERROR) << "Failed to resolve XPU allocation base for "
+                       << (uintptr_t)addr;
+            return ERR_CONTEXT;
+        }
+        int dmabuf_fd = mooncake::xpu::exportDmaBufFd(allocBase, allocSize);
+        if (dmabuf_fd < 0) {
+            LOG(ERROR) << "Failed to export dma_buf fd for XPU memory "
+                       << (uintptr_t)addr;
+            return ERR_CONTEXT;
+        }
+        out.method = DmabufExport::Method::kDmabufReg;
+        out.fd = dmabuf_fd;
+        out.offset = (uintptr_t)addr - (uintptr_t)allocBase;
+    }
 #else
     out.method = DmabufExport::Method::kHostReg;
 #endif
@@ -601,7 +628,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
     }
     mrMeta.addr = addr;
 #if defined(USE_MLU) || defined(USE_MACA) || defined(USE_CUDA) || \
-    defined(USE_HIP_DMABUF) || defined(USE_SUPA)
+    defined(USE_HIP_DMABUF) || defined(USE_SUPA) || defined(USE_XPU)
     if (exp.method == DmabufExport::Method::kDmabufReg) {
         // Import the shared dma_buf fd into this NIC's PD. The fd is kept open
         // by the caller until every NIC has registered; this MR takes its own

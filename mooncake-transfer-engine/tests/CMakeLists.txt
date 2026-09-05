@@ -355,6 +355,13 @@ if(USE_SUNRISE)
   add_test(NAME sunrise_link_copy_test COMMAND sunrise_link_copy_test)
 endif()
 
+if(USE_XPU)
+  add_executable(xpu_transport_test ${WORKSPACE}/xpu_transport_test.cpp)
+  target_link_libraries(xpu_transport_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME xpu_transport_test COMMAND xpu_transport_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest
                                                     gtest_main)
