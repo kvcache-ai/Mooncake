@@ -13,7 +13,7 @@ from mooncake.reshard.weight.manifest import (
 )
 from mooncake.reshard.weight.storage_manifest import (
     StoredFragmentSnapshot,
-    WeightManifest,
+    StoredWeightManifest,
 )
 
 
@@ -72,7 +72,7 @@ def stored_fragment(**overrides) -> StoredFragmentSnapshot:
 
 
 def test_weight_manifest_round_trip_is_stable_and_has_no_runtime_address() -> None:
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen3.5-0.8b",
         revision="step-42",
@@ -90,7 +90,7 @@ def test_weight_manifest_round_trip_is_stable_and_has_no_runtime_address() -> No
 
     encoded = manifest.to_json()
 
-    assert WeightManifest.from_json(encoded) == manifest
+    assert StoredWeightManifest.from_json(encoded) == manifest
     assert encoded == manifest.to_json()
     assert "4096" not in encoded
     assert "address" not in json.loads(encoded)["fragments"][0]
@@ -108,7 +108,7 @@ def test_weight_manifest_round_trip_preserves_shard_dims() -> None:
         ),
     )
     group_id = "weights/default/qwen/rev"
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -133,7 +133,7 @@ def test_weight_manifest_round_trip_preserves_shard_dims() -> None:
     )
 
     encoded = manifest.to_json()
-    decoded = WeightManifest.from_json(encoded)
+    decoded = StoredWeightManifest.from_json(encoded)
 
     assert decoded == manifest
     assert json.loads(encoded)["tensors"][0]["shard_dims"] == [0, 1]
@@ -152,7 +152,7 @@ def test_weight_manifest_round_trip_preserves_single_and_multi_axis_shards() -> 
         ),
     )
     group_id = "weights/default/qwen/rev"
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -188,7 +188,7 @@ def test_weight_manifest_round_trip_preserves_single_and_multi_axis_shards() -> 
     )
 
     encoded = manifest.to_json()
-    decoded = WeightManifest.from_json(encoded)
+    decoded = StoredWeightManifest.from_json(encoded)
 
     assert decoded == manifest
     raw_single_axis = next(
@@ -207,7 +207,7 @@ def test_weight_manifest_round_trip_preserves_parallel_axes() -> None:
         ),
     )
     group_id = "weights/default/qwen/rev"
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -221,7 +221,7 @@ def test_weight_manifest_round_trip_preserves_parallel_axes() -> None:
 
     encoded = manifest.to_json()
 
-    assert WeightManifest.from_json(encoded) == manifest
+    assert StoredWeightManifest.from_json(encoded) == manifest
     assert json.loads(encoded)["tensors"][0]["parallel_axes"] == [
         {"kind": "pp", "semantics": "ownership"},
         {"kind": "tp", "semantics": "split", "dim": 0},
@@ -229,7 +229,7 @@ def test_weight_manifest_round_trip_preserves_parallel_axes() -> None:
 
 
 def test_weight_manifest_json_emits_single_axis_shard_dims_field() -> None:
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -258,7 +258,7 @@ def test_weight_manifest_rejects_invalid_fragment(
     fragment: StoredFragmentSnapshot,
 ) -> None:
     with pytest.raises(ValueError):
-        WeightManifest(
+        StoredWeightManifest(
             namespace="default",
             resource_id="qwen",
             revision="rev",
@@ -273,7 +273,7 @@ def test_weight_manifest_rejects_invalid_fragment(
 
 def test_weight_manifest_rejects_missing_tensor_coverage() -> None:
     with pytest.raises(ValueError, match="not fully covered"):
-        WeightManifest(
+        StoredWeightManifest(
             namespace="default",
             resource_id="qwen",
             revision="rev",
@@ -288,7 +288,7 @@ def test_weight_manifest_rejects_missing_tensor_coverage() -> None:
 
 def test_weight_manifest_rejects_duplicate_fragment_geometry() -> None:
     with pytest.raises(ValueError, match="duplicate fragment geometry"):
-        WeightManifest(
+        StoredWeightManifest(
             namespace="default",
             resource_id="qwen",
             revision="rev",
@@ -312,7 +312,7 @@ def test_weight_manifest_rejects_overlapping_object_ranges(
     second_offset: int,
 ) -> None:
     with pytest.raises(ValueError, match="object ranges overlap"):
-        WeightManifest(
+        StoredWeightManifest(
             namespace="default",
             resource_id="qwen",
             revision="rev",
@@ -335,7 +335,7 @@ def test_weight_manifest_rejects_overlapping_object_ranges(
 
 
 def test_weight_manifest_allows_adjacent_object_ranges() -> None:
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -360,7 +360,7 @@ def test_weight_manifest_allows_adjacent_object_ranges() -> None:
 
 
 def test_weight_manifest_allows_same_offset_for_different_objects() -> None:
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -385,8 +385,8 @@ def test_weight_manifest_allows_same_offset_for_different_objects() -> None:
 
 
 def test_manifest_types_cannot_cross_the_runtime_storage_boundary() -> None:
-    with pytest.raises(ValueError, match="WeightManifest fragments"):
-        WeightManifest(
+    with pytest.raises(ValueError, match="StoredWeightManifest fragments"):
+        StoredWeightManifest(
             namespace="default",
             resource_id="qwen",
             revision="rev",
@@ -419,14 +419,14 @@ def test_manifest_schema_rejects_non_integer_numeric_fields(factory) -> None:
 
 def test_weight_manifest_json_rejects_non_finite_and_non_mapping_values() -> None:
     with pytest.raises(ValueError, match="non-finite"):
-        WeightManifest.from_json('{"model_id":NaN}')
+        StoredWeightManifest.from_json('{"model_id":NaN}')
 
     with pytest.raises(ValueError, match="JSON object"):
-        WeightManifest.from_json("[]")
+        StoredWeightManifest.from_json("[]")
 
 
 def test_weight_manifest_json_rejects_float_geometry() -> None:
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -441,7 +441,7 @@ def test_weight_manifest_json_rejects_float_geometry() -> None:
     raw["tensors"][0]["global_shape"][0] = 8.0
 
     with pytest.raises(ValueError, match="integer"):
-        WeightManifest.from_json(json.dumps(raw))
+        StoredWeightManifest.from_json(json.dumps(raw))
 
 
 @pytest.mark.parametrize(
@@ -461,7 +461,7 @@ def test_weight_manifest_binds_manifest_and_payload_keys_to_group(
     manifest_key: str, object_key: str
 ) -> None:
     with pytest.raises(ValueError, match="group"):
-        WeightManifest(
+        StoredWeightManifest(
             namespace="default",
             resource_id="qwen",
             revision="rev",
@@ -476,7 +476,7 @@ def test_weight_manifest_binds_manifest_and_payload_keys_to_group(
 
 @pytest.mark.parametrize("mutation", ["missing-field", "unknown-field"])
 def test_weight_manifest_json_requires_exact_top_level_schema(mutation: str) -> None:
-    manifest = WeightManifest(
+    manifest = StoredWeightManifest(
         namespace="default",
         resource_id="qwen",
         revision="rev",
@@ -494,4 +494,4 @@ def test_weight_manifest_json_requires_exact_top_level_schema(mutation: str) -> 
         raw["future_semantics"] = "required"
 
     with pytest.raises(ValueError, match="schema"):
-        WeightManifest.from_json(json.dumps(raw))
+        StoredWeightManifest.from_json(json.dumps(raw))
