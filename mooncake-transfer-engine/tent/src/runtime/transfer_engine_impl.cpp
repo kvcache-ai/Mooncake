@@ -2412,15 +2412,26 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
             }
         }
         if (!all_completed) continue;
-        Status last = Status::OK();
-        for (auto target_id : hook.targets) {
-            last = sendNotification(target_id, hook.notifi);
-            if (!last.ok()) {
-                LOG(WARNING) << "sendNotification failed: " << last.ToString();
-                break;
+        // Drop each target as it takes delivery and carry the rest to a later
+        // poll. The hook is only marked fired once every target has, so the
+        // ones that already succeeded must not be notified again.
+        //
+        // Every remaining target is attempted on every pass, including the
+        // ones after a failure. targets is an unordered_set, so stopping at
+        // the first failure would make delivery to the others depend on
+        // iteration order: an unreachable peer visited first would hold back
+        // a self-targeted notification that cannot fail, and its receiver
+        // would block until that unrelated peer came back.
+        for (auto it = hook.targets.begin(); it != hook.targets.end();) {
+            auto status = sendNotification(*it, hook.notifi);
+            if (status.ok()) {
+                it = hook.targets.erase(it);
+                continue;
             }
+            LOG(WARNING) << "sendNotification failed: " << status.ToString();
+            ++it;
         }
-        if (last.ok()) hook.fired = true;
+        if (hook.targets.empty()) hook.fired = true;
     }
     return Status::OK();
 }
@@ -2687,6 +2698,17 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
 
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
                                             const Notification& notifi) {
+    if (target_id == LOCAL_SEGMENT_ID) {
+        // Self-targeted notification: deliver in-process. The data plane
+        // already short-circuits LOCAL_SEGMENT_ID transfers to the local
+        // path; notifications need the same treatment. Routing them through
+        // a transport cannot work: the RDMA local pseudo-endpoint never
+        // establishes a notification QP, so sending fails and the receiver
+        // polls forever.
+        std::lock_guard<std::mutex> lk(local_notifi_mutex_);
+        local_notifi_list_.push_back(notifi);
+        return Status::OK();
+    }
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
@@ -2716,12 +2738,39 @@ Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
 
 Status TransferEngineImpl::receiveNotification(
     std::vector<Notification>& notifi_list) {
+    // Each poll reports what this poll delivered. Callers reuse one vector
+    // across polls, and appending to leftovers would redeliver what the
+    // caller already handled.
+    notifi_list.clear();
+    Status status = Status::OK();
+    bool has_transport = false;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
-        return transport->receiveNotification(notifi_list);
+        has_transport = true;
+        status = transport->receiveNotification(notifi_list);
+        break;
     }
-    return Status::InvalidArgument("Notification not supported" LOC_MARK);
+    // Append self-targeted notifications queued by sendNotification(). They
+    // are deliverable even when no transport supports notifications at all,
+    // and they do not depend on the transport poll having succeeded.
+    {
+        std::lock_guard<std::mutex> lk(local_notifi_mutex_);
+        if (!local_notifi_list_.empty()) {
+            notifi_list.insert(
+                notifi_list.end(),
+                std::make_move_iterator(local_notifi_list_.begin()),
+                std::make_move_iterator(local_notifi_list_.end()));
+            local_notifi_list_.clear();
+        }
+    }
+    // Whatever landed in the list has been consumed from its queue, so the
+    // caller has to see it: report success here and let a later poll -- which
+    // comes back empty -- surface a persistent transport error.
+    if (!notifi_list.empty()) return Status::OK();
+    if (!has_transport)
+        return Status::InvalidArgument("Notification not supported" LOC_MARK);
+    return status;
 }
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
