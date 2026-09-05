@@ -902,63 +902,121 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
     return GetTenantQuotaSnapshot(tenant_id);
 }
 
-auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
-    -> tl::expected<void, ErrorCode> {
-    ErrorCode mount_result = ErrorCode::OK;
+tl::expected<std::vector<SegmentUpdateResult>, ErrorCode>
+MasterService::MountNewSegments(const std::vector<Segment>& segments,
+                                const UUID& client_id) {
+    std::vector<SegmentUpdateResult> results;
+    results.reserve(segments.size());
+    if (segments.empty()) {
+        return results;
+    }
+
+    bool mounted_new_segment = false;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         ScopedSegmentAccess segment_access =
             segment_manager_.getSegmentAccess();
 
-        // Tell the client monitor thread to start timing for this client. To
-        // avoid the following undesired situations, this message must be sent
-        // after locking the segment mutex and before the mounting operation
-        // completes:
-        // 1. Sending the message before the lock: the client expires and
-        // unmouting invokes before this mounting are completed, which prevents
-        // this segment being able to be unmounted forever;
-        // 2. Sending the message after mounting the segment: After mounting
-        // this segment, when trying to push id to the queue, the queue is
-        // already full. However, at this point, the message must be sent,
-        // otherwise this client cannot be monitored and expired.
-        {
-            PodUUID pod_client_id;
-            pod_client_id.first = client_id.first;
-            pod_client_id.second = client_id.second;
-            if (!client_ping_queue_.push(pod_client_id)) {
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=client_ping_queue_full";
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        PodUUID pod_client_id{client_id.first, client_id.second};
+        if (!client_ping_queue_.push(pod_client_id)) {
+            LOG(ERROR) << "client_id=" << client_id
+                       << ", error=client_ping_queue_full";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        for (const auto& segment : segments) {
+            LOG(INFO) << "client_id=" << client_id
+                      << ", action=mount_segment, segment_name="
+                      << segment.name;
+            auto error = segment_access.MountSegment(segment, client_id);
+            if (error == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                error = ErrorCode::OK;
+            } else if (error == ErrorCode::OK) {
+                mounted_new_segment = true;
             }
-        }
-
-        LOG(INFO) << "client_id=" << client_id
-                  << ", action=mount_segment, segment_name=" << segment.name;
-
-        auto err = segment_access.MountSegment(segment, client_id);
-        if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-            // Return OK because this is an idempotent operation
-            mount_result = err;
-        } else if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
+            results.push_back({segment.id, error});
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_) {
-        SegmentMountOp op;
-        op.segment_name = segment.name;
-        op.transport_endpoint = segment.te_endpoint;
-        op.capacity = segment.size;
-        op.is_memory_segment = true;
-        op.file_path.clear();
-        auto bytes = struct_pack::serialize(op);
-        PersistSegmentOpForHAOrEnqueue("MountSegment", OpType::SEGMENT_MOUNT,
-                                       segment.te_endpoint,
-                                       std::string(bytes.begin(), bytes.end()));
+    for (size_t i = 0; i < segments.size(); ++i) {
+        if (results[i].error_code != ErrorCode::OK) {
+            continue;
+        }
+        const auto& segment = segments[i];
+        if (enable_oplog_ && ordered_oplog_writer_) {
+            SegmentMountOp op;
+            op.segment_name = segment.name;
+            op.transport_endpoint = segment.te_endpoint;
+            op.capacity = segment.size;
+            op.is_memory_segment = true;
+            op.file_path.clear();
+            auto bytes = struct_pack::serialize(op);
+            PersistSegmentOpForHAOrEnqueue(
+                "MountSegment", OpType::SEGMENT_MOUNT, segment.te_endpoint,
+                std::string(bytes.begin(), bytes.end()));
+        }
+        UpdateClientHostId(client_id, segment.host_id);
     }
-    UpdateClientHostId(client_id, segment.host_id);
-    if (mount_result == ErrorCode::OK) {
+    if (mounted_new_segment) {
         RecomputeTenantEffectiveQuotas();
+    }
+    return results;
+}
+
+auto MasterService::UpdateSegments(const UpdateSegmentsRequest& request)
+    -> tl::expected<UpdateSegmentsResponse, ErrorCode> {
+    UpdateSegmentsResponse response;
+    if (request.request_intent == SegmentUpdateRequestIntent::REGISTER) {
+        std::vector<Segment> segments;
+        segments.reserve(request.segments.size());
+        for (const auto& update : request.segments) {
+            if (update.intent != SegmentRegistrationIntent::NEW) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            segments.push_back(update.segment);
+        }
+
+        auto mount_result = MountNewSegments(segments, request.client_id);
+        if (!mount_result) {
+            return tl::make_unexpected(mount_result.error());
+        }
+        response.results = std::move(mount_result.value());
+        {
+            std::shared_lock<std::shared_mutex> lock(client_mutex_);
+            response.client_status = ok_client_.contains(request.client_id)
+                                         ? ClientStatus::OK
+                                         : ClientStatus::NEED_REMOUNT;
+        }
+        return response;
+    }
+
+    if (request.request_intent != SegmentUpdateRequestIntent::RECONCILE) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto reconcile_result = ReMountSegment(request.segments, request.client_id);
+    if (!reconcile_result) {
+        return tl::make_unexpected(reconcile_result.error());
+    }
+    response.client_status = ClientStatus::OK;
+    response.results.reserve(request.segments.size());
+    for (const auto& update : request.segments) {
+        response.results.push_back({update.segment.id, ErrorCode::OK});
+    }
+    return response;
+}
+
+auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    auto results = MountNewSegments({segment}, client_id);
+    if (!results) {
+        return tl::make_unexpected(results.error());
+    }
+    if (results->size() != 1) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (results->front().error_code != ErrorCode::OK) {
+        return tl::make_unexpected(results->front().error_code);
     }
     return {};
 }
@@ -1015,37 +1073,59 @@ ErrorCode MasterService::ValidateStandbyRemountSegment(
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
+    std::vector<SegmentUpdate> updates;
+    updates.reserve(segments.size());
+    for (const auto& segment : segments) {
+        updates.emplace_back(segment, SegmentRegistrationIntent::REMOUNT);
+    }
+    return ReMountSegment(updates, client_id);
+}
+
+auto MasterService::ReMountSegment(const std::vector<SegmentUpdate>& updates,
+                                   const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    std::vector<Segment> segments;
+    std::vector<Segment> new_segments;
+    std::vector<Segment> remount_segments;
+    segments.reserve(updates.size());
+    new_segments.reserve(updates.size());
+    remount_segments.reserve(updates.size());
+    for (const auto& update : updates) {
+        segments.push_back(update.segment);
+        if (update.intent == SegmentRegistrationIntent::NEW) {
+            new_segments.push_back(update.segment);
+        } else if (update.intent == SegmentRegistrationIntent::REMOUNT) {
+            remount_segments.push_back(update.segment);
+        }
+    }
+
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-        for (const auto& segment : segments) {
-            if (!segment.host_id.empty()) {
-                client_host_id_[client_id] = segment.host_id;
-                break;
-            }
-        }
         {
             auto segment_access = segment_manager_.getSegmentAccess();
-            for (const auto& segment : segments) {
-                auto standby_validation =
-                    ValidateStandbyRemountSegment(segment);
-                if (standby_validation != ErrorCode::OK) {
-                    return tl::make_unexpected(standby_validation);
+            for (const auto& update : updates) {
+                switch (update.intent) {
+                    case SegmentRegistrationIntent::NEW:
+                        break;
+                    case SegmentRegistrationIntent::REMOUNT: {
+                        auto standby_validation =
+                            ValidateStandbyRemountSegment(update.segment);
+                        if (standby_validation != ErrorCode::OK) {
+                            return tl::make_unexpected(standby_validation);
+                        }
+                        break;
+                    }
+                    default:
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
                 }
-                auto validation =
-                    segment_access.ValidateRemountSegment(segment, client_id);
+                auto validation = segment_access.ValidateRemountSegment(
+                    update.segment, client_id);
                 if (validation != ErrorCode::OK) {
                     return tl::make_unexpected(validation);
                 }
             }
         }
-        if (ok_client_.contains(client_id)) {
-            LOG(WARNING) << "client_id=" << client_id
-                         << ", warn=client_already_remounted";
-            // Return OK because this is an idempotent operation
-            return {};
-        }
-
         struct SegmentRestore {
             Segment segment;
             std::shared_ptr<BufferAllocatorBase> old_allocator;
@@ -1056,7 +1136,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             uint64_t imported_size{0};
         };
         std::vector<SegmentRestore> restores;
-        restores.reserve(segments.size());
+        restores.reserve(updates.size());
         std::vector<bool> segment_existed(segments.size());
         auto rollback_new_segments = [&] {
             ScopedSegmentAccess segment_access =
@@ -1116,9 +1196,33 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
-            remount_error = segment_access.ReMountSegment(segments, client_id);
+            for (const auto& segment : new_segments) {
+                remount_error = segment_access.MountSegment(segment, client_id);
+                if (remount_error == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                    remount_error = ErrorCode::OK;
+                }
+                if (remount_error != ErrorCode::OK) {
+                    break;
+                }
+            }
+            if (remount_error == ErrorCode::OK) {
+                remount_error =
+                    segment_access.ReMountSegment(remount_segments, client_id);
+            }
+
             if (remount_error == ErrorCode::OK) {
                 for (const auto& segment : segments) {
+                    auto allocator = segment_access.GetAllocator(segment.id);
+                    Segment authoritative;
+                    if (!allocator ||
+                        !segment_access.GetSegment(segment.id, authoritative)) {
+                        remount_error = ErrorCode::INTERNAL_ERROR;
+                        break;
+                    }
+                }
+            }
+            if (remount_error == ErrorCode::OK) {
+                for (const auto& segment : remount_segments) {
                     auto allocator = segment_access.GetAllocator(segment.id);
                     Segment authoritative;
                     if (!allocator ||
@@ -1144,8 +1248,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         bool unsupported_cxl = false;
         std::unordered_set<ObjectMetadata*> affected_objects;
         bool any_standby_kept_alive = std::any_of(
-            segments.begin(), segments.end(), [this](const Segment& segment) {
-                return standby_accounted_memory_bytes_.contains(segment.name);
+            restores.begin(), restores.end(), [this](const auto& restore) {
+                return standby_accounted_memory_bytes_.contains(
+                    restore.segment.name);
             });
         for (size_t shard_index = 0;
              any_standby_kept_alive && shard_index < kNumShards;
@@ -1300,9 +1405,20 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 std::chrono::milliseconds(default_kv_lease_ttl_));
         }
 
-        // Change the client status to OK
-        ok_client_.insert(client_id);
-        MasterMetricManager::instance().inc_active_clients();
+        for (const auto& segment : segments) {
+            if (!segment.host_id.empty()) {
+                client_host_id_[client_id] = segment.host_id;
+                break;
+            }
+        }
+
+        // Only a complete reconcile confirms the client snapshot. Keep an
+        // already healthy client healthy if validation or reconciliation
+        // fails; client_mutex_ prevents observers from seeing an in-progress
+        // reconcile.
+        if (ok_client_.insert(client_id).second) {
+            MasterMetricManager::instance().inc_active_clients();
+        }
     }
 
     if (enable_oplog_ && ordered_oplog_writer_) {

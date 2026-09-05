@@ -450,6 +450,7 @@ Client::~Client() {
     }
 
     storage_heartbeat_running_ = false;
+    storage_control_cv_.notify_all();
     if (storage_heartbeat_thread_.joinable()) {
         storage_heartbeat_thread_.join();
     }
@@ -478,7 +479,7 @@ Client::~Client() {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_copy.reserve(mounted_segments_.size());
         for (auto& entry : mounted_segments_) {
-            mounted_segments_copy.emplace_back(entry.second);
+            mounted_segments_copy.emplace_back(entry.second.segment);
         }
         for (auto& entry : gracefully_unmounting_segments_) {
             gracefully_unmounting_segments_copy.emplace_back(entry.second);
@@ -3616,8 +3617,9 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
-    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
-    auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    MountedSegmentMap::iterator it) {
+    auto& segment = it->second.segment;
+    auto unmount_result = master_client_.UnmountSegment(segment.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
@@ -3626,7 +3628,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
+        reinterpret_cast<void*>(segment.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -3644,13 +3646,15 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
 
 tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
                                                      size_t size) {
+    std::lock_guard<std::mutex> update_lock(segment_update_mutex_);
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.end();
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
-            it->second.size == size) {
+        const auto& mounted = it->second.segment;
+        if (mounted.base == reinterpret_cast<uintptr_t>(buffer) &&
+            mounted.size == size) {
             segment = it;
             break;
         }
@@ -3672,12 +3676,14 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     }
 
     UUID segment_id;
+    Segment segment;
+    std::unique_lock<std::mutex> update_lock(segment_update_mutex_);
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
 
         // Check if the segment overlaps with any existing segment
         for (auto& it : mounted_segments_) {
-            auto& mtseg = it.second;
+            auto& mtseg = it.second.segment;
             uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
             uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
             uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
@@ -3698,7 +3704,6 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        Segment segment;
         segment.id = generate_uuid();
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
@@ -3711,25 +3716,66 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
-        auto mount_result = master_client_.MountSegment(segment);
-        if (!mount_result) {
-            ErrorCode err = mount_result.error();
-            LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
-                       << " size=" << size << ", error=" << err;
-            return tl::unexpected(err);
-        }
-
         segment_id = segment.id;
-        mounted_segments_[segment_id] = segment;
+        mounted_segments_[segment_id] = {segment,
+                                         SegmentSyncState::NEW_PENDING};
     }
 
+    UpdateSegmentsRequest request;
+    request.client_id = client_id_;
+    request.request_intent = SegmentUpdateRequestIntent::REGISTER;
+    request.segments.emplace_back(segment, SegmentRegistrationIntent::NEW);
+    auto mount_result = master_client_.UpdateSegments(request);
+
+    ErrorCode mount_error = ErrorCode::OK;
+    if (!mount_result) {
+        mount_error = mount_result.error();
+    } else if (mount_result->results.size() != 1 ||
+               mount_result->results.front().segment_id != segment_id) {
+        mount_error = ErrorCode::INTERNAL_ERROR;
+    } else {
+        mount_error = mount_result->results.front().error_code;
+    }
+
+    if (mount_error != ErrorCode::OK) {
+        LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
+                   << " size=" << size << ", error=" << mount_error;
+        {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            mounted_segments_.erase(segment_id);
+        }
+        int rc = transfer_engine_->unregisterLocalMemory((void*)buffer);
+        if (rc != 0 && rc != ERR_ADDRESS_NOT_REGISTERED) {
+            LOG(ERROR) << "rollback_register_local_memory_failed base="
+                       << buffer << " size=" << size << ", error=" << rc;
+        }
+        return tl::unexpected(mount_error);
+    }
+
+    const bool need_reconcile =
+        mount_result->client_status == ClientStatus::NEED_REMOUNT;
+    if (!need_reconcile) {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        auto entry = mounted_segments_.find(segment_id);
+        if (entry != mounted_segments_.end() &&
+            entry->second.sync_state == SegmentSyncState::NEW_PENDING) {
+            entry->second.sync_state = SegmentSyncState::ACTIVE;
+        }
+    }
+
+    update_lock.unlock();
     EnsureStorageControlPlaneStarted();
+    if (need_reconcile) {
+        segment_flush_requested_.store(true);
+        storage_control_cv_.notify_one();
+    }
     return segment_id;
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(
     const UUID& segment_id, uint64_t grace_period_ms,
     std::function<void(const UUID&)> cleanup_callback) {
+    std::lock_guard<std::mutex> update_lock(segment_update_mutex_);
     std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
     auto segment = mounted_segments_.find(segment_id);
     if (segment == mounted_segments_.end()) {
@@ -3750,7 +3796,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentById(
         return tl::unexpected(err);
     }
 
-    gracefully_unmounting_segments_.emplace(segment->first, segment->second);
+    gracefully_unmounting_segments_.emplace(segment->first,
+                                            segment->second.segment);
     if (cleanup_callback) {
         graceful_unmount_cleanup_callbacks_[segment->first] =
             std::move(cleanup_callback);
@@ -4895,39 +4942,41 @@ void Client::ExecuteTask(const ClientTask& client_task) {
 }
 
 void Client::StorageHeartbeatThreadMain() {
-    // How many failed pings before reconnecting via the HA coordinator
     const int max_ping_fail_count = 3;
-    // How long to wait for next ping after success
     const int success_ping_interval_ms = 1000;
-    // How long to wait for next ping after failure
     const int fail_ping_interval_ms = 1000;
-    // Increment after a ping failure, reset after a ping success
     int ping_fail_count = 0;
 
-    auto remount_segment = [this]() {
-        // This lock must be held until the remount rpc is finished,
-        // otherwise there will be corner cases, e.g., a segment is
-        // unmounted successfully first, and then remounted again in
-        // this thread.
+    auto wait_for_next_cycle = [this](int interval_ms) {
+        std::unique_lock<std::mutex> lock(storage_control_mutex_);
+        storage_control_cv_.wait_for(
+            lock, std::chrono::milliseconds(interval_ms), [this] {
+                return !storage_heartbeat_running_.load() ||
+                       segment_flush_requested_.load();
+            });
+        segment_flush_requested_.store(false);
+    };
+
+    auto mark_need_remount = [this]() {
+        std::lock_guard<std::mutex> update_lock(segment_update_mutex_);
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        std::vector<Segment> segments;
-        for (auto it : mounted_segments_) {
-            auto& segment = it.second;
-            segments.emplace_back(segment);
+        for (auto& [segment_id, entry] : mounted_segments_) {
+            if (entry.sync_state == SegmentSyncState::ACTIVE) {
+                entry.sync_state = SegmentSyncState::REMOUNT_PENDING;
+            }
         }
-        auto remount_result = master_client_.ReMountSegment(segments);
-        if (!remount_result) {
-            ErrorCode err = remount_result.error();
-            LOG(ERROR) << "Failed to remount segments: " << err;
-        }
-        // Re-publish Transfer Engine segment descriptors to the HTTP
-        // metadata server.  When Master (which hosts the HTTP metadata
-        // server in the same process) is killed and restarted, all
-        // in-memory KV entries are lost.  ReMountSegment above only
-        // restores Master-side allocation state; it does NOT write back
-        // the transport-level segment descriptors.  Without this, remote
-        // peers get HTTP 404 when querying our segment descriptor and
-        // data transfers fail.
+    };
+
+    auto has_remount_pending = [this]() {
+        std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+        return std::any_of(mounted_segments_.begin(), mounted_segments_.end(),
+                           [](const auto& item) {
+                               return item.second.sync_state ==
+                                      SegmentSyncState::REMOUNT_PENDING;
+                           });
+    };
+
+    auto republish_transfer_metadata = [this]() {
         auto metadata = transfer_engine_->getMetadata();
         if (metadata) {
             int rc = metadata->updateLocalSegmentDesc();
@@ -4953,40 +5002,138 @@ void Client::StorageHeartbeatThreadMain() {
                 rpc_meta_publish_pending_.store(false);
             }
         }
-        // Note: LOCAL_DISK segment remount is NOT done here.
-        // It is handled by FileStorage::Heartbeat() when it detects
-        // SEGMENT_NOT_FOUND, which also triggers ScanMeta to
-        // re-register offloaded object metadata.
     };
-    // Use another thread to remount segments to avoid blocking the ping
-    // thread
-    std::future<void> remount_segment_future;
 
-    while (storage_heartbeat_running_.load()) {
-        // Join the remount segment thread if it is ready
-        if (remount_segment_future.valid() &&
-            remount_segment_future.wait_for(std::chrono::seconds(0)) ==
-                std::future_status::ready) {
-            remount_segment_future = std::future<void>();
+    auto flush_new_segments = [this]() -> std::optional<ClientStatus> {
+        std::lock_guard<std::mutex> update_lock(segment_update_mutex_);
+        UpdateSegmentsRequest request;
+        request.client_id = client_id_;
+        request.request_intent = SegmentUpdateRequestIntent::REGISTER;
+        {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            request.segments.reserve(mounted_segments_.size());
+            for (const auto& [segment_id, entry] : mounted_segments_) {
+                if (entry.sync_state == SegmentSyncState::NEW_PENDING) {
+                    request.segments.emplace_back(
+                        entry.segment, SegmentRegistrationIntent::NEW);
+                }
+            }
+        }
+        if (request.segments.empty()) {
+            return std::nullopt;
         }
 
-        // Ping master
+        auto result = master_client_.UpdateSegments(request);
+        if (!result) {
+            LOG(ERROR) << "Failed to register new segments: " << result.error();
+            return std::nullopt;
+        }
+
+        if (result->client_status == ClientStatus::OK) {
+            std::unordered_map<UUID, ErrorCode, boost::hash<UUID>> results;
+            results.reserve(result->results.size());
+            for (const auto& update_result : result->results) {
+                results[update_result.segment_id] = update_result.error_code;
+                if (update_result.error_code != ErrorCode::OK) {
+                    LOG(ERROR) << "Failed to register segment "
+                               << UuidToString(update_result.segment_id) << ": "
+                               << update_result.error_code;
+                }
+            }
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            for (const auto& update : request.segments) {
+                auto entry = mounted_segments_.find(update.segment.id);
+                auto update_result = results.find(update.segment.id);
+                if (entry != mounted_segments_.end() &&
+                    entry->second.sync_state == SegmentSyncState::NEW_PENDING &&
+                    update_result != results.end() &&
+                    update_result->second == ErrorCode::OK) {
+                    entry->second.sync_state = SegmentSyncState::ACTIVE;
+                }
+            }
+        }
+        return result->client_status;
+    };
+
+    auto reconcile_segments = [this, &republish_transfer_metadata]() {
+        std::lock_guard<std::mutex> update_lock(segment_update_mutex_);
+        UpdateSegmentsRequest request;
+        request.client_id = client_id_;
+        request.request_intent = SegmentUpdateRequestIntent::RECONCILE;
+        {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            request.segments.reserve(mounted_segments_.size());
+            for (const auto& [segment_id, entry] : mounted_segments_) {
+                if (entry.sync_state == SegmentSyncState::NEW_PENDING) {
+                    request.segments.emplace_back(
+                        entry.segment, SegmentRegistrationIntent::NEW);
+                } else if (entry.sync_state ==
+                           SegmentSyncState::REMOUNT_PENDING) {
+                    request.segments.emplace_back(
+                        entry.segment, SegmentRegistrationIntent::REMOUNT);
+                }
+            }
+        }
+
+        auto result = master_client_.UpdateSegments(request);
+        if (!result) {
+            LOG(ERROR) << "Failed to reconcile segments: " << result.error();
+            return false;
+        }
+        const bool all_succeeded =
+            result->client_status == ClientStatus::OK &&
+            result->results.size() == request.segments.size() &&
+            std::all_of(result->results.begin(), result->results.end(),
+                        [](const auto& update_result) {
+                            return update_result.error_code == ErrorCode::OK;
+                        });
+        if (!all_succeeded) {
+            LOG(ERROR) << "Master did not confirm the complete segment "
+                          "snapshot";
+            return false;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+            for (const auto& update : request.segments) {
+                auto entry = mounted_segments_.find(update.segment.id);
+                if (entry == mounted_segments_.end()) {
+                    continue;
+                }
+                const auto expected_state =
+                    update.intent == SegmentRegistrationIntent::NEW
+                        ? SegmentSyncState::NEW_PENDING
+                        : SegmentSyncState::REMOUNT_PENDING;
+                if (entry->second.sync_state == expected_state) {
+                    entry->second.sync_state = SegmentSyncState::ACTIVE;
+                }
+            }
+        }
+        republish_transfer_metadata();
+        return true;
+    };
+
+    while (storage_heartbeat_running_.load()) {
+        bool need_reconcile = has_remount_pending();
+        if (!need_reconcile) {
+            auto register_status = flush_new_segments();
+            if (register_status == ClientStatus::NEED_REMOUNT) {
+                mark_need_remount();
+                need_reconcile = true;
+            }
+        }
+
         auto ping_result = master_client_.Ping();
         if (ping_result) {
-            // Reset ping failure count
             ping_fail_count = 0;
             last_ping_success_.store(true);
-            auto& ping_response = ping_result.value();
-            if (ping_response.client_status == ClientStatus::NEED_REMOUNT &&
-                !remount_segment_future.valid()) {
-                // Ensure at most one remount segment thread is running
-                remount_segment_future =
-                    std::async(std::launch::async, remount_segment);
-            } else if (segment_desc_publish_pending_.load() &&
-                       !remount_segment_future.valid()) {
-                // Previous remount succeeded but updateLocalSegmentDesc()
-                // failed (e.g. transient HTTP error).  Retry it directly
-                // without re-running ReMountSegment.
+            if (ping_result->client_status == ClientStatus::NEED_REMOUNT) {
+                mark_need_remount();
+                need_reconcile = true;
+            }
+            if (need_reconcile) {
+                (void)reconcile_segments();
+            } else if (segment_desc_publish_pending_.load()) {
                 auto metadata = transfer_engine_->getMetadata();
                 if (metadata) {
                     int rc = metadata->updateLocalSegmentDesc();
@@ -5000,10 +5147,7 @@ void Client::StorageHeartbeatThreadMain() {
                         segment_desc_publish_pending_.store(false);
                     }
                 }
-            } else if (rpc_meta_publish_pending_.load() &&
-                       !remount_segment_future.valid()) {
-                // Previous remount succeeded but rePublishRpcMetaEntry()
-                // failed.  Retry it directly.
+            } else if (rpc_meta_publish_pending_.load()) {
                 auto metadata = transfer_engine_->getMetadata();
                 if (metadata) {
                     int rc = metadata->rePublishRpcMetaEntry(local_hostname_);
@@ -5019,8 +5163,7 @@ void Client::StorageHeartbeatThreadMain() {
                 }
             }
 
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(success_ping_interval_ms));
+            wait_for_next_cycle(success_ping_interval_ms);
             continue;
         }
 
@@ -5028,8 +5171,7 @@ void Client::StorageHeartbeatThreadMain() {
         last_ping_success_.store(false);
         if (ping_fail_count < max_ping_fail_count) {
             LOG(ERROR) << "Failed to ping master";
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(fail_ping_interval_ms));
+            wait_for_next_cycle(fail_ping_interval_ms);
             continue;
         }
 
@@ -5042,14 +5184,12 @@ void Client::StorageHeartbeatThreadMain() {
             if (!current_view) {
                 LOG(ERROR) << "Failed to get new master view: "
                            << toString(current_view.error());
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                wait_for_next_cycle(fail_ping_interval_ms);
                 continue;
             }
             if (!current_view.value().has_value()) {
                 LOG(WARNING) << "No active master view is published yet";
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                wait_for_next_cycle(fail_ping_interval_ms);
                 continue;
             }
 
@@ -5058,8 +5198,7 @@ void Client::StorageHeartbeatThreadMain() {
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to connect to master "
                            << next_view.leader_address << ": " << toString(err);
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                wait_for_next_cycle(fail_ping_interval_ms);
                 continue;
             }
 
@@ -5074,18 +5213,13 @@ void Client::StorageHeartbeatThreadMain() {
             if (err != ErrorCode::OK) {
                 LOG(ERROR) << "Reconnect failed to " << current_master_address
                            << ": " << toString(err);
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(fail_ping_interval_ms));
+                wait_for_next_cycle(fail_ping_interval_ms);
                 continue;
             }
             LOG(INFO) << "Reconnected to master " << current_master_address;
             last_ping_success_.store(true);
             ping_fail_count = 0;
         }
-    }
-    // Explicitly wait for the remount segment thread to finish
-    if (remount_segment_future.valid()) {
-        remount_segment_future.wait();
     }
 }
 
@@ -5116,8 +5250,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     std::unordered_set<std::string> local_endpoints;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
-        for (const auto& [segment_id, segment] : mounted_segments_) {
-            local_endpoints.insert(segment.te_endpoint);
+        for (const auto& [segment_id, entry] : mounted_segments_) {
+            local_endpoints.insert(entry.segment.te_endpoint);
         }
     }
 

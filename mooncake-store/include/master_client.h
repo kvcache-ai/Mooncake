@@ -316,13 +316,8 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemove(
         const std::vector<std::string>& keys, bool force = false);
 
-    /**
-     * @brief Registers a segment to master for allocation
-     * @param segment Segment to register
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
-    [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
-        const Segment& segment);
+    [[nodiscard]] tl::expected<UpdateSegmentsResponse, ErrorCode>
+    UpdateSegments(const UpdateSegmentsRequest& request);
 
     [[nodiscard]] tl::expected<void, ErrorCode> MountSSDSegment(
         const Segment& segment);
@@ -334,17 +329,6 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
         const NoFSegment& segment);
-
-    /**
-     * @brief Re-mount segments, invoked when the client is the first time to
-     * connect to the master or the client Ping TTL is expired and need
-     * to remount. This function is idempotent. Client should retry if the
-     * return code is not ErrorCode::OK.
-     * @param segments Segments to remount
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
-    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments);
 
     /**
      * @brief Re-mount NoF ssd segments, invoked when the client is the first

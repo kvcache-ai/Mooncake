@@ -143,18 +143,13 @@ struct RpcNameTraits<&WrappedMasterService::BatchRemove> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::MountSegment> {
-    static constexpr const char* value = "MountSegment";
+struct RpcNameTraits<&WrappedMasterService::UpdateSegments> {
+    static constexpr const char* value = "UpdateSegments";
 };
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::MountNoFSegment> {
     static constexpr const char* value = "MountNoFSegment";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::ReMountSegment> {
-    static constexpr const char* value = "ReMountSegment";
 };
 
 template <>
@@ -797,15 +792,18 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchRemove(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::MountSegment(
-    const Segment& segment) {
-    ScopedVLogTimer timer(1, "MasterClient::MountSegment");
-    timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                     ", name=", segment.name, ", id=", segment.id,
-                     ", client_id=", client_id_);
+tl::expected<UpdateSegmentsResponse, ErrorCode> MasterClient::UpdateSegments(
+    const UpdateSegmentsRequest& request) {
+    ScopedVLogTimer timer(1, "MasterClient::UpdateSegments");
+    timer.LogRequest(
+        "segments_num=", request.segments.size(),
+        ", request_intent=", static_cast<int>(request.request_intent),
+        ", client_id=", client_id_);
 
-    auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
-        segment, client_id_);
+    auto wire_request = request;
+    wire_request.client_id = client_id_;
+    auto result = invoke_rpc<&WrappedMasterService::UpdateSegments,
+                             UpdateSegmentsResponse>(wire_request);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -819,18 +817,6 @@ tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
 
     auto result = invoke_rpc<&WrappedMasterService::MountNoFSegment, void>(
         segment, client_id_);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<Segment>& segments) {
-    ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
-    timer.LogRequest("segments_num=", segments.size(),
-                     ", client_id=", client_id_);
-
-    auto result = invoke_rpc<&WrappedMasterService::ReMountSegment, void>(
-        segments, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }

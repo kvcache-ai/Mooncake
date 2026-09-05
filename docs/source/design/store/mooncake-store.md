@@ -168,8 +168,9 @@ service MasterService {
   // Remove objects matching a regex
   rpc RemoveByRegex(RemoveByRegexRequest) returns (RemoveByRegexResponse);
 
-  // Storage node (Client) registers a storage segment
-  rpc MountSegment(MountSegmentRequest) returns (MountSegmentResponse);
+  // Storage node (Client) registers new segments or reconciles its full
+  // segment snapshot after the Master requests a remount
+  rpc UpdateSegments(UpdateSegmentsRequest) returns (UpdateSegmentsResponse);
 
   // Storage node (Client) unregisters a storage segment
   rpc UnmountSegment(UnmountSegmentRequest) returns (UnmountSegmentResponse);
@@ -323,21 +324,47 @@ message RemoveByRegexResponse {
 - **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
 - **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
 
-9. MountSegment
+9. UpdateSegments
 
 ```protobuf
-message MountSegmentRequest {
-  required uint64 buffer = 1;       // Starting address of the space
-  required uint64 size = 2;         // Size of the space
-  required string segment_name = 3; // Storage segment name
+enum SegmentRegistrationIntent {
+  NEW = 0;
+  REMOUNT = 1;
 }
 
-message MountSegmentResponse {
-  required int32 status_code = 1;
+enum SegmentUpdateRequestIntent {
+  REGISTER = 0;
+  RECONCILE = 1;
+}
+
+message SegmentUpdate {
+  required Segment segment = 1;
+  required SegmentRegistrationIntent intent = 2;
+}
+
+message UpdateSegmentsRequest {
+  required UUID client_id = 1;
+  required SegmentUpdateRequestIntent request_intent = 2;
+  repeated SegmentUpdate segments = 3;
+}
+
+message SegmentUpdateResult {
+  required UUID segment_id = 1;
+  required int32 error_code = 2;
+}
+
+message UpdateSegmentsResponse {
+  required ClientStatus client_status = 1;
+  repeated SegmentUpdateResult results = 2;
 };
 ```
 
-The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
+After registering memory locally with `TransferEngine`, a storage node sends a
+`REGISTER` request containing `NEW` segments. A client whose heartbeat reports
+`NEED_REMOUNT` sends one `RECONCILE` request containing its complete pending
+snapshot: newly created segments use `NEW`, while segments known before the
+Master lost state use `REMOUNT`. Only a successful reconciliation confirms the
+client snapshot and changes its status to `OK`.
 
 10. UnmountSegment
 
@@ -357,15 +384,15 @@ When the space needs to be released, this interface is used to remove the previo
 
 The Master Service needs to maintain mappings related to buffer allocators and object metadata to efficiently manage memory resources and precisely control replica states in multi-replica scenarios. Additionally, the Master Service uses read-write locks to protect critical data structures, ensuring data consistency and security in multi-threaded environments. The following are the interfaces maintained by the Master Service for storage space information:
 
-- MountSegment
+- UpdateSegments
 
 ```C++
-tl::expected<void, ErrorCode> MountSegment(uint64_t buffer,
-                                          uint64_t size,
-                                          const std::string& segment_name);
+tl::expected<UpdateSegmentsResponse, ErrorCode> UpdateSegments(
+    const UpdateSegmentsRequest& request);
 ```
 
-The storage node (Client) registers the storage segment space with the Master Service.
+The storage node (Client) incrementally registers new segment space or
+reconciles its complete segment snapshot with the Master Service.
 
 - UnmountSegment
 
