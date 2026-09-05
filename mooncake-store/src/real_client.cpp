@@ -3399,14 +3399,26 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto result = client_->RegisterLocalMemory(buffer, size, kWildcardLocation,
-                                               false, true);
+    // If this buffer was allocated by ShmHelper (e.g. HiCache L2 host memory),
+    // use the actual allocated size instead of the caller-supplied size.
+    // ShmHelper::allocate() pads to 16*hugepage_size (32MB for 2MB hugepages)
+    // to satisfy the mlx5 MTT block constraint (npages % 16 == 0). The Python
+    // side only knows the original unaligned size (tensor.nbytes), which may
+    // not satisfy the constraint. Using shm->size ensures ibv_reg_mr always
+    // receives an aligned length.
+    size_t reg_size = size;
+    auto shm = ShmHelper::getInstance()->get_shm(buffer);
+    if (shm != nullptr && buffer == shm->base_addr) {
+        reg_size = shm->size;
+    }
+    auto result = client_->RegisterLocalMemory(buffer, reg_size,
+                                               kWildcardLocation, false, true);
     if (!result) {
         return result;
     }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
-        registered_buffer_sizes_[buffer] = size;
+        registered_buffer_sizes_[buffer] = reg_size;
     }
     return result;
 }
