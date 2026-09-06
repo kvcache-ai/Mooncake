@@ -18,6 +18,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <iostream>
 #include <list>
 #include <memory>
@@ -64,6 +65,8 @@ struct RdmaTask {
     std::atomic<int> success_slices{0};
     std::atomic<int> resolved_slices{0};
     volatile TransferStatusEnum first_error = PENDING;
+    BatchID progress_batch_id{0};
+    std::function<void(BatchID)> notify_progress;
 
     // Set by the control thread. Workers observe this flag before posting or
     // retrying a slice. Already-posted WRs are allowed to drain normally.
@@ -71,6 +74,10 @@ struct RdmaTask {
 
     // Reference counting for UAF protection
     std::atomic<int> ref_count{0};
+
+    void notifyProgress() {
+        if (notify_progress) notify_progress(progress_batch_id);
+    }
 
     void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
     void deref() {
@@ -161,7 +168,10 @@ static inline void updateSliceStatus(RdmaSlice* slice,
                 ? COMPLETED
                 : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
-        __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
+        if (__sync_bool_compare_and_swap(&task->status_word, PENDING,
+                                         final_st)) {
+            task->notifyProgress();
+        }
     }
     task->deref();
 }

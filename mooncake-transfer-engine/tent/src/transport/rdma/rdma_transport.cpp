@@ -473,6 +473,8 @@ Status RdmaTransport::submitTransferTasks(
         task->resolved_slices.store(0, std::memory_order_relaxed);
         task->first_error = PENDING;
         task->cancel_requested.store(false, std::memory_order_relaxed);
+        task->progress_batch_id = rdma_batch->progress_batch_id;
+        task->notify_progress = rdma_batch->notify_progress;
         task->ref();  // Batch holds a reference to the task
 
         const double merge_ratio = 0.25;

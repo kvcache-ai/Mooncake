@@ -27,7 +27,8 @@ namespace {
 QueueOwnerInput makeOwner(
     size_t public_task_id, size_t length,
     QueueOwnerKind kind = QueueOwnerKind::User,
-    std::vector<size_t> derived_task_ids = std::vector<size_t>()) {
+    std::vector<size_t> derived_task_ids = std::vector<size_t>(),
+    int priority = PRIO_HIGH) {
     QueueOwnerInput owner;
     owner.owner_task_id = public_task_id;
     owner.derived_task_ids = std::move(derived_task_ids);
@@ -36,15 +37,15 @@ QueueOwnerInput makeOwner(
     owner.request.target_id = 1;
     owner.request.target_offset = public_task_id * 4096;
     owner.request.length = length;
+    owner.request.priority = priority;
     owner.kind = kind;
     return owner;
 }
 
-QueueSubmit makeSubmit(uint64_t batch_token, size_t batch_slots_left,
+QueueSubmit makeSubmit(uint64_t batch_token,
                        std::vector<QueueOwnerInput> owners) {
     QueueSubmit submit;
     submit.batch_token = batch_token;
-    submit.batch_slots_left = batch_slots_left;
     submit.owners = std::move(owners);
     return submit;
 }
@@ -53,7 +54,7 @@ TEST(AdmissionQueueTest, AllowsEmptySubmitAsNoOp) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids{99};
 
-    auto status = queue.tryAdmit(makeSubmit(1, 0, {}), admitted_ids);
+    auto status = queue.tryAdmit(makeSubmit(1, {}), admitted_ids);
 
     EXPECT_EQ(status.code(), Status::Code::kOk);
     EXPECT_TRUE(admitted_ids.empty());
@@ -66,34 +67,12 @@ TEST(AdmissionQueueTest, RejectsSubmitWhenQueueLimitsAreInvalid) {
     std::vector<QueueOwnerId> admitted_ids{99};
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
 
     EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
     EXPECT_TRUE(admitted_ids.empty());
     EXPECT_EQ(queue.outstandingOwners(), 0u);
     EXPECT_EQ(queue.outstandingBytes(), 0u);
-}
-
-TEST(AdmissionQueueTest, RejectsInvalidInputsWithoutPartialAdmission) {
-    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
-    std::vector<QueueOwnerId> admitted_ids{99};
-
-    auto status = queue.tryAdmit(
-        makeSubmit(
-            1, 2,
-            {makeOwner(0, 16, QueueOwnerKind::User, {1}), makeOwner(1, 16)}),
-        admitted_ids);
-
-    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
-    EXPECT_TRUE(admitted_ids.empty());
-    EXPECT_EQ(queue.outstandingOwners(), 0u);
-    EXPECT_EQ(queue.outstandingBytes(), 0u);
-
-    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(2, 16)}), admitted_ids);
-
-    ASSERT_EQ(status.code(), Status::Code::kOk);
-    ASSERT_EQ(admitted_ids.size(), 1u);
-    EXPECT_EQ(admitted_ids[0], 1u);
 }
 
 TEST(AdmissionQueueTest, RejectsUnsupportedOwnerKindWithoutPartialAdmission) {
@@ -101,7 +80,7 @@ TEST(AdmissionQueueTest, RejectsUnsupportedOwnerKindWithoutPartialAdmission) {
     std::vector<QueueOwnerId> admitted_ids{99};
 
     auto invalid_owner = makeOwner(0, 16, static_cast<QueueOwnerKind>(99), {1});
-    auto status = queue.tryAdmit(makeSubmit(1, 2, {std::move(invalid_owner)}),
+    auto status = queue.tryAdmit(makeSubmit(1, {std::move(invalid_owner)}),
                                  admitted_ids);
 
     EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
@@ -109,7 +88,28 @@ TEST(AdmissionQueueTest, RejectsUnsupportedOwnerKindWithoutPartialAdmission) {
     EXPECT_EQ(queue.outstandingOwners(), 0u);
     EXPECT_EQ(queue.outstandingBytes(), 0u);
 
-    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(2, 16)}), admitted_ids);
+    status = queue.tryAdmit(makeSubmit(1, {makeOwner(2, 16)}), admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    EXPECT_EQ(admitted_ids[0], 1u);
+}
+
+TEST(AdmissionQueueTest, RejectsUnsupportedPriorityWithoutPartialAdmission) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids{99};
+
+    auto invalid_owner = makeOwner(0, 16);
+    invalid_owner.request.priority = 99;
+    auto status = queue.tryAdmit(makeSubmit(1, {std::move(invalid_owner)}),
+                                 admitted_ids);
+
+    EXPECT_EQ(status.code(), Status::Code::kInvalidArgument);
+    EXPECT_TRUE(admitted_ids.empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+
+    status = queue.tryAdmit(makeSubmit(1, {makeOwner(2, 16)}), admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
@@ -121,14 +121,14 @@ TEST(AdmissionQueueTest, RejectsCapacityExceededWithoutPartialAdmission) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2, {makeOwner(0, 16), makeOwner(1, 16)}), admitted_ids);
+        makeSubmit(1, {makeOwner(0, 16), makeOwner(1, 16)}), admitted_ids);
 
     EXPECT_EQ(status.code(), Status::Code::kTooManyRequests);
     EXPECT_TRUE(admitted_ids.empty());
     EXPECT_EQ(queue.outstandingOwners(), 0u);
     EXPECT_EQ(queue.outstandingBytes(), 0u);
 
-    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    status = queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
@@ -140,13 +140,13 @@ TEST(AdmissionQueueTest, RejectsExistingPublicTaskConflictWithoutMutation) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
     EXPECT_EQ(admitted_ids[0], 1u);
 
     status = queue.tryAdmit(
-        makeSubmit(1, 2, {makeOwner(1, 16), makeOwner(0, 16)}), admitted_ids);
+        makeSubmit(1, {makeOwner(1, 16), makeOwner(0, 16)}), admitted_ids);
 
     EXPECT_EQ(status.code(), Status::Code::kInvalidEntry);
     EXPECT_TRUE(admitted_ids.empty());
@@ -164,27 +164,57 @@ TEST(AdmissionQueueTest, RejectsExistingPublicTaskConflictWithoutMutation) {
     status = queue.retireBatch(1);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
-    status = queue.tryAdmit(makeSubmit(2, 1, {makeOwner(0, 16)}), admitted_ids);
+    status = queue.tryAdmit(makeSubmit(2, {makeOwner(0, 16)}), admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
     EXPECT_EQ(admitted_ids[0], 2u);
 }
 
-TEST(AdmissionQueueTest, AccountsPublicSlotsSeparatelyFromQueueOwners) {
+TEST(AdmissionQueueTest, AllowsAdditionalOwnersInSameBatch) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status =
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto first_owner = admitted_ids[0];
+
+    status = queue.tryAdmit(
+        makeSubmit(1, {makeOwner(1, 16, QueueOwnerKind::User, {2})}),
+        admitted_ids);
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 1u);
+    const auto second_owner = admitted_ids[0];
+
+    QueueOwnerId resolved_owner = 0;
+    status = queue.resolveOwner(1, 0, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, first_owner);
+    status = queue.resolveOwner(1, 1, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, second_owner);
+    status = queue.resolveOwner(1, 2, resolved_owner);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+    EXPECT_EQ(resolved_owner, second_owner);
+
+    auto picked = queue.pickForDispatch(2, 32);
+    ASSERT_EQ(picked.size(), 2u);
+    for (const auto owner_id : picked) {
+        status = queue.complete(owner_id, TransferStatusEnum::COMPLETED);
+        ASSERT_EQ(status.code(), Status::Code::kOk);
+    }
+    status = queue.retireBatch(1);
+    EXPECT_EQ(status.code(), Status::Code::kOk);
+}
+
+TEST(AdmissionQueueTest, MapsDerivedPublicTasksToOwner) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2, {makeOwner(7, 32, QueueOwnerKind::User, {8, 9})}),
-        admitted_ids);
-
-    EXPECT_EQ(status.code(), Status::Code::kTooManyRequests);
-    EXPECT_TRUE(admitted_ids.empty());
-    EXPECT_EQ(queue.outstandingOwners(), 0u);
-
-    status = queue.tryAdmit(
-        makeSubmit(1, 3, {makeOwner(7, 32, QueueOwnerKind::User, {8, 9})}),
+        makeSubmit(1, {makeOwner(7, 32, QueueOwnerKind::User, {8, 9})}),
         admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
@@ -211,17 +241,17 @@ TEST(AdmissionQueueTest, PreservesStagingReserveForStagingInternalOwners) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 60)}), admitted_ids);
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 60)}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
-    status = queue.tryAdmit(makeSubmit(2, 1, {makeOwner(0, 1)}), admitted_ids);
+    status = queue.tryAdmit(makeSubmit(2, {makeOwner(0, 1)}), admitted_ids);
     EXPECT_EQ(status.code(), Status::Code::kTooManyRequests);
     EXPECT_TRUE(admitted_ids.empty());
     EXPECT_EQ(queue.outstandingOwners(), 1u);
     EXPECT_EQ(queue.outstandingBytes(), 60u);
 
     status = queue.tryAdmit(
-        makeSubmit(3, 1, {makeOwner(0, 40, QueueOwnerKind::StagingInternal)}),
+        makeSubmit(3, {makeOwner(0, 40, QueueOwnerKind::StagingInternal)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
@@ -230,25 +260,109 @@ TEST(AdmissionQueueTest, PreservesStagingReserveForStagingInternalOwners) {
     EXPECT_EQ(queue.outstandingBytes(), 100u);
 }
 
-TEST(AdmissionQueueTest, KeepsAdmissionOrderForDispatch) {
+TEST(AdmissionQueueTest, BlocksOnSameLaneHeadWhenByteWindowIsTooSmall) {
     LocalTransferAdmissionQueue queue({4, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2,
-                   {makeOwner(0, 60),
-                    makeOwner(1, 10, QueueOwnerKind::StagingInternal)}),
-        admitted_ids);
+        makeSubmit(1, {makeOwner(0, 60), makeOwner(1, 10)}), admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 2u);
     const std::vector<QueueOwnerId> expected_ids{1, 2};
     EXPECT_EQ(admitted_ids, expected_ids);
 
-    EXPECT_TRUE(queue.pickForDispatch(2, 50).empty());
+    auto picked = queue.pickForDispatch(2, 50);
+    EXPECT_TRUE(picked.empty());
 
-    auto picked = queue.pickForDispatch(2, 70);
+    picked = queue.pickForDispatch(2, 70);
 
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, DispatchesHigherPriorityBeforeEarlierLowerPriority) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_LOW),
+                    makeOwner(1, 10, QueueOwnerKind::User, {}, PRIO_HIGH),
+                    makeOwner(2, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 3u);
+
+    auto picked = queue.pickForDispatch(3, 128);
+
+    const std::vector<QueueOwnerId> expected_ids{
+        admitted_ids[1], admitted_ids[2], admitted_ids[0]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, PreservesFifoWithinSamePriorityLane) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(1,
+                   {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM),
+                    makeOwner(1, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM),
+                    makeOwner(2, 10, QueueOwnerKind::User, {}, PRIO_HIGH)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 3u);
+
+    auto picked = queue.pickForDispatch(3, 128);
+
+    const std::vector<QueueOwnerId> expected_ids{
+        admitted_ids[2], admitted_ids[0], admitted_ids[1]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, OwnerKindDoesNotOverrideRequestPriority) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(
+            1,
+            {makeOwner(0, 10, QueueOwnerKind::StagingInternal, {}, PRIO_LOW),
+             makeOwner(1, 10, QueueOwnerKind::User, {}, PRIO_HIGH)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 2u);
+
+    auto picked = queue.pickForDispatch(2, 128);
+
+    const std::vector<QueueOwnerId> expected_ids{admitted_ids[1],
+                                                 admitted_ids[0]};
+    EXPECT_EQ(picked, expected_ids);
+}
+
+TEST(AdmissionQueueTest, AlternatesOwnerKindWithinSamePriority) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto status = queue.tryAdmit(
+        makeSubmit(
+            1,
+            {makeOwner(0, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM),
+             makeOwner(1, 10, QueueOwnerKind::StagingInternal, {}, PRIO_MEDIUM),
+             makeOwner(2, 10, QueueOwnerKind::StagingInternal, {}, PRIO_MEDIUM),
+             makeOwner(3, 10, QueueOwnerKind::User, {}, PRIO_MEDIUM)}),
+        admitted_ids);
+
+    ASSERT_EQ(status.code(), Status::Code::kOk);
+    ASSERT_EQ(admitted_ids.size(), 4u);
+
+    auto picked = queue.pickForDispatch(4, 128);
+
+    const std::vector<QueueOwnerId> expected_ids{
+        admitted_ids[1], admitted_ids[0], admitted_ids[2], admitted_ids[3]};
     EXPECT_EQ(picked, expected_ids);
 }
 
@@ -257,7 +371,7 @@ TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
 
@@ -284,7 +398,7 @@ TEST(AdmissionQueueTest, CancelsQueuedOwnerAndReleasesAccounting) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
     ASSERT_TRUE(
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids)
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids)
             .ok());
     ASSERT_EQ(admitted_ids.size(), 1u);
 
@@ -304,7 +418,7 @@ TEST(AdmissionQueueTest, RejectsQueueCancelAfterDispatchStarts) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
     ASSERT_TRUE(
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids)
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids)
             .ok());
     auto picked = queue.pickForDispatch(1, 16);
     ASSERT_EQ(picked.size(), 1u);
@@ -319,7 +433,7 @@ TEST(AdmissionQueueTest, RetainsTerminalStatusUntilBatchRetire) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2, {makeOwner(0, 16, QueueOwnerKind::User, {1})}),
+        makeSubmit(1, {makeOwner(0, 16, QueueOwnerKind::User, {1})}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
@@ -355,7 +469,7 @@ TEST(AdmissionQueueTest, RetainsSpecificTerminalStatus) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
     auto picked = queue.pickForDispatch(1, 16);
@@ -374,7 +488,7 @@ TEST(AdmissionQueueTest, RejectsRetireWithNonTerminalOwners) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status = queue.tryAdmit(
-        makeSubmit(1, 2, {makeOwner(0, 16), makeOwner(1, 16)}), admitted_ids);
+        makeSubmit(1, {makeOwner(0, 16), makeOwner(1, 16)}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
     auto picked = queue.pickForDispatch(1, 16);
@@ -399,7 +513,7 @@ TEST(AdmissionQueueTest, AllowsBatchTokenReuseAfterRetire) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+        queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
     EXPECT_EQ(admitted_ids[0], 1u);
@@ -411,7 +525,7 @@ TEST(AdmissionQueueTest, AllowsBatchTokenReuseAfterRetire) {
     status = queue.retireBatch(1);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
-    status = queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids);
+    status = queue.tryAdmit(makeSubmit(1, {makeOwner(0, 16)}), admitted_ids);
 
     ASSERT_EQ(status.code(), Status::Code::kOk);
     ASSERT_EQ(admitted_ids.size(), 1u);
@@ -449,7 +563,7 @@ TEST(AdmissionQueueTest, DeadlineAwareDispatchesEarliestDeadlineFirst) {
 
     // Admitted in FIFO order 1,2,3 but with deadlines 300,100,200.
     auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 300),
                                    makeOwnerWithDeadline(1, 16, 100),
                                    makeOwnerWithDeadline(2, 16, 200)}),
@@ -470,7 +584,7 @@ TEST(AdmissionQueueTest, DeadlineAwareKeepsUndeadlinedOwnersLast) {
     std::vector<QueueOwnerId> admitted_ids;
 
     // owner 1: no deadline (0); owner 2: deadline 100; owner 3: no deadline.
-    auto status = queue.tryAdmit(makeSubmit(1, 3,
+    auto status = queue.tryAdmit(makeSubmit(1,
                                             {makeOwnerWithDeadline(0, 16, 0),
                                              makeOwnerWithDeadline(1, 16, 100),
                                              makeOwnerWithDeadline(2, 16, 0)}),
@@ -489,7 +603,7 @@ TEST(AdmissionQueueTest, DeadlineUnawareKeepsStrictFifo) {
     std::vector<QueueOwnerId> admitted_ids;
 
     auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 300),
                                    makeOwnerWithDeadline(1, 16, 100),
                                    makeOwnerWithDeadline(2, 16, 200)}),
@@ -514,24 +628,24 @@ TEST(AdmissionQueueTest, DeadlineAwareOrdersAcrossSeparateAdmits) {
     // Admit one at a time, deadlines arriving out of order: 300, 100, 200, 0.
     ASSERT_EQ(
         queue
-            .tryAdmit(makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 300)}),
+            .tryAdmit(makeSubmit(1, {makeOwnerWithDeadline(0, 16, 300)}),
                       ids)
             .code(),
         Status::Code::kOk);  // owner 1
     ASSERT_EQ(
         queue
-            .tryAdmit(makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 100)}),
+            .tryAdmit(makeSubmit(2, {makeOwnerWithDeadline(0, 16, 100)}),
                       ids)
             .code(),
         Status::Code::kOk);  // owner 2
     ASSERT_EQ(
         queue
-            .tryAdmit(makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 200)}),
+            .tryAdmit(makeSubmit(3, {makeOwnerWithDeadline(0, 16, 200)}),
                       ids)
             .code(),
         Status::Code::kOk);  // owner 3
     ASSERT_EQ(
-        queue.tryAdmit(makeSubmit(4, 1, {makeOwnerWithDeadline(0, 16, 0)}), ids)
+        queue.tryAdmit(makeSubmit(4, {makeOwnerWithDeadline(0, 16, 0)}), ids)
             .code(),
         Status::Code::kOk);  // owner 4 (no deadline → last)
 
@@ -566,7 +680,7 @@ TEST(AdmissionQueueTest, Step3DropsInfeasibleAndKeepsFeasible) {
     // owner 2: window = 1e6 ns → MLU ~1.6e-5 → feasible → dispatch.
     auto status = queue.tryAdmit(
         makeSubmit(
-            1, 2,
+            1,
             {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'010),
              makeDegradationEligibleOwnerWithDeadline(1, 16, 2'000'000'000)}),
         admitted_ids);
@@ -595,7 +709,7 @@ TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
     // deadline 1e9 < now 2e9 → already past → dropped.
     auto status = queue.tryAdmit(
         makeSubmit(
-            1, 1,
+            1,
             {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'000)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
@@ -617,7 +731,7 @@ TEST(AdmissionQueueTest, Step3DisabledWhenThresholdZero) {
     std::vector<QueueOwnerId> admitted_ids;
     auto status = queue.tryAdmit(
         makeSubmit(
-            1, 1,
+            1,
             {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'001)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
@@ -634,7 +748,7 @@ TEST(AdmissionQueueTest, Step3NoDropWithoutBandwidthProvider) {
     LocalTransferAdmissionQueue queue(step3Limits(1.5));
     std::vector<QueueOwnerId> admitted_ids;
     auto status = queue.tryAdmit(
-        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'001)}),
+        makeSubmit(1, {makeOwnerWithDeadline(0, 16, 1'000'000'001)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
@@ -657,7 +771,7 @@ TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {
     // At 1e9 B/s: time=16ns, window=10ns, MLU=1.6 >= 1.5 -> DROP.
     auto status = queue.tryAdmit(
         makeSubmit(
-            1, 1,
+            1,
             {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'010)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
@@ -672,7 +786,7 @@ TEST(AdmissionQueueTest, Step3DynamicBandwidthProvider) {
     live_bw.store(1e10);
     status = queue.tryAdmit(
         makeSubmit(
-            2, 1,
+            2,
             {makeDegradationEligibleOwnerWithDeadline(0, 16, 1'000'000'010)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
@@ -696,7 +810,7 @@ TEST(AdmissionQueueTest, Step3SkipsNonRdmaOwner) {
     auto owner = makeOwnerWithDeadline(0, 16, 1'000'000'010);
     owner.degradation_eligible = false;
     std::vector<QueueOwnerId> admitted_ids;
-    auto status = queue.tryAdmit(makeSubmit(1, 1, {owner}), admitted_ids);
+    auto status = queue.tryAdmit(makeSubmit(1, {owner}), admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
     std::vector<QueueOwnerId> dropped;
@@ -716,7 +830,7 @@ TEST(AdmissionQueueTest, Step3RequiresExplicitDegradationEligibility) {
 
     std::vector<QueueOwnerId> admitted_ids;
     auto status = queue.tryAdmit(
-        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1'000'000'010)}),
+        makeSubmit(1, {makeOwnerWithDeadline(0, 16, 1'000'000'010)}),
         admitted_ids);
     ASSERT_EQ(status.code(), Status::Code::kOk);
 
@@ -745,7 +859,7 @@ TEST(AdmissionQueueTest, PromotionDisabledKeepsEdfOrder) {
 
     std::vector<QueueOwnerId> ids;
     auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 2000),
                                    makeOwnerWithDeadline(1, 16, 1500),
                                    makeOwnerWithDeadline(2, 16, 1800)}),
@@ -764,7 +878,7 @@ TEST(AdmissionQueueTest, PromotionMovesUrgentOwnersToFront) {
 
     std::vector<QueueOwnerId> ids;
     auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 2000),
                                    makeOwnerWithDeadline(1, 16, 1400),
                                    makeOwnerWithDeadline(2, 16, 1300)}),
@@ -783,13 +897,13 @@ TEST(AdmissionQueueTest, PromotionReordersAcrossSeparateAdmits) {
 
     std::vector<QueueOwnerId> ids;
     auto s1 = queue.tryAdmit(
-        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 10000)}), ids);
+        makeSubmit(1, {makeOwnerWithDeadline(0, 16, 10000)}), ids);
     ASSERT_EQ(s1.code(), Status::Code::kOk);
     auto s2 = queue.tryAdmit(
-        makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 6500)}), ids);
+        makeSubmit(2, {makeOwnerWithDeadline(0, 16, 6500)}), ids);
     ASSERT_EQ(s2.code(), Status::Code::kOk);
     auto s3 = queue.tryAdmit(
-        makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 6000)}), ids);
+        makeSubmit(3, {makeOwnerWithDeadline(0, 16, 6000)}), ids);
     ASSERT_EQ(s3.code(), Status::Code::kOk);
 
     auto picked = queue.pickForDispatch(4, 1 << 20);
@@ -804,7 +918,7 @@ TEST(AdmissionQueueTest, PromotionSkipsNoDeadlineOwners) {
 
     std::vector<QueueOwnerId> ids;
     auto status =
-        queue.tryAdmit(makeSubmit(1, 2,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 0),
                                    makeOwnerWithDeadline(1, 16, 2000)}),
                        ids);
@@ -822,7 +936,7 @@ TEST(AdmissionQueueTest, PromotionPreservesEdfWithinPromotedGroup) {
 
     std::vector<QueueOwnerId> ids;
     auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 2500),
                                    makeOwnerWithDeadline(1, 16, 2200),
                                    makeOwnerWithDeadline(2, 16, 2800)}),
@@ -846,7 +960,7 @@ TEST(AdmissionQueueTest, PromotionCoexistsWithStep3Drop) {
 
     std::vector<QueueOwnerId> ids;
     auto status = queue.tryAdmit(
-        makeSubmit(1, 3,
+        makeSubmit(1,
                    {makeDegradationEligibleOwnerWithDeadline(0, 16, 1010),
                     makeDegradationEligibleOwnerWithDeadline(1, 16, 1400),
                     makeDegradationEligibleOwnerWithDeadline(2, 16, 5000)}),
@@ -873,13 +987,13 @@ TEST(AdmissionQueueTest, PromotionWithAdvancingTime) {
 
     std::vector<QueueOwnerId> ids;
     auto s1 = queue.tryAdmit(
-        makeSubmit(1, 1, {makeOwnerWithDeadline(0, 16, 1800)}), ids);
+        makeSubmit(1, {makeOwnerWithDeadline(0, 16, 1800)}), ids);
     ASSERT_EQ(s1.code(), Status::Code::kOk);
     auto s2 = queue.tryAdmit(
-        makeSubmit(2, 1, {makeOwnerWithDeadline(0, 16, 1400)}), ids);
+        makeSubmit(2, {makeOwnerWithDeadline(0, 16, 1400)}), ids);
     ASSERT_EQ(s2.code(), Status::Code::kOk);
     auto s3 = queue.tryAdmit(
-        makeSubmit(3, 1, {makeOwnerWithDeadline(0, 16, 3000)}), ids);
+        makeSubmit(3, {makeOwnerWithDeadline(0, 16, 3000)}), ids);
     ASSERT_EQ(s3.code(), Status::Code::kOk);
 
     auto picked1 = queue.pickForDispatch(1, 1 << 20);
@@ -905,7 +1019,7 @@ TEST(AdmissionQueueTest, PromotionDisabledWithoutDeadlineAware) {
 
     std::vector<QueueOwnerId> ids;
     auto status =
-        queue.tryAdmit(makeSubmit(1, 3,
+        queue.tryAdmit(makeSubmit(1,
                                   {makeOwnerWithDeadline(0, 16, 1200),
                                    makeOwnerWithDeadline(1, 16, 5000),
                                    makeOwnerWithDeadline(2, 16, 1100)}),

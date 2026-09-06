@@ -60,7 +60,6 @@ void runDepth(size_t depth) {
 
         QueueSubmit submit;
         submit.batch_token = repeat + 1;
-        submit.batch_slots_left = depth;
         submit.owners.reserve(depth);
         for (size_t i = 0; i < depth; ++i) {
             // Interleave urgent and comfortable requests so every dispatch
