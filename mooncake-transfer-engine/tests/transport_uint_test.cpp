@@ -76,6 +76,12 @@ class TransferEngineImplTestPeer {
         RWSpinlock::ReadGuard guard(engine.send_notifies_lock_);
         return engine.notifies_to_send_.size();
     }
+
+    static Status freeBatchWithCallback(
+        TransferEngineImpl& engine, BatchID batch_id,
+        const std::function<void()>& before_delete) {
+        return engine.multi_transports_->freeBatchID(batch_id, before_delete);
+    }
 };
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
@@ -749,6 +755,37 @@ TEST_F(TransportTest, BusyBatchKeepsPendingNotify) {
     transport->finishTasks();
     ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
     EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+}
+
+TEST_F(TransportTest, BatchCleanupRunsAfterBeforeDeleteCallback) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+
+    bool before_delete_finished = false;
+    bool cleanup_observed_callback = false;
+    struct CleanupProbe {
+        bool* before_delete_finished;
+        bool* cleanup_observed_callback;
+    };
+    CleanupProbe probe{&before_delete_finished, &cleanup_observed_callback};
+
+    auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto& task = batch.task_list.emplace_back();
+    task.is_finished = true;
+    auto* slice = new Transport::Slice();
+    slice->source_addr = &probe;
+    slice->cleanup_callback = [](Transport::Slice* released) {
+        auto* probe = static_cast<CleanupProbe*>(released->source_addr);
+        *probe->cleanup_observed_callback = *probe->before_delete_finished;
+    };
+    task.slice_list.push_back(slice);
+
+    auto status = TransferEngineImplTestPeer::freeBatchWithCallback(
+        engine, batch_id, [&] { before_delete_finished = true; });
+
+    ASSERT_TRUE(status.ok());
+    EXPECT_TRUE(cleanup_observed_callback);
 }
 
 TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
