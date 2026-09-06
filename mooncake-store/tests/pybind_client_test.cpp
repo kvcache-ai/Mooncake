@@ -2774,9 +2774,8 @@ TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
     }
     ASSERT_TRUE(memory_cleared);
     ASSERT_EQ(py_client_->get_replica_desc(key).size(), 1u);
-    ASSERT_TRUE(py_client_->get_replica_desc(key)
-                    .front()
-                    .is_local_disk_replica());
+    ASSERT_TRUE(
+        py_client_->get_replica_desc(key).front().is_local_disk_replica());
 
     // The disk-only read works before the wipe, so the later failure comes
     // from the missing file, not from a setup mistake.
