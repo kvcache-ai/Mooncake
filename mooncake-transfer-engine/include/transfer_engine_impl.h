@@ -263,7 +263,14 @@ class TransferEngineImpl {
     }
 
     Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
+        // BatchID is pointer-derived and may be reused immediately after free.
+        // Keep release and notify cleanup atomic with notify table access.
+        RWSpinlock::WriteGuard guard(send_notifies_lock_);
+        auto status = multi_transports_->freeBatchID(batch_id);
+        if (status.ok()) {
+            notifies_to_send_.erase(batch_id);
+        }
+        return status;
     }
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);

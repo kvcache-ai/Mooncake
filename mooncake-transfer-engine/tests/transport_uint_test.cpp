@@ -71,6 +71,11 @@ class TransferEngineImplTestPeer {
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
     }
+
+    static size_t pendingNotifyCount(TransferEngineImpl& engine) {
+        RWSpinlock::ReadGuard guard(engine.send_notifies_lock_);
+        return engine.notifies_to_send_.size();
+    }
 };
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
@@ -269,6 +274,36 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
 
    private:
     bool extra_slice_ = false;
+};
+
+class TerminalFailureTransport : public BatchResultTransport {
+   public:
+    explicit TerminalFailureTransport(bool initially_finished)
+        : initially_finished_(initially_finished) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        for (auto* task : tasks_) {
+            task->is_finished = initially_finished_;
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::FAILED;
+        return Status::OK();
+    }
+
+    void finishTasks() {
+        for (auto* task : tasks_) {
+            task->is_finished = true;
+        }
+    }
+
+   private:
+    bool initially_finished_;
+    std::vector<TransferTask*> tasks_;
 };
 
 class TransportTest : public ::testing::Test {
@@ -646,6 +681,74 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
     EXPECT_EQ(
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
+}
+
+TEST_F(TransportTest, FreeBatchClearsPendingNotify) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<TerminalFailureTransport>(true);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"terminal-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "terminal-failure";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+    ASSERT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getBatchTransferStatus(batch_id, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::FAILED);
+    ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+}
+
+TEST_F(TransportTest, BusyBatchKeepsPendingNotify) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<TerminalFailureTransport>(false);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"terminal-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "terminal-failure";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    transport->finishTasks();
+    ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
 }
 
 TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
