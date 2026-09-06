@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import Mapping, Optional, Protocol, Sequence, runtime_checkable
+from typing import Callable, Mapping, Optional, Protocol, Sequence, runtime_checkable
 
 from ..contracts import ParticipantId, RuntimeFragmentId, RuntimeInstanceId
 from ..lifetime import (
@@ -43,6 +43,9 @@ GuardProviderKey = tuple[RuntimeInstanceId, ParticipantId]
 WeightAllocationGuardProviders = Mapping[
     GuardProviderKey, WeightAllocationGuardProvider
 ]
+AllocationRollbackFinalizer = Callable[
+    [Sequence[AllocationTokenSet], TerminalTransferState], None
+]
 
 
 def acquire_weight_lifetime_tokens(
@@ -52,6 +55,10 @@ def acquire_weight_lifetime_tokens(
     bindings: Sequence[WeightRuntimeBindingManifest],
     side: str,
     providers: Optional[WeightAllocationGuardProviders],
+    rollback_finalizer: AllocationRollbackFinalizer,
+    required_fragment_ids_by_key: Optional[
+        Mapping[GuardProviderKey, Sequence[RuntimeFragmentId]]
+    ] = None,
 ) -> tuple[tuple[WeightRuntimeBindingManifest, ...], AllocationTokenSet]:
     """Acquire pins before using a runtime address or TE registration lease."""
 
@@ -59,19 +66,35 @@ def acquire_weight_lifetime_tokens(
         raise ValueError(f"invalid lifetime side: {side}")
     if providers is None:
         raise ValueError(f"{side} allocation guard providers are required")
-    expected_executors = (
-        plan.source_executors if side == "source" else plan.target_executors
-    )
-    required_by_key: dict[GuardProviderKey, tuple[RuntimeFragmentId, ...]] = {}
-    for executor in expected_executors:
-        key = (executor.instance_id, executor.participant_id)
-        existing = required_by_key.get(key, ())
-        required_by_key[key] = tuple(sorted(set((*existing, *executor.fragment_ids))))
+    if not callable(rollback_finalizer):
+        raise TypeError("rollback_finalizer must be callable")
+    if required_fragment_ids_by_key is None:
+        expected_executors = (
+            plan.source_executors if side == "source" else plan.target_executors
+        )
+        required_by_key: dict[GuardProviderKey, tuple[RuntimeFragmentId, ...]] = {}
+        for executor in expected_executors:
+            key = (executor.instance_id, executor.participant_id)
+            existing = required_by_key.get(key, ())
+            required_by_key[key] = tuple(
+                sorted(set((*existing, *executor.fragment_ids)))
+            )
+    else:
+        required_by_key = {
+            key: tuple(sorted(set(fragment_ids)))
+            for key, fragment_ids in required_fragment_ids_by_key.items()
+        }
+        if any(not fragment_ids for fragment_ids in required_by_key.values()):
+            raise ValueError(f"{side} allocation guard requirements are empty")
     binding_by_key = {
         (binding.instance_id, binding.participant_id): binding for binding in bindings
     }
     if len(binding_by_key) != len(bindings):
         raise ValueError(f"duplicate {side} runtime binding participant")
+    if required_fragment_ids_by_key is not None and set(binding_by_key) != set(
+        required_by_key
+    ):
+        raise ValueError(f"{side} runtime binding participants differ from scope")
     if not set(binding_by_key).issubset(required_by_key):
         raise ValueError(f"{side} runtime binding participants differ from plan")
 
@@ -93,6 +116,7 @@ def acquire_weight_lifetime_tokens(
             )
             if not isinstance(acquired, AcquiredWeightBinding):
                 raise ValueError(f"{side} allocation guard returned an invalid binding")
+            tokens.append(acquired.token)
             fresh_binding = acquired.binding
             expected_fence = weight_allocation_fence(
                 fresh_binding,
@@ -105,13 +129,14 @@ def acquire_weight_lifetime_tokens(
                 expected_binding, fresh_binding, required_fragment_ids
             )
             acquired_bindings.append(fresh_binding)
-            tokens.append(acquired.token)
-    except BaseException:
-        AllocationTokenSet(tuple(tokens)).release_after_terminal(
-            TerminalTransferState.ABORTED
-        )
+        return tuple(acquired_bindings), AllocationTokenSet(tuple(tokens))
+    except BaseException as error:
+        token_sets = tuple(AllocationTokenSet((token,)) for token in tokens)
+        try:
+            rollback_finalizer(token_sets, TerminalTransferState.ABORTED)
+        except BaseException as cleanup_error:
+            raise cleanup_error from error
         raise
-    return tuple(acquired_bindings), AllocationTokenSet(tuple(tokens))
 
 
 def acquire_weight_binding_token(
