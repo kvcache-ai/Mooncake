@@ -960,6 +960,8 @@ std::string TransferEngine::showLinks(bool json) const {
 namespace mooncake {
 
 class TransferEngine::ScatterTransferOperation::Impl {
+    using Clock = std::chrono::steady_clock;
+
    public:
     struct Backend {
         std::shared_ptr<TransferEngineImpl> legacy;
@@ -969,14 +971,18 @@ class TransferEngine::ScatterTransferOperation::Impl {
     };
 
     Impl(TransferEngine& engine, Backend backend,
-         const std::vector<ScatterTransferRange>& ranges)
-        : backend_(std::move(backend)) {
+         const std::vector<ScatterTransferRange>& ranges,
+         const ScatterTransferOptions& options)
+        : backend_(std::move(backend)),
+          lifetime_anchors_(options.local_lifetimes),
+          submitted_at_(Clock::now()) {
         callbacks_.reserve(ranges.size());
         size_t fragment_count = 0;
         for (const auto& range : ranges) {
             callbacks_.push_back(range.on_fragment_complete);
-            fragment_count += range.lengths.size();
+            fragment_count += range.local_offsets.size();
         }
+        total_fragments_ = fragment_count;
         requests_.reserve(fragment_count);
         request_fragments_.reserve(fragment_count);
         build(engine, ranges);
@@ -985,6 +991,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
     ~Impl() { wait(); }
 
     Status wait() {
+        if (state_ == ScatterTransferState::QUARANTINED)
+            state_ = ScatterTransferState::DRAINING;
         while (!completed_) {
             poll();
             if (!completed_) std::this_thread::sleep_for(kPollInterval);
@@ -1012,6 +1020,79 @@ class TransferEngine::ScatterTransferOperation::Impl {
             std::this_thread::sleep_for(kPollInterval);
         }
         return aggregate_status_;
+    }
+
+    Status waitUntil(Clock::time_point deadline) {
+        while (!completed_) {
+            poll();
+            if (completed_) break;
+            if (Clock::now() >= deadline) {
+                const auto status =
+                    Status::Clock("scatter transfer deadline exceeded");
+                remember(status);
+                publishPendingCallbacks(status);
+                logical_terminal_published_ = true;
+                if (state_ == ScatterTransferState::SUBMITTED ||
+                    state_ == ScatterTransferState::IN_PROGRESS) {
+                    state_ = ScatterTransferState::TIMED_OUT;
+                    ++deadline_timeouts_;
+                }
+                return aggregate_status_;
+            }
+            std::this_thread::sleep_for(kPollInterval);
+        }
+        return aggregate_status_;
+    }
+
+    Status cancelAndDrainUntil(Clock::time_point deadline) {
+        if (completed_) return aggregate_status_;
+
+        ++drain_attempts_;
+        const auto cancel_status =
+            Status::Clock("scatter transfer cancellation requested");
+        remember(cancel_status);
+        publishPendingCallbacks(cancel_status);
+        logical_terminal_published_ = true;
+        state_ = ScatterTransferState::CANCEL_REQUESTED;
+        if (!cancel_requested_) {
+            cancel_requested_ = true;
+            ++cancel_requests_;
+        }
+        requestAbort(cancel_status);
+        state_ = ScatterTransferState::DRAINING;
+
+        while (!completed_) {
+            poll();
+            if (completed_) break;
+            if (Clock::now() >= deadline) {
+                state_ = ScatterTransferState::QUARANTINED;
+                ++quarantine_events_;
+                return aggregate_status_;
+            }
+            std::this_thread::sleep_for(kPollInterval);
+        }
+        return aggregate_status_;
+    }
+
+    ScatterTransferSnapshot snapshot() const {
+        ScatterTransferSnapshot result;
+        result.state = state_;
+        result.first_failure = aggregate_status_;
+        result.total_bytes = total_bytes_;
+        result.in_flight_bytes = in_flight_bytes_;
+        result.quarantined_bytes =
+            state_ == ScatterTransferState::QUARANTINED ? in_flight_bytes_ : 0;
+        result.total_fragments = total_fragments_;
+        result.completed_fragments = completed_fragments_;
+        result.deadline_timeouts = deadline_timeouts_;
+        result.cancel_requests = cancel_requests_;
+        result.drain_attempts = drain_attempts_;
+        result.quarantine_events = quarantine_events_;
+        result.late_completions = late_completions_;
+        result.submit_to_physical_completion = physical_completion_latency_;
+        result.physical_complete = completed_;
+        result.buffer_reusable = completed_;
+        return result;
     }
 
    private:
@@ -1078,18 +1159,29 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
     void finish() {
         aggregate_status_ = closeSegments(aggregate_status_);
+        const bool drained = state_ == ScatterTransferState::TIMED_OUT ||
+                             state_ == ScatterTransferState::CANCEL_REQUESTED ||
+                             state_ == ScatterTransferState::DRAINING ||
+                             state_ == ScatterTransferState::QUARANTINED;
         completed_ = true;
+        state_ = drained                  ? ScatterTransferState::DRAINED
+                 : aggregate_status_.ok() ? ScatterTransferState::SUCCEEDED
+                                          : ScatterTransferState::FAILED;
+        physical_completion_latency_ =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() -
+                                                                 submitted_at_);
         callbacks_.clear();
+        lifetime_anchors_.clear();
         requests_.clear();
         request_fragments_.clear();
         done_.clear();
+        callback_done_.clear();
         task_sizes_.clear();
         backend_ = {};
     }
 
-    void complete(size_t range_index, size_t fragment_index,
-                  const Status& status) {
-        remember(status);
+    void invokeCallback(size_t range_index, size_t fragment_index,
+                        const Status& status) {
         const auto& callback = callbacks_[range_index];
         if (!callback) return;
         try {
@@ -1100,11 +1192,34 @@ class TransferEngine::ScatterTransferOperation::Impl {
         }
     }
 
+    void completeUnsubmitted(size_t range_index, size_t fragment_index,
+                             const Status& status) {
+        remember(status);
+        ++completed_fragments_;
+        invokeCallback(range_index, fragment_index, status);
+    }
+
     void completeRequest(size_t request_index, const Status& status) {
         const auto [range_index, fragment_index] =
             request_fragments_[request_index];
         done_[request_index] = true;
-        complete(range_index, fragment_index, status);
+        remember(status);
+        ++completed_fragments_;
+        in_flight_bytes_ -= requests_[request_index].length;
+        if (logical_terminal_published_) ++late_completions_;
+        if (!callback_done_[request_index]) {
+            callback_done_[request_index] = true;
+            invokeCallback(range_index, fragment_index, status);
+        }
+    }
+
+    void publishPendingCallbacks(const Status& status) {
+        for (size_t i = 0; i < request_fragments_.size(); ++i) {
+            if (callback_done_[i]) continue;
+            callback_done_[i] = true;
+            const auto [range_index, fragment_index] = request_fragments_[i];
+            invokeCallback(range_index, fragment_index, status);
+        }
     }
 
     void failPending(const Status& status) {
@@ -1145,7 +1260,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     Status::InvalidArgument("invalid scatter transfer range");
                 remember(status);
                 for (size_t i = 0; i < fragment_count; ++i)
-                    complete(range_index, i, status);
+                    completeUnsubmitted(range_index, i, status);
                 continue;
             }
 
@@ -1163,14 +1278,16 @@ class TransferEngine::ScatterTransferOperation::Impl {
                         std::numeric_limits<uint64_t>::max() - remote_offset ||
                     length > std::numeric_limits<uint64_t>::max() -
                                  (range.remote_base_offset + remote_offset)) {
-                    complete(range_index, fragment_index,
-                             Status::InvalidArgument(
-                                 "invalid scatter transfer fragment"));
+                    completeUnsubmitted(
+                        range_index, fragment_index,
+                        Status::InvalidArgument(
+                            "invalid scatter transfer fragment"));
                     continue;
                 }
 
                 if (length == 0) {
-                    complete(range_index, fragment_index, Status::OK());
+                    completeUnsubmitted(range_index, fragment_index,
+                                        Status::OK());
                     continue;
                 }
 
@@ -1185,9 +1302,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 }
                 if (*segment_handle ==
                     static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT)) {
-                    complete(range_index, fragment_index,
-                             Status::InvalidArgument(
-                                 "failed to open scatter transfer segment"));
+                    completeUnsubmitted(
+                        range_index, fragment_index,
+                        Status::InvalidArgument(
+                            "failed to open scatter transfer segment"));
                     continue;
                 }
 
@@ -1201,6 +1319,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .task_group_id = 1,
                 });
                 request_fragments_.emplace_back(range_index, fragment_index);
+                total_bytes_ += length;
             }
         }
 
@@ -1210,6 +1329,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
         }
 
         done_.assign(requests_.size(), false);
+        callback_done_.assign(requests_.size(), false);
+        in_flight_bytes_ = total_bytes_;
         Status submit_status = Status::OK();
         if (useTent()) {
             task_sizes_.assign(requests_.size(), 1);
@@ -1267,6 +1388,8 @@ class TransferEngine::ScatterTransferOperation::Impl {
     }
 
     void poll() {
+        if (state_ == ScatterTransferState::SUBMITTED)
+            state_ = ScatterTransferState::IN_PROGRESS;
         size_t request_index = 0;
         for (size_t task_id = 0; task_id < task_sizes_.size(); ++task_id) {
             const size_t request_start = request_index;
@@ -1340,13 +1463,29 @@ class TransferEngine::ScatterTransferOperation::Impl {
     std::vector<TransferRequest> requests_;
     std::vector<std::pair<size_t, size_t>> request_fragments_;
     std::vector<std::function<void(size_t, const Status&)>> callbacks_;
+    std::vector<std::shared_ptr<void>> lifetime_anchors_;
     std::unordered_map<std::string, SegmentHandle> segment_handles_;
     std::vector<uint8_t> done_;
+    std::vector<uint8_t> callback_done_;
     std::vector<size_t> task_sizes_;
     BatchID batch_id_ = INVALID_BATCH_ID;
     size_t remaining_ = 0;
+    size_t total_bytes_ = 0;
+    size_t in_flight_bytes_ = 0;
+    size_t total_fragments_ = 0;
+    size_t completed_fragments_ = 0;
+    size_t deadline_timeouts_ = 0;
+    size_t cancel_requests_ = 0;
+    size_t drain_attempts_ = 0;
+    size_t quarantine_events_ = 0;
+    size_t late_completions_ = 0;
     Status aggregate_status_;
+    Clock::time_point submitted_at_;
+    std::chrono::nanoseconds physical_completion_latency_{};
+    ScatterTransferState state_ = ScatterTransferState::SUBMITTED;
     bool abort_requested_ = false;
+    bool cancel_requested_ = false;
+    bool logical_terminal_published_ = false;
     bool completed_ = false;
 };
 
@@ -1376,8 +1515,33 @@ Status TransferEngine::ScatterTransferOperation::waitFor(
                : Status::InvalidArgument("invalid scatter transfer operation");
 }
 
+Status TransferEngine::ScatterTransferOperation::waitUntil(
+    std::chrono::steady_clock::time_point deadline) {
+    return impl_
+               ? impl_->waitUntil(deadline)
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+Status TransferEngine::ScatterTransferOperation::cancelAndDrainUntil(
+    std::chrono::steady_clock::time_point deadline) {
+    return impl_
+               ? impl_->cancelAndDrainUntil(deadline)
+               : Status::InvalidArgument("invalid scatter transfer operation");
+}
+
+TransferEngine::ScatterTransferSnapshot
+TransferEngine::ScatterTransferOperation::snapshot() const {
+    return impl_ ? impl_->snapshot() : ScatterTransferSnapshot{};
+}
+
 TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
     const std::vector<ScatterTransferRange>& ranges) {
+    return submitScatter(ranges, ScatterTransferOptions{});
+}
+
+TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
+    const std::vector<ScatterTransferRange>& ranges,
+    const ScatterTransferOptions& options) {
     ScatterTransferOperation::Impl::Backend backend;
     backend.legacy = impl_;
 #ifdef USE_TENT
@@ -1386,7 +1550,7 @@ TransferEngine::ScatterTransferOperation TransferEngine::submitScatter(
 
     return ScatterTransferOperation(
         std::make_unique<ScatterTransferOperation::Impl>(
-            *this, std::move(backend), ranges));
+            *this, std::move(backend), ranges, options));
 }
 
 Status TransferEngine::transferScatter(

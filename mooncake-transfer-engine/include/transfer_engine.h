@@ -147,6 +147,44 @@ class TransferEngine {
         std::function<void(size_t, const Status&)> on_fragment_complete;
     };
 
+    struct ScatterTransferOptions {
+        // Optional ownership anchors for local buffers and their memory
+        // registrations. The operation retains these objects until every
+        // submitted transfer is physically complete.
+        std::vector<std::shared_ptr<void>> local_lifetimes;
+    };
+
+    enum class ScatterTransferState : uint8_t {
+        SUBMITTED,
+        IN_PROGRESS,
+        SUCCEEDED,
+        FAILED,
+        TIMED_OUT,
+        CANCEL_REQUESTED,
+        DRAINING,
+        DRAINED,
+        QUARANTINED,
+    };
+
+    struct ScatterTransferSnapshot {
+        ScatterTransferState state = ScatterTransferState::FAILED;
+        Status first_failure =
+            Status::InvalidArgument("invalid scatter transfer operation");
+        size_t total_bytes = 0;
+        size_t in_flight_bytes = 0;
+        size_t quarantined_bytes = 0;
+        size_t total_fragments = 0;
+        size_t completed_fragments = 0;
+        size_t deadline_timeouts = 0;
+        size_t cancel_requests = 0;
+        size_t drain_attempts = 0;
+        size_t quarantine_events = 0;
+        size_t late_completions = 0;
+        std::chrono::nanoseconds submit_to_physical_completion{};
+        bool physical_complete = false;
+        bool buffer_reusable = false;
+    };
+
     class ScatterTransferOperation {
        public:
         ScatterTransferOperation(ScatterTransferOperation&&) noexcept;
@@ -168,6 +206,22 @@ class TransferEngine {
         // its CPU/GPU buffers alive until a later wait reaches completion.
         Status waitFor(std::chrono::nanoseconds timeout);
 
+        // Wait against one absolute deadline. On timeout, pending callbacks
+        // are completed exactly once with a clock error, but physical work is
+        // still owned by this operation and the buffers are not reusable.
+        Status waitUntil(std::chrono::steady_clock::time_point deadline);
+
+        // Request best-effort cancellation and drain submitted work until the
+        // absolute deadline. A timeout leaves the operation quarantined: keep
+        // it alive and do not reuse its buffers until snapshot() reports
+        // buffer_reusable=true.
+        Status cancelAndDrainUntil(
+            std::chrono::steady_clock::time_point deadline);
+
+        // Return a single-consumer lifecycle snapshot. Do not call this
+        // concurrently with a wait method or from a fragment callback.
+        ScatterTransferSnapshot snapshot() const;
+
        private:
         class Impl;
         explicit ScatterTransferOperation(std::unique_ptr<Impl> impl);
@@ -177,6 +231,9 @@ class TransferEngine {
 
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
+    ScatterTransferOperation submitScatter(
+        const std::vector<ScatterTransferRange>& ranges,
+        const ScatterTransferOptions& options);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
 
     Status submitTransferWithNotify(BatchID batch_id,
