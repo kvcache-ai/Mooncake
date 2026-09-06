@@ -40,6 +40,19 @@ run_test()
         fi
     fi
 
+    # TENT GDN hetero-TP is poisoned by leftover GPU/driver state from the
+    # earlier Mooncake/Staging classes in this file (DecodeLargerTP OOM /
+    # CUDA unknown). Classic passes the upstream source order. On TENT, run
+    # GDN first on a clean GPU, then the remaining classes. Same pytest file;
+    # two invocations so collection order cannot put GDN seventh.
+    local pytest_cmd
+    if [ "${USE_TENT}" = "true" ]; then
+        echo "TENT: running TestDisaggregationGDNHybridHeteroTP first, then remaining different_tp classes"
+        pytest_cmd="${offline_prefix}python3 -m pytest test_disaggregation_different_tp.py::TestDisaggregationGDNHybridHeteroTP -v -s --tb=long && ${offline_prefix}python3 -m pytest test_disaggregation_different_tp.py -k 'not TestDisaggregationGDNHybridHeteroTP' -v -s --tb=long"
+    else
+        pytest_cmd="${offline_prefix}python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long"
+    fi
+
     {
         echo "$cache_diagnostic"
         ${docker_exec} "\
@@ -61,7 +74,7 @@ run_test()
             }
         }' test_disaggregation_different_tp.py && \
             echo 'Model and memory override applied successfully' && \
-            ${offline_prefix}python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long"
+            ${pytest_cmd}"
     } 2>&1 | tee "$log_file"
 
     return ${PIPESTATUS[0]}
