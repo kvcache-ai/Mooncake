@@ -5,6 +5,7 @@ from ...transfer_engine.completion import (
     TransferCompletionFailedError,
     TransferCompletionUnknownError,
     TransferEngineError,
+    TransferRegistrationCleanupPendingError,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "TransferCompletionFailedError",
     "TransferCompletionUnknownError",
     "TransferEngineError",
+    "TransferRegistrationCleanupPendingError",
 ]
