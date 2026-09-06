@@ -3,7 +3,6 @@ from __future__ import annotations
 import pytest
 
 from mooncake.reshard.transfer_engine import (
-    BufferRegistrationLease,
     MooncakeTransferEngineExecutor,
     TransferBatch,
     TransferBatchRange,
@@ -17,7 +16,7 @@ class CompletedTicket:
     status = "COMPLETED"
 
 
-class FakeEngine:
+class TicketEngine:
     def __init__(self) -> None:
         self.calls = []
 
@@ -33,6 +32,24 @@ class FakeEngine:
         return CompletedTicket()
 
 
+class LegacyEngine:
+    """Match the flat synchronous batch API exposed by the current binding."""
+
+    def __init__(self) -> None:
+        self.calls = []
+
+    def get_engine_ptr(self) -> int:
+        return id(self)
+
+    def batch_transfer_sync_read(self, *arguments) -> int:
+        self.calls.append(("read", arguments))
+        return 0
+
+    def batch_transfer_sync_write(self, *arguments) -> int:
+        self.calls.append(("write", arguments))
+        return 0
+
+
 def batch() -> TransferBatch:
     return TransferBatch(
         endpoint="worker-1:12345",
@@ -42,7 +59,7 @@ def batch() -> TransferBatch:
     )
 
 
-def scatter_batch() -> TransferBatch:
+def range_batch() -> TransferBatch:
     return TransferBatch.from_ranges(
         endpoint="worker-1:12345",
         ranges=(
@@ -68,8 +85,8 @@ def scatter_batch() -> TransferBatch:
     )
 
 
-def test_resource_neutral_executor_submits_read_and_write_batches() -> None:
-    engine = FakeEngine()
+def test_resource_neutral_executor_supports_ticket_capable_binding() -> None:
+    engine = TicketEngine()
     executor = MooncakeTransferEngineExecutor(engine)
 
     read = executor.execute_batch(batch(), TransferDirection.READ)
@@ -98,7 +115,7 @@ def test_transfer_batch_rejects_mismatched_or_invalid_ranges() -> None:
 
 
 def test_transfer_batch_ranges_preserve_allocation_bounds_and_flattening() -> None:
-    value = scatter_batch()
+    value = range_batch()
 
     assert value.source_addresses == (0x1020, 0x1100, 0x5000)
     assert value.target_addresses == (0x3040, 0x3200, 0x7020)
@@ -118,10 +135,10 @@ def test_transfer_batch_ranges_preserve_allocation_bounds_and_flattening() -> No
 
 
 def test_executor_flattens_range_batches_for_the_current_python_binding() -> None:
-    engine = FakeEngine()
+    engine = LegacyEngine()
     executor = MooncakeTransferEngineExecutor(engine)
 
-    executor.execute_batch(scatter_batch(), TransferDirection.READ)
+    executor.execute_batch(range_batch(), TransferDirection.READ)
 
     assert engine.calls == [
         (
@@ -143,7 +160,40 @@ class UnknownTicket:
         return self.status
 
 
-class SharedEngine(FakeEngine):
+class StatusReadFailsTicket:
+    def __init__(self) -> None:
+        self._first_read = True
+
+    @property
+    def status(self) -> str:
+        if self._first_read:
+            self._first_read = False
+            raise RuntimeError("native ticket status is unavailable")
+        return "COMPLETED"
+
+    def drain(self, timeout_ms: int) -> str:
+        return "COMPLETED"
+
+
+def test_ticket_status_failure_quarantines_returned_ticket() -> None:
+    ticket = StatusReadFailsTicket()
+    engine = TicketEngine()
+    engine.batch_transfer_sync_write_with_ticket = lambda *arguments: ticket
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    with pytest.raises(TransferCompletionUnknownError) as raised:
+        executor.execute_batch(batch(), TransferDirection.WRITE)
+
+    pending_transfer_id = raised.value.pending_transfer_id
+    executor.retain_pending_resources(
+        pending_transfer_id,
+        registrations=(),
+        resources=(),
+    )
+    assert executor.drain_pending_transfer(pending_transfer_id) == "COMPLETED"
+
+
+class SharedEngine(TicketEngine):
     def __init__(self, engine_ptr: int, ticket: UnknownTicket) -> None:
         super().__init__()
         self.engine_ptr = engine_ptr

@@ -53,6 +53,18 @@ from .store import (
     WeightStore,
     WeightStoreError,
 )
+from .te import (
+    DirectReadReceipt,
+    DirectTransferReceipt,
+    MemoryRegistrationLease,
+    MooncakeTransferEngineReader,
+    MooncakeTransferEngineSink,
+    TransferCompletionFailedError,
+    TransferCompletionUnknownError,
+    TransferEngineError,
+    WeightAllocationGuardProvider,
+    WeightAllocationGuardProviders,
+)
 
 __all__ = [
     "ParallelRank",
@@ -106,4 +118,14 @@ __all__ = [
     "plan_stored_transfer_to_target_placement",
     "resolve_executor_plan",
     "resolve_executor_plans",
+    "DirectReadReceipt",
+    "DirectTransferReceipt",
+    "MemoryRegistrationLease",
+    "MooncakeTransferEngineReader",
+    "MooncakeTransferEngineSink",
+    "TransferCompletionFailedError",
+    "TransferCompletionUnknownError",
+    "TransferEngineError",
+    "WeightAllocationGuardProvider",
+    "WeightAllocationGuardProviders",
 ]

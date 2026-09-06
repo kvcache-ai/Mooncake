@@ -160,7 +160,14 @@ def _batch_transfer_with_completion_fence(
             _UndrainableCompletionUnknownTicket(),
             error,
         ) from error
-    status_name = _completion_status_name(ticket.status)
+    try:
+        status_name = _completion_status_name(ticket.status)
+    except Exception as error:
+        # A ticket exists but its status cannot be observed. DMA may still
+        # reference caller allocations, so retain the ticket for quarantine.
+        raise _CompletionUnknown(ticket) from error
+    except BaseException as error:
+        raise _CompletionWaitInterrupted(ticket, error) from error
     for _ in range(max_drain_attempts):
         if status_name != "COMPLETION_UNKNOWN":
             break

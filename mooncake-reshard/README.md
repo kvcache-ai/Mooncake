@@ -1,9 +1,8 @@
 # Mooncake Reshard
 
 `mooncake-reshard` defines framework-neutral contracts, address-free N-D
-logical planning, runtime binding, and Store-backed snapshots for reusable
-runtime resources. Model-weight storage and Transfer Engine execution remain
-separate runtime phases.
+logical planning, runtime binding, Store-backed snapshots, and execution
+adapters for reusable runtime resources.
 
 Framework-owned adapters inspect framework runtime objects, normalize
 framework-specific values, and construct typed canonical manifests. Mooncake
@@ -15,8 +14,10 @@ The public Python API is split by responsibility:
 - `mooncake.reshard.contracts` exposes `ResourceManifest`,
   `PlacementManifest`, and `RuntimeBindingManifest` as structural `Protocol`
   contracts for resource-neutral identity and lifecycle;
+- `mooncake.reshard.transfer_engine` owns resource-neutral physical batches,
+  completion tracking, pending-resource quarantine, and registration leases;
 - `mooncake.reshard.weight` defines model-weight placement, runtime-binding
-  input contracts, and address-free N-D planning.
+  input contracts, N-D planning, Store, and Transfer Engine adapters.
 
 ## Weight Placement Model
 
@@ -90,6 +91,32 @@ underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
 
+## Transfer Engine Execution
+
+`mooncake.reshard.transfer_engine` executes resource-neutral physical batches
+without model or framework semantics. Its completion fence retains registrations
+and framework allocation tokens when native completion is unknown, then drains
+or quarantines them before a later submission can reuse the same engine.
+
+Model-weight execution is exposed through `MooncakeTransferEngineReader` and
+`MooncakeTransferEngineSink`. The reader initiates bounded reads from selected
+live source bindings into one local target binding; the sink submits bounded
+writes from one selected local source binding to target bindings. Both adapters
+consume a bound `TransferPlan`, acquire framework allocation guards, verify the
+fresh binding against the planned placement, generation, lease, allocation, and
+fragment evidence, then lower N-D regions into bounded physical batches.
+
+The lowerer preserves backing-allocation ranges and submits the validated flat
+batch form supported by the current Python Transfer Engine binding.
+`max_batch_operations`, `max_region_segments`, and
+`max_total_lowered_segments` bound physical expansion before native submission.
+The C++ scatter API remains available for a later Python lowering and
+performance-focused integration.
+
+Live TE adapters accept runtime-bound source fragments. Store-backed restore
+continues through `WeightStore.load()`, which uses the same target placement and
+binding contracts with `get_into_ranges`.
+
 ## Store Snapshots
 
 `StoredResourceManifest` is the persistent resource base. The concrete
@@ -146,6 +173,10 @@ placement, runtime binding, and allocation guards required by `get_into_ranges`.
   a logical plan to typed runtime snapshots and validate physical evidence.
 - `planner.py` exposes both logical planning and runtime-binding APIs.
 - `manifest.py` preserves the public import surface.
+- `transfer_engine/` contains resource-neutral physical transfer batches,
+  registration, completion, and pending-resource lifecycle management.
+- `_te/` contains weight-specific N-D lowering plus source/target execution
+  adapters; `te.py` preserves their public import surface.
 
 `kv_cache` remains reserved as a resource discriminator. This change does not
 define a KVCache manifest; a future KVCache reshard adapter can reuse the

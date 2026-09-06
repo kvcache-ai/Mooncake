@@ -106,6 +106,14 @@ framework activation remain outside this phase. Framework adapters own model
 semantics and conversion into canonical manifests; Mooncake core does not infer
 those semantics from framework objects or parameter names.
 
+The execution companion consumes a bound `TransferPlan` only after framework
+allocation guards return fresh runtime bindings. It validates the planned
+placement, lease, generation, backing allocation, and fragment evidence again
+at the native submission boundary. Live GPU-to-GPU movement lowers compact N-D
+regions to bounded Transfer Engine batches. Store-backed restore uses
+`WeightStore.load()` and `get_into_ranges` with the same target binding
+contract.
+
 ## Reproducible Contract Benchmark
 
 The following opt-in benchmark measures only Python-side planning and binding
