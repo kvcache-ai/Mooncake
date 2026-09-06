@@ -41,6 +41,7 @@
 #include "common/network.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "config/client_auto_discovery_config.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
@@ -520,46 +521,6 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     return client_cfg;
 }
 
-static std::optional<bool> get_auto_discover() {
-    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
-    if (ev_ad) {
-        try {
-            int iv = std::stoi(ev_ad);
-            if (iv == 1) {
-                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-                return true;
-            } else if (iv == 0) {
-                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-                return false;
-            }
-        } catch (const std::exception&) {
-            // A non-numeric or out-of-range value makes std::stoi throw; fall
-            // through to the warning below and use the default instead of
-            // letting the exception abort client initialization.
-        }
-        LOG(WARNING)
-            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-            << ", should be 0 or 1, using default: auto discovery not set";
-    }
-    return std::nullopt;
-}
-
-static std::vector<std::string> get_auto_discover_filters() {
-    const char* raw_filters = std::getenv("MC_MS_FILTERS");
-    if (raw_filters == nullptr) {
-        return {};
-    }
-
-    LOG(INFO) << "whitelist filters: " << raw_filters;
-    std::vector<std::string> filters;
-    boost::split(filters, std::string(raw_filters), boost::is_any_of(","),
-                 boost::token_compress_off);
-    for (auto& filter : filters) {
-        filter = std::string(TrimAsciiWhitespace(filter));
-    }
-    return filters;
-}
-
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     std::vector<std::string> devices;
     boost::split(devices, std::string(value), boost::is_any_of(","),
@@ -777,20 +738,9 @@ ErrorCode Client::InitTransferEngine(
 
     bool auto_discover = false;
     if (!use_tent) {
-        // Get auto_discover and filters from env (non-TENT only)
-        std::optional<bool> env_auto_discover = get_auto_discover();
-        if (env_auto_discover.has_value()) {
-            // Use user-specified auto-discover setting
-            auto_discover = env_auto_discover.value();
-        } else {
-            // Enable auto-discover for RDMA/EFA if no devices are specified
-            if ((protocol == "rdma" || protocol == "efa") &&
-                !device_names.has_value()) {
-                LOG(INFO) << "Set auto discovery ON by default for " << protocol
-                          << " protocol, since no device names provided";
-                auto_discover = true;
-            }
-        }
+        auto config = ClientAutoDiscoveryConfig::FromEnvironment(
+            protocol, device_names.has_value());
+        auto_discover = config.enabled;
         transfer_engine_->setAutoDiscover(
             {.enabled = auto_discover, .protocol = protocol});
 
@@ -799,15 +749,11 @@ ErrorCode Client::InitTransferEngine(
             LOG(INFO)
                 << "Transfer engine auto discovery is enabled for protocol: "
                 << protocol;
-            auto filters = get_auto_discover_filters();
-            transfer_engine_->setWhitelistFilters(std::move(filters));
-        } else {
-            const char* env_filters = std::getenv("MC_MS_FILTERS");
-            if (env_filters && *env_filters != '\0') {
-                LOG(WARNING)
-                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                    << "ignoring whitelist: " << env_filters;
-            }
+        }
+
+        config.LoadFiltersFromEnvironment();
+        if (auto_discover) {
+            transfer_engine_->setWhitelistFilters(std::move(config.filters));
         }
     }
 
