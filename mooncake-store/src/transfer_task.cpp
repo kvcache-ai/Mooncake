@@ -103,17 +103,8 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     return count;
 }
 
-static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
-        task->state->set_completed(task->failed
-                                       ? mooncake::ErrorCode::TRANSFER_FAIL
-                                       : mooncake::ErrorCode::OK);
-        if (!task->on_chain) {
-            delete task;
-        }
-    }
-}
-
+// SPDK completion callback: adapt the NVMe completion and hand the sub-I/O to
+// the transport-independent accounting in transfer_task.h.
 static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     if (!ctx) {
         LOG(ERROR) << "nvmf_io_complete ctx is null";
@@ -122,32 +113,61 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 
     mooncake::SpdkNofSubTask* sub_task =
         reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
-    mooncake::SpdkNofTask* task = sub_task->task;
-    mooncake::SpdkNofQos* nof_qos = task->nof_qos;
-    int op = task->op;
-    if (--(*task->io_count) < 0) {
-        LOG(ERROR) << "total outstanding io < 0";
+    const bool failed = spdk_nvme_cpl_is_error(cpl);
+    if (failed) {
+        if (sub_task->task->nof_qos->state ==
+            mooncake::SpdkNofSegmentState::kDraining) {
+            // Expected while a timed-out qpair is being aborted; the worker
+            // logs one summary for the whole drain.
+            VLOG(1) << "task_complete: I/O aborted "
+                    << spdk_nvme_cpl_get_status_string(&cpl->status);
+        } else {
+            LOG(ERROR) << "task_complete: I/O failed "
+                       << spdk_nvme_cpl_get_status_string(&cpl->status);
+        }
     }
 
-    if (--(task->outstanding_sub_io) < 0) {
-        LOG(ERROR) << "task outstanding io < 0";
+    mooncake::SpdkNofCompleteSubTask(sub_task, failed);
+}
+
+// Act on the stall state of a segment after it has been polled. Runs on the
+// worker thread that owns the segment's qpair, outside any completion
+// callback.
+static void HandleSpdkNofStall(int work_idx, mooncake::nof_seg_handle* seg,
+                               mooncake::SpdkNofQos& nof_qos,
+                               bool io_timed_out) {
+    using mooncake::SpdkNofSegmentState;
+    using mooncake::SpdkNofStallAction;
+    if (!io_timed_out && nof_qos.state == SpdkNofSegmentState::kActive) {
+        return;
     }
 
-    nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
-    if (nof_qos->inflight_blocks[op] < 0) {
-        LOG(ERROR) << "task outstanding io < 0";
+    const auto now = std::chrono::steady_clock::now();
+    SpdkNofStallAction action =
+        mooncake::SpdkNofAdvanceStallState(nof_qos, io_timed_out, now);
+    if (action == SpdkNofStallAction::kAbort) {
+        LOG(ERROR) << "work " << work_idx << ", seg " << seg
+                   << " NoF I/O timed out with inflight_read="
+                   << nof_qos.inflight_blocks[mooncake::kSpdkNofOpRead]
+                   << " inflight_write="
+                   << nof_qos.inflight_blocks[mooncake::kSpdkNofOpWrite]
+                   << " blocks, aborting the qpair locally";
+        // Completes every outstanding request through nvmf_io_complete; with
+        // SPDK v23.01 that happens before the call returns, so the segment
+        // normally drains right here.
+        mooncake::SpdkWrapper::GetInstance().AbortNofSegmentIo(seg);
+        action = mooncake::SpdkNofAdvanceStallState(nof_qos, false, now);
     }
-
-    if (spdk_nvme_cpl_is_error(cpl)) {
-        LOG(ERROR) << "task_complete: I/O failed"
-                   << spdk_nvme_cpl_get_status_string(&cpl->status);
-        task->remaining_lba = 0;
-        task->failed = true;
+    if (action == SpdkNofStallAction::kDrained) {
+        const auto drain_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - nof_qos.drain_started)
+                .count();
+        LOG(ERROR) << "work " << work_idx << ", seg " << seg << " drained "
+                   << nof_qos.drained_sub_io << " aborted sub-I/Os in "
+                   << drain_ms
+                   << " ms; the qpair stays disconnected until reconnected";
     }
-
-    SpdkNofTaskCompletion(task);
-
-    sub_task->sub_task_pool->push(sub_task);
 }
 #endif
 namespace mooncake {
@@ -484,6 +504,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+            if (nof_qos->state != SpdkNofSegmentState::kActive) {
+                // Being drained after an I/O timeout: nothing goes to this
+                // qpair until every outstanding sub-I/O has been reclaimed.
+                continue;
+            }
             uint32_t block_size =
                 SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
             for (int i = 0; i < kSpdkNofOpNum; ++i) {
@@ -520,6 +545,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         if (ret != 0) {
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
+                            // SPDK does not invoke the callback for a request
+                            // it rejected at submission, so the slot is free.
+                            sub_task->task = nullptr;
+                            sub_task_pool.push(sub_task);
                             task->failed = true;
                             task->remaining_lba = 0;
                         } else {
@@ -541,13 +570,21 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         if (total_outstanding_io > 0) {
-            int64_t ret = 0;
-            for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
+            for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+                if (nof_qos->InflightBlocks() == 0) {
+                    // Nothing of ours is outstanding on this qpair. This
+                    // also keeps a disconnected qpair from being polled.
+                    continue;
+                }
+                bool io_timed_out = false;
+                int64_t ret =
+                    SpdkWrapper::GetInstance().NvmePollProcessCompletion(
+                        seg_handle, 0, &io_timed_out);
                 if (ret < 0) {
                     LOG(ERROR) << "poll completion error: ret " << ret;
                 }
+                HandleSpdkNofStall(work_idx, seg_handle, *nof_qos,
+                                   io_timed_out);
             }
         }
 
@@ -568,6 +605,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << CountSpdkNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
                         << CountSpdkNofQueuedTasks(nof_qos->head[1])
+                        << " state=" << static_cast<int>(nof_qos->state)
                         << " total_outstanding_io=" << total_outstanding_io;
                 }
                 last_debug_snapshot = now;

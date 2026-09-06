@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -21,6 +22,8 @@
 #include "storage_backend.h"
 #include "client_metric.h"
 #ifdef USE_NOF
+#include <glog/logging.h>
+
 #include "spdk/spdk_wrapper.h"
 #endif
 
@@ -369,6 +372,7 @@ struct SpdkNofTask {
     int idx;  // subop idx
     bool failed;
     bool on_chain;
+    bool completed;  // caller has been notified (exactly once)
     std::shared_ptr<SpdkNofOperationState> state;
     int64_t* io_count;
     SpdkNofQos* nof_qos;
@@ -386,6 +390,7 @@ struct SpdkNofTask {
           idx(0),
           failed(false),
           on_chain(false),
+          completed(false),
           state(std::move(s)),
           io_count(nullptr),
           nof_qos(nullptr),
@@ -398,6 +403,28 @@ struct SpdkNofSubTask {
     std::stack<SpdkNofSubTask*>* sub_task_pool;
 };
 
+/**
+ * @brief Stall-handling state of one NoF segment (io qpair) in its worker.
+ *
+ * kActive:   normal submission and polling.
+ * kDraining: SPDK reported an I/O timeout on the qpair and the worker aborted
+ *            the qpair locally. Nothing is submitted to the segment until
+ *            every sub-I/O that was outstanding has come back through its
+ *            completion callback, so neither a SpdkNofSubTask slot nor a
+ *            caller buffer is reused while SPDK can still reference it. The
+ *            segment returns to kActive once drained; its qpair stays
+ *            disconnected until something reconnects it, and submissions to
+ *            it fail fast meanwhile.
+ */
+enum class SpdkNofSegmentState { kActive = 0, kDraining = 1 };
+
+/** @brief What the worker has to do after SpdkNofAdvanceStallState(). */
+enum class SpdkNofStallAction {
+    kNone = 0,
+    kAbort = 1,    // abort the qpair locally (SpdkWrapper::AbortNofSegmentIo)
+    kDrained = 2,  // every outstanding sub-I/O has been reclaimed
+};
+
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
 constexpr int kDefaultSpdkNofInflightBytesLimit = (1 << 25);  // 32M
 struct SpdkNofQos {
@@ -406,12 +433,21 @@ struct SpdkNofQos {
     int inflight_blocks_limit;
     SpdkNofTask* head[kSpdkNofOpNum];
     SpdkNofTask* tail[kSpdkNofOpNum];
+    SpdkNofSegmentState state{SpdkNofSegmentState::kActive};
+    // Sub-I/Os reclaimed during the current drain, i.e. aborted ones.
+    int drained_sub_io{0};
+    std::chrono::steady_clock::time_point drain_started{};
 
     explicit SpdkNofQos(uint32_t block_size);
 
     bool Empty() const {
         return (head[kSpdkNofOpRead] == nullptr &&
                 head[kSpdkNofOpWrite] == nullptr);
+    }
+
+    int InflightBlocks() const {
+        return inflight_blocks[kSpdkNofOpRead] +
+               inflight_blocks[kSpdkNofOpWrite];
     }
 
     void PushTask(SpdkNofTask* task) {
@@ -431,6 +467,95 @@ struct SpdkNofQos {
         }
     }
 };
+
+/**
+ * @brief Finish a task once all of its LBAs are submitted and all of its
+ * sub-I/Os have completed.
+ *
+ * Both the completion callback and the submit loop call this, possibly for
+ * the same task, so the caller is notified exactly once. The task is freed
+ * only when it is off the QoS chain and no sub-I/O can still reference it.
+ */
+inline void SpdkNofTaskCompletion(SpdkNofTask* task) {
+    if (task->remaining_lba != 0 || task->outstanding_sub_io != 0) {
+        return;
+    }
+    if (!task->completed) {
+        task->completed = true;
+        task->state->set_completed(task->failed ? ErrorCode::TRANSFER_FAIL
+                                                : ErrorCode::OK);
+    }
+    if (!task->on_chain) {
+        delete task;
+    }
+}
+
+/**
+ * @brief Account one finished sub-I/O and return its slot to the pool.
+ *
+ * Transport-independent half of the SPDK completion callback, and the only
+ * place a SpdkNofSubTask goes back to the free list: a slot is never reused
+ * while SPDK still holds it as a callback context. Completions produced by a
+ * local qpair abort come through here like any other completion.
+ */
+inline void SpdkNofCompleteSubTask(SpdkNofSubTask* sub_task, bool failed) {
+    SpdkNofTask* task = sub_task->task;
+    SpdkNofQos* nof_qos = task->nof_qos;
+    const int op = task->op;
+    if (--(*task->io_count) < 0) {
+        LOG(ERROR) << "total outstanding io < 0";
+    }
+    if (--(task->outstanding_sub_io) < 0) {
+        LOG(ERROR) << "task outstanding io < 0";
+    }
+    nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
+    if (nof_qos->inflight_blocks[op] < 0) {
+        LOG(ERROR) << "segment inflight blocks < 0";
+    }
+    if (nof_qos->state == SpdkNofSegmentState::kDraining) {
+        ++nof_qos->drained_sub_io;
+    }
+    if (failed) {
+        task->remaining_lba = 0;
+        task->failed = true;
+    }
+    SpdkNofTaskCompletion(task);
+    sub_task->task = nullptr;
+    sub_task->sub_task_pool->push(sub_task);
+}
+
+/**
+ * @brief Advance the stall state of a segment after it has been polled.
+ *
+ * @param io_timed_out whether SPDK reported an I/O timeout on the segment's
+ *        qpair during that poll.
+ * @return the action the worker must take. kAbort is returned once per stall;
+ *         kDrained once every sub-I/O outstanding at that point has been
+ *         reclaimed through its completion callback.
+ */
+inline SpdkNofStallAction SpdkNofAdvanceStallState(
+    SpdkNofQos& nof_qos, bool io_timed_out,
+    std::chrono::steady_clock::time_point now) {
+    switch (nof_qos.state) {
+        case SpdkNofSegmentState::kActive:
+            if (!io_timed_out) {
+                return SpdkNofStallAction::kNone;
+            }
+            nof_qos.state = SpdkNofSegmentState::kDraining;
+            nof_qos.drain_started = now;
+            nof_qos.drained_sub_io = 0;
+            return SpdkNofStallAction::kAbort;
+        case SpdkNofSegmentState::kDraining:
+            // A second timeout report while draining changes nothing: the
+            // abort was already issued and only completions can end this.
+            if (nof_qos.InflightBlocks() > 0) {
+                return SpdkNofStallAction::kNone;
+            }
+            nof_qos.state = SpdkNofSegmentState::kActive;
+            return SpdkNofStallAction::kDrained;
+    }
+    return SpdkNofStallAction::kNone;
+}
 
 /**
  * @brief Thread pool for asynchronous spdk nvmf operations

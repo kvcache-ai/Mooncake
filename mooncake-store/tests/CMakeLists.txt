@@ -115,6 +115,7 @@ add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+  add_store_test(nof_task_lifecycle_test nof_task_lifecycle_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
 add_test(
