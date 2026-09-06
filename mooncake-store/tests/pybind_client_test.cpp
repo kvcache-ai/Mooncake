@@ -2708,6 +2708,98 @@ TEST_F(RealClientTest, SunriseLinkHostPutGetRemove) {
 }
 #endif
 
+// Regression for the read-side half of the dangling-replica problem: a
+// COMPLETE LOCAL_DISK replica whose backing file physically disappeared used
+// to make every read return empty bytes forever while the master kept
+// advertising the key. The batch get path must now heal it like the Put path
+// does: prove the file gone, evict the replica, and stop advertising the key
+// instead of returning a silent empty value.
+TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_dangling_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key = "dangling_local_disk_heal";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+            }
+        }
+        if (!disk_ready) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+    ASSERT_TRUE(disk_ready);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+    ASSERT_EQ(py_client_->get_replica_desc(key).size(), 1u);
+    ASSERT_TRUE(py_client_->get_replica_desc(key)
+                    .front()
+                    .is_local_disk_replica());
+
+    // The disk-only read works before the wipe, so the later failure comes
+    // from the missing file, not from a setup mistake.
+    auto before = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(before.size(), 1u);
+    ASSERT_NE(before[0], nullptr);
+
+    // The #3709 shape: the backing files are wiped while the master keeps the
+    // completed replica in metadata.
+    std::error_code ec;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        std::filesystem::remove_all(entry.path(), ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = py_client_->batch_get_buffer({key});
+    ASSERT_EQ(after.size(), 1u);
+    EXPECT_EQ(after[0], nullptr);
+    // The dead replica must be evicted: the master stops advertising the key
+    // instead of letting every later read come back empty.
+    EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

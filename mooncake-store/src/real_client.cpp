@@ -3372,6 +3372,23 @@ RealClient::batch_get_buffer_internal(
                 } else {
                     LOG(ERROR) << "SSD read failed for key '" << key
                                << "': " << toString(read_result.error());
+                    // A dead LOCAL_DISK replica must not return empty
+                    // forever. Heal it like the Put path does: if the backing
+                    // file is proven gone, evict the dangling replica and
+                    // retry the key once so a surviving replica can serve the
+                    // read; when nothing survives, the key stops being
+                    // advertised on disk and the retry surfaces a real miss
+                    // instead of a silent empty value. Each retry strictly
+                    // reduces the replica's registered copies, so it cannot
+                    // recurse forever.
+                    if (client_ && client_->healDanglingLocalDiskReplica(key)) {
+                        auto healed = batch_get_buffer_internal(
+                            {key}, client_buffer_allocator);
+                        if (!healed.empty() && healed[0]) {
+                            final_results[op.original_index] =
+                                std::move(healed[0]);
+                        }
+                    }
                 }
             }
         }
