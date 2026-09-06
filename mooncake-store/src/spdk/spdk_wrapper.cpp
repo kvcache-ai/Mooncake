@@ -184,6 +184,51 @@ void SpdkWrapper::Free(void *ptr) {
     }
 }
 
+int SpdkWrapper::RegisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    if (!InitializeEnv()) {
+        LOG(ERROR) << "SPDK env init failed, cannot register memory";
+        return -1;
+    }
+    int rc = spdk_mem_register(addr, size);
+    if (rc != 0) {
+        LOG(ERROR) << "spdk_mem_register failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
+int SpdkWrapper::UnregisterMemory(void *addr, size_t size) {
+    if (!addr || size == 0) {
+        return -1;
+    }
+    // SPDK env may not be initialized (registration is opt-in) or may already
+    // have been finalized by Cleanup() -> spdk_env_fini(). In both cases there
+    // is no registered memory to release; calling spdk_mem_unregister would
+    // walk a torn-down or never-created global mem_map. (With ShmHelper
+    // destroyed before SpdkWrapper, the `initialized` atomic is still alive
+    // here.)
+    if (!initialized.load(std::memory_order_acquire)) {
+        return 0;
+    }
+    int rc = spdk_mem_unregister(addr, size);
+    if (rc != 0 && rc != -EINVAL) {
+        // -EINVAL is the expected no-op on the register-failure cleanup path:
+        // spdk_mem_unregister returns it (memory.c:404/426) both when the range
+        // fails the 2MB alignment check -- a failed spdk_mem_register never
+        // reached g_mem_reg_map -- and when no segment is marked REGISTERED, so
+        // there is nothing to clean up. Logging it as an error would mislead
+        // operators on a path that already degrades gracefully with a WARNING.
+        // Other codes (-ERANGE etc.) indicate a real teardown problem on a
+        // range that was registered and keep the ERROR level.
+        LOG(ERROR) << "spdk_mem_unregister failed (addr=" << addr
+                   << ", size=" << size << "): " << strerror(-rc);
+    }
+    return rc;
+}
+
 void SpdkWrapper::ProbeReadComplete(void *ctx,
                                     const struct spdk_nvme_cpl *cpl) {
     auto *probe_ctx = reinterpret_cast<ProbeRequestContext *>(ctx);

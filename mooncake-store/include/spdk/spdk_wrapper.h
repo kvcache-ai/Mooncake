@@ -53,6 +53,33 @@ class SpdkWrapper {
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
 
+    /** @brief Register external memory with SPDK for NoF zero-copy transfers.
+     *
+     * Memory returned by Alloc() is already registered with SPDK; use this to
+     * register memory allocated outside of SPDK (e.g. mmap'd shared memory) so
+     * that NoF RDMA transfers can DMA to/from it directly
+     * (spdk_rdma_get_translation).
+     *
+     * The pinned SPDK (v23.01.1) requires BOTH addr and size to be 2MB-aligned
+     * (MASK_2MB), and in iova=pa mode (the typical libibverbs NoF setup) the
+     * PHYSICAL pages must be 2MB-aligned too, which only HugeTLB pages satisfy.
+     * 4KB page-aligned memory always fails with -EINVAL. Callers must pass
+     * 2MB-aligned, hugepage-backed memory (ShmHelper forces this under
+     * MC_STORE_REGISTER_SPDK=1); a failed registration leaves SPDK's
+     * g_mem_reg_map half-marked, so callers should UnregisterMemory() on error.
+     *
+     * @param addr Start of the region; must be 2MB-aligned (hugepage-backed).
+     * @param size Region length; must be a multiple of 2MB.
+     * @return 0 on success, non-zero on failure.
+     */
+    int RegisterMemory(void *addr, size_t size);
+
+    /** @brief Unregister memory previously registered via RegisterMemory().
+     *
+     * @return 0 on success, non-zero on failure.
+     */
+    int UnregisterMemory(void *addr, size_t size);
+
    private:
     struct ProbeBuffer {
         void *ptr{nullptr};
