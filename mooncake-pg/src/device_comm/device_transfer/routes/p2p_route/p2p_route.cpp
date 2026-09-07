@@ -5,7 +5,6 @@
 #include <transport/device/device_transport.h>
 
 #include "gpu_runtime.h"
-#include "pg_utils.h"
 
 namespace mooncake {
 
@@ -36,7 +35,7 @@ std::optional<RouteEndpoint> P2pRoute::localEndpoint() {
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
-        .metadata = pgSerialize(handle),
+        .metadata = encodeEndpointMetadata(handle),
     };
 }
 
@@ -61,7 +60,7 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
         PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
         if (!endpoint) continue;
         PG_TRY(handles[rank],
-               pgDeserialize<std::vector<int32_t>>(endpoint->metadata));
+               decodeEndpointMetadata<std::vector<int32_t>>(*endpoint));
         PG_VALIDATE_ARG(!handles[rank].empty(),
                         "P2P route endpoint handle is empty");
         active[rank] = 1;
