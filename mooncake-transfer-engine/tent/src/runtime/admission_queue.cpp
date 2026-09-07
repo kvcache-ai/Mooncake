@@ -489,5 +489,9 @@ size_t LocalTransferAdmissionQueue::outstandingBytes() const {
     return outstanding_bytes_;
 }
 
+size_t LocalTransferAdmissionQueue::dispatchingBytes() const {
+    return dispatching_bytes_;
+}
+
 }  // namespace tent
 }  // namespace mooncake

@@ -27,7 +27,6 @@
 #include <cstdlib>
 #include <future>
 #include <limits>
-#include <set>
 #include <sstream>
 
 #include "tent/common/status.h"
@@ -36,6 +35,7 @@
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -53,6 +53,8 @@ namespace mooncake {
 namespace tent {
 
 namespace {
+
+constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -378,12 +380,37 @@ Status RdmaTransport::install(std::string& local_segment_name,
     return Status::OK();
 }
 
+Status RdmaTransport::quiesce() {
+    uint64_t timeout_ns = kDefaultRdmaQuiesceTimeoutNs;
+    if (conf_) {
+        timeout_ns = conf_->get("transports/rdma/max_timeout_ns", timeout_ns);
+    }
+    Status drain = Status::OK();
+    if (workers_) {
+        drain = workers_->quiesce(timeout_ns);
+        if (!drain.ok()) {
+            LOG(ERROR) << "RDMA workers quiesce failed: " << drain.ToString();
+        }
+    }
+    const Status sync =
+        Platform::getLoader().synchronizeDevices(local_topology_.get());
+    if (!sync.ok()) {
+        LOG(WARNING) << "RDMA dest-GPU sync during quiesce failed: "
+                     << sync.ToString();
+    }
+    return drain;
+}
+
 Status RdmaTransport::uninstall() {
     // ControlService may still receive BootstrapRdma RPCs while uninstall is
     // running. Unregister and drain the callback before destroying workers,
     // contexts, and other state used by onSetupRdmaConnections(). Keep this
     // outside installed_ so partially-installed transports are covered too.
     if (metadata_) metadata_->setBootstrapRdmaCallback(nullptr);
+
+    // Drain CQ and dest-GPU visibility while MRs and QPs are still alive.
+    // Idempotent when deconstruct() already called quiesce().
+    (void)quiesce();
 
     if (installed_) {
         // Stop notification worker thread
