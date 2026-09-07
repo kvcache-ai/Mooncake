@@ -122,12 +122,31 @@ class MultiLRU {
         auto it = index_.find(key);
         if (it != index_.end()) {
             it->second->size_bytes = size_bytes;
-            MoveToBandFront(it->second, band);
+            MoveToBand(it->second, band, Recency::kMru);
             return;
         }
-        auto& list = lists_[static_cast<int>(band)];
-        list.push_front(Node{std::string(key), size_bytes, band});
-        index_.emplace(list.front().key, list.begin());
+        InsertNodeLocked(key, size_bytes, band, Recency::kMru);
+    }
+
+    // Insert (or refresh) a key at the LRU end of its band, so that band offers
+    // it as a candidate first. For a record recovered from an authoritative
+    // index rather than observed: its band is known from `freq`, its recency is
+    // not, and entering at the MRU would push it past keys that really were
+    // touched. A key that is already resident keeps its position unless its
+    // band changed, because that position is real evidence this call has none
+    // of.
+    void InsertColdest(std::string_view key, size_t size_bytes, uint64_t freq) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const HeatBand band = BandOf(freq, thresholds_);
+        auto it = index_.find(key);
+        if (it != index_.end()) {
+            it->second->size_bytes = size_bytes;
+            if (it->second->band != band) {
+                MoveToBand(it->second, band, Recency::kLru);
+            }
+            return;
+        }
+        InsertNodeLocked(key, size_bytes, band, Recency::kLru);
     }
 
     // Recompute the key's band from `freq` and move it to that band's MRU.
@@ -138,7 +157,7 @@ class MultiLRU {
         if (it == index_.end()) {
             return false;
         }
-        MoveToBandFront(it->second, BandOf(freq, thresholds_));
+        MoveToBand(it->second, BandOf(freq, thresholds_), Recency::kMru);
         return true;
     }
 
@@ -208,14 +227,38 @@ class MultiLRU {
     };
     using ListIter = std::list<Node>::iterator;
 
-    // Splice `node_it` to the front (MRU) of `target_band`'s list, updating its
-    // band tag. std::list::splice preserves the iterator, so `index_` stays
-    // valid without re-insertion.
-    void MoveToBandFront(ListIter node_it, HeatBand target_band) {
+    // Which end of a band's list a node lands on: kMru = front (evicted last),
+    // kLru = back (evicted first).
+    enum class Recency { kMru, kLru };
+
+    // Splice `node_it` to one end of `target_band`'s list, updating its band
+    // tag. std::list::splice preserves the iterator, so `index_` stays valid
+    // without re-insertion.
+    void MoveToBand(ListIter node_it, HeatBand target_band, Recency where) {
         auto& dst = lists_[static_cast<int>(target_band)];
         auto& src = lists_[static_cast<int>(node_it->band)];
         node_it->band = target_band;
-        dst.splice(dst.begin(), src, node_it);
+        dst.splice(where == Recency::kMru ? dst.begin() : dst.end(), src,
+                   node_it);
+    }
+
+    // Add a node for a key that is not resident yet.
+    //
+    // The node is built in a local list and only spliced into lists_ after
+    // index_ names it. Doing it the other way round -- push_front then
+    // index_.emplace -- means a throwing emplace (a rehash under memory
+    // pressure) leaves a node in lists_ that index_ does not name: every
+    // enumeration keeps returning that key, Remove() cannot find it, and
+    // nothing can ever take it out again. splice() is the only step that
+    // touches lists_ and it cannot throw, so a failure here changes nothing.
+    void InsertNodeLocked(std::string_view key, size_t size_bytes,
+                          HeatBand band, Recency where) {
+        std::list<Node> staged;
+        staged.push_front(Node{std::string(key), size_bytes, band});
+        index_.emplace(staged.front().key, staged.begin());
+        auto& list = lists_[static_cast<int>(band)];
+        list.splice(where == Recency::kMru ? list.begin() : list.end(), staged,
+                    staged.begin());
     }
 
     const BandThresholds thresholds_;  // frequency -> band cutoffs (immutable)

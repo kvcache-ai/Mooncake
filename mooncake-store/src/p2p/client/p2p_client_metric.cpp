@@ -353,20 +353,20 @@ std::string TierIdToString(const UUID& tier_id) {
 }  // namespace
 
 void TierMetric::RegisterTier(const UUID& tier_id, const std::string& label,
-                              const std::shared_ptr<CacheTier>& tier,
-                              int priority) {
-    if (!tier) {
-        LOG(ERROR) << "TierMetric::RegisterTier: null tier, tier_id="
+                              MemoryType memory_type, int priority,
+                              size_t capacity, TierUsageFn usage) {
+    if (!usage) {
+        LOG(ERROR) << "TierMetric::RegisterTier: no usage source, tier_id="
                    << TierIdToString(tier_id);
         return;
     }
 
     TierEntry entry;
     entry.label_array = {label};
-    entry.memory_type = tier->GetMemoryType();
+    entry.memory_type = memory_type;
     entry.priority = priority;
-    entry.capacity = tier->GetCapacity();
-    entry.tier = tier;
+    entry.capacity = capacity;
+    entry.usage = std::move(usage);
 
     if (!tiers_.try_emplace(tier_id, std::move(entry)).second) {
         LOG(ERROR) << "TierMetric::RegisterTier: tier already registered"
@@ -378,12 +378,16 @@ void TierMetric::RegisterTier(const UUID& tier_id, const std::string& label,
     // Initialize all series so an idle tier still shows up in /metrics.
     const std::array<std::string, 1> label_array = {label};
     key_count.inc(label_array, 0);
-    capacity_bytes.update(label_array,
-                          static_cast<int64_t>(tier->GetCapacity()));
-    used_bytes.update(label_array, static_cast<int64_t>(tier->GetUsage()));
+    capacity_bytes.update(label_array, static_cast<int64_t>(capacity));
+    used_bytes.update(label_array,
+                      static_cast<int64_t>(tiers_.at(tier_id).usage()));
     evicted_keys.inc(label_array, 0);
     offloaded_keys.inc(label_array, 0);
     onboarded_keys.inc(label_array, 0);
+}
+
+bool TierMetric::HasTier(const UUID& tier_id) const {
+    return tiers_.find(tier_id) != tiers_.end();
 }
 
 void TierMetric::OnReplicaAdded(const UUID& tier_id) {
@@ -436,13 +440,12 @@ void TierMetric::OnMoved(const UUID& source_tier, const UUID& dest_tier) {
 
 void TierMetric::RefreshUsage() {
     for (const auto& [tier_id, entry] : tiers_) {
-        auto tier = entry.tier.lock();
-        if (!tier) {
-            // Tier already destroyed; keep the last known value.
+        if (!entry.usage) {
+            // Registered without a usage source; keep the last known value.
             continue;
         }
         used_bytes.update(entry.label_array,
-                          static_cast<int64_t>(tier->GetUsage()));
+                          static_cast<int64_t>(entry.usage()));
     }
 }
 

@@ -136,7 +136,29 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/client/peer_client.cpp
     p2p/client/client_rpc_service.cpp
     p2p/client/data_manager_types.cpp
+    p2p/client/data_manager_factory.cpp
     p2p/client/v1/data_manager_v1.cpp
+    p2p/client/v2/v2_common.cpp
+    p2p/client/v2/movement.cpp
+    p2p/client/v2/copier.cpp
+    p2p/client/v2/eviction_index.cpp
+    p2p/client/v2/eviction_policy.cpp
+    p2p/client/v2/movement_tracker.cpp
+    p2p/client/v2/tier_graph.cpp
+    p2p/client/v2/block.cpp
+    p2p/client/v2/block_registry.cpp
+    p2p/client/v2/block_pool.cpp
+    p2p/client/v2/block_index.cpp
+    p2p/client/v2/event_center.cpp
+    p2p/client/v2/tiler_manager.cpp
+    p2p/client/v2/frequency_tracker.cpp
+    p2p/client/v2/lease_manager.cpp
+    p2p/client/v2/movement_consumers.cpp
+    p2p/client/v2/migration_engine.cpp
+    p2p/client/v2/evict_engine.cpp
+    p2p/client/v2/local_copy_engine.cpp
+    p2p/client/v2/transfer_coordinator.cpp
+    p2p/client/v2/data_manager_v2.cpp
     p2p/client/route_cache.cpp
     p2p/client/async_memcpy_executor.cpp
     p2p/client/async_metadata_notifier.cpp

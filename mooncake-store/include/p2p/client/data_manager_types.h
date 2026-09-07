@@ -146,6 +146,18 @@ using SegmentSyncCallback = std::function<tl::expected<void, ErrorCode>(
 using RectifyRouteCallback =
     std::function<void(std::string_view, std::optional<UUID>)>;
 
+/**
+ * @struct MetadataCallbacks
+ * @brief The complete set of hooks a DataManager uses to keep Master metadata
+ *        in sync. Passed to the factory; both implementations use the same set.
+ */
+struct MetadataCallbacks {
+    AddReplicaCallback add_replica;
+    RemoveReplicaCallback remove_replica;
+    SegmentSyncCallback segment_sync;
+    RectifyRouteCallback rectify_route;
+};
+
 // ---------------------------------------------------------------------------
 // Access statistics
 // ---------------------------------------------------------------------------
