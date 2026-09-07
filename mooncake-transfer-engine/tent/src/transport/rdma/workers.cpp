@@ -1324,7 +1324,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
     // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
     // fallback storm is visible without flooding; VLOG(1) for debugging.
     VLOG(1) << "fallback device selection for slice " << slice;
-    LOG_EVERY_N(WARNING, 10000) << "fallback device selection for slice " << slice;
+    LOG_EVERY_N(WARNING, 10000)
+        << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 

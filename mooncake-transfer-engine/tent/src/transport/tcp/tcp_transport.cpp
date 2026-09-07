@@ -259,9 +259,8 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         last_error = status;
         VLOG(1) << "TCP transfer attempt " << attempt
                 << " failed: " << status.ToString();
-        LOG_EVERY_N(WARNING, 1000)
-            << "TCP transfer attempt " << attempt
-            << " failed: " << status.ToString();
+        LOG_EVERY_N(WARNING, 1000) << "TCP transfer attempt " << attempt
+                                   << " failed: " << status.ToString();
 
         if (!status.IsRpcServiceError() && !status.IsInternalError()) {
             return status;

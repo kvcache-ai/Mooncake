@@ -137,8 +137,8 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
             LOG(INFO) << "Rail paused: local_nic=" << local_nic
                       << " remote_nic=" << remote_nic
                       << " (errors=" << st.error_count << " in "
-                      << error_window_.count() << "s, cooldown="
-                      << st.cooldown.count() << "s)";
+                      << error_window_.count()
+                      << "s, cooldown=" << st.cooldown.count() << "s)";
         }
         st.resume_time = now + st.cooldown;
         updateBestMapping();
