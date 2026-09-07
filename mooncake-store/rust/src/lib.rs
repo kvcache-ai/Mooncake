@@ -63,7 +63,7 @@ pub mod store;
 mod ffi_dlopen;
 
 pub use error::StoreError;
-pub use store::{MooncakeStore, ReplicateConfig};
+pub use store::{MooncakeStore, ReplicateConfig, SoftPinAction};
 
 #[cfg(all(feature = "dlopen", not(feature = "link")))]
 pub use ffi_dlopen::load_library;
