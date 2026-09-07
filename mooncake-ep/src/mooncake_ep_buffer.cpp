@@ -192,8 +192,7 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     // When EP owns the rdma transport, its destructor handles QP/MR/control
     // teardown. When the engine owns it, unregister this buffer's MR.
-    if (!owned_rdma_transport_ && rdma_transport_ &&
-        rdma_memory_region_.addr) {
+    if (!owned_rdma_transport_ && rdma_transport_ && rdma_memory_region_.addr) {
         const int ret = rdma_transport_->unregisterMemory(rdma_memory_region_);
         if (ret != 0) {
             LOG(ERROR) << "[EP] Failed to unregister the IBGDA memory region";
@@ -584,9 +583,9 @@ void MooncakeEpBuffer::sync_ibgda_peers(
     }
 
     int ret = rdma_transport_->connectPeers(
-        rank, rdma_transport_->isRoce(), rdma_memory_region_.lkey,
-        remote_addrs, remote_keys, flat_qpns, flat_lids, subnet_prefixes,
-        interface_ids, active_ranks_mask);
+        rank, rdma_transport_->isRoce(), rdma_memory_region_.lkey, remote_addrs,
+        remote_keys, flat_qpns, flat_lids, subnet_prefixes, interface_ids,
+        active_ranks_mask);
     if (ret != 0) {
         ibgda_disabled_ = true;
         LOG(WARNING)

@@ -15,7 +15,6 @@ namespace {
 
 constexpr uint32_t kPreferredQpsPerRank = 8;
 constexpr uint32_t kMaxQueuePairs = 256;
-constexpr uint64_t kDrainTimeoutMs = 5000;
 
 uint32_t qpsPerRank(uint32_t max_world_size) {
     return std::max<uint32_t>(
@@ -61,13 +60,6 @@ struct RdmaRoute::State {
                            << cudaGetErrorString(result);
             }
         }
-        if (drain_results) {
-            const auto result = cudaFreeHost(drain_results);
-            if (result != cudaSuccess) {
-                LOG(ERROR) << "Failed to release RDMA drain results: "
-                           << cudaGetErrorString(result);
-            }
-        }
     }
 
     std::unique_ptr<device::RdmaTransport> transport;
@@ -75,11 +67,8 @@ struct RdmaRoute::State {
     device::RdmaMemoryRegion local_staging_region;
     device::RdmaMemoryRegion atomic_sink_region;
     uint64_t* atomic_sink = nullptr;
-    TransferResult* drain_results = nullptr;
-    TransferResult* device_drain_results = nullptr;
-    uint64_t drain_timeout_ticks = 0;
-    cudaStream_t stream = nullptr;
     int device_index = -1;
+    cudaStream_t stream = nullptr;
     uint32_t qps_per_rank = 0;
     uint32_t num_qps = 0;
     std::vector<PeerConnection> peers;
@@ -113,24 +102,11 @@ PGResult<void> RdmaRoute::initialize(int device_index, cudaStream_t stream) {
         return makePGError(PGErrorCode::NotSupported,
                            "device-initiated RDMA transport is unavailable");
     }
-    PG_TRY_TE(state->transport->initialize(
-        "", static_cast<int>(max_world_size_),
-        static_cast<int>(state->num_qps)));
+    PG_TRY_TE(state->transport->initialize("",
+                                           static_cast<int>(max_world_size_),
+                                           static_cast<int>(state->num_qps)));
     PG_TRY_TE(state->transport->allocateControlBuffer());
     PG_TRY_TE(state->transport->createQueuePairs(stream));
-
-    int clock_rate_khz = 0;
-    PG_TRY_CUDA(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
-                                       device_index));
-    state->drain_timeout_ticks = kDrainTimeoutMs * clock_rate_khz;
-    // Recovery drains while the failed collective's last CTA is parked, so
-    // allocate the mapped result buffer up front rather than during recovery.
-    PG_TRY_CUDA(cudaHostAlloc(reinterpret_cast<void**>(&state->drain_results),
-                              state->num_qps * sizeof(TransferResult),
-                              cudaHostAllocMapped));
-    PG_TRY_CUDA(cudaHostGetDevicePointer(
-        reinterpret_cast<void**>(&state->device_drain_results),
-        state->drain_results, 0));
 
     constexpr size_t atomic_sink_bytes = sizeof(uint64_t);
     PG_TRY_CUDA(cudaMalloc(reinterpret_cast<void**>(&state->atomic_sink),
@@ -192,8 +168,8 @@ PGResult<void> RdmaRoute::unregisterRegion(DeviceRegionKind kind, void*,
 
 std::optional<RouteEndpoint> RdmaRoute::localEndpoint() {
     if (!state_) return std::nullopt;
-    const auto metadata = state_->transport->localMetadata(
-        state_->peer_accessible_region);
+    const auto metadata =
+        state_->transport->localMetadata(state_->peer_accessible_region);
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
@@ -243,21 +219,11 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
             candidate.qpns.size() == state_->num_qps &&
             candidate.lids.size() == state_->num_qps &&
             candidate.remote_key != 0;
-        if (!compatible || rank == self_rank_) continue;
+        if (!compatible) continue;
 
         auto& peer = state_->peers[rank];
-        if (peer.connected) {
-            // FIXME:
-            // An RC QP cannot be redirected to a new peer QP without a reset.
-            // Silently selecting HostProxy only on this rank would be unsafe:
-            // the restarted peer could still select our advertised RDMA QPs.
-            PG_VALIDATE_STATE(
-                peer.endpoint_metadata == endpoint->metadata,
-                "device RDMA peer endpoint changed; QP reconnect is not "
-                "supported yet");
-        } else {
-            // Collect this new peer's memory/GID parameters for the connect
-            // batch.
+        if (!peer.connected || peer.endpoint_metadata != endpoint->metadata) {
+            // Collect new and changed peers for the connect batch.
             route_endpoints[rank] = endpoint;
             remote_addrs[rank] =
                 static_cast<int64_t>(endpoints[rank]->region_address);
@@ -295,12 +261,23 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
     }
 
     if (!pending.empty()) {
+        PG_TRY(auto device_guard, GpuDeviceGuard::create(state_->device_index));
+        // Peer reset: reuse our advertised QPNs when a peer restarts.
+        for (const auto rank : pending) {
+            if (!state_->peers[rank].connected) continue;
+            PG_TRY_TE(state_->transport->resetQueuePairs(
+                rank * state_->qps_per_rank, state_->qps_per_rank,
+                state_->stream));
+            LOG(INFO) << "[PG] Device RDMA QPs reset for peer=" << rank;
+        }
+
         // Connect the pending QP groups in one batch.
         PG_TRY_TE(state_->transport->connectPeers(
             self_rank_, state_->transport->isRoce(),
             state_->peer_accessible_region.lkey, remote_addrs, remote_keys,
             remote_qpns, remote_lids, subnet_prefixes, interface_ids, active));
-        // Save new connection state only after the batch reports success.
+
+        // Save connection state only after the batch reports success.
         for (const auto rank : pending) {
             auto& peer = state_->peers[rank];
             peer.connected = true;
@@ -311,28 +288,6 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
     return routes;
 }
 
-PGResult<void> RdmaRoute::quiesce() {
-    if (!state_) return {};
-    PG_TRY(auto device_guard, GpuDeviceGuard::create(state_->device_index));
-    launchRdmaDrainKernel(state_->transport->qpDevCtxsPtr(), state_->num_qps,
-                          state_->drain_timeout_ticks,
-                          state_->device_drain_results, state_->stream);
-    PG_TRY_CUDA(cudaGetLastError());
-    PG_TRY_CUDA(cudaStreamSynchronize(state_->stream));
-    for (uint32_t index = 0; index < state_->num_qps; ++index) {
-        const auto result = state_->drain_results[index];
-        if (result == TransferResult::Succeeded) continue;
-        return makePGError(
-            result == TransferResult::TimedOut
-                ? PGErrorCode::Timeout
-                : PGErrorCode::TransferEngineError,
-            "device RDMA QP " + std::to_string(index) +
-                (result == TransferResult::TimedOut ? " drain timed out"
-                                                    : " drain failed"));
-    }
-    return {};
-}
-
 PGResult<void> RdmaRoute::shutdown() {
     if (shutdown_requested_) return {};
     if (!state_) {
@@ -341,10 +296,11 @@ PGResult<void> RdmaRoute::shutdown() {
     }
 
     PG_TRY(auto device_guard, GpuDeviceGuard::create(state_->device_index));
-    PG_TRY(quiesce());
+    // Device callers drain before kernel exit; their streams must be idle
+    // before route resources are released.
     if (state_->local_staging_region.addr) {
-        PG_TRY_TE(state_->transport->unregisterMemory(
-            state_->local_staging_region));
+        PG_TRY_TE(
+            state_->transport->unregisterMemory(state_->local_staging_region));
         state_->local_staging_region = {};
     }
     if (state_->peer_accessible_region.addr) {
@@ -353,8 +309,8 @@ PGResult<void> RdmaRoute::shutdown() {
         state_->peer_accessible_region = {};
     }
     if (state_->atomic_sink_region.addr) {
-        PG_TRY_TE(state_->transport->unregisterMemory(
-            state_->atomic_sink_region));
+        PG_TRY_TE(
+            state_->transport->unregisterMemory(state_->atomic_sink_region));
         state_->atomic_sink_region = {};
     }
 

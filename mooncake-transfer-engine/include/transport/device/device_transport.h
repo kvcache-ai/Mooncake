@@ -143,6 +143,12 @@ class RdmaTransport {
     // Destroy and recreate QPs (used when active_ranks changes).
     virtual int recreateQueuePairs(void* stream) = 0;
 
+    // Reset [qp_offset, qp_offset + num_qps) to INIT in place, preserving QPNs
+    // and device pointers. Clears CQ/doorbell state and device-side counters.
+    // The caller must stop using these QPs before reset and until reconnect.
+    // On success, the supplied stream's reset work is complete on return.
+    virtual int resetQueuePairs(int qp_offset, int num_qps, void* stream) = 0;
+
     // Connect QPs to peers using exchanged metadata.
     // is_roce: true for RoCE, false for IB.
     virtual int connectPeers(int local_rank, bool is_roce, uint32_t local_lkey,
