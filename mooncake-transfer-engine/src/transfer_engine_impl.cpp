@@ -28,8 +28,10 @@
 #endif
 
 #include "transfer_metadata_plugin.h"
+#include "common.h"
 #include "transport/transport.h"
 #include "transport/rdma_twosided/rdma_twosided_transport.h"
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -41,6 +43,34 @@ bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
                        uint64_t region_length) {
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
                    region_length);
+}
+
+Transport* tryInstallShmTransport(MultiTransport* multi_transports,
+                                  std::shared_ptr<Topology> topology) {
+    if (!multi_transports) return nullptr;
+    if (Transport* existing = multi_transports->getTransport("shm")) {
+        return existing;
+    }
+    return multi_transports->installTransport("shm", topology);
+}
+
+int maybeInstallShmTransport(MultiTransport* multi_transports,
+                             std::shared_ptr<Topology> topology) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!multi_transports || !envFlagEnabled("MC_FORCE_SHM")) return 0;
+    Transport* shm = tryInstallShmTransport(multi_transports, topology);
+    if (!shm) {
+        LOG(WARNING) << "MC_FORCE_SHM is set but failed to install SHM "
+                        "transport; continuing without it";
+        return 0;
+    }
+    LOG(INFO) << "SHM transport installed for same-host DRAM copies";
+    return 0;
+#else
+    (void)multi_transports;
+    (void)topology;
+    return 0;
+#endif
 }
 }  // namespace
 
@@ -223,6 +253,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         return -1;
 #endif
     }
+
+    // MC_FORCE_SHM:
+    // - Without ENABLE_MULTI_PROTOCOL: SHM-only (skip RDMA/TCP), like
+    //   MC_FORCE_TCP.
+    // - With ENABLE_MULTI_PROTOCOL: fall through so auto-discover still
+    //   installs RDMA/TCP, then maybeInstallShmTransport appends SHM.
+#ifndef ENABLE_MULTI_PROTOCOL
+    if (envFlagEnabled("MC_FORCE_SHM")) {
+        Transport* shm_transport =
+            tryInstallShmTransport(multi_transports_.get(), local_topology_);
+        if (!shm_transport) {
+            LOG(ERROR)
+                << "MC_FORCE_SHM is set but failed to install SHM transport";
+            return -1;
+        }
+        LOG(INFO) << "MC_FORCE_SHM is set, using SHM transport only";
+        return 0;
+    }
+#endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport* ascend_transport =
@@ -457,6 +506,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+    maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;
 }
 
@@ -511,6 +561,33 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
 
 int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
+}
+
+void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+    auto* shm =
+        dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
+    if (!shm) {
+        LOG(ERROR) << "allocateSharedMemory requires ShmTransport "
+                      "(set MC_FORCE_SHM=1 or installTransport(\"shm\"))";
+        return nullptr;
+    }
+    return shm->allocateSharedMemory(length);
+}
+
+int TransferEngineImpl::freeSharedMemory(void* addr) {
+    if (!addr) return ERR_INVALID_ARGUMENT;
+    auto* shm =
+        dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
+    if (!shm) return ERR_INVALID_ARGUMENT;
+    std::string shm_name;
+    if (!shm->getShmName(addr, &shm_name)) return ERR_INVALID_ARGUMENT;
+    int uret = unregisterLocalMemory(addr, true);
+    if (uret && uret != ERR_ADDRESS_NOT_REGISTERED) {
+        LOG(WARNING) << "unregisterLocalMemory failed before freeSharedMemory, "
+                        "ret="
+                     << uret;
+    }
+    return shm->freeSharedMemory(addr);
 }
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \

@@ -364,8 +364,15 @@ static int encodeMultiProtocolSegmentDesc(
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
         } else if (buffer.protocol == "tcp") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
+        } else if (buffer.protocol == "shm") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["shm_name"] = buffer.shm_name;
         } else if (buffer.protocol == "hip" || buffer.protocol == "maca" ||
                    buffer.protocol == "musa") {
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
@@ -399,7 +406,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         is_multi_protocol = true;
         for (const auto &proto : protocols) {
             if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                proto != "hip" && proto != "maca" && proto != "musa") {
+                proto != "hip" && proto != "maca" && proto != "musa" &&
+                proto != "shm") {
                 is_multi_protocol = false;
                 break;
             }
@@ -407,8 +415,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         if (!is_multi_protocol) {
             LOG(ERROR) << "Unsupported multi-protocol combination: "
                        << desc.protocol
-                       << ". Only cxl, tcp, rdma, hip, maca and musa may be "
-                          "combined.";
+                       << ". Only cxl, tcp, rdma, hip, maca, musa and shm may "
+                          "be combined.";
             return ERR_INVALID_ARGUMENT;
         }
     }
@@ -456,6 +464,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -491,6 +501,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            if (!buffer.shm_name.empty())
+                bufferJSON["shm_name"] = buffer.shm_name;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -555,7 +567,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                segmentJSON["protocol"] == "maca" ||
                segmentJSON["protocol"] == "musa" ||
                segmentJSON["protocol"] == "ubshmem" ||
-               segmentJSON["protocol"] == "sunrise_link") {
+               segmentJSON["protocol"] == "sunrise_link" ||
+               segmentJSON["protocol"] == "shm") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -728,6 +741,10 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                     << buffer.lkey.size() << ", " << desc->devices.size();
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         } else if (buffer_protocol == "tcp") {
             TransferMetadata::BufferDesc buffer;
@@ -736,6 +753,28 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.protocol = buffer_protocol;
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
+            desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "shm") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.shm_name.empty()) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " buffer_protocol " << buffer_protocol;
@@ -780,7 +819,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             for (const auto &protocolStr : segmentJSON["protocol"]) {
                 std::string proto = protocolStr.asString();
                 if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
-                    proto != "hip" && proto != "maca" && proto != "musa") {
+                    proto != "hip" && proto != "maca" && proto != "musa" &&
+                    proto != "shm") {
                     is_multi_protocol = false;
                     break;
                 }
@@ -789,7 +829,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 LOG(ERROR)
                     << "Unsupported multi-protocol combination in segment: "
                     << segment_name
-                    << ". Only cxl, tcp, rdma, hip, maca and musa may be "
+                    << ". Only cxl, tcp, rdma, hip, maca, musa and shm may be "
                        "combined.";
                 return nullptr;
             }
@@ -872,6 +912,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                     << desc->devices.size();
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         }
 
@@ -928,6 +972,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
+            if (bufferJSON.isMember("shm_name") &&
+                bufferJSON["shm_name"].isString()) {
+                buffer.shm_name = bufferJSON["shm_name"].asString();
+            }
             desc->buffers.push_back(buffer);
         }
         desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
@@ -951,7 +999,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
                desc->protocol == "hip" || desc->protocol == "maca" ||
                desc->protocol == "musa" || desc->protocol == "ubshmem" ||
-               desc->protocol == "sunrise_link") {
+               desc->protocol == "sunrise_link" || desc->protocol == "shm") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();

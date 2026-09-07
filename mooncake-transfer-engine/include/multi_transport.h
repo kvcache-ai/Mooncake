@@ -21,9 +21,11 @@
 
 namespace mooncake {
 class TransferEngineImplTestPeer;
+class MultiTransportTestPeer;
 
 class MultiTransport {
     friend class TransferEngineImplTestPeer;
+    friend class MultiTransportTestPeer;
 
    public:
     using BatchID = Transport::BatchID;
@@ -73,10 +75,11 @@ class MultiTransport {
     Transport *getTransport(const std::string &proto);
 
     /**
-     * @brief Check if TCP is the only installed transport.
+     * @brief Check if TCP is the only installed host transport.
      *
-     * When only TCP transport is available (no RDMA, NVLink, etc.),
-     * local memcpy is preferred over TCP loopback for same-host transfers.
+     * When only TCP is available (no RDMA, NVLink, etc.), local memcpy is
+     * preferred over TCP loopback for same-host transfers. POSIX SHM is
+     * intra-node only and does not change this classification.
      */
     bool isTcpOnly() const;
 
