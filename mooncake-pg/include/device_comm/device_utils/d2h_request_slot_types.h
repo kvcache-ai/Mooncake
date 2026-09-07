@@ -81,6 +81,11 @@ class D2HRequestSlot {
                                                     uint64_t start_ticks,
                                                     uint64_t timeout_ticks);
 
+    // Device side: after producers stop, wait for the latest request's reply.
+    // On timeout, return false. Zero disables timeout.
+    __device__ __forceinline__ bool waitUntilIdle(uint64_t start_ticks,
+                                                 uint64_t timeout_ticks) const;
+
     // Host side: nonblocking receive; return false if there is no new request.
     // Each request is received once and remains pending until its reply.
     // The caller must serialize tryReceive() and RequestHandle::reply().

@@ -43,6 +43,21 @@ D2HRequestSlot<Request, Reply>::RequestHandle::wait(uint64_t start_ticks,
 }
 
 template <typename Request, typename Reply>
+__device__ __forceinline__ bool
+D2HRequestSlot<Request, Reply>::waitUntilIdle(uint64_t start_ticks,
+                                              uint64_t timeout_ticks) const {
+    const uint64_t submitted =
+        device::mc_ld_acquire_u64(&submitted_sequence_);
+    while (true) {
+        const uint64_t replied =
+            device::mc_ld_acquire_u64(&replied_sequence_);
+        if (replied == submitted) return true;
+        PG_DEVICE_ASSERT(replied < submitted);
+        if (deviceTimedOut(start_ticks, timeout_ticks)) return false;
+    }
+}
+
+template <typename Request, typename Reply>
 __device__ __forceinline__
     typename D2HRequestSlot<Request, Reply>::RequestHandle
     D2HRequestSlot<Request, Reply>::submit(const Request& request) {

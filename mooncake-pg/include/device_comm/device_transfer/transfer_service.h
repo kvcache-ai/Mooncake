@@ -68,8 +68,6 @@ class DeviceTransferService {
     PGResult<void> installPeerEndpoint(GlobalRank rank,
                                        const DeviceTransferEndpoint& endpoint);
 
-    PGResult<void> waitUntilIdle();
-
     PGResult<void> shutdown();
 
    private:
