@@ -163,6 +163,9 @@ class LocalTransferAdmissionQueue {
 
     size_t outstandingBytes() const;
 
+    // Bytes of degradation-eligible owners currently Dispatching.
+    size_t dispatchingBytes() const;
+
    private:
     enum class QueueState {
         Queued,

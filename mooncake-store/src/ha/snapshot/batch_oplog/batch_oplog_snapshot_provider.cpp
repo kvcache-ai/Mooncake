@@ -128,28 +128,6 @@ void CopyRegistry(const StandbySegmentRegistry& source,
     }
 }
 
-tl::expected<ReplicaID, ErrorCode> ScanLiveReplicaIds(
-    const StandbyMetadataStore& metadata) {
-    auto cursor = metadata.BeginSnapshotTraversal();
-    ReplicaID max_replica_id = 0;
-    while (!cursor.done()) {
-        std::vector<StandbyObjectEntry> objects;
-        if (!metadata.CopyNextSnapshotChunk(1, cursor, objects)) {
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        for (const auto& object : objects) {
-            std::unordered_set<ReplicaID> object_ids;
-            for (const auto& replica : object.metadata.replicas) {
-                if (replica.id == 0 || !object_ids.insert(replica.id).second) {
-                    return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
-                }
-                max_replica_id = std::max(max_replica_id, replica.id);
-            }
-        }
-    }
-    return max_replica_id;
-}
-
 AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
                            OpLogApplier& applier,
                            const DurablePrefix* baseline) {
@@ -302,9 +280,9 @@ AttemptResult RestorePointer(
     if (suffix.disposition != AttemptDisposition::kSuccess) {
         return suffix;
     }
-    auto live_max_replica_id = ScanLiveReplicaIds(metadata);
-    if (!live_max_replica_id) {
-        return Invalid(live_max_replica_id.error());
+    ReplicaID live_max_replica_id = 0;
+    if (!metadata.ValidateReplicaIds(live_max_replica_id)) {
+        return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
     return {AttemptDisposition::kSuccess,
@@ -314,7 +292,7 @@ AttemptResult RestorePointer(
              .last_applied_seq = suffix.value.last_included_seq,
              .last_applied_batch_id = suffix.value.last_included_batch_id,
              .producer_view_version = descriptor.producer_view_version,
-             .max_replica_id = *live_max_replica_id}};
+             .max_replica_id = live_max_replica_id}};
 }
 
 AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
@@ -341,12 +319,12 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
     if (replay.disposition != AttemptDisposition::kSuccess) {
         return replay;
     }
-    auto max_replica_id = ScanLiveReplicaIds(metadata);
-    if (!max_replica_id) {
-        return Invalid(max_replica_id.error());
+    ReplicaID max_replica_id = 0;
+    if (!metadata.ValidateReplicaIds(max_replica_id)) {
+        return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
-    replay.value.max_replica_id = *max_replica_id;
+    replay.value.max_replica_id = max_replica_id;
     replay.value.last_applied_seq = replay.value.last_included_seq;
     replay.value.last_applied_batch_id = replay.value.last_included_batch_id;
     return replay;

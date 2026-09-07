@@ -31,6 +31,7 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint.h"
@@ -89,6 +90,14 @@ class RdmaTransportTestPeer {
 
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
+    }
+
+    static void setNumWorkers(RdmaTransport& transport, int num_workers) {
+        transport.params_->workers.num_workers = num_workers;
+    }
+
+    static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
+        workers.worker_context_[worker_id].inflight_slices.fetch_add(delta);
     }
 
     using NotifyAction = RdmaTransport::NotifyCompletionAction;
@@ -2094,6 +2103,71 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     const int status = child_guard.finish();
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RdmaQuiesceTest, TransportQuiesceWithoutInstallIsOk) {
+    RdmaTransport transport;
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(transport.quiesce().ok());
+}
+
+TEST(RdmaQuiesceTest, TransportQuiesceSyncsTopologyDevicesViaPlatform) {
+    auto topology = std::make_shared<Topology>();
+    Topology::MemEntry memory;
+    memory.name = "cuda:0";
+    memory.type = Topology::MEM_CUDA;
+    memory.numa_node = 0;
+    topology->mem_list_.push_back(std::move(memory));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(Platform::getLoader().synchronizeDevices(topology.get()).ok());
+}
+
+TEST(RdmaQuiesceTest, WorkersQuiesceWithoutStartRejectsSubmit) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+
+    EXPECT_TRUE(workers->quiesce().ok());
+    EXPECT_TRUE(workers->quiesce().ok());
+
+    RdmaSliceList slice_list;
+    EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
+}
+
+TEST(RdmaQuiesceTest, IdleWorkersDrainAndRejectSubmit) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+
+    EXPECT_TRUE(workers->quiesce().ok());
+    RdmaSliceList slice_list;
+    EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
+    EXPECT_TRUE(workers->quiesce().ok());
+    ASSERT_TRUE(workers->stop().ok());
+}
+
+TEST(RdmaQuiesceTest, DrainTimeoutLeavesInflight) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+    RdmaTransportTestPeer::addInflight(*workers, 0, 1);
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_TRUE(workers->quiesce(50'000'000ull).IsInternalError());
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::milliseconds(500));
+
+    ASSERT_TRUE(workers->stop().ok());
 }
 
 }  // namespace
