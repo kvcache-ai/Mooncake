@@ -752,7 +752,8 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
 }
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
-                               int qp_index) {
+                               int qp_index,
+                               const std::function<void(RdmaSlice*)>& on_post) {
     const static int kSgeEntries = 1;
     RWSpinlock::ReadGuard guard(lock_);
     if (qp_list_.empty()) return 0;
@@ -798,6 +799,7 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         current->ep_weak_ptr = self;
         current->qp_index = qp_index;
         current->failed = false;
+        if (on_post) on_post(current);
         wr.wr_id = (uint64_t)current;
         wr.opcode = getOpCode(current);
         wr.num_sge = kSgeEntries;
@@ -866,7 +868,9 @@ void RdmaEndPoint::resetInflightSlices() {
     }
 }
 
-size_t RdmaEndPoint::acknowledge(RdmaSlice* slice, TransferStatusEnum status) {
+size_t RdmaEndPoint::acknowledge(
+    RdmaSlice* slice, TransferStatusEnum status,
+    const std::function<void(RdmaSlice*)>& on_each) {
     RWSpinlock::ReadGuard guard(lock_);
     auto qp_index = slice->qp_index;
     if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
@@ -878,6 +882,7 @@ size_t RdmaEndPoint::acknowledge(RdmaSlice* slice, TransferStatusEnum status) {
         current = queue.pop();
         if (!current) break;
         num_entries++;
+        if (on_each) on_each(current);
         updateSliceStatus(current, status);
     } while (current != slice);
     cancelQuota(qp_index, num_entries);
