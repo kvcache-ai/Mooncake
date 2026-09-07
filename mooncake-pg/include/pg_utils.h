@@ -5,44 +5,14 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstddef>
 #include <cstdint>
 #include <limits>
-#include <span>
-#include <string>
 #include <thread>
-#include <utility>
-#include <vector>
-
-#include <ylt/struct_pack.hpp>
 
 // For PAUSE macro
 #include <transfer_engine.h>
 
-#include "error_types.h"
-
 namespace mooncake {
-
-template <typename T>
-[[nodiscard]] std::vector<uint8_t> pgSerialize(const T& value) {
-    return struct_pack::serialize<std::vector<uint8_t>>(value);
-}
-
-template <typename T>
-[[nodiscard]] PGResult<T> pgDeserialize(std::span<const uint8_t> data) {
-    PG_VALIDATE_ARG(!data.empty(), "serialized data is empty");
-    size_t consumed = 0;
-    auto result = struct_pack::deserialize<T>(
-        reinterpret_cast<const char*>(data.data()), data.size(), consumed);
-    if (!result.has_value()) {
-        return makePGError(
-            PGErrorCode::InvalidArgument,
-            "deserialization failed: " + std::string(result.error().message()));
-    }
-    PG_VALIDATE_ARG(consumed == data.size(),
-                    "serialized data contains trailing bytes");
-    return std::move(result).value();
-}
 
 inline constexpr bool addOverflows(uint64_t left, uint64_t right) noexcept {
     return right > std::numeric_limits<uint64_t>::max() - left;
