@@ -22,9 +22,15 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include "common.h"
 #include "config.h"
@@ -201,6 +207,189 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
 }
 
 namespace {
+
+#ifdef USE_HTTP
+class LocalHttpMetadataServer {
+   public:
+    LocalHttpMetadataServer() {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) return;
+
+        int one = 1;
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one,
+                       sizeof(one)) != 0)
+            return;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                 sizeof(addr)) != 0)
+            return;
+        if (listen(listen_fd_, 16) != 0) return;
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) !=
+            0)
+            return;
+        port_ = ntohs(addr.sin_port);
+        ok_ = true;
+        thread_ = std::thread([this] { serve(); });
+    }
+
+    ~LocalHttpMetadataServer() {
+        stopped_.store(true, std::memory_order_release);
+        if (listen_fd_ >= 0) (void)shutdown(listen_fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (listen_fd_ >= 0) close(listen_fd_);
+    }
+
+    bool ok() const { return ok_; }
+    std::string uri() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/metadata";
+    }
+
+   private:
+    static std::string decodeUrlComponent(const std::string& value) {
+        auto hex_digit = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+
+        std::string decoded;
+        decoded.reserve(value.size());
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (value[i] == '%' && i + 2 < value.size()) {
+                const int high = hex_digit(value[i + 1]);
+                const int low = hex_digit(value[i + 2]);
+                if (high >= 0 && low >= 0) {
+                    decoded.push_back(static_cast<char>((high << 4) | low));
+                    i += 2;
+                    continue;
+                }
+            }
+            decoded.push_back(value[i] == '+' ? ' ' : value[i]);
+        }
+        return decoded;
+    }
+
+    static bool sendExact(int fd, const std::string& value) {
+        size_t offset = 0;
+        while (offset < value.size()) {
+            const ssize_t n = send(fd, value.data() + offset,
+                                   value.size() - offset, MSG_NOSIGNAL);
+            if (n <= 0) return false;
+            offset += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    static bool readRequest(int fd, std::string& request) {
+        constexpr size_t kMaximumRequestSize = 1 << 20;
+        char buffer[4096];
+        size_t header_end = std::string::npos;
+        while ((header_end = request.find("\r\n\r\n")) == std::string::npos) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+            if (n <= 0) return false;
+            request.append(buffer, static_cast<size_t>(n));
+            if (request.size() > kMaximumRequestSize) return false;
+        }
+
+        size_t content_length = 0;
+        std::istringstream headers(request.substr(0, header_end));
+        std::string line;
+        std::getline(headers, line);
+        while (std::getline(headers, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            constexpr char kContentLength[] = "content-length:";
+            if (lower.rfind(kContentLength, 0) == 0) {
+                content_length =
+                    std::stoull(line.substr(sizeof(kContentLength) - 1));
+            }
+        }
+
+        const size_t complete_size = header_end + 4 + content_length;
+        while (request.size() < complete_size) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+            if (n <= 0) return false;
+            request.append(buffer, static_cast<size_t>(n));
+            if (request.size() > kMaximumRequestSize) return false;
+        }
+        return true;
+    }
+
+    void handle(int fd) {
+        std::string request;
+        if (!readRequest(fd, request)) return;
+
+        const size_t request_line_end = request.find("\r\n");
+        if (request_line_end == std::string::npos) return;
+        std::istringstream request_line(request.substr(0, request_line_end));
+        std::string method;
+        std::string target;
+        std::string version;
+        request_line >> method >> target >> version;
+        (void)version;
+
+        const size_t key_pos = target.find("?key=");
+        if (key_pos == std::string::npos) return;
+        const std::string key = decodeUrlComponent(target.substr(key_pos + 5));
+
+        std::string body = "{}";
+        int status = 200;
+        if (method == "PUT") {
+            const size_t header_end = request.find("\r\n\r\n");
+            const std::string value = request.substr(header_end + 4);
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            values_[key] = value;
+        } else if (method == "GET") {
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            auto it = values_.find(key);
+            if (it == values_.end()) {
+                status = 404;
+            } else {
+                body = it->second;
+            }
+        } else if (method == "DELETE") {
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            values_.erase(key);
+        } else {
+            status = 405;
+        }
+
+        const std::string response =
+            "HTTP/1.1 " + std::to_string(status) +
+            (status == 200 ? " OK\r\n" : " Error\r\n") +
+            "Content-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
+            body;
+        (void)sendExact(fd, response);
+    }
+
+    void serve() {
+        while (!stopped_.load(std::memory_order_acquire)) {
+            const int fd = accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) break;
+            handle(fd);
+            close(fd);
+        }
+    }
+
+    int listen_fd_ = -1;
+    uint16_t port_ = 0;
+    bool ok_ = false;
+    std::thread thread_;
+    std::atomic<bool> stopped_{false};
+    std::mutex values_mutex_;
+    std::unordered_map<std::string, std::string> values_;
+};
+#endif
 
 struct ScopedMetadataRefreshConfig {
     uint64_t old_interval_seconds;
@@ -471,6 +660,59 @@ TEST(TransferMetadataVersionTest,
     ASSERT_NE(cached_desc, nullptr);
     EXPECT_EQ(cached_desc->metadata_version, base_version + 2);
     EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
+TEST(TransferMetadataVersionTest,
+     SyncInvalidatesRpcCacheForUnchangedNewerSegmentVersion) {
+#ifdef USE_HTTP
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint16_t kInitialRpcPort = 1234;
+    constexpr uint16_t kUpdatedRpcPort = 2345;
+
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+
+    TransferMetadata publisher(metadata_server.uri());
+    TransferMetadata client(metadata_server.uri());
+
+    const std::string remote_segment_name = "rpc-refresh-segment";
+    ASSERT_EQ(publisher.updateSegmentDesc(
+                  remote_segment_name,
+                  *makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = kInitialRpcPort;
+    ASSERT_EQ(publisher.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+
+    TransferMetadata::RpcMetaDesc cached_rpc_desc;
+    ASSERT_EQ(client.getRpcMetaEntry(remote_segment_name, cached_rpc_desc), 0);
+    ASSERT_EQ(cached_rpc_desc.ip_or_host_name, "127.0.0.1");
+    ASSERT_EQ(cached_rpc_desc.rpc_port, kInitialRpcPort);
+
+    rpc_desc.ip_or_host_name = "127.0.0.2";
+    rpc_desc.rpc_port = kUpdatedRpcPort;
+    ASSERT_EQ(publisher.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+    ASSERT_EQ(publisher.updateSegmentDesc(
+                  remote_segment_name,
+                  *makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    ASSERT_EQ(client.getRpcMetaEntry(remote_segment_name, cached_rpc_desc), 0);
+    EXPECT_EQ(cached_rpc_desc.ip_or_host_name, "127.0.0.2");
+    EXPECT_EQ(cached_rpc_desc.rpc_port, kUpdatedRpcPort);
+#else
+    GTEST_SKIP() << "HTTP metadata storage is required";
+#endif
 }
 
 TEST(TransferMetadataVersionTest, SyncRejectsConflictingSameVersionMetadata) {
