@@ -14,9 +14,22 @@
 //
 // The one definition of a request's predicted deadline feasibility (MLU),
 // shared by the admission queue's drop predictor (RFC #2519 step 3) and the
-// RDMA workers' bandwidth arbitration (RFC #2792). Both must rank the same
-// request the same way from the same bandwidth series, or the admission
-// layer can drop a flow the NIC layer just promoted.
+// RDMA workers' bandwidth arbitration (RFC #2792). Both must apply the same
+// formula to the same bandwidth series, or the admission layer can drop a
+// flow the NIC layer just promoted.
+//
+// The two layers deliberately do NOT read the same `bytes_ahead`. Each counts
+// the bytes it can actually see ahead of the request at its decision point:
+//   * admission decides before the request reaches a worker, so everything
+//     dispatched and not yet completed precedes it (`dispatching_bytes_`,
+//     which includes slices still sitting in worker queues);
+//   * arbitration decides at posting time, when the worker-queue slices are
+//     its own contenders, so only the hardware backlog (`getPostedBytes`)
+//     plus the slots already ordered ahead of it precede a slot.
+// The drop side therefore reads the wider set. That is the intended way
+// round: the drop is the irreversible decision, so it is the conservative
+// one. Weigh the necessity carefully before changing this asymmetry in
+// either direction.
 
 #pragma once
 
@@ -31,10 +44,11 @@ namespace tent {
 // where predicted completion time = (bytes_ahead + length) / bw_bps.
 //
 // The deadline is absolute, so the request must first wait for the bytes
-// already in the pipeline ahead of it (`bytes_ahead`: dispatched but not
-// completed) and then spend its own wire time. Queueing is therefore an
-// additive term over the wire rate -- not folded into a slower bandwidth,
-// which would scale the wait by the request's size.
+// already in the pipeline ahead of it (`bytes_ahead`: whatever the calling
+// layer can see ahead of the request, see the file comment) and then spend
+// its own wire time. Queueing is therefore an additive term over the wire
+// rate -- not folded into a slower bandwidth, which would scale the wait by
+// the request's size.
 //
 // Higher == more urgent. No deadline (deadline_ns == 0) or no usable
 // bandwidth (bw_bps <= 0) yields 0: nothing to predict, so never urgent and
