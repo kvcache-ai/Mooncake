@@ -52,7 +52,8 @@ class EnvVarGuard {
 TEST(ConfigLifecycleTest, RuntimeAllowlistPathsAreUnique) {
     std::set<std::string_view> paths;
     for (const auto& field : configFieldInventory()) {
-        EXPECT_EQ(field.lifecycle, ConfigLifecycle::kRuntimeCandidate);
+        EXPECT_EQ(classifyConfigPath(field.path),
+                  ConfigLifecycle::kRuntimeCandidate);
         EXPECT_FALSE(field.path.empty());
         EXPECT_TRUE(paths.insert(field.path).second) << field.path;
     }

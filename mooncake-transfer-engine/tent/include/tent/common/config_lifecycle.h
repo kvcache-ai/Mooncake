@@ -43,7 +43,6 @@ enum class ConfigFieldMatch : uint8_t {
 
 struct ConfigFieldSpec {
     std::string_view path;
-    ConfigLifecycle lifecycle;
     ConfigFieldMatch match;
 };
 
