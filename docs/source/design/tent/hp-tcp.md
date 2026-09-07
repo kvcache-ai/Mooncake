@@ -2,9 +2,9 @@
 
 `hp_tcp` is a standalone TENT transport for CPU DRAM transfers over
 data-center TCP. Standard `tcp` remains the RPC-based compatibility path.
-The first version intentionally excludes GPU memory, TLS, per-transfer
-striping, rail failover, transparent replay after an ambiguous WRITE and
-dynamic lane scheduling.
+The first version intentionally excludes GPU memory, TLS, WRITE striping, rail
+failover, transparent replay after an ambiguous WRITE and dynamic lane
+scheduling.
 
 ## Architecture
 
@@ -37,9 +37,11 @@ existing peer-and-lane worker ownership. Both peers must configure the same
 non-zero rail count. A specific listener address must match the sole rail;
 multiple local rails require a wildcard listener.
 
-Routing is deliberately static. A transfer stays on one persistent lane and
-therefore one rail: `hp_tcp` does not stripe a transfer, rebalance traffic, or
-fail over between rails.
+Routing is deliberately static. Small transfers and all WRITEs stay on one
+persistent lane. A READ large enough to contribute at least one internal I/O
+step per configured rail is split into one contiguous slice per rail. The
+slices reuse the persistent lanes and complete as one TENT task. `hp_tcp` does
+not rebalance traffic or fail over between rails.
 
 ## Protocol and memory safety
 
