@@ -5,8 +5,11 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
 #include <string_view>
 #include <vector>
+
+#include <ylt/struct_pack.hpp>
 
 #include "control_plane/control_types.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
@@ -70,6 +73,28 @@ class RouteProvider {
             match = &route_endpoint;
         }
         return match;
+    }
+
+    template <typename T>
+    [[nodiscard]] static std::vector<uint8_t> encodeEndpointMetadata(
+        const T& metadata) {
+        return struct_pack::serialize<std::vector<uint8_t>>(metadata);
+    }
+
+    template <typename T>
+    [[nodiscard]] static PGResult<T> decodeEndpointMetadata(
+        const RouteEndpoint& endpoint) {
+        PG_VALIDATE_ARG(!endpoint.metadata.empty(), "serialized data is empty");
+        T metadata;
+        size_t consumed = 0;
+        const auto error = struct_pack::deserialize_to(
+            metadata, reinterpret_cast<const char*>(endpoint.metadata.data()),
+            endpoint.metadata.size(), consumed);
+        PG_VALIDATE_ARG(
+            !error, "deserialization failed: " + std::string(error.message()));
+        PG_VALIDATE_ARG(consumed == endpoint.metadata.size(),
+                        "serialized data contains trailing bytes");
+        return metadata;
     }
 };
 
