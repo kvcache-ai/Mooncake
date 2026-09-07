@@ -899,7 +899,8 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
                                        : ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    if (TenantHasObjects(tenant_id)) {
+    auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+    if (tenant_handle && tenant_handle->ObjectCount() > 0) {
         restore_policy();
         return tl::make_unexpected(ErrorCode::TENANT_NOT_EMPTY);
     }
@@ -1167,12 +1168,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                             handle) {
                 (void)tenant_id;
                 auto& tenant = *handle;
-                // Collect handles, then lock each per-object.
-                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
-                    objs;
-                tenant.VisitObjects(
-                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                            object_entry) { objs.push_back(object_entry); });
+                auto objs = tenant.SnapshotObjects();
                 for (const auto& object_entry : objs) {
                     if (!object_entry->has_metadata()) {
                         continue;
@@ -1436,14 +1432,6 @@ tl::expected<TenantId, ErrorCode> MasterService::ResolveTenantIdForWriteLocked(
     return tenant_id;
 }
 
-bool MasterService::TenantHasObjects(const TenantId& tenant_id) const {
-    auto handle = tenant_directory_.Lookup(tenant_id);
-    if (!handle) {
-        return false;
-    }
-    return handle->ObjectCount() > 0;
-}
-
 TenantQuotaPolicySnapshot MasterService::BuildTenantQuotaPolicySnapshot()
     const {
     TenantQuotaPolicySnapshot snapshot;
@@ -1538,21 +1526,18 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
 
 std::shared_ptr<MasterService::TenantState>
 MasterService::GetOrCreateTenantStateHandle(const TenantId& tenant_id) {
-    auto handle = tenant_directory_.Lookup(tenant_id);
-    if (!handle) {
-        handle = std::make_shared<TenantState>();
+    // Atomic get-or-create: two concurrent first writers for different keys in
+    // the same absent tenant must both land on the winning TenantState, or the
+    // loser's object would live in a TenantState the directory can never
+    // reach again.
+    return tenant_directory_.GetOrCreate(tenant_id, [this, &tenant_id]() {
+        auto handle = std::make_shared<TenantState>();
         if (enable_multi_tenants_) {
             handle->quota_account =
                 tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
         }
-        tenant_directory_.Upsert(tenant_id, handle);
-    }
-    return handle;
-}
-
-MasterService::TenantState& MasterService::GetOrCreateTenantState(
-    const TenantId& tenant_id) {
-    return *GetOrCreateTenantStateHandle(tenant_id);
+        return handle;
+    });
 }
 
 std::unique_lock<std::shared_mutex> MasterService::LockObjectRouteForTesting(
@@ -1623,12 +1608,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
                                 const std::shared_ptr<TenantState>& handle) {
         auto& tenant_state = *handle;
         // Collect handles, then lock each per-object (there is no tenant
-        // level lock).
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata()) {
                 continue;
@@ -1651,11 +1631,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         auto& tenant_state = *handle;
         tenant_state.quota_account =
             tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata()) {
                 continue;
@@ -1697,18 +1673,6 @@ MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
     return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
-std::shared_ptr<Lease> MasterService::RegisterGroupMember(
-    TenantState& tenant_state, const std::string& key,
-    const std::string& group_id) {
-    if (group_id.empty()) {
-        return nullptr;
-    }
-    auto& store = tenant_state.object_route;
-    auto lease = store.LeaseFor(group_id);
-    store.AddMember(group_id, key);
-    return lease;
-}
-
 void MasterService::UnregisterGroupMember(TenantState& tenant_state,
                                           const std::string& key,
                                           const std::string& group_id) {
@@ -1716,11 +1680,6 @@ void MasterService::UnregisterGroupMember(TenantState& tenant_state,
         return;
     }
     tenant_state.object_route.RemoveMember(group_id, key);
-}
-
-std::vector<std::string> MasterService::GetGroupMemberKeys(
-    const TenantState& tenant_state, const std::string& group_id) const {
-    return tenant_state.object_route.Members(group_id);
 }
 
 MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
@@ -1742,8 +1701,8 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     TenantStateAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
 
-    std::vector<std::string> member_keys =
-        GetGroupMemberKeys(tenant_state, group_id);
+    std::vector<std::string> member_keys = tenant_state.object_route.Members(
+        group_id);
     if (member_keys.empty()) {
         member_keys.push_back(key);
     }
@@ -1797,9 +1756,12 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         EraseMetadata(tenant_state, member_key, tenant_id,
                       QuotaEraseMode::kFull, &tenant_accessor);
     }
-    if (tenant_state.Empty()) {
-        tenant_directory_.Remove(tenant_id);
-    }
+    // NOTE: empty tenants are deliberately left in the directory. An
+    // Empty()-check + Remove() here cannot be made atomic with a concurrent
+    // first insert for the same tenant (Lookup happens outside every tenant
+    // lock), so eager removal could strand a just-inserted object in a
+    // TenantState that is no longer reachable. Registered tenants are bounded,
+    // so the retention cost is a small empty container per tenant.
     return result;
 }
 
@@ -1857,11 +1819,7 @@ void MasterService::RebuildCacheTotalAccounting() {
     tenant_directory_.Visit([&](const TenantId&,
                                 const std::shared_ptr<TenantState>& handle) {
         auto& tenant_state = *handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (entry->has_metadata()) {
                 std::unique_lock<std::shared_mutex> lk(entry->mutex);
@@ -2036,13 +1994,10 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     }
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
                                           erased_replica_ids);
-    if (!metadata.IsValid()) {
-        EraseMetadata(tenant_state, object_entry, tenant_id, quota_mode,
-                      &tenant_accessor);
-        if (tenant_state.Empty()) {
-            tenant_directory_.Remove(tenant_id);
-        }
-    } else {
+        if (!metadata.IsValid()) {
+            EraseMetadata(tenant_state, object_entry, tenant_id, quota_mode,
+                          &tenant_accessor);
+        } else {
         SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                           previous_media);
         auto settle_result =
@@ -2065,9 +2020,6 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     auto& tenant_state = *tenant_handle;
     EraseMetadata(tenant_state, durable_entry.object_key, tenant_id, quota_mode,
                   &tenant_accessor);
-    if (tenant_state.Empty()) {
-        tenant_directory_.Remove(tenant_id);
-    }
 }
 
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
@@ -2254,25 +2206,8 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
-// EraseMetadata deletes the object metadata and also cleans up all
-// associated per-key state: offloading_tasks (with dec_refcnt),
-// processing_keys, replication_tasks, and promotion tasks.
-// Callers no longer need to clean these up manually before calling.
-void MasterService::EraseMetadata(
-    TenantState& tenant_state,
-    const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
-    const TenantId& tenant_id) {
-    EraseMetadata(tenant_state, entry, tenant_id, QuotaEraseMode::kFull,
-                  nullptr);
-}
-
-void MasterService::EraseMetadata(
-    TenantState& tenant_state,
-    const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
-    const TenantId& tenant_id, QuotaEraseMode quota_mode) {
-    EraseMetadata(tenant_state, entry, tenant_id, quota_mode, nullptr);
-}
-
+// Key-based teardown: resolve the entry at call time, then run the shared
+// entry-based teardown below.
 void MasterService::EraseMetadata(TenantState& tenant_state,
                                   const std::string& key,
                                   const TenantId& tenant_id,
@@ -2283,17 +2218,6 @@ void MasterService::EraseMetadata(TenantState& tenant_state,
         return;
     }
     EraseMetadata(tenant_state, entry, tenant_id, quota_mode, tenant_accessor);
-}
-
-void MasterService::EraseMetadata(TenantState& tenant_state,
-                                  const std::string& key,
-                                  const TenantId& tenant_id) {
-    auto entry = tenant_state.Pin(key);
-    if (!entry) {
-        return;
-    }
-    EraseMetadata(tenant_state, entry, tenant_id, QuotaEraseMode::kFull,
-                  nullptr);
 }
 
 // EraseMetadata deletes the object metadata and also cleans up all
@@ -2313,6 +2237,15 @@ void MasterService::EraseMetadata(
     // object are excluded. Release it before the route mutation so entry->mutex
     // and route_lock_ are never held together (lock-order invariant).
     std::unique_lock<std::shared_mutex> object_lock(entry->mutex);
+    // Claim teardown ownership under the object lock. A concurrent eraser
+    // that pinned this entry before the route erase would otherwise run the
+    // whole teardown again and double-release refcounts, quota charges and
+    // KV removal events. The metadata stays wired (only the flag flips), so
+    // readers holding a pin never observe null metadata.
+    if (entry->is_torn_down) {
+        return;
+    }
+    entry->is_torn_down = true;
     const std::string key = entry->key();
     const std::string group_id = entry->group_id();
     ObjectMetadata& metadata = *entry->metadata();
@@ -2402,9 +2335,12 @@ void MasterService::EraseMetadata(
             break;
     }
     // Release the object lock BEFORE the route mutation, so the route erase
-    // (EraseObject, route_lock_ unique) never runs under an entry lock.
+    // (EraseObjectIf, route_lock_ unique) never runs under an entry lock.
     object_lock.unlock();
-    tenant_state.EraseObject(key);
+    // Only erase the route slot if it still points at the entry we tore down;
+    // a concurrent remove + re-create may have published a replacement under
+    // the same key, and that live object must survive our teardown.
+    tenant_state.EraseObjectIf(key, entry.get());
     if (had_completed_disk && tenant_accessor) {
         tenant_accessor->OnDiskReplicaRemoved(had_completed_disk);
     }
@@ -2447,12 +2383,7 @@ void MasterService::RebuildGroupState() {
                                 const std::shared_ptr<TenantState>& handle) {
         auto& tenant_state = *handle;
         // Collect handles, then lock each per-object (there is no tenant
-        // level lock).
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata() || !entry->metadata()->IsGrouped()) {
                 continue;
@@ -2475,11 +2406,7 @@ void MasterService::RebuildGroupState() {
     tenant_directory_.Visit([&](const TenantId& tenant_id,
                                 const std::shared_ptr<TenantState>& handle) {
         auto& tenant_state = *handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata() || !entry->metadata()->IsGrouped()) {
                 continue;
@@ -2498,12 +2425,6 @@ void MasterService::RebuildGroupState() {
             entry->set_lease(lease);
         }
     });
-}
-
-void MasterService::ReRouteRestoredObjectsByKey() {
-    // Every object already lives in its own tenant's container (routing is
-    // decoupled from groups), so re-routing objects across shards is a no-op.
-    return;
 }
 
 void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
@@ -2714,17 +2635,11 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 
 void MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
-    std::vector<TenantId> empty_tenants;
     tenant_directory_.Visit([&](const TenantId& tenant_id,
                                 const std::shared_ptr<TenantState>& handle) {
         TenantStateAccessorRW tenant_accessor(handle.get());
         auto& tenant_state = *handle;
-        // Collect handles, then lock each per-object.
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        handle->VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = handle->SnapshotObjects();
         std::vector<std::string> keys_to_erase;
         for (const auto& entry : objs) {
             if (!entry->has_metadata()) {
@@ -2778,15 +2693,7 @@ void MasterService::ClearStaleHandles(
             EraseMetadata(tenant_state, key, tenant_id, QuotaEraseMode::kFull,
                           &tenant_accessor);
         }
-        if (tenant_state.Empty()) {
-            empty_tenants.push_back(tenant_id);
-        }
     });
-    // Cannot erase from the directory during Visit (immutable snapshot);
-    // remove empty tenants after the walk.
-    for (const auto& tenant_id : empty_tenants) {
-        tenant_directory_.Remove(tenant_id);
-    }
 }
 
 void MasterService::TaskCleanupThreadFunc() {
@@ -3037,11 +2944,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
     auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata()) {
                 continue;
@@ -3906,11 +3809,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
     auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata()) {
                 continue;
@@ -4519,7 +4418,7 @@ auto MasterService::AllocateAndInsertMetadata(
             LogTenantQuotaLedgerError(adopt_result, "adopt_pending", tenant_id,
                                       key);
             refund_pending_quota();
-            tenant_state.EraseObject(key);
+            tenant_state.EraseObjectIf(key, entry.get());
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
@@ -4650,9 +4549,6 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
             if (!admission_result) {
-                if (tenant_state.Empty()) {
-                    tenant_directory_.Remove(object_id.tenant_id);
-                }
                 return tl::make_unexpected(admission_result.error());
             }
 
@@ -5309,9 +5205,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
             if (!admission_result) {
-                if (tenant_state.Empty()) {
-                    tenant_directory_.Remove(object_id.tenant_id);
-                }
                 return tl::make_unexpected(admission_result.error());
             }
 
@@ -6749,12 +6642,11 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
         TenantStateAccessorRW tenant_accessor(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
-        tenant_handle->VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                if (entry->has_metadata()) {
-                    keys.push_back(entry->key());
-                }
-            });
+        for (const auto& entry : tenant_handle->SnapshotObjects()) {
+            if (entry->has_metadata()) {
+                keys.push_back(entry->key());
+            }
+        }
         for (const auto& key : keys) {
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry || !object_entry->has_metadata()) {
@@ -6860,18 +6752,16 @@ long MasterService::RemoveAll(bool force) {
     local_ssd_manager_.RequestRemoveAll();
 
     // Delete metadata — runs concurrently with client SSD cleanup.
-    std::vector<TenantId> empty_tenants;
     tenant_directory_.Visit([&](const TenantId& tenant_id,
                                 const std::shared_ptr<TenantState>& handle) {
         TenantStateAccessorRW tenant_accessor(handle.get());
         auto& tenant_state = *handle;
         std::vector<std::string> keys;
-        handle->VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                if (entry->has_metadata()) {
-                    keys.push_back(entry->key());
-                }
-            });
+        for (const auto& entry : handle->SnapshotObjects()) {
+            if (entry->has_metadata()) {
+                keys.push_back(entry->key());
+            }
+        }
         for (const auto& key : keys) {
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry || !object_entry->has_metadata()) {
@@ -6946,15 +6836,7 @@ long MasterService::RemoveAll(bool force) {
                 }
             }
         }
-        if (tenant_state.Empty()) {
-            empty_tenants.push_back(tenant_id);
-        }
     });
-    // Cannot erase from the directory during Visit (immutable snapshot);
-    // remove empty tenants after the walk.
-    for (const auto& tenant_id : empty_tenants) {
-        tenant_directory_.Remove(tenant_id);
-    }
 
     // tenants_seen holds only tenants that actually held an object, so this
     // difference is "held objects and lost all of them" — a real wipe. Both
@@ -7005,12 +6887,11 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
         TenantStateAccessorRW tenant_accessor(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
-        tenant_handle->VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                if (entry->has_metadata()) {
-                    keys.push_back(entry->key());
-                }
-            });
+        for (const auto& entry : tenant_handle->SnapshotObjects()) {
+            if (entry->has_metadata()) {
+                keys.push_back(entry->key());
+            }
+        }
         for (const auto& key : keys) {
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry || !object_entry->has_metadata()) {
@@ -8116,11 +7997,7 @@ void MasterService::ClearCandidatesForReload() {
     tenant_directory_.Visit([&](const TenantId&,
                                 const std::shared_ptr<TenantState>& handle) {
         auto& tenant_state = *handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
             entry->promotion_candidate.reset();
@@ -8141,11 +8018,7 @@ size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
     auto tenant_handle = tenant_directory_.Lookup(tenant_id);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             std::shared_lock<std::shared_mutex> lk(entry->mutex);
             if (entry->promotion_candidate.has_value()) {
@@ -8161,11 +8034,7 @@ void MasterService::ResetCandidateBackoffsForTesting() {
     tenant_directory_.Visit([&](const TenantId&,
                                 const std::shared_ptr<TenantState>& handle) {
         auto& tenant_state = *handle;
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
             if (entry->promotion_candidate.has_value()) {
@@ -8188,7 +8057,6 @@ size_t MasterService::RunPromotionCandidateRetry() {
     // All of a tenant's candidates live in one tenant container, so there is no
     // cross-tenant partitioning; the batch size bounds the scan.
 
-    std::vector<TenantId> empty_tenants;
     {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
         tenant_directory_.Visit([&](const TenantId& tenant_id,
@@ -8199,10 +8067,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
             }
             auto& tenant_state = *handle;
             // Collect handles, then lock each per-object.
-            std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-            handle->VisitObjects(
-                [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                        entry) { objs.push_back(entry); });
+            auto objs = handle->SnapshotObjects();
             std::vector<std::string> keys_to_drop;
             for (const auto& entry : objs) {
                 if (due_candidates.size() >= kPromotionRetryBatchSize) {
@@ -8267,16 +8132,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
                     }
                 }
             }
-
-            if (tenant_state.Empty()) {
-                empty_tenants.push_back(tenant_id);
-            }
         });
-    }
-    // Cannot erase from the directory during Visit (immutable snapshot);
-    // remove empty tenants after the walk.
-    for (const auto& tenant_id : empty_tenants) {
-        tenant_directory_.Remove(tenant_id);
     }
 
     size_t queued = 0;
@@ -8537,17 +8393,11 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
         return;
     }
     const int64_t now_ms = DynamicReplicationNowMs();
-    std::vector<TenantId> empty_tenants;
     tenant_directory_.Visit([&](const TenantId& tenant_id,
                                 const std::shared_ptr<TenantState>& handle) {
         TenantStateAccessorRW tenant_accessor(handle.get());
         auto& tenant_state = *handle;
-        // Collect handles, then lock each per-object.
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        handle->VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = handle->SnapshotObjects();
         std::vector<std::string> expired_pending_keys;
         for (const auto& entry : objs) {
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
@@ -8570,15 +8420,7 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
             ClearDynamicReplicationStateForKey(tenant_state, key);
         }
         tenant_state.object_route.EraseExpiredDynamicReplicationLeases(now_ms);
-        if (tenant_state.Empty()) {
-            empty_tenants.push_back(tenant_id);
-        }
     });
-    // Cannot erase from the directory during Visit (immutable snapshot);
-    // remove empty tenants after the walk.
-    for (const auto& tenant_id : empty_tenants) {
-        tenant_directory_.Remove(tenant_id);
-    }
 }
 
 bool MasterService::HasDynamicReplicationPending(TenantState& tenant_state,
@@ -9461,19 +9303,12 @@ void MasterService::EvictionThreadFunc() {
             {
                 std::shared_lock<std::shared_mutex> shared_lock(
                     snapshot_mutex_);
-                std::vector<TenantId> empty_tenants;
                 tenant_directory_.Visit(
                     [&](const TenantId& tenant_id,
                         const std::shared_ptr<TenantState>& handle) {
                         TenantStateAccessorRW tenant_accessor(handle.get());
                         DiscardExpiredProcessingReplicas(tenant_accessor, now);
-                        if (handle->Empty()) {
-                            empty_tenants.push_back(tenant_id);
-                        }
                     });
-                for (const auto& tenant_id : empty_tenants) {
-                    tenant_directory_.Remove(tenant_id);
-                }
                 ReleaseExpiredDiscardedReplicas(now);
             }
             last_discard_time = now;
@@ -9526,12 +9361,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // transiently metadata-less tenant falls back to Default.
     auto& tenant_state = tenant_accessor.get();
     // Collect handles, then lock each per-object (there is no tenant level
-    // lock).
-    std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> entries;
-    tenant_state.VisitObjects(
-        [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-            entries.push_back(entry);
-        });
+    auto entries = tenant_state.SnapshotObjects();
 
     // Recovery of the tenant id: every object in a tenant container carries the
     // same tenant id; peek the first object (falls back to Default when empty).
@@ -9991,17 +9821,12 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         if (!skip_cleanup) {
             auto cleanup_now = now;
-            std::vector<TenantId> empty_tenants;
             tenant_directory_.Visit([&](const TenantId& tid,
                                         const std::shared_ptr<TenantState>&
                                             handle) {
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
-                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
-                    objs;
-                tenant_state.VisitObjects(
-                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                            entry) { objs.push_back(entry); });
+                auto objs = tenant_state.SnapshotObjects();
                 std::vector<std::string> keys_to_erase;
                 for (const auto& entry : objs) {
                     if (!entry->has_metadata()) {
@@ -10018,15 +9843,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 for (const auto& key : keys_to_erase) {
                     EraseMetadata(tenant_state, key, tid);
                 }
-                if (tenant_state.Empty()) {
-                    empty_tenants.push_back(tid);
-                }
             });
-            // Cannot erase from the directory during Visit (immutable
-            // snapshot); remove empty tenants after the walk.
-            for (const auto& tid : empty_tenants) {
-                tenant_directory_.Remove(tid);
-            }
         }
 
         // Rebuild allocated memory metrics
@@ -10041,11 +9858,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             [&](const TenantId&, const std::shared_ptr<TenantState>& handle) {
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
-                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
-                    objs;
-                tenant_state.VisitObjects(
-                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                            entry) { objs.push_back(entry); });
+                auto objs = tenant_state.SnapshotObjects();
                 for (const auto& entry : objs) {
                     if (!entry->has_metadata()) {
                         continue;
@@ -10369,10 +10182,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             auto& tenant_state = *tenant_handle;
             candidate_keys.reserve(tenant_state.ObjectCount());
             // Collect handles, then lock each per-object.
-            std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-            tenant_state.VisitObjects(
-                [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                        entry) { objs.push_back(entry); });
+            auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
                 if (!entry->has_metadata()) {
                     continue;
@@ -10830,12 +10640,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         auto& tenant_state = *handle;
         local_object_count += tenant_state.ObjectCount();
-        // Collect handles, then lock each per-object.
-        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-        tenant_state.VisitObjects(
-            [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-                objs.push_back(entry);
-            });
+        auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             if (!entry->has_metadata()) {
                 continue;
@@ -10900,10 +10705,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             TenantStateAccessorRW tenant_accessor(handle.get());
             auto& tenant_state = *handle;
             // Collect handles, then lock each per-object.
-            std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-            tenant_state.VisitObjects(
-                [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                        entry) { objs.push_back(entry); });
+            auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
                 if (!entry->has_metadata()) {
                     continue;
@@ -11288,7 +11090,6 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
         static_cast<long>(std::ceil(object_count * evict_ratio_target));
 
     if (ideal_evict_num > 0) {
-        std::vector<TenantId> empty_tenants;
         tenant_directory_.Visit([&](const TenantId& tenant_id,
                                     const std::shared_ptr<TenantState>&
                                         handle) {
@@ -11297,10 +11098,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             }
             TenantStateAccessorRW tenant_accessor(handle.get());
             auto& tenant_state = *handle;
-            std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objects;
-            tenant_state.VisitObjects(
-                [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                        entry) { objects.push_back(entry); });
+            auto objects = tenant_state.SnapshotObjects();
             for (auto& entry : objects) {
                 if (evicted_count >= ideal_evict_num) {
                     break;
@@ -11425,15 +11223,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                   QuotaEraseMode::kFull, &tenant_accessor);
                 }
             }
-            if (tenant_state.Empty()) {
-                empty_tenants.push_back(tenant_id);
-            }
         });
-        // Cannot erase from the directory during Visit (immutable snapshot);
-        // remove empty tenants after the walk.
-        for (const auto& tenant_id : empty_tenants) {
-            tenant_directory_.Remove(tenant_id);
-        }
     }
 
     if (evicted_count > 0) {
@@ -12021,7 +11811,6 @@ MasterService::MetadataSerializer::Deserialize(
     // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
     // shards before rebuilding the group domain (which is derived from
     // metadata).
-    service_->ReRouteRestoredObjectsByKey();
     service_->RebuildGroupState();
     service_->ClearCandidatesForReload();
     return {};
@@ -12064,12 +11853,11 @@ MasterService::MetadataSerializer::SerializeTenant(
     // within a single tenant; the tenant id is fixed). NOTE: sort may be slow
     // for large tenants.
     std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> entries;
-    tenant_state.VisitObjects(
-        [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry) {
-            if (entry->has_metadata()) {
-                entries.push_back(entry);
-            }
-        });
+    for (const auto& entry : tenant_state.SnapshotObjects()) {
+        if (entry->has_metadata()) {
+            entries.push_back(entry);
+        }
+    }
     std::stable_sort(entries.begin(), entries.end(),
                      [](const auto& lhs, const auto& rhs) {
                          return lhs->key() < rhs->key();
@@ -12936,10 +12724,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
                                     const std::shared_ptr<TenantState>&
                                         handle) {
             auto& tenant_state = *handle;
-            // Collect handles, then lock each per-object.
-            std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-            tenant_state.VisitObjects(
-                [&](const auto& entry) { objs.push_back(entry); });
+            auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
                 if (!entry->has_metadata()) {
                     continue;
@@ -13034,10 +12819,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         tenant_directory_.Visit([&](const TenantId& tenant_id,
                                     const std::shared_ptr<TenantState>&
                                         handle) {
-            // Collect handles, then lock each per-object.
-            std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> objs;
-            handle->VisitObjects(
-                [&](const auto& entry) { objs.push_back(entry); });
+            auto objs = handle->SnapshotObjects();
             for (const auto& entry : objs) {
                 if (!entry->has_metadata()) {
                     continue;

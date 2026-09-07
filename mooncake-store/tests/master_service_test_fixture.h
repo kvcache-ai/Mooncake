@@ -504,7 +504,7 @@ class MasterServiceTest : public ::testing::Test {
         if (!tenant_handle) {
             return {};
         }
-        return service.GetGroupMemberKeys(*tenant_handle, group_id);
+        return tenant_handle->object_route.Members(group_id);
     }
 
     void ClearGroupStateForTest(MasterService& service) {
@@ -564,14 +564,13 @@ class MasterServiceTest : public ::testing::Test {
 
         const TenantId tenant = TenantId::Default();
 
-        // Objects live in the tenant container keyed by tenant_id; there is no
-        // cross-shard object routing to migrate. A grouped object is therefore
-        // reachable via the same object lookup as a singleton, and
-        // ReRouteRestoredObjectsByKey() is a safe no-op.
+        // Objects live in the tenant container keyed by tenant_id; there is
+        // no cross-shard object routing to migrate. A grouped object is
+        // therefore reachable via the same object lookup as a singleton.
         EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
 
-        // Run the (no-op) migration; the grouped object stays reachable.
-        service.ReRouteRestoredObjectsByKey();
+        // Object routing is decoupled from groups, so legacy snapshots need
+        // no migration step; the grouped object stays reachable as-is.
 
         EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
         EXPECT_TRUE(service.ExistKey(ungrouped_key, tenant).value_or(false));

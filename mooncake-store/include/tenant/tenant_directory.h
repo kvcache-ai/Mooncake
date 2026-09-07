@@ -51,6 +51,33 @@ class TenantDirectory {
                                    std::memory_order_release);
     }
 
+    // Atomic get-or-create. Two concurrent callers for an absent tenant each
+    // run `factory` (racing), but both observe the SAME winning handle once
+    // the winner is published, so a loser never keeps building on a private
+    // TenantState that the directory will never reach. `factory` must not
+    // re-enter the directory.
+    template <typename Factory>
+    Handle GetOrCreate(const TenantId& tenant_id, Factory&& factory) {
+        if (auto handle = Lookup(tenant_id)) {
+            return handle;
+        }
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        const auto frame =
+            std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
+        const auto it = frame->find(tenant_id);
+        if (it != frame->end()) {
+            return it->second;
+        }
+        auto handle = factory();
+        // Copy-on-write: never mutate a snapshot that concurrent readers may
+        // still hold.
+        auto next = std::make_shared<Frame>(*frame);
+        (*next)[tenant_id] = handle;
+        std::atomic_store_explicit(&snapshot_, std::move(next),
+                                   std::memory_order_release);
+        return handle;
+    }
+
     void Remove(const TenantId& tenant_id) {
         std::lock_guard<std::mutex> lock(write_mutex_);
         const auto frame =
@@ -64,16 +91,19 @@ class TenantDirectory {
                                    std::memory_order_release);
     }
 
-    // Snapshot-consistent visit of every (tenant, handle). The visitor runs
+    // Snapshot-consistent visit of every (tenant, handle). The frame is
+    // iterated immutably and the handle is passed as const, so a visitor can
+    // never replace entries in an already-published frame and break the COW
+    // invariant (mutation goes through Upsert, which copies). The visitor runs
     // while a strong snapshot is held, so a concurrent COW publish cannot
-    // invalidate it; it must NOT call Upsert/Remove on this directory. Callers
-    // dereference `handle` (a strong owning handle) and lock the target's own
-    // mutex before mutating it.
+    // invalidate it; it must NOT call Upsert/Remove/GetOrCreate on this
+    // directory. Callers dereference `handle` (a strong owning handle) and
+    // lock the target's own mutex before mutating it.
     template <typename Fn>
     void Visit(Fn&& fn) const {
         auto frame =
             std::atomic_load_explicit(&snapshot_, std::memory_order_acquire);
-        for (auto& kv : *frame) {
+        for (const auto& kv : *frame) {
             std::forward<Fn>(fn)(kv.first, kv.second);
         }
     }

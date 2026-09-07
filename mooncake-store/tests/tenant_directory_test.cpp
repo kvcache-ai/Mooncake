@@ -56,6 +56,63 @@ TEST(TenantDirectoryTest,
     EXPECT_EQ(*old_handle, 7);                      // old generation untouched
 }
 
+TEST(TenantDirectoryTest, GetOrCreateReturnsWinningHandleToAllRacers) {
+    TestDirectory dir;
+    const TenantId tenant("tenant-get-or-create");
+
+    // Miss keeps the directory empty until the factory result is published.
+    auto created = dir.GetOrCreate(tenant, [] { return std::make_shared<int>(1); });
+    ASSERT_NE(created, nullptr);
+    EXPECT_EQ(*created, 1);
+
+    // Hit returns the published handle and never invokes the factory.
+    bool factory_ran = false;
+    auto hit = dir.GetOrCreate(tenant, [&] {
+        factory_ran = true;
+        return std::make_shared<int>(2);
+    });
+    EXPECT_FALSE(factory_ran);
+    EXPECT_EQ(hit.get(), created.get());
+    EXPECT_EQ(*hit, 1);
+
+    // Concurrent racers for an ABSENT tenant must all observe the ONE winning
+    // handle, even though every loser also ran its factory. This is the
+    // guarantee a plain Lookup + Upsert pair cannot make.
+    constexpr int kRacers = 16;
+    dir.Remove(tenant);
+    EXPECT_EQ(dir.Lookup(tenant), nullptr);
+    std::vector<std::shared_ptr<int>> observed(kRacers);
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> threads;
+    threads.reserve(kRacers);
+    for (int i = 0; i < kRacers; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            observed[i] = dir.GetOrCreate(
+                tenant, [] { return std::make_shared<int>(-1); });
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kRacers) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    for (int i = 0; i < kRacers; ++i) {
+        ASSERT_NE(observed[i], nullptr) << "racer " << i;
+        EXPECT_EQ(observed[i].get(), observed[0].get())
+            << "racer " << i << " kept a losing handle";
+    }
+    EXPECT_EQ(dir.Lookup(tenant).get(), observed[0].get())
+        << "the winning handle must be the reachable one";
+}
+
 TEST(TenantDirectoryTest, ConcurrentReadsDuringWritesAreSafeAndLinearizable) {
     TestDirectory dir;
     const TenantId tenant("tenant-a");

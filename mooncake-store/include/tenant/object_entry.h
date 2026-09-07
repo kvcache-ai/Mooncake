@@ -46,6 +46,13 @@ class ObjectEntry {
 
     // Per-key runtime task state.
     bool is_processing{false};
+    // Set under `mutex` by EraseMetadata once this entry's metadata has been
+    // torn down, so a second eraser that pinned the entry before the route
+    // erase bails out instead of double-releasing refcounts, quota charges
+    // and KV removal events. The metadata itself stays wired until the entry
+    // is destroyed, so readers that pinned the entry never observe null
+    // metadata.
+    bool is_torn_down{false};
     std::optional<ReplicationTask> replication_task;
     std::optional<OffloadingTask> offloading_task;
     std::optional<PromotionTask> promotion_task;

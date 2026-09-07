@@ -1084,10 +1084,20 @@ class MasterService {
         bool EraseObject(const std::string& key) {
             return object_route.Erase(key);
         }
+        // Only erase when the route still resolves to `expected`; see
+        // TenantStore::EraseIf.
+        bool EraseObjectIf(const std::string& key,
+                           const mooncake::tenant::ObjectEntry* expected) {
+            return object_route.EraseIf(key, expected);
+        }
         bool ContainsObject(const std::string& key) const {
             return object_route.Contains(key);
         }
         size_t ObjectCount() const { return object_route.ObjectCount(); }
+        std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
+        SnapshotObjects() const {
+            return object_route.SnapshotObjects();
+        }
         void VisitObjects(
             const std::function<
                 void(const std::shared_ptr<mooncake::tenant::ObjectEntry>&)>&
@@ -1248,7 +1258,6 @@ class MasterService {
     tl::expected<TenantId, ErrorCode> ResolveTenantIdForWriteLocked(
         const TenantId& tenant_id) const;
     bool IsTenantRegistered(const TenantId& tenant_id) const;
-    bool TenantHasObjects(const TenantId& tenant_id) const;
 
     // Legacy shard-index helpers retained for compatibility; routing is now
     // per-tenant, so these are only used by tests/restore paths.
@@ -1265,15 +1274,10 @@ class MasterService {
 
     // Register a member key under a group and return the group's shared Lease
     // (creating it on first member). Returns nullptr for empty group_id.
-    std::shared_ptr<Lease> RegisterGroupMember(TenantState& tenant_state,
-                                               const std::string& key,
-                                               const std::string& group_id);
     void UnregisterGroupMember(TenantState& tenant_state,
                                const std::string& key,
                                const std::string& group_id);
     // Reads the member keys registered for `group_id`; empty if unregistered.
-    std::vector<std::string> GetGroupMemberKeys(
-        const TenantState& tenant_state, const std::string& group_id) const;
 
     // A single group member's eviction outcome, fed back by the
     // EvictGroupOrObject callback.
@@ -1323,32 +1327,29 @@ class MasterService {
         kPreserveOld,
         kAbortOnly,
     };
+    // Entry-based teardown of a previously pinned entry (the caller may have
+    // extra state wired to it that a fresh Pin could no longer observe).
+    // Key-based teardown resolves the entry at call time. Both erase the
+    // route slot only when it still resolves to the torn-down entry, and the
+    // teardown runs at most once per entry (metadata is taken under the
+    // object lock).
     void EraseMetadata(
         TenantState& tenant_state,
         const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
-        const TenantId& tenant_id);
-    void EraseMetadata(
-        TenantState& tenant_state,
-        const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode,
-        TenantStateAccessorRW* tenant_accessor,
+        const TenantId& tenant_id, QuotaEraseMode quota_mode =
+                                       QuotaEraseMode::kFull,
+        TenantStateAccessorRW* tenant_accessor = nullptr,
         const std::vector<std::string>& previous_media_hint = {});
-    void EraseMetadata(
-        TenantState& tenant_state,
-        const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode);
     void EraseMetadata(TenantState& tenant_state, const std::string& key,
-                       const TenantId& tenant_id, QuotaEraseMode quota_mode,
-                       TenantStateAccessorRW* tenant_accessor);
-    void EraseMetadata(TenantState& tenant_state, const std::string& key,
-                       const TenantId& tenant_id);
+                       const TenantId& tenant_id,
+                       QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
+                       TenantStateAccessorRW* tenant_accessor = nullptr);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         TenantState& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
-    TenantState& GetOrCreateTenantState(const TenantId& tenant_id);
     std::shared_ptr<TenantState> GetOrCreateTenantStateHandle(
         const TenantId& tenant_id);
     // Test-only seam (friend of MasterServiceHATest): return the tenant object
@@ -1403,7 +1404,6 @@ class MasterService {
     // Post-restore migration: re-route every object to its hash(tenant, key)
     // shard, fixing snapshots that placed grouped objects on hash(group_id)
     // shards. No-op for correctly-routed snapshots.
-    void ReRouteRestoredObjectsByKey();
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
@@ -1680,7 +1680,6 @@ class MasterService {
                     if (tenant_state_ != nullptr) {
                         service_->ErasePromotionTaskIfPresent(
                             *tenant_state_, object_id_.user_key);
-                        MaybeEraseEmptyTenant();
                     }
                 }
             }
@@ -1734,21 +1733,18 @@ class MasterService {
                                     object_id_.tenant_id, QuotaEraseMode::kFull,
                                     &tenant_guard_, previous_media_hint);
             entry_.reset();
-            MaybeEraseEmptyTenant();
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
             if (entry_ != nullptr) {
                 entry_->is_processing = false;
             }
-            MaybeEraseEmptyTenant();
         }
 
         void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
             if (entry_ != nullptr) {
                 entry_->replication_task.reset();
             }
-            MaybeEraseEmptyTenant();
         }
 
         void Create(const UUID& client_id, uint64_t total_length,
@@ -1815,16 +1811,13 @@ class MasterService {
             }
         }
 
-        void MaybeEraseEmptyTenant() NO_THREAD_SAFETY_ANALYSIS {
-            if (tenant_state_ == nullptr || !tenant_state_->Empty()) {
-                return;
-            }
-            service_->tenant_directory_.Remove(object_id_.tenant_id);
-            tenant_state_ = nullptr;
-            entry_.reset();
-            lock_ = std::unique_lock<std::shared_mutex>();
-            tenant_guard_ = TenantStateAccessorRW(nullptr);
-        }
+        // NOTE: empty tenants are deliberately left reachable in the directory.
+        // An Empty()-check + Remove() here cannot be made atomic with a
+        // concurrent first insert for the same tenant (Lookup happens outside
+        // every tenant lock), so eager removal could strand a just-inserted
+        // object in a TenantState that is no longer reachable. Registered
+        // tenants are bounded, so the retention cost is a small empty
+        // container per tenant.
 
         MasterService* service_;
         ObjectIdentity object_id_;

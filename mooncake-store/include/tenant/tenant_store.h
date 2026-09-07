@@ -109,6 +109,21 @@ class TenantStore {
         return route_.erase(key) > 0;
     }
 
+    // Erase the route slot for `key` ONLY if it still resolves to `expected`.
+    // A teardown that pinned an entry must not blindly erase by key: the
+    // per-object lock is released before the route mutation, so a concurrent
+    // remove + re-create may already have published a replacement entry under
+    // the same key, and erasing by key alone would drop that live object.
+    bool EraseIf(const std::string& key, const ObjectEntry* expected) {
+        std::unique_lock<std::shared_mutex> lock(route_lock_);
+        const auto it = route_.find(key);
+        if (it == route_.end() || it->second.get() != expected) {
+            return false;
+        }
+        route_.erase(it);
+        return true;
+    }
+
     // Insert an object and, if it has a non-empty group_id, join the group:
     // wire the group's shared Lease into the entry and register it as a member.
     // Returns false if the key already exists. Group membership is wired and
@@ -158,6 +173,21 @@ class TenantStore {
         }
         std::shared_lock<std::shared_mutex> rl(route_lock_);
         return route_.empty();
+    }
+
+    // Collect strong handles to every live object under this tenant. The
+    // route lock is released before returning, so callers can take each
+    // entry's own mutex without holding the route lock. Equivalent to the
+    // collect-then-iterate VisitObjects idiom, without re-stating it at every
+    // call site.
+    std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects() const {
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        std::vector<std::shared_ptr<ObjectEntry>> entries;
+        entries.reserve(route_.size());
+        for (const auto& [key, entry] : route_) {
+            entries.push_back(entry);
+        }
+        return entries;
     }
 
     // Visit every live object under this tenant. Collect the strong handles

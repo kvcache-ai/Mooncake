@@ -941,9 +941,73 @@ TEST_F(MasterServiceTest, AccessorCreateRePinsWinnerOnLostInsert) {
 }
 
 TEST_F(MasterServiceTest,
+       ConcurrentFirstWritesToDistinctKeysShareReachableTenant) {
+    // Get-or-create must be atomic: 16 threads racing to write the first 16
+    // distinct keys of the same absent tenant all run the tenant factory, but
+    // only the published TenantState is reachable through the directory. With
+    // a non-atomic Lookup + Upsert the losers kept writing into a private
+    // TenantState, silently stranding their objects.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+    const TenantId tenant_id("tenant_concurrent_first_write_distinct_keys");
+
+    static constexpr size_t kThreadCount = 16;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::string> keys(kThreadCount);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        keys[i] = "first_write_key_" + std::to_string(i);
+    }
+
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            auto put_start = service_->PutStart(
+                client_id, keys[i], tenant_id, 1024, config);
+            ASSERT_TRUE(put_start.has_value())
+                << "key=" << keys[i] << ", error=" << put_start.error();
+            ASSERT_TRUE(service_->PutEnd(client_id, keys[i], tenant_id,
+                                         ReplicaType::MEMORY)
+                            .has_value());
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Every object must be reachable through the directory, not stranded in a
+    // losing TenantState.
+    for (const auto& key : keys) {
+        EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value())
+            << "stranded key=" << key;
+    }
+}
+
+TEST_F(MasterServiceTest,
        GroupedEvictionExpandsSafeMembersAndSkipsLeasedGroup) {
-    auto service_config =
-        MasterServiceConfig::builder().set_default_kv_lease_ttl(1000).build();
+    // Disable the background evictor entirely (ratio trigger needs
+    // used_ratio > watermark, pressure trigger needs eviction_ratio > 0) and
+    // drive each pass through RunBatchEvictForTesting instead, so the
+    // leased-group assertions below cannot race a background pass that fires
+    // between PutEnd and the lease-acquiring ExistKey.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(1000)
+                              .set_eviction_ratio(0.0)
+                              .set_eviction_high_watermark_ratio(1.0)
+                              .build();
     constexpr size_t kSegmentSize = 4 * 1024 * 1024;
     constexpr size_t kObjectSize = 2 * 1024 * 1024;
 
@@ -974,7 +1038,7 @@ TEST_F(MasterServiceTest,
         ASSERT_FALSE(trigger_result.has_value());
         EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        service_->RunBatchEvictForTesting(1.0, 1.0);
 
         EXPECT_FALSE(service_->ExistKey(evict_key_a, TenantId::Default())
                          .value_or(true));
@@ -1013,7 +1077,9 @@ TEST_F(MasterServiceTest,
         ASSERT_FALSE(trigger_result.has_value());
         EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // The group lease acquired by the ExistKey read above must keep the
+        // whole group intact through a full-throttle eviction pass.
+        service_->RunBatchEvictForTesting(1.0, 1.0);
 
         EXPECT_TRUE(service_->GetReplicaList(leased_key_a, TenantId::Default())
                         .has_value());
