@@ -510,6 +510,130 @@ TEST_F(LocalHotCacheTest, PutHotKeyWithTokenRejectsStaleFill) {
     EXPECT_TRUE(cache.HasHotKey("k"));
 }
 
+// A block handed back without a key is not published; it must return to the
+// LRU tail so it is the next block reused.
+TEST_F(LocalHotCacheTest, PutHotKeyEmptyKeyReturnsBlockToTail) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    HotMemBlock* published = cache.GetFreeBlock();
+    ASSERT_NE(published, nullptr);
+    HotMemBlock* unused = cache.GetFreeBlock();
+    ASSERT_NE(unused, nullptr);
+    ASSERT_EQ(cache.GetCacheSize(), 0u);
+
+    published->key_ = "key1";
+    published->size = 1024;
+    ASSERT_TRUE(cache.PutHotKey(published));
+
+    unused->key_.clear();
+    EXPECT_FALSE(cache.PutHotKey(unused));
+    EXPECT_EQ(cache.GetCacheSize(), 2u)
+        << "Unkeyed block must be returned to the pool";
+
+    // At the tail it is the next victim, so the published key survives.
+    EXPECT_EQ(cache.GetFreeBlock(), unused);
+    EXPECT_TRUE(cache.HasHotKey("key1"));
+}
+
+// Losing the publish race (key already mapped) must keep the published entry
+// and recycle the late block instead of overwriting the mapping.
+TEST_F(LocalHotCacheTest, PutHotKeyDuplicateKeyKeepsPublishedEntry) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    HotMemBlock* first = cache.GetFreeBlock();
+    ASSERT_NE(first, nullptr);
+    first->key_ = "dup";
+    first->size = 1024;
+    ASSERT_TRUE(cache.PutHotKey(first));
+
+    HotMemBlock* second = cache.GetFreeBlock();
+    ASSERT_NE(second, nullptr);
+    ASSERT_NE(second, first);
+    second->key_ = "dup";
+    second->size = 2048;
+
+    EXPECT_FALSE(cache.PutHotKey(second));
+    EXPECT_TRUE(second->key_.empty());
+    EXPECT_EQ(cache.GetCacheSize(), 2u);
+
+    // The original mapping (and its logical size) is untouched.
+    HotMemBlock* hit = cache.GetHotKey("dup");
+    ASSERT_EQ(hit, first);
+    EXPECT_EQ(hit->size, 1024u);
+    cache.ReleaseHotKey("dup");
+}
+
+// A removed-but-still-referenced block keeps its key until the reader
+// releases it. Republishing that key meanwhile must be rejected, otherwise two
+// blocks would claim the same key.
+TEST_F(LocalHotCacheTest, PutHotKeyRejectedWhileActiveBlockHoldsSameKey) {
+    const size_t cache_size = 32 * 1024 * 1024;  // 2 blocks
+    LocalHotCache cache(cache_size);
+
+    HotMemBlock* first = cache.GetFreeBlock();
+    ASSERT_NE(first, nullptr);
+    first->key_ = "k";
+    first->size = 1024;
+    ASSERT_TRUE(cache.PutHotKey(first));
+
+    // Remove while a reader still holds the block.
+    ASSERT_EQ(cache.GetHotKey("k"), first);
+    ASSERT_TRUE(cache.RemoveHotKey("k"));
+    ASSERT_FALSE(cache.HasHotKey("k"));
+
+    HotMemBlock* refill = cache.GetFreeBlock();
+    ASSERT_NE(refill, nullptr);
+    ASSERT_NE(refill, first);
+    refill->key_ = "k";
+    refill->size = 1024;
+
+    EXPECT_FALSE(cache.PutHotKey(refill));
+    EXPECT_FALSE(cache.HasHotKey("k"));
+    EXPECT_EQ(cache.GetCacheSize(), 2u);
+
+    // After the reader releases, the key becomes publishable again.
+    cache.ReleaseHotKey("k");
+    HotMemBlock* republished = cache.GetFreeBlock();
+    ASSERT_NE(republished, nullptr);
+    republished->key_ = "k";
+    republished->size = 1024;
+    EXPECT_TRUE(cache.PutHotKey(republished));
+    EXPECT_TRUE(cache.HasHotKey("k"));
+}
+
+// A detached block must never publish while it carries a stale ref_count:
+// the active-reader guard rejects the publish (a reader may still be copying
+// from the block), but the block itself must be recovered — returned to the
+// pool with its key and ref_count cleared — so it is not leaked.
+TEST_F(LocalHotCacheTest, PutHotKeyStaleRefCountRejectedAndRecovered) {
+    const size_t cache_size = 16 * 1024 * 1024;  // 1 block
+    LocalHotCache cache(cache_size);
+
+    HotMemBlock* block = cache.GetFreeBlock();
+    ASSERT_NE(block, nullptr);
+    block->key_ = "k";
+    block->size = 1024;
+    block->ref_count = 3;  // simulate a stale reader on the detached block
+
+    // The active-reader guard sees ref_count > 0 for this key and refuses
+    // the publish instead of overwriting memory a reader may still use.
+    EXPECT_FALSE(cache.PutHotKey(block));
+    EXPECT_TRUE(block->key_.empty());
+    EXPECT_EQ(block->ref_count.load(), 0);
+    EXPECT_EQ(cache.GetCacheSize(), 1u);
+
+    // The block is back in the pool and cleanly publishable again.
+    HotMemBlock* recovered = cache.GetFreeBlock();
+    ASSERT_EQ(recovered, block);
+    recovered->key_ = "k";
+    recovered->size = 1024;
+    EXPECT_TRUE(cache.PutHotKey(recovered));
+    EXPECT_TRUE(cache.HasHotKey("k"));
+    EXPECT_EQ(recovered->ref_count.load(), 0);
+}
+
 // Test LocalHotCacheHandler basic functionality
 TEST_F(LocalHotCacheTest, LocalHotCacheHandlerBasic) {
     const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
