@@ -59,6 +59,12 @@ Status SegmentManager::openRemote(SegmentID &handle,
     return Status::OK();
 }
 
+std::string SegmentManager::remoteName(SegmentID handle) {
+    RWSpinlock::ReadGuard guard(lock_);
+    auto it = id_to_name_map_.find(handle);
+    return it == id_to_name_map_.end() ? std::string() : it->second;
+}
+
 Status SegmentManager::closeRemote(SegmentID handle) {
     RWSpinlock::WriteGuard guard(lock_);
     if (!id_to_name_map_.count(handle))
