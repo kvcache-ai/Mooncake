@@ -13,7 +13,6 @@ if(USE_CUDA)
   enable_language(CUDA)
   set(_pg_device_input
       "${_pg_device_source}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_transfer/routes/rdma_route/rdma_route.cu"
       "${CMAKE_CURRENT_SOURCE_DIR}/device_comm/device_collective/protocols/ring/ring_all_reduce.cu"
   )
 elseif(USE_MUSA OR USE_MACA)

@@ -12,8 +12,8 @@
 
 namespace mooncake {
 
-__device__ __forceinline__ TransferResult toTransferResult(
-    device::IbgdaPollResult result) {
+__device__ __forceinline__ TransferResult
+toTransferResult(device::IbgdaPollResult result) {
     switch (result) {
         case device::IbgdaPollResult::Completed:
             return TransferResult::Succeeded;
@@ -33,8 +33,8 @@ class RdmaTransferTicket {
         uint64_t* wait_result)
         : wait_result_(wait_result) {}
 
-    __device__ __forceinline__ RdmaTransferTicket(
-        device::IbgdaPollResult result, uint64_t* wait_result)
+    __device__ __forceinline__
+    RdmaTransferTicket(device::IbgdaPollResult result, uint64_t* wait_result)
         : wait_result_(wait_result), result_(result) {}
 
     __device__ __forceinline__ RdmaTransferTicket(mlx5gda_qp_devctx* qp,
@@ -124,7 +124,7 @@ __device__ __forceinline__ void appendRdmaSignal(
     PG_DEVICE_UNREACHABLE();
 }
 
-__device__ __forceinline__ RdmaTransferTicket
+static __device__ __noinline__ RdmaTransferTicket
 rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
         const void* source, uint64_t remote_payload_offset, uint64_t size,
         const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
@@ -182,32 +182,41 @@ rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
 __device__ __forceinline__ RdmaTransferTicket
 rdmaSignal(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
            const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
-           uint64_t* wait_result,
-           cooperative_groups::thread_block block) {
+           uint64_t* wait_result, cooperative_groups::thread_block block) {
     return rdmaPut(route, context, nullptr, 0, 0, signal, timeout_ticks, lane,
                    wait_result, block);
 }
 
-static __global__ void drainRdmaQueuePairs(mlx5gda_qp_devctx* qps,
-                                           uint32_t num_qps,
-                                           uint64_t timeout_ticks,
-                                           TransferResult* results) {
-    // One thread per QP: launch with gridDim.x * blockDim.x >= num_qps.
-    // Extra threads exit below; fewer threads would leave QPs undrained.
-    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= num_qps) return;
+__device__ __forceinline__ void drainRdmaTransfers(
+    const DeviceTransferHandle& handle, const GlobalRank* peers,
+    uint32_t peer_count) {
+    const auto& context = handle.route_context.rdma;
+    const uint32_t num_qps = peer_count * context.qps_per_rank;
+    for (uint32_t index = 0; index < num_qps; ++index) {
+        const auto& route = handle.routes[peers[index / context.qps_per_rank]];
+        if (route.kind != DeviceRouteKind::Rdma) continue;
 
-    auto* qp = qps + index;
-    device::mc_ibgda_lock(qp);
-    auto result = device::IbgdaPollResult::Completed;
-    const uint16_t head = qp->wq_head;
-    if (head != qp->wq_tail) {
-        result = device::mc_ibgda_poll_cq(qp, static_cast<uint16_t>(head - 1),
-                                          clock64() + timeout_ticks);
+        const uint32_t lane = index % context.qps_per_rank;
+        auto* qp = rdmaQueuePair(route.rdma, context, lane);
+        device::mc_ibgda_lock(qp);
+        auto result = device::IbgdaPollResult::Completed;
+        const uint16_t head = qp->wq_head;
+        if (head != qp->wq_tail) {
+            result = device::mc_ibgda_poll_cq(
+                qp, static_cast<uint16_t>(head - 1),
+                clock64() + handle.drain_timeout_ticks);
+        }
+        device::mc_ibgda_unlock(qp);
+
+        // Drain is best-effort, including when the failed peer cannot complete
+        // outstanding work. Do not prevent recovery or kernel exit.
+        if (result != device::IbgdaPollResult::Completed) {
+            printf("[PG] Device RDMA QP %u drain %s; continuing\n",
+                   route.rdma.qp_offset + lane,
+                   result == device::IbgdaPollResult::TimedOut ? "timed out"
+                                                               : "failed");
+        }
     }
-    device::mc_ibgda_unlock(qp);
-
-    results[index] = toTransferResult(result);
 }
 
 }  // namespace mooncake

@@ -21,6 +21,22 @@
 namespace mooncake {
 namespace {
 
+constexpr uint64_t kDrainTimeoutMs = 5000;
+
+const char* routeKindName(DeviceRouteKind kind) {
+    switch (kind) {
+        case DeviceRouteKind::Unreachable:
+            return "Unreachable";
+        case DeviceRouteKind::P2p:
+            return "P2P";
+        case DeviceRouteKind::HostProxy:
+            return "HostProxy";
+        case DeviceRouteKind::Rdma:
+            return "RDMA";
+    }
+    return "Unknown";
+}
+
 bool validEndpoint(const DeviceTransferEndpoint& endpoint) {
     if (endpoint.region_address == 0 ||
         endpoint.region_address % alignof(uint64_t) != 0 ||
@@ -171,6 +187,9 @@ struct DeviceTransferService::DeviceState {
 
         // Publish the kernel entry point last, after every pointer it exposes
         // refers to initialized state.
+        int clock_rate_khz = 0;
+        PG_TRY_CUDA(cudaDeviceGetAttribute(&clock_rate_khz,
+                                           cudaDevAttrClockRate, device_index));
         const DeviceTransferHandle handle_image{
             .peer_accessible_region =
                 {
@@ -181,6 +200,7 @@ struct DeviceTransferService::DeviceState {
             .route_context = state->deviceRouteContext(),
             .routes = state->device_metadata.routes,
             .lane_results = state->device_metadata.lane_results,
+            .drain_timeout_ticks = kDrainTimeoutMs * clock_rate_khz,
             .max_world_size = max_world_size,
         };
         PG_TRY_CUDA(cudaMemcpy(state->device_metadata.handle, &handle_image,
@@ -196,7 +216,8 @@ struct DeviceTransferService::DeviceState {
           max_world_size(max_world_size),
           local_staging_capacity(local_staging_capacity),
           peer_accessible_region(std::move(peer_accessible_region)),
-          route_stream(std::move(route_stream)) {}
+          route_stream(std::move(route_stream)),
+          published_route_kinds(max_world_size, DeviceRouteKind::Unreachable) {}
 
     ~DeviceState() noexcept {
         auto result = shutdown();
@@ -314,11 +335,6 @@ struct DeviceTransferService::DeviceState {
         return {};
     }
 
-    PGResult<void> quiesceRoutes() {
-        for (auto* provider : route_providers) PG_TRY(provider->quiesce());
-        return {};
-    }
-
     PGResult<void> registerRegion(DeviceRegionKind kind,
                                   const DeviceTransferRegion& region) {
         size_t registered = 0;
@@ -358,7 +374,19 @@ struct DeviceTransferService::DeviceState {
             device_metadata.routes, host_route_image,
             static_cast<size_t>(max_world_size) * sizeof(DeviceTransferRoute),
             cudaMemcpyHostToDevice, route_stream.get()));
-        return route_stream.synchronize();
+        PG_TRY(route_stream.synchronize());
+
+        // Report route-kind changes only after publication succeeds.
+        for (GlobalRank rank = 0;
+             rank < static_cast<GlobalRank>(max_world_size); ++rank) {
+            const auto kind = host_route_image[rank].kind;
+            if (kind == published_route_kinds[rank]) continue;
+            LOG(INFO) << "[PG] Device-transfer route selected: rank="
+                      << self_rank << " device=" << device_index
+                      << " peer=" << rank << " route=" << routeKindName(kind);
+            published_route_kinds[rank] = kind;
+        }
+        return {};
     }
 
     PGResult<RegionSlice> allocateLocalStaging(size_t size, size_t alignment) {
@@ -391,7 +419,6 @@ struct DeviceTransferService::DeviceState {
         if (shutdown_requested_) return {};
 
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
-        PG_TRY(quiesceRoutes());
         if (local_staging_region) {
             PG_TRY(unregisterRegion(DeviceRegionKind::LocalStaging,
                                     *local_staging_region));
@@ -450,6 +477,7 @@ struct DeviceTransferService::DeviceState {
     DeviceMetadata device_metadata;
     // Pinned host image copied into device_metadata.routes.
     DeviceTransferRoute* host_route_image = nullptr;
+    std::vector<DeviceRouteKind> published_route_kinds;
     DeviceTransferEndpoint local_endpoint;
     std::vector<std::optional<DeviceTransferEndpoint>> endpoints;
     bool shutdown_requested_ = false;
@@ -585,11 +613,6 @@ PGResult<void> DeviceTransferService::installPeerEndpoint(
     state.endpoints[rank] = endpoint;
     PG_TRY(state.resolveRoutes());
     return state.publishRoutes();
-}
-
-PGResult<void> DeviceTransferService::waitUntilIdle() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    return deviceState().quiesceRoutes();
 }
 
 PGResult<void> DeviceTransferService::shutdown() {

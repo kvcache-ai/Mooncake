@@ -46,7 +46,6 @@ class HostProxyRoute : public RouteProvider {
         std::span<const std::optional<DeviceTransferEndpoint>> endpoints)
         override;
 
-    PGResult<void> quiesce() override;
     PGResult<void> shutdown() override;
 
    private:

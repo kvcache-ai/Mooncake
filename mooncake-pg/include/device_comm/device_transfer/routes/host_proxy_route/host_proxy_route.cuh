@@ -76,7 +76,7 @@ __device__ __forceinline__ void publishHostProxyCommand(
     device::mc_st_release_u64(&slot.submitted_sequence, sequence);
 }
 
-__device__ __forceinline__ HostProxyTransferTicket
+static __device__ __noinline__ HostProxyTransferTicket
 hostProxyPut(const DeviceHostProxyRoute& route,
              const DeviceHostProxyContext& context, GlobalRank target_rank,
              const void* source, uint64_t remote_payload_offset, uint64_t size,
@@ -160,6 +160,30 @@ HostProxyTransferTicket::waitLeader() const {
     }
     PG_DEVICE_UNREACHABLE();
     return TransferResult::Failed;
+}
+
+__device__ __forceinline__ void drainHostProxyTransfers(
+    const DeviceHostProxyContext& context, uint64_t timeout_ticks) {
+    if (!context.command_slots) return;
+
+    // Producers have stopped. The worker publishes completion after finishing
+    // each command; one timeout bounds the wait across all lanes.
+    const uint64_t start_ticks = clock64();
+    for (uint32_t lane = 0; lane < kTransferLaneCount; ++lane) {
+        const auto& slot = context.command_slots[lane];
+        const uint64_t submitted =
+            device::mc_ld_acquire_u64(&slot.submitted_sequence);
+        while (device::mc_ld_acquire_u64(&slot.completed_sequence) !=
+               submitted) {
+            if (hostProxyTimedOut(start_ticks, timeout_ticks)) {
+                printf(
+                    "[PG] Host-proxy drain timed out at lane %u; "
+                    "continuing\n",
+                    lane);
+                return;
+            }
+        }
+    }
 }
 
 }  // namespace mooncake

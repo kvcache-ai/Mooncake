@@ -1,4 +1,3 @@
-#include <chrono>
 #include <string>
 
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.h"
@@ -115,11 +114,6 @@ PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
                        "unknown host-proxy device region kind");
 }
 
-PGResult<void> HostProxyRoute::quiesce() {
-    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
-    return proxy_->waitUntilIdle();
-}
-
 PGResult<void> HostProxyRoute::shutdown() {
     if (shutdown_requested_) return {};
     if (!initialized_) {
@@ -127,7 +121,6 @@ PGResult<void> HostProxyRoute::shutdown() {
         shutdown_requested_ = true;
         return {};
     }
-    PG_TRY(proxy_->waitUntilIdle(std::chrono::milliseconds(0)));
     PG_TRY(proxy_->shutdown());
     shutdown_requested_ = true;
     device_slots_ = nullptr;

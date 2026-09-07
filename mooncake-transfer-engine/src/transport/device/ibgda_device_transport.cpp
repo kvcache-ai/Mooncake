@@ -133,6 +133,21 @@ static std::string autoDetectNic(const std::vector<std::string>& filter) {
     return hca_list[idx];
 }
 
+static mlx5gda_qp_devctx initialQueuePairDeviceContext(const mlx5gda_qp* qp) {
+    return mlx5gda_qp_devctx{
+        .qpn = qp->qpn,
+        .wqeid_mask = qp->num_wqebb - 1,
+        .mutex = 0,
+        .wq = reinterpret_cast<mlx5gda_wqebb*>(qp->dev_wq),
+        .cq = reinterpret_cast<mlx5_cqe64*>(qp->send_cq->dev_cq_buf),
+        .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(qp->dev_dbr),
+        .bf = qp->bf_device_addr,
+        .bf_offset = 0,
+        .wq_head = 0,
+        .wq_tail = 0,
+    };
+}
+
 class IbgdaDeviceTransportImpl : public RdmaTransport {
    public:
     explicit IbgdaDeviceTransportImpl(std::vector<std::string> filter)
@@ -257,11 +272,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int unregisterMemory(const RdmaMemoryRegion& region) override {
-        const auto current = std::find_if(
-            memory_regions_.begin(), memory_regions_.end(),
-            [&region](const RegisteredMemory& registered) {
-                return registered.region == region;
-            });
+        const auto current =
+            std::find_if(memory_regions_.begin(), memory_regions_.end(),
+                         [&region](const RegisteredMemory& registered) {
+                             return registered.region == region;
+                         });
         if (current == memory_regions_.end()) {
             LOG(ERROR) << "[EP IBGDA] unknown memory registration";
             return -1;
@@ -347,18 +362,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 return -1;
             }
             cudaStreamSynchronize(stream);
-            mlx5gda_qp_devctx devctx{
-                .qpn = qp->qpn,
-                .wqeid_mask = qp->num_wqebb - 1,
-                .mutex = 0,
-                .wq = reinterpret_cast<mlx5gda_wqebb*>(qp->dev_wq),
-                .cq = reinterpret_cast<mlx5_cqe64*>(qp->send_cq->dev_cq_buf),
-                .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(qp->dev_dbr),
-                .bf = qp->bf_device_addr,
-                .bf_offset = 0,
-                .wq_head = 0,
-                .wq_tail = 0,
-            };
+            const auto devctx = initialQueuePairDeviceContext(qp);
             cudaMemcpy(
                 static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
                 &devctx, sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
@@ -383,6 +387,79 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int recreateQueuePairs(void* stream_ptr) override {
         destroyQueuePairs();
         return createQueuePairs(stream_ptr);
+    }
+
+    int resetQueuePairs(int qp_offset, int num_qps, void* stream_ptr) override {
+        if (qp_offset < 0 || num_qps <= 0 ||
+            qp_offset > static_cast<int>(qps_.size()) - num_qps) {
+            LOG(ERROR) << "[EP IBGDA] Invalid QP reset range";
+            return -1;
+        }
+        auto stream = static_cast<cudaStream_t>(stream_ptr);
+
+        // Stop the NIC before clearing the selected QPs' queue state. The QP
+        // and CQ objects stay allocated, so their numbers and addresses stay
+        // valid for peers and existing device handles.
+        for (int i = qp_offset; i < qp_offset + num_qps; ++i) {
+            if (mlx5gda_modify_rc_qp_2rst(qps_[i])) {
+                LOG(ERROR) << "[EP IBGDA] 2rst failed for QP " << i;
+                return -1;
+            }
+        }
+
+        const bool host_qp = ctrl_buf_mode_ == ControlMemoryMode::kHostMapped;
+        const bool host_cq =
+            host_qp ||
+            ctrl_buf_mode_ == ControlMemoryMode::kPerQpGpuVaHostMappedCq;
+        std::vector<mlx5gda_qp_devctx> devctxs;
+        devctxs.reserve(num_qps);
+        for (int i = qp_offset; i < qp_offset + num_qps; ++i) {
+            auto* qp = qps_[i];
+            auto* cq = qp->send_cq;
+            // A stale collapsed CQE could complete a new WQE immediately.
+            // Restore the same invalid CQE and zero DBR used at creation.
+            cudaError_t result = cudaSuccess;
+            if (host_cq) {
+                std::memset(cq->cq_buf, 0xff, cq->cqe * sizeof(mlx5_cqe64));
+            } else {
+                result = cudaMemsetAsync(cq->dev_cq_buf, 0xff,
+                                         cq->cqe * sizeof(mlx5_cqe64), stream);
+            }
+            if (result == cudaSuccess) {
+                if (host_qp) {
+                    std::memset(qp->dbr, 0, sizeof(mlx5gda_wq_dbr));
+                } else {
+                    result = cudaMemsetAsync(qp->dev_dbr, 0,
+                                             sizeof(mlx5gda_wq_dbr), stream);
+                }
+            }
+            if (result != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] Failed to clear QP " << i << ": "
+                           << cudaGetErrorString(result);
+                return -1;
+            }
+            devctxs.push_back(initialQueuePairDeviceContext(qp));
+        }
+
+        auto result = cudaMemcpyAsync(
+            static_cast<mlx5gda_qp_devctx*>(qp_devctxs_) + qp_offset,
+            devctxs.data(), devctxs.size() * sizeof(mlx5gda_qp_devctx),
+            cudaMemcpyHostToDevice, stream);
+        if (result == cudaSuccess) result = cudaStreamSynchronize(stream);
+        if (result != cudaSuccess) {
+            LOG(ERROR) << "[EP IBGDA] Failed to reset QP device contexts: "
+                       << cudaGetErrorString(result);
+            return -1;
+        }
+
+        // connectPeers() can now use the usual INIT -> RTR -> RTS path.
+        for (int i = qp_offset; i < qp_offset + num_qps; ++i) {
+            if (mlx5gda_modify_rc_qp_rst2init(qps_[i], 0)) {
+                LOG(ERROR) << "[EP IBGDA] rst2init failed for QP " << i;
+                return -1;
+            }
+        }
+        return 0;
     }
 
     int connectPeers(int local_rank, bool is_roce, uint32_t local_lkey,

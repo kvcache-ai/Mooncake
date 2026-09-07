@@ -11,6 +11,7 @@ class NullRdmaTransport : public RdmaTransport {
     int allocateControlBuffer() override { return -1; }
     int createQueuePairs(void*) override { return -1; }
     int recreateQueuePairs(void*) override { return -1; }
+    int resetQueuePairs(int, int, void*) override { return -1; }
     int connectPeers(int, bool, uint32_t, const std::vector<int64_t>&,
                      const std::vector<int32_t>&, const std::vector<int32_t>&,
                      const std::vector<int32_t>&, const std::vector<int64_t>&,
@@ -18,8 +19,7 @@ class NullRdmaTransport : public RdmaTransport {
                      const std::vector<int>&) override {
         return -1;
     }
-    RdmaLocalMetadata localMetadata(
-        const RdmaMemoryRegion&) const override {
+    RdmaLocalMetadata localMetadata(const RdmaMemoryRegion&) const override {
         return {};
     }
     void* raddrsPtr() override { return nullptr; }

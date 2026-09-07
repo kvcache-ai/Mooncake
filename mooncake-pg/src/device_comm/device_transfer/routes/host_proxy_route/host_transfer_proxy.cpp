@@ -160,7 +160,6 @@ void HostTransferProxy::finishCommand(Lane& lane,
     lane.host_slot->result = result;
     std::atomic_ref(lane.host_slot->completed_sequence)
         .store(sequence, std::memory_order_release);
-    state_changed_.notify_all();
 }
 
 void HostTransferProxy::releaseBatch(Lane& lane) {
@@ -476,32 +475,6 @@ PGResult<HostProxyCommandSlot*> HostTransferProxy::initializeDevice(
     lane_set_ = std::move(lane_set);
     state_changed_.notify_all();
     return device_slots;
-}
-
-PGResult<void> HostTransferProxy::waitUntilIdle() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(lane_set_, "host-proxy CUDA device is not initialized");
-    state_changed_.wait(
-        lock, [this] { return terminated_with_error_ || lanesIdle(); });
-    PG_VALIDATE_STATE(!terminated_with_error_,
-                      "HostTransferProxy worker has failed");
-    return {};
-}
-
-PGResult<void> HostTransferProxy::waitUntilIdle(
-    std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(lane_set_, "host-proxy CUDA device is not initialized");
-    const bool ready = state_changed_.wait_for(lock, timeout, [this] {
-        return terminated_with_error_ || lanesIdle();
-    });
-    if (!ready) {
-        return makePGError(PGErrorCode::Timeout,
-                           "host-proxy device did not become idle in time");
-    }
-    PG_VALIDATE_STATE(!terminated_with_error_,
-                      "HostTransferProxy worker has failed");
-    return {};
 }
 
 PGResult<void> HostTransferProxy::shutdown() {

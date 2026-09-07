@@ -133,8 +133,7 @@ __device__ __forceinline__ IbgdaPollResult mc_ibgda_poll_cq(
 // Every current IBGDA WQE requests a completion, and the collapsed CQE covers
 // all earlier WQEs.
 __device__ __forceinline__ IbgdaPollResult mc_ibgda_wait_for_sq_space(
-    mlx5gda_qp_devctx* qp, uint32_t wqebb_count,
-    uint64_t deadline_ticks = 0) {
+    mlx5gda_qp_devctx* qp, uint32_t wqebb_count, uint64_t deadline_ticks = 0) {
     const uint32_t capacity = qp->wqeid_mask + 1;
     if (wqebb_count == 0 || wqebb_count > capacity) {
         printf("[EP IBGDA] Invalid WQEBB count: count=%u capacity=%u\n",
@@ -147,8 +146,8 @@ __device__ __forceinline__ IbgdaPollResult mc_ibgda_wait_for_sq_space(
         // Wait only for enough oldest WQEs to complete.
         const uint32_t completions_needed =
             wqebb_count - (capacity - outstanding);
-        const uint16_t expect = static_cast<uint16_t>(
-            qp->wq_tail + completions_needed - 1);
+        const uint16_t expect =
+            static_cast<uint16_t>(qp->wq_tail + completions_needed - 1);
         return mc_ibgda_poll_cq(qp, expect, deadline_ticks);
     }
     return IbgdaPollResult::Completed;
@@ -197,8 +196,7 @@ __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
 
 // Finish one locked submission batch and return the WQE id whose completion
 // covers every WQE appended to that batch.
-__device__ __forceinline__ uint16_t mc_ibgda_submit(
-    mlx5gda_qp_devctx* qp) {
+__device__ __forceinline__ uint16_t mc_ibgda_submit(mlx5gda_qp_devctx* qp) {
     const uint16_t expect = static_cast<uint16_t>(qp->wq_head - 1);
     mc_ibgda_post_send_db(qp);
     mc_ibgda_unlock(qp);

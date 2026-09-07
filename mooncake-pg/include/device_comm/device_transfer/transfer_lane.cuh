@@ -44,6 +44,16 @@ __device__ __forceinline__ void validateRemoteSignal(
     }
 }
 
+__device__ __forceinline__ void drainTransfers(
+    const DeviceTransferHandle& handle, const GlobalRank* peers,
+    uint32_t peer_count) {
+    // One thread drains after all producers stop submitting. P2P has no
+    // outstanding asynchronous transport work to drain.
+    drainRdmaTransfers(handle, peers, peer_count);
+    drainHostProxyTransfers(handle.route_context.host_proxy,
+                            handle.drain_timeout_ticks);
+}
+
 class TransferTicket {
    public:
     // Submission already started the operation; dropping this lightweight

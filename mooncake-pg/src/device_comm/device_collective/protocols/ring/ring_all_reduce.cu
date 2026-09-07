@@ -73,6 +73,21 @@ struct PrepareRingCollective {
     }
 };
 
+struct DrainRingTransfers {
+    const RingAllReducePlan* plan;
+
+    __device__ __forceinline__ void operator()() const {
+        if (plan->participant_count <= 1) return;
+        // Drain all transfer lanes for the two outgoing edges, including the
+        // lane used by startup. A two-rank Ring uses the same peer on both
+        // edges.
+        const GlobalRank peers[] = {plan->predecessor.global_rank,
+                                    plan->successor.global_rank};
+        const uint32_t peer_count = peers[0] == peers[1] ? 1 : 2;
+        drainTransfers(*plan->transfer_handle, peers, peer_count);
+    }
+};
+
 template <typename T, ReduceOp Op>
 [[nodiscard]] __device__ __forceinline__ RingStepResult runRingTile(
     const RingAllReducePlan& plan, const RingPrimitives<T, Op>& primitives,
@@ -154,11 +169,12 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
     PG_DEVICE_ASSERT(invocation);
     PG_DEVICE_ASSERT(control_mailbox);
     const auto* const plan_slot = &state->plan;
+    const DrainRingTransfers drain_transfers{&plan_slot->plan};
     const auto preparation = prepareCollectiveInvocation(
         &state->plan, state->view_epoch_signals, invocation, control_mailbox,
         channel, PrepareRingCollective{}, block);
     if (!preparation.succeeded()) {
-        completeChannel(invocation, control_mailbox, block,
+        completeChannel(invocation, control_mailbox, drain_transfers, block,
                         preparation.failed_rank, request.failed_ranks_hint);
         return;
     }
@@ -167,7 +183,7 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
     PG_DEVICE_ASSERT(plan_slot->status == DevicePlanStatus::Ready);
     const auto plan = plan_slot->plan;
     if (request.count == 0) {
-        completeChannel(invocation, control_mailbox, block);
+        completeChannel(invocation, control_mailbox, drain_transfers, block);
         return;
     }
 
@@ -175,7 +191,7 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
     if (channel >= channel_count) {
         // The fixed launch capacity keeps host submission independent of the
         // Plan image. Inactive CTAs still participate in invocation completion.
-        completeChannel(invocation, control_mailbox, block);
+        completeChannel(invocation, control_mailbox, drain_transfers, block);
         return;
     }
     const uint64_t elements_per_channel = request.count / channel_count;
@@ -194,7 +210,7 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
         if (input != output) {
             copyValuesTo(input, channel_elements, block, output);
         }
-        completeChannel(invocation, control_mailbox, block);
+        completeChannel(invocation, control_mailbox, drain_transfers, block);
         return;
     }
     block.sync();
@@ -259,7 +275,7 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
     const auto buffer_ready =
         primitives.waitRecvBufferReady(recv_buffer_ready_sequence, block);
     if (!buffer_ready.succeeded()) {
-        completeChannel(invocation, control_mailbox, block,
+        completeChannel(invocation, control_mailbox, drain_transfers, block,
                         buffer_ready.failed_rank, request.failed_ranks_hint);
         return;
     }
@@ -275,7 +291,7 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
         const auto result = runRingTile(plan, primitives, tile_layout,
                                         tile_index, step_sequences, block);
         if (!result.succeeded()) {
-            completeChannel(invocation, control_mailbox, block,
+            completeChannel(invocation, control_mailbox, drain_transfers, block,
                             result.failed_rank, request.failed_ranks_hint);
             return;
         }
@@ -290,7 +306,7 @@ __global__ __launch_bounds__(kProtocolThreads, 1) void ringAllReduceKernel(
         device::mc_st_release_u64(next_recv_buffer_ready_sequence,
                                   recv_buffer_ready_sequence + 1);
     }
-    completeChannel(invocation, control_mailbox, block);
+    completeChannel(invocation, control_mailbox, drain_transfers, block);
 }
 
 template <typename T>

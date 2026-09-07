@@ -51,7 +51,6 @@ class RouteProvider {
     resolveRoutes(
         std::span<const std::optional<DeviceTransferEndpoint>> endpoints) = 0;
 
-    virtual PGResult<void> quiesce() { return {}; }
     virtual PGResult<void> shutdown() { return {}; }
 
    protected:

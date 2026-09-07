@@ -105,6 +105,7 @@ struct DeviceTransferHandle {
     DeviceRouteContext route_context;             // Per device.
     const DeviceTransferRoute* routes = nullptr;  // One entry per peer.
     uint64_t* lane_results = nullptr;             // One result per lane.
+    uint64_t drain_timeout_ticks = 0;
 
     uint32_t max_world_size = 0;
 
