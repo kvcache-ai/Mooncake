@@ -97,6 +97,18 @@ add_store_test(master_service_segment_scenario_test
                master_service_segment_scenario_test.cpp)
 target_link_libraries(master_service_segment_scenario_test
                       PRIVATE master_service_test_dsl)
+add_store_test(master_service_dfs_scenario_test
+               master_service_dfs_scenario_test.cpp)
+target_link_libraries(master_service_dfs_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_ssd_scenario_test
+               master_service_ssd_scenario_test.cpp)
+target_link_libraries(master_service_ssd_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_offload_scenario_test
+               master_service_offload_scenario_test.cpp)
+target_link_libraries(master_service_offload_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
@@ -135,6 +147,8 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+add_store_test(transfer_submitter_config_test
+               transfer_submitter_config_test.cpp)
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(transfer_task_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
@@ -199,6 +213,8 @@ add_store_test(
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp
 )
 add_store_test(zstd_util_test zstd_util_test.cpp)
+add_store_test(local_file_snapshot_config_test
+               local_file_snapshot_config_test.cpp)
 add_store_test(
   local_file_snapshot_object_store_test
   ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
@@ -219,6 +235,8 @@ add_ha_test(batch_oplog_snapshot_publisher_test
             ha/snapshot/batch_oplog/publisher_test.cpp)
 add_ha_test(batch_oplog_snapshot_coordinator_test
             ha/snapshot/batch_oplog/coordinator_test.cpp)
+add_ha_test(batch_oplog_snapshot_promotion_test
+            ha/snapshot/batch_oplog/promotion_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
