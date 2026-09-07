@@ -1101,9 +1101,9 @@ void WorkerPool::transferWorker(int thread_id) {
 #ifndef USE_FAKE_POST_SEND
         // Two-sided MsgChannel CQs live on this NIC; poll every loop so pure
         // receivers keep making progress even with no one-sided traffic.
-        if (can_poll) {
-            context_.pollMsgChannels();
-        }
+        // (After the peer-owner CQ split on main there is no can_poll helper;
+        // every transfer worker may poll — MsgChannel serializes on its CQ.)
+        context_.pollMsgChannels();
 #endif
         auto processed_slice_count =
             processed_slice_count_.load(std::memory_order_relaxed);
