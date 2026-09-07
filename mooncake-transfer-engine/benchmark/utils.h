@@ -263,7 +263,8 @@ static inline void fillData(void* addr, size_t length, uint8_t seed) {
         return;
     }
 #endif
-    if (XferBenchConfig::xport_type != "hp_tcp") {
+    if (XferBenchConfig::xport_type != "hp_tcp" ||
+        !XferBenchConfig::check_consistency) {
         memset(addr, seed, length);
         return;
     }
@@ -315,7 +316,10 @@ static inline void verifyData(void* addr, size_t length, uint8_t seed) {
         return;
     }
 #endif
-    fillData(ref_data.data(), length, seed);
+    if (XferBenchConfig::xport_type == "hp_tcp" &&
+        XferBenchConfig::check_consistency) {
+        fillData(ref_data.data(), length, seed);
+    }
     if (memcmp(addr, ref_data.data(), length)) {
         LOG(FATAL) << "Inconsistent data detected";
     }

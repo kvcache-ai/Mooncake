@@ -42,6 +42,7 @@
 #include "tent/common/utils/random.h"
 #include "tent/metrics/tent_metrics.h"
 #include "tent/metrics/config_loader.h"
+#include "tent/transport/hp_tcp/hp_tcp_protocol.h"
 
 namespace mooncake {
 namespace tent {
@@ -1478,6 +1479,7 @@ struct BufferKey {
 struct RequestBoundaryInfo {
     std::optional<BufferKey> source_key;
     std::optional<BufferKey> target_key;
+    uint64_t max_merge_bytes{std::numeric_limits<uint64_t>::max()};
 };
 
 struct MergeResult {
@@ -1532,7 +1534,7 @@ uint64_t requestSourceAddr(const Request& request) {
 
 MergeResult mergeRequests(const std::vector<Request>& requests,
                           const std::vector<RequestBoundaryInfo>& boundaries,
-                          bool do_merge, uint64_t hp_tcp_max_transfer_bytes) {
+                          bool do_merge) {
     if (requests.empty()) return {};
     if (!do_merge || boundaries.size() != requests.size()) {
         return makePassThroughMergeResult(requests);
@@ -1561,8 +1563,7 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         return requestSourceAddr(a.req) < requestSourceAddr(b.req);
     });
 
-    auto can_merge = [hp_tcp_max_transfer_bytes](const Item& last,
-                                                 const Item& curr) {
+    auto can_merge = [](const Item& last, const Item& curr) {
         if (last.req.opcode != curr.req.opcode ||
             last.req.target_id != curr.req.target_id) {
             return false;
@@ -1591,11 +1592,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
             std::numeric_limits<size_t>::max() - last.req.length) {
             return false;
         }
-        // Coalescing must not turn valid HP TCP requests into an oversized
-        // request. UNSPEC may select HP TCP after merging as well.
-        if ((last.req.transport_hint == HP_TCP ||
-             last.req.transport_hint == UNSPEC) &&
-            last.req.length + curr.req.length > hp_tcp_max_transfer_bytes) {
+        // Requests to the same peer share the resolved transfer-size limit.
+        if (last.req.length + curr.req.length > last.boundary.max_merge_bytes) {
             return false;
         }
 
@@ -1637,7 +1635,8 @@ std::optional<BufferKey> toBufferKey(BufferDesc* buffer) {
 }
 
 std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
-    ControlService* metadata, const std::vector<Request>& requests) {
+    ControlService* metadata, const std::vector<Request>& requests,
+    const HpTcpTransportConfig& hp_tcp_config) {
     // Group requests by target_id so withCachedSegment fires at most once per
     // peer.
     std::vector<RequestBoundaryInfo> boundaries(requests.size());
@@ -1661,9 +1660,28 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     for (auto& [target_id, idxs] : by_target) {
         metadata->segmentManager().withCachedSegment(
             target_id, [&](SegmentDesc* target_desc) {
+                auto hp_tcp_limit = hp_tcp_config.params.max_transfer_bytes;
+                if (hp_tcp_config.enabled && idxs.size() > 1 &&
+                    target_desc->type == SegmentType::Memory) {
+                    const auto* encoded =
+                        target_desc->getMemory().getTransportAttrs(HP_TCP);
+                    HighPerformanceTcpEndpointAttr endpoint;
+                    if (encoded && DecodeHighPerformanceTcpEndpointAttr(
+                                       *encoded, &endpoint)
+                                       .ok()) {
+                        hp_tcp_limit =
+                            std::min(hp_tcp_limit, endpoint.max_transfer_bytes);
+                    }
+                }
                 bool any_missing = false;
                 for (size_t i : idxs) {
                     const auto& r = requests[i];
+                    // UNSPEC may select HP TCP after merging. Respect both
+                    // endpoints' limits without changing explicit other hints.
+                    if (hp_tcp_config.enabled && (r.transport_hint == HP_TCP ||
+                                                  r.transport_hint == UNSPEC)) {
+                        boundaries[i].max_merge_bytes = hp_tcp_limit;
+                    }
                     auto* buffer =
                         target_desc->findBuffer(r.target_offset, r.length);
                     if (!buffer) {
@@ -1816,13 +1834,11 @@ Status TransferEngineImpl::prepareSubmit(
     prepared.submit_time = std::chrono::steady_clock::now();
     auto merge_boundaries =
         merge_requests_
-            ? resolveRequestBoundaries(metadata_.get(), request_list)
+            ? resolveRequestBoundaries(metadata_.get(), request_list,
+                                       hp_tcp_transport_config_)
             : std::vector<RequestBoundaryInfo>{};
     auto merged =
-        mergeRequests(request_list, merge_boundaries, merge_requests_,
-                      hp_tcp_transport_config_.enabled
-                          ? hp_tcp_transport_config_.params.max_transfer_bytes
-                          : std::numeric_limits<uint64_t>::max());
+        mergeRequests(request_list, merge_boundaries, merge_requests_);
 
     prepared.owners.reserve(merged.request_list.size());
     for (const auto& request : merged.request_list) {
