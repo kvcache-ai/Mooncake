@@ -905,6 +905,54 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             self.store.unregister_buffer(raw_ptr)
             self.store.remove(key, force=True)
 
+    def test_tensor_from_external_zero_payload_staging(self):
+        """Dummy raw tensor writes preserve metadata-only tensor objects."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        tensor = torch.empty((2, 0, 3), dtype=torch.float32)
+        metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+        self.assertEqual(payload_size, 0)
+        raw = (ctypes.c_ubyte * len(metadata))()
+        raw_ptr = ctypes.addressof(raw)
+        ctypes.memmove(raw_ptr, metadata, len(metadata))
+
+        prefix = f"test_dummy_zero_payload_tensor_{os.getpid()}"
+        keys = [f"{prefix}_{i}" for i in range(4)]
+        try:
+            self.assertEqual(self.store.register_buffer(raw_ptr, len(metadata)), 0)
+            self.assertEqual(
+                self.store.put_tensor_from(keys[0], raw_ptr, len(metadata)), 0
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_from(
+                        keys[1:3], [raw_ptr, raw_ptr], [len(metadata)] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_from(
+                        keys[1:3], [raw_ptr, raw_ptr], [len(metadata)] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys[:3]:
+                stored = self.store.get_tensor(key)
+                self.assertIsNotNone(stored)
+                self.assertEqual(tuple(stored.shape), tuple(tensor.shape))
+                self.assertEqual(stored.dtype, tensor.dtype)
+                self.assertEqual(stored.numel(), 0)
+        finally:
+            self.store.unregister_buffer(raw_ptr)
+            for key in keys:
+                self.store.remove(key, force=True)
+
     def _run_dummy_cuda_ipc_stream_readiness_regression(self, batch_width):
         skip_reason = _cuda_stream_readiness_skip_reason()
         if skip_reason is not None:

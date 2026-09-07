@@ -1728,8 +1728,13 @@ int DummyClient::put_from_with_metadata(const std::string& key, void* buffer,
                                         void* metadata_buffer, size_t size,
                                         size_t metadata_size,
                                         const ReplicateConfig& config) {
-    auto results = batch_put_from_multi_buffers(
-        {key}, {{metadata_buffer, buffer}}, {{metadata_size, size}}, config);
+    std::vector<std::vector<void*>> buffers = {{metadata_buffer}};
+    std::vector<std::vector<size_t>> sizes = {{metadata_size}};
+    if (size > 0) {
+        buffers[0].push_back(buffer);
+        sizes[0].push_back(size);
+    }
+    auto results = batch_put_from_multi_buffers({key}, buffers, sizes, config);
     return results.empty() ? -1 : results[0];
 }
 

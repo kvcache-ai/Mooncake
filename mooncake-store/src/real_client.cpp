@@ -5471,7 +5471,7 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
         return -1;
     }
 
-    if (size == 0) {
+    if (size == 0 && metadata_size == 0) {
         LOG(WARNING) << "Attempting to put empty data for key: " << key;
         return 0;
     }
