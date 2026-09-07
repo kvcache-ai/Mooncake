@@ -12,6 +12,7 @@ except ModuleNotFoundError as error:
         raise
     torch = None
 
+import mooncake.store as mooncake_store
 from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
@@ -446,6 +447,83 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key1), 0)
         self.assertEqual(self.store.remove(key2), 0)
 
+    def test_external_host_get_into_ranges_staging(self):
+        """Range reads stage a registered process-local host destination."""
+        import ctypes
+
+        keys = [
+            f"test_dummy_external_ranges_{os.getpid()}_0",
+            f"test_dummy_external_ranges_{os.getpid()}_1",
+        ]
+        values = [b"0123456789", b"abcdefghijklm"]
+        for key, value in zip(keys, values):
+            self.assertEqual(self.store.put(key, value), 0)
+
+        capacity = 64
+        destination = (ctypes.c_ubyte * capacity)()
+        destination_ptr = ctypes.addressof(destination)
+        self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+        try:
+            ctypes.memset(destination_ptr, ord("_"), capacity)
+            range_results = self.store.get_into_ranges(
+                [destination_ptr],
+                [keys],
+                [[[1, 12], [24]]],
+                [[[2, 7], [3]]],
+                [[[4, 3], [5]]],
+            )
+            self.assertEqual(range_results, [[[4, 3], [5]]])
+            self.assertEqual(bytes(destination[1:5]), values[0][2:6])
+            self.assertEqual(bytes(destination[12:15]), values[0][7:10])
+            self.assertEqual(bytes(destination[24:29]), values[1][3:8])
+            self.assertEqual(destination[0], ord("_"))
+            self.assertEqual(bytes(destination[5:12]), b"_" * 7)
+        finally:
+            self.assertEqual(self.store.unregister_buffer(destination_ptr), 0)
+            for key in keys:
+                self.store.remove(key, force=True)
+
+    def test_external_host_multi_buffer_read_staging(self):
+        """Multi-buffer reads copy only returned bytes from host staging."""
+        import ctypes
+
+        keys = [
+            f"test_dummy_external_multi_read_{os.getpid()}_0",
+            f"test_dummy_external_multi_read_{os.getpid()}_1",
+        ]
+        values = [b"0123456789", b"abcdefghijklm"]
+        for key, value in zip(keys, values):
+            self.assertEqual(self.store.put(key, value), 0)
+
+        capacity = 64
+        destination = (ctypes.c_ubyte * capacity)()
+        destination_ptr = ctypes.addressof(destination)
+        self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+        try:
+            ctypes.memset(destination_ptr, ord("_"), capacity)
+            multi_buffer_results = self.store.batch_get_into_multi_buffers(
+                keys,
+                [
+                    [
+                        destination_ptr + 50,
+                        destination_ptr,
+                        destination_ptr + 4,
+                    ],
+                    [destination_ptr + 20, destination_ptr + 25],
+                ],
+                [[0, 4, 6], [5, 8]],
+                False,
+            )
+            self.assertEqual(list(multi_buffer_results), [10, 13])
+            self.assertEqual(bytes(destination[0:10]), values[0])
+            self.assertEqual(bytes(destination[20:33]), values[1])
+            self.assertEqual(bytes(destination[10:20]), b"_" * 10)
+            self.assertEqual(bytes(destination[33:35]), b"__")
+        finally:
+            self.assertEqual(self.store.unregister_buffer(destination_ptr), 0)
+            for key in keys:
+                self.store.remove(key, force=True)
+
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
         import ctypes
@@ -735,6 +813,97 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             self.store.unregister_buffer(buffer_ptr)
             for cleanup_key in cleanup_keys:
                 self.store.remove(cleanup_key)
+
+    def test_tensor_from_external_host_staging(self):
+        """Raw tensor *_from APIs accept a pageable host object buffer."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+        metadata_size = len(metadata)
+        total_size = metadata_size + payload_size
+        raw = (ctypes.c_ubyte * total_size)()
+        raw_ptr = ctypes.addressof(raw)
+        ctypes.memmove(raw_ptr, metadata, metadata_size)
+        ctypes.memmove(raw_ptr + metadata_size, tensor.numpy().tobytes(), payload_size)
+
+        prefix = f"test_dummy_tensor_external_{os.getpid()}"
+        keys = [f"{prefix}_{i}" for i in range(3)]
+        try:
+            self.assertEqual(self.store.register_buffer(raw_ptr, total_size), 0)
+            self.assertEqual(
+                self.store.put_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertTrue(torch.equal(self.store.get_tensor(keys[0]), tensor))
+
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_from(
+                        keys[1:], [raw_ptr, raw_ptr], [total_size, total_size]
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys[1:]:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+
+            updated = tensor + 5
+            ctypes.memmove(
+                raw_ptr + metadata_size, updated.numpy().tobytes(), payload_size
+            )
+            self.assertEqual(
+                self.store.upsert_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertTrue(torch.equal(self.store.get_tensor(keys[0]), updated))
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_from(
+                        keys[1:], [raw_ptr, raw_ptr], [total_size, total_size]
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys[1:]:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), updated))
+        finally:
+            self.store.unregister_buffer(raw_ptr)
+            for key in keys:
+                self.store.remove(key, force=True)
+
+    def test_tensor_from_external_pinned_host_staging(self):
+        """Raw tensor *_from APIs accept a registered pinned host buffer."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        try:
+            tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+            metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+            metadata_size = len(metadata)
+            total_size = metadata_size + payload_size
+            raw = torch.empty(total_size, dtype=torch.uint8, pin_memory=True)
+        except RuntimeError as error:
+            self.skipTest(f"Pinned host allocation is unavailable: {error}")
+
+        raw_ptr = raw.data_ptr()
+        ctypes.memmove(raw_ptr, metadata, metadata_size)
+        ctypes.memmove(raw_ptr + metadata_size, tensor.numpy().tobytes(), payload_size)
+
+        key = f"test_dummy_pinned_tensor_external_{os.getpid()}"
+        try:
+            self.assertTrue(raw.is_pinned())
+            self.assertEqual(self.store.register_buffer(raw_ptr, total_size), 0)
+            self.assertEqual(self.store.put_tensor_from(key, raw_ptr, total_size), 0)
+            stored = self.store.get_tensor(key)
+            self.assertIsNotNone(stored)
+            self.assertTrue(torch.equal(stored, tensor))
+        finally:
+            self.store.unregister_buffer(raw_ptr)
+            self.store.remove(key, force=True)
 
     def _run_dummy_cuda_ipc_stream_readiness_regression(self, batch_width):
         skip_reason = _cuda_stream_readiness_skip_reason()

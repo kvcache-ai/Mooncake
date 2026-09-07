@@ -540,6 +540,18 @@ class RealClient : public PyClient {
             &cached_query_results,
         int32_t device_id, const UUID &client_id);
 
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_staged_shm_helper(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
+
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
     tl::expected<void, ErrorCode> map_shm_internal(int fd,
@@ -1021,6 +1033,19 @@ class RealClient : public PyClient {
     bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
                                         uint64_t dummy_addr, size_t dst_offset,
                                         size_t size, void *&out_real) const;
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_shm_helper_impl(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<size_t> *buffer_capacities,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
