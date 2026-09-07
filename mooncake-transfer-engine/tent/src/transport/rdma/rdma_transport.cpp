@@ -20,6 +20,7 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
@@ -633,6 +634,67 @@ Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
     return local_buffer_manager_.removeBuffer(desc);
 }
 
+Status RdmaTransport::refreshLocalDeviceDesc(const std::string& device_name,
+                                             uint16_t lid,
+                                             const std::string& gid) {
+    if (!metadata_)
+        return Status::InvalidArgument(
+            "RDMA metadata is not initialized" LOC_MARK);
+
+    auto& manager = metadata_->segmentManager();
+    bool existed = false;
+    uint16_t previous_lid = 0;
+    std::string previous_gid;
+    CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        if (segment.type != SegmentType::Memory)
+            return Status::InvalidArgument(
+                "Local segment is not a memory segment" LOC_MARK);
+        auto* device = segment.findDevice(device_name);
+        if (!device) {
+            auto& detail = std::get<MemorySegmentDesc>(segment.detail);
+            DeviceDesc added;
+            added.name = device_name;
+            added.lid = lid;
+            added.gid = gid;
+            detail.devices.push_back(std::move(added));
+            return Status::OK();
+        }
+        existed = true;
+        previous_lid = device->lid;
+        previous_gid = device->gid;
+        device->lid = lid;
+        device->gid = gid;
+        return Status::OK();
+    }));
+
+    auto status = manager.synchronizeLocal();
+    if (status.ok()) return status;
+
+    auto rollback = manager.updateLocal([&](SegmentDesc& segment) -> Status {
+        if (segment.type != SegmentType::Memory)
+            return Status::InvalidArgument(
+                "Local segment is not a memory segment" LOC_MARK);
+        auto& devices = std::get<MemorySegmentDesc>(segment.detail).devices;
+        auto it = std::find_if(devices.begin(), devices.end(),
+                               [&](const DeviceDesc& device) {
+                                   return device.name == device_name;
+                               });
+        if (it == devices.end()) return Status::OK();
+        if (!existed) {
+            devices.erase(it);
+        } else {
+            it->lid = previous_lid;
+            it->gid = previous_gid;
+        }
+        return Status::OK();
+    });
+    if (!rollback.ok()) {
+        LOG(ERROR) << "Failed to roll back RDMA address metadata for "
+                   << device_name << ": " << rollback.ToString();
+    }
+    return status;
+}
+
 Status RdmaTransport::setupLocalSegment() {
     auto& manager = metadata_->segmentManager();
     CHECK_STATUS(manager.updateLocal([&](SegmentDesc& segment) -> Status {
@@ -646,8 +708,9 @@ Status RdmaTransport::setupLocalSegment() {
             if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
             DeviceDesc device_desc;
             device_desc.name = context->name();
-            device_desc.lid = context->lid();
-            device_desc.gid = context->gid();
+            const auto address = context->address();
+            device_desc.lid = address.lid;
+            device_desc.gid = address.gid;
             detail.devices.push_back(device_desc);
         }
         return Status::OK();
@@ -668,10 +731,9 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
     auto ctx_status = context->status();
-    if (ctx_status != RdmaContext::DEVICE_ENABLED &&
-        ctx_status != RdmaContext::DEVICE_PAUSED) {
+    if (ctx_status != RdmaContext::DEVICE_ENABLED) {
         std::stringstream ss;
-        ss << "Device is down: " << peer_desc.local_nic_path;
+        ss << "Device is not ready: " << peer_desc.local_nic_path;
         LOG(ERROR) << ss.str();
         local_desc.reply_msg = ss.str();
         return -1;
