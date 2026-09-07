@@ -14,7 +14,9 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -817,6 +819,159 @@ TEST(AdmissionQueueTest,
     EXPECT_EQ(queue.dispatchingBytes(), 0u);
     ASSERT_EQ(queue.retireBatch(1).code(), Status::Code::kOk);
     EXPECT_EQ(queue.dispatchingBytes(), 0u);
+}
+
+// --- RFC #2519 step 3: the drop / estimate feedback loop -----------------
+//
+// The drop decision, the traffic it lets through, and the bandwidth estimate
+// learned from that traffic form a loop: dropping shapes what is sent, what
+// is sent is the only thing the estimate can learn from, and the estimate
+// is what the next drop is judged against. RDMA throughput is queue-depth
+// bound, so a trickle admitted under a low estimate can genuinely achieve a
+// low rate and confirm the estimate. These tests drive the queue against a
+// model of such a link to see whether the loop returns to saturation or
+// settles on a plateau below it.
+//
+// Model: the link saturates at `line_rate` with `saturating_owners` in
+// flight and achieves a proportional fraction below that; the estimate
+// follows what was achieved with the transmit smoothing (alpha weights the
+// old value, as in DeviceSelector).
+struct QueueDepthBoundLink {
+    double line_rate;
+    int saturating_owners;
+    double alpha;
+    double rate;
+
+    double achieved(int concurrent) const {
+        return line_rate * std::min(concurrent, saturating_owners) /
+               saturating_owners;
+    }
+    void observe(int concurrent) {
+        rate = alpha * rate + (1.0 - alpha) * achieved(concurrent);
+    }
+};
+
+struct FeedbackRound {
+    int admitted;
+    int dropped;
+    double rate_after;
+};
+
+// One round: offer `owners` equal, eligible owners with the same deadline,
+// dispatch, complete whatever was admitted, retire the batch, and let the
+// link learn from the concurrency that round achieved.
+FeedbackRound runFeedbackRound(LocalTransferAdmissionQueue& queue,
+                               QueueDepthBoundLink& link, uint64_t token,
+                               int owners, size_t length,
+                               uint64_t deadline_ns) {
+    std::vector<QueueOwnerInput> inputs;
+    for (int i = 0; i < owners; ++i)
+        inputs.push_back(
+            makeDegradationEligibleOwnerWithDeadline(i, length, deadline_ns));
+    std::vector<QueueOwnerId> ids;
+    EXPECT_EQ(queue.tryAdmit(makeSubmit(token, owners, std::move(inputs)), ids)
+                  .code(),
+              Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(owners, 1 << 30, &dropped);
+    for (auto id : picked)
+        EXPECT_EQ(queue.complete(id, TransferStatusEnum::COMPLETED).code(),
+                  Status::Code::kOk);
+    EXPECT_EQ(queue.retireBatch(token).code(), Status::Code::kOk);
+
+    link.observe(static_cast<int>(picked.size()));
+    return {static_cast<int>(picked.size()), static_cast<int>(dropped.size()),
+            link.rate};
+}
+
+// Shared scenario: 8 owners of 1 MB per round, a 10 ms window, theta 0.95,
+// a link that needs all 8 in flight to reach 1 GB/s (1 MB per ms). At line
+// rate the last owner scores MLU 0.8 and everything is admitted. The i-th
+// owner is judged behind the i-1 picked before it in the same call.
+constexpr double kLineRate = 1e9;
+constexpr int kSaturatingOwners = 8;
+constexpr size_t kOwnerBytes = 1'000'000;
+constexpr uint64_t kNow = 1'000'000'000;
+constexpr uint64_t kDeadline = kNow + 10'000'000;  // 10 ms window
+constexpr double kThetaLocal = 0.95;
+
+std::unique_ptr<LocalTransferAdmissionQueue> makeFeedbackQueue(
+    QueueDepthBoundLink& link, int& hook_calls) {
+    QueueLimits limits{16, 1 << 30, 0, 0};
+    limits.deadline_aware = true;
+    limits.mlu_local_threshold = kThetaLocal;
+    auto queue = std::make_unique<LocalTransferAdmissionQueue>(limits);
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue->setDegradationPolicy([&link] { return link.rate; }, hooks,
+                                [] { return kNow; });
+    return queue;
+}
+
+// From an optimistic seed nothing is dropped, the link stays saturated and
+// the estimate never moves: the loop does not starve itself from a clean
+// start.
+TEST(AdmissionQueueTest, Step3FeedbackCleanStartStaysSaturated) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, kLineRate};
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls);
+    for (uint64_t round = 1; round <= 30; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_EQ(r.admitted, kSaturatingOwners) << "round " << round;
+        ASSERT_EQ(r.dropped, 0) << "round " << round;
+        ASSERT_DOUBLE_EQ(r.rate_after, kLineRate) << "round " << round;
+    }
+    EXPECT_EQ(hook_calls, 0);
+}
+
+// An estimate depressed to what 6 of 8 owners achieve drops one owner a
+// round, but the 7 that get through achieve more than the estimate says,
+// so it climbs back and admission returns to 8: the shallow basin recovers.
+TEST(AdmissionQueueTest, Step3FeedbackShallowDepressionRecovers) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, 0.0};
+    link.rate = link.achieved(6);  // 0.75 GB/s
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls);
+
+    int recovered_at = -1;
+    for (uint64_t round = 1; round <= 40; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_GE(r.admitted, 7) << "round " << round;  // never gets worse
+        if (r.admitted == kSaturatingOwners && recovered_at < 0)
+            recovered_at = static_cast<int>(round);
+        if (recovered_at > 0)
+            ASSERT_EQ(r.admitted, kSaturatingOwners) << "round " << round;
+    }
+    EXPECT_GT(recovered_at, 0);
+    EXPECT_LE(recovered_at, 25);
+    EXPECT_NEAR(link.rate, kLineRate, 0.02 * kLineRate);
+    EXPECT_EQ(hook_calls, recovered_at - 1);  // one drop per round until then
+}
+
+// An estimate depressed to what 4 of 8 owners achieve is a fixed point: the
+// 5th owner scores MLU 1.0, so exactly 4 are admitted, 4 achieve exactly the
+// rate the estimate already holds, and nothing ever pulls it back up. This
+// pins the J21 finding under the queue-depth-bound model: the loop has a
+// self-sustaining plateau below saturation, and admission has no probe
+// (unlike selectMultiPath's probe_mode) to spend evidence on climbing out.
+// A probe mechanism must make this test's expectations flip.
+TEST(AdmissionQueueTest, Step3FeedbackDeepDepressionIsSelfSustaining) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, 0.0};
+    link.rate = link.achieved(4);  // 0.5 GB/s
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls);
+
+    for (uint64_t round = 1; round <= 50; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_EQ(r.admitted, 4) << "round " << round;
+        ASSERT_EQ(r.dropped, 4) << "round " << round;
+        ASSERT_DOUBLE_EQ(r.rate_after, link.achieved(4)) << "round " << round;
+    }
+    EXPECT_EQ(hook_calls, 4 * 50);
 }
 
 TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
