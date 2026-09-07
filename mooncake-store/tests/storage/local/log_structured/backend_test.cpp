@@ -200,14 +200,13 @@ TEST(LogStructuredStorageBackendTest,
     std::promise<void> allow_callback_return;
     auto callback_gate = allow_callback_return.get_future().share();
     auto offload = std::async(std::launch::async, [&]() {
-        return backend.BatchOffload(
-            SingleValueBatch(storage_key, value),
-            [&](const std::vector<std::string>&,
-                std::vector<StorageObjectMetadata>&) {
-                callback_entered.set_value();
-                callback_gate.wait();
-                return ErrorCode::OK;
-            });
+        return backend.BatchOffload(SingleValueBatch(storage_key, value),
+                                    [&](const std::vector<std::string>&,
+                                        std::vector<StorageObjectMetadata>&) {
+                                        callback_entered.set_value();
+                                        callback_gate.wait();
+                                        return ErrorCode::OK;
+                                    });
     });
 
     ASSERT_EQ(callback_entered.get_future().wait_for(std::chrono::seconds(2)),

@@ -518,7 +518,8 @@ add_library(
   mooncake_store
   $<TARGET_OBJECTS:mooncake_store_shared_objects>
   $<TARGET_OBJECTS:mooncake_store_master_objects>
-  $<TARGET_OBJECTS:mooncake_store_client_objects>)
+  $<TARGET_OBJECTS:mooncake_store_client_objects>
+  $<TARGET_OBJECTS:mooncake_log_structured_storage_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store
@@ -544,8 +545,6 @@ if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
-target_link_libraries(mooncake_store PRIVATE mooncake_log_structured_storage)
-
 if(USE_CUDA)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
 elseif(USE_HIP)
