@@ -47,7 +47,6 @@ class RdmaRoute : public RouteProvider {
         std::span<const std::optional<DeviceTransferEndpoint>> endpoints)
         override;
 
-    PGResult<void> quiesce() override;
     PGResult<void> shutdown() override;
 
    private:
@@ -59,10 +58,6 @@ class RdmaRoute : public RouteProvider {
     std::unique_ptr<State> state_;
     bool shutdown_requested_ = false;
 };
-
-void launchRdmaDrainKernel(void* qp_devctxs, uint32_t num_qps,
-                           uint64_t timeout_ticks, TransferResult* results,
-                           cudaStream_t stream);
 
 }  // namespace mooncake
 

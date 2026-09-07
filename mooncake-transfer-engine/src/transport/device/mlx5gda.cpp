@@ -567,6 +567,25 @@ void mlx5gda_destroy_qp(struct mlx5gda_qp* qp) {
     }
 }
 
+int mlx5gda_modify_rc_qp_2rst(struct mlx5gda_qp* qp) {
+    if (!qp || !qp->mqp) {
+        errno = EINVAL;
+        return -1;
+    }
+    uint8_t cmd_in[DEVX_ST_SZ_BYTES(qp_2rst_in)] = {0};
+    uint8_t cmd_out[DEVX_ST_SZ_BYTES(qp_2rst_out)] = {0};
+
+    DEVX_SET(qp_2rst_in, cmd_in, opcode, MLX5_CMD_OP_QP_2RST);
+    DEVX_SET(qp_2rst_in, cmd_in, qpn, qp->qpn);
+
+    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out,
+                                     sizeof(cmd_out));
+    if (ret) {
+        perror("Failed to modify RC QP (2rst)");
+    }
+    return ret;
+}
+
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp* qp, uint16_t pkey_index) {
     if (!qp || !qp->mqp) {
         errno = EINVAL;
