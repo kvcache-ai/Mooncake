@@ -624,10 +624,12 @@ jobs:
           # For PRs: compare against the target branch
           BASE_REF="origin/${{ github.base_ref }}"
         else
-          # For push events: use github.event.before to handle multi-commit pushes
+          # For push events: use github.event.before to handle multi-commit
+          # pushes. workflow_dispatch has no before SHA, and a new-branch push
+          # uses the all-zero SHA — both should compare against the default
+          # branch the same way a PR against main does.
           BEFORE_SHA="${{ github.event.before }}"
-          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
-            # New branch push, compare against default branch
+          if [ -z "${BEFORE_SHA}" ] || [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
             BASE_REF="origin/${{ github.event.repository.default_branch }}"
           else
             # Normal push (single or multiple commits)
