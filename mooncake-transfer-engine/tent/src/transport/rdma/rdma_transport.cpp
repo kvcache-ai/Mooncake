@@ -185,6 +185,8 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     SET_ENDPOINT(send_retry_count, params->endpoint.send_retry_count);
     SET_ENDPOINT(send_rnr_count, params->endpoint.send_rnr_count);
     SET_ENDPOINT(max_rd_atomic, params->endpoint.max_rd_atomic);
+    params->endpoint.notify_proto =
+        conf->get("notification/proto", params->endpoint.notify_proto);
 
     size_t mtu_val = conf->get("transports/rdma/endpoint/path_mtu", 4096);
     if (mtu_val == 4096)
@@ -983,7 +985,7 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
     if (!endpoint) return notifyStatusForEndpointFailure(failure);
     // Notify QP not connected (the peer has none, or it was disabled after a
     // fault), or the post itself was refused.
-    if (!endpoint->sendNotification(notify.name, notify.msg)) {
+    if (!endpoint->sendNotification(notify)) {
         return Status::RdmaError(
             "RDMA notification channel unavailable" LOC_MARK);
     }
@@ -1001,10 +1003,9 @@ Status RdmaTransport::receiveNotification(
     return Status::OK();
 }
 
-void RdmaTransport::addNotificationToQueue(const std::string& name,
-                                           const std::string& msg) {
+void RdmaTransport::addNotificationToQueue(const Notification& notifi) {
     std::lock_guard<std::mutex> lock(notify_mutex_);
-    notify_list_.emplace_back(name, msg);
+    notify_list_.push_back(notifi);
 }
 
 namespace {

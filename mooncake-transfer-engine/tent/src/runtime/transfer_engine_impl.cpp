@@ -84,6 +84,9 @@ struct Batch {
         Notification notifi;
         bool fired{false};
         std::unordered_set<SegmentID> targets;
+        // Stamped once per target, so a retry in a later poll carries the
+        // same sequence number and the receiver can drop the duplicate.
+        std::unordered_map<SegmentID, Notification> stamped;
     };
     std::vector<SubmitHook> submit_hooks;
 };
@@ -406,6 +409,7 @@ Status TransferEngineImpl::construct() {
     }
     merge_requests_ = conf_->get("merge_requests", true);
     notify_rpc_fallback_ = conf_->get("notification/rpc_fallback", true);
+    notify_proto_ = conf_->get("notification/proto", 1);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
@@ -479,6 +483,10 @@ Status TransferEngineImpl::construct() {
     // hands them out. ControlService keeps a single callback: the TCP
     // transports register their own in install() below and take over.
     metadata_->setNotifyCallback([this](const Notification& notifi) -> int {
+        // A copy may also arrive over the notify QP; the window sees both.
+        if (notify_proto_ != 0 &&
+            !notify_dedup_.admit(notifi.session, notifi.seq))
+            return 0;
         std::lock_guard<std::mutex> lk(local_notifi_mutex_);
         local_notifi_list_.push_back(notifi);
         return 0;
@@ -2716,8 +2724,19 @@ Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
         // a self-targeted notification that cannot fail, and its receiver
         // would block until that unrelated peer came back.
         for (auto it = hook.targets.begin(); it != hook.targets.end();) {
-            auto status = sendNotification(*it, hook.notifi);
+            const Notification* to_send = &hook.notifi;
+            if (notify_proto_ != 0 && *it != LOCAL_SEGMENT_ID) {
+                Notification& copy = hook.stamped[*it];
+                if (copy.seq == 0) {
+                    copy = notify_sequencer_.stamp(
+                        metadata_->segmentManager().remoteName(*it),
+                        hook.notifi);
+                }
+                to_send = &copy;
+            }
+            auto status = sendNotification(*it, *to_send);
             if (status.ok()) {
+                hook.stamped.erase(*it);
                 it = hook.targets.erase(it);
                 continue;
             }
@@ -3055,20 +3074,26 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
         local_notifi_list_.push_back(notifi);
         return Status::OK();
     }
+    Notification to_send =
+        notify_proto_ != 0
+            ? notify_sequencer_.stamp(
+                  metadata_->segmentManager().remoteName(target_id), notifi)
+            : notifi;
+    // Off: nothing this engine sends carries a stamp.
+    if (notify_proto_ == 0) to_send.session = to_send.seq = 0;
     // Transports are tried in slot order, RDMA before TCP, so with TCP loaded
     // the fallback is its own RPC-based sendNotification(); the explicit RPC
     // below is for engines without one. Only a transport whose channel is
     // unavailable is skipped - the endpoint could not be brought up or the
     // notification channel on it is gone, so nothing left this host. Any
     // other error (bad argument, stale cache) is the caller's to see, and a
-    // notification that was posted but lost in flight is out of scope here:
-    // resending it would need receiver-side deduplication first.
+    // notification that was posted but lost in flight is not resent here.
     bool attempted = false;
     Status status;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
-        Status attempt = transport->sendNotification(target_id, notifi);
+        Status attempt = transport->sendNotification(target_id, to_send);
         // A transport that advertises notifications without implementing
         // them (SunriseLink) is not a channel at all.
         if (attempt.IsNotImplemented()) continue;
@@ -3089,7 +3114,7 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
         return Status::InvalidArgument("Notification not supported" LOC_MARK);
     // Every loaded notification transport reported its channel unavailable;
     // the control plane the peer answers bootstrap on is still there.
-    return sendNotificationViaRpc(target_id, notifi);
+    return sendNotificationViaRpc(target_id, to_send);
 }
 
 Status TransferEngineImpl::sendNotificationViaRpc(SegmentID target_id,
@@ -3138,6 +3163,23 @@ Status TransferEngineImpl::receiveNotification(
             notifi_list.insert(notifi_list.end(),
                                std::make_move_iterator(part.begin()),
                                std::make_move_iterator(part.end()));
+        }
+    }
+    // A copy that also arrived over another path, or was resent, is dropped.
+    // RPC copies in the local queue were checked on arrival.
+    if (notify_proto_ != 0) {
+        auto dup = std::remove_if(
+            notifi_list.begin(), notifi_list.end(), [&](const Notification& n) {
+                return !notify_dedup_.admit(n.session, n.seq);
+            });
+        if (dup != notifi_list.end()) {
+            notify_dedup_dropped_.fetch_add(notifi_list.end() - dup,
+                                            std::memory_order_relaxed);
+            LOG_EVERY_N(WARNING, 100)
+                << "Dropped duplicate notifications, "
+                << notify_dedup_dropped_.load(std::memory_order_relaxed)
+                << " so far";
+            notifi_list.erase(dup, notifi_list.end());
         }
     }
     // Append self-targeted notifications queued by sendNotification(). They

@@ -322,6 +322,16 @@ TEST(EndpointLifecycleTest, NotificationSendGivesUpWhenPeerStopsCompleting) {
     EXPECT_GE(send(false), stall - milliseconds(100));
 }
 
+// Typed frames only for stamped notifications to peers that advertised them.
+TEST(EndpointLifecycleTest, TypedFrameOnlyToPeersThatAdvertiseIt) {
+    EXPECT_FALSE(RdmaEndPoint::useTypedNotifyFrame(0, 5));
+    EXPECT_FALSE(RdmaEndPoint::useTypedNotifyFrame(1, 0));
+    EXPECT_TRUE(RdmaEndPoint::useTypedNotifyFrame(1, 5));
+    EXPECT_TRUE(RdmaEndPoint::useTypedNotifyFrame(2, 5));
+    RdmaEndPoint endpoint;
+    EXPECT_EQ(endpoint.peerNotifyProto(), 0u);
+}
+
 TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {
     // A fault confined to the notify QP must not retire the endpoint: doing so
     // moves every data QP to ERR and flushes in-flight transfers.

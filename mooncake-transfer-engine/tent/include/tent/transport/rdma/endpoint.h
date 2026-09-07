@@ -137,6 +137,16 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     bool sendNotification(const std::string& name, const std::string& msg);
 
+    // A typed frame carrying session/seq if the peer advertised it and
+    // notifi is stamped; otherwise the raw payload older peers understand.
+    bool sendNotification(const Notification& notifi);
+
+    static bool useTypedNotifyFrame(uint32_t peer_notify_proto, uint64_t seq) {
+        return peer_notify_proto >= 1 && seq != 0;
+    }
+
+    uint32_t peerNotifyProto() const { return peer_notify_proto_; }
+
     // Whether the notify QP is connected and not disabled after a fault.
     bool notifyConnected() const {
         return notify_connected_.load(std::memory_order_acquire);
@@ -296,6 +306,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::vector<uint32_t> peer_qp_num_list_;
+    uint32_t peer_notify_proto_ = 0;  // BootstrapDesc::notify_proto
     // Notification QP (one per endpoint for control plane operations)
     ibv_qp* notify_qp_ = nullptr;
 

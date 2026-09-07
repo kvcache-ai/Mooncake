@@ -53,11 +53,15 @@ struct BootstrapDesc {
     std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
+    // Formats this side's notify QP accepts: 0 = raw payload only (what an
+    // older peer's missing field decodes to), 1 = typed frames as well.
+    uint32_t notify_proto = 0;
 
    public:
-    NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, local_lid, local_gid, reply_msg,
-                                   notify_qp_num);
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE_WITH_DEFAULT(BootstrapDesc, local_nic_path,
+                                                peer_nic_path, qp_num,
+                                                local_lid, local_gid, reply_msg,
+                                                notify_qp_num, notify_proto);
 };
 
 // UB/URMA has Jetty, JFC and EID concepts that are not wire-compatible with

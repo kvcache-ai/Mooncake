@@ -281,12 +281,18 @@ Status ControlClient::recvData(const std::string& server_addr,
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
-    j = nlohmann::json{{"name", n.name}, {"msg", n.msg}};
+    j = nlohmann::json{{"name", n.name},
+                       {"msg", n.msg},
+                       {"session", n.session},
+                       {"seq", n.seq}};
 }
 
+// session/seq are absent from older senders and ignored by older receivers.
 inline void from_json(const nlohmann::json& j, Notification& n) {
     j.at("name").get_to(n.name);
     j.at("msg").get_to(n.msg);
+    n.session = j.value("session", uint64_t{0});
+    n.seq = j.value("seq", uint64_t{0});
 }
 
 Status ControlClient::notify(const std::string& server_addr,

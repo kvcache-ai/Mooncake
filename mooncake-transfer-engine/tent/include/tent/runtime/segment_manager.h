@@ -55,6 +55,9 @@ class SegmentManager {
 
     Status closeRemote(SegmentID handle);
 
+    // The name a remote handle was opened with; empty if it is not open.
+    std::string remoteName(SegmentID handle);
+
     // Use `withCachedSegment()` when you want automatic
     // cache invalidation and retry on stale segment cache.
     Status getRemoteCached(SegmentDesc *&desc, SegmentID handle);

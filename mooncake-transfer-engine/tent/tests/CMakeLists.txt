@@ -828,3 +828,10 @@ endif()
 target_include_directories(tent_peer_health_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_peer_health_test COMMAND tent_peer_health_test)
+
+add_executable(tent_notify_frame_test notify_frame_test.cpp)
+target_link_libraries(tent_notify_frame_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+target_include_directories(tent_notify_frame_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_notify_frame_test COMMAND tent_notify_frame_test)

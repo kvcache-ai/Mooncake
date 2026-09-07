@@ -31,6 +31,7 @@
 #include "tent/common/config.h"
 #include "tent/common/config_lifecycle.h"
 #include "tent/common/status.h"
+#include "tent/common/notify_frame.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
@@ -322,7 +323,8 @@ class TransferEngineImpl {
     // Drains every loaded notification transport plus the in-process queue,
     // so a notification lands with the caller no matter which path carried
     // it. Order is kept within one path only: in a poll, notifications that
-    // took the RPC fallback come after the ones the notify QP carried.
+    // took the RPC fallback come after the ones the notify QP carried. A
+    // stamped notification delivered before is dropped, whichever path.
     Status receiveNotification(std::vector<Notification>& notifi_list);
 
     Status probePeerAliveByID(SegmentID target_id);
@@ -591,6 +593,11 @@ class TransferEngineImpl {
     // in-process rather than through a transport; see sendNotification().
     std::mutex local_notifi_mutex_;
     std::vector<Notification> local_notifi_list_;
+
+    int notify_proto_{1};  // notification/proto; 0 = raw, no stamp, no dedup
+    NotifySequencer notify_sequencer_;
+    NotifyDedupWindow notify_dedup_;
+    std::atomic<uint64_t> notify_dedup_dropped_{0};
 
     std::string hostname_;
     uint16_t port_;
