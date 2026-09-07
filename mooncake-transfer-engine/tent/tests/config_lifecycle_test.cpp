@@ -49,9 +49,10 @@ class EnvVarGuard {
     bool had_value_{false};
 };
 
-TEST(ConfigLifecycleTest, InventoryPathsAreUnique) {
+TEST(ConfigLifecycleTest, RuntimeAllowlistPathsAreUnique) {
     std::set<std::string_view> paths;
     for (const auto& field : configFieldInventory()) {
+        EXPECT_EQ(field.lifecycle, ConfigLifecycle::kRuntimeCandidate);
         EXPECT_FALSE(field.path.empty());
         EXPECT_TRUE(paths.insert(field.path).second) << field.path;
     }
@@ -76,16 +77,25 @@ TEST(ConfigLifecycleTest, ClassifiesRepresentativeFields) {
               ConfigLifecycle::kRuntimeCandidate);
     EXPECT_EQ(classifyConfigPath("metrics/report_interval_seconds"),
               ConfigLifecycle::kRuntimeCandidate);
+    EXPECT_EQ(classifyConfigPath("max_failover_attempts"),
+              ConfigLifecycle::kRuntimeCandidate);
+    EXPECT_EQ(classifyConfigPath("enable_auto_failover_on_poll"),
+              ConfigLifecycle::kRuntimeCandidate);
 
     EXPECT_EQ(classifyConfigPath("unknown/value"),
-              ConfigLifecycle::kUnsupported);
+              ConfigLifecycle::kBootstrapOnly);
+    EXPECT_EQ(classifyConfigPath("policy_extra/value"),
+              ConfigLifecycle::kBootstrapOnly);
 }
 
-TEST(ConfigLifecycleTest, MostSpecificFieldOverridesBootstrapSubtree) {
+TEST(ConfigLifecycleTest, AllowlistedFieldOverridesBootstrapDefault) {
     EXPECT_EQ(classifyConfigPath("transports/rdma/device/max_cqe"),
               ConfigLifecycle::kBootstrapOnly);
     EXPECT_EQ(classifyConfigPath("transports/rdma/enable_smart_scheduling"),
               ConfigLifecycle::kRuntimeCandidate);
+    EXPECT_EQ(
+        classifyConfigPath("transports/rdma/enable_smart_scheduling/extra"),
+        ConfigLifecycle::kBootstrapOnly);
 }
 
 TEST(ConfigLifecycleTest, BundleViewsEnforceLifecycleBoundaries) {
@@ -178,7 +188,7 @@ TEST(ConfigLifecycleTest, PreservesNestedBeforeFlatLookupCompatibility) {
     EXPECT_EQ(bundle.bootstrap->get("metrics/http_port", 0), 9100);
 }
 
-TEST(ConfigLifecycleTest, ReportsUnsupportedFieldsWithoutRejectingBundle) {
+TEST(ConfigLifecycleTest, UnmatchedFieldsAreBootstrapOnlyWithoutDiagnostics) {
     Config config;
     ASSERT_TRUE(config
                     .load(R"({
@@ -188,15 +198,12 @@ TEST(ConfigLifecycleTest, ReportsUnsupportedFieldsWithoutRejectingBundle) {
                     .ok());
 
     auto bundle = buildTentConfigBundle(config);
-    ASSERT_EQ(bundle.diagnostics.size(), 2);
-    EXPECT_EQ(bundle.diagnostics[0].code,
-              ConfigDiagnosticCode::kUnsupportedField);
-    EXPECT_EQ(bundle.diagnostics[0].path, "mystery");
-    EXPECT_EQ(bundle.diagnostics[1].code,
-              ConfigDiagnosticCode::kUnsupportedField);
-    EXPECT_EQ(bundle.diagnostics[1].path, "transports/unknown/enable");
-    EXPECT_NE(bundle.bootstrap, nullptr);
-    EXPECT_NE(bundle.runtime, nullptr);
+    EXPECT_TRUE(bundle.diagnostics.empty());
+    EXPECT_EQ(bundle.bootstrap->get("mystery", 0), 1);
+    EXPECT_TRUE(bundle.bootstrap->get("transports/unknown/enable", false));
+    EXPECT_FALSE(bundle.runtime->config->contains("mystery"));
+    EXPECT_FALSE(
+        bundle.runtime->config->get("transports/unknown/enable", false));
 }
 
 TEST(ConfigLifecycleTest, ReportsNonObjectRoot) {
@@ -236,16 +243,6 @@ TEST(ConfigLifecycleTest, PreservesLegacyEnvironmentPrecedence) {
 
     EXPECT_EQ(bundle.bootstrap->get("transports/rdma/bind_address", ""),
               "10.0.0.2");
-}
-
-TEST(ConfigLifecycleTest, RepositoryExampleIsFullyClassified) {
-    Config config;
-    ASSERT_TRUE(config.loadFile(TENT_CONFIG_FIXTURE_PATH).ok());
-
-    auto bundle = buildTentConfigBundle(config);
-    for (const auto& diagnostic : bundle.diagnostics) {
-        ADD_FAILURE() << diagnostic.path << ": " << diagnostic.message;
-    }
 }
 
 }  // namespace
