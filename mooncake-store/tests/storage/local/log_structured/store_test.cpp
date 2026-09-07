@@ -14,6 +14,7 @@
 #include <sstream>
 #include <stop_token>
 #include <string>
+#include <thread>
 
 #include <gtest/gtest.h>
 
@@ -1632,6 +1633,129 @@ TEST(LogStructuredStoreTest, PreparesBatchAcrossSegmentsAndRecovers) {
         EXPECT_EQ(*value, values[index]);
     }
     EXPECT_GT((*reopened)->SnapshotStats().sealed_segments, size_t{0});
+}
+
+TEST(LogStructuredStoreTest, GroupsConcurrentPrepareWalSyncs) {
+    StoreTempDirectory temp;
+    auto config = Config(temp);
+    config.sync_data = false;
+    config.use_uring = false;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    const auto stats_before = (*store)->SnapshotStats();
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool first_group_blocked = false;
+    bool release_first_group = false;
+    std::atomic<size_t> hook_calls{0};
+    WalWriter::SetBeforeWriteHookForTest([&] {
+        if (hook_calls.fetch_add(1, std::memory_order_relaxed) != 0) return;
+        std::unique_lock lock(hook_mutex);
+        first_group_blocked = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_first_group; });
+    });
+
+    constexpr size_t kRequests = 16;
+    std::vector<std::future<tl::expected<PreparedWrite, StoreError>>> futures;
+    futures.reserve(kRequests);
+    for (size_t index = 0; index < kRequests; ++index) {
+        futures.push_back(std::async(std::launch::async, [&, index] {
+            return (*store)->PreparePut(
+                "tenant-a", "group-" + std::to_string(index), "value");
+        }));
+    }
+
+    {
+        std::unique_lock lock(hook_mutex);
+        EXPECT_TRUE(hook_cv.wait_for(lock, std::chrono::seconds(2),
+                                     [&] { return first_group_blocked; }));
+    }
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((*store)->SnapshotStats().wal_append_requests < kRequests &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool all_queued =
+        (*store)->SnapshotStats().wal_append_requests == kRequests;
+    {
+        std::lock_guard lock(hook_mutex);
+        release_first_group = true;
+    }
+    hook_cv.notify_all();
+
+    std::vector<PreparedWrite> prepared;
+    prepared.reserve(kRequests);
+    for (auto& future : futures) {
+        auto result = future.get();
+        EXPECT_TRUE(result.has_value());
+        if (result) prepared.push_back(std::move(*result));
+    }
+    WalWriter::SetBeforeWriteHookForTest({});
+
+    ASSERT_TRUE(all_queued);
+    ASSERT_EQ(prepared.size(), kRequests);
+    const auto stats = (*store)->SnapshotStats();
+    EXPECT_EQ(stats.wal_write_groups - stats_before.wal_write_groups,
+              uint64_t{2});
+    EXPECT_EQ(stats.wal_sync_groups - stats_before.wal_sync_groups,
+              uint64_t{2});
+    EXPECT_GT(stats.wal_max_group_requests, uint64_t{1});
+    EXPECT_TRUE((*store)->CommitPuts(prepared).has_value());
+}
+
+TEST(LogStructuredStoreTest, SerializesTransitionsForTheSameLogicalKey) {
+    StoreTempDirectory temp;
+    auto config = Config(temp);
+    config.sync_data = false;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    const auto identity = StoreIdentity("same-key", 1);
+    auto prepared = (*store)->PreparePut(identity, "value");
+    ASSERT_TRUE(prepared.has_value());
+    const uint64_t requests_before =
+        (*store)->SnapshotStats().wal_append_requests;
+
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool commit_blocked = false;
+    bool release_commit = false;
+    WalWriter::SetBeforeWriteHookForTest([&] {
+        std::unique_lock lock(hook_mutex);
+        commit_blocked = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_commit; });
+    });
+
+    auto first = std::async(std::launch::async, [&] {
+        return (*store)->CommitPut(identity, prepared->sequence);
+    });
+    {
+        std::unique_lock lock(hook_mutex);
+        EXPECT_TRUE(hook_cv.wait_for(lock, std::chrono::seconds(2),
+                                     [&] { return commit_blocked; }));
+    }
+    auto second = std::async(std::launch::async, [&] {
+        return (*store)->CommitPut(identity, prepared->sequence);
+    });
+    EXPECT_EQ(second.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_EQ((*store)->SnapshotStats().wal_append_requests,
+              requests_before + 1);
+
+    {
+        std::lock_guard lock(hook_mutex);
+        release_commit = true;
+    }
+    hook_cv.notify_all();
+    EXPECT_TRUE(first.get().has_value());
+    EXPECT_TRUE(second.get().has_value());
+    WalWriter::SetBeforeWriteHookForTest({});
+    EXPECT_EQ((*store)->SnapshotStats().wal_append_requests,
+              requests_before + 1);
 }
 
 }  // namespace

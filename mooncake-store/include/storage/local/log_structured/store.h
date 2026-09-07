@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <condition_variable>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -11,6 +12,7 @@
 #include <stop_token>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "storage/local/log_structured/index.h"
@@ -80,6 +82,10 @@ struct StoreStats {
     size_t sealed_segments{0};
     size_t retired_segments{0};
     uint64_t wal_sequence{0};
+    uint64_t wal_append_requests{0};
+    uint64_t wal_write_groups{0};
+    uint64_t wal_sync_groups{0};
+    uint64_t wal_max_group_requests{0};
     uint64_t checkpoint_sequence{0};
 };
 
@@ -149,6 +155,17 @@ class LogStructuredStore {
         std::function<bool(CompactionCrashPoint)> predicate);
 
    private:
+    struct TransitionKey {
+        std::string tenant_id;
+        std::string object_key;
+
+        bool operator==(const TransitionKey&) const = default;
+    };
+
+    struct TransitionKeyHash {
+        size_t operator()(const TransitionKey& key) const;
+    };
+
     struct PinnedEntry {
         IndexSnapshotEntry entry;
         std::shared_ptr<SegmentReader> reader;
@@ -183,6 +200,9 @@ class LogStructuredStore {
         const PinnedEntry& pinned);
     static tl::expected<void, StoreError> ReadPinnedEntryInto(
         const PinnedEntry& pinned, char* value, size_t value_size);
+    bool AcquireTransitionKeysLocked(std::unique_lock<std::mutex>& lock,
+                                     const std::vector<TransitionKey>& keys);
+    void ReleaseTransitionKeysLocked(const std::vector<TransitionKey>& keys);
     tl::expected<void, StoreError> CheckpointLocked();
     void CleanupRetiredSegmentsLocked();
     std::string SegmentPath(uint64_t segment_id) const;
@@ -191,6 +211,8 @@ class LogStructuredStore {
     std::string segments_path_;
     std::string wal_path_;
     mutable std::mutex mutex_;
+    std::condition_variable transition_cv_;
+    std::unordered_set<TransitionKey, TransitionKeyHash> transitions_in_flight_;
     mutable std::shared_mutex mutation_mutex_;
     std::mutex compaction_mutex_;
     std::unique_ptr<StorageDirectory> directory_;

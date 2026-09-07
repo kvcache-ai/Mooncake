@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <limits>
@@ -43,6 +44,21 @@ constexpr size_t kFooterPayloadChecksumOffset = 0;
 constexpr size_t kFooterChecksumOffset = 4;
 constexpr size_t kFooterMagicOffset = 8;
 constexpr size_t kFooterChecksumInputSize = kFooterChecksumOffset;
+constexpr size_t kMaxGroupBytes = 1024 * 1024;
+constexpr size_t kMaxGroupRequests = 128;
+constexpr size_t kMaxGroupRecords = 4096;
+
+std::mutex wal_test_hook_mutex;
+std::function<void()> before_write_hook;
+
+void RunBeforeWriteHook() {
+    std::function<void()> hook;
+    {
+        std::lock_guard lock(wal_test_hook_mutex);
+        hook = before_write_hook;
+    }
+    if (hook) hook();
+}
 
 template <typename T>
 void WriteLittleEndian(char* output, T value) {
@@ -298,54 +314,162 @@ tl::expected<std::unique_ptr<WalWriter>, WalError> WalWriter::OpenForAppend(
 
 tl::expected<void, WalError> WalWriter::Append(const WalRecord& record,
                                                bool sync) {
-    auto encoded = EncodeWalRecord(record);
-    if (!encoded ||
-        tail_ > static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
-                    encoded->size()) {
-        return tl::unexpected(WalError::kInvalidArgument);
-    }
-    if (!PwriteAll(fd_, encoded->data(), encoded->size(), tail_)) {
-        return tl::unexpected(WalError::kIoError);
-    }
-    if (sync && fdatasync(fd_) != 0) {
-        return tl::unexpected(WalError::kSyncFailed);
-    }
-    tail_ += encoded->size();
-    return {};
+    return AppendBatch(std::vector<WalRecord>{record}, sync);
 }
 
 tl::expected<void, WalError> WalWriter::AppendBatch(
     const std::vector<WalRecord>& records, bool sync) {
     if (records.empty()) return {};
-    const uint64_t original_tail = tail_;
-    uint64_t next_tail = tail_;
+
+    PendingAppend request;
+    request.record_count = records.size();
+    request.sync = sync;
     for (const auto& record : records) {
         auto encoded = EncodeWalRecord(record);
         if (!encoded ||
-            next_tail >
-                static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
-                    encoded->size() ||
-            !PwriteAll(fd_, encoded->data(), encoded->size(), next_tail)) {
-            if (ftruncate(fd_, static_cast<off_t>(original_tail)) != 0) {
-                return tl::unexpected(WalError::kTruncateFailed);
-            }
-            return tl::unexpected(WalError::kIoError);
+            request.encoded.size() >
+                std::numeric_limits<size_t>::max() - encoded->size()) {
+            return tl::unexpected(WalError::kInvalidArgument);
         }
-        next_tail += encoded->size();
+        request.encoded.append(*encoded);
     }
-    if (sync && fdatasync(fd_) != 0) {
-        if (ftruncate(fd_, static_cast<off_t>(original_tail)) != 0) {
-            return tl::unexpected(WalError::kTruncateFailed);
-        }
-        return tl::unexpected(WalError::kSyncFailed);
-    }
-    tail_ = next_tail;
-    return {};
+    return Submit(request);
 }
 
 tl::expected<void, WalError> WalWriter::Sync() {
-    if (fdatasync(fd_) != 0) return tl::unexpected(WalError::kSyncFailed);
+    PendingAppend request;
+    request.sync = true;
+    return Submit(request);
+}
+
+tl::expected<void, WalError> WalWriter::Submit(PendingAppend& request) {
+    std::unique_lock lock(mutex_);
+    if (terminal_error_) return tl::unexpected(*terminal_error_);
+    pending_.push_back(&request);
+    ++stats_.append_requests;
+    stats_.appended_records += request.record_count;
+    if (!writer_active_) {
+        writer_active_ = true;
+        request.leader = true;
+    }
+
+    completion_cv_.wait(lock, [&] { return request.done || request.leader; });
+    if (request.leader) {
+        lock.unlock();
+        RunWriter();
+        lock.lock();
+        if (!terminal_error_ && !pending_.empty()) {
+            pending_.front()->leader = true;
+        } else {
+            writer_active_ = false;
+        }
+        completion_cv_.notify_all();
+    }
+    if (request.error) return tl::unexpected(*request.error);
     return {};
+}
+
+void WalWriter::RunWriter() {
+    std::vector<PendingAppend*> group;
+    uint64_t original_tail = 0;
+    size_t group_bytes = 0;
+    size_t group_records = 0;
+    bool sync = false;
+    {
+        std::lock_guard lock(mutex_);
+        original_tail = tail_;
+        while (!pending_.empty()) {
+            PendingAppend* next = pending_.front();
+            const bool exceeds_limit =
+                !group.empty() &&
+                (group.size() >= kMaxGroupRequests ||
+                 group_bytes >= kMaxGroupBytes ||
+                 next->encoded.size() > kMaxGroupBytes - group_bytes ||
+                 group_records >= kMaxGroupRecords ||
+                 next->record_count > kMaxGroupRecords - group_records);
+            if (exceeds_limit) break;
+            pending_.pop_front();
+            group.push_back(next);
+            group_bytes += next->encoded.size();
+            group_records += next->record_count;
+            sync = sync || next->sync;
+        }
+    }
+
+    std::string encoded_group;
+    encoded_group.reserve(group_bytes);
+    for (const auto* request : group) {
+        encoded_group.append(request->encoded);
+    }
+
+    RunBeforeWriteHook();
+
+    std::optional<WalError> error;
+    if (encoded_group.size() >
+        static_cast<uint64_t>(std::numeric_limits<off_t>::max()) -
+            original_tail) {
+        error = WalError::kInvalidArgument;
+    } else if (!encoded_group.empty() &&
+               !PwriteAll(fd_, encoded_group.data(), encoded_group.size(),
+                          original_tail)) {
+        error = WalError::kIoError;
+    } else if (sync && fdatasync(fd_) != 0) {
+        error = WalError::kSyncFailed;
+    }
+
+    if (error && ftruncate(fd_, static_cast<off_t>(original_tail)) != 0) {
+        error = WalError::kTruncateFailed;
+    }
+
+    {
+        std::lock_guard lock(mutex_);
+        ++stats_.write_groups;
+        if (sync) ++stats_.sync_groups;
+        stats_.grouped_requests += group.size();
+        stats_.max_group_requests =
+            std::max<uint64_t>(stats_.max_group_requests, group.size());
+        if (!error) {
+            tail_ = original_tail + encoded_group.size();
+            stats_.appended_bytes += encoded_group.size();
+        }
+    }
+    CompleteGroup(group, error);
+}
+
+void WalWriter::CompleteGroup(const std::vector<PendingAppend*>& group,
+                              std::optional<WalError> error) {
+    {
+        std::lock_guard lock(mutex_);
+        for (auto* request : group) {
+            request->error = error;
+            request->done = true;
+        }
+        if (error) {
+            terminal_error_ = error;
+            while (!pending_.empty()) {
+                PendingAppend* request = pending_.front();
+                pending_.pop_front();
+                request->error = error;
+                request->done = true;
+            }
+        }
+    }
+    completion_cv_.notify_all();
+}
+
+uint64_t WalWriter::tail() const {
+    std::lock_guard lock(mutex_);
+    return tail_;
+}
+
+WalWriterStats WalWriter::SnapshotStats() const {
+    std::lock_guard lock(mutex_);
+    return stats_;
+}
+
+void WalWriter::SetBeforeWriteHookForTest(std::function<void()> hook) {
+    std::lock_guard lock(wal_test_hook_mutex);
+    before_write_hook = std::move(hook);
 }
 
 tl::expected<WalScanResult, WalError> ScanWal(const std::string& path) {

@@ -1,7 +1,12 @@
 #pragma once
 
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -48,6 +53,16 @@ struct WalScanResult {
     WalScanTermination termination{WalScanTermination::kCleanEof};
 };
 
+struct WalWriterStats {
+    uint64_t append_requests{0};
+    uint64_t appended_records{0};
+    uint64_t write_groups{0};
+    uint64_t sync_groups{0};
+    uint64_t grouped_requests{0};
+    uint64_t max_group_requests{0};
+    uint64_t appended_bytes{0};
+};
+
 class WalWriter {
    public:
     static tl::expected<std::unique_ptr<WalWriter>, WalError> Create(
@@ -65,15 +80,38 @@ class WalWriter {
         const std::vector<WalRecord>& records, bool sync);
     tl::expected<void, WalError> Sync();
 
-    uint64_t tail() const { return tail_; }
+    uint64_t tail() const;
+    WalWriterStats SnapshotStats() const;
     const std::string& path() const { return path_; }
 
+    static void SetBeforeWriteHookForTest(std::function<void()> hook);
+
    private:
+    struct PendingAppend {
+        std::string encoded;
+        size_t record_count{0};
+        bool sync{false};
+        bool leader{false};
+        bool done{false};
+        std::optional<WalError> error;
+    };
+
     WalWriter(std::string path, int fd, uint64_t tail);
+
+    tl::expected<void, WalError> Submit(PendingAppend& request);
+    void RunWriter();
+    void CompleteGroup(const std::vector<PendingAppend*>& group,
+                       std::optional<WalError> error);
 
     std::string path_;
     int fd_;
+    mutable std::mutex mutex_;
+    std::condition_variable completion_cv_;
+    std::deque<PendingAppend*> pending_;
+    bool writer_active_{false};
+    std::optional<WalError> terminal_error_;
     uint64_t tail_;
+    WalWriterStats stats_;
 };
 
 tl::expected<WalScanResult, WalError> ScanWal(const std::string& path);

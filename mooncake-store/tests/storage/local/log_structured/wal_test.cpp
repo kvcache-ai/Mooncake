@@ -4,9 +4,15 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <fstream>
+#include <future>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <gtest/gtest.h>
 
@@ -227,6 +233,87 @@ TEST(LogStructuredWalTest, AppendsBatchWithSingleDurabilityBoundary) {
     ASSERT_TRUE(scan.has_value());
     EXPECT_EQ(scan->termination, WalScanTermination::kCleanEof);
     EXPECT_EQ(scan->records, records);
+}
+
+TEST(LogStructuredWalTest, GroupsConcurrentDurableAppends) {
+    WalTempDirectory temp;
+    const auto path = temp.File("WAL-group-commit");
+    auto writer = WalWriter::Create(path.string());
+    ASSERT_TRUE(writer.has_value());
+
+    std::mutex hook_mutex;
+    std::condition_variable hook_cv;
+    bool first_group_blocked = false;
+    bool release_first_group = false;
+    std::atomic<size_t> hook_calls{0};
+    WalWriter::SetBeforeWriteHookForTest([&] {
+        if (hook_calls.fetch_add(1, std::memory_order_relaxed) != 0) return;
+        std::unique_lock lock(hook_mutex);
+        first_group_blocked = true;
+        hook_cv.notify_all();
+        hook_cv.wait(lock, [&] { return release_first_group; });
+    });
+
+    auto first = std::async(std::launch::async, [&] {
+        const auto identity = WalIdentity("first", 1);
+        return (*writer)->Append(Transition(WalRecordType::kPrepareValue,
+                                            identity, 1, WalPhysical(1, 0)),
+                                 true);
+    });
+    bool hook_entered = false;
+    {
+        std::unique_lock lock(hook_mutex);
+        hook_entered = hook_cv.wait_for(lock, std::chrono::seconds(2),
+                                        [&] { return first_group_blocked; });
+    }
+    EXPECT_TRUE(hook_entered);
+
+    constexpr size_t kFollowers = 16;
+    std::vector<std::future<tl::expected<void, WalError>>> followers;
+    followers.reserve(kFollowers);
+    for (size_t index = 0; index < kFollowers; ++index) {
+        followers.push_back(std::async(std::launch::async, [&, index] {
+            const auto identity =
+                WalIdentity("follower-" + std::to_string(index), index + 2);
+            return (*writer)->Append(
+                Transition(WalRecordType::kPrepareValue, identity, index + 2,
+                           WalPhysical(1, (index + 1) * 160)),
+                true);
+        }));
+    }
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while ((*writer)->SnapshotStats().append_requests < kFollowers + 1 &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::yield();
+    }
+    const bool all_queued =
+        (*writer)->SnapshotStats().append_requests == kFollowers + 1;
+    {
+        std::lock_guard lock(hook_mutex);
+        release_first_group = true;
+    }
+    hook_cv.notify_all();
+
+    EXPECT_TRUE(first.get().has_value());
+    for (auto& follower : followers) {
+        EXPECT_TRUE(follower.get().has_value());
+    }
+    WalWriter::SetBeforeWriteHookForTest({});
+
+    ASSERT_TRUE(all_queued);
+    const auto stats = (*writer)->SnapshotStats();
+    EXPECT_EQ(stats.append_requests, kFollowers + 1);
+    EXPECT_EQ(stats.write_groups, uint64_t{2});
+    EXPECT_EQ(stats.sync_groups, uint64_t{2});
+    EXPECT_EQ(stats.max_group_requests, kFollowers);
+    writer.value().reset();
+
+    auto scan = ScanWal(path.string());
+    ASSERT_TRUE(scan.has_value());
+    EXPECT_EQ(scan->termination, WalScanTermination::kCleanEof);
+    EXPECT_EQ(scan->records.size(), kFollowers + 1);
 }
 
 }  // namespace

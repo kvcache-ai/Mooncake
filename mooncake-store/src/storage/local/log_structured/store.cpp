@@ -170,6 +170,34 @@ bool ValidatePersistentMetadata(const CheckpointState& checkpoint,
 
 }  // namespace
 
+size_t LogStructuredStore::TransitionKeyHash::operator()(
+    const TransitionKey& key) const {
+    const size_t tenant_hash = std::hash<std::string>{}(key.tenant_id);
+    const size_t object_hash = std::hash<std::string>{}(key.object_key);
+    return tenant_hash ^ (object_hash + 0x9e3779b97f4a7c15ULL +
+                          (tenant_hash << 6) + (tenant_hash >> 2));
+}
+
+bool LogStructuredStore::AcquireTransitionKeysLocked(
+    std::unique_lock<std::mutex>& lock,
+    const std::vector<TransitionKey>& keys) {
+    transition_cv_.wait(lock, [&] {
+        if (recovery_required_) return true;
+        return std::none_of(keys.begin(), keys.end(), [&](const auto& key) {
+            return transitions_in_flight_.contains(key);
+        });
+    });
+    if (recovery_required_) return false;
+    for (const auto& key : keys) transitions_in_flight_.insert(key);
+    return true;
+}
+
+void LogStructuredStore::ReleaseTransitionKeysLocked(
+    const std::vector<TransitionKey>& keys) {
+    for (const auto& key : keys) transitions_in_flight_.erase(key);
+    transition_cv_.notify_all();
+}
+
 LogStructuredStore::LogStructuredStore(LogStructuredStoreConfig config)
     : config_(std::move(config)),
       segments_path_(config_.root_path + "/segments"),
@@ -750,7 +778,14 @@ LogStructuredStore::PreparePutBatch(const std::vector<PutRequest>& requests) {
     }
     std::vector<PreparedWrite> prepared;
     prepared.reserve(requests.size());
-    std::lock_guard lock(mutex_);
+    std::vector<TransitionKey> transition_keys;
+    transition_keys.reserve(requests.size());
+    for (const auto& request : requests) {
+        transition_keys.push_back(
+            {.tenant_id = request.tenant_id, .object_key = request.object_key});
+    }
+
+    std::unique_lock lock(mutex_);
     auto finish_pending = [&] {
         for (const auto& chunk : chunks) {
             auto pending =
@@ -775,6 +810,15 @@ LogStructuredStore::PreparePutBatch(const std::vector<PutRequest>& requests) {
         finish_pending();
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    if (!AcquireTransitionKeysLocked(lock, transition_keys)) {
+        finish_pending();
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    ScopeExit transition_guard([&] {
+        if (!lock.owns_lock()) lock.lock();
+        ReleaseTransitionKeysLocked(transition_keys);
+    });
+
     std::vector<WalRecord> wal_records;
     wal_records.reserve(requests.size());
     for (const auto& chunk : chunks) {
@@ -785,8 +829,16 @@ LogStructuredStore::PreparePutBatch(const std::vector<PutRequest>& requests) {
                                    .physical = chunk.physical_records[index]});
         }
     }
-    if (!wal_->AppendBatch(wal_records, config_.sync_wal)) {
+    lock.unlock();
+    auto wal_result = wal_->AppendBatch(wal_records, config_.sync_wal);
+    lock.lock();
+    if (!wal_result) {
         recovery_required_ = true;
+        finish_pending();
+        transition_cv_.notify_all();
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    if (recovery_required_) {
         finish_pending();
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
@@ -868,10 +920,20 @@ tl::expected<PreparedWrite, StoreError> LogStructuredStore::PreparePutLocked(
 tl::expected<void, StoreError> LogStructuredStore::CommitPut(
     const RecordIdentity& identity, uint64_t sequence) {
     std::shared_lock mutation_lock(mutation_mutex_);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    const std::vector<TransitionKey> transition_keys = {
+        {.tenant_id = identity.tenant_id, .object_key = identity.object_key}};
+    if (!AcquireTransitionKeysLocked(lock, transition_keys)) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    ScopeExit transition_guard([&] {
+        if (!lock.owns_lock()) lock.lock();
+        ReleaseTransitionKeysLocked(transition_keys);
+    });
+
     auto current = index_.Lookup(identity);
     if (!current) return tl::unexpected(StoreError::kNotFound);
     if (current->state == VersionState::kCommitted &&
@@ -882,17 +944,24 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
         current->sequence != sequence) {
         return tl::unexpected(StoreError::kInvalidTransition);
     }
-    auto previous_current =
-        index_.LookupCurrent(identity.tenant_id, identity.object_key);
+
+    lock.unlock();
     auto persisted = wal_->Append(WalRecord{.type = WalRecordType::kCommitValue,
                                             .sequence = sequence,
                                             .identity = identity,
                                             .physical = {}},
                                   config_.sync_wal);
+    lock.lock();
     if (!persisted) {
         recovery_required_ = true;
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+
+    auto previous_current =
+        index_.LookupCurrent(identity.tenant_id, identity.object_key);
     auto committed = index_.Commit(identity, sequence);
     if (!committed) return tl::unexpected(MapIndexError(committed.error()));
     if (previous_current && previous_current->identity != identity) {
@@ -906,11 +975,25 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPut(
 tl::expected<void, StoreError> LogStructuredStore::CommitPuts(
     const std::vector<PreparedWrite>& writes) {
     std::shared_lock mutation_lock(mutation_mutex_);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
     if (writes.empty()) return {};
+
+    std::vector<TransitionKey> transition_keys;
+    transition_keys.reserve(writes.size());
+    for (const auto& write : writes) {
+        transition_keys.push_back({.tenant_id = write.identity.tenant_id,
+                                   .object_key = write.identity.object_key});
+    }
+    if (!AcquireTransitionKeysLocked(lock, transition_keys)) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    ScopeExit transition_guard([&] {
+        if (!lock.owns_lock()) lock.lock();
+        ReleaseTransitionKeysLocked(transition_keys);
+    });
 
     std::vector<WalRecord> records;
     records.reserve(writes.size());
@@ -926,10 +1009,18 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPuts(
                            .identity = write.identity,
                            .physical = {}});
     }
-    if (!wal_->AppendBatch(records, config_.sync_wal)) {
+
+    lock.unlock();
+    auto persisted = wal_->AppendBatch(records, config_.sync_wal);
+    lock.lock();
+    if (!persisted) {
         recovery_required_ = true;
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+
     for (const auto& write : writes) {
         auto previous_current = index_.LookupCurrent(write.identity.tenant_id,
                                                      write.identity.object_key);
@@ -950,10 +1041,20 @@ tl::expected<void, StoreError> LogStructuredStore::CommitPuts(
 tl::expected<void, StoreError> LogStructuredStore::AbortPut(
     const RecordIdentity& identity, uint64_t sequence) {
     std::shared_lock mutation_lock(mutation_mutex_);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    const std::vector<TransitionKey> transition_keys = {
+        {.tenant_id = identity.tenant_id, .object_key = identity.object_key}};
+    if (!AcquireTransitionKeysLocked(lock, transition_keys)) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    ScopeExit transition_guard([&] {
+        if (!lock.owns_lock()) lock.lock();
+        ReleaseTransitionKeysLocked(transition_keys);
+    });
+
     auto current = index_.Lookup(identity);
     if (!current) return tl::unexpected(StoreError::kNotFound);
     if (current->state == VersionState::kAborted &&
@@ -964,15 +1065,23 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPut(
         current->sequence != sequence) {
         return tl::unexpected(StoreError::kInvalidTransition);
     }
+
+    lock.unlock();
     auto persisted = wal_->Append(WalRecord{.type = WalRecordType::kAbortValue,
                                             .sequence = sequence,
                                             .identity = identity,
                                             .physical = {}},
                                   config_.sync_wal);
+    lock.lock();
     if (!persisted) {
         recovery_required_ = true;
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+
+    current = index_.Lookup(identity);
     auto aborted = index_.Abort(identity, sequence);
     if (!aborted) return tl::unexpected(MapIndexError(aborted.error()));
     auto removed = RemoveLiveRecordLocked(current->physical);
@@ -983,11 +1092,25 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPut(
 tl::expected<void, StoreError> LogStructuredStore::AbortPuts(
     const std::vector<PreparedWrite>& writes) {
     std::shared_lock mutation_lock(mutation_mutex_);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
     if (writes.empty()) return {};
+
+    std::vector<TransitionKey> transition_keys;
+    transition_keys.reserve(writes.size());
+    for (const auto& write : writes) {
+        transition_keys.push_back({.tenant_id = write.identity.tenant_id,
+                                   .object_key = write.identity.object_key});
+    }
+    if (!AcquireTransitionKeysLocked(lock, transition_keys)) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    ScopeExit transition_guard([&] {
+        if (!lock.owns_lock()) lock.lock();
+        ReleaseTransitionKeysLocked(transition_keys);
+    });
 
     std::vector<WalRecord> records;
     records.reserve(writes.size());
@@ -1003,10 +1126,18 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPuts(
                            .identity = write.identity,
                            .physical = {}});
     }
-    if (!wal_->AppendBatch(records, config_.sync_wal)) {
+
+    lock.unlock();
+    auto persisted = wal_->AppendBatch(records, config_.sync_wal);
+    lock.lock();
+    if (!persisted) {
         recovery_required_ = true;
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+
     for (const auto& write : writes) {
         auto current = index_.Lookup(write.identity);
         auto aborted = index_.Abort(write.identity, write.sequence);
@@ -1023,7 +1154,7 @@ tl::expected<void, StoreError> LogStructuredStore::AbortPuts(
 tl::expected<void, StoreError> LogStructuredStore::Delete(
     const RecordIdentity& identity) {
     std::shared_lock mutation_lock(mutation_mutex_);
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (recovery_required_) {
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
@@ -1031,18 +1162,35 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
         identity.object_key.size() > kMaxKeyLength) {
         return tl::unexpected(StoreError::kInvalidArgument);
     }
-    const auto existing = index_.Lookup(identity);
+
+    const std::vector<TransitionKey> transition_keys = {
+        {.tenant_id = identity.tenant_id, .object_key = identity.object_key}};
+    if (!AcquireTransitionKeysLocked(lock, transition_keys)) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+    ScopeExit transition_guard([&] {
+        if (!lock.owns_lock()) lock.lock();
+        ReleaseTransitionKeysLocked(transition_keys);
+    });
+
     const uint64_t sequence = next_sequence_++;
+    lock.unlock();
     auto persisted =
         wal_->Append(WalRecord{.type = WalRecordType::kApplyTombstone,
                                .sequence = sequence,
                                .identity = identity,
                                .physical = {}},
                      config_.sync_wal);
+    lock.lock();
     if (!persisted) {
         recovery_required_ = true;
         return tl::unexpected(StoreError::kRecoveryRequired);
     }
+    if (recovery_required_) {
+        return tl::unexpected(StoreError::kRecoveryRequired);
+    }
+
+    const auto existing = index_.Lookup(identity);
     auto tombstoned = index_.ApplyTombstone(identity, sequence);
     if (!tombstoned) {
         return tl::unexpected(MapIndexError(tombstoned.error()));
@@ -1052,7 +1200,7 @@ tl::expected<void, StoreError> LogStructuredStore::Delete(
         auto removed = RemoveLiveRecordLocked(existing->physical);
         if (!removed) return tl::unexpected(removed.error());
     }
-    applied_delete_watermark_ = sequence;
+    applied_delete_watermark_ = std::max(applied_delete_watermark_, sequence);
     return {};
 }
 
@@ -1779,6 +1927,11 @@ StoreStats LogStructuredStore::SnapshotStats() const {
     }
     stats.reclaimable_bytes = stats.physical_bytes - stats.live_record_bytes;
     stats.wal_sequence = next_sequence_ - 1;
+    const auto wal_stats = wal_->SnapshotStats();
+    stats.wal_append_requests = wal_stats.append_requests;
+    stats.wal_write_groups = wal_stats.write_groups;
+    stats.wal_sync_groups = wal_stats.sync_groups;
+    stats.wal_max_group_requests = wal_stats.max_group_requests;
     stats.checkpoint_sequence = checkpoint_sequence_;
     return stats;
 }
