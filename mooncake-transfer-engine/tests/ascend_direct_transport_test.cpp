@@ -2292,9 +2292,23 @@ int32_t CurrentAclDevice() {
     return device_id;
 }
 
+int g_host_alloc_calls = 0;
+
+void* CountingHostAlloc(size_t size, size_t alignment, bool defer) {
+    (void)alignment;
+    (void)defer;
+    ++g_host_alloc_calls;
+    void* ptr = nullptr;
+    EXPECT_EQ(aclrtMallocHost(&ptr, size), ACL_ERROR_NONE);
+    return ptr;
+}
+
+void* NullHostAlloc(size_t, size_t, bool) { return nullptr; }
+
 struct AgentAllocEnv {
     explicit AgentAllocEnv(int device_count) {
         mock_acl::reset();
+        g_host_alloc_calls = 0;
         globalConfig().ascend_agent_mode = true;
         globalConfig().ascend_use_fabric_mem = false;
         mock_acl::set_device_count(device_count);
@@ -2338,6 +2352,72 @@ TEST(AgentModeAllocTest, ConsecutiveStoreAllocsRotateDevices) {
     ASSERT_NE(wrap, nullptr);
     EXPECT_EQ(CurrentAclDevice(), first);
     ascend_free_memory("ascend", wrap);
+}
+
+TEST(AgentModeAllocTest, HostAllocRotatesDevices) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    int first = -1;
+    for (int i = 0; i < kDeviceCount; ++i) {
+        size_t actual = 0;
+        void* ptr = ascend_allocate_memory_best_effort(
+            kAllocSize, "ascend", &actual, CountingHostAlloc, kAllocSize,
+            false);
+        ASSERT_NE(ptr, nullptr);
+        EXPECT_EQ(actual, kAllocSize);
+        if (i == 0) {
+            first = CurrentAclDevice();
+            ASSERT_GE(first, 0);
+            ASSERT_LT(first, kDeviceCount);
+        } else {
+            EXPECT_EQ(CurrentAclDevice(), (first + i) % kDeviceCount);
+        }
+        ascend_free_memory("ascend", ptr);
+    }
+    EXPECT_EQ(g_host_alloc_calls, kDeviceCount);
+}
+
+TEST(AgentModeAllocTest, FabricMemIgnoresHostAlloc) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    AgentAllocEnv env(kDeviceCount);
+    globalConfig().ascend_use_fabric_mem = true;
+    mock_acl::set_malloc_physical_max_success(0);
+
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(
+        kGiB, "ascend", &actual, CountingHostAlloc, kGiB, false);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(g_host_alloc_calls, 0) << "fabric_mem must not call host_alloc";
+    EXPECT_GT(actual, 0);
+    ascend_free_memory("ascend", ptr);
+}
+
+TEST(AgentModeAllocTest, FailedHostAllocDoesNotConsumeSlot) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    size_t actual = 0;
+    void* marker =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(marker, nullptr);
+    const int d0 = CurrentAclDevice();
+    ascend_free_memory("ascend", marker);
+
+    actual = 0;
+    void* failed = ascend_allocate_memory_best_effort(
+        kAllocSize, "ascend", &actual, NullHostAlloc, kAllocSize, false);
+    EXPECT_EQ(failed, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    actual = 0;
+    void* ok = ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount);
+    ascend_free_memory("ascend", ok);
 }
 
 TEST(AgentModeAllocTest, DirectVmmDoesNotRotateSequencer) {

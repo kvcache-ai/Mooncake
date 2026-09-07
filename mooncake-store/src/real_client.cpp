@@ -105,6 +105,30 @@ bool RestoreAgentModeDeviceZero() {
 }
 #endif
 
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+void *AllocateAscendStoreSegment(size_t segment_size,
+                                 const std::string &protocol, bool use_hugepage,
+                                 bool defer_hugetlb, size_t *mapped_size) {
+    size_t actual_size = 0;
+    AscendHostAllocFn host_alloc = nullptr;
+    size_t host_align = 0;
+    size_t alloc_size = segment_size;
+    if (use_hugepage) {
+        host_align = get_hugepage_size_from_env();
+        alloc_size = align_up(segment_size, host_align);
+        host_alloc =
+            static_cast<AscendHostAllocFn>(allocate_buffer_mmap_memory);
+    }
+    void *ptr = ascend_allocate_memory_best_effort(alloc_size, protocol,
+                                                   &actual_size, host_alloc,
+                                                   host_align, defer_hugetlb);
+    if (ptr != nullptr) {
+        *mapped_size = actual_size;
+    }
+    return ptr;
+}
+#endif
+
 std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
     void *ptr, size_t size, const std::string &protocol,
     const char *segment_owner) {
@@ -991,22 +1015,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
                                                     page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+            } else if (protocol == "ascend" || protocol == "ubshmem") {
+                ptr = AllocateAscendStoreSegment(
+                    segment_size, this->protocol, should_use_hugepage,
+                    parallel_hugetlb_population, &mapped_size);
+#endif
             } else if (should_use_hugepage) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-            } else if ((protocol == "ascend" || protocol == "ubshmem") &&
-                       globalConfig().ascend_use_fabric_mem) {
-                size_t actual_size = 0;
-                ptr = ascend_allocate_memory_best_effort(
-                    segment_size, this->protocol, &actual_size);
-                if (ptr) {
-                    mapped_size = actual_size;
-                }
-#endif
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -1022,7 +1042,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+            if ((this->protocol == "ascend" || this->protocol == "ubshmem") &&
+                !should_use_hugepage) {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
             } else if (this->protocol == "sunrise_link") {
