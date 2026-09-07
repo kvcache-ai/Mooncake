@@ -321,6 +321,39 @@ std::vector<IndexSnapshotEntry> VersionIndex::CurrentSnapshot() const {
     return snapshot;
 }
 
+std::vector<IndexSnapshotEntry> VersionIndex::CheckpointSnapshot() const {
+    std::shared_lock lock(mutex_);
+    std::vector<IndexSnapshotEntry> snapshot;
+    snapshot.reserve(current_.size());
+    for (const auto& [identity, version] : versions_) {
+        if (version.state == VersionState::kPrepared) {
+            snapshot.push_back({.identity = identity, .version = version});
+            continue;
+        }
+        if (version.state != VersionState::kCommitted) continue;
+        const auto current = current_.find(ToLogicalKey(identity));
+        if (current != current_.end() && current->second == identity) {
+            snapshot.push_back({.identity = identity, .version = version});
+        }
+    }
+    return snapshot;
+}
+
+void VersionIndex::PruneCheckpointedHistory() {
+    std::unique_lock lock(mutex_);
+    for (auto it = versions_.begin(); it != versions_.end();) {
+        const auto current = current_.find(ToLogicalKey(it->first));
+        const bool keep_current =
+            it->second.state == VersionState::kCommitted &&
+            current != current_.end() && current->second == it->first;
+        if (keep_current || it->second.state == VersionState::kPrepared) {
+            ++it;
+        } else {
+            it = versions_.erase(it);
+        }
+    }
+}
+
 tl::expected<void, IndexError> VersionIndex::Restore(
     const std::vector<IndexSnapshotEntry>& snapshot) {
     std::unique_lock lock(mutex_);

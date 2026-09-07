@@ -8,6 +8,7 @@
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -262,6 +263,24 @@ TEST(LogStructuredStorageBackendTest,
     EXPECT_EQ(loaded, old_value);
 }
 
+TEST(LogStructuredStorageBackendTest, CallbackExceptionAbortsPreparedWrite) {
+    BackendTempDirectory temp;
+    const auto config = BackendConfig(temp);
+    const std::string storage_key = TenantId("tenant-b").MakeScopedKey("key");
+    std::string value = "value";
+
+    LogStructuredStorageBackend backend(config);
+    ASSERT_TRUE(backend.Init().has_value());
+    EXPECT_THROW(backend.BatchOffload(
+                     SingleValueBatch(storage_key, value),
+                     [](const std::vector<std::string>&,
+                        std::vector<StorageObjectMetadata>&) -> ErrorCode {
+                         throw std::runtime_error("callback failure");
+                     }),
+                 std::runtime_error);
+    EXPECT_FALSE(backend.IsExist(storage_key).value());
+}
+
 TEST(LogStructuredStorageBackendTest, PartialFailureReportsOnlyStoredKeys) {
     BackendTempDirectory temp;
     const auto config = BackendConfig(temp);
@@ -338,6 +357,15 @@ TEST(LogStructuredStorageBackendTest, ReadsAndValidatesBackendConfiguration) {
     EXPECT_EQ(config.compaction_max_bytes_per_second, uint64_t{32768});
     EXPECT_EQ(config.compaction_reserve_bytes, uint64_t{2048});
     EXPECT_DOUBLE_EQ(config.compaction_min_reclaim_ratio, 0.35);
+}
+
+TEST(LogStructuredStorageBackendTest, RejectsTieringSourceLimitBelowFanout) {
+    LogStructuredBackendConfig config;
+    config.compaction_policy = LogStructuredCompactionPolicy::kTiered;
+    config.compaction_fanout = 4;
+    config.compaction_max_sources = 3;
+
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST(LogStructuredStorageBackendTest, BackgroundTieringKeepsObjectsReadable) {

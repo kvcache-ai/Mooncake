@@ -92,8 +92,12 @@ bool PreadAll(int fd, char* data, size_t length, uint64_t offset) {
 }  // namespace
 
 SegmentWriter::SegmentWriter(std::string path, uint64_t segment_id, int fd,
-                             uint64_t tail)
-    : path_(std::move(path)), segment_id_(segment_id), fd_(fd), tail_(tail) {}
+                             uint64_t tail, bool use_uring)
+    : path_(std::move(path)),
+      segment_id_(segment_id),
+      fd_(fd),
+      tail_(tail),
+      use_uring_(use_uring) {}
 
 SegmentWriter::~SegmentWriter() {
     if (fd_ >= 0) {
@@ -127,24 +131,25 @@ void SegmentWriter::SetWriteFailurePredicateForTest(
 }
 
 tl::expected<std::unique_ptr<SegmentWriter>, SegmentError>
-SegmentWriter::Create(std::string path, uint64_t segment_id) {
+SegmentWriter::Create(std::string path, uint64_t segment_id, bool use_uring) {
     return Open(std::move(path), segment_id,
-                O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0);
+                O_CREAT | O_TRUNC | O_RDWR | O_CLOEXEC, 0, use_uring);
 }
 
 tl::expected<std::unique_ptr<SegmentWriter>, SegmentError> SegmentWriter::Open(
-    std::string path, uint64_t segment_id, int flags, uint64_t tail) {
+    std::string path, uint64_t segment_id, int flags, uint64_t tail,
+    bool use_uring) {
     const int fd = open(path.c_str(), flags, 0644);
     if (fd < 0) {
         return tl::unexpected(SegmentError::kOpenFailed);
     }
     return std::unique_ptr<SegmentWriter>(
-        new SegmentWriter(std::move(path), segment_id, fd, tail));
+        new SegmentWriter(std::move(path), segment_id, fd, tail, use_uring));
 }
 
 tl::expected<std::unique_ptr<SegmentWriter>, SegmentError>
 SegmentWriter::OpenForAppend(std::string path, uint64_t segment_id,
-                             uint64_t valid_bytes) {
+                             uint64_t valid_bytes, bool use_uring) {
     const int fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (fd < 0) {
         return tl::unexpected(SegmentError::kOpenFailed);
@@ -159,8 +164,8 @@ SegmentWriter::OpenForAppend(std::string path, uint64_t segment_id,
         close(fd);
         return tl::unexpected(SegmentError::kTruncateFailed);
     }
-    return std::unique_ptr<SegmentWriter>(
-        new SegmentWriter(std::move(path), segment_id, fd, valid_bytes));
+    return std::unique_ptr<SegmentWriter>(new SegmentWriter(
+        std::move(path), segment_id, fd, valid_bytes, use_uring));
 }
 
 tl::expected<PhysicalRecord, SegmentError> SegmentWriter::Append(
@@ -366,7 +371,9 @@ tl::expected<void, SegmentError> SegmentWriter::WriteBatchAt(
                                   .offset = offset});
     }
 
-    auto write_result = UringBatchWrite(fd_, write_requests, parallelism);
+    auto write_result = use_uring_
+                            ? UringBatchWrite(fd_, write_requests, parallelism)
+                            : UringBatchWriteResult::kUnavailable;
     if (write_result == UringBatchWriteResult::kUnavailable) {
         write_result = UringBatchWriteResult::kSuccess;
         for (const auto& request : write_requests) {

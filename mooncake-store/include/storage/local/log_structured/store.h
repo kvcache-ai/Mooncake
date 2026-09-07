@@ -42,6 +42,7 @@ struct LogStructuredStoreConfig {
     uint64_t max_total_physical_bytes{std::numeric_limits<uint64_t>::max()};
     bool sync_data{true};
     bool sync_wal{true};
+    bool use_uring{true};
     size_t payload_write_parallelism{4};
 };
 
@@ -166,6 +167,8 @@ class LogStructuredStore {
     tl::expected<void, StoreError> RemoveLiveRecordLocked(
         const PhysicalRecord& physical);
     uint64_t PhysicalBytesLocked() const;
+    tl::expected<void, StoreError> EnsureForegroundCapacityLocked(
+        uint64_t requested_bytes);
     tl::expected<void, StoreError> RotateSegmentIfNeeded(
         uint64_t next_record_bytes);
     tl::expected<void, StoreError> RotateActiveSegmentLocked();

@@ -62,10 +62,11 @@ struct SegmentAppendRequest {
 class SegmentWriter {
    public:
     static tl::expected<std::unique_ptr<SegmentWriter>, SegmentError> Create(
-        std::string path, uint64_t segment_id);
+        std::string path, uint64_t segment_id, bool use_uring = true);
 
     static tl::expected<std::unique_ptr<SegmentWriter>, SegmentError>
-    OpenForAppend(std::string path, uint64_t segment_id, uint64_t valid_bytes);
+    OpenForAppend(std::string path, uint64_t segment_id, uint64_t valid_bytes,
+                  bool use_uring = true);
 
     ~SegmentWriter();
 
@@ -99,9 +100,11 @@ class SegmentWriter {
 
    private:
     static tl::expected<std::unique_ptr<SegmentWriter>, SegmentError> Open(
-        std::string path, uint64_t segment_id, int flags, uint64_t tail);
+        std::string path, uint64_t segment_id, int flags, uint64_t tail,
+        bool use_uring);
 
-    SegmentWriter(std::string path, uint64_t segment_id, int fd, uint64_t tail);
+    SegmentWriter(std::string path, uint64_t segment_id, int fd, uint64_t tail,
+                  bool use_uring);
 
     tl::expected<std::vector<PhysicalRecord>, SegmentError> ReserveBatchLocked(
         const std::vector<SegmentAppendRequest>& requests);
@@ -118,6 +121,7 @@ class SegmentWriter {
     std::condition_variable append_cv_;
     uint64_t tail_;
     size_t in_flight_batches_{0};
+    bool use_uring_{true};
 };
 
 class SegmentReader {

@@ -121,6 +121,7 @@ DEFINE_bool(run_all, false,
             "Run full benchmark suite with all parameter combinations");
 DEFINE_bool(skip_cleanup, false,
             "Skip cleanup after benchmark (for debugging)");
+DEFINE_bool(use_uring, false, "Enable io_uring for backends that support it");
 DEFINE_string(test, "all",
               "Test to run: init, offload, load, concurrent_load, exist, "
               "mixed_rw, churn, restart, all");
@@ -817,6 +818,7 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
     config.storage_filepath = storage_path;
     config.total_size_limit = capacity_bytes;
     config.total_keys_limit = 10'000'000;
+    config.use_uring = FLAGS_use_uring;
 
     switch (type) {
         case BackendType::OFFSET_ALLOCATOR: {
@@ -967,6 +969,8 @@ void PrintBenchmarkConfig(BackendType backend, CacheMode cache_mode) {
     std::cout << "  Operations:   " << FLAGS_num_operations
               << " (warmup: " << FLAGS_warmup_operations << ")\n";
     std::cout << "  Threads:      " << FLAGS_num_threads << "\n";
+    std::cout << "  I/O requested:"
+              << (FLAGS_use_uring ? "io_uring" : "pwrite/pread") << "\n";
     std::cout << "  Fill ratio:   " << (FLAGS_fill_ratio * 100) << "%\n";
     std::cout << "\n  --- Cache & Verification ---\n";
     std::cout << "  Cache mode:   " << CacheModeToString(cache_mode) << "\n";

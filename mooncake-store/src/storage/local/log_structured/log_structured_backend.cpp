@@ -97,6 +97,8 @@ bool LogStructuredBackendConfig::Validate() const {
     return segment_size_bytes > 0 && payload_write_parallelism > 0 &&
            compaction_interval_ms > 0 && compaction_fanout >= 2 &&
            compaction_max_levels > 0 && compaction_max_sources > 0 &&
+           (compaction_policy != LogStructuredCompactionPolicy::kTiered ||
+            compaction_max_sources >= compaction_fanout) &&
            compaction_max_input_bytes > 0 &&
            compaction_max_target_bytes >= segment_size_bytes &&
            compaction_min_reclaim_ratio >= 0.0 &&
@@ -192,6 +194,7 @@ tl::expected<void, ErrorCode> LogStructuredStorageBackend::Init() {
              backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
          .sync_wal =
              backend_config_.sync_policy == LogStructuredSyncPolicy::kRecord,
+         .use_uring = file_storage_config_.use_uring,
          .payload_write_parallelism =
              backend_config_.payload_write_parallelism});
     if (!store) {
@@ -277,6 +280,15 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
         return tl::make_unexpected(ToWriteError(batch.error()));
     }
     prepared = std::move(batch.value());
+    struct PreparedBatchGuard {
+        logstructured::LogStructuredStore* store;
+        const std::vector<logstructured::PreparedWrite>* writes;
+        bool active{true};
+
+        ~PreparedBatchGuard() {
+            if (active) static_cast<void>(store->AbortPuts(*writes));
+        }
+    } prepared_guard{store_.get(), &prepared};
     for (size_t index = 0; index < prepared.size(); ++index) {
         metadatas.push_back(StorageObjectMetadata{
             -1, 0, static_cast<int64_t>(keys[index].size()),
@@ -284,7 +296,6 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
     }
     if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
         !store_->Sync()) {
-        static_cast<void>(store_->AbortPuts(prepared));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -293,7 +304,6 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
         if (complete_handler) {
             const auto result = complete_handler(keys, metadatas);
             if (result != ErrorCode::OK) {
-                static_cast<void>(store_->AbortPuts(prepared));
                 return tl::make_unexpected(result);
             }
         }
@@ -301,6 +311,7 @@ tl::expected<int64_t, ErrorCode> LogStructuredStorageBackend::BatchOffload(
         if (!committed) {
             return tl::make_unexpected(ToWriteError(committed.error()));
         }
+        prepared_guard.active = false;
     }
     if (backend_config_.sync_policy == LogStructuredSyncPolicy::kBatch &&
         !store_->Sync()) {

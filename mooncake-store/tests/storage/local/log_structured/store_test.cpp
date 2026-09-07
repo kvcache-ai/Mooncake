@@ -79,6 +79,87 @@ TEST(LogStructuredStoreTest, PutIsInvisibleUntilMasterCommit) {
     EXPECT_EQ((*store)->Get(identity).value(), "value");
 }
 
+TEST(LogStructuredStoreTest, ReplaysCommitWrittenAfterPreparedCheckpoint) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("key", 1);
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        auto prepared = (*store)->PreparePut(identity, "value");
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(identity, prepared->sequence).has_value());
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(identity).value(), "value");
+}
+
+TEST(LogStructuredStoreTest, ReplaysAbortWrittenAfterPreparedCheckpoint) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("key", 1);
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        auto prepared = (*store)->PreparePut(identity, "value");
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+        ASSERT_TRUE(
+            (*store)->AbortPut(identity, prepared->sequence).has_value());
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->Get(identity).error(), StoreError::kNotFound);
+}
+
+TEST(LogStructuredStoreTest, CheckpointPrunesHistoricalVersions) {
+    StoreTempDirectory temp;
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        for (uint64_t incarnation = 1; incarnation <= 16; ++incarnation) {
+            const auto identity = StoreIdentity("key", incarnation);
+            auto prepared = (*store)->PreparePut(identity, "value");
+            ASSERT_TRUE(prepared.has_value());
+            ASSERT_TRUE(
+                (*store)->CommitPut(identity, prepared->sequence).has_value());
+        }
+        EXPECT_EQ((*store)->SnapshotIndex().size(), size_t{16});
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+        EXPECT_EQ((*store)->SnapshotIndex().size(), size_t{1});
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_EQ((*recovered)->SnapshotIndex().size(), size_t{1});
+    EXPECT_EQ((*recovered)->GetLatest("tenant-a", "key").value(), "value");
+}
+
+TEST(LogStructuredStoreTest, CheckpointPrunesDeletedVersion) {
+    StoreTempDirectory temp;
+    const auto identity = StoreIdentity("deleted", 1);
+    {
+        auto store = LogStructuredStore::Open(Config(temp));
+        ASSERT_TRUE(store.has_value());
+        auto prepared = (*store)->PreparePut(identity, "value");
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE(
+            (*store)->CommitPut(identity, prepared->sequence).has_value());
+        ASSERT_TRUE((*store)->Delete(identity).has_value());
+        ASSERT_EQ((*store)->SnapshotIndex().size(), size_t{1});
+        ASSERT_TRUE((*store)->Checkpoint().has_value());
+        EXPECT_TRUE((*store)->SnapshotIndex().empty());
+    }
+
+    auto recovered = LogStructuredStore::Open(Config(temp));
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_TRUE((*recovered)->SnapshotIndex().empty());
+    EXPECT_EQ((*recovered)->Get(identity).error(), StoreError::kNotFound);
+}
+
 TEST(LogStructuredStoreTest, ReadsCommittedRecordWhileActiveSegmentGrows) {
     StoreTempDirectory temp;
     auto config = Config(temp, 16 * 1024 * 1024);
@@ -359,6 +440,50 @@ TEST(LogStructuredStoreTest, RepairsTornWalAndSegmentTailsOnRestart) {
     EXPECT_EQ((*recovered)->Get(identity).value(), "value");
 }
 
+TEST(LogStructuredStoreTest, CapacityFailureSealsActiveSegmentForReclaim) {
+    StoreTempDirectory temp;
+    const std::string value(96, 'a');
+    const uint64_t record_bytes = AlignedRecordSize(
+        static_cast<uint32_t>(std::string_view("tenant-a").size()),
+        static_cast<uint32_t>(std::string_view("old").size()), value.size());
+    auto config = Config(temp, 4096);
+    config.max_physical_bytes = record_bytes;
+    config.max_total_physical_bytes = record_bytes;
+    auto store = LogStructuredStore::Open(config);
+    ASSERT_TRUE(store.has_value());
+
+    const auto old_identity = StoreIdentity("old", 1);
+    auto old_write = (*store)->PreparePut(old_identity, value);
+    ASSERT_TRUE(old_write.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(old_identity, old_write->sequence).has_value());
+    ASSERT_TRUE((*store)->Delete(old_identity).has_value());
+
+    const auto new_identity = StoreIdentity("new", 2);
+    auto blocked = (*store)->PreparePut(new_identity, value);
+    ASSERT_FALSE(blocked.has_value());
+    EXPECT_EQ(blocked.error(), StoreError::kNoSpace);
+    EXPECT_EQ((*store)->SnapshotStats().sealed_segments, size_t{1});
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 1,
+                                            .max_input_bytes = 4096,
+                                            .max_target_bytes = 4096,
+                                            .max_temporary_bytes = 0,
+                                            .fanout = 2,
+                                            .max_levels = 2,
+                                            .min_reclaim_ratio = 0.0,
+                                            .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{1});
+    EXPECT_EQ(compacted->reclaimed_bytes, record_bytes);
+
+    auto retried = (*store)->PreparePut(new_identity, value);
+    ASSERT_TRUE(retried.has_value());
+    ASSERT_TRUE(
+        (*store)->CommitPut(new_identity, retried->sequence).has_value());
+    EXPECT_EQ((*store)->Get(new_identity).value(), value);
+}
+
 TEST(LogStructuredStoreTest, ReclaimsFullyDeadSealedSegment) {
     StoreTempDirectory temp;
     const auto first = StoreIdentity("key", 1);
@@ -515,6 +640,34 @@ TEST(LogStructuredStoreTest, PreparedValuePinsSealedSegmentUntilResolved) {
     EXPECT_EQ(compacted->source_segments, size_t{0});
     ASSERT_TRUE((*store)->CommitPut(identity, prepared->sequence).has_value());
     EXPECT_EQ((*store)->Get(identity).value(), std::string(96, 'a'));
+}
+
+TEST(LogStructuredStoreTest, TieringSkipsWhenBudgetDropsBelowFanout) {
+    StoreTempDirectory temp;
+    auto store = LogStructuredStore::Open(Config(temp, 256));
+    ASSERT_TRUE(store.has_value());
+
+    for (size_t index = 0; index < 4; ++index) {
+        auto prepared = (*store)->PreparePut(
+            "tenant-a", "key-" + std::to_string(index), std::string(96, 'a'));
+        ASSERT_TRUE(prepared.has_value());
+        ASSERT_TRUE((*store)
+                        ->CommitPut(prepared->identity, prepared->sequence)
+                        .has_value());
+        ASSERT_TRUE((*store)->SealActiveSegment().has_value());
+    }
+
+    auto compacted = (*store)->CompactOnce({.max_source_segments = 3,
+                                            .max_input_bytes = 1024 * 1024,
+                                            .max_target_bytes = 1024 * 1024,
+                                            .fanout = 4,
+                                            .max_levels = 2,
+                                            .min_reclaim_ratio = 1.0,
+                                            .enable_tiering = true,
+                                            .stop_token = {}});
+    ASSERT_TRUE(compacted.has_value());
+    EXPECT_EQ(compacted->source_segments, size_t{0});
+    EXPECT_EQ(compacted->target_segments, size_t{0});
 }
 
 TEST(LogStructuredStoreTest, MissingCommittedCompactionTargetFailsClosed) {

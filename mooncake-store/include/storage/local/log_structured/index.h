@@ -82,6 +82,8 @@ class VersionIndex {
     std::optional<VersionEntry> Lookup(const RecordIdentity& identity) const;
     std::vector<IndexSnapshotEntry> Snapshot() const;
     std::vector<IndexSnapshotEntry> CurrentSnapshot() const;
+    std::vector<IndexSnapshotEntry> CheckpointSnapshot() const;
+    void PruneCheckpointedHistory();
     tl::expected<void, IndexError> Restore(
         const std::vector<IndexSnapshotEntry>& snapshot);
     size_t size() const;
