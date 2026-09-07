@@ -401,7 +401,7 @@ jobs:
           master_pid=$!
           trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
           sleep 3
-          python scripts/test_tensor_api.py -n 1
+          python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
           python scripts/test_async_store.py
           python scripts/test_copy_move_api.py
           python scripts/test_drain_http_api.py --timeout-sec 90
