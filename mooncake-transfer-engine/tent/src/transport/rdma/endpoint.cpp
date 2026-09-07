@@ -19,6 +19,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <iomanip>
 #include <mutex>
 #include <queue>
@@ -177,9 +179,18 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         return -1;
     }
 
-    // Pre-post recv buffers for notification
-    notify_recv_buffers_.resize(kNotifyMaxPendingSends);
-    notify_recv_mrs_.resize(kNotifyMaxPendingSends);
+    // Allocate one contiguous recv buffer, logically split into
+    // kNotifyMaxPendingSends slots. One MR covers every slot so high
+    // endpoint counts do not explode ibv_reg_mr.
+    notify_recv_buffer_.resize(kNotifyBufferSize * kNotifyMaxPendingSends);
+    notify_recv_mr_ = context_->verbs_.ibv_reg_mr_default(
+        context_->nativePD(), notify_recv_buffer_.data(),
+        notify_recv_buffer_.size(), IBV_ACCESS_LOCAL_WRITE);
+    if (!notify_recv_mr_) {
+        PLOG(ERROR) << "Failed to register notification recv buffer";
+        deconstruct();
+        return -1;
+    }
 
     // Allocate one contiguous send buffer, logically split into
     // kNotifyMaxPendingSends slots to avoid DMA-vs-overwrite races.
@@ -191,20 +202,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         PLOG(ERROR) << "Failed to register notification send buffer";
         deconstruct();
         return -1;
-    }
-
-    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
-        notify_recv_buffers_[i].resize(kNotifyBufferSize);
-
-        // Register memory for recv buffer
-        notify_recv_mrs_[i] = context_->verbs_.ibv_reg_mr_default(
-            context_->nativePD(), notify_recv_buffers_[i].data(),
-            kNotifyBufferSize, IBV_ACCESS_LOCAL_WRITE);
-        if (!notify_recv_mrs_[i]) {
-            PLOG(ERROR) << "Failed to register notification recv buffer";
-            deconstruct();
-            return -1;
-        }
     }
 
     return 0;
@@ -254,20 +251,15 @@ int RdmaEndPoint::deconstructUnlocked() {
         // A live QP may still reference the notification MRs. Keep both MRs
         // and backing buffers intact until QP destruction succeeds.
         if (!notify_qp_) {
-            for (auto& mr : notify_recv_mrs_) {
-                if (!mr) continue;
-                if (context_->verbs_.ibv_dereg_mr(mr)) {
+            if (notify_recv_mr_) {
+                if (context_->verbs_.ibv_dereg_mr(notify_recv_mr_)) {
                     PLOG(ERROR) << "Failed to deregister notification recv MR";
                     result = -1;
                 } else {
-                    mr = nullptr;
+                    notify_recv_mr_ = nullptr;
                 }
             }
-            if (std::all_of(notify_recv_mrs_.begin(), notify_recv_mrs_.end(),
-                            [](ibv_mr* mr) { return mr == nullptr; })) {
-                notify_recv_mrs_.clear();
-                notify_recv_buffers_.clear();
-            }
+            if (!notify_recv_mr_) notify_recv_buffer_.clear();
 
             if (notify_send_mr_) {
                 if (context_->verbs_.ibv_dereg_mr(notify_send_mr_)) {
@@ -306,8 +298,8 @@ int RdmaEndPoint::deconstructUnlocked() {
         wr_depth_list_ = nullptr;
     }
 
-    if (result == 0 && !notify_qp_ && notify_recv_mrs_.empty() &&
-        !notify_send_mr_ && qp_list_.empty()) {
+    if (result == 0 && !notify_qp_ && !notify_recv_mr_ && !notify_send_mr_ &&
+        qp_list_.empty()) {
         peer_server_name_.clear();
         peer_nic_name_.clear();
         status_.store(EP_DESTROYED, std::memory_order_release);
@@ -1036,14 +1028,57 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     return 0;
 }
 
+char* RdmaEndPoint::notifySlotPtr(char* base, size_t idx) {
+    return base + idx * kNotifyBufferSize;
+}
+
+bool RdmaEndPoint::encodeNotifyPayload(char* slot, const std::string& name,
+                                       const std::string& msg,
+                                       uint32_t* out_len) {
+    if (!slot || !out_len) return false;
+    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) return false;
+    uint32_t name_len = static_cast<uint32_t>(name.size());
+    uint32_t msg_len = static_cast<uint32_t>(msg.size());
+    const size_t total_size =
+        sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
+    if (total_size > kNotifyBufferSize) return false;
+
+    auto* ptr = slot;
+    std::memcpy(ptr, &name_len, sizeof(name_len));
+    ptr += sizeof(name_len);
+    std::memcpy(ptr, name.data(), name_len);
+    ptr += name_len;
+    std::memcpy(ptr, &msg_len, sizeof(msg_len));
+    ptr += sizeof(msg_len);
+    std::memcpy(ptr, msg.data(), msg_len);
+    *out_len = static_cast<uint32_t>(total_size);
+    return true;
+}
+
+bool RdmaEndPoint::decodeNotifyPayload(const char* data, size_t byte_len,
+                                       std::string* name, std::string* msg) {
+    if (!data || !name || !msg || byte_len < 8) return false;
+    uint32_t name_len = 0;
+    std::memcpy(&name_len, data, sizeof(name_len));
+    if (name_len > byte_len - 8) return false;
+    uint32_t msg_len = 0;
+    std::memcpy(&msg_len, data + 4 + name_len, sizeof(msg_len));
+    if (msg_len > byte_len - 8 - name_len) return false;
+    name->assign(data + 4, name_len);
+    msg->assign(data + 4 + name_len + 4, msg_len);
+    return true;
+}
+
 void RdmaEndPoint::postNotifyRecv(size_t idx) {
-    if (idx >= notify_recv_buffers_.size() || idx >= notify_recv_mrs_.size())
+    if (!notify_qp_ || !notify_recv_mr_ || idx >= kNotifyMaxPendingSends ||
+        notify_recv_buffer_.size() < (idx + 1) * kNotifyBufferSize)
         return;
 
     ibv_sge sge = {};
-    sge.addr = reinterpret_cast<uint64_t>(notify_recv_buffers_[idx].data());
-    sge.length = notify_recv_buffers_[idx].size();
-    sge.lkey = notify_recv_mrs_[idx]->lkey;
+    sge.addr = reinterpret_cast<uint64_t>(
+        notifySlotPtr(notify_recv_buffer_.data(), idx));
+    sge.length = kNotifyBufferSize;
+    sge.lkey = notify_recv_mr_->lkey;
 
     ibv_recv_wr wr = {};
     wr.wr_id = idx;
@@ -1169,29 +1204,12 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     // Pick the next send slot — flow control guarantees this slot's previous
     // DMA has completed (at most kNotifyMaxPendingSends-1 in-flight).
     size_t slot = notify_send_wr_id_ % kNotifyMaxPendingSends;
-    char* slot_ptr = notify_send_buffer_.data() + slot * kNotifyBufferSize;
-
-    // Serialize: [name_len(4)][name][msg_len(4)][msg]
-    if (name.size() > UINT32_MAX || msg.size() > UINT32_MAX) {
-        LOG(ERROR) << "Notification field exceeds uint32 limit";
+    char* slot_ptr = notifySlotPtr(notify_send_buffer_.data(), slot);
+    uint32_t total_size = 0;
+    if (!encodeNotifyPayload(slot_ptr, name, msg, &total_size)) {
+        LOG(ERROR) << "Failed to encode notification payload";
         return false;
     }
-    uint32_t name_len = static_cast<uint32_t>(name.size());
-    uint32_t msg_len = static_cast<uint32_t>(msg.size());
-    size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
-    if (total_size > kNotifyBufferSize) {
-        LOG(ERROR) << "Notification message too large: " << total_size;
-        return false;
-    }
-
-    auto* ptr = slot_ptr;
-    std::memcpy(ptr, &name_len, sizeof(name_len));
-    ptr += sizeof(name_len);
-    std::memcpy(ptr, name.data(), name_len);
-    ptr += name_len;
-    std::memcpy(ptr, &msg_len, sizeof(msg_len));
-    ptr += sizeof(msg_len);
-    std::memcpy(ptr, msg.data(), msg_len);
 
     // Post send
     ibv_sge sge = {};
@@ -1223,7 +1241,8 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
 
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     std::lock_guard<std::mutex> resource_guard(notify_resource_mutex_);
-    if (buffer_idx >= notify_recv_buffers_.size()) {
+    if (!notify_recv_mr_ || buffer_idx >= kNotifyMaxPendingSends ||
+        notify_recv_buffer_.size() < (buffer_idx + 1) * kNotifyBufferSize) {
         LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
         return false;
     }
@@ -1234,32 +1253,15 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
         return false;
     }
 
-    char* data = notify_recv_buffers_[buffer_idx].data();
-    size_t len = byte_len;
-
-    // Deserialize: [name_len(4)][name][msg_len(4)][msg]
-    if (len < 8) {
-        LOG(ERROR) << "Invalid notification message size: " << len;
+    char* data = notifySlotPtr(notify_recv_buffer_.data(), buffer_idx);
+    std::string name;
+    std::string msg;
+    if (!decodeNotifyPayload(data, byte_len, &name, &msg)) {
+        LOG(ERROR) << "Invalid notification message size or format: "
+                   << byte_len;
         postNotifyRecv(buffer_idx);
         return false;
     }
-
-    uint32_t name_len = *reinterpret_cast<uint32_t*>(data);
-    if (name_len > len - 8) {
-        LOG(ERROR) << "Invalid notification message format (name too long)";
-        postNotifyRecv(buffer_idx);
-        return false;
-    }
-
-    std::string name(data + 4, name_len);
-    uint32_t msg_len = *reinterpret_cast<uint32_t*>(data + 4 + name_len);
-    if (msg_len > len - 8 - name_len) {
-        LOG(ERROR) << "Invalid notification message format (msg too long)";
-        postNotifyRecv(buffer_idx);
-        return false;
-    }
-
-    std::string msg(data + 4 + name_len + 4, msg_len);
 
     // Add directly to transport queue (skip endpoint queue for lower latency)
     context_->transport_.addNotificationToQueue(name, msg);

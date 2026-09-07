@@ -79,6 +79,11 @@ class Transport {
 
     virtual Status uninstall() { return Status::OK(); }
 
+    // Called before registered ranges and sub-batches are reclaimed.  Most
+    // transports have no background work; transports with async I/O use this
+    // barrier to settle work while their buffer registry is still alive.
+    virtual Status quiesce() { return Status::OK(); }
+
     virtual const Capabilities capabilities() const { return caps; }
 
     virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size) {
@@ -109,6 +114,12 @@ class Transport {
                                      TransferStatus& status) {
         return Status::NotImplemented(
             "getTransferStatus not implemented" LOC_MARK);
+    }
+
+    virtual Status retryTransferTask(SubBatchRef batch, int task_id,
+                                     const Request& request) {
+        return Status::NotImplemented(
+            "retryTransferTask not implemented" LOC_MARK);
     }
 
     // Cancellation is best effort: implementations must prevent work that has
@@ -154,6 +165,10 @@ class Transport {
         return Status::NotImplemented(
             "removeMemoryBuffer not implemented" LOC_MARK);
     }
+
+    // Some transports keep private local-only registrations that must not be
+    // advertised through BufferDesc::transports.
+    virtual bool tracksLocalBuffer(const BufferDesc&) const { return false; }
 
     virtual bool supportNotification() const { return false; }
 

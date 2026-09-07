@@ -7,7 +7,7 @@
 #include <sstream>
 #include <utility>
 
-#include "storage/distributed/distributed_storage_backend.h"
+#include "config/distributed_storage_config.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "utils.h"

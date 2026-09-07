@@ -490,6 +490,61 @@ TEST(TransferEngineConfigOverrideTest,
     }
 }
 
+TEST(TransferEngineConfigOverrideTest,
+     RegisterLocalMemoryIgnoresIncompatibleCallerLocation) {
+#ifdef _WIN32
+    GTEST_SKIP() << "Requires local HTTP metadata server support";
+#else
+    // registerLocalMemory observes existing memory; the NUMA probe is the
+    // source of truth for transport selection. A caller-supplied location
+    // must not overwrite the probe with an unknown or incompatible type.
+    // The store's buildSegmentsLocation() emits "segments:4096:0,1" (a
+    // classic TE NUMA-segment encoding TENT's type system does not
+    // understand); blindly adopting it made getTypeEnum() return
+    // MTYPE_UNKNOWN and broke transport selection (warmup "Unable to find
+    // registered buffer"). The override must validate and keep the probe.
+    const auto live_port = reserveUnusedTcpPort();
+    TestHttpMetadataServer metadata_server(live_port);
+    ASSERT_TRUE(metadata_server.start());
+    const auto live_endpoint = buildHttpMetadataEndpoint(live_port);
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "http");
+    config->set("metadata_servers", live_endpoint);
+    config->set("local_segment_name", kSegmentName);
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", "0");
+    configureTcpOnlyTransports(*config);
+
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    // Register a host buffer with an incompatible caller location. The
+    // probe classifies host memory as "cpu:N"; "segments:..." is an unknown
+    // type to TENT and must be ignored in favor of the probe.
+    constexpr size_t kBufSize = 4096;
+    std::vector<char> buf(kBufSize, 0);
+    MemoryOptions options;
+    options.location = "segments:4096:0,1";
+    std::vector<void*> addrs = {buf.data()};
+    std::vector<size_t> sizes = {kBufSize};
+    ASSERT_TRUE(engine.registerLocalMemory(addrs, sizes, options).ok());
+
+    SegmentInfo info;
+    ASSERT_TRUE(engine.getSegmentInfo(LOCAL_SEGMENT_ID, info).ok());
+    ASSERT_EQ(info.buffers.size(), 1u);
+    // The buffer location must be the probed "cpu:..." form, NOT the
+    // caller-supplied "segments:..." string.
+    const auto& loc = info.buffers[0].location;
+    EXPECT_NE(loc.find("cpu"), std::string::npos)
+        << "expected probed cpu location, got '" << loc << "'";
+    EXPECT_EQ(loc.find("segments"), std::string::npos)
+        << "caller 'segments:' must not leak into buffer location";
+
+    engine.unregisterLocalMemory(buf.data(), kBufSize);
+#endif
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

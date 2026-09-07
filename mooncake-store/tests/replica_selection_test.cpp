@@ -10,6 +10,8 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <cstdlib>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -75,11 +77,29 @@ Replica::Descriptor MakeDfs(const std::string& path) {
     return d;
 }
 
-// A test fixture that guarantees scoring state is reset between tests, since
-// the enable flag / injected scorer are process-wide.
+// Restore the environment and injected scorer between tests. The cached
+// environment setting intentionally remains fixed for the process lifetime.
 class ReplicaSelectionTest : public ::testing::Test {
    protected:
-    void TearDown() override { SetRemoteReplicaScorer(nullptr); }
+    void SetUp() override {
+        if (const char* value = std::getenv("MC_STORE_REPLICA_SCORING")) {
+            original_env_ = value;
+        }
+    }
+
+    void TearDown() override {
+        SetRemoteReplicaScorer(nullptr);
+        if (original_env_.has_value()) {
+            EXPECT_EQ(
+                setenv("MC_STORE_REPLICA_SCORING", original_env_->c_str(), 1),
+                0);
+        } else {
+            EXPECT_EQ(unsetenv("MC_STORE_REPLICA_SCORING"), 0);
+        }
+    }
+
+   private:
+    std::optional<std::string> original_env_;
 };
 
 // --- Base policy (scoring off): behaviour must be unchanged --------------
@@ -178,6 +198,19 @@ TEST_F(ReplicaSelectionTest, EnvironmentOptInUsesBuiltinScorer) {
     const auto* sel = SelectBestReplica(reps, local);
     ASSERT_NE(sel, nullptr);
     EXPECT_EQ(sel->get_memory_descriptor().buffer_descriptor.protocol_, "rdma");
+}
+
+TEST_F(ReplicaSelectionTest, EnvironmentIsCachedButInjectedScorerRemainsLive) {
+    const bool initially_enabled = RemoteReplicaScoringEnabled();
+    ASSERT_EQ(
+        setenv("MC_STORE_REPLICA_SCORING", initially_enabled ? "0" : "1", 1),
+        0);
+    EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
+
+    SetRemoteReplicaScorer(BuiltinRemoteReplicaScore);
+    EXPECT_TRUE(RemoteReplicaScoringEnabled());
+    SetRemoteReplicaScorer(nullptr);
+    EXPECT_EQ(RemoteReplicaScoringEnabled(), initially_enabled);
 }
 
 TEST_F(ReplicaSelectionTest, ScorerTieKeepsMasterOrder) {

@@ -26,6 +26,10 @@ class NativePlacementTarget final : public PlacementTarget {
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
         return allocator().allocate(size);
     }
+
+    PlacementTargetKind Kind() const noexcept override {
+        return PlacementTargetKind::NATIVE;
+    }
 };
 
 class CxlPlacementTarget final : public PlacementTarget {
@@ -41,6 +45,10 @@ class CxlPlacementTarget final : public PlacementTarget {
             buffer->change_to_cxl(cxl_binding_name_);
         }
         return buffer;
+    }
+
+    PlacementTargetKind Kind() const noexcept override {
+        return PlacementTargetKind::CXL;
     }
 
    private:

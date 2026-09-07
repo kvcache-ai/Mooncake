@@ -101,10 +101,12 @@ RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
       cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
-    if (!qp_list_.empty()) {
-        // In normal flow, beginDestroy()+finishDestroy() should have been
-        // called already via endpoint_store. This is a fallback for abnormal
-        // shutdown (e.g., process exit).
+    // In normal flow, beginDestroy()+finishDestroy() should have been
+    // called already via endpoint_store. This is a fallback for abnormal
+    // shutdown (e.g., process exit). Keyed on wr_depth_list_ as well:
+    // construct() allocates it even for a zero-QP endpoint, whose qp_list_
+    // is empty, and skipping deconstructLocked() would leak it.
+    if (!qp_list_.empty() || wr_depth_list_) {
         RWSpinlock::WriteGuard guard(lock_);
         deconstructLocked();
     }
