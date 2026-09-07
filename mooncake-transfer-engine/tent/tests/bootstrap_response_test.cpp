@@ -71,6 +71,27 @@ TEST(BootstrapResponseTest, EmptyGidIsHandshakeFailure) {
               std::string_view::npos);
 }
 
+// An older peer omits notify_proto; it must decode as 0, not fail.
+TEST(BootstrapResponseTest, MissingNotifyProtoDecodesAsRawOnly) {
+    BootstrapDesc parsed;
+    const std::string legacy =
+        R"({"local_nic_path":"a","peer_nic_path":"b","qp_num":[1],)"
+        R"("local_lid":0,"local_gid":"fe80::1","reply_msg":"",)"
+        R"("notify_qp_num":5})";
+    auto status = ControlClient::decodeBootstrapResponse(legacy, parsed);
+    EXPECT_TRUE(status.ok()) << status.ToString();
+    EXPECT_EQ(parsed.notify_qp_num, 5u);
+    EXPECT_EQ(parsed.notify_proto, 0u);
+
+    BootstrapDesc desc;
+    desc.local_gid = "fe80::1";
+    desc.notify_proto = 1;
+    BootstrapDesc typed;
+    ASSERT_TRUE(
+        ControlClient::decodeBootstrapResponse(json(desc).dump(), typed).ok());
+    EXPECT_EQ(typed.notify_proto, 1u);
+}
+
 TEST(BootstrapResponseTest, InvalidJsonIsMalformed) {
     BootstrapDesc parsed;
     auto status = ControlClient::decodeBootstrapResponse("not-json", parsed);
