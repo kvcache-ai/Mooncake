@@ -764,8 +764,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-    const bool should_use_hugepage =
-        use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
         auto ascend_setup = setup_ascend_internal(local_buffer_size);
@@ -872,6 +870,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_NOF
     use_spdk_dma_for_client_buffer = true;
 #endif
+    const bool should_use_hugepage = use_hugepage_ &&
+                                     this->protocol != "ubshmem" &&
+                                     !globalConfig().ascend_use_fabric_mem;
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
         use_spdk_dma_for_client_buffer);
