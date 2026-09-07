@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -424,10 +425,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
-        std::atomic<bool> writer_terminal{false};
+        auto writer_terminal = std::make_shared<std::atomic<bool>>(false);
+        auto serving_gate = std::make_shared<std::mutex>();
         wrapped_master_service->SetBatchOpLogTerminalCallback(
             [&](const OrderedOpLogWriterTerminalState& state) {
-                if (writer_terminal.exchange(true)) return;
+                std::lock_guard<std::mutex> lock(*serving_gate);
+                if (writer_terminal->exchange(true)) return;
                 LOG(ERROR) << "Batch OpLog writer terminal: "
                            << toString(state.error);
                 admin_server.SetServiceAvailable(false);
@@ -536,15 +539,20 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return -1;
         }
 
-        if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
-            ActivateServingState(admin_server, wrapped_master_service,
-                                 label_reconciler);
+        {
+            std::lock_guard<std::mutex> lock(*serving_gate);
+            if (!serve_shutdown_requested.load(std::memory_order_acquire) &&
+                !writer_terminal->load(std::memory_order_acquire)) {
+                ActivateServingState(admin_server, wrapped_master_service,
+                                     label_reconciler);
+            }
         }
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
+        wrapped_master_service->StopBatchOpLogWriter();
         DeactivateServingState(admin_server, label_reconciler);
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);

@@ -206,6 +206,7 @@ class MasterService {
     void SetBatchOpLogWriterFactoryForTesting(BatchOpLogWriterFactory factory);
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
+    void StopBatchOpLogWriter();
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that

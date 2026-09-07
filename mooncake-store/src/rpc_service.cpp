@@ -98,6 +98,10 @@ void WrappedMasterService::SetBatchOpLogTerminalCallback(
     master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
 }
 
+void WrappedMasterService::StopBatchOpLogWriter() {
+    master_service_.StopBatchOpLogWriter();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();

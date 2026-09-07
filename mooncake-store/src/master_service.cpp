@@ -732,6 +732,10 @@ void MasterService::SetBatchOpLogTerminalCallback(
     }
 }
 
+void MasterService::StopBatchOpLogWriter() {
+    if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
+}
+
 void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
                                             double evict_ratio_lowerbound) {
     BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
