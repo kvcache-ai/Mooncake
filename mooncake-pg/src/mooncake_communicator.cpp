@@ -1540,10 +1540,6 @@ PGResult<void> MooncakeCommunicator::syncActiveRanksMirror() const {
     // storage.
     const size_t bytes = max_group_size_ * sizeof(int32_t);
     if (active_ranks_mirror_is_device_) {
-        if (meta_ && meta_->activeRanksMirrorDevice && worker_ &&
-            worker_->hasPendingActiveRanksMirrorUpdate(meta_.get())) {
-            return {};
-        }
         PG_VALIDATE_STATE(active_ranks_mirror_staging_ &&
                               active_ranks_mirror_stream_.has_value(),
                           "device active-ranks mirror staging is unavailable");
@@ -1838,7 +1834,6 @@ void MooncakeCommunicator::applyGroupState(
     // getSize() reads this from the application thread.
     meta_->activeSize.store(active_size, std::memory_order_release);
 
-    bool active_ranks_in_control_update = false;
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
     if (effective_gpu_collective_backend == GpuCollectiveBackend::New) {
         switch (next_mode) {
@@ -1850,22 +1845,26 @@ void MooncakeCommunicator::applyGroupState(
                 PG_ASSERT_OK(device_collective_->applyGroupView(view));
                 break;
         }
-        if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
-            active_ranks_mirror_device_index_ == device_index_) {
-            // Check after updating the runtime's host state. If recovery is
-            // still pending, its pinned update will now include this view;
-            // otherwise the mirror must follow the normal copy path below.
-            active_ranks_in_control_update =
-                device_collective_->hasPendingRecovery();
-        }
     }
 #endif
 
-    // A same-device mirror must be copied by the control update. During
-    // recovery, even synchronizing an independent CUDA stream may lead to a
-    // deadlock. Non-recovery update, host and cross-device mirrors retain
-    // their cudaMemcpyAsync path.
-    if (!active_ranks_in_control_update) {
+    // Decide who updates a same-device mirror after the runtime's host state
+    // includes this view. Recovery uses the resident kernel to avoid
+    // synchronizing a CUDA copy while that kernel waits for the host.
+    bool mirror_update_in_kernel = false;
+    if (active_ranks_mirror_ && active_ranks_mirror_is_device_ &&
+        active_ranks_mirror_device_index_ == device_index_) {
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+        if (effective_gpu_collective_backend == GpuCollectiveBackend::New) {
+            mirror_update_in_kernel = device_collective_->hasPendingRecovery();
+        }
+#endif
+        if (!mirror_update_in_kernel && worker_) {
+            mirror_update_in_kernel =
+                worker_->hasPendingActiveRanksMirrorUpdate(meta_.get());
+        }
+    }
+    if (!mirror_update_in_kernel) {
         PG_ASSERT_OK(syncActiveRanksMirror());
     }
 

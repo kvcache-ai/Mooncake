@@ -1328,10 +1328,7 @@ class _ElasticMixin:
         """Collectives recover when the same live process rejoins."""
         if (
             self.device_type == "cuda"
-            and os.environ.get(
-                "MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND"
-            )
-            == "new"
+            and os.environ.get("MOONCAKE_PG_PREFERRED_GPU_COLLECTIVE_BACKEND") == "new"
         ):
             self.skipTest("fault injection does not support the new path")
         self._run_inplace_rejoin("collective")
