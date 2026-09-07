@@ -718,6 +718,30 @@ TEST_F(OffsetAllocatorTest, DeserializesLegacyThreeBitBinLayout) {
     EXPECT_EQ(restored->storageReport().totalFreeSpace, ALLOCATOR_SIZE);
 }
 
+TEST_F(OffsetAllocatorTest, RejectsLegacyLayoutWithAmbiguousNodeCount) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 LEGACY_NODE_COUNT = 1501;
+    constexpr uint32 CORRUPTED_NODE_COUNT = 1468;
+    auto allocator = OffsetAllocator::create(0, ALLOCATOR_SIZE,
+                                             LEGACY_NODE_COUNT,
+                                             LEGACY_NODE_COUNT);
+    const auto legacy_buffer = serializeLegacyAllocator(allocator);
+    auto corrupted_buffer = legacy_buffer;
+
+    constexpr size_t CURRENT_CAPACITY_OFFSET =
+        sizeof(uint64_t) * 5 + sizeof(uint32);
+    static_assert(LEGACY_NODE_COUNT - CORRUPTED_NODE_COUNT == 33);
+    std::memcpy(corrupted_buffer.data() + CURRENT_CAPACITY_OFFSET,
+                &CORRUPTED_NODE_COUNT, sizeof(CORRUPTED_NODE_COUNT));
+
+    const auto log_level = FLAGS_minloglevel;
+    FLAGS_minloglevel = google::GLOG_FATAL;
+    auto restored = deserialize_from<OffsetAllocator>(corrupted_buffer);
+    FLAGS_minloglevel = log_level;
+
+    EXPECT_EQ(restored, nullptr);
+}
+
 TEST_F(OffsetAllocatorTest, DeserializesLegacyThreeBitMsgpackLayout) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
     auto allocator = OffsetAllocator::create(0, ALLOCATOR_SIZE, 128, 128);

@@ -33,6 +33,9 @@ static constexpr uint32 LEGACY_BINS_PER_LEAF = 8;
 static constexpr uint32 LEGACY_NUM_LEAF_BINS =
     NUM_TOP_BINS * LEGACY_BINS_PER_LEAF;
 
+static constexpr uint64_t SERIALIZATION_MAGIC = 0x4d434f4646534554ULL;
+static constexpr uint32 SERIALIZATION_VERSION = 1;
+
 struct OffsetAllocation {
     static constexpr uint32 NO_SPACE = 0xffffffff;
 
@@ -251,7 +254,7 @@ class __Allocator {
    public:
     __Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity);
     template <typename T>
-    __Allocator(T& serializer) noexcept(false);
+    __Allocator(T& serializer, bool legacy_format) noexcept(false);
     __Allocator(__Allocator&& other);
     ~__Allocator() = default;
     void reset();
@@ -314,6 +317,9 @@ void OffsetAllocator::serialize_to(T& serializer) const {
         return;
     }
 
+    serializer.write(&SERIALIZATION_MAGIC, sizeof(SERIALIZATION_MAGIC));
+    serializer.write(&SERIALIZATION_VERSION, sizeof(SERIALIZATION_VERSION));
+
     // Basic member variables
     serializer.write(&m_base, sizeof(m_base));
     serializer.write(&m_multiplier_bits, sizeof(m_multiplier_bits));
@@ -334,6 +340,22 @@ template <typename T>
 OffsetAllocator::OffsetAllocator(T& serializer) {
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {
+        bool legacy_format = true;
+        if (serializer.remaining_size() >= sizeof(SERIALIZATION_MAGIC)) {
+            uint64_t magic = 0;
+            serializer.peek(&magic, sizeof(magic));
+            if (magic == SERIALIZATION_MAGIC) {
+                uint32 version = 0;
+                serializer.read(&magic, sizeof(magic));
+                serializer.read(&version, sizeof(version));
+                if (version != SERIALIZATION_VERSION) {
+                    throw std::runtime_error(
+                        "unsupported allocator serialization version");
+                }
+                legacy_format = false;
+            }
+        }
+
         serializer.read(&m_base, sizeof(m_base));
         serializer.read(&m_multiplier_bits, sizeof(m_multiplier_bits));
         serializer.read(&m_capacity, sizeof(m_capacity));
@@ -350,7 +372,8 @@ OffsetAllocator::OffsetAllocator(T& serializer) {
             throw std::runtime_error(
                 "Deserializing OffsetAllocator failed: corrupt header");
         }
-        m_allocator = std::make_unique<__Allocator>(serializer);
+        m_allocator =
+            std::make_unique<__Allocator>(serializer, legacy_format);
         const uint64_t largest_free_region =
             m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
         m_largest_free_region.store(largest_free_region,
@@ -387,7 +410,7 @@ void __Allocator::serialize_to(T& serializer) const {
 }
 
 template <typename T>
-__Allocator::__Allocator(T& serializer) {
+__Allocator::__Allocator(T& serializer, bool legacy_format) {
     try {
         serializer.read(&m_size, sizeof(m_size));
         serializer.read(&m_current_capacity, sizeof(m_current_capacity));
@@ -410,9 +433,10 @@ __Allocator::__Allocator(T& serializer) {
             sizeof(m_usedBinsTop) + sizeof(m_usedBins) + sizeof(m_binIndices) +
             common_tail_size;
         const size_t remaining_size = serializer.remaining_size();
-        const bool legacy_format = remaining_size == legacy_tail_size;
-        if (!legacy_format && remaining_size != current_tail_size) {
-            throw std::runtime_error("unsupported allocator format");
+        const size_t expected_tail_size =
+            legacy_format ? legacy_tail_size : current_tail_size;
+        if (remaining_size != expected_tail_size) {
+            throw std::runtime_error("invalid allocator payload size");
         }
 
         NodeIndex legacy_bin_indices[LEGACY_NUM_LEAF_BINS];
