@@ -180,6 +180,12 @@ class MasterServiceEvictScenarioTest : public ::testing::Test {
             .build();
     }
 
+    MasterServiceConfig PressureConfig(bool allow_soft_pin_eviction = false) {
+        auto config = EvictConfig(allow_soft_pin_eviction);
+        config.eviction_ratio = 0.05;
+        return config;
+    }
+
     MasterServiceConfig TenantConfig(
         const std::map<std::string, uint64_t>& quotas) {
         auto config = EvictConfig();
@@ -593,6 +599,194 @@ TEST_F(MasterServiceEvictScenarioTest,
         .When(PutStart("tenant-b-overflow", 1)
                   .ForTenant("tenant-b")
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
+}
+
+// The scenarios below drive the background eviction thread through the
+// client-visible pressure path: a failed allocation arms eviction, and the
+// only observable outcomes are which writes eventually succeed and which
+// objects remain readable. Sizes are chosen so each armed cycle reclaims
+// exactly one expired one-megabyte object.
+
+TEST_F(MasterServiceEvictScenarioTest, AllocationPressureEvictsOldestFirst) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    MasterScenario scenario("allocation pressure evicts the oldest objects",
+                            PressureConfig());
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 14)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase()))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(Key(14)))
+        .Then(IndexedObjects(0, 3).DoNotExist())
+        .Then(IndexedObjects(3, 15).AreReadable())
+        .Then(ReadableCount(IndexedObjects(0, 15), 12));
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       PressureEvictsUnpinnedObjectsBeforeSoftPinned) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto active_pin =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    MasterScenario scenario("pressure spares soft-pinned objects",
+                            PressureConfig(true));
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 2)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase())
+                   .SoftPinnedUntil(active_pin))
+        .Given(IndexedObjects(2, 14)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(2)))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(Key(14)))
+        .Then(IndexedObjects(0, 2).AreReadable())
+        .Then(IndexedObjects(2, 5).DoNotExist())
+        .Then(IndexedObjects(5, 15).AreReadable());
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       PressureEvictsSoftPinnedAsFallbackWhenAllowed) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto active_pin =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    MasterScenario scenario("pressure falls back to soft-pinned objects",
+                            PressureConfig(true));
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 14)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase())
+                   .SoftPinnedUntil(active_pin))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .WithSoftPin()
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(Key(14)))
+        .Then(IndexedObjects(0, 3).DoNotExist())
+        .Then(IndexedObjects(3, 15).AreReadable());
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       PressureCannotReclaimSoftPinnedWhenDisallowed) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto active_pin =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    MasterScenario scenario("soft pins block reclamation when disallowed",
+                            PressureConfig(false));
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 14)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase())
+                   .SoftPinnedUntil(active_pin))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(WaitFor(std::chrono::milliseconds(100)))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .Then(IndexedObjects(0, 14).AreReadable());
+}
+
+TEST_F(MasterServiceEvictScenarioTest, HardPinnedObjectsSurvivePressure) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    MasterScenario scenario("hard pins survive pressure until forced removal",
+                            PressureConfig());
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 1)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase())
+                   .WithHardPin())
+        .Given(IndexedObjects(1, 14)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(1)))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(Key(14)))
+        .Then(Object(Key(0)).IsReadable())
+        .Then(IndexedObjects(1, 4).DoNotExist())
+        .Then(IndexedObjects(4, 15).AreReadable())
+        .When(Remove(Key(0)).Force())
+        .Then(Object(Key(0)).DoesNotExist());
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       PressureSparesHardPinnedAndSoftPinnedInOrder) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto active_pin =
+        std::chrono::system_clock::now() + std::chrono::hours(1);
+    MasterScenario scenario("pressure spares hard and soft pins in order",
+                            PressureConfig(true));
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 1)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase())
+                   .WithHardPin())
+        .Given(IndexedObjects(1, 2)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(1))
+                   .SoftPinnedUntil(active_pin))
+        .Given(IndexedObjects(2, 14)
+                   .Size(kLargeObject)
+                   .CompleteOn("memory")
+                   .ExpiredFrom(ExpiredBase() + std::chrono::nanoseconds(2)))
+        .When(PutStart(Key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(Key(14)))
+        .Then(Object(Key(0)).IsReadable())
+        .Then(Object(Key(1)).IsReadable())
+        .Then(IndexedObjects(2, 5).DoNotExist())
+        .Then(IndexedObjects(5, 15).AreReadable());
+}
+
+TEST_F(MasterServiceEvictScenarioTest, PressureEvictionExpandsToWholeGroup) {
+    constexpr uint64_t kGroupObject = 2 * 1024 * 1024;
+    MasterScenario scenario("pressure eviction expands to the whole group",
+                            PressureConfig());
+    scenario.Given(MemoryNode("memory").Capacity(4 * 1024 * 1024))
+        .Given(Objects({"grouped_evict_a", "grouped_evict_b"})
+                   .Size(kGroupObject)
+                   .CompleteOn("memory")
+                   .InGroup(GroupOnDifferentShard("grouped_evict_a"))
+                   .ExpiredFrom(ExpiredBase()))
+        .When(PutStart("grouped_evict_trigger", kGroupObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd("grouped_evict_trigger"))
+        .Then(Object("grouped_evict_a").DoesNotExist())
+        .Then(Object("grouped_evict_b").DoesNotExist())
+        .Then(Object("grouped_evict_trigger").IsReadable());
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       LeasedGroupMemberShieldsWholeGroupFromPressure) {
+    constexpr uint64_t kGroupObject = 2 * 1024 * 1024;
+    auto config = PressureConfig();
+    config.default_kv_lease_ttl = 60 * 60 * 1000;
+    MasterScenario scenario("a leased member shields its group from pressure",
+                            config);
+    scenario.Given(MemoryNode("memory").Capacity(4 * 1024 * 1024))
+        .Given(Objects({"grouped_leased_a", "grouped_leased_b"})
+                   .Size(kGroupObject)
+                   .CompleteOn("memory")
+                   .InGroup(GroupOnDifferentShard("grouped_leased_a"))
+                   .ExpiredFrom(ExpiredBase()))
+        // Reading one member grants it a fresh lease, which shields the whole
+        // group from the eviction armed by the failing writes below.
+        .Then(Object("grouped_leased_a").IsReadable())
+        .When(PutStart("grouped_leased_trigger", kGroupObject)
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(WaitFor(std::chrono::milliseconds(200)))
+        .When(PutStart("grouped_leased_trigger", kGroupObject)
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .Then(Object("grouped_leased_a").IsReadable())
+        .Then(Object("grouped_leased_b").IsReadable());
 }
 
 }  // namespace

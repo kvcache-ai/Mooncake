@@ -109,6 +109,10 @@ add_store_test(master_service_offload_scenario_test
                master_service_offload_scenario_test.cpp)
 target_link_libraries(master_service_offload_scenario_test
                       PRIVATE master_service_test_dsl)
+add_store_test(master_service_concurrent_scenario_test
+               master_service_concurrent_scenario_test.cpp)
+target_link_libraries(master_service_concurrent_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
