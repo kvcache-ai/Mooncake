@@ -237,27 +237,40 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
         return 0;
     }
 
-    auto hwc = std::thread::hardware_concurrency();
-    auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
+    const auto hwc = std::thread::hardware_concurrency();
+    size_t num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
     }
-    size_t block_size = length / num_threads;
-    if (block_size == 0) {
+
+    const size_t page_size = detectBufferPageSize(addr);
+    const size_t page_count = length / page_size;
+    if (page_count == 0) {
         return 0;
     }
+    num_threads = std::min(num_threads, page_count);
+    const size_t pages_per_thread = page_count / num_threads;
+    const size_t extra_pages = page_count % num_threads;
+    size_t offset = 0;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     std::vector<int> thread_results(num_threads, 0);
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
-        void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
+        const size_t block_pages =
+            pages_per_thread + (thread_i < extra_pages ? 1 : 0);
+        size_t block_size = block_pages * page_size;
+        if (thread_i + 1 == num_threads) {
+            block_size += length % page_size;
+        }
+        void *block_addr = static_cast<char *>(addr) + offset;
         threads.emplace_back([this, thread_i, block_addr, block_size,
                               &thread_results]() {
             int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
             thread_results[thread_i] = ret;
         });
+        offset += block_size;
     }
 
     for (auto &thread : threads) {
