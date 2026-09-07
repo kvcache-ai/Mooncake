@@ -10434,6 +10434,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
 void MasterService::BatchEvict(double evict_ratio_target,
                                double evict_ratio_lowerbound) {
+    // Consume the allocation-pressure signal before this pass. A new failure
+    // during the pass remains visible to the next iteration.
+    const bool allocation_pressure =
+        need_mem_eviction_.exchange(false, std::memory_order_relaxed);
+
     if (evict_ratio_target < evict_ratio_lowerbound) {
         LOG(ERROR) << "evict_ratio_target=" << evict_ratio_target
                    << ", evict_ratio_lowerbound=" << evict_ratio_lowerbound
@@ -10639,7 +10644,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         uint64_t freed_bytes{0};
         long evicted_objects{0};
         bool stop_scan{false};
-        ErrorCode error{ErrorCode::OK};
         // Set when the candidate was present but its re-validation failed
         // (lease still live, soft-pinned, or no evictable replica), so the
         // first pass can keep its lease timeout for the second-pass census.
@@ -10690,7 +10694,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     persist_evict_oplog_or_skip(tenant_id, key, metadata);
                 if (!submission) {
                     entry_lock.unlock();
-                    return {.stop_scan = true, .error = submission.error()};
+                    return {.stop_scan = true};
                 }
                 uint64_t freed = try_evict_or_offload(
                     tenant_id, key, metadata, tenant_state, deferred_replicas);
@@ -10734,7 +10738,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
                                                           member_metadata);
             if (!submission) {
-                return {.stop_scan = true, .error = submission.error()};
+                return {.stop_scan = true};
             }
             const uint64_t freed =
                 try_evict_or_offload(tenant_id, member_key, member_metadata,
@@ -10754,8 +10758,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             tenant_id, key, group_id, allow_soft_pinned, now, evict_one_member);
         EvictionResult result{.freed_bytes = group_result.freed_bytes,
                               .evicted_objects = group_result.evicted_objects,
-                              .stop_scan = group_result.stop_scan,
-                              .error = group_result.error};
+                              .stop_scan = group_result.stop_scan};
 
         // The callback erased every member except the trigger; re-look-up the
         // trigger to erase it if it is now invalid and to drop an emptied
@@ -10872,7 +10875,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::move(local_soft_pin);
 
     if (total_eviction_base == 0) {
-        need_mem_eviction_ = false;
         VLOG(1) << "[EVICT-DIAG] object_count=" << object_count
                 << " eviction_base=0 (no evictable memory objects)";
         return;
@@ -10974,7 +10976,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
     bool stop_eviction_scan = false;
-    ErrorCode oplog_failure{ErrorCode::OK};
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
     // Tenants that actually evicted this cycle; their metadata maps are
@@ -11024,7 +11025,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 }
                 if (evict_result.stop_scan) {
                     stop_eviction_scan = true;
-                    oplog_failure = evict_result.error;
                 }
                 deferred_replicas.clear();
             }
@@ -11113,7 +11113,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                     if (evict_result.stop_scan) {
                         stop_eviction_scan = true;
-                        oplog_failure = evict_result.error;
                     }
                 }
                 deferred_replicas.clear();
@@ -11172,7 +11171,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                     if (evict_result.stop_scan) {
                         stop_eviction_scan = true;
-                        oplog_failure = evict_result.error;
                     }
                 }
                 deferred_replicas.clear();
@@ -11197,13 +11195,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     const bool made_progress = evicted_count > 0 || released_discarded_cnt > 0;
     const bool success = made_progress || offload_deferred_count > 0;
-    if (stop_eviction_scan) {
-        need_mem_eviction_ =
-            oplog_failure == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED;
-    } else if (success) {
-        need_mem_eviction_ = false;
-    } else if (total_eviction_base == 0) {
-        need_mem_eviction_ = false;
+    if (allocation_pressure && !stop_eviction_scan && !success &&
+        total_eviction_base > 0) {
+        need_mem_eviction_.store(true, std::memory_order_relaxed);
     }
 
     if (success) {
