@@ -67,6 +67,41 @@ struct QueueLimits {
     // NowProvider (via setDegradationPolicy) or defaults to steady_clock.
     // 0 (default) disables promotion entirely.
     uint64_t promotion_slack_ns{0};
+    // Opt-in exploration for the drop above. The drop and the bandwidth
+    // estimate it divides by form a loop: dropping decides what is sent,
+    // and what is sent is all the estimate can learn from. On a link whose
+    // throughput needs enough work in flight, an estimate depressed by a
+    // spell of contention admits too little to ever measure more, and the
+    // queue settles below saturation for good. Per pickForDispatch call, up
+    // to this many owners the drop predicate would reject are dispatched
+    // anyway -- in EDF order, so the most urgent infeasible owner is probed
+    // first -- so the meter can see whether the NIC sustains more than the
+    // estimate says. A probe is dispatched like any other owner: it takes
+    // dispatch budget, counts toward the queue ahead, may still miss its
+    // deadline, and is not signalled through the degradation hook. It
+    // recurs on every pick for as long as the drop predicate fires, so on a
+    // link that genuinely is that slow it costs one late transfer per pick
+    // indefinitely, and its bytes raise the queue ahead of the owners behind
+    // it. 0 (default) = never probe. 1 is the value to use: the exploration the
+    // climb costs is set by how far the estimate has to move, not by the
+    // budget, so a larger budget only shortens the climb -- while, when the
+    // estimate is right, it dispatches that many more late transfers per
+    // pick and pushes that much more queue ahead onto the feasible owners
+    // behind them.
+    size_t mlu_probe_owners{0};
+    // Which rejected owners are worth probing. A depressed estimate
+    // misjudges owners just past the threshold: where it admits n owners a
+    // pick, the (n+1)-th -- the one a probe should test -- scores (n+1)/n
+    // times what the last owner scores at saturation, so at most twice
+    // that, and that saturated score is itself below theta or the drop would
+    // fire at line rate too. An owner far past the threshold -- a large
+    // transfer with a tight deadline -- is infeasible whatever the estimate
+    // says, and probing it buys a late transfer and no information. Only
+    // owners with MLU below mlu_local_threshold x this factor are probe
+    // candidates; the rest are dropped even with budget to spare. 2.0 covers
+    // every plateau a depressed estimate can produce. <= 1.0 removes the
+    // ceiling.
+    double mlu_probe_ceiling_factor{2.0};
 };
 
 struct QueueOwnerInput {
@@ -144,7 +179,17 @@ class LocalTransferAdmissionQueue {
                               DegradationHooks hooks,
                               NowProvider now_provider = nullptr);
 
-    Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status);
+    // How an owner that was dispatched as a probe (QueueLimits::
+    // mlu_probe_owners) ended: met its deadline, or did not (missed it, or
+    // ended in any terminal status other than COMPLETED). None for every
+    // other owner.
+    enum class ProbeOutcome { None, MetDeadline, MissedDeadline };
+
+    // `probe_outcome`, when given, receives the probe verdict for this owner
+    // so the caller can meter it; the queue keeps the same tally in
+    // probeStats().
+    Status complete(QueueOwnerId owner_id, TransferStatusEnum terminal_status,
+                    ProbeOutcome* probe_outcome = nullptr);
 
     // Cancel an owner that has not entered the dispatch window. Idempotent for
     // an owner already canceled; dispatching owners must be canceled through
@@ -166,6 +211,16 @@ class LocalTransferAdmissionQueue {
     // Bytes of degradation-eligible owners currently Dispatching.
     size_t dispatchingBytes() const;
 
+    // Owners dispatched as probes (see QueueLimits::mlu_probe_owners) since
+    // construction, and how the completed ones fared against their deadline.
+    // met + missed <= dispatched: the rest are still in flight.
+    struct ProbeStats {
+        size_t dispatched{0};
+        size_t met_deadline{0};
+        size_t missed_deadline{0};
+    };
+    ProbeStats probeStats() const;
+
    private:
     enum class QueueState {
         Queued,
@@ -180,7 +235,12 @@ class LocalTransferAdmissionQueue {
         bool degradation_eligible{false};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
+        bool probe{false};  // dispatched past the drop predicate
     };
+
+    // now_provider_ when installed, else steady_clock; the clock the deadline
+    // predictor and the probe verdict share.
+    uint64_t clockNs() const;
 
     QueueLimits limits_;
     Status limits_status_;
@@ -196,6 +256,7 @@ class LocalTransferAdmissionQueue {
     // the queue-ahead term of the step-3 drop prediction. Owners on other
     // transports share the queue but not the provider's bandwidth.
     size_t dispatching_bytes_{0};
+    ProbeStats probe_stats_;
 
     // RFC #2519 step 3 degradation policy (all optional / opt-in).
     BandwidthProvider bandwidth_provider_;

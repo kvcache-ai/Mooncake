@@ -248,16 +248,7 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         limits_.deadline_aware && limits_.promotion_slack_ns > 0;
     const bool need_now = drop_enabled || promotion_enabled;
     const double bw_bps = drop_enabled ? bandwidth_provider_() : 0.0;
-    const uint64_t now_ns =
-        need_now
-            ? (now_provider_
-                   ? now_provider_()
-                   : static_cast<uint64_t>(
-                         std::chrono::duration_cast<std::chrono::nanoseconds>(
-                             std::chrono::steady_clock::now()
-                                 .time_since_epoch())
-                             .count()))
-            : 0;
+    const uint64_t now_ns = need_now ? clockNs() : 0;
 
     // Deadline proximity promotion: partition fifo_ so owners with critical
     // slack (deadline approaching within promotion_slack_ns) appear before
@@ -275,21 +266,26 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         });
     }
 
-    // True if the owner is predicted to miss its deadline hard enough to
-    // drop, by the same DeadlineMlu the RDMA workers order QP slots with.
-    // `bytes_ahead`: eligible bytes dispatched and still in flight,
-    // including what this call already picked. No deadline or no bandwidth
-    // (<= 0) means nothing to predict from, so never a drop -- not even
-    // past the deadline; DeadlineMlu yields 0 there too, the explicit
-    // checks just keep the rule readable here.
-    auto shouldDrop = [&](const QueueOwner& owner, size_t bytes_ahead) {
-        if (!drop_enabled || !owner.degradation_eligible) return false;
-        if (owner.request.deadline_ns == 0 || bw_bps <= 0.0) return false;
-        const double mlu =
-            DeadlineMlu(bytes_ahead, owner.request.length,
-                        owner.request.deadline_ns, now_ns, bw_bps);
-        return mlu >= limits_.mlu_local_threshold;
+    // Predicted MLU of a drop-eligible owner behind `bytes_ahead` (eligible
+    // bytes dispatched and still in flight, including what this call already
+    // picked), by the same DeadlineMlu the RDMA workers order QP slots with.
+    // -1 when there is nothing to predict from -- drop off, owner not
+    // eligible, no deadline, no bandwidth (<= 0) -- so never a drop then,
+    // not even past the deadline; DeadlineMlu yields 0 there too, the
+    // explicit checks just keep the rule readable here.
+    auto predictedMlu = [&](const QueueOwner& owner, size_t bytes_ahead) {
+        if (!drop_enabled || !owner.degradation_eligible) return -1.0;
+        if (owner.request.deadline_ns == 0 || bw_bps <= 0.0) return -1.0;
+        return DeadlineMlu(bytes_ahead, owner.request.length,
+                           owner.request.deadline_ns, now_ns, bw_bps);
     };
+    // An owner at or past the threshold is dropped; see
+    // QueueLimits::mlu_probe_ceiling_factor for the band above it that a
+    // probe may still take.
+    const double probe_ceiling =
+        limits_.mlu_probe_ceiling_factor > 1.0
+            ? limits_.mlu_local_threshold * limits_.mlu_probe_ceiling_factor
+            : std::numeric_limits<double>::infinity();
 
     auto dropOwner = [&](QueueOwnerId owner_id, QueueOwner& owner) {
         owner.state = QueueState::Terminal;
@@ -308,6 +304,7 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
+    size_t probes_used = 0;
     while (!fifo_.empty() && used_owners < max_owners) {
         auto owner_id = fifo_.front();
         auto owner_it = owners_.find(owner_id);
@@ -324,10 +321,20 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         // dispatched) and does not consume the dispatch budget. Because the
         // queue is EDF-ordered, later owners have looser deadlines, so we keep
         // scanning rather than stopping.
-        if (shouldDrop(owner_it->second, dispatching_bytes_)) {
-            fifo_.pop_front();
-            dropOwner(owner_id, owner_it->second);
-            continue;
+        // A probe is dispatched in the drop's place so the meter can learn
+        // what the NIC does with more in flight than the estimate admits;
+        // see QueueLimits::mlu_probe_owners and mlu_probe_ceiling_factor. It
+        // takes the normal path below and is budgeted like any other owner.
+        bool probe = false;
+        const double mlu = predictedMlu(owner_it->second, dispatching_bytes_);
+        if (drop_enabled && mlu >= limits_.mlu_local_threshold) {
+            if (probes_used < limits_.mlu_probe_owners && mlu < probe_ceiling) {
+                probe = true;
+            } else {
+                fifo_.pop_front();
+                dropOwner(owner_id, owner_it->second);
+                continue;
+            }
         }
 
         const auto& owner = owner_it->second;
@@ -338,6 +345,11 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         owner_it->second.state = QueueState::Dispatching;
         if (owner.degradation_eligible)
             dispatching_bytes_ += owner.request.length;
+        if (probe) {
+            ++probes_used;
+            ++probe_stats_.dispatched;
+            owner_it->second.probe = true;
+        }
         picked.push_back(owner_id);
         ++used_owners;
         used_bytes += owner.request.length;
@@ -345,8 +357,10 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     return picked;
 }
 
-Status LocalTransferAdmissionQueue::complete(
-    QueueOwnerId owner_id, TransferStatusEnum terminal_status) {
+Status LocalTransferAdmissionQueue::complete(QueueOwnerId owner_id,
+                                             TransferStatusEnum terminal_status,
+                                             ProbeOutcome* probe_outcome) {
+    if (probe_outcome) *probe_outcome = ProbeOutcome::None;
     if (owner_id == 0) {
         return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
     }
@@ -366,6 +380,20 @@ Status LocalTransferAdmissionQueue::complete(
     owner.state = QueueState::Terminal;
     owner.terminal_status = terminal_status;
     if (owner.degradation_eligible) dispatching_bytes_ -= owner.request.length;
+    if (owner.probe) {
+        // The verdict the probe was dispatched to obtain: did the transfer the
+        // estimate called infeasible make it? Anything but a completion
+        // inside the window counts against the estimate having been wrong.
+        const bool met = terminal_status == TransferStatusEnum::COMPLETED &&
+                         clockNs() < owner.request.deadline_ns;
+        if (met)
+            ++probe_stats_.met_deadline;
+        else
+            ++probe_stats_.missed_deadline;
+        if (probe_outcome)
+            *probe_outcome =
+                met ? ProbeOutcome::MetDeadline : ProbeOutcome::MissedDeadline;
+    }
     --outstanding_owners_;
     outstanding_bytes_ -= owner.request.length;
     if (owner.kind == QueueOwnerKind::User) {
@@ -491,6 +519,19 @@ size_t LocalTransferAdmissionQueue::outstandingBytes() const {
 
 size_t LocalTransferAdmissionQueue::dispatchingBytes() const {
     return dispatching_bytes_;
+}
+
+LocalTransferAdmissionQueue::ProbeStats
+LocalTransferAdmissionQueue::probeStats() const {
+    return probe_stats_;
+}
+
+uint64_t LocalTransferAdmissionQueue::clockNs() const {
+    if (now_provider_) return now_provider_();
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
 }
 
 }  // namespace tent

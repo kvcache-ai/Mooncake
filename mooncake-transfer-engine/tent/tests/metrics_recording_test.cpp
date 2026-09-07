@@ -794,6 +794,29 @@ TEST_F(MetricsRecordingTest, FailedTransferCountsFailureNotBytes) {
               0);
 }
 
+// A probe -- an owner the admission drop dispatched past its predicate -- is
+// counted by whether it met its deadline, in a counter of its own: the
+// met/missed ratio is what tells an operator whether the drop threshold is
+// over-conservative or the link genuinely full.
+TEST_F(MetricsRecordingTest, DeadlineProbeCountsByOutcome) {
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    TentMetrics::instance().recordDeadlineProbe(/*met_deadline=*/true);
+    TentMetrics::instance().recordDeadlineProbe(/*met_deadline=*/true);
+    TentMetrics::instance().recordDeadlineProbe(/*met_deadline=*/false);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(after.series("tent_deadline_probe_total{outcome=\"met\"}") -
+                  before.series("tent_deadline_probe_total{outcome=\"met\"}"),
+              2);
+    EXPECT_EQ(
+        after.series("tent_deadline_probe_total{outcome=\"missed\"}") -
+            before.series("tent_deadline_probe_total{outcome=\"missed\"}"),
+        1);
+    EXPECT_EQ(after.counter("tent_deadline_probe_total") -
+                  before.counter("tent_deadline_probe_total"),
+              3);
+}
+
 // ---------------------------------------------------------------------------
 // A transfer whose deadline was already in the past at submit must increment
 // the dedicated tent_deadline_infeasible_total counter, and must NOT pollute

@@ -238,6 +238,7 @@ void TentMetrics::registerMetrics() {
         &transport_attempt_failures_total_,
         &task_failures_total_,
         &deadline_infeasible_total_,
+        &deadline_probe_total_,
         &quarantined_batches_total_,
     };
 
@@ -313,6 +314,14 @@ void TentMetrics::recordDeadlineInfeasible(TransportType tp) {
         return;
     deadline_infeasible_total_.incCached(transportSlot(tp), [tp] {
         return std::array<std::string, 1>{transportTypeName(tp)};
+    });
+}
+
+void TentMetrics::recordDeadlineProbe(bool met_deadline) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    deadline_probe_total_.incCached(met_deadline ? 0 : 1, [met_deadline] {
+        return std::array<std::string, 1>{met_deadline ? "met" : "missed"};
     });
 }
 
@@ -701,6 +710,8 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&transport_attempt_failures_total_);
         root[deadline_infeasible_total_.str_name()] =
             sumCounterValues(&deadline_infeasible_total_);
+        root[deadline_probe_total_.str_name()] =
+            sumCounterValues(&deadline_probe_total_);
         root[quarantined_batches_total_.str_name()] =
             static_cast<int64_t>(quarantined_batches_total_.value());
 
@@ -804,6 +815,7 @@ void TentMetrics::recordTransportAttemptFinished(TransportType, Request::OpCode,
                                                  TransferStatusEnum, double) {}
 void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
+void TentMetrics::recordDeadlineProbe(bool) {}
 void TentMetrics::recordBatchQuarantined() {}
 void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
 void TentMetrics::recordInflightAttemptStarted(TransportType) {}

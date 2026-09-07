@@ -118,6 +118,13 @@ class TentMetrics {
     // distinguishable from genuine MLU samples in the histogram above.
     void recordDeadlineInfeasible(TransportType tp);
 
+    // Record how an owner the admission queue dispatched as a probe -- past
+    // a drop predicate that called it infeasible (runtime_queue/
+    // mlu_probe_owners) -- ended: met its deadline, or missed it. The ratio
+    // says whether the drop threshold is over-conservative (probes mostly
+    // meet) or the link is genuinely full (probes mostly miss).
+    void recordDeadlineProbe(bool met_deadline);
+
     // Record a batch abandoned by lazyFreeBatch after repeated failed reclaim
     // attempts. Such a batch stays on the freelist without further retries and
     // is only reclaimed at engine teardown, so a nonzero value means resources
@@ -226,6 +233,8 @@ class TentMetrics {
                                                                   "operation"};
     static inline const std::array<std::string, 2> kTaskFailureLabels{
         "transport", "reason"};
+    static inline const std::array<std::string, 1> kOutcomeLabel{"outcome"};
+    static constexpr size_t kOutcomeDomain = 2;  // met, missed
 
     // Hot-path metrics record through pre-resolved label cells (see
     // cached_metric.h). Label domain sizes: TransportType has
@@ -290,6 +299,11 @@ class TentMetrics {
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
         kTransportLabel, kTransportDomain};
+    metrics::CachedDynamicCounter<1> deadline_probe_total_{
+        "tent_deadline_probe_total",
+        "Owners the admission drop dispatched as probes, by whether they met "
+        "their deadline",
+        kOutcomeLabel, kOutcomeDomain};
     // Label-less: quarantine is a batch-lifecycle event, not a per-transport
     // one (a batch may hold SubBatches on several transports).
     ylt::metric::counter_t quarantined_batches_total_{
