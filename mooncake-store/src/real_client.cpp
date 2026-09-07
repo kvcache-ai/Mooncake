@@ -103,9 +103,7 @@ bool RestoreAgentModeDeviceZero() {
     }
     return true;
 }
-#endif
 
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 void *AllocateAscendStoreSegment(size_t segment_size,
                                  const std::string &protocol, bool use_hugepage,
                                  bool defer_hugetlb, size_t *mapped_size) {
@@ -113,7 +111,7 @@ void *AllocateAscendStoreSegment(size_t segment_size,
     AscendHostAllocFn host_alloc = nullptr;
     size_t host_align = 0;
     size_t alloc_size = segment_size;
-    if (use_hugepage) {
+    if (use_hugepage && !globalConfig().ascend_use_fabric_mem) {
         host_align = get_hugepage_size_from_env();
         alloc_size = align_up(segment_size, host_align);
         host_alloc =
@@ -894,11 +892,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_NOF
     use_spdk_dma_for_client_buffer = true;
 #endif
-    const bool should_use_hugepage = use_hugepage_ &&
-                                     this->protocol != "ubshmem" &&
-                                     !globalConfig().ascend_use_fabric_mem;
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage,
+        local_buffer_size, this->protocol,
+        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
         use_spdk_dma_for_client_buffer);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
@@ -989,7 +985,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && should_use_hugepage;
+            protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size =
@@ -1007,7 +1003,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
-                size_t page_sz = should_use_hugepage
+                size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
                 mapped_size =
@@ -1015,13 +1011,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
                                                     page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#ifdef USE_ASCEND_DIRECT
             } else if (protocol == "ascend" || protocol == "ubshmem") {
                 ptr = AllocateAscendStoreSegment(
-                    segment_size, this->protocol, should_use_hugepage,
+                    segment_size, this->protocol, use_hugepage_,
                     parallel_hugetlb_population, &mapped_size);
 #endif
-            } else if (should_use_hugepage) {
+            } else if (use_hugepage_) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
@@ -1042,10 +1038,14 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
-            if ((this->protocol == "ascend" || this->protocol == "ubshmem") &&
-                !should_use_hugepage) {
-                ascend_segment_ptrs_.emplace_back(
-                    ptr, AscendSegmentDeleter{this->protocol});
+            if (this->protocol == "ascend" || this->protocol == "ubshmem") {
+                if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    ascend_segment_ptrs_.emplace_back(
+                        ptr, AscendSegmentDeleter{this->protocol});
+                }
             } else if (this->protocol == "sunrise_link") {
 #if defined(USE_SUNRISE)
                 sunrise_segment_ptrs_.emplace_back(ptr,
@@ -1058,7 +1058,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+            } else if (!seg_numa_nodes.empty() || use_hugepage_) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(

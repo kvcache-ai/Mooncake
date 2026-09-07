@@ -16,10 +16,12 @@ using AscendHostAllocFn = void* (*)(size_t, size_t, bool);
 // Fabric-mem: try 100%/90%/.../50% of target (1G-aligned); host_alloc is
 // ignored. Otherwise: exact-size via host_alloc, or aclrtMallocHost if
 // host_alloc is null. Sets *actual_size on success.
-void* ascend_allocate_memory_best_effort(
-    size_t target_size, const std::string& protocol, size_t* actual_size,
-    AscendHostAllocFn host_alloc = nullptr, size_t host_alignment = 0,
-    bool defer_hugetlb_population = false);
+void* ascend_allocate_memory_best_effort(size_t target_size,
+                                         const std::string& protocol,
+                                         size_t* actual_size,
+                                         AscendHostAllocFn host_alloc = nullptr,
+                                         size_t host_alignment = 0,
+                                         bool defer_hugetlb_population = false);
 
 void ascend_free_memory(const std::string& protocol, void* ptr);
 

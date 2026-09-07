@@ -232,10 +232,10 @@ void *AllocateExactOnBoundDevice(size_t total_size, const std::string &protocol,
                                  AscendHostAllocFn host_alloc,
                                  size_t host_alignment,
                                  bool defer_hugetlb_population) {
-    void *ptr = host_alloc != nullptr
-                    ? host_alloc(total_size, host_alignment,
-                                 defer_hugetlb_population)
-                    : AllocateStoreMemoryImpl(total_size, protocol);
+    void *ptr =
+        host_alloc != nullptr
+            ? host_alloc(total_size, host_alignment, defer_hugetlb_population)
+            : AllocateStoreMemoryImpl(total_size, protocol);
     if (ptr == nullptr) {
         return nullptr;
     }

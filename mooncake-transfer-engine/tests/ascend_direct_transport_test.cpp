@@ -2414,7 +2414,8 @@ TEST(AgentModeAllocTest, FailedHostAllocDoesNotConsumeSlot) {
     EXPECT_EQ(actual, 0);
 
     actual = 0;
-    void* ok = ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    void* ok =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
     ASSERT_NE(ok, nullptr);
     EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount);
     ascend_free_memory("ascend", ok);
