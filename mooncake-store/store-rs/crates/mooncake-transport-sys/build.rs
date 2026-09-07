@@ -14,7 +14,6 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PYTHON_EXECUTABLE");
     println!("cargo:rerun-if-env-changed=MOONCAKE_SKIP_CLASSIC_TE");
     println!("cargo:rerun-if-env-changed=MOONCAKE_SKIP_NATIVE_BUILD");
-    println!("cargo:rerun-if-changed=../../third_party/Mooncake");
     println!("cargo:rerun-if-changed=src/classic_shim.cc");
     println!("cargo:rerun-if-changed=src/tent_shim.cc");
 
@@ -24,20 +23,17 @@ fn main() {
     }
 
     let upstream_dir = env_path("MOONCAKE_UPSTREAM_DIR").unwrap_or_else(default_upstream_dir);
+    println!(
+        "cargo:rerun-if-changed={}",
+        upstream_dir.join("mooncake-common/FindYLT.cmake").display()
+    );
     let build_dir =
         env_path("MOONCAKE_UPSTREAM_BUILD_DIR").unwrap_or_else(|| upstream_dir.join("build-rust"));
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR must be set by Cargo"));
-    let yalantinglibs_prefix = ensure_yalantinglibs_prefix(&upstream_dir, &build_dir);
     let python = detect_python();
     let jsoncpp = detect_jsoncpp();
 
-    ensure_upstream_native_artifacts(
-        &upstream_dir,
-        &build_dir,
-        &yalantinglibs_prefix,
-        &python,
-        &jsoncpp,
-    );
+    ensure_upstream_native_artifacts(&upstream_dir, &build_dir, &python, &jsoncpp);
     build_native_shims(&upstream_dir, &build_dir, &out_dir);
 }
 
@@ -47,7 +43,9 @@ fn env_path(key: &str) -> Option<PathBuf> {
 
 fn default_upstream_dir() -> PathBuf {
     PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir must exist"))
-        .join("../../third_party/Mooncake")
+        .join("../../../..")
+        .canonicalize()
+        .expect("Mooncake repository root must exist")
 }
 
 fn skip_classic_te() -> bool {
@@ -82,21 +80,6 @@ struct PythonConfig {
 struct JsonCppConfig {
     include_dir: PathBuf,
     library_path: PathBuf,
-}
-
-fn merged_cmake_prefix_path(yalantinglibs_prefix: &Path) -> String {
-    let mut prefixes = vec![yalantinglibs_prefix.display().to_string()];
-    if let Some(extra) = env::var_os("MOONCAKE_EXTRA_CMAKE_PREFIX_PATH") {
-        let extra = extra.to_string_lossy();
-        for prefix in extra
-            .split(';')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            prefixes.push(prefix.to_string());
-        }
-    }
-    prefixes.join(";")
 }
 
 fn detect_python() -> PythonConfig {
@@ -278,67 +261,15 @@ fn detect_jsoncpp_from_env() -> Option<JsonCppConfig> {
     })
 }
 
-fn ensure_yalantinglibs_prefix(upstream_dir: &Path, build_dir: &Path) -> PathBuf {
-    let install_dir = build_dir.join("yalantinglibs-install");
-    let config_dir = install_dir.join("lib/cmake/yalantinglibs");
-    let config_file = config_dir.join("yalantinglibsConfig.cmake");
-    if config_file.exists() {
-        return install_dir;
-    }
-
-    let source_candidates = [
-        upstream_dir.join("extern/yalantinglibs"),
-        build_dir.join("_deps/yalantinglibs-src"),
-    ];
-    let source_dir = source_candidates
-        .iter()
-        .find(|candidate| candidate.join("CMakeLists.txt").is_file())
-        .unwrap_or_else(|| {
-            panic!(
-                "yalantinglibs source was not found in {} or {}",
-                source_candidates[0].display(),
-                source_candidates[1].display()
-            )
-        });
-    let ylt_build_dir = build_dir.join("yalantinglibs-build");
-
-    run(
-        Command::new("cmake")
-            .arg("-S")
-            .arg(source_dir)
-            .arg("-B")
-            .arg(&ylt_build_dir)
-            .arg(format!("-DCMAKE_INSTALL_PREFIX={}", install_dir.display()))
-            .arg("-DBUILD_EXAMPLES=OFF")
-            .arg("-DBUILD_BENCHMARK=OFF")
-            .arg("-DBUILD_UNIT_TESTS=OFF"),
-        "configure bundled yalantinglibs",
-    );
-    run(
-        Command::new("cmake")
-            .arg("--build")
-            .arg(&ylt_build_dir)
-            .arg("-j8"),
-        "build bundled yalantinglibs",
-    );
-    run(
-        Command::new("cmake").arg("--install").arg(&ylt_build_dir),
-        "install bundled yalantinglibs",
-    );
-
-    install_dir
-}
-
 fn ensure_upstream_native_artifacts(
     upstream_dir: &Path,
     build_dir: &Path,
-    yalantinglibs_prefix: &Path,
     python: &PythonConfig,
     jsoncpp: &JsonCppConfig,
 ) {
     if !upstream_dir.exists() {
         panic!(
-            "Mooncake upstream source was not found at {}. Run `git submodule update --init --recursive` or set MOONCAKE_UPSTREAM_DIR.",
+            "Mooncake source was not found at {}. Set MOONCAKE_UPSTREAM_DIR to the Mooncake repository root.",
             upstream_dir.display()
         );
     }
@@ -363,13 +294,7 @@ fn ensure_upstream_native_artifacts(
             .arg(build_dir)
             .arg(format!(
                 "-DCMAKE_PREFIX_PATH={}",
-                merged_cmake_prefix_path(yalantinglibs_prefix)
-            ))
-            .arg(format!(
-                "-Dyalantinglibs_DIR={}",
-                yalantinglibs_prefix
-                    .join("lib/cmake/yalantinglibs")
-                    .display()
+                env::var("MOONCAKE_EXTRA_CMAKE_PREFIX_PATH").unwrap_or_default()
             ))
             .arg(format!(
                 "-DPYTHON_EXECUTABLE={}",
@@ -456,6 +381,14 @@ fn ensure_upstream_native_artifacts(
 }
 
 fn native_artifacts_are_fresh(upstream_dir: &Path, build_dir: &Path, artifacts: &[&Path]) -> bool {
+    // The shims consume the same fetched headers as the upstream targets.
+    // Configure again when a reused build tree only contains binary artifacts.
+    if !build_dir
+        .join("_deps/yalantinglibs-src/include/ylt/easylog.hpp")
+        .is_file()
+    {
+        return false;
+    }
     if artifacts.iter().any(|artifact| !artifact.exists()) {
         return false;
     }
@@ -543,6 +476,10 @@ fn file_mtime(path: &Path) -> Option<SystemTime> {
 fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {
     let include = upstream_dir.join("mooncake-transfer-engine/include");
     let tent_include = upstream_dir.join("mooncake-transfer-engine/tent/include");
+    let common_include = upstream_dir.join("mooncake-common/include");
+    let ylt_include = build_dir.join("_deps/yalantinglibs-src/include");
+    let ylt_thirdparty = ylt_include.join("ylt/thirdparty");
+    let ylt_standalone = ylt_include.join("ylt/standalone");
     let classic_dir = build_dir.join("mooncake-transfer-engine/src");
     let tent_dir = build_dir.join("mooncake-transfer-engine/tent/src");
 
@@ -552,7 +489,13 @@ fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {
             "classic_shim.cc",
             "libmooncake_classic_shim.so",
             "compile classic transfer-engine shim",
-            &[&include],
+            &[
+                &include,
+                &common_include,
+                &ylt_include,
+                &ylt_thirdparty,
+                &ylt_standalone,
+            ],
             &[(&classic_dir, "transfer_engine")],
         );
     }
@@ -561,7 +504,14 @@ fn build_native_shims(upstream_dir: &Path, build_dir: &Path, out_dir: &Path) {
         "tent_shim.cc",
         "libmooncake_tent_shim.so",
         "compile tent transfer-engine shim",
-        &[&include, &tent_include],
+        &[
+            &include,
+            &tent_include,
+            &common_include,
+            &ylt_include,
+            &ylt_thirdparty,
+            &ylt_standalone,
+        ],
         &[(&tent_dir, "tent_shared")],
     );
 }

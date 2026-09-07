@@ -34,7 +34,6 @@ if [ ! -d "${UPSTREAM_DIR}/mooncake-transfer-engine" ] \
   UPSTREAM_DIR=$(cd "${REPO_ROOT}/../.." && pwd)
 fi
 UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
-YALANTINGLIBS_PREFIX=${YALANTINGLIBS_PREFIX:-"${UPSTREAM_BUILD_DIR}/yalantinglibs-install"}
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
 BUILD_GIT_BRANCH=${MC_BUILD_GIT_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}
 BUILD_GIT_COMMIT=${MC_BUILD_GIT_COMMIT:-$(git -C "${REPO_ROOT}" rev-parse HEAD)}
@@ -50,8 +49,6 @@ Environment:
   DIST_DIR                   Output directory for wheel and binary artifacts
   MOONCAKE_UPSTREAM_DIR      Mooncake upstream source tree
   MOONCAKE_UPSTREAM_BUILD_DIR  Upstream build directory used for engine/CLI assets
-  YALANTINGLIBS_PREFIX       Install prefix for bundled yalantinglibs
-  YALANTINGLIBS_PREBUILT_DIR Prebuilt yalantinglibs directory (if set, skip build and copy from here)
   PYBIND11_PREBUILT_DIR      Prebuilt pybind11 directory (if set, use instead of submodule)
   MOONCAKE_REUSE_NATIVE_ARTIFACTS
                              Reuse existing native assets in MOONCAKE_UPSTREAM_BUILD_DIR
@@ -193,71 +190,6 @@ AUDITWHEEL_EXCLUDES=(
   --exclude "ascend_transport*.so"
   --exclude "libaccl_barex.so*"
 )
-
-ensure_yalantinglibs() {
-  local source_dir="${UPSTREAM_DIR}/extern/yalantinglibs"
-  local fetched_source_dir="${UPSTREAM_BUILD_DIR}/_deps/yalantinglibs-src"
-  local build_dir="${UPSTREAM_BUILD_DIR}/yalantinglibs-build"
-  local config_file="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs/yalantinglibsConfig.cmake"
-  local header_file="${YALANTINGLIBS_PREFIX}/include/ylt/easylog.hpp"
-
-  # 如果已经安装，直接返回
-  if [[ -f "${config_file}" && -f "${header_file}" ]]; then
-    return 0
-  fi
-
-  # 如果设置了预编译目录，直接从那里复制
-  if [[ -n "${YALANTINGLIBS_PREBUILT_DIR:-}" && -d "${YALANTINGLIBS_PREBUILT_DIR}" ]]; then
-    echo "Using prebuilt yalantinglibs from: ${YALANTINGLIBS_PREBUILT_DIR}"
-    mkdir -p "${YALANTINGLIBS_PREFIX}"
-    cp -r "${YALANTINGLIBS_PREBUILT_DIR}"/* "${YALANTINGLIBS_PREFIX}/"
-    # 验证复制是否成功
-    if [[ -f "${config_file}" && -f "${header_file}" ]]; then
-      echo "Successfully copied prebuilt yalantinglibs to: ${YALANTINGLIBS_PREFIX}"
-      return 0
-    else
-      echo "Warning: Prebuilt yalantinglibs copy failed, falling back to build from source"
-    fi
-  fi
-
-  # In the monorepo layout yalantinglibs is populated by the enclosing CMake
-  # FetchContent declaration. Bootstrap configuration once so the same pinned
-  # source is available before this script installs its reusable CMake package.
-  if [[ ! -f "${source_dir}/CMakeLists.txt" && ! -f "${fetched_source_dir}/CMakeLists.txt" ]]; then
-    echo "Preparing fetched yalantinglibs source..."
-    PATH="${VENV_BIN}:${PATH}" cmake \
-      -S "${UPSTREAM_DIR}" \
-      -B "${UPSTREAM_BUILD_DIR}" \
-      -DPython3_EXECUTABLE="${VENV_PYTHON}" \
-      -DWITH_TE=ON \
-      -DWITH_STORE=OFF \
-      -DWITH_STORE_RUST=OFF \
-      -DBUILD_EXAMPLES=OFF \
-      -DBUILD_UNIT_TESTS=OFF \
-      -DUSE_TENT=ON \
-      -DUSE_REDIS=ON \
-      -DUSE_HTTP=ON \
-      -DUSE_ETCD=OFF
-  fi
-  if [[ ! -f "${source_dir}/CMakeLists.txt" ]]; then
-    source_dir=${fetched_source_dir}
-  fi
-  if [[ ! -f "${source_dir}/CMakeLists.txt" ]]; then
-    echo "missing yalantinglibs source in source and CMake build trees" >&2
-    exit 1
-  fi
-
-  echo "Building yalantinglibs from source..."
-  cmake \
-    -S "${source_dir}" \
-    -B "${build_dir}" \
-    -DCMAKE_INSTALL_PREFIX="${YALANTINGLIBS_PREFIX}" \
-    -DBUILD_EXAMPLES=OFF \
-    -DBUILD_BENCHMARK=OFF \
-    -DBUILD_UNIT_TESTS=OFF
-  cmake --build "${build_dir}" -j"${BUILD_JOBS}"
-  cmake --install "${build_dir}"
-}
 
 ensure_pybind11() {
   local pybind_dir="${UPSTREAM_DIR}/extern/pybind11"
@@ -475,17 +407,13 @@ else
     git -C "${REPO_ROOT}" submodule update --init --recursive
   fi
   ensure_pybind11
-  ensure_yalantinglibs
-  export CPATH="${YALANTINGLIBS_PREFIX}/include${CPATH:+:${CPATH}}"
-  _timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11 + yalantinglibs)"
+  _timer_elapsed $_WHEEL_GLOBAL_START "setup (venv + deps + pybind11)"
 
   _CMAKE_SHARED_CONF_START=$(_timer_start)
   PATH="${VENV_BIN}:${PATH}" cmake \
     -S "${UPSTREAM_DIR}" \
     -B "${UPSTREAM_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="${YALANTINGLIBS_PREFIX}" \
-    -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
     -DPython3_EXECUTABLE="${VENV_PYTHON}" \
     -DWITH_TE=ON \
     -DWITH_STORE=OFF \
@@ -512,8 +440,6 @@ else
     -S "${UPSTREAM_DIR}" \
     -B "${UPSTREAM_BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_PREFIX_PATH="${YALANTINGLIBS_PREFIX}" \
-    -Dyalantinglibs_DIR="${YALANTINGLIBS_PREFIX}/lib/cmake/yalantinglibs" \
     -DPython3_EXECUTABLE="${VENV_PYTHON}" \
     -DWITH_TE=ON \
     -DWITH_STORE=OFF \

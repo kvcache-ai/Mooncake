@@ -125,8 +125,13 @@ MOONCAKE_SKIP_NATIVE_BUILD=1 cargo check
 This is intended for IDE analysis and for build environments that provide native artifacts through
 `MOONCAKE_UPSTREAM_BUILD_DIR` and the explicit shim library path variables. Runtime builds that need
 fresh TE/TENT artifacts should leave `MOONCAKE_SKIP_NATIVE_BUILD` unset.
-In the monorepo layout, native dependency discovery also consumes FetchContent
-sources from `${MOONCAKE_UPSTREAM_BUILD_DIR}/_deps`, including yalantinglibs.
+The native build defaults to the enclosing Mooncake repository and its
+`build-rust` directory. Its CMake configuration owns the pinned FetchContent
+dependencies, including header-only yalantinglibs. On a fresh checkout CMake
+populates `_deps` before the Rust shims compile against those headers; a reused
+build tree with missing headers is configured again. Native builds share this
+dependency source with the wheel helpers and require no separate yalantinglibs
+installation.
 
 ## Enable Routed Writes
 

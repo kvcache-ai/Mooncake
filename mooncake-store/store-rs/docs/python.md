@@ -219,7 +219,10 @@ cargo build -p mooncake-store-py
 export PYTHONPATH="$PWD/python"
 ```
 
-The package loads the native extension from the local `target` directory and preloads the upstream Mooncake TE/TENT shared libraries from `third_party/Mooncake/build-rust`.
+The package loads the native extension from the local `target` directory and
+preloads Mooncake TE/TENT shared libraries from the enclosing repository's
+`build-rust` directory. `MOONCAKE_UPSTREAM_DIR` and
+`MOONCAKE_UPSTREAM_BUILD_DIR` select an explicit source and build tree.
 
 ## Build a Wheel
 
@@ -241,7 +244,11 @@ By default the script:
 Repository packaging rule:
 
 - `scripts/build/build-wheel.sh` is the single owner of wheel asset injection and `auditwheel repair`
-- nested monorepo builds bootstrap FetchContent dependencies from the enclosing Mooncake CMake tree before building the wheel
+- the enclosing Mooncake CMake configuration fetches its pinned header-only
+  yalantinglibs dependency into the build tree; the Rust native shims use those
+  same fetched headers, including on a fresh checkout
+- wheel and native-library build helpers share that CMake dependency source;
+  yalantinglibs requires no separate installation or prebuilt prefix
 
 Common variants:
 

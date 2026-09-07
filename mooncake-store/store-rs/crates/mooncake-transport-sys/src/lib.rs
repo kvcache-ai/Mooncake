@@ -5,12 +5,9 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-pub const DEFAULT_UPSTREAM_DIR: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../third_party/Mooncake");
-pub const DEFAULT_UPSTREAM_BUILD_DIR: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../third_party/Mooncake/build-rust"
-);
+pub const DEFAULT_UPSTREAM_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../../..");
+pub const DEFAULT_UPSTREAM_BUILD_DIR: &str =
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../../../build-rust");
 
 const WHEEL_LIB_DIRS: [&str; 2] = ["mooncake.libs", "mooncake_store_rs.libs"];
 
