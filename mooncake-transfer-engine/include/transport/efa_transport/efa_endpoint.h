@@ -45,6 +45,11 @@ struct EfaOpContext {
     // std::atomic<int> (not volatile int) so the CQ-poller decrement
     // and the submit-path fetch_add play by the C++ memory model.
     std::atomic<int>* wr_depth;
+    // The AV slot this operation was posted against, plus the slot number
+    // itself; the CQ poller settles slot->inflight and any deferred
+    // fi_av_remove on completion.  See EfaContext::av_slots_.
+    EfaContext::AvSlotState* slot;
+    fi_addr_t slot_addr;
 };
 
 // Per-peer handle in the shared-endpoint SRD model.
@@ -80,16 +85,25 @@ class EfaEndPoint {
     int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                   HandShakeDesc& local_desc);
 
-    // Always false under the shared-endpoint model: outstanding work is
-    // tracked at the context (shared) level, not per-peer.  Retained for
-    // API compatibility with callers that still ask.
-    bool hasOutstandingSlice() const { return false; }
+    // True if the AV slot this handle points at still has operations awaiting a
+    // CQ entry.  Asks the context for the slot inflight count, which is shared
+    // across endpoints (see EfaContext::av_slots_).
+    bool hasOutstandingSlice() const;
 
     bool connected() const {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
     void disconnect();
+
+    // Refuse to disconnect this handle unless the write lock is free (no
+    // submitter inside submitPostSend) AND the shared AV slot has no inflight
+    // operations; the decision is taken under the same write lock that
+    // submitPostSend() holds as a reader, so a submitter cannot slip in
+    // between the check and the teardown.  AV removal may still be deferred by
+    // refcount / inflight inside removePeerAddr().  Returns false if the peer
+    // was left alone because it is busy.
+    bool disconnectIfIdle();
 
     // Called during EfaContext teardown: forget the AV slot WITHOUT calling
     // fi_av_remove().  The AV itself is about to be closed, which invalidates
@@ -121,15 +135,16 @@ class EfaEndPoint {
     EfaContext& context_;
     std::atomic<Status> status_;
 
-    RWSpinlock lock_;  // protects peer_nic_path_ and status_
+    // protects peer_nic_path_, status_ and peer_fi_addr_.  mutable so const
+    // observers (hasOutstandingSlice) can read peer_fi_addr_ safely.
+    mutable RWSpinlock lock_;
     std::string peer_nic_path_;
     fi_addr_t peer_fi_addr_;  // slot in context_.av()
-    // Last peer EFA address successfully inserted into the AV.  Used to
-    // make passive handshakes idempotent: when both peers initiate a
-    // handshake concurrently (the common case under bilateral sglang PD
-    // traffic), the second passive handshake carries the same EFA
-    // address as the cached value, and we can skip the fi_av_remove/
-    // fi_av_insert churn entirely.
+    // Last peer EFA address successfully inserted into the AV.  Used ONLY to
+    // classify a passive handshake as same-address (benign symmetric handshake
+    // under bilateral sglang PD traffic) versus a real reconnect, which picks
+    // the log level.  The AV reinsert is still mandatory on every handshake --
+    // see the classify comment in setupConnectionsByPassive().
     std::string cached_peer_addr_;
 };
 
