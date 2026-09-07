@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,8 +27,6 @@
 
 namespace mooncake::tent {
 namespace {
-
-constexpr size_t kDataLength = 256 * 1024;
 
 bool ReadExactly(int fd, void* buffer, size_t length) {
     auto* cursor = static_cast<uint8_t*>(buffer);
@@ -108,7 +107,8 @@ bool WaitBatchDone(TransferEngine& engine, BatchID batch) {
     return false;
 }
 
-void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
+void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail,
+                                     size_t kDataLength = 256 * 1024) {
     const size_t remote_buffer_length = task_count * kDataLength;
     const size_t local_buffer_length = 2 * remote_buffer_length;
 
@@ -183,13 +183,14 @@ void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
     }
     close(ready_pipe[0]);
 
+    std::vector<uint8_t> local(local_buffer_length, 0);
     TransferEngine client(MakeHpConfig(multi_rail));
     ASSERT_TRUE(client.available());
-    std::vector<uint8_t> local(local_buffer_length, 0);
+    std::mt19937 data(3834);
     for (size_t task = 0; task < task_count; ++task) {
         uint8_t* source = local.data() + task * kDataLength;
         for (size_t i = 0; i < kDataLength; ++i) {
-            source[i] = static_cast<uint8_t>((task * 131 + i * 7) & 0xff);
+            source[i] = static_cast<uint8_t>(data());
         }
     }
     ASSERT_TRUE(
@@ -266,6 +267,10 @@ TEST(HighPerformanceTcpE2eTest, WriteThenReadConcurrency16) {
 
 TEST(HighPerformanceTcpE2eTest, WriteThenReadAcrossTwoRails) {
     RunWriteThenReadAcrossProcesses(16, true);
+}
+
+TEST(HighPerformanceTcpE2eTest, UnevenSlicedReadAcrossProcesses) {
+    RunWriteThenReadAcrossProcesses(4, true, (4ULL << 20) + 3);
 }
 
 }  // namespace

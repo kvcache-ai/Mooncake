@@ -32,7 +32,8 @@ struct MergeResult {
 
 MergeResult mergeRequests(const std::vector<Request>& requests,
                           const std::vector<RequestBoundaryInfo>& boundaries,
-                          bool do_merge);
+                          bool do_merge,
+                          uint64_t hp_tcp_max_transfer_bytes = UINT64_MAX);
 
 namespace {
 
@@ -90,6 +91,15 @@ TEST(RequestMergeTest, MergesAdjacentRequestsInsideSameRegisteredBuffers) {
     EXPECT_EQ(merged.request_list[0].length, 2048u);
     EXPECT_EQ(merged.task_lookup.at(0), 0u);
     EXPECT_EQ(merged.task_lookup.at(1), 0u);
+    for (auto hint : {HP_TCP, UNSPEC, TCP}) {
+        for (auto& request : requests) request.transport_hint = hint;
+        EXPECT_EQ(
+            mergeRequests(requests, boundaries, true, 1024).request_list.size(),
+            hint == TCP ? 1u : 2u);
+        EXPECT_EQ(
+            mergeRequests(requests, boundaries, true, 2048).request_list.size(),
+            1u);
+    }
 }
 
 TEST(RequestMergeTest, KeepsNonContiguousRequestsSplit) {

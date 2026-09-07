@@ -1532,7 +1532,7 @@ uint64_t requestSourceAddr(const Request& request) {
 
 MergeResult mergeRequests(const std::vector<Request>& requests,
                           const std::vector<RequestBoundaryInfo>& boundaries,
-                          bool do_merge) {
+                          bool do_merge, uint64_t hp_tcp_max_transfer_bytes) {
     if (requests.empty()) return {};
     if (!do_merge || boundaries.size() != requests.size()) {
         return makePassThroughMergeResult(requests);
@@ -1561,7 +1561,8 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         return requestSourceAddr(a.req) < requestSourceAddr(b.req);
     });
 
-    auto can_merge = [](const Item& last, const Item& curr) {
+    auto can_merge = [hp_tcp_max_transfer_bytes](const Item& last,
+                                                 const Item& curr) {
         if (last.req.opcode != curr.req.opcode ||
             last.req.target_id != curr.req.target_id) {
             return false;
@@ -1588,6 +1589,13 @@ MergeResult mergeRequests(const std::vector<Request>& requests,
         }
         if (curr.req.length >
             std::numeric_limits<size_t>::max() - last.req.length) {
+            return false;
+        }
+        // Coalescing must not turn valid HP TCP requests into an oversized
+        // request. UNSPEC may select HP TCP after merging as well.
+        if ((last.req.transport_hint == HP_TCP ||
+             last.req.transport_hint == UNSPEC) &&
+            last.req.length + curr.req.length > hp_tcp_max_transfer_bytes) {
             return false;
         }
 
@@ -1811,7 +1819,10 @@ Status TransferEngineImpl::prepareSubmit(
             ? resolveRequestBoundaries(metadata_.get(), request_list)
             : std::vector<RequestBoundaryInfo>{};
     auto merged =
-        mergeRequests(request_list, merge_boundaries, merge_requests_);
+        mergeRequests(request_list, merge_boundaries, merge_requests_,
+                      hp_tcp_transport_config_.enabled
+                          ? hp_tcp_transport_config_.params.max_transfer_bytes
+                          : std::numeric_limits<uint64_t>::max());
 
     prepared.owners.reserve(merged.request_list.size());
     for (const auto& request : merged.request_list) {
