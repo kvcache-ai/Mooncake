@@ -129,6 +129,17 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
         if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
     }
     if (st.error_count >= error_threshold_) {
+        if (!st.paused()) {
+            // Log the pause transition once; the per-slice "Optimal device
+            // pair not available" message in workers.cpp would otherwise
+            // flood while the rail sits in cooldown. Recovery is logged
+            // symmetrically in available()/markRecovered().
+            LOG(INFO) << "Rail paused: local_nic=" << local_nic
+                      << " remote_nic=" << remote_nic
+                      << " (errors=" << st.error_count << " in "
+                      << error_window_.count() << "s, cooldown="
+                      << st.cooldown.count() << "s)";
+        }
         st.resume_time = now + st.cooldown;
         updateBestMapping();
     }

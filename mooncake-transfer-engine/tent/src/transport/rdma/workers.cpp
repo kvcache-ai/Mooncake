@@ -1272,7 +1272,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     if (gdr_excluded ||
         !rail.available(slice->source_dev_id, slice->target_dev_id)) {
-        LOG_EVERY_N(INFO, 100)
+        VLOG(1) << "Optimal device pair not available: source_dev_id "
+                << slice->source_dev_id << ", target_dev_id "
+                << slice->target_dev_id;
+        LOG_EVERY_N(WARNING, 10000)
             << "Optimal device pair not available: source_dev_id "
             << slice->source_dev_id << ", target_dev_id "
             << slice->target_dev_id;
@@ -1318,7 +1321,10 @@ bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
-    LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
+    // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
+    // fallback storm is visible without flooding; VLOG(1) for debugging.
+    VLOG(1) << "fallback device selection for slice " << slice;
+    LOG_EVERY_N(WARNING, 10000) << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 
