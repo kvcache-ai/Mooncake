@@ -351,6 +351,32 @@ func isSubsetOf(old *Payload, new *Payload) bool {
 	return true
 }
 
+// reconcilePayloadAfterTransfer decides whether a transfer must be retried
+// after its metadata snapshot changed. A retry is only needed when at least
+// one source used by the completed transfer disappeared.
+func reconcilePayloadAfterTransfer(payload *Payload, revision int64,
+	newPayload *Payload, newRevision int64) (*Payload, int64, bool, error) {
+	if newPayload == nil {
+		return nil, newRevision, false, ErrPayloadNotFound
+	}
+	if revision == newRevision {
+		return payload, revision, false, nil
+	}
+	// Carry the latest revision forward even when the completed transfer is
+	// still valid (for example, another replica was added). This avoids
+	// finalizing against a stale CAS revision and preserves concurrent updates.
+	return newPayload, newRevision, !isSubsetOf(payload, newPayload), nil
+}
+
+// releaseRetryRegistrations leaves the one registration round owned by the
+// catalog and releases the extra references acquired by transfer retries.
+func (store *P2PStore) releaseRetryRegistrations(bufferList []Buffer,
+	maxShardSize uint64, successfulRounds int) {
+	if successfulRounds > 1 {
+		store.unregisterBuffersTimes(bufferList, maxShardSize, successfulRounds-1)
+	}
+}
+
 func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
 	if len(addrList) != len(sizeList) || len(addrList) == 0 {
 		return ErrInvalidArgument
@@ -368,32 +394,38 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 		return ErrPayloadNotFound
 	}
 	replicaBuffers := buffersFromLists(addrList, sizeList)
+	registrationMaxShardSize := payload.MaxShardSize
 	successfulRounds := 0
 	for {
 		err = store.doGetReplica(ctx, payload, addrList, sizeList)
 		if err != nil {
 			// doGetReplica rolled back its own round; undo earlier rounds.
-			store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+			store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
 			return err
 		}
 		successfulRounds++
-		newPayload, recheckRevision, err := store.metadata.Get(ctx, name)
+		newPayload, newRevision, err := store.metadata.Get(ctx, name)
 		if err != nil {
-			store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+			store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
 			return err
 		}
-		if revision == recheckRevision {
-			break
+		var retry bool
+		payload, revision, retry, err = reconcilePayloadAfterTransfer(
+			payload, revision, newPayload, newRevision)
+		if err != nil {
+			store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
+			return err
 		}
-		if isSubsetOf(payload, newPayload) {
+		if !retry {
 			break
 		}
 	}
 	err = store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
 	if err != nil {
-		store.unregisterBuffersTimes(replicaBuffers, payload.MaxShardSize, successfulRounds)
+		store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
 		return err
 	}
+	store.releaseRetryRegistrations(replicaBuffers, registrationMaxShardSize, successfulRounds)
 	return nil
 }
 
