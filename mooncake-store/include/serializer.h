@@ -271,6 +271,14 @@ class SerializerReader {
         offset_ += data_size;
     }
 
+    void peek(void* data, const size_t data_size) const {
+        if (offset_ + data_size > size_) {
+            throw std::runtime_error("buffer_overflow");
+        }
+        std::memcpy(data, static_cast<const uint8_t*>(buffer_) + offset_,
+                    data_size);
+    }
+
     /**
      * @brief Checks if all data in the buffer has been read
      *
