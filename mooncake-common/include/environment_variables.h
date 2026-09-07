@@ -100,6 +100,10 @@ struct ReplicaSelectionEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
 };
 
+struct LocalFileSnapshotEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
+};
+
 struct TransferSubmitterEnvironmentVariables {
     // Keep the raw string to preserve the legacy token set, whitespace,
     // invalid-value fallback, and warning behavior.
