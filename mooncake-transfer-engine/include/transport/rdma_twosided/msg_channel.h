@@ -19,7 +19,6 @@
 
 #include <atomic>
 #include <cstdint>
-#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -28,6 +27,7 @@
 #include "transfer_metadata.h"
 #include "transport/rdma_twosided/bounce_pool.h"
 #include "transport/rdma_twosided/msg_header.h"
+#include "transport/rdma_twosided/pending_read_resp_queue.h"
 
 namespace mooncake {
 
@@ -98,8 +98,10 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
     // Send READ_RESP, or hold it for replay when the bounce pool is momentarily
     // full. Never drops the response: a dropped READ_RESP would strand the
     // requester, which waits for that exact slice forever. The payload is read
-    // from `addr` (a validated local managed buffer) at (re)send time. Returns
-    // 0 unless the channel is down.
+    // from `addr` (a validated local managed buffer) at (re)send time. Uses a
+    // single-drainer / recheck queue so a SEND completion between the failed
+    // post and enqueue cannot leave the response stranded. Returns 0 unless
+    // the channel is down.
     int sendOrQueueReadResp(uint64_t task_id, uint32_t slice_seq, uint64_t addr,
                             uint32_t length);
 
@@ -117,9 +119,8 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
     int postSend(const MsgHeader &hdr, const void *payload, uint32_t length);
     void dispatchRecv(size_t idx, size_t byte_len);
     void handleSendComplete(uint64_t wr_id);
-    // Replay READ_RESPs held back by a full bounce pool. Called whenever a send
-    // slot frees up (SEND completion) or the pool grows (expandPool).
-    void drainPendingReadResps();
+    // TrySend callback shared by enqueue and slot-free drains.
+    PendingReadRespQueue::TrySendFn pendingReadRespSender();
 
     RdmaTwoSidedTransport &transport_;
     RdmaContext &context_;
@@ -139,16 +140,10 @@ class MsgChannel : public std::enable_shared_from_this<MsgChannel> {
     std::mutex inflight_mutex_;
     std::vector<int> inflight_slots_;  // indexed by wr_id % capacity
 
-    // READ_RESP deferred because the bounce pool was full; replayed in order on
-    // the next slot recycle or pool expansion. Guarded by resp_mutex_.
-    struct PendingReadResp {
-        uint64_t task_id;
-        uint64_t addr;
-        uint32_t length;
-        uint32_t slice_seq;
-    };
-    std::mutex resp_mutex_;
-    std::deque<PendingReadResp> pending_resps_;
+    // READ_RESP deferred because the bounce pool was full. Single-drainer /
+    // recheck protocol closes the lost-wakeup window between a failed post and
+    // enqueue, and between a mid-drain slot free and exit.
+    PendingReadRespQueue pending_read_resps_;
 
     std::mutex resource_mutex_;
     std::atomic<bool> connected_{false};

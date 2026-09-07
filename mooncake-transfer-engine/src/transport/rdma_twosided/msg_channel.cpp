@@ -219,7 +219,7 @@ int MsgChannel::expandPool(size_t extra) {
                   << " max=" << pool_max_;
     }
     // New send slots are available now: replay any held-back READ_RESP.
-    drainPendingReadResps();
+    pending_read_resps_.onSlotFreed(pendingReadRespSender());
     return rc;
 }
 
@@ -492,47 +492,32 @@ int MsgChannel::sendReadResp(uint64_t task_id, uint32_t slice_seq,
     return postSend(hdr, src, length);
 }
 
+PendingReadRespQueue::TrySendFn MsgChannel::pendingReadRespSender() {
+    return [this](const PendingReadResp &item) {
+        int rc = sendReadResp(item.task_id, item.slice_seq, item.addr,
+                              reinterpret_cast<const void *>(item.addr),
+                              item.length);
+        if (rc != 0 && rc != ERR_TOO_MANY_REQUESTS) {
+            LOG(ERROR) << "MsgChannel: dropping queued READ_RESP after send "
+                          "error rc="
+                       << rc << " peer=" << peer_server_name_;
+        }
+        return rc;
+    };
+}
+
 int MsgChannel::sendOrQueueReadResp(uint64_t task_id, uint32_t slice_seq,
                                     uint64_t addr, uint32_t length) {
     int rc = sendReadResp(task_id, slice_seq, addr,
                           reinterpret_cast<const void *>(addr), length);
     if (rc != ERR_TOO_MANY_REQUESTS) return rc;
     // Bounce pool is momentarily full (postSend already requested an expand).
-    // Hold the response and replay it once a SEND completion or the expansion
-    // frees a slot; the requester waits for this exact slice, so dropping it
-    // would hang the transfer.
-    std::lock_guard<std::mutex> lock(resp_mutex_);
-    pending_resps_.push_back({task_id, addr, length, slice_seq});
+    // Enqueue then kick a serialized drain so a SEND completion that landed
+    // between the failed post and this enqueue cannot leave the response
+    // stranded (lost wakeup).
+    pending_read_resps_.enqueue({task_id, addr, length, slice_seq},
+                                pendingReadRespSender());
     return 0;
-}
-
-void MsgChannel::drainPendingReadResps() {
-    for (;;) {
-        PendingReadResp item;
-        {
-            std::lock_guard<std::mutex> lock(resp_mutex_);
-            if (pending_resps_.empty()) return;
-            item = pending_resps_.front();
-            pending_resps_.pop_front();
-        }
-        int rc = sendReadResp(item.task_id, item.slice_seq, item.addr,
-                              reinterpret_cast<const void *>(item.addr),
-                              item.length);
-        if (rc == ERR_TOO_MANY_REQUESTS) {
-            // Still full: put it back at the front (order is not required for
-            // correctness since the requester places by slice_seq, but keeping
-            // FIFO avoids starving the oldest response) and wait for the next
-            // recycle.
-            std::lock_guard<std::mutex> lock(resp_mutex_);
-            pending_resps_.push_front(item);
-            return;
-        }
-        if (rc != 0) {
-            LOG(ERROR) << "MsgChannel: dropping queued READ_RESP after send "
-                          "error rc="
-                       << rc << " peer=" << peer_server_name_;
-        }
-    }
 }
 
 void MsgChannel::handleSendComplete(uint64_t wr_id) {
@@ -551,7 +536,7 @@ void MsgChannel::handleSendComplete(uint64_t wr_id) {
         if (pending_sends_ > 0) pending_sends_--;
     }
     // A send slot just freed up: replay any READ_RESP held back by a full pool.
-    drainPendingReadResps();
+    pending_read_resps_.onSlotFreed(pendingReadRespSender());
 }
 
 void MsgChannel::dispatchRecv(size_t idx, size_t byte_len) {
