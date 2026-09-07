@@ -119,7 +119,6 @@ class WorkerPool {
     // Serialize breaker transitions with physical-event recovery so a late
     // completion cannot arm TTL recovery after a fatal event.
     void resetContextBreaker(bool context_active);
-    void clearContextBreaker();
 
    private:
     RdmaContext &context_;

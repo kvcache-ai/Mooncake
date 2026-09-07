@@ -26,12 +26,14 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 
 #include <glog/logging.h>
 
+#include "rdma_test_peers.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
@@ -57,6 +59,22 @@ __lsan_default_suppressions() {
 #endif
 
 using namespace mooncake;
+
+#ifdef __linux__
+namespace {
+std::function<GidRefreshResult()> gid_probe;
+}
+
+// Wrap the device probe, leaving the actual WorkerPool recovery path intact.
+extern "C" GidRefreshResult
+wrapRefreshCurrentGid(RdmaContext *, std::string *, std::string *) asm(
+    "__wrap__ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_"
+    "stringIcSt11char_traitsIcESaIcEEES7_");
+extern "C" GidRefreshResult wrapRefreshCurrentGid(RdmaContext *, std::string *,
+                                                  std::string *) {
+    return gid_probe ? gid_probe() : GidRefreshResult::FAILED;
+}
+#endif
 
 namespace mooncake {
 
@@ -131,8 +149,16 @@ class WorkerPoolTestPeer {
                                                std::memory_order_relaxed);
     }
 
-    static void resetContextBreaker(WorkerPool &pool, bool context_active) {
-        pool.resetContextBreaker(context_active);
+    static void contextEvent(WorkerPool &pool, ibv_event_type event) {
+        pool.processContextEventForTest(event);
+    }
+
+    static uint64_t recoveryActivateAfter(WorkerPool &pool) {
+        return pool.recovery_activate_after_ns_.load(std::memory_order_relaxed);
+    }
+
+    static void recoverContext(WorkerPool &pool) {
+        pool.maybeActivateRecoveredContext();
     }
 
     static int contextFailureThreshold() {
@@ -155,11 +181,10 @@ class WorkerPoolRailStateTest : public ::testing::Test {
         previous_min_log_level_ = FLAGS_minloglevel;
         FLAGS_minloglevel = google::GLOG_FATAL;
 
-        // Intentional leak: ~RdmaTransport dereferences metadata_, which is
-        // null until install(). We only need it as RdmaContext's owner, same
-        // as rdma_endpoint_state_test.
-        transport_ = new RdmaTransport();
-        MC_LSAN_IGNORE_OBJECT(transport_);
+        metadata_ = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+        transport_ = std::make_unique<RdmaTransport>();
+        RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,
+                                            "rail-state-test");
         context_ = std::make_unique<RdmaContext>(*transport_, "unused");
         // Always fails, on any host, because no device is named "unused". It
         // still creates the endpoint store, which the monitor tick can touch
@@ -170,8 +195,12 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     }
 
     void TearDown() override {
+#ifdef __linux__
+        gid_probe = {};
+#endif
         worker_pool_.reset();
         context_.reset();
+        transport_.reset();
         FLAGS_minloglevel = previous_min_log_level_;
     }
 
@@ -185,7 +214,8 @@ class WorkerPoolRailStateTest : public ::testing::Test {
     }
 
     int previous_min_log_level_ = 0;
-    RdmaTransport *transport_ = nullptr;
+    std::shared_ptr<TransferMetadata> metadata_;
+    std::unique_ptr<RdmaTransport> transport_;
     std::unique_ptr<RdmaContext> context_;
     std::unique_ptr<WorkerPool> worker_pool_;
 };
@@ -246,13 +276,48 @@ TEST_F(WorkerPoolRailStateTest, RailsArePausedIndependently) {
     EXPECT_TRUE(railAvailable(kPeerB));
 }
 
-// Peer/rail failures stay scoped to that path and never charge the local
-// context breaker. This is the incident shape: one restarting peer must not
-// remove a healthy local RNIC from service.
-TEST_F(WorkerPoolRailStateTest, PeerRailFailuresDoNotDeactivateContext) {
+// Exercise the submit path that used to mistake one peer's unavailable rails
+// for a local RNIC failure, not just the rail-pausing helper.
+TEST_F(WorkerPoolRailStateTest,
+       AllRailsUnavailableSubmitsDoNotDeactivateContext) {
+    constexpr SegmentID target_id = 3559;
+    constexpr uint64_t buffer_addr = 0x10000;
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "10.0.0.1";
+    desc->protocol = "rdma";
+    desc->devices.push_back({"mlx5_bond_0", 1, "", ""});
+    desc->devices.push_back({"mlx5_bond_1", 1, "", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = buffer_addr;
+    buffer.length = 4096;
+    buffer.rkey = {11, 22};
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(desc->topology.parse(
+                  R"({"cpu:0": [["mlx5_bond_0", "mlx5_bond_1"], []]})"),
+              0);
+    metadata_->addLocalSegment(target_id, "10.0.0.1", std::move(desc));
     WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
-    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+    Transport::TransferTask task;
+    task.batch_id = transport_->allocateBatchID(1);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i) {
         failRail(kPeerA, /*immediate_pause=*/true);
+        failRail(kPeerB, /*immediate_pause=*/true);
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.target_id = target_id;
+        slice.rdma.dest_addr = buffer_addr;
+        slice.length = 64;
+        ASSERT_EQ(worker_pool_->submitPostSend({&slice}), 0);
+        EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+        // Device selection succeeded, so the failure was unavailable rails.
+        EXPECT_TRUE(slice.rdma.dest_rkey == 11 || slice.rdma.dest_rkey == 22);
+        EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+        EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    }
+    EXPECT_EQ(task.failed_slice_count,
+              WorkerPoolTestPeer::contextFailureThreshold());
+    EXPECT_TRUE(transport_->freeBatchID(task.batch_id).ok());
 
     EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
@@ -330,7 +395,7 @@ TEST_F(WorkerPoolRailStateTest, FatalEventOwnershipCancelsBreakerDeadline) {
         WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
     ASSERT_NE(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
 
-    WorkerPoolTestPeer::resetContextBreaker(*worker_pool_, false);
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_DEVICE_FATAL);
     EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
     EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
     EXPECT_FALSE(WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
@@ -339,5 +404,79 @@ TEST_F(WorkerPoolRailStateTest, FatalEventOwnershipCancelsBreakerDeadline) {
         WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, UINT64_MAX));
     EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
 }
+
+TEST_F(WorkerPoolRailStateTest,
+       RedundantPortActivePreservesLocalFailureStreak) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold() - 1; ++i)
+        WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
+
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ACTIVE);
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 31);
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    EXPECT_TRUE(WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_NE(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+}
+
+#ifdef __linux__
+TEST_F(WorkerPoolRailStateTest, GidProbeOwnsRecoveryThroughoutIoAndRetry) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+        WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_);
+
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ACTIVE);
+    EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 32);
+    EXPECT_NE(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    int probe_count = 0;
+    gid_probe = [&] {
+        ++probe_count;
+        EXPECT_NE(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+        EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+        // A poller can still deliver late CQEs while the monitor probes.
+        for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i)
+            EXPECT_FALSE(
+                WorkerPoolTestPeer::markLocalContextFailure(*worker_pool_));
+        EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_),
+                  0u);
+        EXPECT_FALSE(WorkerPoolTestPeer::tryReactivateContext(*worker_pool_,
+                                                              UINT64_MAX));
+        return probe_count == 1 ? GidRefreshResult::FAILED
+                                : GidRefreshResult::UNCHANGED;
+    };
+
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_EQ(probe_count, 1);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_NE(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    EXPECT_EQ(WorkerPoolTestPeer::breakerReactivateAfter(*worker_pool_), 0u);
+
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_EQ(probe_count, 2);
+    EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest, FatalEventCancelsPendingGidProbe) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, false);
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ACTIVE);
+    WorkerPoolTestPeer::setRecoveryActivateAfter(*worker_pool_, 1);
+    WorkerPoolTestPeer::contextEvent(*worker_pool_, IBV_EVENT_PORT_ERR);
+    gid_probe = [] {
+        ADD_FAILURE() << "Fatal event must cancel the pending probe";
+        return GidRefreshResult::UNCHANGED;
+    };
+    WorkerPoolTestPeer::recoverContext(*worker_pool_);
+    EXPECT_FALSE(WorkerPoolTestPeer::contextActive(*worker_pool_));
+    EXPECT_EQ(WorkerPoolTestPeer::recoveryActivateAfter(*worker_pool_), 0u);
+    EXPECT_FALSE(
+        WorkerPoolTestPeer::tryReactivateContext(*worker_pool_, UINT64_MAX));
+}
+#endif
 
 }  // namespace

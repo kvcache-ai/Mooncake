@@ -55,6 +55,14 @@ add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Control GID I/O to exercise recovery while completion failures arrive.
+  target_link_options(
+    worker_pool_rail_state_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+  )
+endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips

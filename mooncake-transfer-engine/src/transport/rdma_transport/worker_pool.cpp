@@ -504,12 +504,6 @@ void WorkerPool::resetContextBreaker(bool context_active) {
     context_.set_active(context_active);
 }
 
-void WorkerPool::clearContextBreaker() {
-    std::lock_guard<std::mutex> lock(context_state_lock_);
-    breaker_reactivate_after_ns_ = 0;
-    context_failure_count_.store(0, std::memory_order_relaxed);
-}
-
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
@@ -1302,10 +1296,7 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
     } else if (event_type == IBV_EVENT_PORT_ACTIVE) {
         // PORT_ACTIVE only means the link started coming back. Real mlx5/RoCE
         // data path can still reject RTR for a while after link-up, so delay
-        // publishing this local RNIC back to metadata. Clear any local-WC
-        // breaker deadline so its shorter TTL cannot bypass this recovery
-        // delay; successful recovery below performs the active transition.
-        clearContextBreaker();
+        // publishing an inactive local RNIC back to metadata.
         scheduleContextRecovery();
         if (event != nullptr) ibv_ack_async_event(event);
     } else {
@@ -1316,6 +1307,15 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
 }
 
 void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    // A redundant PORT_ACTIVE on an in-service context is not recovery
+    // evidence: preserve its local-WC streak and do not arm a probe that
+    // could later override a new local-WC trip.
+    if (context_.active()) return;
+
+    // Event recovery owns this inactive period. Cancel only the breaker
+    // deadline; a successful GID probe below resets the failure count.
+    breaker_reactivate_after_ns_ = 0;
     uint64_t activate_after = getCurrentTimeInNano() + delay_ns;
     recovery_activate_after_ns_.store(activate_after,
                                       std::memory_order_relaxed);
@@ -1331,15 +1331,12 @@ void WorkerPool::maybeActivateRecoveredContext() {
         static_cast<uint64_t>(getCurrentTimeInNano()) < activate_after)
         return;
 
-    uint64_t expected = activate_after;
-    if (!recovery_activate_after_ns_.compare_exchange_strong(
-            expected, 0, std::memory_order_relaxed)) {
-        return;
-    }
-
+    // Recovery probes and async events run on the same monitor thread.
+    // Keep the deadline armed throughout GID I/O: event recovery still owns
+    // the inactive context, and late CQEs must not arm breaker recovery.
     auto gid_refresh_result = refreshPublishedLocalGid();
     if (gid_refresh_result == GidRefreshResult::FAILED) {
-        context_.set_active(false);
+        resetContextBreaker(false);
         refreshPublishedLocalTopology();
         scheduleContextRecovery();
         LOG(WARNING) << "Worker: Context " << context_.deviceName()
@@ -1355,6 +1352,7 @@ void WorkerPool::maybeActivateRecoveredContext() {
     }
 
     resetContextBreaker(true);
+    recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
     refreshPublishedLocalTopology();
     LOG(INFO) << "Worker: Context " << context_.deviceName()
               << " is now active after recovery delay";
@@ -1446,6 +1444,8 @@ void WorkerPool::monitorWorker() {
         const uint64_t current_ts =
             static_cast<uint64_t>(getCurrentTimeInNano());
         maybeActivateRecoveredContext();
+        // Check short breaker TTLs on every loop, like GID recovery.
+        maybeReactivateContext();
         if (current_ts - last_reset_ts > 1000000000ll) {
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
@@ -1455,9 +1455,6 @@ void WorkerPool::monitorWorker() {
             // Drop expired active-connect pause entries so the map doesn't grow
             // for peers that are never re-attempted after their pause lapses.
             context_.pruneConnectPause();
-            // Half-open recovery for the context breaker: reactivate the
-            // context once its pause TTL has elapsed.
-            maybeReactivateContext();
             last_reset_ts = current_ts;
         }
 
