@@ -1,6 +1,7 @@
 #include "p2p/client/v2/transfer_coordinator.h"
 
 #include <algorithm>
+#include <csignal>
 #include <thread>
 #include <unordered_map>
 #include <utility>
