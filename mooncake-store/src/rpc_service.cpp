@@ -93,6 +93,11 @@ WrappedMasterService::WrappedMasterService(
 
 WrappedMasterService::~WrappedMasterService() = default;
 
+void WrappedMasterService::SetBatchOpLogTerminalCallback(
+    OrderedOpLogWriter::TerminalCallback callback) {
+    master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();

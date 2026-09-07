@@ -725,6 +725,13 @@ void MasterService::SetBatchOpLogWriterFactoryForTesting(
     batch_oplog_writer_factory_ = std::move(factory);
 }
 
+void MasterService::SetBatchOpLogTerminalCallback(
+    OrderedOpLogWriter::TerminalCallback callback) {
+    if (ordered_oplog_writer_) {
+        ordered_oplog_writer_->SetTerminalCallback(std::move(callback));
+    }
+}
+
 void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
                                             double evict_ratio_lowerbound) {
     BatchEvict(evict_ratio_target, evict_ratio_lowerbound);

@@ -424,6 +424,18 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
+        std::atomic<bool> writer_terminal{false};
+        wrapped_master_service->SetBatchOpLogTerminalCallback(
+            [&](const OrderedOpLogWriterTerminalState& state) {
+                if (writer_terminal.exchange(true)) return;
+                LOG(ERROR) << "Batch OpLog writer terminal: "
+                           << toString(state.error);
+                admin_server.SetServiceAvailable(false);
+                admin_server.SetServiceDelegate(nullptr);
+                label_reconciler.SetLeader(false);
+                SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
+                server.stop();
+            });
 
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.

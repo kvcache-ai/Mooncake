@@ -21,6 +21,8 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).

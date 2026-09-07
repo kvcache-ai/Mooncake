@@ -204,6 +204,8 @@ class MasterService {
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
     void SetBatchOpLogWriterFactoryForTesting(BatchOpLogWriterFactory factory);
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
