@@ -1,6 +1,5 @@
 """Framework-neutral KV-cache reshard contracts and planning API."""
 
-from .lowering import KVCacheTransferBatch, lower_kv_cache_transfer
 from .manifest import (
     KVCacheBufferBinding,
     KVCacheComponent,
@@ -63,7 +62,6 @@ __all__ = [
     "KVCacheSnapshotDescriptor",
     "KVCacheTopology",
     "KVCacheTopologyParticipant",
-    "KVCacheTransferBatch",
     "KVCacheTransferEdge",
     "SnapshotId",
     "assemble_kv_cache_placement",
@@ -77,7 +75,6 @@ __all__ = [
     "kv_cache_runtime_binding_to_json",
     "kv_cache_snapshot_from_json",
     "kv_cache_snapshot_to_json",
-    "lower_kv_cache_transfer",
     "placement_fragment_id",
     "plan_kv_cache_transfer_to_local_target",
     "prepare_kv_cache_transfer",
