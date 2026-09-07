@@ -505,6 +505,9 @@ void HighPerformanceTcpServer::installAcceptedSocket(
     }
     std::shared_ptr<Session> session;
     try {
+        // READ response headers and payloads are separate writes. Do not wait
+        // for a delayed ACK before sending a short payload on a reused socket.
+        socket->set_option(asio::ip::tcp::no_delay(true));
         session = std::make_shared<Session>(this, worker_id, socket, config_,
                                             registry_);
         sessions_[worker_id].insert(session);

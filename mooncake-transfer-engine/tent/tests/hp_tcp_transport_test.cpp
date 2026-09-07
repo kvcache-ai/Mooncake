@@ -14,12 +14,15 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/platform.h"
+#include "tent/transfer_engine.h"
 #include "tent/transport/hp_tcp/hp_tcp_protocol.h"
 #include "tent/transport/hp_tcp/hp_tcp_transport.h"
 
@@ -36,11 +39,6 @@ class HighPerformanceTcpTransportTestPeer {
     static bool hasFailedWorker(const HighPerformanceTcpTransport& transport) {
         return transport.workers_->hasFailedWorker();
     }
-
-    static uint64_t connectionsCreated(
-        const HighPerformanceTcpTransport& transport) {
-        return transport.client_->connectionsCreatedForTest();
-    }
 };
 
 namespace {
@@ -56,6 +54,9 @@ bool WaitUntil(Predicate predicate) {
 }
 
 std::shared_ptr<ControlService> MakeLocalMetadata() {
+    // Standalone transports also use the process-wide platform loader.
+    // Initialize it with a config before the full-engine cases probe topology.
+    (void)Platform::getLoader(std::make_shared<Config>());
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
     EXPECT_TRUE(metadata->segmentManager()
                     .updateLocal([](SegmentDesc& segment) -> Status {
@@ -241,11 +242,105 @@ Status WaitForTransportResult(HighPerformanceTcpTransport& transport,
     return Status::InternalError("HP TCP test transfer did not finish");
 }
 
-TEST(HighPerformanceTcpTransportTest, SlicesSingleLargeReadAcrossTwoRails) {
-    constexpr size_t kLength = 4ULL << 20;
+// Test-only relay: observe the wire request and forward it to the real server.
+// Pumped by the test thread; no transport worker waits for another callback.
+class RailRelay {
+   public:
+    struct Observation {
+        std::string source;
+        std::string destination;
+        HighPerformanceTcpRequestFrame request;
+    };
+
+    RailRelay(const std::string& address, uint16_t server_port)
+        : acceptor_(io_, {asio::ip::make_address(address), 0}),
+          backend_(asio::ip::make_address(address), server_port) {
+        asio::co_spawn(io_, accept(), [this](std::exception_ptr error) {
+            if (error) error_ = error;
+        });
+    }
+
+    uint16_t port() const { return acceptor_.local_endpoint().port(); }
+    void poll() {
+        io_.poll();
+        if (error_) std::rethrow_exception(error_);
+    }
+    size_t connections = 0;
+    std::vector<Observation> observations;
+
+   private:
+    asio::awaitable<void> accept() {
+        for (;;) {
+            auto socket = co_await acceptor_.async_accept(asio::use_awaitable);
+            ++connections;
+            asio::co_spawn(io_, forward(std::move(socket)),
+                           [this](std::exception_ptr error) {
+                               if (error) error_ = error;
+                           });
+        }
+    }
+
+    asio::awaitable<void> forward(asio::ip::tcp::socket socket) {
+        asio::ip::tcp::socket server(io_);
+        co_await server.async_connect(backend_, asio::use_awaitable);
+        for (;;) {
+            std::array<uint8_t, kHighPerformanceTcpRequestSize> header{};
+            co_await asio::async_read(socket, asio::buffer(header),
+                                      asio::use_awaitable);
+            HighPerformanceTcpRequestFrame request;
+            if (!DecodeHighPerformanceTcpRequest(header.data(), header.size(),
+                                                 &request)
+                     .ok()) {
+                throw std::runtime_error("invalid relayed HP TCP request");
+            }
+            co_await asio::async_write(server, asio::buffer(header),
+                                       asio::use_awaitable);
+            std::vector<uint8_t> payload(request.length);
+            if (request.opcode == HighPerformanceTcpOpcode::kWrite) {
+                co_await asio::async_read(socket, asio::buffer(payload),
+                                          asio::use_awaitable);
+                co_await asio::async_write(server, asio::buffer(payload),
+                                           asio::use_awaitable);
+            }
+            std::array<uint8_t, kHighPerformanceTcpResponseSize> response{};
+            co_await asio::async_read(server, asio::buffer(response),
+                                      asio::use_awaitable);
+            co_await asio::async_write(socket, asio::buffer(response),
+                                       asio::use_awaitable);
+            if (request.opcode == HighPerformanceTcpOpcode::kRead) {
+                co_await asio::async_read(server, asio::buffer(payload),
+                                          asio::use_awaitable);
+                co_await asio::async_write(socket, asio::buffer(payload),
+                                           asio::use_awaitable);
+            }
+            observations.push_back(
+                {socket.remote_endpoint().address().to_string(),
+                 socket.local_endpoint().address().to_string(), request});
+        }
+    }
+
+    asio::io_context io_;
+    asio::ip::tcp::acceptor acceptor_;
+    asio::ip::tcp::endpoint backend_;
+    std::exception_ptr error_;
+};
+
+// As in the socket tests, the kernel orders the remote WRITE before its ACK,
+// but that ordering is not a C++ happens-before edge visible to TSan.
+__attribute__((no_sanitize("thread"))) bool SocketOrderedEqual(
+    const std::vector<uint8_t>& actual, const std::vector<uint8_t>& expected) {
+    return actual == expected;
+}
+
+void CheckRailPayloads(bool multi_rail) {
+    constexpr size_t kLength = (4ULL << 20) + 97;
+    constexpr size_t kOffset = 37;
+    std::vector<uint8_t> remote(kLength);
     auto params = MakeParams();
     params.bind_address.clear();
-    params.rail_addresses = {"127.0.0.1", "127.0.0.2"};
+    params.rail_addresses =
+        multi_rail ? std::vector<std::string>{"127.0.0.1", "127.0.0.2"}
+                   : std::vector<std::string>{"127.0.0.1"};
     params.max_outstanding_bytes = 8ULL << 20;
     params.max_transfer_bytes = 8ULL << 20;
 
@@ -266,10 +361,11 @@ TEST(HighPerformanceTcpTransportTest, SlicesSingleLargeReadAcrossTwoRails) {
     ASSERT_TRUE(
         server.install(installed_server_name, server_metadata, nullptr, nullptr)
             .ok());
-    std::vector<uint8_t> remote(kLength);
+    std::mt19937 data(3689);
     for (size_t i = 0; i < remote.size(); ++i) {
-        remote[i] = static_cast<uint8_t>((i * 17) & 0xff);
+        remote[i] = static_cast<uint8_t>(data());
     }
+    auto expected = remote;
     BufferDesc remote_desc;
     remote_desc.addr = reinterpret_cast<uint64_t>(remote.data());
     remote_desc.length = remote.size();
@@ -280,53 +376,220 @@ TEST(HighPerformanceTcpTransportTest, SlicesSingleLargeReadAcrossTwoRails) {
     ASSERT_TRUE(server.addMemoryBuffer(remote_desc, remote_options).ok());
     ASSERT_TRUE(PublishBuffers(server_metadata, {remote_desc}).ok());
 
-    auto client_metadata = MakeLocalMetadata();
-    HighPerformanceTcpTransport client(params);
-    std::string client_name = "hp_transport_client";
-    ASSERT_TRUE(
-        client.install(client_name, client_metadata, nullptr, nullptr).ok());
-    SegmentID target = 0;
-    ASSERT_TRUE(
-        client_metadata->segmentManager().openRemote(target, server_name).ok());
+    HighPerformanceTcpEndpointAttr endpoint;
+    ASSERT_TRUE(DecodeHighPerformanceTcpEndpointAttr(
+                    server_metadata->segmentManager()
+                        .getLocal()
+                        ->getMemory()
+                        .transport_attrs.at(static_cast<int>(HP_TCP)),
+                    &endpoint)
+                    .ok());
+    std::vector<std::unique_ptr<RailRelay>> relays;
+    for (auto& rail : endpoint.endpoints) {
+        relays.push_back(std::make_unique<RailRelay>(rail.host, rail.port));
+        rail.port = relays.back()->port();
+    }
+    ASSERT_TRUE(server_metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) {
+                        return EncodeHighPerformanceTcpEndpointAttr(
+                            endpoint,
+                            &std::get<MemorySegmentDesc>(segment.detail)
+                                 .transport_attrs[static_cast<int>(HP_TCP)]);
+                    })
+                    .ok());
 
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("transports/tcp/enable", false);
+    config->set("transports/rdma/enable", false);
+    config->set("transports/shm/enable", false);
+    config->set("transports/hp_tcp/enable", true);
+    config->set("transports/hp_tcp/bind_address", "");
+    config->set("transports/hp_tcp/rail_addresses", params.rail_addresses);
+    config->set("transports/hp_tcp/connections_per_peer", 2);
+    config->set("transports/hp_tcp/progress_timeout_ms", 1000);
     std::vector<uint8_t> local(kLength, 0);
-    BufferDesc local_desc;
-    local_desc.addr = reinterpret_cast<uint64_t>(local.data());
-    local_desc.length = local.size();
-    local_desc.location = "cpu:0";
-    MemoryOptions local_options;
-    local_options.type = HP_TCP;
-    local_options.perm = kLocalReadWrite;
-    ASSERT_TRUE(client.addMemoryBuffer(local_desc, local_options).ok());
+    std::vector<uint8_t> stalled_buffer(kLength);
+    TransferEngine client(config);
+    ASSERT_TRUE(client.available());
+    SegmentID target = 0;
+    ASSERT_TRUE(client.openSegment(target, server_name).ok());
 
-    Transport::SubBatchRef batch = nullptr;
-    ASSERT_TRUE(client.allocateSubBatch(batch, 1).ok());
-    Request request{};
-    request.opcode = Request::READ;
-    request.source = local.data();
-    request.target_id = target;
-    request.target_offset = remote_desc.addr;
-    request.length = remote_desc.length;
-    request.transport_hint = HP_TCP;
-    ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
-
-    TransferStatus transfer_status;
-    const Status result =
-        WaitForTransportResult(client, batch, transfer_status);
-    EXPECT_TRUE(result.ok()) << result.ToString();
-    EXPECT_EQ(transfer_status.s, COMPLETED);
-    EXPECT_EQ(transfer_status.transferred_bytes, kLength);
-    EXPECT_EQ(std::memcmp(local.data(), remote.data(), kLength), 0);
-    EXPECT_EQ(HighPerformanceTcpTransportTestPeer::connectionsCreated(client),
-              2);
-
-    ASSERT_TRUE(client.freeSubBatch(batch).ok());
-    ASSERT_TRUE(client.removeMemoryBuffer(local_desc).ok());
+    ASSERT_TRUE(client.registerLocalMemory(local.data(), local.size()).ok());
+    // Repeat on the same pool to exercise both fresh and reused connections.
+    for (int round = 0; round < 2; ++round) {
+        for (auto opcode : {Request::READ, Request::WRITE}) {
+            for (size_t length : std::array<size_t, 4>{
+                     4096, (2ULL << 20) - 1, 2ULL << 20, (4ULL << 20) + 3}) {
+                SCOPED_TRACE(::testing::Message()
+                             << multi_rail << ":" << round << ":" << opcode
+                             << ":" << length);
+                std::fill(local.begin(), local.end(), 0xa5);
+                if (opcode == Request::WRITE) {
+                    for (size_t i = kOffset; i < kOffset + length; ++i)
+                        expected[i] ^= 0xff;
+                    std::copy_n(expected.data() + kOffset, length,
+                                local.data() + kOffset);
+                }
+                for (auto& relay : relays) relay->observations.clear();
+                Request request{};
+                request.opcode = opcode;
+                request.source = local.data() + kOffset;
+                request.target_id = target;
+                request.target_offset = remote_desc.addr + kOffset;
+                request.length = length;
+                request.transport_hint = HP_TCP;
+                const auto batch = client.allocateBatch(1);
+                ASSERT_TRUE(client.submitTransfer(batch, {request}).ok());
+                TransferStatus status{PENDING, 0};
+                ASSERT_TRUE(WaitUntil([&] {
+                    for (auto& relay : relays) relay->poll();
+                    EXPECT_TRUE(client.getTransferStatus(batch, status).ok());
+                    return status.s != PENDING;
+                }));
+                ASSERT_EQ(status.s, COMPLETED);
+                EXPECT_EQ(status.transferred_bytes, length);
+                const size_t count = multi_rail && opcode == Request::READ &&
+                                             length >= (2ULL << 20)
+                                         ? 2
+                                         : 1;
+                ASSERT_TRUE(WaitUntil([&] {
+                    size_t observed = 0;
+                    for (auto& relay : relays) {
+                        relay->poll();
+                        observed += relay->observations.size();
+                    }
+                    return observed == count;
+                }));
+                uint64_t cursor = request.target_offset;
+                for (size_t rail = 0; rail < relays.size(); ++rail) {
+                    if (count == 2)
+                        ASSERT_EQ(relays[rail]->observations.size(), 1U);
+                    for (const auto& seen : relays[rail]->observations) {
+                        EXPECT_EQ(seen.source, params.rail_addresses[rail]);
+                        EXPECT_EQ(seen.destination,
+                                  params.rail_addresses[rail]);
+                        EXPECT_EQ(seen.request.opcode,
+                                  opcode == Request::READ
+                                      ? HighPerformanceTcpOpcode::kRead
+                                      : HighPerformanceTcpOpcode::kWrite);
+                        EXPECT_EQ(seen.request.remote_addr, cursor);
+                        EXPECT_EQ(
+                            seen.request.length,
+                            length / count + (rail < length % count ? 1 : 0));
+                        cursor += seen.request.length;
+                    }
+                }
+                EXPECT_EQ(cursor, request.target_offset + length);
+                EXPECT_EQ(std::memcmp(local.data() + kOffset,
+                                      expected.data() + kOffset, length),
+                          0);
+                if (opcode == Request::WRITE)
+                    EXPECT_TRUE(SocketOrderedEqual(remote, expected));
+                EXPECT_TRUE(std::all_of(local.begin(), local.begin() + kOffset,
+                                        [](uint8_t b) { return b == 0xa5; }));
+                EXPECT_TRUE(std::all_of(local.begin() + kOffset + length,
+                                        local.end(),
+                                        [](uint8_t b) { return b == 0xa5; }));
+                ASSERT_TRUE(client.freeBatch(batch).ok());
+            }
+        }
+        size_t connections = 0;
+        for (auto& relay : relays) connections += relay->connections;
+        EXPECT_EQ(connections, 2U);
+    }
+    if (multi_rail) {
+        // A second peer sends one payload byte per slice, then stalls. The
+        // original peer must still complete in this same engine and worker
+        // pool.
+        asio::io_context io;
+        asio::ip::tcp::acceptor stalled(io, {asio::ip::tcp::v4(), 0});
+        stalled.non_blocking(true);
+        auto stalled_metadata = MakeLocalMetadata();
+        uint16_t stalled_rpc_port = 0;
+        ASSERT_TRUE(stalled_metadata->start(stalled_rpc_port).ok());
+        const auto stalled_name =
+            "127.0.0.1:" + std::to_string(stalled_rpc_port);
+        auto stalled_endpoint = endpoint;
+        for (auto& rail : stalled_endpoint.endpoints)
+            rail.port = stalled.local_endpoint().port();
+        ASSERT_TRUE(
+            stalled_metadata->segmentManager()
+                .updateLocal([&](SegmentDesc& segment) {
+                    segment = *server_metadata->segmentManager().getLocal();
+                    segment.name = segment.rpc_server_addr = stalled_name;
+                    return EncodeHighPerformanceTcpEndpointAttr(
+                        stalled_endpoint,
+                        &std::get<MemorySegmentDesc>(segment.detail)
+                             .transport_attrs[static_cast<int>(HP_TCP)]);
+                })
+                .ok());
+        SegmentID stalled_target;
+        ASSERT_TRUE(client.openSegment(stalled_target, stalled_name).ok());
+        ASSERT_TRUE(
+            client.registerLocalMemory(stalled_buffer.data(), kLength).ok());
+        Request request{Request::READ, stalled_buffer.data(), stalled_target,
+                        remote_desc.addr, (4ULL << 20) + 3};
+        request.transport_hint = HP_TCP;
+        auto slow = client.allocateBatch(1);
+        ASSERT_TRUE(client.submitTransfer(slow, {request}).ok());
+        std::array<asio::ip::tcp::socket, 2> sockets{asio::ip::tcp::socket(io),
+                                                     asio::ip::tcp::socket(io)};
+        for (auto& socket : sockets) {
+            ASSERT_TRUE(WaitUntil([&] {
+                std::error_code error;
+                if (!socket.is_open()) stalled.accept(socket, error);
+                return socket.is_open();
+            }));
+            std::array<uint8_t, kHighPerformanceTcpRequestSize> header{};
+            asio::read(socket, asio::buffer(header));
+            HighPerformanceTcpRequestFrame frame;
+            ASSERT_TRUE(DecodeHighPerformanceTcpRequest(header.data(),
+                                                        header.size(), &frame)
+                            .ok());
+            const auto response = EncodeHighPerformanceTcpResponse(
+                {HighPerformanceTcpStatus::kOk, frame.request_id,
+                 frame.length});
+            asio::write(socket, asio::buffer(response));
+            asio::write(socket, asio::buffer(remote.data(), 1));
+        }
+        request.source = local.data();
+        request.target_id = target;
+        request.length = 4096;
+        auto healthy = client.allocateBatch(1);
+        ASSERT_TRUE(client.submitTransfer(healthy, {request}).ok());
+        TransferStatus status{PENDING, 0};
+        ASSERT_TRUE(WaitUntil([&] {
+            for (auto& relay : relays) relay->poll();
+            EXPECT_TRUE(client.getTransferStatus(healthy, status).ok());
+            return status.s != PENDING;
+        }));
+        EXPECT_EQ(status.s, COMPLETED);
+        EXPECT_EQ(std::memcmp(local.data(), expected.data(), 4096), 0);
+        ASSERT_TRUE(client.freeBatch(healthy).ok());
+        ASSERT_TRUE(client.getTransferStatus(slow, status).ok());
+        EXPECT_EQ(status.s, PENDING);
+        ASSERT_TRUE(WaitUntil([&] {
+            EXPECT_TRUE(client.getTransferStatus(slow, status).ok());
+            return status.s != PENDING;
+        }));
+        EXPECT_EQ(status.s, TIMEOUT);
+        ASSERT_TRUE(client.freeBatch(slow).ok());
+        ASSERT_TRUE(
+            client.unregisterLocalMemory(stalled_buffer.data(), kLength).ok());
+    }
+    ASSERT_TRUE(client.unregisterLocalMemory(local.data(), local.size()).ok());
     ASSERT_TRUE(server.removeMemoryBuffer(remote_desc).ok());
-    ASSERT_TRUE(client.quiesce().ok());
     ASSERT_TRUE(server.quiesce().ok());
-    ASSERT_TRUE(client.uninstall().ok());
     ASSERT_TRUE(server.uninstall().ok());
+}
+
+TEST(HighPerformanceTcpTransportTest, RailPayloadsAndConnectionReuse) {
+    CheckRailPayloads(true);
+}
+
+TEST(HighPerformanceTcpTransportTest, SingleRailPayloadsAndConnectionReuse) {
+    CheckRailPayloads(false);
 }
 
 TEST(HighPerformanceTcpTransportTest,

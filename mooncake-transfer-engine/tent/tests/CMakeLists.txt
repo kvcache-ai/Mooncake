@@ -234,11 +234,14 @@ target_link_libraries(tent_hp_tcp_e2e_test PRIVATE gtest gtest_main
                                                    tent_link_group)
 target_include_directories(tent_hp_tcp_e2e_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(
-  NAME tent_hp_tcp_e2e_test_concurrency_16
-  COMMAND tent_hp_tcp_e2e_test
-          --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency16)
-set_tests_properties(tent_hp_tcp_e2e_test_concurrency_16 PROPERTIES TIMEOUT 120)
+# Each fork-based case starts before earlier cases can create runtime threads.
+foreach(case WriteThenReadConcurrency16 WriteThenReadAcrossTwoRails
+             UnevenSlicedReadAcrossProcesses)
+  add_test(NAME tent_hp_tcp_e2e_${case}
+           COMMAND tent_hp_tcp_e2e_test
+                   --gtest_filter=HighPerformanceTcpE2eTest.${case})
+  set_tests_properties(tent_hp_tcp_e2e_${case} PROPERTIES TIMEOUT 120)
+endforeach()
 
 add_executable(tent_tcp_datapath_roundtrip_test tcp_datapath_roundtrip_test.cpp)
 target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
@@ -615,10 +618,9 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
-add_executable(tent_local_memory_lifecycle_test
-               local_memory_lifecycle_test.cpp)
-target_link_libraries(tent_local_memory_lifecycle_test
-                      PRIVATE gtest gtest_main tent_link_group)
+add_executable(tent_local_memory_lifecycle_test local_memory_lifecycle_test.cpp)
+target_link_libraries(tent_local_memory_lifecycle_test PRIVATE gtest gtest_main
+                                                               tent_link_group)
 if(TARGET asio_shared)
   target_link_libraries(tent_local_memory_lifecycle_test PRIVATE asio_shared)
 endif()
