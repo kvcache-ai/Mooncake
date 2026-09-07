@@ -8,7 +8,6 @@
 #include <transport/device/device_transport.h>
 
 #include "gpu_runtime.h"
-#include "pg_utils.h"
 
 namespace mooncake {
 namespace {
@@ -173,7 +172,7 @@ std::optional<RouteEndpoint> RdmaRoute::localEndpoint() {
     return RouteEndpoint{
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
-        .metadata = pgSerialize(RdmaEndpointMetadata{
+        .metadata = encodeEndpointMetadata(RdmaEndpointMetadata{
             .is_roce = static_cast<uint32_t>(state_->transport->isRoce()),
             .qps_per_rank = state_->qps_per_rank,
             .remote_key = static_cast<uint32_t>(metadata.rkey),
@@ -209,7 +208,7 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
         PG_TRY(auto endpoint, findEndpoint(endpoints[rank]));
         if (!endpoint) continue;
         PG_TRY(auto candidate,
-               pgDeserialize<RdmaEndpointMetadata>(endpoint->metadata));
+               decodeEndpointMetadata<RdmaEndpointMetadata>(*endpoint));
         const bool compatible =
             candidate.is_roce == state_->transport->isRoce() &&
             (candidate.is_roce ||
