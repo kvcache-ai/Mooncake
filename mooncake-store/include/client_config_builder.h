@@ -412,7 +412,7 @@ class ClientConfigBuilder {
         // The implementation selector lives in the same JSON document as
         // `tiers`, so a deployment switches versions by editing one file and
         // no client wiring changes. Unknown/absent -> keep the v1 default;
-        // CreateDataManager rejects an unparseable value loudly.
+        // CreateDataManager rejects an unparsable value loudly.
         if (tiered_config.isMember("data_manager_version") &&
             tiered_config["data_manager_version"].isString()) {
             config.data_manager_version =

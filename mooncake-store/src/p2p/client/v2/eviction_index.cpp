@@ -435,9 +435,9 @@ class OrderedEvictionIndex final : public EvictionIndex {
     /**
      * @brief Count a rejected token and report the first one.
      *
-     * Logged once at ERROR because a mis-routed caller produces one per
-     * operation and would otherwise drown the log; the running count stays
-     * visible at VLOG level for anyone chasing the rest.
+     * Logged once at ERROR because an incorrectly routed caller produces an
+     * error per operation and would otherwise drown the log; the running count
+     * stays visible at VLOG level for anyone chasing the rest.
      */
     void NoteForeignToken(const char* where) {
         const uint64_t count =
