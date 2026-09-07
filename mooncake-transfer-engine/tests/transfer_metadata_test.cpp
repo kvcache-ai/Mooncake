@@ -408,6 +408,71 @@ TEST(TransferMetadataVersionTest, SyncRejectsOlderMetadataVersion) {
     EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
 }
 
+TEST(TransferMetadataVersionTest,
+     SyncAdvancesVersionForUnchangedDescriptorBeforeRejectingOlderUpdate) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kStaleAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto same_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    same_desc->metadata_version = base_version + 2;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(same_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 2);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto stale_desc = makeRdmaSegmentDesc(remote_segment_name, kStaleAddr);
+    stale_desc->metadata_version = base_version + 1;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(stale_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 2);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
 TEST(TransferMetadataVersionTest, SyncRejectsConflictingSameVersionMetadata) {
     constexpr uint64_t kInitialAddr = 0x1000;
     constexpr uint64_t kConflictingAddr = 0x2000;

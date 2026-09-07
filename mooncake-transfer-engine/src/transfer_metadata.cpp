@@ -1361,6 +1361,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             }
 
             if (!changed) {
+                if (old_desc &&
+                    desc->metadata_version > old_desc->metadata_version) {
+                    segment_id_to_desc_map_[segment_id] = desc;
+                }
                 ++unchanged_count;
                 continue;
             }
