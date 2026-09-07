@@ -157,6 +157,60 @@ TEST(ConfigLifecycleTest, RejectsMixedLifecycleSubtreeReads) {
               json({{"shutdown_drain_timeout_ms", 1000}}));
 }
 
+TEST(ConfigLifecycleTest, RejectsNoncanonicalScalarPaths) {
+    Config config;
+    config.set("merge_requests", true);
+    auto bundle = buildTentConfigBundle(config);
+
+    EXPECT_TRUE(bundle.runtime->config->get("merge_requests", false));
+    for (const auto* path : {"/merge_requests", "merge_requests/"}) {
+        SCOPED_TRACE(path);
+        EXPECT_FALSE(bundle.bootstrap->get(path, false));
+        EXPECT_FALSE(bundle.bootstrap->contains(path));
+        EXPECT_FALSE(bundle.runtime->config->get(path, false));
+        EXPECT_FALSE(bundle.runtime->config->contains(path));
+    }
+}
+
+TEST(ConfigLifecycleTest, RejectsNoncanonicalMetricsPaths) {
+    Config config;
+    config.set("metrics/enabled", true);
+    config.set("metrics/report_interval_seconds", 5);
+    auto bundle = buildTentConfigBundle(config);
+
+    for (const auto* path :
+         {"metrics/", "/metrics", "metrics//report_interval_seconds"}) {
+        SCOPED_TRACE(path);
+        std::string output = "unchanged";
+        EXPECT_FALSE(bundle.bootstrap->dumpSubtree(path, &output));
+        EXPECT_EQ(output, "unchanged");
+        EXPECT_FALSE(bundle.bootstrap->contains(path));
+        EXPECT_EQ(bundle.bootstrap->get<json>(path, json::object()),
+                  json::object());
+    }
+}
+
+TEST(ConfigLifecycleTest, RejectsRootAliasesInBothViews) {
+    Config config;
+    config.set("rpc_server_port", 18080);
+    config.set("merge_requests", true);
+    auto bundle = buildTentConfigBundle(config);
+    const LifecycleConfigView* views[] = {bundle.bootstrap.get(),
+                                          bundle.runtime->config.get()};
+
+    for (const auto* view : views) {
+        SCOPED_TRACE(configLifecycleName(view->lifecycle()));
+        for (const auto* path : {"/", "//", ""}) {
+            SCOPED_TRACE(path);
+            std::string output = "unchanged";
+            EXPECT_FALSE(view->dumpSubtree(path, &output));
+            EXPECT_EQ(output, "unchanged");
+            EXPECT_FALSE(view->contains(path));
+            EXPECT_EQ(view->get<json>(path, json::object()), json::object());
+        }
+    }
+}
+
 TEST(ConfigLifecycleTest, SnapshotDoesNotChangeWithLegacyConfig) {
     Config config;
     config.set("rpc_server_port", 18080);

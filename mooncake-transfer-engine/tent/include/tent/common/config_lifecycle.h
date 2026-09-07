@@ -68,6 +68,8 @@ struct ConfigDiagnostic {
 // A lifecycle-restricted view over a frozen Config. Both bootstrap and runtime
 // views share the same immutable backing object, so one bundle always
 // represents one coherent capture of the legacy configuration.
+// Read paths must be non-empty and contain no empty slash-delimited segments.
+// Noncanonical paths are rejected with the default value or false.
 class LifecycleConfigView {
    public:
     template <typename T>

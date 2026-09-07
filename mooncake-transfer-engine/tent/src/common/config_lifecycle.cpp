@@ -99,6 +99,12 @@ bool LifecycleConfigView::allows(std::string_view key_path) const {
 }
 
 bool LifecycleConfigView::canRead(std::string_view key_path) const {
+    // Config skips empty segments; reject aliases before lifecycle and
+    // descendant checks so they apply to the same path as the lookup.
+    if (key_path.empty() || key_path.front() == '/' || key_path.back() == '/' ||
+        key_path.find("//") != std::string_view::npos) {
+        return false;
+    }
     if (!values_ || !allows(key_path)) return false;
 
     for (const auto& configured_path : configured_paths_) {
