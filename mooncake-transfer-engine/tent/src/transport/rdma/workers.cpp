@@ -1272,9 +1272,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     if (gdr_excluded ||
         !rail.available(slice->source_dev_id, slice->target_dev_id)) {
-        LOG(INFO) << "Optimal device pair not available: source_dev_id "
-                  << slice->source_dev_id << ", target_dev_id "
-                  << slice->target_dev_id;
+        LOG_EVERY_N(INFO, 100)
+            << "Optimal device pair not available: source_dev_id "
+            << slice->source_dev_id << ", target_dev_id "
+            << slice->target_dev_id;
         return selectFallbackDevice(source, target, slice);
     }
 
