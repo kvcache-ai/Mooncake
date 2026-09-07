@@ -140,6 +140,13 @@ target_include_directories(tent_qp_pool_layout_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_qp_pool_layout_test COMMAND tent_qp_pool_layout_test)
 
+add_executable(tent_ticket_lock_test ticket_lock_test.cpp)
+target_link_libraries(tent_ticket_lock_test PRIVATE tent_common gtest
+                                                    gtest_main)
+target_include_directories(tent_ticket_lock_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_ticket_lock_test COMMAND tent_ticket_lock_test)
+
 add_executable(tent_coalesce_regions_test coalesce_regions_test.cpp)
 target_link_libraries(tent_coalesce_regions_test PRIVATE tent_common gtest
                                                          gtest_main)
