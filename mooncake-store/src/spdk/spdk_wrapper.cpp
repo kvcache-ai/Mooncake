@@ -467,6 +467,24 @@ void SpdkWrapper::CloseNofSegment(nof_seg_handle *handle) {
     open_segments_.erase(it);
 }
 
+bool SpdkWrapper::RetireNofConnection(nof_seg_handle *handle) {
+    if (!handle) return false;
+    std::lock_guard<std::mutex> lock(segments_mutex_);
+    auto it = open_segments_.find(handle);
+    if (it == open_segments_.end()) {
+        // Already retired (or never opened via the worker path).
+        // Idempotent.
+        return false;
+    }
+    open_segments_.erase(it);
+    // ~unique_ptr<NofConnection> runs here: ~NofConnection
+    // (nof_connection.cpp:322-329) calls qpair_pool_.reset() then
+    // spdk_nvme_detach(ctrlr_).  ~NofQpairPool
+    // (nof_connection.cpp:93-143) drains, force-waits inflight,
+    // and calls spdk_nvme_ctrlr_free_io_qpair for each qpair.
+    return true;
+}
+
 // Obtain block size via NofSegment.
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     if (!seg_handle || !seg_handle->segment) {
@@ -642,27 +660,31 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     //
     // If Phase 1 timed out (done==false), the request may still be
     // in flight.  We prove termination by waiting for the qpair
-    // pool's InflightCount to reach 0.  This is the actual fix for
-    // the timeout-path UAF: by the time WaitForInflightCompletion
-    // returns true, ProbeIoTrampoline has fired, DecrementInflight
-    // has happened, and no callback can fire in the future.
+    // pool's InflightCount to reach 0.  By the time
+    // WaitForInflightCompletion returns true, ProbeIoTrampoline has
+    // fired, DecrementInflight has happened, and the
+    // release/acquire synchronises-with edge guarantees every
+    // release-store in the callback body is observable.
     //
-    // 30 s budget matches ~NofQpairPool's budget so the conn
-    // destructor (which runs on function return) can finish
+    // kDefaultDrainTimeoutMs matches ~NofQpairPool's budget so the
+    // conn destructor (which runs on function return) can finish
     // promptly: if Phase 1b succeeds here, ~NofQpairPool will see
     // InflightCount==0 immediately; if Phase 1b fails here, we
     // defer the conn itself to ProbeCtxRecycler.
     // ──────────────────────────────────────────────────────────────
     if (!probe_ctx->done.load(std::memory_order_acquire)) {
-        // Strict spin on InflightCount == 0.  PushWithConn remains as a
-        // defensive fallback if the counter never reaches 0 (target
-        // crash, SPDK impl bug); the next probe's Drain() will catch
-        // up.
-        bool quiescent = conn->GetQpairPool().WaitForInflightCompletion();
+        // Bounded wait: passes kDefaultDrainTimeoutMs explicitly.
+        // On timeout, WaitForInflightCompletion force-zeros inflight
+        // and force-DRAININGs the pool, then returns false; the
+        // trampoline's CAS-saturating clamp keeps any late CQE safe.
+        // PushWithConn remains as the defensive fallback for the
+        // next probe's Drain() to catch up.
+        bool quiescent = conn->GetQpairPool().WaitForInflightCompletion(
+            kDefaultDrainTimeoutMs);
         if (!quiescent) {
-            // Forward-compatibility guard for a false return.
             LOG(ERROR) << "ProbeNofSegment: qpair pool did not quiesce "
-                          "— deferring destruction to next probe";
+                          "within " << kDefaultDrainTimeoutMs
+                          << "ms — deferring destruction to next probe";
             ProbeCtxRecycler::Instance().PushWithConn(
                 std::move(probe_ctx), std::move(conn),
                 std::move(submit_wrapper_sp));

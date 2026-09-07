@@ -157,6 +157,22 @@ class SpdkWrapper {
      */
     void CloseNofSegment(nof_seg_handle *handle);
 
+    /// Retire the connection backing `handle`. Idempotent.
+    /// Drops the unique_ptr<NofConnection> from open_segments_ under
+    /// segments_mutex_; runs ~NofConnection → ~NofQpairPool (drain +
+    /// spdk_nvme_ctrlr_free_io_qpair) → spdk_nvme_detach.
+    ///
+    /// @return true if the entry was present and retired; false if the
+    ///         handle was already retired or null.
+    ///
+    /// Safety: caller MUST have already entered the pool's DRAINING
+    /// state and called WaitForInflightCompletion (or accepted the
+    /// timeout-path). The segment/handle itself is NOT freed here —
+    /// that is owned by the next CloseNofSegment, which becomes a
+    /// no-op for the connection entry (the "already closed" branch at
+    /// spdk_wrapper.cpp:451-456).
+    bool RetireNofConnection(nof_seg_handle *handle);
+
     // Config accessors and the lower-level PipelineRead/Write entry points
     // exposed on the singleton for callers that drive NVMe-oF directly
     // (not part of the Mooncake transfer hot path).

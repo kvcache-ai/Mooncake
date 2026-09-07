@@ -13,6 +13,10 @@
 #include <spdk/env.h>
 #include <spdk/nvme.h>
 
+#ifdef USE_NOF
+#include "transfer_task.h"  // for SubTaskFreeList full definition
+#endif
+
 namespace mooncake {
 
 // ===================================================================
@@ -28,33 +32,68 @@ NofQpairPool::NofQpairPool(std::vector<spdk_nvme_qpair *> qpairs,
                                      : static_cast<uint32_t>(qpairs_.size())),
       ctrlr_(ctrlr) {}
 
-// Spin until InflightCount() == 0 with no time budget.  The spin never
-// times out: a hung destructor (target crash, network partition) is
-// recoverable by an external watchdog, whereas force-freeing under live
-// CQE callbacks is silent memory corruption.
+// Block until InflightCount() == 0 OR `timeout_ms` elapses OR
+// PollAll reports a transport error (<0).
 //
-// SPDK has no synchronous abort for SQ-resident requests in v23.01.1,
-// so the release/acquire pair between IncrementInflight (submit side)
-// and DecrementInflight (CQE side) is the only mechanism guarantee
-// that every CQE has fired before this returns.
-bool NofQpairPool::WaitForInflightCompletion() {
+// Three terminal exit paths, all force-zero + force-DRAINING:
+//   1. PollAll < 0 (dead qpair): PollAll iterated the full sibling
+//      set before reporting, so healthy sibling CQEs have already
+//      been delivered and accounted for in inflight_count_; the
+//      remaining count belongs to the dead qpair(s), whose CQEs will
+//      never arrive.  Force-zero without waiting for the deadline.
+//   2. timeout_ms elapsed: same terminal actions as fast-path.
+//      Fallback for slow-but-not-dead targets where PollAll never
+//      reports -1.
+//   3. InflightCount() == 0 observed: success, no terminal actions.
+//
+// On every terminal path, late CQEs that arrive after force-zero are
+// silenced by:
+//   - state_ forced to kDraining, so the trampoline reads
+//     IsDraining()==true and short-circuits before touching task
+//     memory (transfer_task.cpp:nvmf_io_complete).
+//   - DecrementInflight's CAS-saturating clamp, so inflight_count_
+//     cannot underflow below 0.
+bool NofQpairPool::WaitForInflightCompletion(uint32_t timeout_ms) {
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(timeout_ms);
     while (inflight_count_.load(std::memory_order_acquire) > 0) {
-        // PollAll drives pending CQEs synchronously; each callback's
-        // DecrementInflight (release) is observed on the next acquire
-        // load.
+        // timeout_ms == 0 is observe-only: do not wait, do not poll.
+        // Return false immediately so the caller can decide whether
+        // the non-zero count is acceptable (e.g. ~NofQpairPool can
+        // log and proceed).
         int32_t processed = PollAll(0);
         if (processed < 0) {
-            // qpair dead — stop polling but keep waiting for the
-            // inflight counter to reach 0.
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            // Fast-path: at least one qpair reported a transport
+            // error.  PollAll iterated the full sibling set before
+            // reporting, so healthy sibling CQEs have already been
+            // delivered and accounted for in inflight_count_.  The
+            // remaining count belongs to the dead qpair(s), whose
+            // CQEs will never arrive — force-zero without waiting
+            // for the deadline.
+            inflight_count_.exchange(0, std::memory_order_acq_rel);
+            QpairPoolState expected = QpairPoolState::kActive;
+            state_.compare_exchange_strong(expected,
+                                           QpairPoolState::kDraining);
+            return false;
         }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            // Slow-target fallback: deadline elapsed with no error
+            // signal.  Same terminal actions as the fast-path.
+            inflight_count_.exchange(0, std::memory_order_acq_rel);
+            QpairPoolState expected = QpairPoolState::kActive;
+            state_.compare_exchange_strong(expected,
+                                           QpairPoolState::kDraining);
+            return false;
+        }
+        // PollAll drove pending CQEs synchronously; each callback's
+        // DecrementInflight (release) is observed on the next acquire
+        // load.  Sleep briefly before the next poll.
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
     }
     return true;
 }
 
-// Best-effort CQ drain on a single qpair.  SPDK has no public API to
-// force-fail SQ-resident requests, so this only drains CQEs that are
-// already ready in the CQ.
+// Best-effort CQ drain on a single qpair.
 static void AbortAllInflightRequests(spdk_nvme_ctrlr * /*ctrlr*/,
                                      spdk_nvme_qpair *qp) {
     if (qp) {
@@ -95,8 +134,44 @@ NofQpairPool::~NofQpairPool() {
             // Strict fence: WaitForInflightCompletion observes the
             // release/acquire synchronises-with edge against the last
             // DecrementInflight, proving no callback body is still
-            // running.
-            WaitForInflightCompletion();
+            // running.  timeout_ms=0 makes this observe-only: by the
+            // time the destructor runs, the worker drain protocol
+            // (DrainDrainingPoolsUntilQuiescent) has already paid back
+            // every counter via FinalizeAfterDrain, so InflightCount
+            // should be 0.  If not, log an ERROR and proceed; the
+            // pool is in kClosed state so any late CQE takes the
+            // trampoline's DRAINING short-circuit.
+            bool quiescent = WaitForInflightCompletion(/*timeout_ms=*/0);
+            if (!quiescent) {
+                LOG(ERROR)
+                    << "[NofQpairPool::~NofQpairPool] InflightCount="
+                    << InflightCount()
+                    << " at destructor entry — worker drain protocol "
+                    << "did not converge; relying on trampoline DRAINING "
+                    << "short-circuit and CAS-saturating DecrementInflight";
+            }
+
+#ifndef NDEBUG
+            // DEBUG invariant: once the worker has run
+            // DrainDrainingPoolsUntilQuiescent + FinalizeAfterDrain, every
+            // callback that COULD have fired must have already decremented.
+            // A non-zero counter at destruction time means a task's CQE
+            // handler is still outstanding — this is a worker-drain
+            // regression we want to surface loudly in DEBUG builds instead
+            // of silently relying on the trampoline DRAINING short-circuit.
+            int32_t final_count =
+                inflight_count_.load(std::memory_order_acquire);
+            if (was_ever_used_with_inflight_.load(std::memory_order_acquire) &&
+                final_count != 0) {
+                LOG(FATAL)
+                    << "[NofQpairPool::~NofQpairPool] InflightCount="
+                    << final_count
+                    << " at destruction in DEBUG build — worker drain "
+                    << "did not converge.  This indicates a regression in "
+                    << "SpdkNofTaskCompletion / FinalizeAfterDrain / "
+                    << "FinalizeSubmittedTask single-pop semantics.";
+            }
+#endif
 
             if (was_ever_used_with_inflight_.load(std::memory_order_acquire)) {
                 VLOG(2) << "[NofQpairPool::~NofQpairPool] "
@@ -112,7 +187,34 @@ NofQpairPool::~NofQpairPool() {
         }
     }
     qpairs_.clear();
+
+#ifdef USE_NOF
+    // Release the sub_task free list AFTER all qpairs are destroyed
+    // and their CQ-drain (which may fire late trampolines that call
+    // free_list->Release) has completed.  Any in-flight sub_tasks
+    // captured by trampolines via shared_ptr<SpdkNofSubTask>* ctx are
+    // safe — they keep themselves alive via their shared_ptr until the
+    // trampoline returns them to the free list (or destroys them via
+    // shared_ptr refcount == 0 if the free list is already gone).  See
+    // SubTaskFreeList comment in transfer_task.h for the full
+    // rationale.
+    sub_task_free_list_.reset();
+#endif
 }
+
+#ifdef USE_NOF
+// Lazy-init so transfer_task.h stays out of nof_connection.h's include
+// surface (only the forward decl of SubTaskFreeList is in the header).
+// Called once on the first submission to the pool, which is the
+// natural lifetime boundary (no allocation cost when the pool is never
+// used).
+std::shared_ptr<SubTaskFreeList> NofQpairPool::GetSubTaskFreeList() {
+    if (!sub_task_free_list_) {
+        sub_task_free_list_ = std::make_shared<SubTaskFreeList>();
+    }
+    return sub_task_free_list_;
+}
+#endif
 
 spdk_nvme_qpair *NofQpairPool::GetNextQpair() {
     // Reject submissions once the pool has entered DRAINING.
@@ -130,15 +232,68 @@ int32_t NofQpairPool::PollAll(uint32_t max_completions) {
     for (size_t i = 0; i < qpairs_.size(); ++i) {
         auto *qp = qpairs_[i];
 #ifdef MOONCAKE_TEST_DRAIN
-        // Test-only injection: synthesise a transport error on the
-        // armed qpair.  Single-shot arm — cleared after consumption.
-        size_t armed = pending_inject_error_idx_.exchange(
-            SIZE_MAX, std::memory_order_acq_rel);
-        if (armed == i) {
+        // Phase 1: test-only injection.  Atomic check-and-clear via
+        // compare_exchange: pending_inject_error_idx_ is swapped from
+        // `i` to SIZE_MAX iff its current value equals `i`, all in a
+        // single atomic step.
+        //
+        // Race properties this guarantees:
+        //   - Exactly one PollAll iteration (across all threads
+        //     concurrently running PollAll on this pool) fires per
+        //     arm.  Any other CAS racing on the same arm loses
+        //     because pending_inject_error_idx_ is no longer `i`.
+        //   - Non-matching iterations (pending != i) leave the arm
+        //     untouched.  The next iteration of the same PollAll
+        //     call, or the next PollAll call from any thread, retries
+        //     the CAS with its own i and only fires when i matches.
+        //   - A concurrent TestInjectPollErrorOnce that lands between
+        //     any two PollAll iterations (or after a failing CAS)
+        //     simply re-arms pending_inject_error_idx_; no CAS ever
+        //     overwrites a non-matching arm with SIZE_MAX.
+        //
+        // Memory ordering: acq_rel on the CAS provides synchronizes-
+        // with against TestInjectPollErrorOnce's release store
+        // (nof_connection.h:229) and against any prior successful
+        // firing iteration.
+        //
+        // NOTE: this path runs BEFORE the hold gate (Phase 2) so
+        // TestInjectPollErrorOnce still fires while TestHoldAllCompletions
+        // is set.  This matches the regression-test contract:
+        // `Reproducer_DrainTimeout_FutureCompletesNotHangs` arms inject
+        // after hold so the pool must still observe the error and
+        // EnterDraining even while CQEs are blocked.
+        size_t expected = i;
+        if (pending_inject_error_idx_.compare_exchange_strong(
+                expected, SIZE_MAX,
+                std::memory_order_acq_rel)) {
             if (first_error == 0) first_error = -1;
             continue;
         }
+        // CAS failed: pending_inject_error_idx_ was not `i`
+        // (either SIZE_MAX, or armed for some other qpair).  Fall
+        // through to the hold gate and SPDK CQE harvest.
 #endif
+#ifdef MOONCAKE_TEST_DRAIN
+        // Phase 2: test-only "hold all completions" gate.  When armed,
+        // skip ONLY the SPDK CQE harvest below — the test-injection
+        // path above has already run and consumed any pending arm.
+        // Sibling qpairs whose CQE harvest is suppressed will see
+        // their SpdkNofSubTask objects returned to the sub_task_pool
+        // via the trampoline's DRAINING short-circuit once the pool
+        // enters kDraining (which the worker drives from the -1 return
+        // produced in Phase 1).
+        if (hold_all_completions_.load(std::memory_order_acquire)) {
+            continue;
+        }
+#endif
+        // Defensive: a null slot (e.g. test pools built with nullptr
+        // qpairs, or a future code path that fails to populate every
+        // index) must not reach spdk_nvme_qpair_process_completions —
+        // SPDK dereferences the qpair at offset 0..8 unconditionally.
+        // Production pools only insert non-null qpairs (see Connect()
+        // — `if (!qp) break;`), so this branch is a no-op there.
+        if (!qp) continue;
+        // Phase 3: real SPDK CQE processing.
         int32_t n = spdk_nvme_qpair_process_completions(
             qp, max_completions == 0 ? 0 : (max_completions - total));
         if (n < 0) {
@@ -156,6 +311,22 @@ int32_t NofQpairPool::PollAll(uint32_t max_completions) {
     }
     return first_error != 0 ? first_error : total;
 }
+
+#ifdef MOONCAKE_TEST_DRAIN
+// Single source of truth for the trampoline's DRAINING branch (mirrors
+// nvmf_io_complete at transfer_task.cpp:183-187).  Centralising here
+// lets the Layer-1 drain-protocol test exercise the real code path
+// rather than a copy that can drift from production.
+void NofQpairPool::TestRunDrainingShortCircuit() {
+    if (IsDraining()) {
+        DecrementInflight();
+        return;
+    }
+    LOG(ERROR)
+        << "TestRunDrainingShortCircuit invoked with pool not in "
+           "DRAINING state — test ordering bug";
+}
+#endif
 
 // Use the ctrlr_ stored at construction time to allocate new qpairs.
 // spdk_nvme_qpair is only forward-declared in the public header, so we

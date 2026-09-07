@@ -127,16 +127,19 @@ TEST_F(RealTarget, ProbeNormalPath) {
 
 // ===========================================================================
 // T2: ProbeLateCallback — soft timeout=0 forces Phase 1 timeout;
-// Phase 1b's WaitForInflightCompletion catches the late callback
-// before the conn destructor.  Validates INV-3 + the trampoline path.
+// Phase 1b's WaitForInflightCompletion(timeout_ms=kDefaultDrainTimeoutMs)
+// catches the late callback before the conn destructor.  Validates
+// INV-3 + the trampoline path.
 // ===========================================================================
 
 TEST_F(RealTarget, ProbeLateCallback) {
     auto &wrapper = mooncake::SpdkWrapper::GetInstance();
     std::string reason;
     // timeout_ms=1: soft timeout fires immediately, but the I/O will
-    // complete shortly after.  Phase 1b's 30s budget is what actually
-    // waits for the callback.
+    // complete shortly after.  Phase 1b's 30s budget
+    // (kDefaultDrainTimeoutMs, passed explicitly to
+    // WaitForInflightCompletion) is what actually waits for the
+    // callback.
     bool ok = wrapper.ProbeNofSegment(target_, /*timeout_ms=*/1, &reason);
     // ok==true means the late callback was caught AND it reported
     // success (status.sc==0).  ok==false with reason=="completion_error"
@@ -146,8 +149,9 @@ TEST_F(RealTarget, ProbeLateCallback) {
     // Phase 1b itself timed out after 30s).
     if (!ok) {
         EXPECT_NE(reason, "completion_timeout")
-            << "Phase 1b exceeded 30s budget — quiescent proof failed: "
-            << reason;
+            << "Phase 1b exceeded "
+            << mooncake::kDefaultDrainTimeoutMs
+            << "ms budget — quiescent proof failed: " << reason;
     }
 }
 

@@ -18,11 +18,15 @@
  *
  *   - INV-1: Increment/Decrement pair maintains InflightCount accurately.
  *   - INV-2: WasEverUsedWithInflight flips on first Increment.
- *   - INV-3: WaitForInflightCompletion returns immediately when
+ *   - INV-3: WaitForInflightCompletion(0) returns true immediately when
  *     InflightCount==0 (no SPDK dereference).
- *   - INV-4: WaitForInflightCompletion with a 0-budget still returns
- *     the current state (defensive).
- *   - INV-5: ProbeCtxRecycler::PushWithConn accepts ctx + null conn
+ *   - INV-4: WaitForInflightCompletion(0) returns false immediately when
+ *     InflightCount>0 (defensive observe-only path).
+ *   - INV-5: WaitForInflightCompletion(timeout>0) force-zeros and
+ *     force-DRAININGs on timeout.
+ *   - INV-6: DecrementInflight is CAS-saturating; over-decrement is a
+ *     no-op (no underflow).
+ *   - INV-7: ProbeCtxRecycler::PushWithConn accepts ctx + null conn
  *     and Drain releases both atomically.
  *
  * Note: tests that need a real SPDK target (T2/T3 boundary-timeout,
@@ -121,22 +125,45 @@ TEST(NofQpairInflight, WasEverUsedStaysTrueAfterDecrement) {
 TEST(NofQpairInflight, WasEverUsedStaysFalseIfNeverIncremented) {
     auto pool = MakeStubPool();
     EXPECT_FALSE(pool->WasEverUsedWithInflight());
-    // Decrementing without prior Increment must not flip the flag.
-    // (This protects against double-decrement bugs.)
-    // We don't call Decrement here because the count would go
-    // negative; the test is just that the flag stays false.
+    // DecrementInflight is CAS-saturating: calling it without prior
+    // Increment is a no-op (counter stays at 0).  This protects against
+    // double-decrement bugs and against late CQEs that arrive after
+    // WaitForInflightCompletion's force-zero path.  The flag stays
+    // false because IncrementInflight is the only thing that flips it.
+    pool->DecrementInflight();
+    pool->DecrementInflight();
     EXPECT_FALSE(pool->WasEverUsedWithInflight());
 }
 
 // ===========================================================================
-// INV-3: WaitForInflightCompletion returns immediately when
+// INV-6: DecrementInflight is CAS-saturating; over-decrement is a
+// no-op (no underflow).
+// ===========================================================================
+
+TEST(NofQpairInflight, DecrementInflightClampedAtZero) {
+    auto pool = MakeStubPool();
+    pool->IncrementInflight();
+    pool->IncrementInflight();
+    EXPECT_EQ(pool->InflightCount(), 2);
+    pool->DecrementInflight();
+    pool->DecrementInflight();
+    EXPECT_EQ(pool->InflightCount(), 0);
+    // 10 further decrements: counter must stay at 0.
+    for (int i = 0; i < 10; ++i) {
+        pool->DecrementInflight();
+    }
+    EXPECT_EQ(pool->InflightCount(), 0);
+}
+
+// ===========================================================================
+// INV-3: WaitForInflightCompletion(0) returns true immediately when
 // InflightCount==0 — happy path: no polling required.
 // ===========================================================================
 
 TEST(NofQpairInflight, WaitReturnsImmediatelyWhenCountIsZero) {
     auto pool = MakeStubPool();
     auto start = std::chrono::steady_clock::now();
-    bool ok = pool->WaitForInflightCompletion();
+    bool ok = pool->WaitForInflightCompletion(/*timeout_ms=*/0);
     auto elapsed = std::chrono::steady_clock::now() - start;
     EXPECT_TRUE(ok);
     // Should complete in microseconds, not seconds.
@@ -151,20 +178,54 @@ TEST(NofQpairInflight, WaitReturnsTrueAfterDecrementPair) {
     pool->IncrementInflight();
     pool->DecrementInflight();
     pool->DecrementInflight();
-    EXPECT_TRUE(pool->WaitForInflightCompletion());
+    EXPECT_TRUE(pool->WaitForInflightCompletion(/*timeout_ms=*/0));
 }
 
 // ===========================================================================
-// INV-4: WaitForInflightCompletion has NO budget parameter — it is a
-// strict mechanism-level fence.  This test guards the API shape so
-// future regressions that re-introduce a budget get caught here.
+// INV-4: WaitForInflightCompletion(0) returns false immediately when
+// InflightCount>0 (observe-only defensive path).  This test guards the
+// API shape so future regressions that re-introduce unbounded waiting
+// get caught here.
 // ===========================================================================
 
 TEST(NofQpairInflight, WaitReturnsCurrentStateImmediately) {
     auto pool = MakeStubPool();
-    // Even without a budget, if count is 0 we return true immediately
+    // Even with timeout_ms=0, if count is 0 we return true immediately
     // (the loop body checks count first and exits without sleeping).
-    EXPECT_TRUE(pool->WaitForInflightCompletion());
+    EXPECT_TRUE(pool->WaitForInflightCompletion(/*timeout_ms=*/0));
+}
+
+// ===========================================================================
+// INV-5: WaitForInflightCompletion(timeout>0) force-zeros and
+// force-DRAININGs on timeout.
+// ===========================================================================
+
+TEST(NofQpairInflight, WaitTimeoutForceZerosAndDrains) {
+    auto pool = MakeStubPool();
+    pool->IncrementInflight();
+    pool->IncrementInflight();
+    EXPECT_EQ(pool->InflightCount(), 2);
+    EXPECT_FALSE(pool->IsDraining());
+
+    auto start = std::chrono::steady_clock::now();
+    bool quiescent = pool->WaitForInflightCompletion(/*timeout_ms=*/0);
+    auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start)
+                          .count();
+
+    // Observe-only: returns false immediately when InflightCount > 0.
+    EXPECT_FALSE(quiescent);
+    EXPECT_EQ(pool->InflightCount(), 0);
+    EXPECT_TRUE(pool->IsDraining());
+    // Observe-only must not spin: < 100ms.
+    EXPECT_LT(elapsed_ms, 100);
+
+    // After force-zero, late DecrementInflight must be a CAS-no-op
+    // (saturating clamp): no underflow.
+    for (int i = 0; i < 5; ++i) {
+        pool->DecrementInflight();
+    }
+    EXPECT_EQ(pool->InflightCount(), 0);
 }
 
 // ===========================================================================

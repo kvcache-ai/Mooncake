@@ -190,7 +190,8 @@ if(USE_NOF)
                              PRIVATE MOONCAKE_TEST_DRAIN=1)
   target_sources(
     nof_qpair_sibling_failure_test
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/spdk/nof_connection.cpp)
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/spdk/nof_connection.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/transfer_task.cpp)
   target_link_options(nof_qpair_sibling_failure_test PRIVATE
                       -Wl,--allow-multiple-definition)
   # nof_qpair_inflight_real_test verifies the NofQpairPool root-cause fix
