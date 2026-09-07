@@ -71,11 +71,10 @@ class HighPerformanceTcpTransport final : public Transport {
    private:
     friend class HighPerformanceTcpTransportTestPeer;
 
-    struct TaskPlan;
-
     Status validateParams() const;
-    Status planTask(const Request& request, HighPerformanceTcpSubBatch* batch,
-                    TaskPlan* plan);
+    Status planTask(const Request& request, HighPerformanceTcpSubBatch& batch,
+                    std::shared_ptr<HighPerformanceTcpTaskState>& task,
+                    std::vector<HighPerformanceTcpWorkers::Command>& commands);
     Status rollbackPublishedEndpoint(
         const std::optional<std::string>& previous_attr);
     Status stopRuntime();

@@ -573,14 +573,12 @@ void HighPerformanceTcpClient::cancelRequestOnWorker(size_t worker_id,
     if (worker_id >= worker_states_.size()) return;
     for (auto& [key, lane] : worker_states_[worker_id].lanes) {
         (void)key;
-        if (lane->cancelRequest(request_id)) return;
+        (void)lane->cancelRequest(request_id);
     }
 }
 
-Status HighPerformanceTcpClient::cancelRequest(size_t owner_worker,
-                                               uint64_t request_id) {
-    if (workers_ == nullptr || owner_worker >= worker_states_.size() ||
-        request_id == 0) {
+Status HighPerformanceTcpClient::cancelRequest(uint64_t request_id) {
+    if (workers_ == nullptr || request_id == 0) {
         return Status::InvalidArgument(
             "invalid HP TCP cancellation request" LOC_MARK);
     }
@@ -589,10 +587,13 @@ Status HighPerformanceTcpClient::cancelRequest(size_t owner_worker,
             "HP TCP worker contexts are unavailable" LOC_MARK);
     }
     try {
-        asio::post(workers_->ioContext(owner_worker),
-                   [this, owner_worker, request_id] {
-                       cancelRequestOnWorker(owner_worker, request_id);
-                   });
+        for (size_t worker_id = 0; worker_id < worker_states_.size();
+             ++worker_id) {
+            asio::post(workers_->ioContext(worker_id),
+                       [this, worker_id, request_id] {
+                           cancelRequestOnWorker(worker_id, request_id);
+                       });
+        }
     } catch (const std::exception& error) {
         return Status::InternalError(
             std::string("HP TCP cancellation post failed: ") + error.what() +

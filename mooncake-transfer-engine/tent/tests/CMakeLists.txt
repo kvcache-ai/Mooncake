@@ -432,8 +432,8 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
-# DeviceSelector inflight quota accounting: estimate->exact reconcile, fallback
-# migration, retry recharge, baseline no-underflow, EWMA gating, charge-failure.
+# DeviceSelector inflight quota accounting: per-slice charge/release balance,
+# chargeDevice, baseline no-underflow, EWMA gating, charge-failure.
 add_executable(tent_quota_accounting_test quota_accounting_test.cpp)
 target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
                                                          tent_link_group)
@@ -475,6 +475,14 @@ add_test(NAME tent_strict_local_numa_test COMMAND tent_strict_local_numa_test)
 
 if(USE_UB)
   add_executable(
+    tent_ub_core_test ub_core_test.cpp ../src/transport/ub/quota.cpp
+                      ../src/transport/ub/rail_monitor.cpp)
+  target_link_libraries(tent_ub_core_test PRIVATE tent_common gtest gtest_main)
+  target_include_directories(tent_ub_core_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_core_test COMMAND tent_ub_core_test)
+
+  add_executable(
     tent_ub_teardown_test
     ub_teardown_test.cpp ../src/transport/ub/buffers.cpp
     ../src/transport/ub/context.cpp ../src/transport/ub/jfc.cpp)
@@ -483,6 +491,14 @@ if(USE_UB)
   target_include_directories(tent_ub_teardown_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_ub_teardown_test COMMAND tent_ub_teardown_test)
+
+  add_executable(tent_ub_native_data_path_test ub_native_data_path_test.cpp)
+  target_link_libraries(tent_ub_native_data_path_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+  target_include_directories(tent_ub_native_data_path_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_ub_native_data_path_test
+           COMMAND tent_ub_native_data_path_test)
 endif()
 
 # End-to-end failover test: drives real TransferEngineImpl with

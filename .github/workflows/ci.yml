@@ -172,7 +172,8 @@ jobs:
           exit 1
         fi
 
-        python scripts/test_tensor_api.py -n 1
+        python scripts/test_upsert_api.py
+        python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
         python scripts/test_async_store.py
         python scripts/test_copy_move_api.py
         python -m unittest mooncake-wheel.tests.test_safetensor_functions
@@ -381,6 +382,7 @@ jobs:
           -DUSE_ETCD=ON \
           -DUSE_CUDA=ON \
           -DWITH_P2P_STORE=ON \
+          -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
           -DCMAKE_BUILD_TYPE=Release \
           -DBUILD_UNIT_TESTS=ON \

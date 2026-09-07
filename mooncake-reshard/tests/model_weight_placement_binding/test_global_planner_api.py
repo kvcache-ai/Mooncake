@@ -18,7 +18,7 @@ from mooncake.reshard.weight import (
 )
 from mooncake.reshard.weight.storage_manifest import (
     StoredFragmentSnapshot,
-    WeightManifest,
+    StoredWeightManifest,
 )
 
 
@@ -138,9 +138,9 @@ def test_logical_plan_rejects_forged_placement_source_provenance() -> None:
         replace(plan, target_tensors=())
 
 
-def _stored_source(tensor: TensorDescriptor) -> WeightManifest:
+def _stored_source(tensor: TensorDescriptor) -> StoredWeightManifest:
     group_id = "weights/default/model/revision/9"
-    return WeightManifest(
+    return StoredWeightManifest(
         namespace="default",
         resource_id="model",
         revision="revision",
@@ -249,7 +249,7 @@ def test_store_backed_planner_accepts_reordered_tensor_catalog() -> None:
     target = _two_tensor_placement("target")
     tensors = target.tensors
     group_id = "weights/default/model/revision/9"
-    source = WeightManifest(
+    source = StoredWeightManifest(
         namespace="default",
         resource_id="model",
         revision="revision",

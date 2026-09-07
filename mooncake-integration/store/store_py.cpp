@@ -2085,15 +2085,6 @@ PYBIND11_MODULE(store, m) {
                  return self.shm_helper_->free(reinterpret_cast<void *>(ptr));
              });
 
-    py::class_<ParallelAxisSpec>(m, "ParallelAxis")
-        .def(py::init<>())
-        .def_readwrite("kind", &ParallelAxisSpec::kind)
-        .def_readwrite("rank", &ParallelAxisSpec::rank)
-        .def_readwrite("size", &ParallelAxisSpec::size)
-        .def_readwrite("split_dim", &ParallelAxisSpec::split_dim)
-        .def_readwrite("expert_id", &ParallelAxisSpec::expert_id)
-        .def_readwrite("stage_id", &ParallelAxisSpec::stage_id);
-
     auto make_pyclient_capsule =
         [](const std::shared_ptr<PyClient> &store) -> py::object {
         if (!store) {
@@ -2108,34 +2099,6 @@ PYBIND11_MODULE(store, m) {
         (void)ptr.release();  // Transfer ownership to capsule
         return cap;
     };
-
-    py::class_<TensorParallelismSpec>(m, "TensorParallelism")
-        .def(py::init<>())
-        .def_readwrite("axes", &TensorParallelismSpec::axes);
-
-    py::class_<ReadTargetSpec>(m, "ReadTarget")
-        .def(py::init<>())
-        .def_property(
-            "mode",
-            [](const ReadTargetSpec &self) {
-                switch (self.mode) {
-                    case ReadTargetMode::AS_STORED:
-                        return std::string("as_stored");
-                    case ReadTargetMode::SHARD:
-                        return std::string("shard");
-                    case ReadTargetMode::FULL:
-                        return std::string("full");
-                }
-                return std::string("as_stored");
-            },
-            [](ReadTargetSpec &self, const std::string &mode) {
-                auto parsed = parse_read_target_mode(py::str(mode));
-                if (!parsed.has_value()) {
-                    throw std::runtime_error("Unsupported ReadTarget mode");
-                }
-                self.mode = *parsed;
-            })
-        .def_readwrite("parallelism", &ReadTargetSpec::parallelism);
 
     py::class_<MooncakeDistributedNoFRegisterPyWrapper>(
         m, "MooncakeDistributedNoFRegister")
@@ -2191,6 +2154,18 @@ PYBIND11_MODULE(store, m) {
 
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
+        .def(
+            "begin_weight_snapshot",
+            [](MooncakeStorePyWrapper &self, py::object snapshot,
+               py::object adapter) -> py::object {
+                py::object raw_store =
+                    py::cast(&self, py::return_value_policy::reference);
+                return py::module_::import("mooncake.reshard.weight.store")
+                    .attr("begin_weight_snapshot")(raw_store, snapshot,
+                                                   adapter);
+            },
+            py::arg("snapshot"), py::arg("adapter"),
+            "Open a model-weight snapshot writer backed by this Store")
         .def(
             "_get_pyclient_capsule",
             [make_pyclient_capsule](MooncakeStorePyWrapper &self)
@@ -2578,91 +2553,6 @@ PYBIND11_MODULE(store, m) {
              py::arg("tensors_list"), py::arg("config") = ReplicateConfig{},
              "Batch upsert PyTorch tensors with configurable replication "
              "settings")
-        .def("get_tensor_with_parallelism",
-             &MooncakeStorePyWrapper::get_tensor_with_parallelism,
-             py::arg("key"), py::arg("target") = py::none(),
-             "Get a PyTorch tensor from the store using a ReadTarget request.")
-        .def("batch_get_tensor_with_parallelism",
-             &MooncakeStorePyWrapper::batch_get_tensor_with_parallelism,
-             py::arg("keys"), py::arg("targets") = py::none(),
-             "Get a batch of PyTorch tensors from the store using ReadTarget "
-             "requests.")
-        .def("get_tensor_with_parallelism_into",
-             &MooncakeStorePyWrapper::get_tensor_with_parallelism_into,
-             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-             py::arg("target") = py::none(),
-             "Get a PyTorch tensor from the store directly into a "
-             "pre-allocated buffer using a ReadTarget request.")
-        .def("batch_get_tensor_with_parallelism_into",
-             &MooncakeStorePyWrapper::batch_get_tensor_with_parallelism_into,
-             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-             py::arg("targets") = py::none(),
-             "Get a batch of PyTorch tensors into pre-allocated buffers using "
-             "ReadTarget requests.")
-        .def("put_tensor_with_parallelism",
-             &MooncakeStorePyWrapper::put_tensor_with_parallelism,
-             py::arg("key"), py::arg("tensor"),
-             py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partition") = py::none(),
-             "Put a PyTorch tensor into the store using a TensorParallelism "
-             "request or a writer_partition request.")
-        .def("batch_put_tensor_with_parallelism",
-             &MooncakeStorePyWrapper::batch_put_tensor_with_parallelism,
-             py::arg("keys"), py::arg("tensors_list"),
-             py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partitions") = py::none(),
-             "Put a batch of PyTorch tensors into the store using "
-             "TensorParallelism requests or writer_partition requests.")
-        .def("put_tensor_with_parallelism_from",
-             &MooncakeStorePyWrapper::put_tensor_with_parallelism_from,
-             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-             py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partition") = py::none(),
-             "Put a tensor directly from a pre-allocated buffer using a "
-             "TensorParallelism request or a writer_partition request.")
-        .def("batch_put_tensor_with_parallelism_from",
-             &MooncakeStorePyWrapper::batch_put_tensor_with_parallelism_from,
-             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-             py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partitions") = py::none(),
-             "Put a batch of tensors directly from pre-allocated buffers using "
-             "TensorParallelism requests or writer_partition requests.")
-        .def("upsert_tensor_with_parallelism",
-             &MooncakeStorePyWrapper::upsert_tensor_with_parallelism,
-             py::arg("key"), py::arg("tensor"),
-             py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partition") = py::none(),
-             "Upsert a PyTorch tensor into the store using a TensorParallelism "
-             "request or a writer_partition request.")
-        .def("upsert_tensor_with_parallelism_from",
-             &MooncakeStorePyWrapper::upsert_tensor_with_parallelism_from,
-             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-             py::arg("parallelism") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partition") = py::none(),
-             "Upsert a tensor directly from a pre-allocated buffer using a "
-             "TensorParallelism request or a writer_partition request.")
-        .def("batch_upsert_tensor_with_parallelism_from",
-             &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism_from,
-             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-             py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partitions") = py::none(),
-             "Upsert a batch of tensors directly from pre-allocated buffers "
-             "using TensorParallelism requests or writer_partition requests.")
-        .def("batch_upsert_tensor_with_parallelism",
-             &MooncakeStorePyWrapper::batch_upsert_tensor_with_parallelism,
-             py::arg("keys"), py::arg("tensors_list"),
-             py::arg("parallelisms") = py::none(),
-             py::arg("config") = ReplicateConfig{},
-             py::arg("writer_partitions") = py::none(),
-             "Upsert a batch of PyTorch tensors into the store using "
-             "TensorParallelism requests or writer_partition requests.")
         .def(
             "upsert_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,

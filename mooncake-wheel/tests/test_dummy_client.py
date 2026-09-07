@@ -16,9 +16,11 @@ from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000  # 5000 milliseconds
 # Use environment variable if set, otherwise use default
-default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
+default_kv_lease_ttl = int(
+    os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL)
+)
 
 CUDA_IPC_STREAM_READINESS_PAYLOAD_BYTES = 16 * 1024 * 1024
 _CUDA_IPC_INITIAL_BYTE = 0x31
@@ -281,19 +283,17 @@ def get_client(store, local_buffer_size_param=None):
     """Initialize and setup the distributed store client."""
     mem_pool_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = (
-        local_buffer_size_param if local_buffer_size_param is not None
+        local_buffer_size_param
+        if local_buffer_size_param is not None
         else 512 * 1024 * 1024  # 512 MB
     )
     real_client_address = "127.0.0.1:50052"
 
-    retcode = store.setup_dummy(
-        mem_pool_size,
-        local_buffer_size,
-        real_client_address
-    )
+    retcode = store.setup_dummy(mem_pool_size, local_buffer_size, real_client_address)
 
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+
 
 class TestDistributedObjectStoreSingleStore(unittest.TestCase):
     """Test class for single store operations (no replication)."""
@@ -333,7 +333,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         keys = [f"test_batch_exist_key_{i}" for i in range(batch_size)]
 
         # Put only the first half of the keys
-        existing_keys = keys[:batch_size // 2]
+        existing_keys = keys[: batch_size // 2]
         for key in existing_keys:
             self.assertEqual(self.store.put(key, test_data), 0)
 
@@ -345,11 +345,15 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
         # First half should exist (result = 1)
         for i in range(batch_size // 2):
-            self.assertEqual(results[i], 1, f"Key {keys[i]} should exist but got {results[i]}")
+            self.assertEqual(
+                results[i], 1, f"Key {keys[i]} should exist but got {results[i]}"
+            )
 
         # Second half should not exist (result = 0)
         for i in range(batch_size // 2, batch_size):
-            self.assertEqual(results[i], 0, f"Key {keys[i]} should not exist but got {results[i]}")
+            self.assertEqual(
+                results[i], 0, f"Key {keys[i]} should not exist but got {results[i]}"
+            )
 
         # Test with empty keys list
         empty_results = self.store.batch_is_exist([])
@@ -427,7 +431,11 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertLess(destination_overflow_results[0][0][0], 0)
 
         missing_key_results = self.store.get_into_ranges(
-            [buffer_ptr0], [["missing-key", key1]], [[[0], [8]]], [[[0], [0]]], [[[4], [4]]]
+            [buffer_ptr0],
+            [["missing-key", key1]],
+            [[[0], [8]]],
+            [[[0], [0]]],
+            [[[4], [4]]],
         )
         self.assertLess(missing_key_results[0][0][0], 0)
         self.assertEqual(missing_key_results[0][1][0], 4)
@@ -462,7 +470,9 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Allocate one large buffer with significant spacing
         total_buffer_size = buffer_spacing * batch_size
         large_buffer_ptr = self.store.alloc_from_mem_pool(total_buffer_size)
-        large_buffer = (ctypes.c_char * total_buffer_size).from_address(large_buffer_ptr)
+        large_buffer = (ctypes.c_char * total_buffer_size).from_address(
+            large_buffer_ptr
+        )
 
         # Register the entire large buffer once
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
@@ -489,28 +499,46 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(len(results), batch_size, "Should return result for each key")
 
         for i, (expected_data, result) in enumerate(zip(test_data, results)):
-            self.assertGreater(result, 0, f"batch_get_into should succeed for key {keys[i]}")
-            self.assertEqual(result, len(expected_data), f"Should read correct number of bytes for key {keys[i]}")
+            self.assertGreater(
+                result, 0, f"batch_get_into should succeed for key {keys[i]}"
+            )
+            self.assertEqual(
+                result,
+                len(expected_data),
+                f"Should read correct number of bytes for key {keys[i]}",
+            )
 
             # Verify data integrity - read from the correct offset in the large buffer
             offset = i * buffer_spacing
-            read_data = bytes(large_buffer[offset:offset + result])
-            self.assertEqual(read_data, expected_data, f"Data should match for key {keys[i]}")
+            read_data = bytes(large_buffer[offset : offset + result])
+            self.assertEqual(
+                read_data, expected_data, f"Data should match for key {keys[i]}"
+            )
 
         # Test error cases
         # Test with mismatched array sizes
-        mismatched_results = self.store.batch_get_into(keys[:2], buffer_ptrs[:3], buffer_sizes[:3])
-        self.assertEqual(len(mismatched_results), 2, "Should return results for provided keys")
+        mismatched_results = self.store.batch_get_into(
+            keys[:2], buffer_ptrs[:3], buffer_sizes[:3]
+        )
+        self.assertEqual(
+            len(mismatched_results), 2, "Should return results for provided keys"
+        )
         for result in mismatched_results:
             self.assertLess(result, 0, "Should fail with mismatched array sizes")
 
         # Test with empty arrays
         empty_results = self.store.batch_get_into([], [], [])
-        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
+        self.assertEqual(
+            len(empty_results), 0, "Should return empty results for empty input"
+        )
 
         # Cleanup
         time.sleep(default_kv_lease_ttl / 1000)
-        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed",
+        )
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 
@@ -533,7 +561,9 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Allocate one large buffer with significant spacing
         total_buffer_size = buffer_spacing * batch_size
         large_buffer_ptr = self.store.alloc_from_mem_pool(total_buffer_size)
-        large_buffer = (ctypes.c_char * total_buffer_size).from_address(large_buffer_ptr)
+        large_buffer = (ctypes.c_char * total_buffer_size).from_address(
+            large_buffer_ptr
+        )
 
         # Register the entire large buffer once
         result = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
@@ -563,27 +593,43 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(len(results), batch_size, "Should return result for each key")
 
         for i, result in enumerate(results):
-            self.assertEqual(result, 0, f"batch_put_from should succeed for key {keys[i]}")
+            self.assertEqual(
+                result, 0, f"batch_put_from should succeed for key {keys[i]}"
+            )
 
         # Verify data was stored correctly using regular get
         for i, (key, expected_data) in enumerate(zip(keys, test_data)):
             retrieved_data = self.store.get(key)
-            self.assertEqual(retrieved_data, expected_data, f"Data should match after batch_put_from for key {key}")
+            self.assertEqual(
+                retrieved_data,
+                expected_data,
+                f"Data should match after batch_put_from for key {key}",
+            )
 
         # Test error cases
         # Test with mismatched array sizes
-        mismatched_results = self.store.batch_put_from(keys[:2], buffer_ptrs[:3], buffer_sizes[:3])
-        self.assertEqual(len(mismatched_results), 2, "Should return results for provided keys")
+        mismatched_results = self.store.batch_put_from(
+            keys[:2], buffer_ptrs[:3], buffer_sizes[:3]
+        )
+        self.assertEqual(
+            len(mismatched_results), 2, "Should return results for provided keys"
+        )
         for result in mismatched_results:
             self.assertLess(result, 0, "Should fail with mismatched array sizes")
 
         # Test with empty arrays
         empty_results = self.store.batch_put_from([], [], [])
-        self.assertEqual(len(empty_results), 0, "Should return empty results for empty input")
+        self.assertEqual(
+            len(empty_results), 0, "Should return empty results for empty input"
+        )
 
         # Cleanup
         time.sleep(default_kv_lease_ttl / 1000)
-        self.assertEqual(self.store.unregister_buffer(large_buffer_ptr), 0, "Buffer unregistration should succeed")
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed",
+        )
         for key in keys:
             self.assertEqual(self.store.remove(key), 0)
 
@@ -602,23 +648,14 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         pub_key = f"{key}_pub"
         tp_key = f"{key}_tp"
         batch_tp_key = f"{key}_batch_tp"
-        parallel_key = f"{key}_parallel"
-        parallel_batch_keys = [f"{key}_parallel_batch_{i}" for i in range(2)]
-        parallel_from_key = f"{key}_parallel_from"
-        parallel_upsert_key = f"{key}_parallel_upsert"
-        parallel_upsert_from_key = f"{key}_parallel_upsert_from"
         cleanup_keys = [
-            key, key_from, *batch_keys, upsert_key, cuda_upsert_key, pub_key
+            key,
+            key_from,
+            *batch_keys,
+            upsert_key,
+            cuda_upsert_key,
+            pub_key,
         ]
-        cleanup_keys.extend(
-            [
-                parallel_key,
-                *parallel_batch_keys,
-                parallel_from_key,
-                parallel_upsert_key,
-                parallel_upsert_from_key,
-            ]
-        )
         cleanup_keys.extend(f"{tp_key}_tp_{rank}" for rank in range(2))
         cleanup_keys.extend(f"{batch_tp_key}_tp_{rank}" for rank in range(2))
         tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -681,16 +718,12 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             self.assertTrue(torch.equal(self.store.get_tensor(pub_key), tensor + 3))
 
             self.assertEqual(
-                self.store.put_tensor_with_tp(
-                    tp_key, tensor, tp_size=2, split_dim=1
-                ),
+                self.store.put_tensor_with_tp(tp_key, tensor, tp_size=2, split_dim=1),
                 0,
             )
             tp_shards = torch.chunk(tensor, 2, dim=1)
             for rank, expected in enumerate(tp_shards):
-                actual = self.store.get_tensor_with_tp(
-                    tp_key, tp_rank=rank, tp_size=2
-                )
+                actual = self.store.get_tensor_with_tp(tp_key, tp_rank=rank, tp_size=2)
                 self.assertIsNotNone(actual)
                 self.assertTrue(torch.equal(actual, expected.contiguous()))
 
@@ -698,59 +731,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
                 [batch_tp_key], [tensor], tp_size=2, split_dim=1
             )
             self.assertEqual(list(batch_tp_results), [0])
-
-            self.assertEqual(
-                self.store.put_tensor_with_parallelism(parallel_key, tensor),
-                0,
-            )
-            self.assertTrue(torch.equal(self.store.get_tensor(parallel_key), tensor))
-
-            parallel_batch = [tensor + 4, tensor + 5]
-            parallel_batch_results = self.store.batch_put_tensor_with_parallelism(
-                parallel_batch_keys, parallel_batch
-            )
-            self.assertEqual(list(parallel_batch_results), [0, 0])
-            parallel_batch_retrieved = self.store.batch_get_tensor(
-                parallel_batch_keys
-            )
-            for expected, actual in zip(parallel_batch, parallel_batch_retrieved):
-                self.assertIsNotNone(actual)
-                self.assertTrue(torch.equal(actual, expected))
-
-            self.assertEqual(
-                self.store.put_tensor_with_parallelism_from(
-                    parallel_from_key, buffer_ptr, buffer_size
-                ),
-                0,
-            )
-            self.assertTrue(
-                torch.equal(self.store.get_tensor(parallel_from_key), tensor)
-            )
-
-            parallel_update = tensor + 6
-            self.assertEqual(
-                self.store.upsert_tensor_with_parallelism(
-                    parallel_upsert_key, parallel_update
-                ),
-                0,
-            )
-            self.assertTrue(
-                torch.equal(
-                    self.store.get_tensor(parallel_upsert_key), parallel_update
-                )
-            )
-
-            parallel_upsert_from_results = (
-                self.store.batch_upsert_tensor_with_parallelism_from(
-                    [parallel_upsert_from_key], [buffer_ptr], [buffer_size]
-                )
-            )
-            self.assertEqual(list(parallel_upsert_from_results), [0])
-            self.assertTrue(
-                torch.equal(
-                    self.store.get_tensor(parallel_upsert_from_key), tensor
-                )
-            )
         finally:
             self.store.unregister_buffer(buffer_ptr)
             for cleanup_key in cleanup_keys:
@@ -788,8 +768,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         regular_keys = [f"{prefix}_regular_{i}" for i in range(iterations)]
         tensor_keys = [f"{prefix}_tensor_{i}" for i in range(iterations)]
         regular_values = [
-            (f"regular-payload-{i}-".encode() * 4096)
-            for i in range(iterations)
+            (f"regular-payload-{i}-".encode() * 4096) for i in range(iterations)
         ]
         tensors = [
             (torch.arange(4096, dtype=torch.float32) + i).reshape(64, 64)
@@ -852,67 +831,70 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
     # Mark this test as zzz_ so that it is the last test to run
     def zzz_test_dict_fuzz_e2e(self):
-         """End-to-end fuzz test comparing distributed store behavior with dict.
-         Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
-         After testing, all keys are removed.
-         """
-         import random
-         # Local reference dict to simulate expected dict behavior
-         reference = {}
-         operations = 1000
-         # Use a pool of keys to limit memory consumption
-         keys_pool = [f"key_{i}" for i in range(100)]
-         # Track which keys have values assigned to ensure consistency
-         key_values = {}
-         # Fuzz record for debugging in case of errors
-         fuzz_record = []
-         try:
-             for i in range(operations):
-                 op = random.choice(["put", "get", "remove"])
-                 key = random.choice(keys_pool)
-                 if op == "put":
-                     # If key already exists, use the same value to ensure consistency
-                     if key in key_values:
-                         value = key_values[key]
-                         size = len(value)
-                     else:
-                         size = random.randint(1, 64 * 1024 * 1024)
-                         value = os.urandom(size)
-                         key_values[key] = value
+        """End-to-end fuzz test comparing distributed store behavior with dict.
+        Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
+        After testing, all keys are removed.
+        """
+        import random
 
-                     fuzz_record.append(f"{i}: put {key} [size: {size}]")
-                     error_code = self.store.put(key, value)
-                     if error_code == -200:
-                         # The space is not enough, continue to next operation
-                         continue
-                     elif error_code == 0:
-                         reference[key] = value
-                     else:
-                         raise RuntimeError(f"Put operation failed for key {key}. Error code: {error_code}")
-                 elif op == "get":
-                     fuzz_record.append(f"{i}: get {key}")
-                     retrieved = self.store.get(key)
-                     if retrieved != b"": # Otherwise the key may have been evicted
+        # Local reference dict to simulate expected dict behavior
+        reference = {}
+        operations = 1000
+        # Use a pool of keys to limit memory consumption
+        keys_pool = [f"key_{i}" for i in range(100)]
+        # Track which keys have values assigned to ensure consistency
+        key_values = {}
+        # Fuzz record for debugging in case of errors
+        fuzz_record = []
+        try:
+            for i in range(operations):
+                op = random.choice(["put", "get", "remove"])
+                key = random.choice(keys_pool)
+                if op == "put":
+                    # If key already exists, use the same value to ensure consistency
+                    if key in key_values:
+                        value = key_values[key]
+                        size = len(value)
+                    else:
+                        size = random.randint(1, 64 * 1024 * 1024)
+                        value = os.urandom(size)
+                        key_values[key] = value
+
+                    fuzz_record.append(f"{i}: put {key} [size: {size}]")
+                    error_code = self.store.put(key, value)
+                    if error_code == -200:
+                        # The space is not enough, continue to next operation
+                        continue
+                    elif error_code == 0:
+                        reference[key] = value
+                    else:
+                        raise RuntimeError(
+                            f"Put operation failed for key {key}. Error code: {error_code}"
+                        )
+                elif op == "get":
+                    fuzz_record.append(f"{i}: get {key}")
+                    retrieved = self.store.get(key)
+                    if retrieved != b"":  # Otherwise the key may have been evicted
                         expected = reference.get(key, b"")
                         self.assertEqual(retrieved, expected)
-                 elif op == "remove":
-                     fuzz_record.append(f"{i}: remove {key}")
-                     error_code = self.store.remove(key)
-                     # if remove did not fail due to the key has a lease
-                     if error_code != -706:
+                elif op == "remove":
+                    fuzz_record.append(f"{i}: remove {key}")
+                    error_code = self.store.remove(key)
+                    # if remove did not fail due to the key has a lease
+                    if error_code != -706:
                         reference.pop(key, None)
                         # Also remove from key_values to allow new value if key is reused
                         key_values.pop(key, None)
-         except Exception as e:
-             print(f"Error: {e}")
-             print('\nFuzz record (operations so far):')
-             for record in fuzz_record:
-                 print(record)
-             raise e
-         # Cleanup: ensure all remaining keys are removed
-         time.sleep(default_kv_lease_ttl / 1000)
-         for key in list(reference.keys()):
-             self.store.remove(key)
+        except Exception as e:
+            print(f"Error: {e}")
+            print("\nFuzz record (operations so far):")
+            for record in fuzz_record:
+                print(record)
+            raise e
+        # Cleanup: ensure all remaining keys are removed
+        time.sleep(default_kv_lease_ttl / 1000)
+        for key in list(reference.keys()):
+            self.store.remove(key)
 
     def test_replicate_config_creation_and_properties(self):
         """Test ReplicateConfig class creation and property access."""
@@ -938,6 +920,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertIsInstance(config_str, str)
         self.assertIn("3", config_str)  # Should contain replica_num
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     # Show which test is running; stop on first failure
     unittest.main(verbosity=2, failfast=True)
