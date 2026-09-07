@@ -28,6 +28,32 @@ build Mooncake with `-DUSE_NOF=ON`.
 
 ### 2.2 Deploy the Master Service
 
+#### Configure the NVMe-oF Host NQN
+
+Targets that restrict access by Host NQN must allow the identity used by each
+Mooncake process that connects to them, including the master for heartbeat
+probes and clients for NoF I/O. Mooncake trims surrounding ASCII whitespace
+from NQN values and skips values longer than SPDK's 223-byte limit. It resolves
+this identity in order:
+
+1. `MC_NVME_HOSTNQN`, when it contains a non-empty value.
+2. The first line of `/etc/nvme/hostnqn`. Set `MC_NVME_HOSTNQN_PATH` to use a
+   different file; an unset or empty path override uses the default path.
+3. Otherwise, leave SPDK's automatically generated Host NQN unchanged.
+
+For a container without access to the host file, configure the identity directly
+before starting the process:
+
+```bash
+export MC_NVME_HOSTNQN='nqn.2026-08.io.mooncake:service-node-81'
+```
+
+Alternatively, mount the host's NQN file into the container and set
+`MC_NVME_HOSTNQN_PATH` to its path inside the container. Restart the process
+after changing the environment variables or file contents.
+
+#### Start the Master
+
 ```bash
 mooncake_master --rpc_address=192.168.65.81
 ```
