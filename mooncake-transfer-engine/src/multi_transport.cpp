@@ -106,6 +106,11 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    return freeBatchID(batch_id, std::function<void()>());
+}
+
+Status MultiTransport::freeBatchID(BatchID batch_id,
+                                   const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -113,6 +118,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
+    }
+    if (before_delete) {
+        before_delete();
     }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
