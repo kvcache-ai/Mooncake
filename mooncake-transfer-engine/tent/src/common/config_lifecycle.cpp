@@ -18,74 +18,9 @@ namespace mooncake {
 namespace tent {
 namespace {
 
-// Transport namespaces are extension points and therefore use subtree
-// entries. Runtime-eligible exceptions below them are listed as exact fields;
-// classifyConfigPath() resolves those using longest-match semantics.
+// Only runtime candidates need explicit entries. Everything else is
+// bootstrap-only, including new transport namespaces and unknown keys.
 constexpr ConfigFieldSpec kConfigFields[] = {
-    // Bootstrap identity and process-level services.
-    {"local_segment_name", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"metadata_type", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"metadata_servers", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"rpc_server_hostname", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"rpc_server_port", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"rpc_server_threads", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"verbose", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kExact},
-    {"use_legacy_transport_selection", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"enable_progress_worker", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"enable_runtime_queue", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"staging", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kSubtree},
-
-    // Discovery and resource construction.
-    {"topology", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kSubtree},
-    {"transports", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kExact},
-    {"transports/rdma", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/tcp", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/hp_tcp", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/shm", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/nvlink", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/mnnvl", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/gds", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/io_uring", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/ub", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/ascend_direct", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/sunrise_link", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/tpu", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-    {"transports/mpcomm", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kSubtree},
-
-    // Metrics listener construction is bootstrap-only. Its reporting cadence
-    // is a runtime candidate and is overridden below.
-    {"metrics", ConfigLifecycle::kBootstrapOnly, ConfigFieldMatch::kExact},
-    {"metrics/enabled", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"metrics/http_port", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"metrics/http_host", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-    {"metrics/http_server_threads", ConfigLifecycle::kBootstrapOnly,
-     ConfigFieldMatch::kExact},
-
     // Fields that can be represented by an immutable runtime generation.
     {"log_level", ConfigLifecycle::kRuntimeCandidate, ConfigFieldMatch::kExact},
     {"merge_requests", ConfigLifecycle::kRuntimeCandidate,
@@ -173,7 +108,7 @@ ConfigLifecycle classifyConfigPath(std::string_view path) {
             best_match = &field;
         }
     }
-    return best_match ? best_match->lifecycle : ConfigLifecycle::kUnsupported;
+    return best_match ? best_match->lifecycle : ConfigLifecycle::kBootstrapOnly;
 }
 
 const char* configLifecycleName(ConfigLifecycle lifecycle) {
@@ -182,12 +117,8 @@ const char* configLifecycleName(ConfigLifecycle lifecycle) {
             return "bootstrap-only";
         case ConfigLifecycle::kRuntimeCandidate:
             return "runtime-candidate";
-        case ConfigLifecycle::kDerived:
-            return "derived";
-        case ConfigLifecycle::kUnsupported:
-            return "unsupported";
     }
-    return "unsupported";
+    return "unknown";
 }
 
 bool LifecycleConfigView::allows(std::string_view key_path) const {
@@ -232,12 +163,6 @@ TentConfigBundle buildTentConfigBundle(const Config& effective_config,
             bundle.diagnostics.push_back(
                 {ConfigDiagnosticCode::kInvalidRoot, "$",
                  "TENT configuration root must be a JSON object"});
-            continue;
-        }
-        if (classifyConfigPath(path) == ConfigLifecycle::kUnsupported) {
-            bundle.diagnostics.push_back(
-                {ConfigDiagnosticCode::kUnsupportedField, path,
-                 "Unsupported TENT configuration field: " + path});
         }
     }
     return bundle;

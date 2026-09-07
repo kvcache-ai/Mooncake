@@ -34,8 +34,6 @@ namespace tent {
 enum class ConfigLifecycle : uint8_t {
     kBootstrapOnly,
     kRuntimeCandidate,
-    kDerived,
-    kUnsupported,
 };
 
 enum class ConfigFieldMatch : uint8_t {
@@ -49,8 +47,9 @@ struct ConfigFieldSpec {
     ConfigFieldMatch match;
 };
 
-// Return the audited TENT configuration field inventory. When more than one
-// entry matches a path, the most specific (longest) path wins.
+// Return the TENT runtime-candidate allowlist. When more than one entry matches
+// a path, the most specific (longest) path wins. Unmatched paths are
+// bootstrap-only.
 std::span<const ConfigFieldSpec> configFieldInventory();
 
 ConfigLifecycle classifyConfigPath(std::string_view path);
@@ -59,7 +58,6 @@ const char* configLifecycleName(ConfigLifecycle lifecycle);
 
 enum class ConfigDiagnosticCode : uint8_t {
     kInvalidRoot,
-    kUnsupportedField,
 };
 
 struct ConfigDiagnostic {
