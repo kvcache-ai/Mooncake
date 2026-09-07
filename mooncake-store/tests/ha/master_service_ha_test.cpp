@@ -4595,7 +4595,8 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
 }
 #endif
 
-TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
+TEST_F(MasterServiceHATest,
+       BatchEvictQueueSaturationDoesNotRequestAnotherPass) {
     const std::string cluster_id = "test_batch_evict_reservation_failure";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
@@ -4642,7 +4643,7 @@ TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
                   logs.find(warning, first_warning + warning.size()))
             << logs;
         EXPECT_NE(std::string::npos, logs.find("err=-1401")) << logs;
-        EXPECT_TRUE(NeedMemEvictionForTesting(service));
+        EXPECT_FALSE(NeedMemEvictionForTesting(service));
         EXPECT_EQ(1u,
                   ReplicaCountForTesting(service, kDefaultTenant, first_key));
         EXPECT_EQ(1u,
