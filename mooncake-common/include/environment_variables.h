@@ -38,6 +38,12 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
 };
 
+struct FilePerKeyEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FSDIR);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_ENABLE_EVICTION);
+    MC_DEFINE_ENV_VAR(bool, ENABLE_EVICTION);
+};
+
 struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_SETUP_RETRIES);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MIN_PORT);
