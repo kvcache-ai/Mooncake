@@ -19,6 +19,11 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -2247,6 +2252,49 @@ TEST(RdmaNotifyFlushTest, FlushDisabledStillDrainsQueue) {
     EXPECT_TRUE(transport.receiveNotification(list).ok());
     EXPECT_TRUE(list.empty());
 }
+
+#ifdef USE_CUDA
+TEST(RdmaNotifyFlushTest, DestFlushDoesNotCreateIdlePrimaryContexts) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+        GTEST_SKIP() << "need at least 2 CUDA devices";
+    }
+    ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+
+    auto primary_active = [](int device) {
+        CUdevice cu_dev = 0;
+        if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+        unsigned int flags = 0;
+        int active = 0;
+        return cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) ==
+                   CUDA_SUCCESS &&
+               active != 0;
+    };
+
+    constexpr int kIdle = 1;
+    if (primary_active(kIdle)) {
+        GTEST_SKIP() << "cuda:1 already has a primary context";
+    }
+
+    auto topology = std::make_shared<Topology>();
+    for (int i = 0; i < device_count; ++i) {
+        Topology::MemEntry memory;
+        memory.name = "cuda:" + std::to_string(i);
+        memory.type = Topology::MEM_CUDA;
+        memory.numa_node = 0;
+        topology->mem_list_.push_back(std::move(memory));
+    }
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setGpuToGpu(transport, true);
+    transport.addNotificationToQueue("peer", "done");
+
+    std::vector<Notification> list;
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    EXPECT_FALSE(primary_active(kIdle));
+}
+#endif
 
 }  // namespace
 }  // namespace tent

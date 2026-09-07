@@ -21,6 +21,7 @@
 #include <sys/time.h>
 
 #ifdef USE_CUDA
+#include <cuda.h>
 #include <cuda_runtime.h>
 #endif
 
@@ -89,9 +90,32 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
 }
 
 #ifdef USE_CUDA
-// Walk only CUDA devices named in this engine's topology so dest visibility
-// work does not create primary contexts on unused GPUs. Restores the caller's
-// current device. `op` is a log tag (e.g. "gdr-flush").
+// Driver-API probe: true iff this process already has a primary context on
+// `device`. Does not create one. Topology lists every visible GPU for NIC
+// affinity; cudaSetDevice on those names would allocate idle-card contexts
+// (Tone runs --gpus all without CUDA_VISIBLE_DEVICES).
+bool cudaPrimaryContextIsActive(int device) {
+    if (cuInit(0) != CUDA_SUCCESS) return false;
+    CUdevice cu_dev = 0;
+    if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+    unsigned int flags = 0;
+    int active = 0;
+    if (cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) != CUDA_SUCCESS) {
+        return false;
+    }
+    return active != 0;
+}
+
+bool cudaHasCurrentContext() {
+    if (cuInit(0) != CUDA_SUCCESS) return false;
+    CUcontext ctx = nullptr;
+    return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+}
+
+// Walk topology CUDA devices that already have a primary context. Restores
+// the caller's current device only when this thread already had one — a
+// bare cudaGetDevice() can implicitly create GPU 0. `op` is a log tag
+// (e.g. "quiesce", "gdr-flush").
 template <typename Fn>
 void forEachTopologyCudaDevice(const Topology* topology, const char* op,
                                Fn&& on_device) {
@@ -121,7 +145,8 @@ void forEachTopologyCudaDevice(const Topology* topology, const char* op,
     }
 
     int saved = 0;
-    const bool have_saved = cudaGetDevice(&saved) == cudaSuccess;
+    const bool have_saved =
+        cudaHasCurrentContext() && cudaGetDevice(&saved) == cudaSuccess;
     if (!have_saved) (void)cudaGetLastError();
 
     for (size_t i = 0; i < mem_count; ++i) {
@@ -131,6 +156,7 @@ void forEachTopologyCudaDevice(const Topology* topology, const char* op,
         LocationParser parser(mem->name);
         const int device = parser.index();
         if (device < 0 || device >= device_count) continue;
+        if (!cudaPrimaryContextIsActive(device)) continue;
         err = cudaSetDevice(device);
         if (err != cudaSuccess) {
             LOG(WARNING) << "RDMA " << op << " cudaSetDevice(" << device
