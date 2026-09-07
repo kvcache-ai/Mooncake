@@ -250,6 +250,70 @@ TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar cache_size("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576");
+    ScopedEnvVar block_size("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096");
+    ScopedEnvVar shared_cache("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+    ScopedEnvVar admission("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "snapshot_gpu_hot_cache";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+
+    // Populate the key-based cache with the new value after taking the old
+    // snapshot. Keep the read buffer alive until the async cache fill
+    // completes.
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+    bool cache_ready = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (py_client_->acquire_hot_cache(key).has_value()) {
+            ASSERT_TRUE(py_client_->release_hot_cache(key).has_value());
+            cache_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(cache_ready);
+
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, original.size()), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(py_client_->register_buffer(destination, original.size()), 0);
+    registered = true;
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination}, {{key}}, {{{0}}}, {{{0}}},
+                  {{{original.size()}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{32}}}));
+    std::string actual(original.size(), '\0');
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, original);
+}
+
 TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {

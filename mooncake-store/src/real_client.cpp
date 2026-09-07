@@ -3895,7 +3895,10 @@ RealClient::get_into_ranges_internal(
                     if (!allow_query_refresh) {
                         for (size_t k = 0; k < range_results.size(); ++k) {
                             if (dst_offsets[k] > capacities[i] ||
-                                sizes[k] > capacities[i] - dst_offsets[k]) {
+                                sizes[k] > capacities[i] - dst_offsets[k] ||
+                                is_object_range_overflow(
+                                    src_offsets[k], sizes[k],
+                                    static_cast<size_t>(metadata.total_size))) {
                                 continue;
                             }
                             if (metadata.query_result.IsLeaseExpired()) {
@@ -3903,10 +3906,21 @@ RealClient::get_into_ranges_internal(
                                     tl::unexpected(ErrorCode::LEASE_EXPIRED);
                                 continue;
                             }
-                            range_results[k] = execute_ranged_read(
-                                keys[j], buffers[i], dst_offsets[k],
-                                src_offsets[k], sizes[k], metadata, false,
-                                false);
+                            // Even a full-object snapshot read must bypass
+                            // the key-based hot cache, which may hold a newer
+                            // version than the supplied replica descriptor.
+                            std::vector<Slice> slices{
+                                {static_cast<char *>(buffers[i]) +
+                                     dst_offsets[k],
+                                 sizes[k]}};
+                            auto query_result = FilterQueryResult(
+                                metadata.query_result, metadata.replica, false);
+                            auto read = client_->Get(keys[j], query_result,
+                                                     slices, src_offsets[k]);
+                            range_results[k] =
+                                read
+                                    ? tl::expected<int64_t, ErrorCode>(sizes[k])
+                                    : tl::unexpected(read.error());
                         }
                         continue;
                     }
