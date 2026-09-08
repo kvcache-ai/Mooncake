@@ -94,6 +94,23 @@ static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+// Client mass-expiry circuit breaker, armed by default. The rule it applies
+// and the reasoning behind it are written out in one place,
+// MasterService::ClientMonitorFunc. It is armed by default because expiring a
+// client the master only suspects of being dead is unrecoverable, so it gets a
+// named off switch rather than a sentinel value in another flag.
+static constexpr bool DEFAULT_CLIENT_MASS_EXPIRY_GUARD = true;
+// Upper bound on how long the breaker may defer one episode. Past this the
+// master expires the clients, so the breaker cannot defer forever. 0 disables
+// deferral.
+static constexpr int64_t DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC =
+    60;  // in seconds
+// Grace bounds the master accepts. A negative value is not a shorter grace,
+// it is a silently disabled breaker, so the command-line validator and the
+// config-file path both reject one through this predicate.
+inline constexpr bool IsValidClientMassExpiryGraceSec(int64_t grace_sec) {
+    return grace_sec >= 0;
+}
 static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
 static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;

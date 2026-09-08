@@ -130,6 +130,86 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
     }
 }
 
+// The exclusive client_mutex_ hold windows the master has recorded, as the
+// client monitor reads them. Ping needs client_mutex_ shared, so an exclusive
+// holder is the one thing that stops the Ping handler running at all, which
+// makes these windows the cause the monitor judges on rather than the symptom.
+struct ExclusiveClientLockHolds {
+    // Start of a hold that has not been released yet. Such a hold runs to the
+    // present instant, so it overlaps any window that has not closed.
+    std::optional<std::chrono::steady_clock::time_point> in_progress_start;
+    // The most recently released hold's window, [first, second].
+    std::optional<std::pair<std::chrono::steady_clock::time_point,
+                            std::chrono::steady_clock::time_point>>
+        last_completed;
+
+    // Whether any recorded hold overlapped [window_start, window_end].
+    bool Overlaps(std::chrono::steady_clock::time_point window_start,
+                  std::chrono::steady_clock::time_point window_end) const {
+        if (in_progress_start.has_value() && *in_progress_start <= window_end) {
+            return true;
+        }
+        if (last_completed.has_value() && last_completed->first <= window_end &&
+            last_completed->second >= window_start) {
+            return true;
+        }
+        return false;
+    }
+};
+
+// Tracked clients the mass-expiry circuit breaker needs before it treats its
+// own silence as evidence about itself. With two or more clients, hearing from
+// nobody says the master is serving nobody; with exactly one it says only that
+// that client stopped, which is the client's own problem -- the store process
+// restarted or lost its host -- and the master must act on it at once. A
+// single-client cluster is protected by the hold condition instead, which
+// measures the cause rather than the silence.
+inline constexpr size_t kMinTrackedClientsForSilenceEvidence = 2;
+
+// Everything the client monitor's mass-expiry judgement is made from. Grouped
+// so the judgement is a pure function of one tick's readings and can be tested
+// over its boundary cases without running a monitor thread.
+struct ClientMassExpiryInputs {
+    bool guard_enabled = true;
+    std::chrono::seconds grace{0};
+    size_t expired_count = 0;
+    // Clients the monitor tracks, i.e. the size of its own ttl map.
+    size_t tracked_clients = 0;
+    ExclusiveClientLockHolds holds;
+    std::chrono::steady_clock::time_point now{};
+    // Last tick that popped at least one heartbeat, and so the left edge of
+    // the window an exclusive hold has to overlap to explain this tick's
+    // candidates: a hold that released before it is refuted by that heartbeat.
+    std::chrono::steady_clock::time_point last_ping_batch_at{};
+    // Newest deadline among the clients this tick would expire.
+    std::chrono::steady_clock::time_point newest_expired_deadline{};
+    // When the episode in progress began, or nullopt to open a new one at now.
+    std::optional<std::chrono::steady_clock::time_point> episode_since{};
+};
+
+// What the monitor does with one tick's expiry candidates.
+struct ClientMassExpiryDecision {
+    // Either condition holds, so this tick's candidates are an episode the
+    // master cannot distinguish from its own stall.
+    bool is_mass_expiry = false;
+    // Hold the candidates back this tick.
+    bool defer = false;
+    // The episode outlived the grace bound, so the candidates are expired.
+    bool grace_exceeded = false;
+    // An exclusive client_mutex_ hold overlapped the window in which these
+    // clients' heartbeats could have been refreshed.
+    bool exclusive_hold_overlap = false;
+    // No heartbeat was processed after the newest candidate went overdue.
+    bool master_silent = false;
+    std::chrono::steady_clock::duration deferred_for{};
+    std::chrono::steady_clock::duration silent_for{};
+};
+
+// Judge one client-monitor tick. The full reasoning behind the rule lives at
+// its only caller, MasterService::ClientMonitorFunc in master_service.cpp.
+ClientMassExpiryDecision EvaluateClientMassExpiry(
+    const ClientMassExpiryInputs& inputs);
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -2614,6 +2694,61 @@ class MasterService {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
     const int64_t client_live_ttl_sec_;
+    // Client mass-expiry circuit breaker. ClientMonitorFunc carries the rule
+    // and the reasoning behind it.
+    const bool client_mass_expiry_guard_;
+    const std::chrono::seconds client_mass_expiry_grace_;
+
+    // Exclusive client_mutex_ hold windows, as steady_clock nanoseconds since
+    // its epoch, or kNoClientLockHold for "none recorded". Ping needs
+    // client_mutex_ shared, so an exclusive holder stops it running at all;
+    // recording the holds lets ClientMonitorFunc name the cause of a heartbeat
+    // gap instead of inferring one from the gap itself. Only the thread
+    // holding the lock writes these, so relaxed atomics are enough -- the
+    // monitor reads them once a second and a nanosecond either way changes
+    // nothing.
+    static constexpr int64_t kNoClientLockHold =
+        std::numeric_limits<int64_t>::min();
+    std::atomic<int64_t> client_lock_hold_start_ns_{kNoClientLockHold};
+    std::atomic<int64_t> client_lock_last_hold_start_ns_{kNoClientLockHold};
+    std::atomic<int64_t> client_lock_last_hold_end_ns_{kNoClientLockHold};
+
+    // Records one exclusive client_mutex_ hold on the service for the client
+    // monitor to read. Construct it immediately after acquiring the lock, so
+    // that the mutex itself guarantees a single writer, and never at
+    // ClientMonitorFunc's own expiry branch: that branch holds the lock
+    // exclusively too, and a previous tick's expiry work must not come back as
+    // evidence that the master was stalling.
+    class ExclusiveClientLockWindow {
+       public:
+        explicit ExclusiveClientLockWindow(MasterService& service)
+            : service_(service) {
+            service_.client_lock_hold_start_ns_.store(
+                std::chrono::steady_clock::now().time_since_epoch().count(),
+                std::memory_order_relaxed);
+        }
+        ~ExclusiveClientLockWindow() {
+            const int64_t start = service_.client_lock_hold_start_ns_.load(
+                std::memory_order_relaxed);
+            service_.client_lock_last_hold_start_ns_.store(
+                start, std::memory_order_relaxed);
+            service_.client_lock_last_hold_end_ns_.store(
+                std::chrono::steady_clock::now().time_since_epoch().count(),
+                std::memory_order_relaxed);
+            service_.client_lock_hold_start_ns_.store(
+                kNoClientLockHold, std::memory_order_relaxed);
+        }
+        ExclusiveClientLockWindow(const ExclusiveClientLockWindow&) = delete;
+        ExclusiveClientLockWindow& operator=(const ExclusiveClientLockWindow&) =
+            delete;
+
+       private:
+        MasterService& service_;
+    };
+
+    // The recorded hold windows as one snapshot.
+    ExclusiveClientLockHolds ReadExclusiveClientLockHolds() const;
+
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
