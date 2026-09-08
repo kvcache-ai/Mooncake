@@ -1,10 +1,10 @@
 #pragma once
 
-// ObjectEntry: the per-object unit that consolidates the per-key runtime task
-// state that previously lived as N separate MasterService TenantState maps
-// keyed by the same string. The host wires the ObjectMetadata envelope at
-// construction, so a published entry is always fully materialized; the
-// per-object mutex is the mutation boundary.
+// ObjectEntry: the per-object runtime shell. The ObjectMetadata envelope is
+// the single source of identity (user_key, group_id) and group-lease wiring;
+// the entry adds only the per-key task state and the per-object mutation
+// boundary. Previously this state lived as N separate MasterService
+// TenantState maps keyed by the same string.
 
 #include <chrono>
 #include <memory>
@@ -24,13 +24,10 @@ namespace tenant {
 
 class ObjectEntry {
    public:
-    // Takes ownership of a non-null metadata envelope; `key`/`group_id` must
-    // agree with `metadata`'s.
-    ObjectEntry(std::string key, std::string group_id,
-                std::unique_ptr<ObjectMetadata> metadata)
-        : key_(std::move(key)),
-          group_id_(std::move(group_id)),
-          metadata_(std::move(metadata)) {}
+    // Takes ownership of a non-null metadata envelope; the envelope carries
+    // the object's identity (user_key, group_id).
+    explicit ObjectEntry(std::unique_ptr<ObjectMetadata> metadata)
+        : metadata_(std::move(metadata)) {}
 
     // Not copyable/movable: it owns per-object state and a per-object lock.
     ObjectEntry(const ObjectEntry&) = delete;
@@ -38,16 +35,9 @@ class ObjectEntry {
     ObjectEntry(ObjectEntry&&) = delete;
     ObjectEntry& operator=(ObjectEntry&&) = delete;
 
-    const std::string& key() const { return key_; }
-    const std::string& group_id() const { return group_id_; }
-
-    // Authoritative lease: a singleton never sets one (lease() stays null); a
-    // grouped member points at the group's shared Lease so the read path can
-    // extend the group TTL without touching the group table. Written only
-    // before publish or under `mutex` (restore re-wiring); readers hold
-    // `mutex`.
-    std::shared_ptr<Lease> lease() const { return lease_; }
-    void set_lease(std::shared_ptr<Lease> lease) { lease_ = std::move(lease); }
+    // Identity lives in the envelope; these are pass-through views.
+    const std::string& key() const { return metadata_->user_key; }
+    const std::string& group_id() const { return metadata_->group_id; }
 
     // Per-key runtime task state. By convention at most one in-flight task
     // (replication / offload / promotion / dynamic-replication pending) is
@@ -84,9 +74,6 @@ class ObjectEntry {
     }
 
    private:
-    const std::string key_;
-    const std::string group_id_;
-    std::shared_ptr<Lease> lease_;
     std::unique_ptr<ObjectMetadata> metadata_;
 };
 

@@ -18,7 +18,6 @@ namespace {
 std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
                                        const std::string& group_id) {
     return std::make_shared<ObjectEntry>(
-        key, group_id,
         std::make_unique<ObjectMetadata>(
             UUID{1, 2}, std::chrono::system_clock::now(), 128,
             std::vector<Replica>{}, std::nullopt, false,
@@ -184,8 +183,8 @@ TEST(TenantStoreTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
 
     EXPECT_EQ(store.ObjectCount(), 1u);
     EXPECT_EQ(store.Members("g1").size(), 1u);
-    ASSERT_NE(member->lease(), nullptr);  // shared lease wired
-    EXPECT_EQ(member->lease().get(),
+    ASSERT_NE(member->metadata().lease(), nullptr);  // shared lease wired
+    EXPECT_EQ(member->metadata().lease().get(),
               store.LeaseFor("g1").get());  // same single shared lease
 }
 
@@ -197,8 +196,10 @@ TEST(TenantStoreTest, InsertObjectDoesNotJoinForSingleton) {
 
     EXPECT_EQ(store.ObjectCount(), 1u);
     EXPECT_TRUE(store.Members("g1").empty());  // singleton adds no group
-    EXPECT_EQ(singleton->lease(),
-              nullptr);  // own lease wired by caller, not here
+    // A singleton keeps the envelope's own never-granted lease: non-null but
+    // expired, and distinct from any group's shared lease.
+    EXPECT_NE(singleton->metadata().lease(), nullptr);
+    EXPECT_TRUE(singleton->metadata().IsLeaseExpired());
 }
 
 TEST(TenantStoreTest, InsertObjectRejectsDuplicateKey) {

@@ -22,7 +22,7 @@ std::unique_ptr<ObjectMetadata> MakeMetadata(const std::string& user_key) {
 TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
     auto metadata = MakeMetadata("k1");
     auto* raw = metadata.get();
-    auto entry = std::make_shared<ObjectEntry>("k1", "", std::move(metadata));
+    auto entry = std::make_shared<ObjectEntry>(std::move(metadata));
 
     // The envelope is wired from construction on: metadata() returns a
     // reference, so there is nothing to null-check at the call sites.

@@ -1734,7 +1734,6 @@ class MasterService {
             const auto now = std::chrono::system_clock::now();
             EnsureTenantState();
             auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-                object_id_.user_key, group_id,
                 std::make_unique<ObjectMetadata>(
                     client_id, now, total_length, std::move(replicas),
                     std::nullopt, enable_hard_pin, data_type, group_id,
@@ -1761,11 +1760,6 @@ class MasterService {
             // write processing is set by the PutStart/Upsert paths.
             entry_ = entry;
             lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
-            // Keep the metadata lease in sync with the group's shared lease so
-            // the read path (ObjectMetadata::lease_) agrees with the group.
-            if (!group_id.empty()) {
-                entry_->metadata().SetLease(entry_->lease());
-            }
         }
 
        private:

@@ -138,7 +138,7 @@ class TenantStore {
         }
         const std::string group_id = entry->group_id();
         if (!group_id.empty()) {
-            entry->set_lease(LeaseFor(group_id));
+            entry->metadata().SetLease(LeaseFor(group_id));
             if (!AddMember(group_id, entry->key())) {
                 return false;
             }

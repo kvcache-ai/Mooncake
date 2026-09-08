@@ -203,9 +203,10 @@ class MasterServiceTest : public ::testing::Test {
         winner_replicas.emplace_back(
             Replica(client_id, 4096, "host:port", ReplicaStatus::COMPLETE));
         auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(
-            key, "", std::make_unique<ObjectMetadata>(
-                       client_id, std::chrono::system_clock::now(), 4096,
-                       std::move(winner_replicas)));
+            std::make_unique<ObjectMetadata>(
+                client_id, std::chrono::system_clock::now(), 4096,
+                std::move(winner_replicas), std::nullopt, false,
+                ObjectDataType::UNKNOWN, std::string{}, TenantId(), key));
         auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized);
         ASSERT_TRUE(tenant_handle->InsertObject(key, winner));
 

@@ -2388,7 +2388,6 @@ void MasterService::RebuildGroupState() {
                 lease->ExtendTo(it->second);
             }
             metadata.SetLease(lease);
-            entry->set_lease(lease);
         }
     });
 }
@@ -3359,7 +3358,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             auto tenant_handle = GetOrCreateTenantStateHandle(object.tenant_id);
             auto& tenant_state = *tenant_handle;
             auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-                object.user_key, standby_meta.group_id,
                 std::make_unique<ObjectMetadata>(
                     standby_meta.client_id, now, standby_meta.size,
                     std::move(object.replicas), std::nullopt,
@@ -3367,12 +3365,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                     standby_meta.data_type, standby_meta.group_id,
                     object.tenant_id, object.user_key));
             tenant_state.InsertObject(object.user_key, entry);
-            if (!standby_meta.group_id.empty()) {
-                // InsertObject wired the ObjectEntry lease to the group's
-                // shared lease; the read path reads ObjectMetadata::lease_, so
-                // mirror it.
-                entry->metadata().SetLease(entry->lease());
-            }
             entry->is_processing = false;
         }
         restored_object_count += objects.size();
@@ -4358,7 +4350,6 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-        key, group_id,
         std::make_unique<ObjectMetadata>(
             client_id, now, value_length, std::move(replicas),
             std::move(committed_soft_pin_timeout), config.with_hard_pin,
@@ -4385,11 +4376,6 @@ auto MasterService::AllocateAndInsertMetadata(
     if (deadline_to_index) {
         soft_pin_deadline_index_.Upsert(tenant_id.MakeScopedKey(key),
                                         *deadline_to_index);
-    }
-    // Wire grouped objects to the group's shared lease; ungrouped objects keep
-    // the per-object lease created at construction.
-    if (!group_id.empty()) {
-        entry->metadata().SetLease(entry->lease());
     }
     entry->is_processing = true;
 
@@ -11861,7 +11847,6 @@ MasterService::MetadataSerializer::DeserializeTenant(
         auto& tenant_state = *tenant_handle;
         const std::string user_key = key;
         auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-            std::move(key), metadata_ptr->group_id,
             std::make_unique<ObjectMetadata>(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,

@@ -640,7 +640,6 @@ class MasterServiceHATest : public ::testing::Test {
         auto entry = tenant_state.Pin(key);
         if (!entry) {
             entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-                key, "",
                 std::make_unique<ObjectMetadata>(
                     holder_id, std::chrono::system_clock::now(), object_size,
                     std::vector<Replica>{}, std::nullopt, false,
