@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import uuid
+from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -972,11 +973,16 @@ class MooncakeBundleTransfer:
         result = _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
         )
+        destination_batch = (
+            _dataproto_result_batch_mapping(result)
+            if any(read.destination is not None for read in matrix_reads)
+            else None
+        )
         for read in matrix_reads:
             value = read.finish(staged_matrices[read.name])
-            if read.destination is not None:
+            if destination_batch is not None and read.destination is not None:
                 batch[read.name] = value
-                _rebind_dataproto_batch_value(result, read.name, value)
+                destination_batch[read.name] = value
         return result
 
     def _read_dataproto_matrices(
@@ -2094,22 +2100,17 @@ def _build_dataproto_like_result(
         ) from error
 
 
-def _rebind_dataproto_batch_value(result: Any, name: str, value: Any) -> None:
-    """Update a constructed DataProto result after committing a destination."""
+def _dataproto_result_batch_mapping(result: Any) -> MutableMapping[str, Any]:
+    """Return the mutable batch mapping of a constructed DataProto result."""
     if isinstance(result, Mapping):
         batch = result.get("batch")
     else:
         batch = getattr(result, "batch", None)
-    if batch is None:
-        raise TypeError(
-            "DataProto result has no batch mapping when using destinations"
-        )
-    try:
-        batch[name] = value
-    except (AttributeError, TypeError) as error:
+    if not isinstance(batch, MutableMapping):
         raise TypeError(
             "DataProto result batch must be mutable when using destinations"
-        ) from error
+        )
+    return batch
 
 
 def _split_dataproto_like(

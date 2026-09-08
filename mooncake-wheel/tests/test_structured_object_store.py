@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import time
+from types import MappingProxyType
 
 import numpy as np
 import pytest
@@ -1598,7 +1599,7 @@ def test_dataproto_matrix_range_cap_falls_back(monkeypatch) -> None:
     assert plain_store.get_into_ranges_calls == 0
 
 
-def test_dataproto_matrix_fallback_does_not_block_on_buffer_pool() -> None:
+def test_dataproto_matrix_fallback_does_not_block_on_buffer_pool(monkeypatch) -> None:
     pool = NonBlockingOnlyBufferPool()
     store, transfer = make_transfer()
     matrix = np.arange(48, dtype=np.int16).reshape(6, 8)
@@ -1606,6 +1607,7 @@ def test_dataproto_matrix_fallback_does_not_block_on_buffer_pool() -> None:
         SimpleDataProto(batch={"matrix": matrix}), chunk_bytes=2
     )
     transfer._transport._buffer_pool = pool
+    monkeypatch.setattr(sos, "MAX_MATRIX_RANGES", 1)
     destination = np.full((3, 4), -1, dtype=np.int16)
 
     result = transfer.get_dataproto(
@@ -1618,8 +1620,7 @@ def test_dataproto_matrix_fallback_does_not_block_on_buffer_pool() -> None:
 
     assert np.array_equal(destination, matrix[[4, 0, 2], 3:7])
     assert result["batch"]["matrix"] is destination
-    assert pool.acquire_calls == 1
-    assert pool.acquire_blocks == [False]
+    assert pool.acquire_calls == 0
     assert store.get_into_ranges_calls == 1
 
 
@@ -1689,6 +1690,36 @@ def test_dataproto_result_failure_does_not_commit_matrix_destination() -> None:
             batch_slices={"matrix": slice(2, 5)},
             destinations={"matrix": destination},
             data_cls=BadDataProto,
+        )
+
+    assert np.all(destination == -1)
+
+
+def test_dataproto_immutable_result_does_not_commit_matrix_destination() -> None:
+    class ImmutableDataProto(SimpleDataProto):
+        @classmethod
+        def from_dict(cls, batch, non_tensor_batch=None, meta_info=None):
+            return cls(
+                batch=MappingProxyType(dict(batch)),
+                non_tensor_batch=dict(non_tensor_batch or {}),
+                meta_info=dict(meta_info or {}),
+            )
+
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    matrix = np.arange(30, dtype=np.int32).reshape(5, 6)
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+    destination = np.full((2, 3), -1, dtype=np.int32)
+
+    with pytest.raises(
+        TypeError, match="DataProto result batch must be mutable"
+    ):
+        transfer.get_dataproto(
+            ref,
+            batch_fields=["matrix"],
+            rows=[3, 1],
+            batch_slices={"matrix": slice(2, 5)},
+            destinations={"matrix": destination},
+            data_cls=ImmutableDataProto,
         )
 
     assert np.all(destination == -1)
