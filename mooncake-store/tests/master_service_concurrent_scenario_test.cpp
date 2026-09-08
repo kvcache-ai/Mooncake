@@ -102,6 +102,21 @@ TEST(MasterServiceConcurrentScenarioTest, RemoveAllSweepsAroundInFlightWrites) {
         .Then(Object("write-race-3-99").DoesNotExist());
 }
 
+TEST(MasterServiceConcurrentScenarioTest, RemoveAllPreservesInFlightWrite) {
+    MasterScenario scenario("an in-flight write completes after RemoveAll",
+                            LeaseConfig(0));
+    scenario.Given(MemoryNode("memory"))
+        .When(PutStart("completed", 1_KB))
+        .When(PutEnd("completed"))
+        .When(PutStart("in-flight", 1_KB))
+        .When(RemoveAll().ExpectRemoved(1))
+        .Then(Object("completed").DoesNotExist())
+        .When(PutEnd("in-flight"))
+        .Then(Object("in-flight").IsReadable())
+        .When(RemoveAll().ExpectRemoved(1))
+        .Then(Object("in-flight").DoesNotExist());
+}
+
 TEST(MasterServiceConcurrentScenarioTest, LeasedReadsHoldOffARacingRemoveAll) {
     constexpr size_t kObjectCount = 1000;
     constexpr uint64_t kLeaseTtlMs = 200;

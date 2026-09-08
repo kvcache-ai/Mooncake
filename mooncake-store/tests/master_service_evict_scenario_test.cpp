@@ -625,6 +625,25 @@ TEST_F(MasterServiceEvictScenarioTest, AllocationPressureEvictsOldestFirst) {
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
+       ClientRequestedSoftPinsSurviveAllocationPressure) {
+    constexpr uint64_t kObjectSize = 1024 * 1024;
+    MasterScenario scenario("client-requested soft pins survive pressure",
+                            PressureConfig(true));
+    scenario.Given(MemoryNode("memory").Capacity(16 * 1024 * 1024))
+        .Given(IndexedObjects(0, 2)
+                   .Size(kObjectSize)
+                   .CompleteOn("memory")
+                   .WithSoftPin())
+        .Given(IndexedObjects(2, 14).Size(kObjectSize).CompleteOn("memory"))
+        .When(PutStart(Key(14), 3 * kObjectSize)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(Key(14)))
+        .Then(IndexedObjects(0, 2).AreReadable())
+        .Then(Object(Key(14)).IsReadable())
+        .Then(ReadableCount(IndexedObjects(2, 14), 9));
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
        PressureEvictsUnpinnedObjectsBeforeSoftPinned) {
     constexpr uint64_t kLargeObject = 1024 * 1024;
     const auto active_pin =
