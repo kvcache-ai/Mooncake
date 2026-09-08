@@ -22,7 +22,7 @@
 #include "segment.h"
 #include "serialize/serializer.h"
 #include "types.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake::test {
 
