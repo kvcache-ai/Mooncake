@@ -57,14 +57,6 @@ struct FdGuard {
 
 namespace mooncake {
 
-bool FilePerKeyConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
-        return false;
-    }
-    return true;
-}
-
 bool BucketBackendConfig::Validate() const {
     if (bucket_keys_limit <= 0) {
         LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
@@ -75,18 +67,6 @@ bool BucketBackendConfig::Validate() const {
         return false;
     }
     return true;
-}
-
-FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
-    FilePerKeyConfig config;
-
-    config.fsdir = Environ::GetString("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
-
-    config.enable_eviction = Environ::GetBool(
-        "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
-        Environ::GetBool("ENABLE_EVICTION", config.enable_eviction));
-
-    return config;
 }
 
 BucketBackendConfig BucketBackendConfig::FromEnvironment() {

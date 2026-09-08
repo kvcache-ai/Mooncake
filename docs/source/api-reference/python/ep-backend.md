@@ -412,6 +412,80 @@ matching dispatch `handle` and pass the resulting tensor back to `combine()` wit
 Reconnects EP peers after backend membership changes. Call it after PG recovery
 updates rank activeness so EP transport metadata and QPs can be refreshed.
 
+## Default NCCL backend for `ElasticBuffer`
+
+`mooncake.mooncake_elastic_buffer.ElasticBuffer` now defaults to
+`transport="auto"`. Auto mode uses NCCL when the extension was built with the
+NCCL Device API and the inferred EP topology is supported by the compiled NCCL
+kernels. Existing constructor calls require no changes. If NCCL cannot be
+used, auto mode falls back to IPC + IBGDA and retains the previous backend
+behavior. As before, the requested workload must have a compiled elastic kernel
+shape.
+
+NCCL support is opt-in. Build with
+`-DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON`; the option defaults to
+`OFF`. NCCL-enabled EP extensions currently link directly to `libnccl`, so
+importing `mooncake.ep` requires a matching NCCL runtime even when the NCCL
+transport is not selected. Keep the option disabled for deployments that must
+remain compatible with older NCCL runtimes.
+
+No application-side communicator bootstrap is required. Auto mode creates one
+NCCL unique ID on process-group rank zero and broadcasts it to the group:
+
+```python
+import torch.distributed as dist
+
+from mooncake.mooncake_elastic_buffer import ElasticBuffer
+
+# Run this program with torchrun so rank metadata is available.
+dist.init_process_group(backend="nccl")
+buffer = ElasticBuffer(
+    dist.group.WORLD,
+    num_max_tokens_per_rank=128,
+    hidden=4096,
+    num_topk=8,
+)
+print(f"Mooncake EP selected {buffer.transport}")
+
+try:
+    # Call buffer.dispatch(...) and buffer.combine(...).
+    pass
+finally:
+    # Deterministic collective cleanup is recommended when NCCL was selected.
+    buffer.destroy()
+
+dist.destroy_process_group()
+```
+
+For a controlled rollout, pass `transport="ibgda"` or set
+`MOONCAKE_EP_TRANSPORT=ibgda`. Explicit `transport="nccl"` disables automatic
+fallback and reports an error if NCCL support is unavailable. The
+`explicitly_destroy` argument remains optional for compatibility with the
+DeepEP API; calling `destroy()` collectively is still the most predictable way
+to release NCCL symmetric windows before destroying the process group.
+
+The NCCL backend currently has the following constraints:
+
+- It requires NCCL 2.30.4 or newer with Device API and GIN support. The NCCL
+  headers used to build Mooncake must exactly match the loaded `libnccl`.
+  Rebuild Mooncake after an NCCL upgrade. If PyTorch would load another NCCL
+  first, configure or preload the matching runtime before initializing the
+  process group.
+- Process-group ranks must form contiguous, equal-sized NCCL LSA teams. The
+  compiled kernels support one team of two or eight GPUs (`1x2` or `1x8`), two
+  teams of four or eight GPUs (`2x4` or `2x8`), and four teams of four GPUs
+  (`4x4`). Cross-team communication uses hybrid mode and rail GIN. Auto mode
+  selects IPC + IBGDA for other shapes.
+- Groups with more than one rank request GIN resources, including runs whose
+  data path remains inside one LSA team.
+- Communicator membership is fixed. Create a new `ElasticBuffer` instead of
+  calling `update_ep_member()` after membership changes.
+- A rank-local failure before the internal status collective is established
+  (for example, mismatched configuration/runtime or failure to allocate its
+  minimal CUDA control resources) is not recoverable in place and may require
+  restarting the process group. Use identical NCCL/CUDA configuration on every
+  rank.
+
 ## Active-rank tensors: PG vs EP
 
 There are two active-rank tensors in the API surface:

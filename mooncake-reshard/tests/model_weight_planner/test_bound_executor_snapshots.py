@@ -31,7 +31,7 @@ from mooncake.reshard.weight._planner.contracts import (
 )
 from mooncake.reshard.weight.storage_manifest import (
     StoredFragmentSnapshot,
-    WeightManifest,
+    StoredWeightManifest,
 )
 
 from .helpers import RuntimeInputs, plan_transfer, rebuild_placement, tp_manifests
@@ -456,7 +456,7 @@ def test_bound_stored_plan_rejects_coordinated_fragment_forgery_after_pickle() -
         worker_prefix="target",
     )
     group_id = "weights/default/qwen3.5-0.8b/step-42/1"
-    source_manifest = WeightManifest(
+    source_manifest = StoredWeightManifest(
         namespace="default",
         resource_id=target.placement.resource_id,
         revision=target.placement.revision,

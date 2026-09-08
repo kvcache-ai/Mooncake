@@ -38,6 +38,12 @@ struct FileStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_USE_URING);
 };
 
+struct FilePerKeyEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFLOAD_FSDIR);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OFFLOAD_ENABLE_EVICTION);
+    MC_DEFINE_ENV_VAR(bool, ENABLE_EVICTION);
+};
+
 struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_SETUP_RETRIES);
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MIN_PORT);
@@ -98,6 +104,23 @@ struct OffsetAllocatorBackendEnvironmentVariables {
 struct ReplicaSelectionEnvironmentVariables {
     // Only the exact string "1" enables scoring, unlike canonical bool parsing.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_REPLICA_SCORING);
+};
+
+struct RpcTimeoutEnvironmentVariables {
+    // Preserve atoll parsing: empty/nonnumeric values become zero, and numeric
+    // prefixes are accepted, unlike the shared typed integer parser.
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_TIMEOUT_MS);
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_CONNECT_TIMEOUT_MS);
+};
+
+struct LocalFileSnapshotEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
+};
+
+struct TransferSubmitterEnvironmentVariables {
+    // Keep the raw string to preserve the legacy token set, whitespace,
+    // invalid-value fallback, and warning behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
 };
 
 #undef MC_DEFINE_ENV_VAR
