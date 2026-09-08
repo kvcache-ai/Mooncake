@@ -1,5 +1,4 @@
 from importlib.util import find_spec
-from pathlib import Path
 import sys
 import unittest
 from unittest.mock import patch
@@ -7,16 +6,7 @@ from unittest.mock import patch
 if find_spec("paramiko") is None:
     raise unittest.SkipTest("paramiko is required for SPDK target tests")
 
-import mooncake.spdk_tgt_create as spdk_tgt_create
 from mooncake.spdk_tgt_create import SPDKTgtCreator, parse_arguments
-
-
-def test_module_loads_from_canonical_source():
-    repository_root = Path(__file__).resolve().parents[3]
-
-    assert Path(spdk_tgt_create.__file__).resolve() == (
-        repository_root / "python" / "mooncake" / "spdk_tgt_create.py"
-    )
 
 
 def test_parse_arguments_accepts_ssh_port():

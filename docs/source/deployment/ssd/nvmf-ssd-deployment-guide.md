@@ -95,15 +95,9 @@ If a timeout error occurs during startup, check whether a proxy is configured on
 
 ### 3.2 Install SSH Dependencies
 
-Install the administration extra for the Mooncake distribution used by the
-deployment. For the default CUDA distribution, run:
-
 ```bash
-python3 -m pip install "mooncake-transfer-engine[administration]"
+python3 -m pip install "paramiko>=3.4.0"
 ```
-
-For another hardware variant, substitute its distribution name while keeping
-the `[administration]` extra.
 
 ### 3.3 Deploy the SSD Pool
 
