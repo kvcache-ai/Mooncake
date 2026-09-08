@@ -204,6 +204,10 @@ class TransferEngine {
         friend class TransferEngine;
     };
 
+    // Under TENT, scatter pins a direct transport route that supports
+    // post-submit cancellation. Non-cancellable and staged routes are
+    // rejected before transport work is published; runtime queue admission
+    // and automatic failover are not used for this operation.
     ScatterTransferOperation submitScatter(
         const std::vector<ScatterTransferRange>& ranges);
     Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
@@ -312,6 +316,9 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    Status submitScatterTransfer(BatchID batch_id,
+                                 const std::vector<TransferRequest>& entries);
+
     std::shared_ptr<mooncake::tent::Config> buildTentConfig(
         const std::string& metadata_conn_string,
         const std::string& local_server_name) const;

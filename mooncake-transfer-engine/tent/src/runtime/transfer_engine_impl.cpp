@@ -1625,6 +1625,7 @@ struct TransferEngineImpl::PreparedSubmit {
 
     std::chrono::steady_clock::time_point submit_time{};
     LogicalTransferRuntimePolicy runtime_policy;
+    bool require_post_submit_cancellation{false};
     std::vector<Task> tasks;
     std::vector<Owner> owners;
 };
@@ -1989,7 +1990,7 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
 
 Status TransferEngineImpl::prepareSubmit(
     Batch* batch, const std::vector<Request>& request_list,
-    PreparedSubmit& prepared) {
+    PreparedSubmit& prepared, bool require_post_submit_cancellation) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
     for (size_t i = 0; i < request_list.size(); ++i) {
         auto st = validateTransportHint(request_list[i], i);
@@ -1997,6 +1998,8 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared = PreparedSubmit{};
+    prepared.require_post_submit_cancellation =
+        require_post_submit_cancellation;
     auto runtime_config = std::atomic_load_explicit(&runtime_config_snapshot_,
                                                     std::memory_order_acquire);
     prepared.runtime_policy.config_generation = runtime_config->generation;
@@ -2004,6 +2007,10 @@ Status TransferEngineImpl::prepareSubmit(
         runtime_config->max_failover_attempts;
     prepared.runtime_policy.enable_auto_failover_on_poll =
         runtime_config->enable_auto_failover_on_poll;
+    if (require_post_submit_cancellation) {
+        prepared.runtime_policy.max_failover_attempts = 0;
+        prepared.runtime_policy.enable_auto_failover_on_poll = false;
+    }
     const size_t start_task_id = batch->task_list.size();
     prepared.submit_time = std::chrono::steady_clock::now();
     auto merge_boundaries =
@@ -2051,12 +2058,28 @@ Status TransferEngineImpl::prepareSubmit(
         PreparedSubmit::Owner owner;
         owner.request = request;
         owner.route = resolveTransport(owner.request, 0);
+        if (require_post_submit_cancellation) {
+            const auto type = owner.route.transport;
+            if (type == UNSPEC || type < 0 ||
+                type >= static_cast<TransportType>(kSupportedTransportTypes) ||
+                !transport_list_[type] ||
+                !transport_list_[type]->supportsCancellation()) {
+                return Status::NotImplemented(
+                    "scatter transfer requires a cancellable "
+                    "transport" LOC_MARK);
+            }
+        }
         owner.staging_params = owner.route.staging_params;
         if (owner.staging_params.empty() &&
             (owner.route.transport == TCP || owner.route.transport == HP_TCP)) {
             findStagingPolicy(owner.request, owner.staging_params);
         }
         owner.staging = !owner.staging_params.empty() && staging_proxy_;
+        if (require_post_submit_cancellation && owner.staging) {
+            return Status::NotImplemented(
+                "scatter transfer does not support staged TENT "
+                "routes" LOC_MARK);
+        }
         prepared.owners.push_back(std::move(owner));
     }
 
@@ -2576,6 +2599,7 @@ bool TransferEngineImpl::hasActiveRuntimeQueue() {
 bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
                                            QueueOwnerKind owner_kind) const {
     if (!runtime_queue_config_.enabled) return false;
+    if (prepared.require_post_submit_cancellation) return false;
     if (owner_kind == QueueOwnerKind::StagingInternal) return true;
     return std::none_of(
         prepared.owners.begin(), prepared.owners.end(),
@@ -2584,13 +2608,15 @@ bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
 
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
-    const Notification* notifi, QueueOwnerKind owner_kind) {
+    const Notification* notifi, QueueOwnerKind owner_kind,
+    bool require_post_submit_cancellation) {
     Batch* batch = nullptr;
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
     const size_t start_task_id = batch_ref.get()->task_list.size();
     PreparedSubmit prepared;
-    CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared));
+    CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared,
+                               require_post_submit_cancellation));
 
     if (shouldQueueSubmit(prepared, owner_kind)) {
         CHECK_STATUS(
@@ -2615,6 +2641,12 @@ Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list) {
     return submitTransfer(batch_id, request_list, nullptr,
                           QueueOwnerKind::User);
+}
+
+Status TransferEngineImpl::submitTransferRequiringPostSubmitCancellation(
+    BatchID batch_id, const std::vector<Request>& request_list) {
+    return submitTransfer(batch_id, request_list, nullptr, QueueOwnerKind::User,
+                          true);
 }
 
 Status TransferEngineImpl::submitStagingTransfer(
@@ -2976,6 +3008,20 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;
+        for (size_t alias_id = 0; alias_id < batch->task_list.size();
+             ++alias_id) {
+            auto& alias = batch->task_list[alias_id];
+            if (!alias.derived || alias.physical_owner_task_id != task_id)
+                continue;
+            alias.type = task.type;
+            alias.sub_task_id = task.sub_task_id;
+            alias.status = task.status;
+            alias.failover_count = task.failover_count;
+            alias.xport_priority = task.xport_priority;
+            alias.device_mask = task.device_mask;
+            alias.qp_pool = task.qp_pool;
+            alias.staging = task.staging;
+        }
     }
 }
 
