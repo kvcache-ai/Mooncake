@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "common/client_buffer_allocation.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -28,7 +29,8 @@
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
-#include "utils.h"
+#include "common/network.h"
+#include "common/result.h"
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"

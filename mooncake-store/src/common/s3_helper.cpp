@@ -1,4 +1,4 @@
-#include "utils/s3_helper.h"
+#include "common/s3_helper.h"
 
 #include <aws/s3/model/PutObjectRequest.h>
 #include <aws/s3/model/GetObjectRequest.h>
@@ -33,7 +33,7 @@
 #include "crc32c.h"
 #include "environ.h"
 #include "fmt/format.h"
-#include "utils/base64.h"
+#include "common/base64.h"
 
 namespace mooncake {
 

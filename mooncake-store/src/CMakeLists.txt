@@ -3,15 +3,14 @@ add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
-    utils.cpp
-    mmap_arena.cpp
+    common/network.cpp
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
-    utils/file_util.cpp)
+    common/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
@@ -72,7 +71,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
-    client_buffer_allocation.cpp
+    common/client_buffer_allocation.cpp
+    mmap_arena.cpp
+    common/mmap_buffer.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
@@ -168,7 +169,7 @@ if(AWSSDK_FOUND)
   message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
   set(HAVE_AWS_SDK TRUE)
   # Add S3 related source files
-  list(APPEND MOONCAKE_STORE_MASTER_SOURCES utils/s3_helper.cpp)
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES common/s3_helper.cpp)
 else()
   message(STATUS "AWS SDK not found, S3 functionality will be disabled")
   set(HAVE_AWS_SDK FALSE)

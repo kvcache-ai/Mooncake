@@ -109,6 +109,10 @@ add_store_test(master_service_offload_scenario_test
                master_service_offload_scenario_test.cpp)
 target_link_libraries(master_service_offload_scenario_test
                       PRIVATE master_service_test_dsl)
+add_store_test(master_service_concurrent_scenario_test
+               master_service_concurrent_scenario_test.cpp)
+target_link_libraries(master_service_concurrent_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
@@ -184,7 +188,10 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
-add_store_test(utils_test utils_test.cpp)
+add_store_test(byte_size_test byte_size_test.cpp)
+add_store_test(network_test network_test.cpp)
+add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
+add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)

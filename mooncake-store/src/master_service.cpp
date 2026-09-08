@@ -53,12 +53,11 @@
 #include "types.h"
 #include "serialize/serializer.h"
 #include "ha/snapshot/snapshot_logger.h"
-#include "utils/zstd_util.h"
-#include "utils/file_util.h"
+#include "common/zstd_util.h"
+#include "common/file_util.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
-#include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
 #include "master_snapshot_repository.h"
@@ -724,6 +723,17 @@ void MasterService::SetBatchOpLogWriterFactoryForTesting(
     assert(factory);
     assert(!ordered_oplog_writer_);
     batch_oplog_writer_factory_ = std::move(factory);
+}
+
+void MasterService::SetBatchOpLogTerminalCallback(
+    OrderedOpLogWriter::TerminalCallback callback) {
+    if (ordered_oplog_writer_) {
+        ordered_oplog_writer_->SetTerminalCallback(std::move(callback));
+    }
+}
+
+void MasterService::StopBatchOpLogWriter() {
+    if (ordered_oplog_writer_) ordered_oplog_writer_->Stop();
 }
 
 void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
@@ -4295,7 +4305,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     if (use_disk_replica_) {
         std::string file_path =
-            ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
+            FileUtil::ResolvePathFromKey(key, root_fs_dir_, cluster_id_);
         replicas.emplace_back(file_path, value_length,
                               ReplicaStatus::PROCESSING);
     }

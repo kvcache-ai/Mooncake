@@ -4,6 +4,7 @@
 #include <chrono>
 #include <thread>
 
+#include "common/byte_size.h"
 #include "version.h"
 
 namespace mooncake {

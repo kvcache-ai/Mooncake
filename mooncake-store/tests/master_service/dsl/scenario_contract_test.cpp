@@ -481,4 +481,62 @@ TEST(MasterScenarioContractTest, CompletesOffloadUsingRecordedPutStartSize) {
                   .HasLocalDiskReplicas(1));
 }
 
+TEST(MasterScenarioContractTest, ReportsRacePutStartAdmissionMismatch) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("race put start admission mismatch")
+            .Given(MemoryNode("memory"))
+            .When(RacePutStart("key", 1_KB).Threads(2).ExpectSuccesses(2)),
+        "RacePutStart(key) admitted 1 writers; expected 2");
+}
+
+TEST(MasterScenarioContractTest, ReportsRaceMountUnmountWithoutNodes) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("race mount unmount without nodes")
+                                .Given(MemoryNode("memory"))
+                                .When(RaceMountUnmount("race").Nodes(0)),
+                            "RaceMountUnmount requires nodes and iterations");
+}
+
+TEST(MasterScenarioContractTest, ReportsRaceMountLocalDiskFailure) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("race local disk mounts without offload mode")
+            .Given(MemoryNode("memory"))
+            .When(RaceMountLocalDisk("client").Clients(1)),
+        "RaceMountLocalDisk(client) mount failed: UNABLE_OFFLOAD");
+}
+
+TEST(MasterScenarioContractTest, ReportsRaceWritesWithoutWriters) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("race writes without writers")
+            .Given(MemoryNode("memory"))
+            .When(RaceWritesWithRemoveAll("race").Writers(0)),
+        "RaceWritesWithRemoveAll requires writers and objects");
+}
+
+TEST(MasterScenarioContractTest, ReportsRaceReadsWithoutKeys) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("race reads without keys")
+                                .Given(MemoryNode("memory"))
+                                .When(RaceReadsWithRemoveAll({})),
+                            "RaceReadsWithRemoveAll requires at least one key");
+}
+
+TEST(MasterScenarioContractTest, ReportsRaceRemoveAllCountMismatch) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("race remove all count mismatch")
+            .Given(MemoryNode("memory"))
+            .Given(Objects({"key"}).Size(1_KB).CompleteOn("memory").ExpiredFrom(
+                std::chrono::system_clock::now() - std::chrono::hours(1)))
+            .When(RaceRemoveAll().ExpectTotalRemoved(2)),
+        "RaceRemoveAll removed 1 objects; expected 2");
+}
+
+TEST(MasterScenarioContractTest, ReportsMissingOffloadTasksWhenSomeExpected) {
+    MasterScenario scenario("offload heartbeat expected some tasks",
+                            ContractOffloadConfig());
+    scenario.Given(MemoryNode("memory")).When(MountLocalDisk("memory"));
+    EXPECT_NONFATAL_FAILURE(
+        scenario.When(OffloadHeartbeat("memory").ExpectSomeTasks()),
+        "OffloadHeartbeat(memory) returned no offload tasks; expected at "
+        "least one");
+}
+
 }  // namespace mooncake::test

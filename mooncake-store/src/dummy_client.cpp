@@ -14,9 +14,10 @@
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "common/client_buffer_allocation.h"
 #include "uds_transport.h"
-#include "utils.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/result.h"
+#include "common/scoped_vlog_timer.h"
 #include "rpc_types.h"
 #include "types.h"
 #include "default_config.h"
