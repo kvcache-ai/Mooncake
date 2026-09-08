@@ -255,8 +255,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
+    // Legacy metadata-bucket placement (std::hash % 1024); carries no
+    // behavioral meaning under per-tenant routing.
     uint32_t GetShardIndexForTest(const std::string& key) {
-        return static_cast<uint32_t>(service_->getShardIndex(key));
+        return static_cast<uint32_t>(std::hash<std::string>{}(key) % 1024);
     }
 
     tl::expected<void, SerializationError> DeserializeMetadataForTest(
@@ -278,10 +280,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,
                                             const std::string& key) {
-        const size_t key_shard = svc->getShardIndex(key);
+        const size_t key_shard =
+            std::hash<std::string>{}(key) % 1024;
         for (int i = 0; i < 1024; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
-            if (svc->getShardIndex(group_id) != key_shard) {
+            if (std::hash<std::string>{}(group_id) % 1024 != key_shard) {
                 return group_id;
             }
         }

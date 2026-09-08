@@ -50,6 +50,15 @@ class MetadataCatalog {
     // empty-tenant reclamation — see the retention note in MasterService).
     void Remove(const TenantId& tenant_id) { tenants_.Remove(tenant_id); }
 
+    // Rebuild group membership and shared-lease deadlines from object metadata
+    // in every tenant (snapshot / standby restore path).
+    void RebuildGroupState() {
+        tenants_.Visit([](const TenantId&,
+                          const std::shared_ptr<TenantCatalog>& handle) {
+            handle->RebuildGroupState();
+        });
+    }
+
    private:
     TenantDirectory<std::shared_ptr<TenantCatalog>> tenants_;
 };

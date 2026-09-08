@@ -1651,15 +1651,6 @@ MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
     return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
-void MasterService::UnregisterGroupMember(TenantCatalog& tenant_state,
-                                          const std::string& key,
-                                          const std::string& group_id) {
-    if (group_id.empty()) {
-        return;
-    }
-    tenant_state.group_index.RemoveMember(group_id, key);
-}
-
 MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     const TenantId& tenant_id, const std::string& key,
     const std::string& group_id, bool allow_soft_pinned,
@@ -2320,7 +2311,7 @@ void MasterService::EraseMetadata(
     if (had_completed_disk && tenant_accessor) {
         tenant_accessor->OnDiskReplicaRemoved(had_completed_disk);
     }
-    UnregisterGroupMember(tenant_state, key, group_id);
+    tenant_state.UnregisterGroupMember(key, group_id);
 }
 
 void MasterService::ReleaseLocalDiskUsage(
@@ -2345,62 +2336,6 @@ void MasterService::ReleaseLocalDiskUsage(
     }
 }
 
-void MasterService::RebuildGroupState() {
-    // The group domain is single-sourced in each tenant's object_index: flat
-    // group membership + one shared Lease live in the tenant's own
-    // ObjectIndex, so there is no global table to clear or rebuild. Rebuild the
-    // shared lease from object metadata after snapshot/standby restore.
-    // Pass 1: aggregate the maximum restored lease deadline per group so a
-    // grouped object is not left with a zero-deadline lease, which would make
-    // it look expired and be dropped by post-restore cleanup.
-    std::unordered_map<std::string, std::chrono::system_clock::time_point>
-        max_deadline_by_group;
-    catalog_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantCatalog>& handle) {
-        auto& tenant_state = *handle;
-        // Collect handles, then lock each per-object (there is no tenant
-        auto objs = tenant_state.SnapshotObjects();
-        for (const auto& entry : objs) {
-            if (!entry->metadata().IsGrouped()) {
-                continue;
-            }
-            auto lk = entry->LockShared();
-            ObjectMetadata& metadata = entry->metadata();
-            const auto scoped = tenant_id.MakeScopedKey(metadata.group_id);
-            const auto deadline = metadata.EvictionDeadline();
-            auto [it, inserted] =
-                max_deadline_by_group.try_emplace(scoped, deadline);
-            if (!inserted) {
-                it->second = std::max(it->second, deadline);
-            }
-        }
-    });
-    // Pass 2: rebuild membership and wire the shared lease, preserving the
-    // group's maximum restored deadline. Singletons keep their per-object
-    // lease (created at ObjectMetadata construction); only grouped members are
-    // pointed at the group's shared Lease.
-    catalog_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantCatalog>& handle) {
-        auto& tenant_state = *handle;
-        auto objs = tenant_state.SnapshotObjects();
-        for (const auto& entry : objs) {
-            if (!entry->metadata().IsGrouped()) {
-                continue;
-            }
-            auto lk = entry->LockUnique();
-            ObjectMetadata& metadata = entry->metadata();
-            auto lease = tenant_state.group_index.LeaseFor(metadata.group_id);
-            tenant_state.group_index.AddMember(metadata.group_id,
-                                                entry->key());
-            auto it = max_deadline_by_group.find(
-                tenant_id.MakeScopedKey(metadata.group_id));
-            if (it != max_deadline_by_group.end()) {
-                lease->ExtendTo(it->second);
-            }
-            metadata.SetLease(lease);
-        }
-    });
-}
 
 void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
     const size_t live_count = registrations_.size();
@@ -7958,38 +7893,6 @@ size_t MasterService::RunPromotionCandidateRetryForTesting() {
     return RunPromotionCandidateRetry();
 }
 
-size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
-    size_t count = 0;
-    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    auto tenant_handle = catalog_.Lookup(tenant_id);
-    if (tenant_handle) {
-        const auto& tenant_state = *tenant_handle;
-        auto objs = tenant_state.SnapshotObjects();
-        for (const auto& entry : objs) {
-            auto lk = entry->LockShared();
-            if (entry->promotion_candidate.has_value()) {
-                ++count;
-            }
-        }
-    }
-    return count;
-}
-
-void MasterService::ResetCandidateBackoffsForTesting() {
-    const auto epoch = std::chrono::steady_clock::time_point{};
-    catalog_.Visit([&](const TenantId&,
-                                const std::shared_ptr<TenantCatalog>& handle) {
-        auto& tenant_state = *handle;
-        auto objs = tenant_state.SnapshotObjects();
-        for (const auto& entry : objs) {
-            auto lk = entry->LockUnique();
-            if (entry->promotion_candidate.has_value()) {
-                entry->promotion_candidate->retry_after = epoch;
-            }
-        }
-    });
-}
-
 size_t MasterService::RunPromotionCandidateRetry() {
     if (!promotion_on_hit_ ||
         promotion_candidate_count_.load(std::memory_order_relaxed) == 0) {
@@ -11714,7 +11617,7 @@ MasterService::MetadataSerializer::Deserialize(
     // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
     // shards before rebuilding the group domain (which is derived from
     // metadata).
-    service_->RebuildGroupState();
+    service_->catalog_.RebuildGroupState();
     service_->ClearCandidatesForReload();
     return {};
 }

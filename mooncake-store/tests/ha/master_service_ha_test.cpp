@@ -596,12 +596,18 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
-    static std::string FindGroupIdOnDifferentShard(MasterService& service,
-                                                   size_t source_shard,
+    // Legacy metadata-bucket placement (std::hash % 1024). Routing is now
+    // per-tenant, so the bucket carries no behavioral meaning; the helpers
+    // only pick names the old formula placed apart.
+    static size_t LegacyShardOf(std::string_view value) {
+        return std::hash<std::string_view>{}(value) % 1024;
+    }
+
+    static std::string FindGroupIdOnDifferentShard(size_t source_shard,
                                                    const std::string& prefix) {
-        for (size_t index = 0; index < MasterService::kNumShards * 2; ++index) {
+        for (size_t index = 0; index < 2048; ++index) {
             std::string group_id = prefix + std::to_string(index);
-            if (service.getShardIndex(group_id) != source_shard) {
+            if (LegacyShardOf(group_id) != source_shard) {
                 return group_id;
             }
         }
@@ -609,21 +615,17 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
     static std::string FindGroupIdOnDifferentShardFromObject(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key, const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service, service.getShardIndex(tenant_id, key), prefix);
+        const TenantId& tenant_id, const std::string& key,
+        const std::string& prefix) {
+        const std::string scope =
+            tenant_id.IsDefault() ? key : tenant_id.value();
+        return FindGroupIdOnDifferentShard(LegacyShardOf(scope), prefix);
     }
 
     static std::string FindGroupIdOnDifferentShardFromGroup(
-        MasterService& service, const std::string& group_id,
-        const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service, service.getShardIndex(group_id), prefix);
+        const std::string& group_id, const std::string& prefix) {
+        return FindGroupIdOnDifferentShard(LegacyShardOf(group_id), prefix);
     }
-
-    // Friend access to MasterService::metadata_shards_ and
-    // getShardIndex, which are otherwise private.
     // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
     // hence this static funnel. Seeds an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
@@ -1314,8 +1316,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(
-        service, kDefaultTenant, key, "group-");
+    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(kDefaultTenant, key, "group-");
     ASSERT_FALSE(duplicate.metadata.group_id.empty());
 
     auto result = service.RestoreFromStandbySnapshot(
@@ -1340,8 +1341,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
-        service, existing.metadata.group_id, "replacement-group-");
+    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(existing.metadata.group_id, "replacement-group-");
     ASSERT_FALSE(duplicate.metadata.group_id.empty());
 
     auto result = service.RestoreFromStandbySnapshot(

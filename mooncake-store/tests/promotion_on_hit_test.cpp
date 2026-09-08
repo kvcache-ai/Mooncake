@@ -57,7 +57,8 @@ class PromotionOnHitTest : public ::testing::Test {
 
     static size_t CountPromotionCandidatesForTesting(MasterService* service,
                                                      const TenantId& tenant) {
-        return service->CountCandidatesForTesting(tenant);
+        return service->catalog_.Lookup(tenant)
+            ->CountPromotionCandidatesForTesting();
     }
 
     static constexpr uint32_t MaxPromotionCandidateRetriesForTesting() {
@@ -69,7 +70,11 @@ class PromotionOnHitTest : public ::testing::Test {
     }
 
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
-        service->ResetCandidateBackoffsForTesting();
+        service->catalog_.Visit([](const TenantId&,
+                                   const std::shared_ptr<TenantCatalog>&
+                                       handle) {
+            handle->ResetPromotionCandidateBackoffsForTesting();
+        });
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
@@ -994,10 +999,8 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
     constexpr size_t seg_size = 1024 * 1024 * 16;
     auto seg = PrepareSegment(*service, "seg_a", kDefaultSegmentBase, seg_size);
 
-    // Find two keys that hash to the same shard. MasterService::
-    // getShardIndex is private but the formula is deterministic
-    // (std::hash<std::string>{}(key) % kNumShards), so we can mirror
-    // it here. kNumShards=1024 (master_service.h:889).
+    // Find two keys that hash to the same metadata bucket
+    // (std::hash<std::string>{}(key) % 1024).
     constexpr size_t kNumShardsLocal = 1024;
     auto shard_of = [](const std::string& k) {
         return std::hash<std::string>{}(k) % kNumShardsLocal;

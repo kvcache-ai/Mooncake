@@ -49,10 +49,80 @@ class TenantCatalog {
         return true;
     }
 
+    // Test/benchmark introspection of the promotion retry queue.
+    size_t CountPromotionCandidatesForTesting() const {
+        size_t count = 0;
+        for (const auto& entry : object_index.SnapshotObjects()) {
+            auto lk = entry->LockShared();
+            if (entry->promotion_candidate.has_value()) {
+                ++count;
+            }
+        }
+        return count;
+    }
+
+    void ResetPromotionCandidateBackoffsForTesting() {
+        const auto epoch = std::chrono::steady_clock::time_point{};
+        for (const auto& entry : object_index.SnapshotObjects()) {
+            auto lk = entry->LockUnique();
+            if (entry->promotion_candidate.has_value()) {
+                entry->promotion_candidate->retry_after = epoch;
+            }
+        }
+    }
+
     // Empty of objects, group membership and (via ObjectIndex) in-flight
     // dynamic-replication leases.
     bool Empty() const {
         return group_index.Empty() && object_index.Empty();
+    }
+
+    // Remove a grouped entry's membership (object teardown path).
+    void UnregisterGroupMember(const std::string& key,
+                               const std::string& group_id) {
+        if (group_id.empty()) {
+            return;
+        }
+        group_index.RemoveMember(group_id, key);
+    }
+
+    // Rebuild group membership and shared-lease deadlines from object metadata
+    // (snapshot / standby restore). Pass 1 aggregates the maximum restored
+    // lease deadline per group so a grouped object is not left with a
+    // zero-deadline lease, which post-restore cleanup would drop; pass 2
+    // re-wires membership and points every grouped entry at the group's
+    // shared Lease. Singletons keep their per-object lease.
+    void RebuildGroupState() {
+        std::unordered_map<std::string, std::chrono::system_clock::time_point>
+            max_deadline_by_group;
+        auto objs = object_index.SnapshotObjects();
+        for (const auto& entry : objs) {
+            if (!entry->metadata().IsGrouped()) {
+                continue;
+            }
+            auto lk = entry->LockShared();
+            ObjectMetadata& metadata = entry->metadata();
+            const auto deadline = metadata.EvictionDeadline();
+            auto [it, inserted] = max_deadline_by_group.try_emplace(
+                metadata.group_id, deadline);
+            if (!inserted) {
+                it->second = std::max(it->second, deadline);
+            }
+        }
+        for (const auto& entry : objs) {
+            if (!entry->metadata().IsGrouped()) {
+                continue;
+            }
+            auto lk = entry->LockUnique();
+            ObjectMetadata& metadata = entry->metadata();
+            auto lease = group_index.LeaseFor(metadata.group_id);
+            group_index.AddMember(metadata.group_id, entry->key());
+            auto it = max_deadline_by_group.find(metadata.group_id);
+            if (it != max_deadline_by_group.end()) {
+                lease->ExtendTo(it->second);
+            }
+            metadata.SetLease(lease);
+        }
     }
 
     // Count of objects with >=1 completed LOCAL_DISK replica; the eviction

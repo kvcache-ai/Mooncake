@@ -1053,10 +1053,6 @@ class MasterService {
 
     // The per-object runtime task types are defined in object_entry_types.h.
 
-    // Legacy shard count kept for getShardIndex() compatibility; routing is now
-    // per-tenant, so this no longer partitions a tenant's objects.
-    static constexpr size_t kNumShards = 1024;
-
 
     // The authoritative metadata boundary: owns the tenant registry and the
     // lifecycle rules (atomic get-or-create, no eager reclamation). RAII
@@ -1201,24 +1197,9 @@ class MasterService {
         const TenantId& tenant_id) const;
     bool IsTenantRegistered(const TenantId& tenant_id) const;
 
-    // Legacy shard-index helpers retained for compatibility; routing is now
-    // per-tenant, so these are only used by tests/restore paths.
-    size_t getShardIndex(const TenantId& tenant_id,
-                         const std::string& user_key) const {
-        if (tenant_id.IsDefault()) {
-            return std::hash<std::string>{}(user_key) % kNumShards;
-        }
-        return std::hash<std::string>{}(tenant_id.value()) % kNumShards;
-    }
-    size_t getShardIndex(const std::string& key) const {
-        return std::hash<std::string>{}(key) % kNumShards;
-    }
 
     // Register a member key under a group and return the group's shared Lease
     // (creating it on first member). Returns nullptr for empty group_id.
-    void UnregisterGroupMember(TenantCatalog& tenant_state,
-                               const std::string& key,
-                               const std::string& group_id);
     // Reads the member keys registered for `group_id`; empty if unregistered.
 
     // A single group member's eviction outcome, fed back by the
@@ -1336,7 +1317,7 @@ class MasterService {
         const std::string& why, const TenantId& tenant_id,
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
-    void RebuildGroupState();
+
     // Post-restore migration: re-route every object to its hash(tenant, key)
     // shard, fixing snapshots that placed grouped objects on hash(group_id)
     // shards. No-op for correctly-routed snapshots.
@@ -1477,8 +1458,6 @@ class MasterService {
     bool IsTransientResult(PromotionQueueResult result) const;
     size_t RunPromotionCandidateRetry();
     size_t RunPromotionCandidateRetryForTesting();
-    size_t CountCandidatesForTesting(const TenantId& tenant_id);
-    void ResetCandidateBackoffsForTesting();
 
     // Erase any in-flight PromotionTask for `key`, refund its pending charge,
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task

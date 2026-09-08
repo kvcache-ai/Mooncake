@@ -172,14 +172,6 @@ class MasterServiceTest : public ::testing::Test {
         return MasterService::KvMediaForRemoval(accessor.Get());
     }
 
-    // Lets a test line up a key with a shard the RemoveAll scan has already
-    // passed, which is the only way to reproduce the commit/clear ordering race
-    // deterministically.
-    size_t ShardIndexForKey(MasterService& service, const std::string& key,
-                            const TenantId& tenant_id = TenantId::Default()) {
-        return service.getShardIndex(tenant_id, key);
-    }
-
     // Regression: MetadataAccessorRW::Create() used to ignore InsertObject()'s
     // return value. If a concurrent writer inserted the key first, Create()
     // would bind to an orphan entry not in the route. It must re-Pin the
@@ -521,7 +513,7 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     void RebuildGroupStateForTest(MasterService& service) {
-        service.RebuildGroupState();
+        service.catalog_.RebuildGroupState();
     }
 
     std::shared_ptr<Lease> GetGroupLeaseForTest(

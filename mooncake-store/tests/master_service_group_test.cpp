@@ -256,7 +256,7 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
 
     // Two member keys that hash to different metadata shards, sharing one
     // group whose id hashes to yet another shard. The default-tenant route is
-    // hash(key) % kNumShards (mirrors MasterService::getShardIndex).
+    // hash(key) % 1024 (the legacy metadata-bucket placement).
     constexpr size_t kMetadataShardCountForTest = 1024;
     const std::string key_a = "route_decouple_key_a";
     const std::string group_id = FindGroupIdOnDifferentShard(key_a);
