@@ -92,6 +92,26 @@ underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
 
+## Transfer Engine Execution
+
+`mooncake.reshard.transfer_engine` executes resource-neutral physical batches
+without model or framework semantics. Its completion fence retains registrations
+and framework allocation tokens when native completion is unknown, then drains
+or quarantines them before a later submission can reuse the same engine.
+
+Range batches use
+`scatter_transfer_sync_read/write_with_ticket`, which forwards allocation
+bases, capacities, and offset vectors to `TransferEngine::submitScatter()`.
+The returned ticket distinguishes completed, failed-and-drained, and unknown
+completion. Unknown completion retains registrations and allocation tokens
+until `drain_pending_transfer()` reaches a terminal state.
+
+Engines without the scatter ticket entry point continue to use the flat
+`batch_transfer_sync_read/write` compatibility path. A zero result is terminal;
+any non-zero result quarantines registrations and allocation tokens as
+restart-required because the flat API provides no drainable operation handle.
+Registration cleanup failures use the same pending lifecycle.
+
 ## Store Snapshots
 
 `StoredResourceManifest` is the persistent resource base. The concrete
