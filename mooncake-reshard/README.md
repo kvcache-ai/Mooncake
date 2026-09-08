@@ -98,12 +98,18 @@ without model or framework semantics. Its completion fence retains registrations
 and framework allocation tokens when native completion is unknown, then drains
 or quarantines them before a later submission can reuse the same engine.
 
-The current flat `batch_transfer_sync_read/write` binding does not return a
-drainable completion ticket. A zero result is terminal; any non-zero result
-quarantines registrations and allocation tokens as restart-required. A ticket
-API can report a confirmed terminal failure. Registration cleanup failures use
-the same pending lifecycle and retry through `drain_pending_transfer()` before
-allocation tokens are released.
+Range batches use
+`scatter_transfer_sync_read/write_with_ticket`, which forwards allocation
+bases, capacities, and offset vectors to `TransferEngine::submitScatter()`.
+The returned ticket distinguishes completed, failed-and-drained, and unknown
+completion. Unknown completion retains registrations and allocation tokens
+until `drain_pending_transfer()` reaches a terminal state.
+
+Engines without the scatter ticket entry point continue to use the flat
+`batch_transfer_sync_read/write` compatibility path. A zero result is terminal;
+any non-zero result quarantines registrations and allocation tokens as
+restart-required because the flat API provides no drainable operation handle.
+Registration cleanup failures use the same pending lifecycle.
 
 Model-weight execution is exposed through `MooncakeTransferEngineReader` and
 `MooncakeTransferEngineSink`. The reader initiates bounded reads from selected
@@ -113,12 +119,11 @@ consume a bound `TransferPlan`, acquire framework allocation guards, verify the
 fresh binding against the planned placement, generation, lease, allocation, and
 fragment evidence, then lower N-D regions into bounded physical batches.
 
-The lowerer preserves backing-allocation ranges and submits the validated flat
-batch form supported by the current Python Transfer Engine binding.
-`max_batch_operations`, `max_region_segments`, and
-`max_total_lowered_segments` bound physical expansion before native submission.
-The C++ scatter API remains available for a later Python lowering and
-performance-focused integration.
+The lowerer preserves backing-allocation ranges. Range batches stay grouped by
+allocation and are submitted through the scatter ticket API; flat batches use
+the compatibility entry point. `max_batch_operations`,
+`max_region_segments`, and `max_total_lowered_segments` bound physical
+expansion before native submission.
 
 Live TE adapters accept runtime-bound source fragments. Store-backed restore
 continues through `WeightStore.load()`, which uses the same target placement and

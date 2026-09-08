@@ -32,6 +32,16 @@ class TicketEngine:
         return CompletedTicket()
 
 
+class ScatterTicketEngine(TicketEngine):
+    def scatter_transfer_sync_read_with_ticket(self, *arguments):
+        self.calls.append(("scatter_read", arguments))
+        return CompletedTicket()
+
+    def scatter_transfer_sync_write_with_ticket(self, *arguments):
+        self.calls.append(("scatter_write", arguments))
+        return CompletedTicket()
+
+
 class LegacyEngine:
     """Match the flat synchronous batch API exposed by the current binding."""
 
@@ -153,11 +163,80 @@ def test_executor_flattens_range_batches_for_the_current_python_binding() -> Non
     ]
 
 
+def test_executor_uses_scatter_ticket_for_range_read() -> None:
+    engine = ScatterTicketEngine()
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    receipt = executor.execute_batch(range_batch(), TransferDirection.READ)
+
+    assert engine.calls == [
+        (
+            "scatter_read",
+            (
+                "worker-1:12345",
+                [0x3000, 0x7000],
+                [0x800, 0x100],
+                [0x1000, 0x5000],
+                [0x400, 0x100],
+                [[0x40, 0x200], [0x20]],
+                [[0x20, 0x100], [0]],
+                [[64, 128], [32]],
+            ),
+        )
+    ]
+    assert receipt.operation_count == 3
+    assert receipt.nbytes == 224
+
+
+def test_executor_uses_scatter_ticket_for_range_write() -> None:
+    engine = ScatterTicketEngine()
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    receipt = executor.execute_batch(range_batch(), TransferDirection.WRITE)
+
+    assert engine.calls == [
+        (
+            "scatter_write",
+            (
+                "worker-1:12345",
+                [0x1000, 0x5000],
+                [0x400, 0x100],
+                [0x3000, 0x7000],
+                [0x800, 0x100],
+                [[0x20, 0x100], [0]],
+                [[0x40, 0x200], [0x20]],
+                [[64, 128], [32]],
+            ),
+        )
+    ]
+    assert receipt.operation_count == 3
+    assert receipt.nbytes == 224
+
+
 class UnknownTicket:
     status = "COMPLETION_UNKNOWN"
 
     def drain(self, timeout_ms: int) -> str:
         return self.status
+
+
+def test_scatter_unknown_ticket_is_retained_until_later_drain() -> None:
+    ticket = UnknownTicket()
+    engine = ScatterTicketEngine()
+    engine.scatter_transfer_sync_write_with_ticket = lambda *arguments: ticket
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    with pytest.raises(TransferCompletionUnknownError) as raised:
+        executor.execute_batch(range_batch(), TransferDirection.WRITE)
+
+    pending_transfer_id = raised.value.pending_transfer_id
+    executor.retain_pending_resources(
+        pending_transfer_id,
+        registrations=(),
+        resources=(ticket,),
+    )
+    ticket.status = "COMPLETED"
+    assert executor.drain_pending_transfer(pending_transfer_id) == "COMPLETED"
 
 
 class StatusReadFailsTicket:
