@@ -93,6 +93,7 @@ class FakeTransport : public Transport {
     // Number of individual requests handed to submitTransferTasks().
     std::atomic<int> submitted_request_count{0};
     std::atomic<int> status_calls{0};
+    std::atomic<int> cancel_calls{0};
     std::atomic<int> add_mem_calls{0};
 
     Status install(std::string& /*local_segment_name*/,
@@ -145,12 +146,26 @@ class FakeTransport : public Transport {
             return Status::InvalidArgument("bad task_id" LOC_MARK);
         }
         ++fb->poll_counts[task_id];
-        if (poll_status_factory_) {
+        if (fb->statuses[task_id].s == TransferStatusEnum::CANCELED) {
+            status = fb->statuses[task_id];
+        } else if (poll_status_factory_) {
             status = poll_status_factory_(fb->requests[task_id],
                                           fb->poll_counts[task_id]);
         } else {
             status = fb->statuses[task_id];
         }
+        return Status::OK();
+    }
+
+    bool supportsCancellation() const override { return true; }
+
+    Status cancelTransferTask(SubBatchRef batch, int task_id) override {
+        auto* fb = static_cast<FakeSubBatch*>(batch);
+        if (task_id < 0 || task_id >= (int)fb->statuses.size()) {
+            return Status::InvalidArgument("bad task_id" LOC_MARK);
+        }
+        ++cancel_calls;
+        fb->statuses[task_id] = {TransferStatusEnum::CANCELED, 0};
         return Status::OK();
     }
 
@@ -1526,6 +1541,111 @@ TEST(EngineFailoverE2E, SubmitStageFailoverWithDerivedTasks) {
 
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
+}
+
+TEST(EngineFailoverE2E, PollStageFailoverWithDerivedTasksRunsOnce) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("merge_requests", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::FAILED, 0};
+        });
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kHalf = 2048;
+    std::vector<uint8_t> buffer(kHalf * 2, 0x4b);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first;
+    first.opcode = Request::WRITE;
+    first.source = buffer.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    first.length = kHalf;
+    Request second = first;
+    second.source = buffer.data() + kHalf;
+    second.target_offset += kHalf;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {first, second}).ok());
+
+    auto derived_status = pollUntilDone(engine, batch_id, 1);
+    auto owner_status = pollUntilDone(engine, batch_id, 0);
+    EXPECT_EQ(derived_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(owner_status.s, TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submitted_request_count.load(), 1);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, DerivedCancellationFollowsPollStageFailoverOwner) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("merge_requests", true);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::FAILED, 0};
+        });
+    auto fake_tcp = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(segment_name, nullptr, nullptr).ok());
+    ASSERT_TRUE(fake_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kHalf = 2048;
+    std::vector<uint8_t> buffer(kHalf * 2, 0x5c);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch_id = engine.allocateBatch(2);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request first;
+    first.opcode = Request::WRITE;
+    first.source = buffer.data();
+    first.target_id = LOCAL_SEGMENT_ID;
+    first.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    first.length = kHalf;
+    Request second = first;
+    second.source = buffer.data() + kHalf;
+    second.target_offset += kHalf;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {first, second}).ok());
+
+    TransferStatus derived{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 1, derived).ok());
+    EXPECT_EQ(derived.s, TransferStatusEnum::PENDING);
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    ASSERT_TRUE(engine.cancelTransfer(batch_id, 1).ok());
+    EXPECT_EQ(fake_rdma->cancel_calls.load(), 0);
+    EXPECT_EQ(fake_tcp->cancel_calls.load(), 1);
+
+    TransferStatus owner{};
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, owner).ok());
+    EXPECT_EQ(owner.s, TransferStatusEnum::CANCELED);
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 1, derived).ok());
+    EXPECT_EQ(derived.s, TransferStatusEnum::CANCELED);
+
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(EngineFailoverE2E, QueuedPathSubmitStageFailover) {
