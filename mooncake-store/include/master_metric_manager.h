@@ -755,6 +755,16 @@ class MasterMetricManager {
     ylt::metric::counter_t fetch_tasks_failures_;
     ylt::metric::counter_t mark_task_to_complete_requests_;
     ylt::metric::counter_t mark_task_to_complete_failures_;
+
+    // Build Info Metric
+    // Prometheus "info" pattern: the value carries no meaning and is always 1,
+    // the version strings are exposed as labels so dashboards and alerts can
+    // group or filter by the running build. The label values are compile-time
+    // constants, so this is a single-series gauge with static labels rather
+    // than a dynamic-label metric.
+    // Shares the `mooncake_build_info` name with the client-side metric; the
+    // two are told apart by the scrape target's job/instance labels.
+    ylt::metric::gauge_t build_info_;
 };
 
 }  // namespace mooncake

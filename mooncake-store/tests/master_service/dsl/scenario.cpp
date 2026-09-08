@@ -3,8 +3,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 #include <utility>
 
@@ -254,6 +256,56 @@ WaitForOpLogFailureAction WaitForOpLogFailure() { return {}; }
 
 PingAction Ping(std::string actor) { return {.actor = std::move(actor)}; }
 
+MountLocalDiskAction MountLocalDisk(std::string actor) {
+    return {.actor = std::move(actor)};
+}
+
+UnmountLocalDiskAction UnmountLocalDisk(std::string actor) {
+    return {.actor = std::move(actor)};
+}
+
+ReportSsdCapacityAction ReportSsdCapacity(std::string actor,
+                                          int64_t capacity_bytes) {
+    return {.actor = std::move(actor), .capacity_bytes = capacity_bytes};
+}
+
+OffloadHeartbeatAction OffloadHeartbeat(std::string actor) {
+    return {.actor = std::move(actor)};
+}
+
+CompleteOffloadAction CompleteOffload(std::initializer_list<std::string> keys) {
+    CompleteOffloadAction action;
+    action.keys.assign(keys.begin(), keys.end());
+    return action;
+}
+
+EvictDiskReplicaAction EvictDiskReplica(std::string key) {
+    return {.key = std::move(key)};
+}
+
+RacePutStartAction RacePutStart(std::string key, uint64_t size) {
+    return {.key = std::move(key), .size = size};
+}
+
+RaceMountUnmountAction RaceMountUnmount(std::string prefix) {
+    return {.prefix = std::move(prefix)};
+}
+
+RaceMountLocalDiskAction RaceMountLocalDisk(std::string prefix) {
+    return {.prefix = std::move(prefix)};
+}
+
+RaceWritesWithRemoveAllAction RaceWritesWithRemoveAll(std::string prefix) {
+    return {.prefix = std::move(prefix)};
+}
+
+RaceReadsWithRemoveAllAction RaceReadsWithRemoveAll(
+    std::vector<std::string> keys) {
+    return {.keys = std::move(keys)};
+}
+
+RaceRemoveAllAction RaceRemoveAll() { return {}; }
+
 MasterScenario::MasterScenario(std::string name) : name_(std::move(name)) {}
 
 MasterScenario::MasterScenario(std::string name, MasterServiceConfig config,
@@ -404,9 +456,20 @@ MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     if (action.group_ids.has_value()) {
         config.group_ids = std::move(action.group_ids);
     }
-    const auto result =
-        service_->PutStart(ActorId(action.actor), action.key,
-                           TenantId(action.tenant), action.size, config);
+    const auto actor_id = ActorId(action.actor);
+    const TenantId tenant_id(action.tenant);
+    const auto deadline =
+        std::chrono::steady_clock::now() + action.eventual_timeout;
+    auto result = service_->PutStart(actor_id, action.key, tenant_id,
+                                     action.size, config);
+    while (!result && action.eventual_timeout.count() > 0 &&
+           (result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED ||
+            result.error() == ErrorCode::NO_AVAILABLE_HANDLE) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        result = service_->PutStart(actor_id, action.key, tenant_id,
+                                    action.size, config);
+    }
     ValidateStartResult("PutStart(" + action.key + ")", action.expected_error,
                         action.expected_replica_count,
                         action.expected_replica_status, result,
@@ -1019,12 +1082,12 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
             return false;
         }
         SpinLocker locker(&metadata_it->second.lock);
-        metadata_it->second.lease_timeout = action.lease_timeout;
+        metadata_it->second.lease_->SetDeadline(action.lease_timeout);
         metadata_it->second.soft_pin_timeout = action.soft_pin_timeout;
         return true;
     };
 
-    const size_t routed = service_->getMetadataShardIndex(tenant, action.key);
+    const size_t routed = service_->getShardIndex(tenant, action.key);
     if (update(routed)) {
         return *this;
     }
@@ -1091,6 +1154,490 @@ MasterScenario& MasterScenario::When(PingAction action) {
     ValidateActionResult("Ping(" + action.actor + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(MountLocalDiskAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->MountLocalDiskSegment(
+        ActorId(action.actor), action.enable_offloading);
+    ValidateActionResult("MountLocalDisk(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(UnmountLocalDiskAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result =
+        service_->UnmountLocalDiskSegment(ActorId(action.actor));
+    ValidateActionResult("UnmountLocalDisk(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(ReportSsdCapacityAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->ReportSsdCapacity(ActorId(action.actor),
+                                                    action.capacity_bytes);
+    ValidateActionResult("ReportSsdCapacity(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(OffloadHeartbeatAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->OffloadObjectHeartbeat(
+        ActorId(action.actor), action.enable_offloading);
+    ValidateActionResult("OffloadHeartbeat(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    if (result && action.expect_some_tasks && result->empty()) {
+        Fail("OffloadHeartbeat(" + action.actor +
+             ") returned no offload tasks; expected at least one");
+    }
+    if (!result || !action.expected_task_keys.has_value()) {
+        return *this;
+    }
+    if (result->size() != action.expected_task_keys->size()) {
+        Fail("OffloadHeartbeat(" + action.actor + ") returned " +
+             std::to_string(result->size()) + " offload tasks; expected " +
+             std::to_string(action.expected_task_keys->size()));
+        return *this;
+    }
+    for (const auto& key : *action.expected_task_keys) {
+        const auto match = std::find_if(
+            result->begin(), result->end(), [&](const OffloadTaskItem& task) {
+                return task.tenant_id == action.tenant && task.key == key &&
+                       task.size == action.expected_task_size;
+            });
+        if (match == result->end()) {
+            Fail("OffloadHeartbeat(" + action.actor +
+                 ") is missing an offload task for " + key);
+        }
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(CompleteOffloadAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.keys.empty()) {
+        Fail("CompleteOffload requires at least one key");
+        return *this;
+    }
+    if (action.node.empty()) {
+        Fail("CompleteOffload requires OnNode");
+        return *this;
+    }
+    const auto segment = segments_.find(action.node);
+    const std::string endpoint =
+        segment != segments_.end() ? segment->second.te_endpoint : action.node;
+    std::vector<OffloadTaskItem> tasks;
+    std::vector<StorageObjectMetadata> metadatas;
+    tasks.reserve(action.keys.size());
+    metadatas.reserve(action.keys.size());
+    for (const auto& key : action.keys) {
+        int64_t size = 0;
+        if (action.size.has_value()) {
+            size = *action.size;
+        } else {
+            const auto record =
+                last_start_results_.find(action.tenant + "\n" + key);
+            const Replica::Descriptor* descriptor = nullptr;
+            if (record != last_start_results_.end()) {
+                for (const auto& candidate : record->second) {
+                    if (candidate.is_memory_replica()) {
+                        descriptor = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (descriptor == nullptr) {
+                Fail("CompleteOffload(" + key +
+                     ") has no PutStart-recorded size; use OfSize");
+                return *this;
+            }
+            size = static_cast<int64_t>(
+                descriptor->get_memory_descriptor().buffer_descriptor.size_);
+        }
+        tasks.push_back(OffloadTaskItem{
+            .tenant_id = action.tenant, .key = key, .size = size});
+        StorageObjectMetadata metadata{};
+        metadata.data_size = size;
+        metadata.transport_endpoint = endpoint;
+        metadatas.push_back(std::move(metadata));
+    }
+    const auto result =
+        service_->NotifyOffloadSuccess(ActorId(action.actor), tasks, metadatas);
+    ValidateActionResult("CompleteOffload(" + action.keys.front() + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(EvictDiskReplicaAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->EvictDiskReplica(
+        ActorId(action.actor), action.key, TenantId(action.tenant),
+        action.replica_type);
+    ValidateActionResult("EvictDiskReplica(" + action.key + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RacePutStartAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.thread_count == 0) {
+        Fail("RacePutStart requires at least one thread");
+        return *this;
+    }
+    const UUID actor_id = ActorId(action.actor);
+    const TenantId tenant_id(action.tenant);
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<size_t> admitted{0};
+    std::atomic<size_t> completed{0};
+    std::mutex failures_mutex;
+    std::vector<std::string> failures;
+    std::vector<std::thread> threads;
+    threads.reserve(action.thread_count);
+    for (size_t index = 0; index < action.thread_count; ++index) {
+        threads.emplace_back([&, index] {
+            ReplicateConfig config;
+            config.replica_num = 1;
+            if (!action.group_ids.empty()) {
+                // An empty entry means this thread races without a group.
+                const auto& group =
+                    action.group_ids[index % action.group_ids.size()];
+                if (!group.empty()) {
+                    config.group_ids = {group};
+                }
+            }
+            ready.fetch_add(1);
+            while (!go.load()) {
+                std::this_thread::yield();
+            }
+            const auto result = service_->PutStart(
+                actor_id, action.key, tenant_id, action.size, config);
+            if (result) {
+                admitted.fetch_add(1);
+                const auto end = service_->PutEnd(
+                    actor_id, action.key, tenant_id, ReplicaType::MEMORY);
+                if (end) {
+                    completed.fetch_add(1);
+                } else {
+                    std::lock_guard lock(failures_mutex);
+                    failures.push_back("PutEnd failed: " +
+                                       toString(end.error()));
+                }
+            } else if (result.error() != ErrorCode::OBJECT_ALREADY_EXISTS) {
+                std::lock_guard lock(failures_mutex);
+                failures.push_back("losing PutStart failed with " +
+                                   toString(result.error()) +
+                                   "; expected OBJECT_ALREADY_EXISTS");
+            }
+        });
+    }
+    while (ready.load() < action.thread_count) {
+        std::this_thread::yield();
+    }
+    go.store(true);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    for (const auto& failure : failures) {
+        Fail("RacePutStart(" + action.key + ") " + failure);
+    }
+    if (admitted.load() != action.expected_successes) {
+        Fail("RacePutStart(" + action.key + ") admitted " +
+             std::to_string(admitted.load()) + " writers; expected " +
+             std::to_string(action.expected_successes));
+    }
+    if (completed.load() != action.expected_completions) {
+        Fail("RacePutStart(" + action.key + ") completed " +
+             std::to_string(completed.load()) + " writes; expected " +
+             std::to_string(action.expected_completions));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RaceMountUnmountAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.node_count == 0 || action.iterations == 0) {
+        Fail("RaceMountUnmount requires nodes and iterations");
+        return *this;
+    }
+    std::vector<Segment> segments;
+    std::vector<UUID> actors;
+    segments.reserve(action.node_count);
+    actors.reserve(action.node_count);
+    for (size_t index = 0; index < action.node_count; ++index) {
+        const std::string name = action.prefix + "-" + std::to_string(index);
+        Segment segment;
+        segment.id = StableUuid("race-segment", name);
+        segment.name = name;
+        segment.base = next_segment_base_;
+        segment.size = action.capacity;
+        segment.te_endpoint = name;
+        next_segment_base_ += action.capacity + 4096;
+        segments.push_back(std::move(segment));
+        actors.push_back(ActorId(name));
+    }
+    std::atomic<size_t> cycles{0};
+    std::mutex failures_mutex;
+    std::vector<std::string> failures;
+    std::vector<std::thread> threads;
+    threads.reserve(action.node_count);
+    for (size_t index = 0; index < action.node_count; ++index) {
+        threads.emplace_back([&, index] {
+            for (size_t iteration = 0; iteration < action.iterations;
+                 ++iteration) {
+                const auto mount =
+                    service_->MountSegment(segments[index], actors[index]);
+                if (!mount) {
+                    continue;
+                }
+                const auto unmount =
+                    service_->UnmountSegment(segments[index].id, actors[index]);
+                if (!unmount) {
+                    std::lock_guard lock(failures_mutex);
+                    failures.push_back("unmount of " + segments[index].name +
+                                       " failed after a successful mount: " +
+                                       toString(unmount.error()));
+                    return;
+                }
+                cycles.fetch_add(1);
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    for (const auto& failure : failures) {
+        Fail("RaceMountUnmount(" + action.prefix + ") " + failure);
+    }
+    if (cycles.load() < action.expected_min_cycles) {
+        Fail("RaceMountUnmount(" + action.prefix + ") completed " +
+             std::to_string(cycles.load()) +
+             " mount and unmount cycles; expected at least " +
+             std::to_string(action.expected_min_cycles));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RaceMountLocalDiskAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.client_count == 0) {
+        Fail("RaceMountLocalDisk requires at least one client");
+        return *this;
+    }
+    std::vector<UUID> actors;
+    actors.reserve(action.client_count);
+    for (size_t index = 0; index < action.client_count; ++index) {
+        actors.push_back(ActorId(action.prefix + "-" + std::to_string(index)));
+    }
+    std::mutex failures_mutex;
+    std::vector<std::string> failures;
+    std::vector<std::thread> threads;
+    threads.reserve(action.client_count);
+    for (size_t index = 0; index < action.client_count; ++index) {
+        threads.emplace_back([&, index] {
+            const auto result =
+                service_->MountLocalDiskSegment(actors[index], true);
+            if (!result) {
+                std::lock_guard lock(failures_mutex);
+                failures.push_back("mount failed: " + toString(result.error()));
+            }
+        });
+    }
+    for (auto& thread : threads) {
+        thread.join();
+    }
+    for (const auto& failure : failures) {
+        Fail("RaceMountLocalDisk(" + action.prefix + ") " + failure);
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RaceWritesWithRemoveAllAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.writer_count == 0 || action.objects_per_writer == 0) {
+        Fail("RaceWritesWithRemoveAll requires writers and objects");
+        return *this;
+    }
+    const UUID actor_id = ActorId(action.actor);
+    const TenantId tenant_id(action.tenant);
+    std::atomic<size_t> written{0};
+    std::mutex failures_mutex;
+    std::vector<std::string> failures;
+    std::vector<std::thread> writers;
+    writers.reserve(action.writer_count);
+    for (size_t writer = 0; writer < action.writer_count; ++writer) {
+        writers.emplace_back([&, writer] {
+            for (size_t index = 0; index < action.objects_per_writer; ++index) {
+                const std::string key = action.prefix + "-" +
+                                        std::to_string(writer) + "-" +
+                                        std::to_string(index);
+                ReplicateConfig config;
+                config.replica_num = 1;
+                const auto start = service_->PutStart(
+                    actor_id, key, tenant_id, action.object_size, config);
+                if (!start) {
+                    std::lock_guard lock(failures_mutex);
+                    failures.push_back("PutStart(" + key +
+                                       ") failed: " + toString(start.error()));
+                    continue;
+                }
+                const auto end = service_->PutEnd(actor_id, key, tenant_id,
+                                                  ReplicaType::MEMORY);
+                if (!end) {
+                    std::lock_guard lock(failures_mutex);
+                    failures.push_back("PutEnd(" + key +
+                                       ") failed: " + toString(end.error()));
+                    continue;
+                }
+                written.fetch_add(1);
+            }
+        });
+    }
+    long removed_during = 0;
+    std::thread remover([&] {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (written.load() == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        removed_during = service_->RemoveAll();
+    });
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    remover.join();
+    const long removed_after = service_->RemoveAll();
+    for (const auto& failure : failures) {
+        Fail("RaceWritesWithRemoveAll(" + action.prefix + ") " + failure);
+    }
+    if (removed_during < 1) {
+        Fail("RaceWritesWithRemoveAll(" + action.prefix +
+             ") removed nothing while writes were in flight");
+    }
+    const long expected_total = static_cast<long>(action.writer_count) *
+                                static_cast<long>(action.objects_per_writer);
+    if (removed_during + removed_after != expected_total) {
+        Fail("RaceWritesWithRemoveAll(" + action.prefix + ") removed " +
+             std::to_string(removed_during + removed_after) +
+             " objects across both sweeps; expected " +
+             std::to_string(expected_total));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RaceReadsWithRemoveAllAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.keys.empty()) {
+        Fail("RaceReadsWithRemoveAll requires at least one key");
+        return *this;
+    }
+    if (action.reader_count == 0) {
+        Fail("RaceReadsWithRemoveAll requires at least one reader");
+        return *this;
+    }
+    const TenantId tenant_id(action.tenant);
+    std::atomic<size_t> reads{0};
+    std::vector<std::thread> readers;
+    readers.reserve(action.reader_count);
+    for (size_t reader = 0; reader < action.reader_count; ++reader) {
+        readers.emplace_back([&] {
+            for (const auto& key : action.keys) {
+                if (service_->GetReplicaList(key, tenant_id)) {
+                    reads.fetch_add(1);
+                }
+            }
+        });
+    }
+    long removed_during = 0;
+    std::thread remover([&] {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (reads.load() == 0 &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::yield();
+        }
+        removed_during = service_->RemoveAll();
+    });
+    for (auto& reader : readers) {
+        reader.join();
+    }
+    remover.join();
+    if (reads.load() == 0) {
+        Fail("RaceReadsWithRemoveAll read nothing while removal was racing");
+        return *this;
+    }
+    long removed_after = 0;
+    if (action.final_remove_after > std::chrono::milliseconds::zero()) {
+        std::this_thread::sleep_for(action.final_remove_after);
+        removed_after = service_->RemoveAll();
+    }
+    if (action.expected_total_removed.has_value() &&
+        removed_during + removed_after !=
+            static_cast<long>(*action.expected_total_removed)) {
+        Fail("RaceReadsWithRemoveAll removed " +
+             std::to_string(removed_during + removed_after) +
+             " objects across both sweeps; expected " +
+             std::to_string(*action.expected_total_removed));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RaceRemoveAllAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.caller_count == 0) {
+        Fail("RaceRemoveAll requires at least one caller");
+        return *this;
+    }
+    std::atomic<long> removed{0};
+    std::vector<std::thread> callers;
+    callers.reserve(action.caller_count);
+    for (size_t caller = 0; caller < action.caller_count; ++caller) {
+        callers.emplace_back([&] { removed.fetch_add(service_->RemoveAll()); });
+    }
+    for (auto& caller : callers) {
+        caller.join();
+    }
+    if (action.expected_total_removed.has_value() &&
+        removed.load() != static_cast<long>(*action.expected_total_removed)) {
+        Fail("RaceRemoveAll removed " + std::to_string(removed.load()) +
+             " objects; expected " +
+             std::to_string(*action.expected_total_removed));
+    }
     return *this;
 }
 

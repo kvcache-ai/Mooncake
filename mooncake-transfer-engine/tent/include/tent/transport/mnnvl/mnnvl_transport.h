@@ -17,7 +17,6 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include "cuda_fabric_compat.h"
 
 #include <functional>
 #include <iostream>

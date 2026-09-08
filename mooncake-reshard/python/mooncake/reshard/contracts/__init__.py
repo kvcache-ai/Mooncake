@@ -11,7 +11,7 @@ from .ids import (
     RevisionId,
     RuntimeFragmentId,
     RuntimeInstanceId,
-    StoredFragmentId,
+    StoredFragmentSnapshotId,
     TensorId,
     TopologyId,
 )
@@ -39,7 +39,7 @@ __all__ = [
     "RuntimeBindingFragment",
     "RuntimeFragmentId",
     "RuntimeInstanceId",
-    "StoredFragmentId",
+    "StoredFragmentSnapshotId",
     "TensorId",
     "TopologyId",
     "StoredResourceManifest",

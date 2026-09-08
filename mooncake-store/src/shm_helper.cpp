@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <glog/logging.h>
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "config.h"
 #if defined(USE_ASCEND_DIRECT)
 #include "ascend_allocator.h"
@@ -171,13 +171,9 @@ int ShmHelper::free(void* addr) {
 
 std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
-    const auto address = reinterpret_cast<uintptr_t>(addr);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(addr);
     for (auto& shm : shms_) {
-        const auto base = reinterpret_cast<uintptr_t>(shm->base_addr);
-        // Compare integer addresses so querying an arbitrary external pointer
-        // (for example a CUDA or pinned-CPU allocation) is well-defined. C++
-        // relational comparisons between pointers to unrelated objects are
-        // otherwise unspecified.
+        const uintptr_t base = reinterpret_cast<uintptr_t>(shm->base_addr);
         if (address >= base && address - base < shm->size) {
             return shm;
         }

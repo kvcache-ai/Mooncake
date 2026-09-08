@@ -37,6 +37,9 @@ struct IOUringTask {
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     void *buffer = nullptr;
+    // The kernel may read the iovec asynchronously at execution time, so it
+    // must live as long as the task (i.e. until the completion is reaped).
+    struct iovec iov{};
 
     ~IOUringTask() {
         if (buffer) free(buffer);
@@ -79,6 +82,15 @@ class IOUringTransport : public Transport {
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "io-uring"; }
+
+   protected:
+    // Thin seam over io_uring_submit() so tests can simulate a positive
+    // short submission (0 < rc < number of prepared SQEs) — the case where
+    // part of the batch is already dispatched and an error return would
+    // make the engine's submit-stage failover re-execute it.
+    virtual int submitSqes(struct io_uring *ring) {
+        return io_uring_submit(ring);
+    }
 
    private:
     std::string getIOUringFilePath(SegmentID handle);

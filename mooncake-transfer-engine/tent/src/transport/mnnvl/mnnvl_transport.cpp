@@ -28,15 +28,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
-// CUDA Fabric Memory was added after the CUDA 12.0 driver headers.  TENT's
-// MNNVL transport is still built with older toolkits, so compile it as an
-// unavailable transport instead of referencing missing Fabric symbols.
-#if defined(USE_CUDA) && defined(CUDA_VERSION) && CUDA_VERSION >= 12040
-#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
-#else
-#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
-#endif
-
 #include "tent/common/status.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
@@ -72,9 +63,6 @@ static Status roundGranularity(CUmemAllocationProp &prop, size_t granularity,
 }
 
 static bool supportFabricMem() {
-#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
-    return false;
-#else
     int num_devices = 0;
     cudaError_t err = cudaGetDeviceCount(&num_devices);
     if (err != cudaSuccess || num_devices == 0) {
@@ -94,7 +82,6 @@ static bool supportFabricMem() {
         }
     }
     return true;
-#endif
 }
 
 namespace {
@@ -191,15 +178,10 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     supported_ = true;
     auto handle_type_str =
         conf_->get("transports/nvlink/handle_type", "fabric");
-    if (handle_type_str == "fabric") {
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
+    if (handle_type_str == "fabric")
         handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
-#else
+    else
         handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-#endif
-    } else {
-        handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-    }
     host_register_ = conf_->get("transports/nvlink/host_register", true);
     return setPeerAccess();
 }
@@ -508,21 +490,13 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
             cuMemExportToShareableHandle(&shared_fd, handle, handle_type_, 0));
         desc.mnnvl_handle =
             std::to_string(getpid()) + "-" + std::to_string(shared_fd);
-    }
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
-    else {
+    } else {
         CUmemFabricHandle export_handle;
         CHECK_CU(cuMemExportToShareableHandle(&export_handle, handle,
                                               handle_type_, 0));
         desc.mnnvl_handle =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
     }
-#else
-    else {
-        return Status::InvalidArgument(
-            "CUDA Fabric handles are unavailable in this toolkit" LOC_MARK);
-    }
-#endif
 
     void *real_addr;
     size_t real_size;
@@ -704,9 +678,13 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 "Requested address is not in registered CUDA buffer" LOC_MARK);
         }
 
-        int cuda_dev = 0;
-        CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        cudaSetDevice(location.index());
+        // Do NOT switch to buffer->location's device index: that ordinal is
+        // the PEER's device index, relative to the peer's
+        // CUDA_VISIBLE_DEVICES. In the local process it may be an invalid
+        // ordinal, and even when numerically valid it may denote a different
+        // physical GPU. The driver calls below are device-agnostic: the VA
+        // mapping is process-wide and cuMemSetAccess grants read/write
+        // access to ALL local devices.
         if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
             auto [pid, remote_fd] = parsePidFd(buffer->mnnvl_handle);
             int local_fd = importFdFromProcess(pid, remote_fd);
@@ -715,10 +693,6 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     "Unable to import fd from remote process");
             CHECK_CU(cuMemImportFromShareableHandle(&handle, &local_fd,
                                                     handle_type_));
-#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
-        }
-#endif
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
         } else {
             std::vector<unsigned char> output_buffer;
             deserializeBinaryData(buffer->mnnvl_handle, output_buffer);
@@ -731,12 +705,6 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
                                                     handle_type_));
         }
-#else
-        else {
-            return Status::InvalidArgument(
-                "CUDA Fabric handles are unavailable in this toolkit" LOC_MARK);
-        }
-#endif
         CHECK_CU(cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, buffer->length,
                                      0, 0, 0));
         CHECK_CU(
@@ -754,9 +722,10 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         OpenedMnnvlEntry mnnvl_entry;
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
-        mnnvl_entry.cuda_id = location.index();
+        int cuda_dev = 0;
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        mnnvl_entry.cuda_id = cuda_dev;
         relocate_map_[target_id][buffer->addr] = mnnvl_entry;
-        cudaSetDevice(cuda_dev);
     }
 
     auto mnnvl_addr = relocate_map_[target_id][buffer->addr].mnnvl_addr;

@@ -17,7 +17,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "segment.h"
 #include "serialize/serializer.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake {
 

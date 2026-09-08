@@ -20,6 +20,7 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -99,6 +100,8 @@ class NVLinkTransport : public Transport {
 
     Status setPeerAccess();
 
+    friend class NVLinkTransportTestPeer;
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -125,7 +128,11 @@ class NVLinkTransport : public Transport {
     bool host_register_;
 
     mutable std::mutex register_mutex_;
-    std::unordered_set<uint64_t> registered_base_addrs_;
+    // cudaMalloc base address -> serialized cudaIpcMemHandle_t for that
+    // segment. Multiple BufferDescs can sub-allocate within one cudaMalloc
+    // segment (torch caching allocator); every one of them must carry the
+    // segment's IPC handle or NVLink submission for that buffer fails.
+    std::unordered_map<uint64_t, std::string> registered_base_addrs_;
 };
 }  // namespace tent
 }  // namespace mooncake

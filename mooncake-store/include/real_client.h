@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -14,12 +15,13 @@
 #include <unordered_set>
 #include <vector>
 
-#include "pyclient.h"
-#include "client_service.h"
+#include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
+#include "client_service.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
-#include "utils.h"
+#include "common/network.h"
+#include "pyclient.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -539,6 +541,18 @@ class RealClient : public PyClient {
             &cached_query_results,
         int32_t device_id, const UUID &client_id);
 
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_staged_shm_helper(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
+
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
     tl::expected<void, ErrorCode> map_shm_internal(int fd,
@@ -645,6 +659,19 @@ class RealClient : public PyClient {
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+
+    using LocalDiskOffloadObjects =
+        std::unordered_map<std::string, std::vector<Slice>>;
+    using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
+        const std::string &, LocalDiskOffloadObjects &)>;
+
+    // Dependency-injected overload used to verify routing decisions without
+    // requiring multiple live SSD offload servers.
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const LocalDiskOffloadReader &local_disk_reader);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -1007,6 +1034,19 @@ class RealClient : public PyClient {
     bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
                                         uint64_t dummy_addr, size_t dst_offset,
                                         size_t size, void *&out_real) const;
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_shm_helper_impl(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<size_t> *buffer_capacities,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,

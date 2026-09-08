@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/result.h"
+
 #include <atomic>
 #include <csignal>
 #include <mutex>
@@ -200,25 +202,55 @@ class DummyClient : public PyClient {
 
    private:
     struct PreparedBuffer {
-        void* original = nullptr;
-        void* dummy = nullptr;
+        void *original = nullptr;
+        void *dummy = nullptr;
         size_t size = 0;
         std::unique_ptr<BufferHandle> staging;
         bool copy_back = false;
     };
 
-    bool is_dummy_shm_buffer(void* buffer, size_t size) const;
-    std::optional<size_t> external_buffer_remaining(void* buffer) const;
-    std::optional<PreparedBuffer> prepare_buffer(void* buffer, size_t size,
+    bool is_device_buffer(void *buffer) const;
+    bool is_dummy_shm_buffer(void *buffer, size_t size) const;
+    std::optional<size_t> external_buffer_remaining(void *buffer) const;
+    bool is_registered_buffer(void *buffer, size_t size) const;
+    int register_external_buffer(void *buffer, size_t size);
+    int unregister_external_buffer(void *buffer);
+#if defined(USE_ASCEND_DIRECT)
+    std::optional<size_t> registered_ascend_buffer_remaining(
+        void *buffer) const;
+#endif
+    std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
                                                  bool copy_to_staging,
                                                  bool copy_back = false);
-    bool copy_from_staging(const PreparedBuffer& buffer, size_t size) const;
+    std::optional<PreparedBuffer> prepare_ranged_read_buffer(
+        void *buffer, std::vector<std::vector<size_t>> &dst_offsets,
+        const std::vector<std::vector<size_t>> &sizes);
+    bool copy_from_staging(const PreparedBuffer &buffer, size_t size,
+                           size_t offset = 0, size_t staging_offset = 0) const;
 
-    std::vector<int> batch_write_from_multi_buffers_impl(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        const ReplicateConfig& config, bool upsert);
+    struct PreparedMultiBuffers {
+        std::vector<PreparedBuffer> buffers;
+        std::vector<std::vector<uint64_t>> dummy_buffers;
+    };
+    std::optional<PreparedMultiBuffers> prepare_multi_buffers(
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool copy_to_staging = true, bool copy_back = false);
+
+    struct ExternalBufferRegistration {
+        size_t size = 0;
+        size_t references = 0;
+    };
+    using BufferRegistrationMap =
+        std::unordered_map<uintptr_t, ExternalBufferRegistration>;
+    enum class BufferRegistrationAction { kReject, kFirst, kRetained };
+    enum class BufferReleaseAction { kReject, kFinal, kRetained };
+    static BufferRegistrationAction retain_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base, size_t size);
+    static BufferReleaseAction release_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base);
+    mutable std::mutex registered_external_buffers_mutex_;
+    BufferRegistrationMap registered_external_buffers_;
 
     ErrorCode connect(const std::string &server_address);
 
@@ -233,26 +265,9 @@ class DummyClient : public PyClient {
 
     int unregister_device_buffer_for_reconnect(void *buffer);
 
-    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
-    get_registered_device_buffers() const;
-#endif
+    int reregister_fabric_buffers();
 
-#if defined(USE_ASCEND_DIRECT)
-    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
-    get_registered_external_fabric_buffers() const;
-#endif
-
-    mutable std::mutex registered_external_buffers_mutex_;
-    std::unordered_map<uintptr_t, size_t> registered_external_buffers_;
-#if defined(USE_ASCEND_DIRECT)
-    // Fabric-backed host registrations are mapped in the RealClient process
-    // and need an explicit remote unmap when the caller unregisters them.
-    std::unordered_map<uintptr_t, size_t>
-        registered_external_fabric_buffers_;
-    // Serializes Fabric registration RPCs with reconnect and unregister so a
-    // reconnect snapshot cannot re-register an address after its owner has
-    // released it.
-    mutable std::mutex external_fabric_registration_mutex_;
+    int reregister_device_buffers();
 #endif
 
     /**
@@ -326,8 +341,10 @@ class DummyClient : public PyClient {
     std::atomic<bool> connected_{false};
 
 #if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex external_fabric_registration_mutex_;
     mutable std::mutex registered_device_buffers_mutex_;
-    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+    // Tracks directly mapped Ascend device and Fabric host buffers.
+    BufferRegistrationMap registered_device_buffers_;
 #endif
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy

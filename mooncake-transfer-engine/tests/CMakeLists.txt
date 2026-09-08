@@ -48,14 +48,21 @@ target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
 
-# Regression test for the reconnect storm of issue #3299: repeated local
-# completion faults toward one peer RNIC must pause that path instead of
-# re-handshaking it forever. The rail monitor is plain per-worker-pool state,
-# so this runs on every CI runner without an RDMA device.
+# Hardware-free regression tests for peer-rail pausing and the local-WC context
+# breaker. Both are plain per-worker-pool state, so this runs on every CI runner
+# without an RDMA device.
 add_executable(worker_pool_rail_state_test
                ${WORKSPACE}/worker_pool_rail_state_test.cpp)
 target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
                                                          gtest_main)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Control GID I/O to exercise recovery while completion failures arrive.
+  target_link_options(
+    worker_pool_rail_state_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+  )
+endif()
 add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
@@ -165,6 +172,17 @@ if(USE_TCP)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
+
+  if(USE_CUDA)
+    add_executable(tcp_cuda_staging_test ${WORKSPACE}/tcp_cuda_staging_test.cpp)
+    target_compile_definitions(tcp_cuda_staging_test
+                               PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
+    target_include_directories(tcp_cuda_staging_test
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(tcp_cuda_staging_test PUBLIC transfer_engine gtest
+                                                       gtest_main CUDA::cudart)
+    add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
+  endif()
 endif()
 
 add_executable(tcp_address_validation_test
@@ -352,6 +370,12 @@ add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)
 add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
+
+add_executable(glog_preinitialized_test
+               ${WORKSPACE}/glog_preinitialized_test.cpp)
+target_link_libraries(glog_preinitialized_test PUBLIC transfer_engine gtest
+                                                      gtest_main glog::glog)
+add_test(NAME glog_preinitialized_test COMMAND glog_preinitialized_test)
 
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest

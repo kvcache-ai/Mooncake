@@ -28,3 +28,8 @@ foreach(parser_test ascii_string bool_parser environment_value_parser
                                                    gtest_main pthread)
   add_test(NAME ${parser_test}_test COMMAND ${parser_test}_test)
 endforeach()
+
+add_executable(ib_link_speed_test ib_link_speed_test.cpp)
+target_link_libraries(ib_link_speed_test PUBLIC mooncake_common gtest
+                                                gtest_main pthread)
+add_test(NAME ib_link_speed_test COMMAND ib_link_speed_test)

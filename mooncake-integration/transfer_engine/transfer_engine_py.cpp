@@ -584,7 +584,11 @@ int TransferEnginePy::batchTransferSync(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            if (handle == (Transport::SegmentHandle)-1) return -1;
+            if (handle == (Transport::SegmentHandle)-1) {
+                LOG(ERROR) << "batchTransferSync: openSegment failed for "
+                           << target_hostname;
+                return -1;
+            }
             handle_map_[target_hostname] = handle;
         }
     }
@@ -626,6 +630,10 @@ int TransferEnginePy::batchTransferSync(
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
+            LOG(ERROR) << "batchTransferSync: submitTransfer failed for "
+                       << target_hostname << " (batch of " << batch_size
+                       << " requests, " << total_length
+                       << " bytes): " << s.ToString();
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
@@ -650,6 +658,10 @@ int TransferEnginePy::batchTransferSync(
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "batchTransferSync: transfer FAILED for "
+                           << target_hostname << " (batch of " << batch_size
+                           << " requests, " << total_length
+                           << " bytes) on retry " << retry << "/" << max_retry;
                 engine_->freeBatchID(batch_id);
                 already_freed = true;
                 completed = true;
@@ -673,6 +685,9 @@ int TransferEnginePy::batchTransferSync(
             }
         }
     }
+    LOG(ERROR) << "batchTransferSync: all " << max_retry
+               << " retries exhausted for " << target_hostname << " (batch of "
+               << batch_size << " requests, " << total_length << " bytes)";
     return -1;
 }
 

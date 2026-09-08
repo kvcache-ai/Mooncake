@@ -22,6 +22,30 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+void collectConfigPaths(const json& node, const std::string& prefix,
+                        std::vector<std::string>& paths) {
+    // A default-constructed Config has a null root and represents an empty
+    // configuration whose callers rely entirely on defaults.
+    if (prefix.empty() && node.is_null()) return;
+    if (!node.is_object()) {
+        paths.push_back(prefix);
+        return;
+    }
+    if (node.empty()) {
+        if (!prefix.empty()) paths.push_back(prefix);
+        return;
+    }
+
+    for (auto it = node.begin(); it != node.end(); ++it) {
+        std::string path = prefix.empty() ? it.key() : prefix + "/" + it.key();
+        collectConfigPaths(it.value(), path, paths);
+    }
+}
+
+}  // namespace
+
 Status Config::load(const std::string& content) {
     std::lock_guard<std::mutex> lock(mutex_);
     try {
@@ -79,10 +103,38 @@ bool Config::dumpSubtree(const std::string& key_path, std::string* out) const {
     return false;
 }
 
+std::shared_ptr<const Config> Config::freeze() const {
+    auto frozen = std::make_shared<Config>();
+    std::lock_guard<std::mutex> lock(mutex_);
+    frozen->config_data_ = config_data_;
+    return frozen;
+}
+
+std::vector<std::string> Config::paths() const {
+    std::vector<std::string> paths;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        collectConfigPaths(config_data_, "", paths);
+    }
+    std::sort(paths.begin(), paths.end());
+    paths.erase(std::unique(paths.begin(), paths.end()), paths.end());
+    return paths;
+}
+
 static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
     if (val) config.setFromString(config_key, std::string(val));
+}
+
+// Bool env vars: setFromString() stores "1" as int, so get(..., false) misses
+// it.
+static inline void setBoolConfig(Config& config, const std::string& env_key,
+                                 const std::string& config_key) {
+    const char* val = std::getenv(env_key.c_str());
+    if (!val) return;
+    config.set(config_key,
+               ConfigHelper::parseBool(val, config.get(config_key, false)));
 }
 
 // Like setConfig, but parses the env value as a comma-separated list and
@@ -135,6 +187,7 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     }
 
     // Legacy keys for backward compatibility (MC_* env vars)
+    setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",
               "transports/rdma/device/num_cq_list");
@@ -167,6 +220,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/disable_gpu_direct_rdma");
     setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
               "transports/rdma/log_slice_affinity");
+    setBoolConfig(config, "MC_STRICT_LOCAL_NUMA",
+                  "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works
@@ -179,9 +234,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     // MC_CUSTOM_TOPO_JSON works under MC_USE_TENT. Inline
     // topology/priority_matrix in MC_TENT_CONF still takes precedence.
     setConfig(config, "MC_CUSTOM_TOPO_JSON", "topology/custom_json_path");
-    // TENT RPC server io_context threads. The TCP data-path handlers do
-    // full-payload blocking copies inline, so deployments pushing bulk data
-    // over the TENT TCP transport raise this above the default of 1.
+    // TENT RPC server io_context threads. TCP SendData/RecvData copies are
+    // offloaded onto the blocking executor; this pool still reads the RPC
+    // attachments. When TCP is enabled and this key is unset, the engine
+    // defaults to several threads so concurrent bulk transfers are not
+    // serialized on one io_context.
     setConfig(config, "MC_TENT_RPC_THREADS", "rpc_server_threads");
     return status;
 }

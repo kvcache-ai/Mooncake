@@ -232,10 +232,10 @@ Useful entry points:
 
 ```bash
 # EP grid correctness test
-python mooncake-ep/tests/test_ep_grid.py
+python python/tests/ep/test_ep_grid.py
 
-# Wheel-level EP smoke test
-python mooncake-wheel/tests/test_mooncake_ep.py
+# EP wrapper smoke test
+python python/tests/ep/test_mooncake_ep.py
 ```
 
 Adapt launch commands to the target environment and number of GPUs.

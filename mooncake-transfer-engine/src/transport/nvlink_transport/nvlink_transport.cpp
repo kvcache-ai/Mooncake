@@ -37,20 +37,6 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
-// CUDA Fabric Memory was added after the CUDA 12.0 driver headers.  Keep
-// Fabric-only code out of older-toolkit builds; those builds use CUDA IPC.
-#if defined(USE_CUDA)
-#if defined(CUDA_VERSION) && CUDA_VERSION >= 12040
-#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
-#else
-#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
-#endif
-#elif defined(USE_MUSA)
-#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 1
-#else
-#define MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED 0
-#endif
-
 static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -581,9 +567,6 @@ static int getNumDevices() {
 }
 
 static bool supportFabricMem() {
-#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
-    return false;
-#else
     if (getenv("MC_USE_NVLINK_IPC")) return false;
 
     int num_devices = 0;
@@ -598,7 +581,7 @@ static bool supportFabricMem() {
         return false;
     }
 
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
+#ifdef USE_CUDA
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
         cuDeviceGetAttribute(&device_support_fabric_mem,
@@ -610,7 +593,6 @@ static bool supportFabricMem() {
     }
 #endif
     return true;
-#endif
 }
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
@@ -1006,10 +988,6 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             desc.protocol = policy_->protocol();
 #endif
         return metadata_->addLocalMemoryBuffer(desc, true);
-#if !MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
-    }
-#endif
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
     } else {
         CUmemGenericAllocationHandle handle;
         auto result = cuMemRetainAllocationHandle(&handle, addr);
@@ -1056,8 +1034,6 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
 #endif
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
-#endif
-    return -1;
 }
 
 int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
@@ -1108,7 +1084,6 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 #endif
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
                            use_fabric_mem_) {
                     CUmemFabricHandle export_handle;
@@ -1163,7 +1138,6 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     shm_entry.length = entry.length;
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
-#endif
                 } else {
                     LOG(ERROR) << "Mismatched NVLink data transfer method";
                     return -1;
@@ -1209,7 +1183,6 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         cudaMalloc(&ptr, size);
         return ptr;
     }
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
@@ -1286,8 +1259,6 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         return nullptr;
     }
     return ptr;
-#endif
-    return nullptr;
 }
 
 void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
@@ -1295,7 +1266,6 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
         cudaFree(ptr);
         return;
     }
-#if MOONCAKE_CUDA_FABRIC_MEM_SUPPORTED
     CUmemGenericAllocationHandle handle;
     size_t size = 0;
     auto result = cuMemRetainAllocationHandle(&handle, ptr);
@@ -1310,6 +1280,5 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
         cuMemAddressFree((CUdeviceptr)ptr, size);
     }
     cuMemRelease(handle);
-#endif
 }
 }  // namespace mooncake

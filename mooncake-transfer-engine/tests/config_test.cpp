@@ -14,9 +14,14 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdlib>
+#include <thread>
 
 #include "config.h"
+#include "transport/batch_registration.h"
 
 namespace mooncake {
 namespace {
@@ -398,6 +403,78 @@ TEST_F(MaxConcurrentRegMrEnvTest, EmptyStringKeepsDefault) {
     config.max_concurrent_reg_mr = 17;
     loadGlobalConfig(config);
     EXPECT_EQ(config.max_concurrent_reg_mr, 17u);
+}
+
+class MaxConcurrentRegMrScope {
+   public:
+    explicit MaxConcurrentRegMrScope(size_t value)
+        : previous_(globalConfig().max_concurrent_reg_mr) {
+        globalConfig().max_concurrent_reg_mr = value;
+    }
+
+    ~MaxConcurrentRegMrScope() {
+        globalConfig().max_concurrent_reg_mr = previous_;
+    }
+
+   private:
+    size_t previous_;
+};
+
+void updatePeak(std::atomic<size_t>& peak, size_t current) {
+    size_t observed = peak.load();
+    while (observed < current &&
+           !peak.compare_exchange_weak(observed, current)) {
+    }
+}
+
+TEST(BatchRegistrationTest, RespectsConfiguredWorkerLimit) {
+    MaxConcurrentRegMrScope limit(3);
+    std::atomic<size_t> active{0};
+    std::atomic<size_t> peak{0};
+    std::atomic<size_t> completed{0};
+
+    int ret = runBoundedRegMrBatch(24, [&](size_t) {
+        size_t current = active.fetch_add(1) + 1;
+        updatePeak(peak, current);
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        active.fetch_sub(1);
+        completed.fetch_add(1);
+        return 0;
+    });
+
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(completed.load(), 24u);
+    EXPECT_LE(peak.load(), 3u);
+}
+
+TEST(BatchRegistrationTest, LimitOneRunsSerially) {
+    MaxConcurrentRegMrScope limit(1);
+    std::atomic<size_t> active{0};
+    std::atomic<size_t> peak{0};
+
+    int ret = runBoundedRegMrBatch(8, [&](size_t) {
+        size_t current = active.fetch_add(1) + 1;
+        updatePeak(peak, current);
+        std::this_thread::yield();
+        active.fetch_sub(1);
+        return 0;
+    });
+
+    EXPECT_EQ(ret, 0);
+    EXPECT_EQ(peak.load(), 1u);
+}
+
+TEST(BatchRegistrationTest, AttemptsEveryItemAndReturnsAnError) {
+    MaxConcurrentRegMrScope limit(4);
+    std::atomic<size_t> completed{0};
+
+    int ret = runBoundedRegMrBatch(12, [&](size_t index) {
+        completed.fetch_add(1);
+        return index == 7 ? -7 : 0;
+    });
+
+    EXPECT_EQ(ret, -7);
+    EXPECT_EQ(completed.load(), 12u);
 }
 
 class EfaNicSelectionEnvTest : public ::testing::Test {
@@ -835,6 +912,85 @@ TEST_F(MtuEnvTest, InvalidIsIgnored) {
     GlobalConfig config;
     loadGlobalConfig(config);
     EXPECT_EQ(config.mtu_length, IBV_MTU_4096);
+}
+
+// MC_CONTEXT_PAUSE_TTL_MS bounds how long the context-level circuit breaker
+// holds a tripped local RNIC context inactive before half-open reactivation.
+// The valid range is 1-600000ms. Zero, garbage, negative and out-of-range
+// values must preserve the configured value because zero would re-introduce
+// the permanent-latch behavior this knob exists to fix.
+class ContextPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ContextPauseTtlEnvTest, DefaultIsFiveThousandWhenUnset) {
+    ::unsetenv("MC_CONTEXT_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 5000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "10000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 10000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, ZeroIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 99;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 99);
+}
+
+TEST_F(ContextPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 600000);
+}
+
+TEST_F(ContextPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 7);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 11);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 13;  // a typo must NOT re-enable the latch
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 13);
+}
+
+TEST_F(ContextPauseTtlEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "5000s", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 15);
+}
+
+TEST_F(ContextPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONTEXT_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.context_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.context_pause_ttl_ms, 17);
 }
 
 }  // namespace
