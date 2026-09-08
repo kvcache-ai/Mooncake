@@ -54,6 +54,12 @@ bool OffsetAllocatorBackendConfig::Validate() const {
             << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
         return false;
     }
+    if (dax_alignment_bytes <= 0 ||
+        (dax_alignment_bytes & (dax_alignment_bytes - 1)) != 0) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: dax_alignment_bytes must "
+                      "be a positive power of two";
+        return false;
+    }
     return true;
 }
 
@@ -130,6 +136,13 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
         record_crc.has_value() && !*record_crc) {
         cfg.enable_record_crc = false;
     }
+
+    // Device-DAX / byte-addressable arena (see DaxFile).
+    cfg.dax_device_path = Environ::ReadOr(
+        Variables::MOONCAKE_OFFSET_DAX_DEVICE_PATH, cfg.dax_device_path);
+    cfg.dax_alignment_bytes =
+        Environ::ReadOr(Variables::MOONCAKE_OFFSET_DAX_ALIGNMENT_BYTES,
+                        cfg.dax_alignment_bytes);
 
     return cfg;
 }

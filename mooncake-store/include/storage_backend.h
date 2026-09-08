@@ -1474,6 +1474,11 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Returns full path to data file: {storage_path_}/kv_cache.data
     std::string GetDataFilePath() const;
 
+    // Maps cfg_.dax_device_path as the data arena (see DaxFile), binding
+    // data_file_path_ and data_file_. Used instead of the file open paths
+    // whenever dax_device_path is set.
+    tl::expected<void, ErrorCode> OpenDaxDataFile();
+
     static constexpr size_t kNumShards =
         1024;  // Number of shards (must be power of 2 for bitwise optimization)
 
@@ -1656,6 +1661,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     int64_t GetMetadataConsecutiveFailures() const {
         return metadata_consecutive_failures_.load(std::memory_order_relaxed);
     }
+    uint64_t GetCapacityForTest() const { return capacity_; }
 
    private:
 };
