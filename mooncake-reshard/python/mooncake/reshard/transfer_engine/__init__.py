@@ -3,6 +3,7 @@
 from .completion import (
     PendingTransferManager,
     TransferCompletionFailedError,
+    TransferCompletionInterrupted,
     TransferCompletionUnknownError,
     TransferEngineError,
     TransferRegistrationCleanupPendingError,
@@ -13,7 +14,7 @@ from .contracts import (
     TransferBatchReceipt,
     TransferDirection,
 )
-from .executor import MooncakeTransferEngineExecutor
+from .executor import MooncakeTransferEngineExecutor, TransferSubmission
 from .lifetime import (
     AllocationFence,
     AllocationLifetimeToken,
@@ -31,9 +32,11 @@ __all__ = [
     "TransferBatchRange",
     "TransferBatchReceipt",
     "TransferCompletionUnknownError",
+    "TransferCompletionInterrupted",
     "TransferCompletionFailedError",
     "TransferDirection",
     "TransferEngineError",
     "TransferRegistrationCleanupPendingError",
+    "TransferSubmission",
     "TerminalTransferState",
 ]
