@@ -418,6 +418,9 @@ def _dump(value: JsonValue) -> str:
 
 
 def _load_json_object(value: str, label: str) -> JsonObject:
+    if type(value) is not str or len(value.encode("utf-8")) > 16 * 1024 * 1024:
+        raise ValueError("KV-cache JSON must be text within the 16 MiB wire limit")
+
     def reject_constant(constant: str) -> None:
         raise ValueError(f"non-finite JSON number is unsupported: {constant}")
 

@@ -50,6 +50,7 @@ class KVCacheSnapshotDescriptor:
             require_nonempty_string(value, name)
         require_integer(token_start, "token_start")
         require_integer(token_count, "token_count", minimum=1)
+        require_integer(token_start + token_count, "token_end")
         require_sha256(token_fingerprint, "token_fingerprint")
         require_sha256(semantic_fingerprint, "semantic_fingerprint")
         content = _snapshot_content(

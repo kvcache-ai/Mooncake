@@ -116,15 +116,18 @@ selected topology. Each participant contributes a `KVCachePlacementPart`, and
 `KVCacheRuntimeBindingManifest` supplies operation-scoped live buffers. Runtime
 bindings contain no lease or eviction state; the framework owns pinning and
 lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
-semantics. Runtime-to-Runtime callers may omit it when the runtimes already own
-that semantic agreement, while Store paths require it.
+semantics. Legacy logical planning permits omission for compatibility; the
+Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
 
 The KV-cache implementation is split by responsibility:
 
-- `snapshot.py` defines optional content identity;
+- `snapshot.py` defines content identity;
 - `topology.py`, `part.py`, and `placement.py` define logical placement;
 - `runtime.py` and `binding.py` define and validate live buffer bindings;
 - `planner.py` defines semantically validated logical and prepared plans;
+- `resolved.py` and `transfer.py` validate and lower bounded resolved ranges;
+- `executor.py` and `completion.py` execute TE writes and collect all participants;
+- `runtime_serde.py` serializes resolved bindings, operations, and receipts;
 - `serde.py`, `snapshot_serde.py`, and `plan_serde.py` define strict JSON
   boundaries.
 

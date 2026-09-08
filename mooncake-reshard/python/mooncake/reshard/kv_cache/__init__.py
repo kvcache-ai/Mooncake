@@ -1,5 +1,7 @@
 """Framework-neutral KV-cache reshard contracts and planning API."""
 
+from .completion import KVCacheCompletion, KVCacheTargetReceipt, KVCacheWriterReceipt
+from .executor import KVCacheTransferEngineExecutor
 from .manifest import (
     KVCacheBufferBinding,
     KVCacheComponent,
@@ -32,6 +34,24 @@ from .planner import (
     plan_kv_cache_transfer_to_local_target,
     prepare_kv_cache_transfer,
 )
+from .resolved import (
+    KVCacheRegisteredRegion,
+    KVCacheResolvedRange,
+    KVCacheResolvedRuntimeBinding,
+    KVCacheTransferLimits,
+    resolve_contiguous_runtime_binding,
+    validate_resolved_runtime_binding,
+)
+from .runtime_serde import (
+    kv_cache_resolved_binding_from_json,
+    kv_cache_resolved_binding_to_json,
+    kv_cache_runtime_transfer_from_json,
+    kv_cache_runtime_transfer_to_json,
+    kv_cache_target_receipt_from_json,
+    kv_cache_target_receipt_to_json,
+    kv_cache_writer_receipt_from_json,
+    kv_cache_writer_receipt_to_json,
+)
 from .serde import (
     kv_cache_part_from_json,
     kv_cache_part_to_json,
@@ -44,9 +64,11 @@ from .snapshot_serde import (
     kv_cache_snapshot_from_json,
     kv_cache_snapshot_to_json,
 )
+from .transfer import KVCacheRuntimeTransferPlan, KVCacheWrite
 
 __all__ = [
     "KVCacheBufferBinding",
+    "KVCacheCompletion",
     "KVCacheComponent",
     "KVCacheDescriptor",
     "KVCacheLayout",
@@ -56,13 +78,22 @@ __all__ = [
     "KVCachePreparedTransferEdge",
     "KVCachePreparedTransferPlan",
     "KVCacheRank",
+    "KVCacheRegisteredRegion",
+    "KVCacheResolvedRange",
+    "KVCacheResolvedRuntimeBinding",
     "KVCacheRuntimeBinding",
     "KVCacheRuntimeBindingManifest",
     "KVCacheRuntimeBuffer",
+    "KVCacheRuntimeTransferPlan",
     "KVCacheSnapshotDescriptor",
+    "KVCacheTargetReceipt",
     "KVCacheTopology",
     "KVCacheTopologyParticipant",
     "KVCacheTransferEdge",
+    "KVCacheTransferEngineExecutor",
+    "KVCacheTransferLimits",
+    "KVCacheWrite",
+    "KVCacheWriterReceipt",
     "SnapshotId",
     "assemble_kv_cache_placement",
     "kv_cache_logical_plan_from_json",
@@ -71,13 +102,23 @@ __all__ = [
     "kv_cache_part_to_json",
     "kv_cache_placement_from_json",
     "kv_cache_placement_to_json",
+    "kv_cache_resolved_binding_from_json",
+    "kv_cache_resolved_binding_to_json",
     "kv_cache_runtime_binding_from_json",
     "kv_cache_runtime_binding_to_json",
+    "kv_cache_runtime_transfer_from_json",
+    "kv_cache_runtime_transfer_to_json",
     "kv_cache_snapshot_from_json",
     "kv_cache_snapshot_to_json",
+    "kv_cache_target_receipt_from_json",
+    "kv_cache_target_receipt_to_json",
+    "kv_cache_writer_receipt_from_json",
+    "kv_cache_writer_receipt_to_json",
     "placement_fragment_id",
     "plan_kv_cache_transfer_to_local_target",
     "prepare_kv_cache_transfer",
+    "resolve_contiguous_runtime_binding",
+    "validate_resolved_runtime_binding",
     "validate_runtime_binding",
     "validate_runtime_bindings",
 ]

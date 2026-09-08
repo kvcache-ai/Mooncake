@@ -211,11 +211,22 @@ def _validate_logical_coverage(
     topology: KVCacheTopology,
     descriptor: KVCacheDescriptor,
 ) -> None:
+    if len(parts) ** 2 * len(descriptor.global_layer_ids) > 10_000_000:
+        raise ValueError("KV-cache placement validation work limit exceeded")
     selected_dp_ranks = sorted({item.rank.dp for item in topology.participants})
     for dp_rank in selected_dp_ranks:
         dp_parts = tuple(part for part in parts if part.rank.dp == dp_rank)
         for layer_id in descriptor.global_layer_ids:
-            for head in range(descriptor.total_kv_heads):
+            boundaries = sorted(
+                {0, descriptor.total_kv_heads}
+                | {
+                    boundary
+                    for part in dp_parts
+                    if layer_id in part.layer_ids
+                    for boundary in (part.head_start, part.head_start + part.head_count)
+                }
+            )
+            for head in boundaries[:-1]:
                 owners = [
                     part
                     for part in dp_parts
@@ -228,6 +239,13 @@ def _validate_logical_coverage(
                         f"dp={dp_rank} layer={layer_id} head={head}"
                     )
                 if len(owners) > 1:
+                    if (
+                        len({(part.head_start, part.head_count) for part in owners})
+                        != 1
+                    ):
+                        raise ValueError(
+                            "overlapping replica head intervals must match exactly"
+                        )
                     ordinals = {part.replica_ordinal for part in owners}
                     counts = {part.replica_count for part in owners}
                     if counts != {len(owners)} or ordinals != set(range(len(owners))):

@@ -12,7 +12,12 @@ from .part import KVCachePlacementPart
 from .placement import KVCachePlacementManifest
 from .runtime import KVCacheRuntimeBindingManifest
 from .snapshot import KVCacheSnapshotDescriptor, SnapshotId
-from .types import KVCacheComponent, require_integer, require_nonempty_string
+from .types import (
+    KVCacheComponent,
+    require_integer,
+    require_manifest_items,
+    require_nonempty_string,
+)
 
 
 @dataclass(frozen=True)
@@ -72,9 +77,14 @@ class KVCacheLogicalTransferPlan:
         _validate_placement_compatibility(
             self.source_placement, self.target_placement, self.snapshot
         )
-        if not self.edges or not all(
-            isinstance(edge, KVCacheTransferEdge) for edge in self.edges
-        ):
+        object.__setattr__(
+            self,
+            "edges",
+            require_manifest_items(
+                self.edges, "logical plan edges", KVCacheTransferEdge
+            ),
+        )
+        if not self.edges:
             raise ValueError("logical transfer plan must contain transfer edges")
         if any(
             edge.target_participant_id != self.target_participant_id
@@ -221,6 +231,8 @@ def _build_transfer_edges(
     target: KVCachePlacementPart,
     source_dp_rank: int,
 ) -> tuple[KVCacheTransferEdge, ...]:
+    if len(source_placement.parts) ** 2 * len(target.layer_ids) > 10_000_000:
+        raise ValueError("KV-cache logical planning work limit exceeded")
     descriptor = source_placement.descriptor
     edges: list[KVCacheTransferEdge] = []
     for layer_id in target.layer_ids:
@@ -242,28 +254,20 @@ def _build_transfer_edges(
                     f"source placement misses target layer {layer_id} head {head}"
                 )
             selected = candidates[target.replica_ordinal % len(candidates)]
-            run_end = head + 1
-            while run_end < target_end:
-                next_candidates = sorted(
-                    (
-                        part
-                        for part in source_placement.parts
-                        if part.rank.dp == source_dp_rank
-                        and layer_id in part.layer_ids
-                        and part.head_start
-                        <= run_end
-                        < part.head_start + part.head_count
-                    ),
-                    key=lambda part: (part.replica_ordinal, part.participant_id),
-                )
-                if not next_candidates:
-                    break
-                if (
-                    next_candidates[target.replica_ordinal % len(next_candidates)]
-                    != selected
-                ):
-                    break
-                run_end += 1
+            # Ownership is constant between explicit interval boundaries. Never
+            # iterate across a potentially untrusted total_kv_heads value.
+            run_end = min(
+                [target_end]
+                + [
+                    boundary
+                    for part in source_placement.parts
+                    if part.rank.dp == source_dp_rank and layer_id in part.layer_ids
+                    for boundary in (part.head_start, part.head_start + part.head_count)
+                    if boundary > head
+                ]
+            )
+            if len(edges) + 2 > 100_000:
+                raise ValueError("KV-cache logical plan edge limit exceeded")
             for component, head_dim in (
                 (KVCacheComponent.KEY, descriptor.key_head_dim),
                 (KVCacheComponent.VALUE, descriptor.value_head_dim),
