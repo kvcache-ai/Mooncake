@@ -126,8 +126,10 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
             // invalidation. This is a best-effort mechanism to reduce stale
             // cache hits. Errors are logged and ignored; correctness should not
             // depend on this.
-            ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
-                                                       local_rpc_addr);
+            // A peer whose control plane stopped answering is not dialed.
+            if (!PeerHealth::instance().shouldFailFast(peer_rpc_addr))
+                ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
+                                                           local_rpc_addr);
         } else {
             LOG(ERROR) << "Unexpected empty RPC address, peer: '"
                        << peer_rpc_addr << "', local: '" << local_rpc_addr
@@ -161,6 +163,29 @@ Status SegmentManager::getRemote(SegmentDescRef &desc, SegmentID handle) {
 Status SegmentManager::getRemote(SegmentDescRef &desc,
                                  const std::string &segment_name) {
     return registry_->getSegmentDesc(desc, segment_name);
+}
+
+Status SegmentManager::withPeerRpcAddr(
+    SegmentID segment_id,
+    const std::function<Status(const std::string &)> &call) {
+    const bool may_move = segment_id != LOCAL_SEGMENT_ID && registry_ &&
+                          registry_->refetchMayChangeRpcAddr();
+    std::string failed_addr;
+    Status failed;
+    return withCachedSegment(segment_id, [&](SegmentDesc *segment) {
+        const std::string &addr = segment->rpc_server_addr;
+        if (addr.empty()) {
+            return Status::NeedsRefreshCache("Empty RPC server addr" LOC_MARK);
+        }
+        if (addr == failed_addr) return failed;  // refetched, same address
+        Status status = call(addr);
+        if (!status.IsRpcServiceError() || !may_move || !failed_addr.empty())
+            return status;
+        failed_addr = addr;
+        failed = status;
+        return Status::NeedsRefreshCache(std::string{status.message()} +
+                                         LOC_MARK);
+    });
 }
 
 Status SegmentManager::invalidateRemote(SegmentID handle) {

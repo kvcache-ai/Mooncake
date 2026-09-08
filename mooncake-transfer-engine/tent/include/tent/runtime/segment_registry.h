@@ -47,6 +47,8 @@ class SegmentRegistry {
     virtual Status putSegmentDesc(SegmentDescRef &desc) = 0;
 
     virtual Status deleteSegmentDesc(const std::string &segment_name) = 0;
+
+    virtual bool refetchMayChangeRpcAddr() const { return true; }
 };
 
 class CentralSegmentRegistry : public SegmentRegistry {
@@ -84,6 +86,9 @@ class PeerSegmentRegistry : public SegmentRegistry {
     virtual Status deleteSegmentDesc(const std::string &segment_name) {
         return Status::OK();  // no operation in purpose
     }
+
+    // The name is the rpc_server_addr, so a refetch cannot move it.
+    virtual bool refetchMayChangeRpcAddr() const { return false; }
 };
 
 }  // namespace tent
