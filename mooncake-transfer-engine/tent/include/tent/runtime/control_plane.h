@@ -268,7 +268,9 @@ class ControlClient {
                               const std::string_view& request,
                               std::string& response,
                               std::chrono::milliseconds timeout,
-                              bool bypass_peer_health = false);
+                              bool bypass_peer_health = false,
+                              bool* peer_unreachable = nullptr,
+                              bool* peer_answered = nullptr);
 };
 
 class ControlService {

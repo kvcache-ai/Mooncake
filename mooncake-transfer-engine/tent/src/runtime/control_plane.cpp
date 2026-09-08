@@ -143,9 +143,11 @@ Status ControlClient::callGuarded(const std::string& server_addr, int func_id,
                                   const std::string_view& request,
                                   std::string& response,
                                   std::chrono::milliseconds timeout,
-                                  bool bypass_peer_health) {
+                                  bool bypass_peer_health,
+                                  bool* peer_unreachable, bool* peer_answered) {
     auto& health = PeerHealth::instance();
     if (!bypass_peer_health && health.shouldFailFast(server_addr)) {
+        if (peer_unreachable) *peer_unreachable = true;
         return Status::RpcConnectionError("Peer control plane " + server_addr +
                                           " marked unreachable, not dialing" +
                                           LOC_MARK);
@@ -154,8 +156,10 @@ Status ControlClient::callGuarded(const std::string& server_addr, int func_id,
     RpcCallOptions options;
     options.timeout = timeout;
     options.peer_unreachable = &unreachable;
+    options.peer_answered = peer_answered;
     Status status =
         tl_rpc_agent.call(server_addr, func_id, request, response, options);
+    if (peer_unreachable) *peer_unreachable = unreachable;
     if (unreachable) {
         health.markUnreachable(server_addr);
     } else if (status.ok()) {
@@ -290,16 +294,32 @@ Status ControlClient::notify(const std::string& server_addr,
     json j = message;
     std::string request = j.dump();
     std::string response;
-    return callGuarded(server_addr, Notify, request, response,
-                       requestTimeout());
+    bool unreachable = false, answered = false;
+    auto status =
+        callGuarded(server_addr, Notify, request, response, requestTimeout(),
+                    /*bypass_peer_health=*/false, &unreachable, &answered);
+    // A local error on an idle pooled connection says nothing about the peer
+    // (a stale pool, or a lost reply): once more, as before this change.
+    if (status.IsRpcServiceError() && !unreachable && !answered) {
+        status = callGuarded(server_addr, Notify, request, response,
+                             requestTimeout());
+    }
+    return status;
 }
 
 Status ControlClient::probe(const std::string& server_addr,
                             std::chrono::milliseconds timeout) {
     std::string request, response;
     if (timeout.count() <= 0) timeout = requestTimeout();
-    return callGuarded(server_addr, Probe, request, response, timeout,
-                       /*bypass_peer_health=*/true);
+    bool unreachable = false;
+    auto status = callGuarded(server_addr, Probe, request, response, timeout,
+                              /*bypass_peer_health=*/true, &unreachable);
+    // Read-only: retry a failure that says nothing about the peer (stale pool).
+    if (status.IsRpcServiceError() && !unreachable) {
+        status = callGuarded(server_addr, Probe, request, response, timeout,
+                             /*bypass_peer_health=*/true);
+    }
+    return status;
 }
 
 inline void to_json(json& j, const Request& r) {

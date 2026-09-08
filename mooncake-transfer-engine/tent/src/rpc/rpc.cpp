@@ -290,6 +290,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     if (!call_result.has_value()) {
         lease.broken = true;
         const bool answered = peerAnswered(call_result.error().code);
+        if (options.peer_answered) *options.peer_answered = answered;
         // A local error on an idle pooled connection only says it is stale;
         // a timeout, or no answer on a connection made for this call, does not.
         if (options.peer_unreachable && !answered &&

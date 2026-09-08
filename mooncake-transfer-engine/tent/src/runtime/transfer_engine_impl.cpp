@@ -3094,40 +3094,16 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
 
 Status TransferEngineImpl::sendNotificationViaRpc(SegmentID target_id,
                                                   const Notification& notifi) {
-    return metadata_->segmentManager().withCachedSegment(
-        target_id, [&](SegmentDesc* segment) {
-            auto rpc_server_addr = segment->rpc_server_addr;
-            if (rpc_server_addr.empty()) {
-                return Status::NeedsRefreshCache(
-                    "Empty RPC server addr" LOC_MARK);
-            }
-            auto status = ControlClient::notify(rpc_server_addr, notifi);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
-            return status;
+    return metadata_->segmentManager().withPeerRpcAddr(
+        target_id, [&](const std::string& rpc_server_addr) {
+            return ControlClient::notify(rpc_server_addr, notifi);
         });
 }
 
 Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
-    return metadata_->segmentManager().withCachedSegment(
-        target_id, [&](SegmentDesc* segment) {
-            auto rpc_server_addr = segment->rpc_server_addr;
-            if (rpc_server_addr.empty()) {
-                return Status::NeedsRefreshCache(
-                    "Empty RPC server addr" LOC_MARK);
-            }
-            auto status = ControlClient::probe(rpc_server_addr);
-            if (status.IsRpcServiceError()) {
-                // Perhaps rpc_server_addr can be updated in the future
-                return Status::NeedsRefreshCache(
-                    "RPC service error: " + std::string{status.message()} +
-                    LOC_MARK);
-            }
-            return status;
+    return metadata_->segmentManager().withPeerRpcAddr(
+        target_id, [&](const std::string& rpc_server_addr) {
+            return ControlClient::probe(rpc_server_addr);
         });
 }
 

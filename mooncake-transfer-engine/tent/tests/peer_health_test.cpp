@@ -19,12 +19,15 @@
 #include <atomic>
 #include <chrono>
 #include <functional>
+#include <memory>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "tent/common/types.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/segment_manager.h"
+#include "tent/runtime/segment_registry.h"
 #include "tent/rpc/rpc.h"
 
 namespace mooncake {
@@ -170,7 +173,14 @@ TEST(PeerHealthTest, ARequestTimeoutMarksThePeer) {
     ControlClient::setRequestTimeout(200ms);
 
     const std::vector<std::function<Status()>> calls = {
-        [&] { return ControlClient::notify(addr, Notification{}); },
+        [&] {
+            const Status s = ControlClient::notify(addr, Notification{});
+            // Not sent again: a second attempt would be refused as marked.
+            EXPECT_EQ(s.message().find("marked unreachable"),
+                      std::string_view::npos)
+                << s.ToString();
+            return s;
+        },
         [&] {
             std::string response;
             return ControlClient::getSegmentDesc(addr, response);
@@ -245,6 +255,8 @@ TEST(PeerHealthTest, RefusedConnectMarksThePeer) {
     const Status first = ControlClient::probe(addr);
     EXPECT_TRUE(first.IsRpcServiceError()) << first.ToString();
     EXPECT_TRUE(health.shouldFailFast(addr));
+    // Marked once: a refused dial is not retried.
+    EXPECT_FALSE(health.shouldFailFast(addr, Clock::now() + 5001ms));
     const Status again = ControlClient::probe(addr);
     EXPECT_EQ(again.message().find("marked unreachable"),
               std::string_view::npos)
@@ -317,6 +329,47 @@ TEST(PeerHealthTest, ProberIdlesOnceTheIntervalIsSetToZero) {
     EXPECT_EQ(probes.load(), seen);
 
     health.clear();
+}
+
+struct FixedRegistry : SegmentRegistry {  // no RPC, like a central one
+    explicit FixedRegistry(std::string addr) : addr(std::move(addr)) {}
+    Status getSegmentDesc(SegmentDescRef& desc, const std::string&) override {
+        desc = std::make_shared<SegmentDesc>();
+        desc->rpc_server_addr = addr;
+        return Status::OK();
+    }
+    Status putSegmentDesc(SegmentDescRef&) override { return Status::OK(); }
+    Status deleteSegmentDesc(const std::string&) override {
+        return Status::OK();
+    }
+    const std::string addr;
+};
+
+// A marked peer's segment is still looked up, but not dialed to subscribe.
+TEST(PeerHealthTest, MarkedPeerIsNotSubscribedTo) {
+    auto& health = PeerHealth::instance();
+    health.configure(config());
+    std::atomic<int> subscribes{0};
+    CoroRpcAgent server;
+    const std::string addr = startServer(
+        server, SubscribeSegmentUpdate,
+        [&](const std::string_view&, std::string&) { ++subscribes; });
+    SegmentManager manager(std::make_unique<FixedRegistry>(addr));
+    (void)manager.updateLocal([](SegmentDesc& local) {
+        local.rpc_server_addr = "127.0.0.1:2";
+        return Status::OK();
+    });
+    for (const bool marked : {true, false}) {
+        marked ? health.markUnreachable(addr) : health.clear();
+        SegmentID id = 0;
+        ASSERT_TRUE(manager.openRemote(id, marked ? "marked" : "free").ok());
+        onFreshThread([&] {  // up while the async subscribe goes out
+            SegmentDescRef desc;
+            EXPECT_TRUE(manager.getRemoteCached(desc, id).ok());
+            std::this_thread::sleep_for(300ms);
+        });
+        EXPECT_EQ(subscribes, marked ? 0 : 1);
+    }
 }
 
 }  // namespace
