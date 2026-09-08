@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from threading import Lock
-from typing import Any, Sequence, Union
+from typing import Any, Protocol, Sequence, Union, cast
 from uuid import uuid4
 
 from .lifetime import (
@@ -11,14 +11,28 @@ from .lifetime import (
 )
 
 
+class _CompletionTicket(Protocol):
+    @property
+    def status(self) -> object: ...
+
+    def drain(self, timeout_ms: int) -> object: ...
+
+
 class TransferEngineError(RuntimeError):
     pass
 
 
 class TransferCompletionUnknownError(TransferEngineError):
-    def __init__(self, message: str, *, pending_transfer_id: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        pending_transfer_id: str,
+        engine_identity: tuple[str, int],
+    ) -> None:
         super().__init__(message)
         self.pending_transfer_id = pending_transfer_id
+        self.engine_identity = engine_identity
 
 
 class TransferCompletionFailedError(TransferEngineError):
@@ -34,27 +48,36 @@ class TransferRegistrationCleanupPendingError(TransferEngineError):
 
 
 class _CompletionUnknown(RuntimeError):
-    def __init__(self, ticket: Any) -> None:
+    def __init__(self, ticket: _CompletionTicket) -> None:
         super().__init__("transfer completion remains unknown")
         self.ticket = ticket
 
 
 class _CompletionWaitInterrupted(BaseException):
-    def __init__(self, ticket: Any, interruption: BaseException) -> None:
+    def __init__(
+        self,
+        ticket: _CompletionTicket,
+        interruption: BaseException,
+    ) -> None:
         super().__init__(str(interruption))
         self.ticket = ticket
         self.interruption = interruption
 
 
-class _PendingCompletionWaitInterrupted(BaseException):
+class TransferCompletionInterrupted(BaseException):
+    """Completion wait was interrupted while the transfer remained pending."""
+
     def __init__(
         self,
         pending_transfer_id: str,
         interruption: BaseException,
+        *,
+        engine_identity: tuple[str, int],
     ) -> None:
         super().__init__(str(interruption))
         self.pending_transfer_id = pending_transfer_id
         self.interruption = interruption
+        self.engine_identity = engine_identity
 
 
 class _UndrainableCompletionUnknownTicket:
@@ -101,7 +124,7 @@ def _canonical_engine_identity(engine: Any) -> tuple[str, int]:
 class _PendingTransfer:
     engine: Any
     engine_identity: tuple[str, int]
-    ticket: Any
+    ticket: _CompletionTicket
     registrations: set[int]
     resources: tuple[Any, ...]
     allocation_tokens: tuple[AllocationLifetimeToken, ...]
@@ -167,7 +190,7 @@ def _batch_transfer_with_completion_fence(
         return result
 
     try:
-        ticket = ticket_method(*arguments)
+        ticket = cast(_CompletionTicket, ticket_method(*arguments))
     except Exception as error:
         # A ticket-bearing entry point can also cross the native submission
         # boundary before throwing. With no ticket to drain, fail closed and
@@ -213,7 +236,7 @@ class PendingTransferManager:
 
     def _retain_pending_ticket(
         self,
-        ticket: Any,
+        ticket: _CompletionTicket,
         *,
         terminal_state: TerminalTransferState | None = None,
     ) -> str:
@@ -283,6 +306,7 @@ class PendingTransferManager:
         registrations: Sequence[int],
         resources: Sequence[Any],
         allocation_tokens: Sequence[AllocationLifetimeToken] = (),
+        handoff_complete: bool = True,
     ) -> None:
         with _pending_transfer_lock:
             pending = _pending_transfers.get(pending_transfer_id)
@@ -294,21 +318,55 @@ class PendingTransferManager:
                 raise TransferEngineError(
                     f"pending transfer does not exist: {pending_transfer_id}"
                 )
+            if pending.draining:
+                raise TransferEngineError(
+                    "pending transfer resources cannot be handed off while draining: "
+                    f"{pending_transfer_id}"
+                )
             if pending.resources_handed_off:
                 raise TransferEngineError(
                     "pending transfer resources were already handed off: "
                     f"{pending_transfer_id}"
                 )
             pending.registrations.update(registrations)
-            pending.resources += tuple(resources)
-            token_ids = {token.fence.token_id for token in pending.allocation_tokens}
+            resource_ids = {id(resource) for resource in pending.resources}
+            additional_resources: list[Any] = []
+            for resource in resources:
+                resource_id = id(resource)
+                if resource_id in resource_ids:
+                    continue
+                resource_ids.add(resource_id)
+                additional_resources.append(resource)
+            pending.resources += tuple(additional_resources)
+            tokens_by_id = {
+                token.fence.token_id: token for token in pending.allocation_tokens
+            }
             for token in allocation_tokens:
-                if token.fence.token_id in token_ids:
+                token_id = token.fence.token_id
+                existing = tokens_by_id.get(token_id)
+                if existing is token:
+                    continue
+                if existing is not None:
                     raise TransferEngineError(
-                        "pending transfer has duplicate allocation lifetime token"
+                        "pending transfer has conflicting allocation lifetime token"
                     )
-                token_ids.add(token.fence.token_id)
-            pending.allocation_tokens += tuple(allocation_tokens)
+                tokens_by_id[token_id] = token
+                pending.allocation_tokens += (token,)
+            pending.resources_handed_off = handoff_complete
+
+    def _seal_pending_resource_handoff(self, pending_transfer_id: str) -> None:
+        with _pending_transfer_lock:
+            pending = self._get_pending_transfer(pending_transfer_id)
+            if pending.draining:
+                raise TransferEngineError(
+                    "pending transfer resources cannot be sealed while draining: "
+                    f"{pending_transfer_id}"
+                )
+            if pending.resources_handed_off:
+                raise TransferEngineError(
+                    "pending transfer resources were already handed off: "
+                    f"{pending_transfer_id}"
+                )
             pending.resources_handed_off = True
 
     def _reserve_submission(self) -> None:

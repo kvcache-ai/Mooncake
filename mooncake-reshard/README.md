@@ -106,11 +106,23 @@ The returned ticket distinguishes completed, failed-and-drained, and unknown
 completion. Unknown completion retains registrations and allocation tokens
 until `drain_pending_transfer()` reaches a terminal state.
 
+Under TENT, Scatter pins a direct route that supports cancellation before
+publishing transport work. An unsupported or staged route is rejected before
+DMA submission, so status-query failures always have a cancellation path.
+
+An interrupted completion wait raises `TransferCompletionInterrupted` with the
+pending transfer ID, engine identity, and original interruption. The affected
+submission remains unusable, while its registered buffers follow the same
+pending drain lifecycle.
+
 Engines without the scatter ticket entry point continue to use the flat
 `batch_transfer_sync_read/write` compatibility path. A zero result is terminal;
 any non-zero result quarantines registrations and allocation tokens as
 restart-required because the flat API provides no drainable operation handle.
-Registration cleanup failures use the same pending lifecycle.
+Registration cleanup uses the same pending lifecycle. Explicit non-zero cleanup
+results remain retryable; an exception or interruption makes the cleanup
+outcome restart-required. Allocation tokens are retired one at a time, so a
+later unknown release never replays tokens whose release already completed.
 
 ## Store Snapshots
 
