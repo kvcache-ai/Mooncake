@@ -1152,11 +1152,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 auto& tenant = *handle;
                 auto objs = tenant.SnapshotObjects();
                 for (const auto& object_entry : objs) {
-                    if (!object_entry->has_metadata()) {
-                        continue;
-                    }
                     std::unique_lock<std::shared_mutex> lk(object_entry->mutex);
-                    ObjectMetadata& metadata = *object_entry->metadata();
+                    ObjectMetadata& metadata = object_entry->metadata();
                     metadata.VisitReplicas(
                         [](const Replica& replica) {
                             return replica.is_memory_replica() &&
@@ -1587,11 +1584,8 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         // Collect handles, then lock each per-object (there is no tenant
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata()) {
-                continue;
-            }
             std::shared_lock<std::shared_mutex> lk(entry->mutex);
-            ObjectMetadata& metadata = *entry->metadata();
+            ObjectMetadata& metadata = entry->metadata();
             auto& charged_bytes = usage[tenant_id];
             const uint64_t charge = CompletedMemoryQuotaCharge(metadata);
             if (charge > TenantQuotaAccount::kMaxChargedBytes ||
@@ -1610,11 +1604,8 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
             tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata()) {
-                continue;
-            }
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
-            ObjectMetadata& metadata = *entry->metadata();
+            ObjectMetadata& metadata = entry->metadata();
             auto rebuild_result = metadata.quota_ledger.Rebuild(
                 tenant_state.quota_account,
                 CompletedMemoryQuotaCharge(metadata));
@@ -1691,13 +1682,13 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     std::vector<std::string> members_to_erase;
     for (const auto& member_key : member_keys) {
         auto entry = tenant_state.Pin(member_key);
-        if (!entry || !entry->has_metadata()) {
+        if (!entry) {
             continue;
         }
         // Hold the per-object lock across the member eviction; released before
         // erasing the member below (callback no longer erases).
         std::unique_lock<std::shared_mutex> member_lock(entry->mutex);
-        ObjectMetadata& member_metadata = *entry->metadata();
+        ObjectMetadata& member_metadata = entry->metadata();
         // Re-validate under the per-object lock: the group/member lease
         // and pin state may have changed since the caller's snapshot. A
         // surviving shared group lease makes every member's lease not
@@ -1798,10 +1789,8 @@ void MasterService::RebuildCacheTotalAccounting() {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (entry->has_metadata()) {
-                std::unique_lock<std::shared_mutex> lk(entry->mutex);
-                SyncCacheTotalAccounting(*entry->metadata());
-            }
+            std::unique_lock<std::shared_mutex> lk(entry->mutex);
+            SyncCacheTotalAccounting(entry->metadata());
         }
     });
 }
@@ -1907,12 +1896,12 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     TenantStateAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Pin(durable_entry.object_key);
-    if (!object_entry || !object_entry->has_metadata()) {
+    if (!object_entry) {
         return;
     }
 
     std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
-    auto& metadata = *object_entry->metadata();
+    auto& metadata = object_entry->metadata();
     // The replicas being finalized are already marked REMOVED, so the normal
     // completed-replica view no longer contains their media. Preserve the
     // pre-removal view (and any caller-provided snapshot) for the event delta.
@@ -2207,7 +2196,7 @@ void MasterService::EraseMetadata(
     const TenantId& tenant_id, QuotaEraseMode quota_mode,
     TenantStateAccessorRW* tenant_accessor,
     const std::vector<std::string>& previous_media_hint) {
-    if (!entry || !entry->has_metadata()) {
+    if (!entry) {
         return;
     }
     // Take the per-object lock for teardown so concurrent point ops on the same
@@ -2225,7 +2214,7 @@ void MasterService::EraseMetadata(
     entry->is_torn_down = true;
     const std::string key = entry->key();
     const std::string group_id = entry->group_id();
-    ObjectMetadata& metadata = *entry->metadata();
+    ObjectMetadata& metadata = entry->metadata();
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -2362,11 +2351,11 @@ void MasterService::RebuildGroupState() {
         // Collect handles, then lock each per-object (there is no tenant
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata() || !entry->metadata()->IsGrouped()) {
+            if (!entry->metadata().IsGrouped()) {
                 continue;
             }
             std::shared_lock<std::shared_mutex> lk(entry->mutex);
-            ObjectMetadata& metadata = *entry->metadata();
+            ObjectMetadata& metadata = entry->metadata();
             const auto scoped = tenant_id.MakeScopedKey(metadata.group_id);
             const auto deadline = metadata.EvictionDeadline();
             auto [it, inserted] =
@@ -2385,11 +2374,11 @@ void MasterService::RebuildGroupState() {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata() || !entry->metadata()->IsGrouped()) {
+            if (!entry->metadata().IsGrouped()) {
                 continue;
             }
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
-            ObjectMetadata& metadata = *entry->metadata();
+            ObjectMetadata& metadata = entry->metadata();
             auto lease = tenant_state.object_route.LeaseFor(metadata.group_id);
             tenant_state.object_route.AddMember(metadata.group_id,
                                                 entry->key());
@@ -2571,11 +2560,11 @@ void MasterService::CleanupExpiredSoftPins(
             continue;
         }
         auto object_entry = tenant_handle->Pin(key);
-        if (!object_entry || !object_entry->has_metadata()) {
+        if (!object_entry) {
             continue;
         }
         std::unique_lock<std::shared_mutex> lock(object_entry->mutex);
-        if (object_entry->metadata()->ExpireSoftPinIfDeadlineMatches(
+        if (object_entry->metadata().ExpireSoftPinIfDeadlineMatches(
                 entry.deadline, now)) {
             ++expired_count;
         }
@@ -2619,11 +2608,8 @@ void MasterService::ClearStaleHandles(
         auto objs = handle->SnapshotObjects();
         std::vector<std::string> keys_to_erase;
         for (const auto& entry : objs) {
-            if (!entry->has_metadata()) {
-                continue;
-            }
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
-            ObjectMetadata& metadata = *entry->metadata();
+            ObjectMetadata& metadata = entry->metadata();
             const std::string key = entry->key();
             const auto cleanup_plan =
                 BuildStaleHandleCleanupPlan(metadata, is_stale);
@@ -2894,14 +2880,14 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
         auto entry = tenant_state.Pin(key);
-        if (!entry || !entry->has_metadata()) {
+        if (!entry) {
             VLOG(1) << "key=" << key << ", tenant_id=" << normalized_tenant
                     << ", info=object_not_found";
             results[i] = false;
             continue;
         }
         std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
-        const ObjectMetadata& metadata = *entry->metadata();
+        const ObjectMetadata& metadata = entry->metadata();
         if (!metadata.IsValid() || !HasReadableReplica(metadata)) {
             results[i] = false;
             continue;
@@ -2923,13 +2909,10 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
         const auto& tenant_state = *tenant_handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata()) {
-                continue;
-            }
             // Collect-then-process (route released); lock per-object while
             // reading.
             std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
-            const ObjectMetadata& metadata = *entry->metadata();
+            const ObjectMetadata& metadata = entry->metadata();
             if (!HasReadableReplica(metadata)) {
                 continue;
             }
@@ -3376,19 +3359,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             auto tenant_handle = GetOrCreateTenantStateHandle(object.tenant_id);
             auto& tenant_state = *tenant_handle;
             auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-                object.user_key, standby_meta.group_id);
-            entry->SetMetadata(std::make_unique<ObjectMetadata>(
-                standby_meta.client_id, now, standby_meta.size,
-                std::move(object.replicas), std::nullopt,
-                standby_meta.hard_pinned.value_or(false),
-                standby_meta.data_type, standby_meta.group_id,
-                object.tenant_id, object.user_key));
+                object.user_key, standby_meta.group_id,
+                std::make_unique<ObjectMetadata>(
+                    standby_meta.client_id, now, standby_meta.size,
+                    std::move(object.replicas), std::nullopt,
+                    standby_meta.hard_pinned.value_or(false),
+                    standby_meta.data_type, standby_meta.group_id,
+                    object.tenant_id, object.user_key));
             tenant_state.InsertObject(object.user_key, entry);
             if (!standby_meta.group_id.empty()) {
                 // InsertObject wired the ObjectEntry lease to the group's
                 // shared lease; the read path reads ObjectMetadata::lease_, so
                 // mirror it.
-                entry->metadata()->SetLease(entry->lease());
+                entry->metadata().SetLease(entry->lease());
             }
             entry->is_processing = false;
         }
@@ -3788,15 +3771,12 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         const auto& tenant_state = *tenant_handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata()) {
-                continue;
-            }
             const std::string& key = entry->key();
             if (std::regex_search(key, pattern)) {
                 // Collect-then-process; lock per-object while reading.
                 std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
                 std::vector<Replica::Descriptor> replica_list;
-                entry->metadata()->VisitReplicas(
+                entry->metadata().VisitReplicas(
                     [this](const Replica& replica) {
                         return IsReplicaReadable(replica);
                     },
@@ -3812,7 +3792,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                 }
 
                 results.emplace(key, std::move(replica_list));
-                entry->metadata()->GrantReadLease(
+                entry->metadata().GrantReadLease(
                     std::chrono::milliseconds(default_kv_lease_ttl_));
             }
         }
@@ -3984,7 +3964,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             MasterMetricManager::instance().inc_total_get_nums();
 
             const auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 VLOG(1) << "key=" << key << ", info=object_not_found";
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -3992,7 +3972,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             }
 
             std::shared_lock<std::shared_mutex> entry_lock(object_entry->mutex);
-            const ObjectMetadata& metadata = *object_entry->metadata();
+            const ObjectMetadata& metadata = object_entry->metadata();
             if (!metadata.IsValid()) {
                 VLOG(1) << "key=" << key << ", info=object_not_found";
                 results[original_idx] =
@@ -4107,14 +4087,14 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
             const std::string& key = keys[original_idx];
 
             const auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
 
             std::shared_lock<std::shared_mutex> entry_lock(object_entry->mutex);
-            const ObjectMetadata& metadata = *object_entry->metadata();
+            const ObjectMetadata& metadata = object_entry->metadata();
             if (!metadata.IsValid()) {
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -4377,19 +4357,20 @@ auto MasterService::AllocateAndInsertMetadata(
         }
     }
 
-    auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(key, group_id);
-    entry->SetMetadata(std::make_unique<ObjectMetadata>(
-        client_id, now, value_length, std::move(replicas),
-        std::move(committed_soft_pin_timeout), config.with_hard_pin,
-        config.data_type, group_id, tenant_id, key));
+    auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
+        key, group_id,
+        std::make_unique<ObjectMetadata>(
+            client_id, now, value_length, std::move(replicas),
+            std::move(committed_soft_pin_timeout), config.with_hard_pin,
+            config.data_type, group_id, tenant_id, key));
     if (!tenant_state.InsertObject(key, entry)) {
-        FreeDfsReplicas(key, entry->metadata()->GetAllReplicas());
+        FreeDfsReplicas(key, entry->metadata().GetAllReplicas());
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         refund_pending_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     if (enable_multi_tenants_) {
-        auto adopt_result = entry->metadata()->quota_ledger.AdoptPendingCharge(
+        auto adopt_result = entry->metadata().quota_ledger.AdoptPendingCharge(
             GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
         if (!adopt_result) {
             LogTenantQuotaLedgerError(adopt_result, "adopt_pending", tenant_id,
@@ -4399,7 +4380,7 @@ auto MasterService::AllocateAndInsertMetadata(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
-    entry->metadata()->BeginSoftPinAction(soft_pin_request,
+    entry->metadata().BeginSoftPinAction(soft_pin_request,
                                           std::move(eligible_replica_ids));
     if (deadline_to_index) {
         soft_pin_deadline_index_.Upsert(tenant_id.MakeScopedKey(key),
@@ -4408,7 +4389,7 @@ auto MasterService::AllocateAndInsertMetadata(
     // Wire grouped objects to the group's shared lease; ungrouped objects keep
     // the per-object lease created at construction.
     if (!group_id.empty()) {
-        entry->metadata()->SetLease(entry->lease());
+        entry->metadata().SetLease(entry->lease());
     }
     entry->is_processing = true;
 
@@ -4529,7 +4510,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
 
             auto entry = tenant_state.Pin(key);
-            if (entry && entry->has_metadata()) {
+            if (entry) {
                 // Hold the per-object lock for the read-modify block. PutEnd
                 // holds the same entry->mutex while calling mark_complete(),
                 // so these reads/writes must be excluded. The lock is released
@@ -4538,11 +4519,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 // never held together).
                 std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
                 auto cleanup_plan = BuildStaleHandleCleanupPlan(
-                    *entry->metadata(), alive_clients);
+                    entry->metadata(), alive_clients);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
-                        *entry->metadata(), cleanup_plan);
+                        entry->metadata(), cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -4551,7 +4532,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(
                                    key, object_id.tenant_id, tenant_state,
-                                   *entry->metadata(), alive_clients,
+                                   entry->metadata(), alive_clients,
                                    &tenant_accessor)) {
                         entry_lock.unlock();
                         EraseMetadata(tenant_state, entry, object_id.tenant_id,
@@ -4559,8 +4540,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                         entry.reset();
                     }
                 }
-                if (entry && entry->has_metadata()) {
-                    auto& metadata = *entry->metadata();
+                if (entry) {
+                    auto& metadata = entry->metadata();
                     if (metadata.HasReplica(&Replica::fn_is_completed) ||
                         metadata.put_start_time +
                                 put_start_discard_timeout_sec_ >=
@@ -5187,13 +5168,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             auto object_entry = tenant_state.Pin(key);
 
             // --- Step 0: stale handle cleanup ---
-            if (object_entry != nullptr && object_entry->has_metadata()) {
+            if (object_entry != nullptr) {
                 auto cleanup_plan = BuildStaleHandleCleanupPlan(
-                    *object_entry->metadata(), alive_clients);
+                    object_entry->metadata(), alive_clients);
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "UpsertStart(stale cleanup)", object_id.tenant_id, key,
-                        *object_entry->metadata(), cleanup_plan);
+                        object_entry->metadata(), cleanup_plan);
                     if (!persist_result) {
                         return tl::make_unexpected(persist_result.error());
                     }
@@ -5202,7 +5183,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(
                                    key, object_id.tenant_id, tenant_state,
-                                   *object_entry->metadata(), alive_clients,
+                                   object_entry->metadata(), alive_clients,
                                    &tenant_accessor)) {
                         // EraseMetadata handles processing,
                         // replication_tasks, offloading_tasks (with
@@ -5216,8 +5197,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
 
             // --- Step 1: safety checks and preemption (only if key exists) ---
-            if (object_entry != nullptr && object_entry->has_metadata()) {
-                auto& metadata = *object_entry->metadata();
+            if (object_entry != nullptr) {
+                auto& metadata = object_entry->metadata();
 
                 // Reject if the caller tries to change group membership.
                 // Group membership is immutable while an object exists.
@@ -5311,7 +5292,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
                 // ---
-                auto& metadata = *object_entry->metadata();
+                auto& metadata = object_entry->metadata();
 
                 // Reject if any reader holds a reference (refcnt > 0).
                 // Overwriting a buffer that an RDMA read is streaming from
@@ -5466,7 +5447,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 }
                 auto new_entry = tenant_state.Pin(key);
                 if (has_replacement_charge) {
-                    if (!new_entry || !new_entry->has_metadata()) {
+                    if (!new_entry) {
                         auto rollback_result =
                             replacement_charge.ReleaseReplacement(
                                 quota_account);
@@ -5477,7 +5458,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     }
                     auto transfer_result =
                         replacement_charge.TransferReplacementCharge(
-                            quota_account, new_entry->metadata()->quota_ledger);
+                            quota_account, new_entry->metadata().quota_ledger);
                     if (!transfer_result) {
                         LogTenantQuotaLedgerError(transfer_result,
                                                   "transfer_replacement_in",
@@ -6619,16 +6600,14 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         for (const auto& entry : tenant_handle->SnapshotObjects()) {
-            if (entry->has_metadata()) {
-                keys.push_back(entry->key());
-            }
+            keys.push_back(entry->key());
         }
         for (const auto& key : keys) {
             auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 continue;
             }
-            ObjectMetadata& metadata = *object_entry->metadata();
+            ObjectMetadata& metadata = object_entry->metadata();
             if (std::regex_search(key, pattern)) {
                 if (!force && !metadata.IsLeaseExpired()) {
                     VLOG(1) << "key=" << key
@@ -6734,16 +6713,14 @@ long MasterService::RemoveAll(bool force) {
         auto& tenant_state = *handle;
         std::vector<std::string> keys;
         for (const auto& entry : handle->SnapshotObjects()) {
-            if (entry->has_metadata()) {
-                keys.push_back(entry->key());
-            }
+            keys.push_back(entry->key());
         }
         for (const auto& key : keys) {
             auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 continue;
             }
-            ObjectMetadata& metadata = *object_entry->metadata();
+            ObjectMetadata& metadata = object_entry->metadata();
             // Record the tenant only once the loop actually reaches an
             // object. A tenant row can outlive its objects, and recording
             // it unconditionally made every empty-but-present tenant look
@@ -6864,16 +6841,14 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         for (const auto& entry : tenant_handle->SnapshotObjects()) {
-            if (entry->has_metadata()) {
-                keys.push_back(entry->key());
-            }
+            keys.push_back(entry->key());
         }
         for (const auto& key : keys) {
             auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 continue;
             }
-            ObjectMetadata& metadata = *object_entry->metadata();
+            ObjectMetadata& metadata = object_entry->metadata();
             saw_any_object = true;
             if ((force || metadata.IsLeaseExpired(now)) &&
                 metadata.AllReplicas(&Replica::fn_is_completed) &&
@@ -6973,14 +6948,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             const std::string& key = keys[original_idx];
             auto object_entry = tenant_state.Pin(key);
 
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 VLOG(1) << "key=" << key << ", error=object_not_found";
                 results[original_idx] =
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
 
-            ObjectMetadata& metadata = *object_entry->metadata();
+            ObjectMetadata& metadata = object_entry->metadata();
             // Clean up stale replica handles (consistent with single Remove).
             auto cleanup_plan =
                 BuildStaleHandleCleanupPlan(metadata, alive_clients);
@@ -7246,14 +7221,14 @@ void MasterService::RunDfsEviction() {
             for (const size_t i : candidate_indices) {
                 const auto& candidate = candidates[i];
                 auto object_entry = tenant_state.Pin(candidate.key);
-                if (!object_entry || !object_entry->has_metadata()) {
+                if (!object_entry) {
                     accepted[i] = true;
                     continue;
                 }
                 std::unique_lock<std::shared_mutex> entry_lock(
                     object_entry->mutex);
 
-                auto& metadata = *object_entry->metadata();
+                auto& metadata = object_entry->metadata();
                 const bool has_candidate =
                     metadata.HasReplica([&](const Replica& replica) {
                         return matches_candidate(replica, candidate);
@@ -8083,11 +8058,11 @@ size_t MasterService::RunPromotionCandidateRetry() {
 
                 // Quick pre-filter under the per-object lock to avoid adding
                 // candidates that are obviously ineligible.
-                if (!entry->has_metadata() || !entry->metadata()->IsValid() ||
+                if (!entry->metadata().IsValid() ||
                     entry->is_processing || entry->promotion_task.has_value() ||
-                    entry->metadata()->HasReplica(
+                    entry->metadata().HasReplica(
                         &Replica::fn_is_memory_replica) ||
-                    !entry->metadata()->HasReplica(
+                    !entry->metadata().HasReplica(
                         &Replica::fn_is_local_disk_replica)) {
                     keys_to_drop.push_back(key);
                     continue;
@@ -9343,11 +9318,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // same tenant id; peek the first object (falls back to Default when empty).
     TenantId tenant_id = TenantId::Default();
     for (const auto& entry : entries) {
-        if (entry->has_metadata()) {
-            std::shared_lock<std::shared_mutex> peek_lock(entry->mutex);
-            tenant_id = entry->metadata()->tenant_id;
-            break;
-        }
+        std::shared_lock<std::shared_mutex> peek_lock(entry->mutex);
+        tenant_id = entry->metadata().tenant_id;
+        break;
     }
 
     std::vector<std::string> erase_keys;
@@ -9355,14 +9328,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
     // its entry; process each in place under the per-object lock, collecting
     // keys that must be erased (after the route iteration releases its lock).
     for (const auto& entry : entries) {
-        if (!entry->has_metadata()) {
-            continue;
-        }
         std::unique_lock<std::shared_mutex> lk(entry->mutex);
         if (!entry->is_processing) {
             continue;
         }
-        ObjectMetadata& metadata = *entry->metadata();
+        ObjectMetadata& metadata = entry->metadata();
         const std::string& key = entry->key();
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
@@ -9454,9 +9424,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
     std::vector<std::string> replication_erase_keys;
     for (const auto& entry : entries) {
-        if (!entry->has_metadata()) {
-            continue;
-        }
         std::unique_lock<std::shared_mutex> lk(entry->mutex);
         if (!entry->replication_task.has_value()) {
             continue;
@@ -9469,7 +9436,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             continue;
         }
 
-        ObjectMetadata& metadata = *entry->metadata();
+        ObjectMetadata& metadata = entry->metadata();
         const bool had_complete_replica =
             metadata.HasReplica(&Replica::fn_is_completed);
         const std::vector<ReplicaID> replica_ids = replication_task.replica_ids;
@@ -9576,9 +9543,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& entry : entries) {
-        if (!entry->has_metadata()) {
-            continue;
-        }
         std::unique_lock<std::shared_mutex> lk(entry->mutex);
         if (!entry->offloading_task.has_value()) {
             continue;
@@ -9588,7 +9552,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (ttl > now) {
             continue;
         }
-        auto source = entry->metadata()->GetReplicaByID(
+        auto source = entry->metadata().GetReplicaByID(
             entry->offloading_task->source_id);
         if (source != nullptr) {
             source->dec_refcnt();
@@ -9599,9 +9563,6 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     for (const auto& entry : entries) {
-        if (!entry->has_metadata()) {
-            continue;
-        }
         std::unique_lock<std::shared_mutex> lk(entry->mutex);
         if (!entry->promotion_task.has_value()) {
             continue;
@@ -9612,14 +9573,14 @@ void MasterService::DiscardExpiredProcessingReplicas(
             continue;
         }
         auto source =
-            entry->metadata()->GetReplicaByID(entry->promotion_task->source_id);
+            entry->metadata().GetReplicaByID(entry->promotion_task->source_id);
         if (source != nullptr) {
             source->dec_refcnt();
         }
         if (entry->promotion_task->alloc_id != 0) {
             const ReplicaID alloc_id = entry->promotion_task->alloc_id;
             EraseReplicasWithCacheTotalAccounting(
-                *entry->metadata(), [alloc_id](const Replica& replica) {
+                entry->metadata(), [alloc_id](const Replica& replica) {
                     return replica.id() == alloc_id;
                 });
         }
@@ -9805,13 +9766,10 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 auto objs = tenant_state.SnapshotObjects();
                 std::vector<std::string> keys_to_erase;
                 for (const auto& entry : objs) {
-                    if (!entry->has_metadata()) {
-                        continue;
-                    }
                     std::shared_lock<std::shared_mutex> lk(entry->mutex);
-                    if (entry->metadata()->HasDiffRepStatus(
+                    if (entry->metadata().HasDiffRepStatus(
                             ReplicaStatus::COMPLETE) ||
-                        entry->metadata()->IsLeaseExpired(cleanup_now)) {
+                        entry->metadata().IsLeaseExpired(cleanup_now)) {
                         VLOG(1) << "clear metadata key=" << entry->key();
                         keys_to_erase.push_back(entry->key());
                     }
@@ -9836,11 +9794,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 // Collect handles, then lock each per-object.
                 auto objs = tenant_state.SnapshotObjects();
                 for (const auto& entry : objs) {
-                    if (!entry->has_metadata()) {
-                        continue;
-                    }
                     std::shared_lock<std::shared_mutex> lk(entry->mutex);
-                    for (auto& replica : entry->metadata()->GetAllReplicas()) {
+                    for (auto& replica : entry->metadata().GetAllReplicas()) {
                         if (!replica.get_descriptor().is_memory_replica()) {
                             continue;
                         }
@@ -10035,13 +9990,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             TenantStateAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 return {};
             }
             // Hold the per-object lock across the metadata mutation; released
             // before EraseMetadata (which re-locks the entry).
             std::unique_lock<std::shared_mutex> entry_lock(object_entry->mutex);
-            auto& metadata = *object_entry->metadata();
+            auto& metadata = object_entry->metadata();
             // Re-validate: state may have changed since the collection phase.
             // Soft pins are only a blocker when this pass is not allowed to
             // evict them.
@@ -10122,13 +10077,13 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 TenantStateAccessorRW tenant_accessor(tenant_handle.get());
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Pin(key);
-                if (object_entry && object_entry->has_metadata()) {
+                if (object_entry) {
                     bool invalid = false;
                     {
                         // Read IsValid under the per-object lock.
                         std::unique_lock<std::shared_mutex> lk(
                             object_entry->mutex);
-                        invalid = !object_entry->metadata()->IsValid();
+                        invalid = !object_entry->metadata().IsValid();
                     }
                     if (invalid) {
                         EraseMetadata(tenant_state, object_entry,
@@ -10160,11 +10115,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             // Collect handles, then lock each per-object.
             auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
-                if (!entry->has_metadata()) {
-                    continue;
-                }
                 std::shared_lock<std::shared_mutex> lk(entry->mutex);
-                ObjectMetadata& metadata = *entry->metadata();
+                ObjectMetadata& metadata = entry->metadata();
                 if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                     (!allow_soft_pinned && IsSoftPinActive(metadata, now)) ||
                     !can_evict_replicas(metadata)) {
@@ -10459,13 +10411,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             TenantStateAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || !object_entry->has_metadata()) {
+            if (!object_entry) {
                 return {};
             }
             // Hold the per-object lock across the metadata mutation; released
             // before EraseMetadata (which re-locks the entry).
             std::unique_lock<std::shared_mutex> entry_lock(object_entry->mutex);
-            auto& metadata = *object_entry->metadata();
+            auto& metadata = object_entry->metadata();
             // Re-validate: state may have changed since the census. Soft pins
             // are only a blocker when this pass is not allowed to evict them.
             if (now < metadata.EvictionDeadline() ||
@@ -10555,14 +10507,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 TenantStateAccessorRW tenant_accessor(tenant_handle.get());
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Pin(key);
-                if (!enable_oplog_ && object_entry &&
-                    object_entry->has_metadata()) {
+                if (!enable_oplog_ && object_entry) {
                     bool invalid = false;
                     {
                         // Read IsValid under the per-object lock.
                         std::unique_lock<std::shared_mutex> lk(
                             object_entry->mutex);
-                        invalid = !object_entry->metadata()->IsValid();
+                        invalid = !object_entry->metadata().IsValid();
                     }
                     if (invalid) {
                         EraseMetadata(tenant_state, object_entry, tenant_id,
@@ -10618,11 +10569,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         local_object_count += tenant_state.ObjectCount();
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
-            if (!entry->has_metadata()) {
-                continue;
-            }
             std::shared_lock<std::shared_mutex> lk(entry->mutex);
-            ObjectMetadata& metadata = *entry->metadata();
+            ObjectMetadata& metadata = entry->metadata();
             if (metadata.IsHardPinned()) continue;
             bool has_evictable = can_evict_replicas(metadata);
             if (has_evictable) local_eviction_base++;
@@ -10683,11 +10631,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Collect handles, then lock each per-object.
             auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
-                if (!entry->has_metadata()) {
-                    continue;
-                }
                 std::shared_lock<std::shared_mutex> lk(entry->mutex);
-                ObjectMetadata& metadata = *entry->metadata();
+                ObjectMetadata& metadata = entry->metadata();
                 if (metadata.IsHardPinned() || IsSoftPinActive(metadata, now) ||
                     !can_evict_replicas(metadata)) {
                     continue;
@@ -10862,10 +10807,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         auto& tenant_state = *handle;
                         for (const auto& entry :
                              tenant_state.SnapshotObjects()) {
-                            if (!entry->has_metadata()) {
-                                continue;
-                            }
-                            ObjectMetadata& metadata = *entry->metadata();
+                            ObjectMetadata& metadata = entry->metadata();
                             if (!metadata.IsHardPinned() &&
                                 now >= metadata.EvictionDeadline() &&
                                 metadata.EvictionDeadline() <=
@@ -10917,10 +10859,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         auto& tenant_state = *handle;
                         for (const auto& entry :
                              tenant_state.SnapshotObjects()) {
-                            if (!entry->has_metadata()) {
-                                continue;
-                            }
-                            ObjectMetadata& metadata = *entry->metadata();
+                            ObjectMetadata& metadata = entry->metadata();
                             if (metadata.IsHardPinned() ||
                                 now < metadata.EvictionDeadline() ||
                                 !can_evict_replicas(metadata)) {
@@ -11077,11 +11016,8 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 if (evicted_count >= ideal_evict_num) {
                     break;
                 }
-                if (!entry->has_metadata()) {
-                    continue;
-                }
                 std::unique_lock<std::shared_mutex> lk(entry->mutex);
-                auto& metadata = *entry->metadata();
+                auto& metadata = entry->metadata();
                 const auto& key = entry->key();
                 if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
                     IsSoftPinActive(metadata, now)) {
@@ -11828,9 +11764,7 @@ MasterService::MetadataSerializer::SerializeTenant(
     // for large tenants.
     std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> entries;
     for (const auto& entry : tenant_state.SnapshotObjects()) {
-        if (entry->has_metadata()) {
-            entries.push_back(entry);
-        }
+        entries.push_back(entry);
     }
     std::stable_sort(entries.begin(), entries.end(),
                      [](const auto& lhs, const auto& rhs) {
@@ -11841,7 +11775,7 @@ MasterService::MetadataSerializer::SerializeTenant(
     for (const auto& entry : entries) {
         // Lock per-object so metadata is not mutated mid-serialize.
         std::shared_lock<std::shared_mutex> lk(entry->mutex);
-        const ObjectMetadata& metadata = *entry->metadata();
+        const ObjectMetadata& metadata = entry->metadata();
         // Each metadata item format: [tenant_id, key, metadata_object].
         packer.pack_array(3);
         packer.pack(tenant_id.value());
@@ -11927,15 +11861,15 @@ MasterService::MetadataSerializer::DeserializeTenant(
         auto& tenant_state = *tenant_handle;
         const std::string user_key = key;
         auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-            std::move(key), metadata_ptr->group_id);
-        entry->SetMetadata(std::make_unique<ObjectMetadata>(
-            metadata_ptr->client_id, metadata_ptr->put_start_time,
-            metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,
-            metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
-            metadata_ptr->group_id, tenant_id, user_key));
+            std::move(key), metadata_ptr->group_id,
+            std::make_unique<ObjectMetadata>(
+                metadata_ptr->client_id, metadata_ptr->put_start_time,
+                metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,
+                metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
+                metadata_ptr->group_id, tenant_id, user_key));
         tenant_state.InsertObject(user_key, entry);
 
-        auto& restored_metadata = *entry->metadata();
+        auto& restored_metadata = entry->metadata();
         restored_metadata.ExtendLeaseDeadline(metadata_ptr->EvictionDeadline());
         restored_metadata.object_checksum = metadata_ptr->object_checksum;
 
@@ -12700,12 +12634,9 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
             auto& tenant_state = *handle;
             auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
-                if (!entry->has_metadata()) {
-                    continue;
-                }
                 const auto& key = entry->key();
                 std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
-                auto& metadata = *entry->metadata();
+                auto& metadata = entry->metadata();
                 for (const auto& source_segment : job.request.segments) {
                     const auto unit_key =
                         MakeDrainUnitKey(tenant_id, key, source_segment);
@@ -12795,12 +12726,9 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
                                         handle) {
             auto objs = handle->SnapshotObjects();
             for (const auto& entry : objs) {
-                if (!entry->has_metadata()) {
-                    continue;
-                }
                 const auto& key = entry->key();
                 std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
-                auto& metadata = *entry->metadata();
+                auto& metadata = entry->metadata();
                 const auto replica_segments = metadata.GetReplicaSegmentNames();
                 for (const auto& source_segment : job.request.segments) {
                     if (std::find(replica_segments.begin(),

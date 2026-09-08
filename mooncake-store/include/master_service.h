@@ -1607,12 +1607,11 @@ class MasterService {
             // local_disk replicas are cleaned up by ClearInvalidHandles() in
             // ClientMonitorFunc.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
-                tenant_state_ != nullptr && entry_ != nullptr &&
-                entry_->has_metadata()) {
+                tenant_state_ != nullptr && entry_ != nullptr) {
                 // Erase invalid memory replicas (those with unmounted
                 // segments). No client_mutex_ needed since we only check memory
                 // replicas.
-                ObjectMetadata& metadata = *entry_->metadata();
+                ObjectMetadata& metadata = entry_->metadata();
                 // Gate the snapshot on the publisher being live: this runs on
                 // every read-write metadata access, and the VisitReplicas walk
                 // plus vector allocation is pure overhead when KV events are
@@ -1666,7 +1665,7 @@ class MasterService {
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr && entry_ != nullptr &&
-                   entry_->has_metadata() && entry_->metadata()->IsValid();
+                   entry_->metadata().IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1688,7 +1687,7 @@ class MasterService {
 
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
-            return *entry_->metadata();
+            return entry_->metadata();
         }
 
         ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
@@ -1735,11 +1734,11 @@ class MasterService {
             const auto now = std::chrono::system_clock::now();
             EnsureTenantState();
             auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
-                object_id_.user_key, group_id);
-            entry->SetMetadata(std::make_unique<ObjectMetadata>(
-                client_id, now, total_length, std::move(replicas), std::nullopt,
-                enable_hard_pin, data_type, group_id, object_id_.tenant_id,
-                object_id_.user_key));
+                object_id_.user_key, group_id,
+                std::make_unique<ObjectMetadata>(
+                    client_id, now, total_length, std::move(replicas),
+                    std::nullopt, enable_hard_pin, data_type, group_id,
+                    object_id_.tenant_id, object_id_.user_key));
             if (!tenant_state_->InsertObject(object_id_.user_key, entry)) {
                 // A concurrent writer already inserted this key. Re-pin the
                 // existing entry and use it instead of the orphan we built.
@@ -1765,7 +1764,7 @@ class MasterService {
             // Keep the metadata lease in sync with the group's shared lease so
             // the read path (ObjectMetadata::lease_) agrees with the group.
             if (!group_id.empty()) {
-                entry_->metadata()->SetLease(entry_->lease());
+                entry_->metadata().SetLease(entry_->lease());
             }
         }
 
@@ -1873,7 +1872,7 @@ class MasterService {
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr && entry_ != nullptr &&
-                   entry_->has_metadata() && entry_->metadata()->IsValid();
+                   entry_->metadata().IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1882,7 +1881,7 @@ class MasterService {
 
         // Get metadata (only call when Exists() is true)
         const ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
-            return *entry_->metadata();
+            return entry_->metadata();
         }
 
         const TenantState* GetTenantState() const NO_THREAD_SAFETY_ANALYSIS {

@@ -19,37 +19,28 @@ std::unique_ptr<ObjectMetadata> MakeMetadata(const std::string& user_key) {
         std::string{}, TenantId(), user_key);
 }
 
-TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
-    auto entry = std::make_shared<ObjectEntry>("k1", "");
-    // Not wired yet: metadata is null and callback accessors are no-ops.
-    EXPECT_FALSE(entry->has_metadata());
-    EXPECT_EQ(entry->metadata(), nullptr);
-    bool called = false;
-    entry->WithMetadata([&](ObjectMetadata&) { called = true; });
-    EXPECT_FALSE(called);
-
-    // Attach ownership of a metadata envelope.
+TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
     auto metadata = MakeMetadata("k1");
     auto* raw = metadata.get();
-    auto prior = entry->SetMetadata(std::move(metadata));
-    EXPECT_EQ(prior, nullptr);  // nothing owned before
-    EXPECT_TRUE(entry->has_metadata());
-    EXPECT_EQ(entry->metadata(), raw);
-    EXPECT_EQ(entry->metadata()->size, 128u);  // readable through the accessor
+    auto entry = std::make_shared<ObjectEntry>("k1", "", std::move(metadata));
 
-    // WithMetadata runs the callback while the per-object lock is held, and the
-    // callback observes the same envelope the accessor exposed.
-    called = false;
+    // The envelope is wired from construction on: metadata() returns a
+    // reference, so there is nothing to null-check at the call sites.
+    EXPECT_EQ(&entry->metadata(), raw);
+    EXPECT_EQ(entry->metadata().size, 128u);
+
+    // WithMetadata runs the callback while the per-object lock is held, and
+    // the callback observes the same envelope the accessor exposed.
+    bool called = false;
     entry->WithMetadata([&](ObjectMetadata& m) {
         called = true;
         EXPECT_EQ(&m, raw);
         m.object_checksum = 42;
     });
     EXPECT_TRUE(called);
-    EXPECT_TRUE(entry->metadata()->object_checksum.has_value());
-    EXPECT_EQ(*entry->metadata()->object_checksum, 42u);
-
-    EXPECT_EQ(entry->metadata(), raw);  // envelope stays wired
+    EXPECT_TRUE(entry->metadata().object_checksum.has_value());
+    EXPECT_EQ(*entry->metadata().object_checksum, 42u);
+    EXPECT_EQ(&entry->metadata(), raw);  // envelope stays wired
 }
 
 }  // namespace

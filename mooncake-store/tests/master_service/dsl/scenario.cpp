@@ -1054,13 +1054,13 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         return *this;
     }
     auto entry = tenant_handle->Pin(action.key);
-    if (!entry || !entry->has_metadata()) {
+    if (!entry) {
         Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;
     }
     std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
-    entry->metadata()->SetLeaseDeadlineForTesting(action.lease_timeout);
-    entry->metadata()->SetCommittedSoftPinTimeoutForTesting(
+    entry->metadata().SetLeaseDeadlineForTesting(action.lease_timeout);
+    entry->metadata().SetCommittedSoftPinTimeoutForTesting(
         action.soft_pin_timeout);
     return *this;
 }

@@ -639,7 +639,12 @@ class MasterServiceHATest : public ::testing::Test {
         auto& tenant_state = *tenant_handle;
         auto entry = tenant_state.Pin(key);
         if (!entry) {
-            entry = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
+            entry = std::make_shared<mooncake::tenant::ObjectEntry>(
+                key, "",
+                std::make_unique<ObjectMetadata>(
+                    holder_id, std::chrono::system_clock::now(), object_size,
+                    std::vector<Replica>{}, std::nullopt, false,
+                    ObjectDataType::UNKNOWN, "", tenant, key));
             tenant_state.InsertObject(key, entry);
         }
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);

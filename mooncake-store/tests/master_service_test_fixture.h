@@ -90,11 +90,11 @@ class MasterServiceTest : public ::testing::Test {
             return std::nullopt;
         }
         auto entry = tenant_handle->Pin(key);
-        if (!entry || !entry->has_metadata()) {
+        if (!entry) {
             return std::nullopt;
         }
         std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
-        return entry->metadata()->GetCommittedSoftPinTimeout();
+        return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
     void CleanupExpiredSoftPinsAt(
@@ -112,9 +112,9 @@ class MasterServiceTest : public ::testing::Test {
         auto tenant_handle =
             service.GetOrCreateTenantStateHandle(normalized_tenant);
         auto entry = tenant_handle->Pin(key);
-        ASSERT_TRUE(entry != nullptr && entry->has_metadata());
+        ASSERT_TRUE(entry != nullptr);
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
-        entry->metadata()->SetCommittedSoftPinTimeoutForTesting(deadline);
+        entry->metadata().SetCommittedSoftPinTimeoutForTesting(deadline);
         service.soft_pin_deadline_index_.Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);
     }
@@ -199,13 +199,13 @@ class MasterServiceTest : public ::testing::Test {
 
         // A concurrent writer wins and publishes the key first, with valid
         // metadata (a LOCAL_DISK replica keeps IsValid() true).
-        auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(key, "");
         std::vector<Replica> winner_replicas;
         winner_replicas.emplace_back(
             Replica(client_id, 4096, "host:port", ReplicaStatus::COMPLETE));
-        winner->SetMetadata(std::make_unique<ObjectMetadata>(
-            client_id, std::chrono::system_clock::now(), 4096,
-            std::move(winner_replicas)));
+        auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(
+            key, "", std::make_unique<ObjectMetadata>(
+                       client_id, std::chrono::system_clock::now(), 4096,
+                       std::move(winner_replicas)));
         auto tenant_handle = service.GetOrCreateTenantStateHandle(normalized);
         ASSERT_TRUE(tenant_handle->InsertObject(key, winner));
 

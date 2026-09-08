@@ -249,10 +249,10 @@ class SnapshotChildProcessTest : public ::testing::Test {
             return std::nullopt;
         }
         auto entry = handle->Pin(key);
-        if (!entry || !entry->has_metadata()) {
+        if (!entry) {
             return std::nullopt;
         }
-        return entry->metadata()->GetCommittedSoftPinTimeout();
+        return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -272,8 +272,8 @@ class SnapshotChildProcessTest : public ::testing::Test {
             return false;
         }
         auto entry = handle->Pin(key);
-        return entry != nullptr && entry->has_metadata() &&
-               entry->metadata()->IsGrouped();
+        return entry != nullptr &&
+               entry->metadata().IsGrouped();
     }
 
     std::string FindGroupIdOnDifferentShard(MasterService* svc,

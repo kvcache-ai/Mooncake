@@ -13,6 +13,18 @@ namespace mooncake {
 namespace tenant {
 namespace {
 
+// Build an entry with a minimal (128 B, replica-less) envelope; the store
+// tests exercise routing/membership, not replica validity.
+std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
+                                       const std::string& group_id) {
+    return std::make_shared<ObjectEntry>(
+        key, group_id,
+        std::make_unique<ObjectMetadata>(
+            UUID{1, 2}, std::chrono::system_clock::now(), 128,
+            std::vector<Replica>{}, std::nullopt, false,
+            ObjectDataType::UNKNOWN, group_id, TenantId(), key));
+}
+
 // --- Group membership ---
 
 TEST(TenantStoreTest, StartsWithNoGroups) {
@@ -94,7 +106,7 @@ TEST(TenantStoreTest, InsertPinEraseContainsObjectCount) {
     TenantStore store;
     EXPECT_EQ(store.ObjectCount(), 0u);
 
-    auto e1 = std::make_shared<ObjectEntry>("k1", "");
+    auto e1 = MakeEntry("k1", "");
     EXPECT_TRUE(store.Insert("k1", e1));
     EXPECT_TRUE(store.Contains("k1"));
     EXPECT_EQ(store.ObjectCount(), 1u);
@@ -115,9 +127,9 @@ TEST(TenantStoreTest, InsertPinEraseContainsObjectCount) {
 
 TEST(TenantStoreTest, DuplicateInsertIsRejected) {
     TenantStore store;
-    store.Insert("k1", std::make_shared<ObjectEntry>("k1", ""));
+    store.Insert("k1", MakeEntry("k1", ""));
     // Second insert for the same key must not clobber the original.
-    EXPECT_FALSE(store.Insert("k1", std::make_shared<ObjectEntry>("k1", "")));
+    EXPECT_FALSE(store.Insert("k1", MakeEntry("k1", "")));
     EXPECT_EQ(store.ObjectCount(), 1u);
     ASSERT_NE(store.Pin("k1"), nullptr);
     EXPECT_EQ(store.Pin("k1")->key(), "k1");
@@ -125,9 +137,9 @@ TEST(TenantStoreTest, DuplicateInsertIsRejected) {
 
 TEST(TenantStoreTest, SnapshotObjectsEnumeratesEveryEntry) {
     TenantStore store;
-    store.Insert("k1", std::make_shared<ObjectEntry>("k1", ""));
-    store.Insert("k2", std::make_shared<ObjectEntry>("k2", "g1"));
-    store.Insert("k3", std::make_shared<ObjectEntry>("k3", "g1"));
+    store.Insert("k1", MakeEntry("k1", ""));
+    store.Insert("k2", MakeEntry("k2", "g1"));
+    store.Insert("k3", MakeEntry("k3", "g1"));
 
     std::vector<std::string> keys;
     for (const auto& entry : store.SnapshotObjects()) {
@@ -143,7 +155,7 @@ TEST(TenantStoreTest,
      ObjectRouteAndGroupMembershipAreIndependentFlatStructures) {
     TenantStore store;
     // A grouped member is just a flat route entry with a group_id annotation.
-    auto member = std::make_shared<ObjectEntry>("k2", "g1");
+    auto member = MakeEntry("k2", "g1");
     store.Insert("k2", member);
     store.LeaseFor("g1");
     store.AddMember("g1", "k2");
@@ -167,7 +179,7 @@ TEST(TenantStoreTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
 
     // A grouped object: InsertObject should wire the group's shared Lease into
     // the entry's lease slot AND register it as a group member.
-    auto member = std::make_shared<ObjectEntry>("k1", "g1");
+    auto member = MakeEntry("k1", "g1");
     EXPECT_TRUE(store.InsertObject("k1", member));
 
     EXPECT_EQ(store.ObjectCount(), 1u);
@@ -180,7 +192,7 @@ TEST(TenantStoreTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
 TEST(TenantStoreTest, InsertObjectDoesNotJoinForSingleton) {
     TenantStore store;
 
-    auto singleton = std::make_shared<ObjectEntry>("k1", "");
+    auto singleton = MakeEntry("k1", "");
     EXPECT_TRUE(store.InsertObject("k1", singleton));
 
     EXPECT_EQ(store.ObjectCount(), 1u);
@@ -191,10 +203,10 @@ TEST(TenantStoreTest, InsertObjectDoesNotJoinForSingleton) {
 
 TEST(TenantStoreTest, InsertObjectRejectsDuplicateKey) {
     TenantStore store;
-    store.InsertObject("k1", std::make_shared<ObjectEntry>("k1", "g1"));
+    store.InsertObject("k1", MakeEntry("k1", "g1"));
     // Second insert for the same key is rejected; the original is intact.
     EXPECT_FALSE(
-        store.InsertObject("k1", std::make_shared<ObjectEntry>("k1", "g2")));
+        store.InsertObject("k1", MakeEntry("k1", "g2")));
     EXPECT_EQ(store.ObjectCount(), 1u);
     EXPECT_EQ(store.Members("g1").size(), 1u);
     EXPECT_TRUE(store.Members("g2").empty());
@@ -204,29 +216,19 @@ TEST(TenantStoreTest, InsertObjectRejectsDuplicateKey) {
 
 TEST(TenantStoreTest, WithObjectScopeRespectsPresenceAndAbsence) {
     TenantStore store;
-    auto singleton = std::make_shared<ObjectEntry>("k1", "");
+    auto singleton = MakeEntry("k1", "");
     store.Insert("k1", singleton);
+    auto& raw = singleton->metadata();
 
-    // No metadata wired yet -> callback is not invoked.
+    // Present key -> WithObject reaches the envelope under the per-object
+    // lock. Absent key -> callback is not invoked.
     bool called = false;
-    store.WithObject("k1", [&](ObjectMetadata&) { called = true; });
-    EXPECT_FALSE(called);
-
-    // Absent key -> callback is not invoked.
     store.WithObject("missing", [&](ObjectMetadata&) { FAIL(); });
-
-    // After wiring metadata into the entry, WithObject reaches it under the
-    // per-object lock.
-    singleton->SetMetadata(std::make_unique<ObjectMetadata>(
-        UUID{1, 2}, std::chrono::system_clock::now(), 64,
-        std::vector<Replica>{}, std::nullopt, false, ObjectDataType::UNKNOWN,
-        std::string{}, TenantId(), "k1"));
-    const auto* raw = singleton->metadata();
 
     called = false;
     store.WithObject("k1", [&](ObjectMetadata& m) {
         called = true;
-        EXPECT_EQ(&m, raw);
+        EXPECT_EQ(&m, &raw);
     });
     EXPECT_TRUE(called);
 }
@@ -236,7 +238,7 @@ TEST(TenantStoreTest, EmptyTracksRouteGroupsAndLeases) {
     EXPECT_TRUE(store.Empty());
 
     // A routed object makes the container non-empty.
-    store.Insert("k1", std::make_shared<ObjectEntry>("k1", ""));
+    store.Insert("k1", MakeEntry("k1", ""));
     EXPECT_FALSE(store.Empty());
     ASSERT_TRUE(store.EraseIf("k1", store.Pin("k1").get()));
     EXPECT_TRUE(store.Empty());
