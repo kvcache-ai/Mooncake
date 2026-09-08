@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -71,7 +72,8 @@ struct LogicalTransferRuntimePolicy {
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};                  // merged by other tasks
+    bool derived{false};  // merged by other tasks
+    size_t physical_owner_task_id{std::numeric_limits<size_t>::max()};
     int xport_priority{0};                // transport priority (for fallback)
     int failover_count{0};                // number of failover attempts
     int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
@@ -110,6 +112,7 @@ struct TaskInfo {
         : type(other.type),
           sub_task_id(other.sub_task_id),
           derived(other.derived),
+          physical_owner_task_id(other.physical_owner_task_id),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
@@ -134,6 +137,7 @@ struct TaskInfo {
         : type(other.type),
           sub_task_id(other.sub_task_id),
           derived(other.derived),
+          physical_owner_task_id(other.physical_owner_task_id),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
           metadata_refresh_retry_count(other.metadata_refresh_retry_count),
@@ -159,6 +163,7 @@ struct TaskInfo {
             type = other.type;
             sub_task_id = other.sub_task_id;
             derived = other.derived;
+            physical_owner_task_id = other.physical_owner_task_id;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;
@@ -189,6 +194,7 @@ struct TaskInfo {
             type = other.type;
             sub_task_id = other.sub_task_id;
             derived = other.derived;
+            physical_owner_task_id = other.physical_owner_task_id;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
             metadata_refresh_retry_count = other.metadata_refresh_retry_count;

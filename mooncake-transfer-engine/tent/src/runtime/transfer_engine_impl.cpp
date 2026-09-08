@@ -1931,10 +1931,10 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
-            if (task.type != UNSPEC) {
-                auto owner_it =
-                    owner_task_id_by_merged_task.find(merged_task_id);
-                if (owner_it != owner_task_id_by_merged_task.end()) {
+            auto owner_it = owner_task_id_by_merged_task.find(merged_task_id);
+            if (owner_it != owner_task_id_by_merged_task.end()) {
+                task.physical_owner_task_id = owner_it->second;
+                if (task.type != UNSPEC) {
                     public_tasks_by_physical_owner[owner_it->second].push_back(
                         task_id);
                 }
@@ -1954,6 +1954,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.type = owner.route.transport;
         task.device_mask = owner.route.device_mask;
         if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
+        task.physical_owner_task_id = task_id;
+        owner_task_id_by_merged_task[merged_task_id] = task_id;
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1995,7 +1997,6 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.sub_task_id = -1;
         task.derived = false;
         physical_task_id_list[task.type].push_back(task_id);
-        owner_task_id_by_merged_task[merged_task_id] = task_id;
         public_tasks_by_physical_owner[task_id].push_back(task_id);
         merged_task_id_map[merged_task_id] = task;
     }
@@ -2508,6 +2509,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     }
 
     size_t owner_task_id = task_id;
+    bool queued_owner_resolved = false;
     if (runtime_queue_config_.enabled && batch->queue_token != 0) {
         QueueOwnerId owner_id = 0;
         auto resolve_status =
@@ -2524,6 +2526,7 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
                                  "queued owner metadata missing" LOC_MARK);
             }
             owner_task_id = queued_it->second.owner_task_id;
+            queued_owner_resolved = true;
             if (!queued_it->second.in_dispatch_window) {
                 CHECK_STATUS(cancelQueuedOwner(owner_id));
                 CHECK_STATUS(refillDispatchWindow());
@@ -2531,6 +2534,14 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
                 return Status::OK();
             }
         }
+    }
+    const auto& public_task = batch->task_list[task_id];
+    if (public_task.derived && !queued_owner_resolved) {
+        if (public_task.physical_owner_task_id >= batch->task_list.size()) {
+            return Status::InvalidArgument(
+                "derived task has no physical owner" LOC_MARK);
+        }
+        owner_task_id = public_task.physical_owner_task_id;
     }
 
     auto& owner = batch->task_list[owner_task_id];
@@ -2557,8 +2568,10 @@ Status TransferEngineImpl::cancelTransfer(BatchID batch_id, size_t task_id) {
     CHECK_STATUS(transport->cancelTransferTask(sub_batch, owner.sub_task_id));
     // Merged public tasks share one physical transport task. Mark every alias
     // so polling any of them cannot trigger failover after cancellation.
-    for (auto& task : batch->task_list) {
-        if (task.type == owner.type && task.sub_task_id == owner.sub_task_id) {
+    for (size_t alias_id = 0; alias_id < batch->task_list.size(); ++alias_id) {
+        auto& task = batch->task_list[alias_id];
+        if (alias_id == owner_task_id ||
+            (task.derived && task.physical_owner_task_id == owner_task_id)) {
             task.cancel_requested = true;
         }
     }
@@ -2840,6 +2853,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     const size_t public_task_id = task_id;
     size_t poll_task_id = task_id;
+    const auto& public_task = batch->task_list[public_task_id];
+    bool queued_owner_resolved = false;
     CHECK_STATUS(refillDispatchWindow());
     if (runtime_queue_config_.enabled && batch->queue_token != 0) {
         QueueOwnerId owner_id = 0;
@@ -2863,8 +2878,16 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
             if (batch->task_list[public_task_id].derived &&
                 queued_it != queued_owners_.end()) {
                 poll_task_id = queued_it->second.owner_task_id;
+                queued_owner_resolved = true;
             }
         }
+    }
+    if (public_task.derived && !queued_owner_resolved) {
+        if (public_task.physical_owner_task_id >= batch->task_list.size()) {
+            return Status::InvalidArgument(
+                "derived task has no physical owner" LOC_MARK);
+        }
+        poll_task_id = public_task.physical_owner_task_id;
     }
     auto& task = batch->task_list[poll_task_id];
     auto prev_status = task.status;
