@@ -2551,7 +2551,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         VLOG(1) << "No more transports available after "
                 << transportTypeName(prev_type) << " failed";
         LOG_EVERY_N(WARNING, 100) << "No more transports available after "
-                                   << transportTypeName(prev_type) << " failed";
+                                  << transportTypeName(prev_type) << " failed";
         return Status::InvalidEntry("All available transports are failed");
     }
 
