@@ -19,8 +19,12 @@
 #include "rpc_types.h"
 #include "tenant/tenant_id.h"
 
+namespace mooncake::test {
+class MasterServiceHATest;
+}  // namespace mooncake::test
+
 namespace mooncake {
-class MasterService;  // friend for the test-only route-lock seam below
+class MasterService;  // friend: the service owns and operates the store
 namespace tenant {
 
 // A group is not a container of objects: it is a thin membership table plus a
@@ -293,11 +297,13 @@ class TenantStore {
 
    private:
     friend class ::mooncake::MasterService;
+    // The HA fixture holds the route lock EXCLUSIVELY via LockRouteForTesting
+    // to gate PutStart at its first Pin for deterministic lock-order checks.
+    friend class ::mooncake::test::MasterServiceHATest;
 
     // Test-only seam: hold the route lock EXCLUSIVELY so concurrent
-    // Pin/Insert/Erase/Contains block at that boundary. Accessed by
-    // MasterService (which friends TenantStore) for the snapshot-barrier test
-    // hook.
+    // Pin/Insert/Erase/Contains block at that boundary. Accessed by the
+    // friended HA test fixture directly.
     std::unique_lock<std::shared_mutex> LockRouteForTesting() const {
         return std::unique_lock<std::shared_mutex>(route_lock_);
     }

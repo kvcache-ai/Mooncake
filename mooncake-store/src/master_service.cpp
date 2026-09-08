@@ -191,6 +191,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
+      snapshot_arrive_hook_(config.snapshot_arrive_hook),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       nof_eviction_ratio_(config.nof_eviction_ratio),
@@ -747,25 +748,6 @@ uint64_t MasterService::GetKvClearedPublishedForTesting() const {
 
 uint64_t MasterService::GetKvClearedSuppressedForTesting() const {
     return kv_cleared_suppressed_by_epoch_.load(std::memory_order_relaxed);
-}
-
-void MasterService::ArmSnapshotBarrierForTesting() {
-    std::lock_guard<std::mutex> lock(snapshot_barrier_test_mutex_);
-    snapshot_barrier_test_reached_ = false;
-    snapshot_barrier_test_armed_.store(true, std::memory_order_release);
-}
-
-void MasterService::DisarmSnapshotBarrierForTesting() {
-    snapshot_barrier_test_armed_.store(false, std::memory_order_release);
-    std::lock_guard<std::mutex> lock(snapshot_barrier_test_mutex_);
-    snapshot_barrier_test_reached_ = false;
-}
-
-bool MasterService::WaitForSnapshotBarrierForTesting(
-    std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(snapshot_barrier_test_mutex_);
-    return snapshot_barrier_test_cv_.wait_for(
-        lock, timeout, [this] { return snapshot_barrier_test_reached_; });
 }
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
@@ -1538,11 +1520,6 @@ MasterService::GetOrCreateTenantStateHandle(const TenantId& tenant_id) {
         }
         return handle;
     });
-}
-
-std::unique_lock<std::shared_mutex> MasterService::LockObjectRouteForTesting(
-    TenantState& tenant_state) const {
-    return tenant_state.object_route.LockRouteForTesting();
 }
 
 TenantQuotaHandle MasterService::GetBoundTenantQuotaHandle(
@@ -4532,15 +4509,14 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             auto alive_clients = ok_client_;
             client_lock.unlock();
-            // Test-only snapshot-barrier signal : PutStart has released
+            // Snapshot-section entry point: PutStart has released
             // client_mutex_ and holds snapshot_mutex_ (shared) for the rest of
             // this block, so no subsequent code in the barrier may re-acquire
-            // client_mutex_. The lock-order test waits on this instead of
-            // racing the async timing; no-op in production (not armed).
-            if (snapshot_barrier_test_armed_.load(std::memory_order_acquire)) {
-                std::lock_guard<std::mutex> lock(snapshot_barrier_test_mutex_);
-                snapshot_barrier_test_reached_ = true;
-                snapshot_barrier_test_cv_.notify_all();
+            // client_mutex_. The injected hook lets a lock-order test observe
+            // this point and resume deterministically instead of racing the
+            // async timing; empty in production.
+            if (snapshot_arrive_hook_) {
+                snapshot_arrive_hook_();
             }
             auto tenant_handle =
                 GetOrCreateTenantStateHandle(object_id.tenant_id);

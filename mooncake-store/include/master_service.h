@@ -204,13 +204,6 @@ class MasterService {
                                     double evict_ratio_lowerbound);
     void RunDfsEvictionForTesting();
 
-    // Test-only snapshot-barrier gate: PutStart releases client_mutex_ while
-    // holding snapshot_mutex_ (shared). These hooks let a test observe that
-    // point and resume deterministically. No-ops in production.
-    void ArmSnapshotBarrierForTesting();
-    void DisarmSnapshotBarrierForTesting();
-    bool WaitForSnapshotBarrierForTesting(std::chrono::milliseconds timeout);
-
     /**
      * @brief Enables the tenant-epoch bookkeeping that decides whether
      *        RemoveAll may publish `cleared`. Production turns this on from the
@@ -1352,12 +1345,6 @@ class MasterService {
                                         const ReplicateConfig& config) const;
     std::shared_ptr<TenantState> GetOrCreateTenantStateHandle(
         const TenantId& tenant_id);
-    // Test-only seam (friend of MasterServiceHATest): return the tenant object
-    // route lock EXCLUSIVE, so the test can gate a PutStart at its first Pin
-    // inside the snapshot barrier. Delegates to TenantStore's private
-    // LockRouteForTesting.
-    std::unique_lock<std::shared_mutex> LockObjectRouteForTesting(
-        TenantState& tenant_state) const;
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const;
     tl::expected<void, ErrorCode> ChargeTenantQuota(
@@ -2174,15 +2161,11 @@ class MasterService {
     std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
 
-    // Test-only snapshot-barrier gate state (see ArmSnapshotBarrierForTesting).
-    // PutStart signals snapshot_barrier_test_reached_ (and notifies the CV)
-    // when it has released client_mutex_ and holds snapshot_mutex_ (inside the
-    // barrier). Always no-ops in production (snapshot_barrier_test_armed_ is
-    // false unless a test armed it).
-    std::atomic<bool> snapshot_barrier_test_armed_{false};
-    mutable std::mutex snapshot_barrier_test_mutex_;
-    std::condition_variable snapshot_barrier_test_cv_;
-    bool snapshot_barrier_test_reached_ = false;
+    // Injected via MasterServiceConfig: invoked when PutStart enters the
+    // snapshot section (client_mutex_ released, snapshot_mutex_ held shared).
+    // Empty in production; lock-order tests inject a gate so they can observe
+    // the checkpoint and resume deterministically instead of racing.
+    const std::function<void()> snapshot_arrive_hook_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

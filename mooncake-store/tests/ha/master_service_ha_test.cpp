@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -243,6 +244,45 @@ class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
    private:
     ErrorCode commit_error_{ErrorCode::OK};
     size_t rejected_commits_{0};
+};
+
+// Self-contained arrive-gate injected into MasterService via
+// MasterServiceConfig::set_snapshot_arrive_hook. Owns all the barrier state
+// (armed flag, mutex, CV) that used to live on MasterService as
+// *ForTesting members; Arm/Disarm/Wait keep those semantics.
+struct SnapshotBarrierGate {
+    void Arm() {
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = false;
+        armed.store(true, std::memory_order_release);
+    }
+
+    void Disarm() {
+        armed.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = false;
+    }
+
+    // Invoked by PutStart through the injected hook when it enters the
+    // snapshot section (client_mutex_ released, snapshot_mutex_ held shared).
+    void Arrive() {
+        if (!armed.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = true;
+        cv.notify_all();
+    }
+
+    bool WaitForArrive(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout, [this] { return reached; });
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> armed{false};
+    bool reached{false};
 };
 
 class MasterServiceHATest : public ::testing::Test {
@@ -775,6 +815,8 @@ class MasterServiceHATest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
+    SnapshotBarrierGate snapshot_gate_;
+
     static std::unique_lock<std::shared_mutex> LockMetadataShardForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
@@ -783,7 +825,7 @@ class MasterServiceHATest : public ::testing::Test {
         // barrier (snapshot held, client_mutex_ released) without racing the
         // async PutStart.
         auto tenant_handle = service.GetOrCreateTenantStateHandle(tenant_id);
-        return service.LockObjectRouteForTesting(*tenant_handle);
+        return tenant_handle->object_route.LockRouteForTesting();
     }
 
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
@@ -1494,6 +1536,7 @@ TEST_F(MasterServiceHATest,
     MasterService service(
         MasterServiceConfig::builder()
             .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_snapshot_arrive_hook([this] { snapshot_gate_.Arrive(); })
             .build());
     const UUID client_id = generate_uuid();
     const std::string key = "local_first_lock_order_key";
@@ -1506,13 +1549,13 @@ TEST_F(MasterServiceHATest,
     // Deterministically gate PutStart inside the snapshot barrier: holding the
     // owning route shard EXCLUSIVE parks it at its first Pin, after it released
     // client_mutex_ and while it holds snapshot_mutex_ (shared).
-    service.ArmSnapshotBarrierForTesting();
+    snapshot_gate_.Arm();
     auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
 
-    if (!service.WaitForSnapshotBarrierForTesting(std::chrono::seconds(5))) {
+    if (!snapshot_gate_.WaitForArrive(std::chrono::seconds(5))) {
         // PutStart never entered the barrier within the deadline. Unblock it
         // and drain the future so the service destructs cleanly, then fail.
         shard_lock.unlock();
@@ -1522,7 +1565,7 @@ TEST_F(MasterServiceHATest,
             std::future_status::ready) {
             (void)put.get();
         }
-        service.DisarmSnapshotBarrierForTesting();
+        snapshot_gate_.Disarm();
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
@@ -1537,7 +1580,7 @@ TEST_F(MasterServiceHATest,
         put.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     client_lock.unlock();
 
-    service.DisarmSnapshotBarrierForTesting();
+    snapshot_gate_.Disarm();
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());
