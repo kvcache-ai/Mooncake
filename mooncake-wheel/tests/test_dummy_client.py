@@ -893,16 +893,107 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         ctypes.memmove(raw_ptr, metadata, metadata_size)
         ctypes.memmove(raw_ptr + metadata_size, tensor.numpy().tobytes(), payload_size)
 
-        key = f"test_dummy_pinned_tensor_external_{os.getpid()}"
+        self.assertTrue(raw.is_pinned())
+        self._check_external_tensor_writes(raw, tensor, "pinned")
+
+    def _check_external_tensor_writes(self, raw, tensor, label):
+        raw_ptr = raw.data_ptr()
+        total_size = raw.numel()
+        keys = [f"test_dummy_{label}_tensor_{os.getpid()}_{i}" for i in range(3)]
+        self.assertEqual(self.store.register_buffer(raw_ptr, total_size), 0)
         try:
-            self.assertTrue(raw.is_pinned())
-            self.assertEqual(self.store.register_buffer(raw_ptr, total_size), 0)
-            self.assertEqual(self.store.put_tensor_from(key, raw_ptr, total_size), 0)
-            stored = self.store.get_tensor(key)
-            self.assertIsNotNone(stored)
-            self.assertTrue(torch.equal(stored, tensor))
+            self.assertEqual(
+                self.store.put_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_put_tensor_from(
+                        keys[1:], [raw_ptr] * 2, [total_size] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
+
+            updated = tensor + 7
+            metadata, _, _, _ = mooncake_store._serialize_tensor(updated)
+            serialized = torch.tensor(
+                list(metadata + updated.numpy().tobytes()), dtype=torch.uint8
+            )
+            raw.copy_(serialized)
+            if raw.is_cuda:
+                torch.cuda.synchronize(raw.device)
+            self.assertEqual(
+                self.store.upsert_tensor_from(keys[0], raw_ptr, total_size), 0
+            )
+            self.assertEqual(
+                list(
+                    self.store.batch_upsert_tensor_from(
+                        keys[1:], [raw_ptr] * 2, [total_size] * 2
+                    )
+                ),
+                [0, 0],
+            )
+            for key in keys:
+                self.assertTrue(torch.equal(self.store.get_tensor(key), updated))
         finally:
-            self.store.unregister_buffer(raw_ptr)
+            self.assertEqual(self.store.unregister_buffer(raw_ptr), 0)
+            for key in keys:
+                self.store.remove(key, force=True)
+
+    def test_tensor_from_external_cuda_staging(self):
+        """Exercise all four raw APIs with a registered CUDA serialized object."""
+        if torch is None or not torch.cuda.is_available():
+            self.skipTest("CUDA is not available")
+        tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        metadata, _, _, _ = mooncake_store._serialize_tensor(tensor)
+        raw = torch.tensor(
+            list(metadata + tensor.numpy().tobytes()), dtype=torch.uint8, device="cuda"
+        )
+        torch.cuda.synchronize(raw.device)
+        self._check_external_tensor_writes(raw, tensor, "cuda")
+
+    def test_tensor_from_invalid_object_ranges(self):
+        """Reject malformed objects and overflow before dereferencing the header."""
+        import ctypes
+
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+        tensor = torch.arange(4, dtype=torch.float32)
+        metadata, _, payload_size, _ = mooncake_store._serialize_tensor(tensor)
+        size = len(metadata) + payload_size
+        raw = (ctypes.c_ubyte * size)()
+        ptr = ctypes.addressof(raw)
+        ctypes.memmove(ptr, metadata, len(metadata))
+        max_address = (1 << (8 * ctypes.sizeof(ctypes.c_void_p))) - 1
+        key = f"test_dummy_invalid_tensor_{os.getpid()}"
+        self.assertEqual(self.store.register_buffer(ptr, size), 0)
+        try:
+            for address, length in [
+                (0, size),
+                (max_address - 8, size),
+                (ptr, len(metadata) - 1),
+                (ptr, size - 1),
+            ]:
+                with self.subTest(address=address, length=length):
+                    self.assertLess(self.store.put_tensor_from(key, address, length), 0)
+                    self.assertLess(
+                        self.store.upsert_tensor_from(key, address, length), 0
+                    )
+                    self.assertLess(
+                        self.store.batch_put_tensor_from([key], [address], [length])[0],
+                        0,
+                    )
+                    self.assertLess(
+                        self.store.batch_upsert_tensor_from([key], [address], [length])[
+                            0
+                        ],
+                        0,
+                    )
+                    self.assertEqual(self.store.is_exist(key), 0)
+        finally:
+            self.assertEqual(self.store.unregister_buffer(ptr), 0)
             self.store.remove(key, force=True)
 
     def test_tensor_from_external_zero_payload_staging(self):
@@ -942,7 +1033,10 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
                 ),
                 [0, 0],
             )
-            for key in keys[:3]:
+            self.assertEqual(
+                self.store.upsert_tensor_from(keys[3], raw_ptr, len(metadata)), 0
+            )
+            for key in keys:
                 stored = self.store.get_tensor(key)
                 self.assertIsNotNone(stored)
                 self.assertEqual(tuple(stored.shape), tuple(tensor.shape))

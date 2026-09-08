@@ -97,7 +97,8 @@ struct RawTensorObjectParts {
 
 std::optional<RawTensorObjectParts> make_raw_tensor_object_parts(
     uintptr_t buffer_ptr, size_t size, const char *operation_name) {
-    if (buffer_ptr == 0 || size < sizeof(TensorMetadata)) {
+    if (buffer_ptr == 0 || size < sizeof(TensorMetadata) ||
+        size > std::numeric_limits<uintptr_t>::max() - buffer_ptr) {
         LOG(ERROR) << operation_name << ": invalid tensor object buffer";
         return std::nullopt;
     }
@@ -1719,14 +1720,12 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (!make_raw_tensor_object_parts(buffer_ptr, size,
-                                          "upsert_tensor_from")
-                 .has_value()) {
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        auto results = batch_upsert_tensor_from({key}, {buffer_ptr}, {size});
+        if (results.size() != 1) {
+            LOG(ERROR) << "Tensor upsert returned unexpected result count";
+            return to_py_ret(ErrorCode::INTERNAL_ERROR);
         }
-        py::gil_scoped_release release_gil;
-        return store_->upsert_from(key, reinterpret_cast<void *>(buffer_ptr),
-                                   size, ReplicateConfig{});
+        return results[0];
     }
 
     int validate_replicate_config(

@@ -768,7 +768,7 @@ std::optional<DummyClient::PreparedBuffer> DummyClient::prepare_buffer(
 
 std::optional<DummyClient::PreparedBuffer>
 DummyClient::prepare_ranged_read_buffer(
-    void* buffer, const std::vector<std::vector<size_t>>& dst_offsets,
+    void* buffer, std::vector<std::vector<size_t>>& dst_offsets,
     const std::vector<std::vector<size_t>>& sizes) {
     if (buffer == nullptr) {
         return PreparedBuffer{nullptr, nullptr, 0, nullptr, false};
@@ -789,12 +789,27 @@ DummyClient::prepare_ranged_read_buffer(
                 const size_t offset = dst_offsets[i][j];
                 const size_t fragment_size = sizes[i][j];
                 if (offset > capacity || fragment_size > capacity - offset) {
+                    // Keep invalid destinations invalid after compaction, even
+                    // for zero-length fragments. RealClient reports each error.
+                    dst_offsets[i][j] = std::numeric_limits<size_t>::max();
                     continue;
                 }
-                staging_size = std::max(staging_size, offset + fragment_size);
+                if (fragment_size >
+                    std::numeric_limits<size_t>::max() - staging_size) {
+                    return std::nullopt;
+                }
+                dst_offsets[i][j] = staging_size;
+                staging_size += fragment_size;
             }
         }
-        return prepare_buffer(buffer, staging_size, false, true);
+        // Reserve only fragment bytes, not the unused prefix or sparse gaps.
+        // The original destination capacity remains the copy-back bound.
+        auto allocation =
+            allocate_client_buffer(std::max<size_t>(staging_size, 1));
+        if (!allocation) return std::nullopt;
+        auto staging = std::make_unique<BufferHandle>(std::move(*allocation));
+        return PreparedBuffer{buffer, staging->ptr(), capacity,
+                              std::move(staging), true};
     }
     if (shm_helper_ == nullptr) return std::nullopt;
     auto shm = shm_helper_->get_shm(buffer);
@@ -807,14 +822,19 @@ DummyClient::prepare_ranged_read_buffer(
 }
 
 bool DummyClient::copy_from_staging(const PreparedBuffer& buffer, size_t size,
-                                    size_t offset) const {
+                                    size_t offset,
+                                    size_t staging_offset) const {
     if (!buffer.copy_back || buffer.staging == nullptr || size == 0)
         return true;
-    if (offset > buffer.size || size > buffer.size - offset) return false;
+    if (offset > buffer.size || size > buffer.size - offset ||
+        staging_offset > buffer.staging->size() ||
+        size > buffer.staging->size() - staging_offset)
+        return false;
     const auto& runtime =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     auto* destination = static_cast<uint8_t*>(buffer.original) + offset;
-    auto* source = static_cast<uint8_t*>(buffer.staging->ptr()) + offset;
+    auto* source =
+        static_cast<uint8_t*>(buffer.staging->ptr()) + staging_offset;
     return runtime.CopyFromHost(destination, source, size);
 }
 
@@ -1426,6 +1446,7 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     std::vector<PreparedBuffer> prepared;
     std::vector<uint64_t> dummy_buffers = void_ptrs_to_u64(buffers);
     std::vector<size_t> dummy_buffer_sizes;
+    auto dummy_dst_offsets = all_dst_offsets;
     bool requires_staging = false;
     prepared.reserve(buffers.size());
     dummy_buffer_sizes.reserve(buffers.size());
@@ -1446,7 +1467,7 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
             }
         }
 
-        auto item = prepare_ranged_read_buffer(buffers[i], all_dst_offsets[i],
+        auto item = prepare_ranged_read_buffer(buffers[i], dummy_dst_offsets[i],
                                                all_sizes[i]);
         if (!item) {
             return build_ranged_read_error_results(buffers.size(), all_keys,
@@ -1454,7 +1475,8 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                                                    ErrorCode::INVALID_PARAMS);
         }
         dummy_buffers[i] = reinterpret_cast<uint64_t>(item->dummy);
-        dummy_buffer_sizes.push_back(item->size);
+        dummy_buffer_sizes.push_back(item->staging ? item->staging->size()
+                                                   : item->size);
         requires_staging |= item->staging != nullptr;
         prepared.push_back(std::move(*item));
     }
@@ -1468,9 +1490,9 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
         requires_staging
             ? invoke_rpc<&RealClient::get_into_ranges_staged_shm_helper,
                          RangedReadResults>(
-                  dummy_buffers, dummy_buffer_sizes, all_keys, all_dst_offsets,
-                  all_src_offsets, all_sizes, cached_query_results, device_id_,
-                  client_id_)
+                  dummy_buffers, dummy_buffer_sizes, all_keys,
+                  dummy_dst_offsets, all_src_offsets, all_sizes,
+                  cached_query_results, device_id_, client_id_)
             : invoke_rpc<&RealClient::get_into_ranges_shm_helper,
                          RangedReadResults>(
                   dummy_buffers, all_keys, all_dst_offsets, all_src_offsets,
@@ -1520,7 +1542,8 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
                 if (result < 0) continue;
                 if (static_cast<uint64_t>(result) > all_sizes[i][j][k] ||
                     !copy_from_staging(prepared[i], static_cast<size_t>(result),
-                                       all_dst_offsets[i][j][k])) {
+                                       all_dst_offsets[i][j][k],
+                                       dummy_dst_offsets[i][j][k])) {
                     result = toInt(ErrorCode::INTERNAL_ERROR);
                 }
             }
