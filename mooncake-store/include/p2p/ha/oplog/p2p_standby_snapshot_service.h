@@ -50,8 +50,8 @@ struct StandbySnapshotChunkRequest {
 
 struct StandbySnapshotObjectRecord {
     std::string key;
-    StandbyObjectMetadata metadata;
-    YLT_REFL(StandbySnapshotObjectRecord, key, metadata);
+    P2PStandbyRouteEntry route;
+    YLT_REFL(StandbySnapshotObjectRecord, key, route);
 };
 
 struct StandbySnapshotClientRecord {

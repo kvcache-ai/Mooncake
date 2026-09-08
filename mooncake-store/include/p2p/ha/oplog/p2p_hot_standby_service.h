@@ -59,7 +59,7 @@ struct P2PStandbySyncStatus {
 // centralized HotStandbyService. The centralized service owns centralized
 // metadata/apply/export semantics, while P2P promotion needs
 // P2PStandbyMetadataStore, P2POpLogApplier, and an export shape that includes
-// clients, segments, objects, and replicas. This class reuses the shared
+// clients, segments, and route locations. This class reuses the shared
 // lower-level components (StandbyStateMachine, OpLogStoreFactory,
 // OpLogChangeNotifier, and OpLogReplicator) and keeps only the orchestration
 // layer P2P-specific.

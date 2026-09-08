@@ -767,12 +767,12 @@ auto P2PMasterService::ApplyPublishLocked(
     }
 
     if (GetOpLogManager() != nullptr) {
-        AddReplicaPayload payload;
+        PublishRoutePayload payload;
         payload.object_key = std::string(key);
         payload.client_id = client_id;
         payload.segment_id = segment_id;
         payload.size = size;
-        const auto error = RecordOplog(OpType_ADD_REPLICA, payload.object_key,
+        const auto error = RecordOplog(OpType_PUBLISH_ROUTE, payload.object_key,
                                        SerializeP2PPayload(payload));
         if (error != ErrorCode::OK) {
             LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
@@ -808,12 +808,12 @@ auto P2PMasterService::ApplyWithdrawLocked(
         if (GetOpLogManager() == nullptr) {
             return ErrorCode::OK;
         }
-        RemoveReplicaPayload payload;
+        WithdrawRoutePayload payload;
         payload.object_key = std::string(key);
         payload.client_id = client_id;
         payload.segment_id = segment_id;
         const auto error =
-            RecordOplog(OpType_REMOVE_REPLICA, payload.object_key,
+            RecordOplog(OpType_WITHDRAW_ROUTE, payload.object_key,
                         SerializeP2PPayload(payload));
         if (error != ErrorCode::OK) {
             LOG(ERROR) << "RemoveReplica(P2P): failed to record oplog"
@@ -1007,42 +1007,25 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         ++restored_clients;
     }
 
-    for (const auto& [key, standby_metadata] : metadata.objects) {
+    for (const auto& [key, standby_route] : metadata.routes) {
         bool restored_object = false;
-        for (const auto& desc : standby_metadata.replicas) {
-            if (!std::holds_alternative<P2PProxyDescriptor>(
-                    desc.descriptor_variant)) {
-                LOG(WARNING) << "RestoreFromStandbyMetadata: skipping non-P2P "
-                                "route descriptor"
-                             << ", key=" << key;
-                ++skipped_routes;
-                continue;
-            }
-
-            const auto& p2p_desc =
-                std::get<P2PProxyDescriptor>(desc.descriptor_variant);
-            auto client = client_manager_->GetClient(p2p_desc.client_id);
+        for (const auto& location : standby_route.locations) {
+            auto client = client_manager_->GetClient(location.client_id);
             if (!client ||
-                !client->QuerySegment(p2p_desc.segment_id).has_value()) {
+                !client->QuerySegment(location.segment_id).has_value()) {
                 LOG(WARNING)
                     << "RestoreFromStandbyMetadata: skipping route "
                        "with unavailable client or segment"
-                    << ", key=" << key << ", client_id=" << p2p_desc.client_id
-                    << ", segment_id=" << p2p_desc.segment_id;
+                    << ", key=" << key << ", client_id=" << location.client_id
+                    << ", segment_id=" << location.segment_id;
                 ++skipped_routes;
                 continue;
             }
 
-            const uint64_t object_size = standby_metadata.size != 0
-                                             ? standby_metadata.size
-                                             : p2p_desc.object_size;
             auto& shard = route_shards_[GetRouteShardIndex(key)];
             SharedMutexLocker lock(&shard.mutex);
-            auto mutation = shard.table.Publish(
-                key, object_size,
-                P2PRouteLocation{.client_id = p2p_desc.client_id,
-                                 .segment_id = p2p_desc.segment_id},
-                max_client_per_key_);
+            auto mutation = shard.table.Publish(key, standby_route.object_size,
+                                                location, max_client_per_key_);
             if (!mutation.has_value()) {
                 HAMetricManager::instance().inc_promotion_restore_failures();
                 LOG(ERROR) << "RestoreFromStandbyMetadata: failed to restore "
@@ -1054,7 +1037,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
             if (mutation->created_key) {
                 P2PMasterMetricManager::instance().inc_key_count(1);
                 P2PMasterMetricManager::instance().observe_value_size(
-                    object_size);
+                    standby_route.object_size);
                 restored_object = true;
             }
             ++restored_routes;

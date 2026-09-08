@@ -521,7 +521,7 @@ class RedisChaosTest : public ::testing::Test {
                     if (entry.sequence_id > read_from_seq) {
                         read_from_seq = entry.sequence_id;
                     }
-                    if (entry.op_type == OpType_ADD_REPLICA &&
+                    if (entry.op_type == OpType_PUBLISH_ROUTE &&
                         entry.object_key == key) {
                         return true;
                     }

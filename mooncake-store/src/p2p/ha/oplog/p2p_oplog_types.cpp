@@ -2,9 +2,25 @@
 
 #include <string>
 
+#include <glog/logging.h>
 #include <ylt/struct_pack.hpp>
 
 namespace mooncake {
+namespace {
+
+template <typename Payload>
+bool DeserializePayload(const std::string& data, Payload& payload) {
+    const auto error =
+        struct_pack::deserialize_to(payload, data.data(), data.size());
+    if (error != struct_pack::errc::ok) {
+        LOG(ERROR) << "Failed to deserialize P2P OpLog payload"
+                   << ", struct_pack_error=" << static_cast<int>(error);
+        return false;
+    }
+    return true;
+}
+
+}  // namespace
 
 std::string SerializeP2PPayload(const RegisterClientPayload& payload) {
     return struct_pack::serialize<std::string>(payload);
@@ -14,11 +30,11 @@ std::string SerializeP2PPayload(const UnregisterClientPayload& payload) {
     return struct_pack::serialize<std::string>(payload);
 }
 
-std::string SerializeP2PPayload(const AddReplicaPayload& payload) {
+std::string SerializeP2PPayload(const PublishRoutePayload& payload) {
     return struct_pack::serialize<std::string>(payload);
 }
 
-std::string SerializeP2PPayload(const RemoveReplicaPayload& payload) {
+std::string SerializeP2PPayload(const WithdrawRoutePayload& payload) {
     return struct_pack::serialize<std::string>(payload);
 }
 
@@ -30,50 +46,34 @@ std::string SerializeP2PPayload(const UnmountSegmentPayload& payload) {
     return struct_pack::serialize<std::string>(payload);
 }
 
-// ============================================================================
-// DeserializeP2PPayload implementations
-// ============================================================================
-
 bool DeserializeP2PPayload(const std::string& data,
                            RegisterClientPayload& payload) {
-    auto result =
-        struct_pack::deserialize_to(payload, data.data(), data.size());
-    return result == struct_pack::errc::ok;
+    return DeserializePayload(data, payload);
 }
 
 bool DeserializeP2PPayload(const std::string& data,
                            UnregisterClientPayload& payload) {
-    auto result =
-        struct_pack::deserialize_to(payload, data.data(), data.size());
-    return result == struct_pack::errc::ok;
+    return DeserializePayload(data, payload);
 }
 
 bool DeserializeP2PPayload(const std::string& data,
-                           AddReplicaPayload& payload) {
-    auto result =
-        struct_pack::deserialize_to(payload, data.data(), data.size());
-    return result == struct_pack::errc::ok;
+                           PublishRoutePayload& payload) {
+    return DeserializePayload(data, payload);
 }
 
 bool DeserializeP2PPayload(const std::string& data,
-                           RemoveReplicaPayload& payload) {
-    auto result =
-        struct_pack::deserialize_to(payload, data.data(), data.size());
-    return result == struct_pack::errc::ok;
+                           WithdrawRoutePayload& payload) {
+    return DeserializePayload(data, payload);
 }
 
 bool DeserializeP2PPayload(const std::string& data,
                            MountSegmentPayload& payload) {
-    auto result =
-        struct_pack::deserialize_to(payload, data.data(), data.size());
-    return result == struct_pack::errc::ok;
+    return DeserializePayload(data, payload);
 }
 
 bool DeserializeP2PPayload(const std::string& data,
                            UnmountSegmentPayload& payload) {
-    auto result =
-        struct_pack::deserialize_to(payload, data.data(), data.size());
-    return result == struct_pack::errc::ok;
+    return DeserializePayload(data, payload);
 }
 
 }  // namespace mooncake

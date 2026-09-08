@@ -72,7 +72,7 @@ BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
     // reconciles the snapshot for the asynchronous HA consistency model.
     session.baseline_sequence_id = standby_->GetLatestAppliedSequenceId();
     auto* store = standby_->GetMetadataStore();
-    session.object_keys = store->ListObjectKeys();
+    session.object_keys = store->ListRouteKeys();
     session.client_ids = store->ListClientIds();
     session.last_access = std::chrono::steady_clock::now();
 
@@ -147,11 +147,11 @@ StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
         std::min<size_t>(request.limit,
                          session.object_keys.size() - object_offset);
     for (size_t i = object_offset; i < object_end; ++i) {
-        auto metadata =
-            standby_->GetMetadataStore()->GetMetadata(session.object_keys[i]);
-        if (metadata) {
+        auto route =
+            standby_->GetMetadataStore()->GetRoute(session.object_keys[i]);
+        if (route) {
             response.objects.push_back(
-                {session.object_keys[i], std::move(*metadata)});
+                {session.object_keys[i], std::move(*route)});
         }
     }
     response.next_object_offset = object_end;
@@ -305,7 +305,7 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                                    record.info.rpc_port, record.info.segments);
         }
         for (const auto& record : chunk->objects) {
-            target->RestoreMetadata(record.key, record.metadata);
+            target->RestoreRoute(record.key, record.route);
         }
         object_offset = chunk->next_object_offset;
         client_offset = chunk->next_client_offset;

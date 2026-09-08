@@ -45,9 +45,9 @@ TEST(RedisOpLogStoreStandaloneTest, EndpointRequiresExplicitPort) {
     }
 }
 
-TEST(RedisOpLogStoreStandaloneTest, OnlyAddReplicaIsBestEffort) {
-    EXPECT_TRUE(IsBestEffortP2POpLog(OpType_ADD_REPLICA));
-    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_REMOVE_REPLICA));
+TEST(RedisOpLogStoreStandaloneTest, OnlyPublishRouteIsBestEffort) {
+    EXPECT_TRUE(IsBestEffortP2POpLog(OpType_PUBLISH_ROUTE));
+    EXPECT_FALSE(IsBestEffortP2POpLog(OpType_WITHDRAW_ROUTE));
     EXPECT_FALSE(IsBestEffortP2POpLog(OpType_MOUNT_SEGMENT));
     EXPECT_FALSE(IsBestEffortP2POpLog(OpType_UNMOUNT_SEGMENT));
     EXPECT_FALSE(IsBestEffortP2POpLog(OpType_REGISTER_CLIENT));

@@ -150,7 +150,6 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/ha/oplog/localfs_oplog_store.cpp
     p2p/ha/oplog/polling_oplog_change_notifier.cpp
     p2p/ha/oplog/oplog_store_factory.cpp
-    p2p/ha/oplog/oplog_applier.cpp
     p2p/ha/oplog/oplog_replicator.cpp
     p2p/ha/oplog/p2p_oplog_types.cpp
     p2p/ha/oplog/p2p_oplog_applier.cpp

@@ -4,13 +4,13 @@
 
 #include <algorithm>
 
-#include "p2p/ha/oplog/oplog_applier.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
 #include "p2p/ha/ha_metric_manager.h"
 
 namespace mooncake {
 
 OpLogReplicator::OpLogReplicator(OpLogChangeNotifier* notifier,
-                                 OpLogApplier* applier)
+                                 P2POpLogApplier* applier)
     : notifier_(notifier), applier_(applier) {
     if (notifier_ == nullptr) {
         LOG(FATAL) << "OpLogChangeNotifier cannot be null";

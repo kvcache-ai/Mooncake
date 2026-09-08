@@ -1,4 +1,4 @@
-#include "p2p/ha/oplog/oplog_applier.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -12,13 +12,10 @@
 
 #include <xxhash.h>
 
-#include "p2p/ha/metadata_store.h"
-#include "mock_metadata_store.h"
 #include "mock_oplog_store.h"
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "types.h"
 
-using mooncake::test::MockMetadataStore;
 using mooncake::test::MockOpLogStore;
 
 namespace mooncake::test {
@@ -44,15 +41,25 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
     return e;
 }
 
-// Helper function to create a valid struct_pack payload for PUT_END
-std::string MakeValidPayload(uint64_t client_id_first = 1,
+// Helper function to create a valid P2P publish payload
+std::string MakeValidPayload(const std::string& key,
+                             uint64_t client_id_first = 1,
                              uint64_t client_id_second = 2,
                              uint64_t size = 1024) {
-    mooncake::MetadataPayload payload;
+    PublishRoutePayload payload;
+    payload.object_key = key;
     payload.client_id = {client_id_first, client_id_second};
+    payload.segment_id = {3, 4};
     payload.size = size;
-    auto result = struct_pack::serialize(payload);
-    return std::string(result.begin(), result.end());
+    return SerializeP2PPayload(payload);
+}
+
+std::string MakeWithdrawPayload(const std::string& key) {
+    WithdrawRoutePayload payload;
+    payload.object_key = key;
+    payload.client_id = {1, 2};
+    payload.segment_id = {3, 4};
+    return SerializeP2PPayload(payload);
 }
 
 class OpLogApplierTest : public ::testing::Test {
@@ -60,76 +67,65 @@ class OpLogApplierTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("OpLogApplierTest");
         FLAGS_logtostderr = 1;
-        mock_metadata_store_ = std::make_unique<MockMetadataStore>();
+        metadata_store_ = std::make_unique<P2PStandbyMetadataStore>();
         cluster_id_ = "test_cluster_001";
-        applier_ = std::make_unique<OpLogApplier>(mock_metadata_store_.get(),
-                                                  cluster_id_);
+        applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
+                                                     cluster_id_);
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    std::unique_ptr<MockMetadataStore> mock_metadata_store_;
-    std::unique_ptr<OpLogApplier> applier_;
+    std::unique_ptr<P2PStandbyMetadataStore> metadata_store_;
+    std::unique_ptr<P2POpLogApplier> applier_;
     std::string cluster_id_;
 };
 
 // ========== 4.1.1 Basic apply tests ==========
 
-TEST_F(OpLogApplierTest, TestApplyPutEnd) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+TEST_F(OpLogApplierTest, TestApplyPublishRoute) {
+    OpLogEntry entry =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     // After applying seq=1, expected_sequence_id becomes 2
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_EQ(1u, mock_metadata_store_->GetKeyCount());
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
+    EXPECT_EQ(1u, metadata_store_->GetRouteKeyCount());
 }
 
-TEST_F(OpLogApplierTest, TestApplyPutRevoke) {
+TEST_F(OpLogApplierTest, TestApplyWithdrawRoute) {
     // First add a key
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
 
     // Then revoke it
-    OpLogEntry entry2 = MakeEntry(2, OpType::PUT_REVOKE, "key1", "");
+    OpLogEntry entry2 = MakeEntry(2, OpType_WITHDRAW_ROUTE, "key1",
+                                  MakeWithdrawPayload("key1"));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
-    EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
-}
-
-TEST_F(OpLogApplierTest, TestApplyRemove) {
-    // First add a key
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-
-    // Then remove it
-    OpLogEntry entry2 = MakeEntry(2, OpType::REMOVE, "key1", "");
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
-    EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
-    EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+    EXPECT_FALSE(metadata_store_->RouteExists("key1"));
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {
     OpLogEntry entry =
-        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload());
-    // Manually set an invalid op_type (assuming OpType is an enum)
-    // Since we can't directly set invalid enum, we test with valid types
-    // and verify that unsupported types in ProcessPendingEntries are handled
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+        MakeEntry(1, static_cast<OpType>(99), "key1", MakeValidPayload("key1"));
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
+    EXPECT_FALSE(applier_->IsHealthy());
+    EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
+    EXPECT_FALSE(metadata_store_->RouteExists("key1"));
 }
 
 // ========== 4.1.2 Sequence ordering tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyInOrder) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry2 =
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "key2", MakeValidPayload("key2"));
+    OpLogEntry entry3 =
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"));
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
@@ -138,17 +134,19 @@ TEST_F(OpLogApplierTest, TestApplyInOrder) {
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry3));
     EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
 
-    EXPECT_EQ(3u, mock_metadata_store_->GetKeyCount());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
+    EXPECT_EQ(3u, metadata_store_->GetRouteKeyCount());
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key2"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key3"));
 }
 
 TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
-    OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry3 =
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"));
+    OpLogEntry entry2 =
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "key2", MakeValidPayload("key2"));
 
     // Apply entry1 (seq=1) - should succeed
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -158,7 +156,7 @@ TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
     EXPECT_FALSE(applier_->ApplyOpLogEntry(entry3));
     EXPECT_EQ(2u,
               applier_->GetExpectedSequenceId());  // Still waiting for seq=2
-    EXPECT_FALSE(mock_metadata_store_->Exists("key3"));
+    EXPECT_FALSE(metadata_store_->RouteExists("key3"));
 
     // Apply entry2 (seq=2) - should succeed and trigger processing of entry3
     // ApplyOpLogEntry internally calls ProcessPendingEntries(), so entry3
@@ -167,9 +165,9 @@ TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
     EXPECT_EQ(4u, applier_->GetExpectedSequenceId());  // Now at seq=4
 
     // entry3 should already be processed by ApplyOpLogEntry
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key2"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key3"));
 
     // ProcessPendingEntries may return 0 if entry3 was already processed
     (void)applier_->ProcessPendingEntries();
@@ -177,9 +175,10 @@ TEST_F(OpLogApplierTest, TestApplyOutOfOrder) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyWithGap) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry4 =
+        MakeEntry(4, OpType_PUBLISH_ROUTE, "key4", MakeValidPayload("key4"));
 
     // Apply entry1 (seq=1)
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -197,9 +196,10 @@ TEST_F(OpLogApplierTest, TestApplyWithGap) {
 }
 
 TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry1_dup = MakeEntry(1, OpType::PUT_END, "key1_dup", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry1_dup = MakeEntry(1, OpType_PUBLISH_ROUTE, "key1_dup",
+                                      MakeValidPayload("key1_dup"));
 
     // Apply entry1
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -210,7 +210,7 @@ TEST_F(OpLogApplierTest, TestApplyDuplicateSequenceId) {
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1_dup));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
     // key1_dup should not be added (treated as no-op)
-    EXPECT_FALSE(mock_metadata_store_->Exists("key1_dup"));
+    EXPECT_FALSE(metadata_store_->RouteExists("key1_dup"));
 }
 
 // ========== 4.1.3 Gap resolution tests ==========
@@ -220,31 +220,30 @@ class OpLogApplierGapTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("OpLogApplierGapTest");
         FLAGS_logtostderr = 1;
-        mock_metadata_store_ = std::make_unique<MockMetadataStore>();
+        metadata_store_ = std::make_unique<P2PStandbyMetadataStore>();
         mock_oplog_store_ = std::make_unique<MockOpLogStore>();
-        applier_ = std::make_unique<OpLogApplier>(mock_metadata_store_.get(),
-                                                  "test_cluster",
-                                                  mock_oplog_store_.get());
+        applier_ = std::make_unique<P2POpLogApplier>(
+            metadata_store_.get(), "test_cluster", mock_oplog_store_.get());
     }
     void TearDown() override { google::ShutdownGoogleLogging(); }
 
-    std::unique_ptr<MockMetadataStore> mock_metadata_store_;
+    std::unique_ptr<P2PStandbyMetadataStore> metadata_store_;
     std::unique_ptr<MockOpLogStore> mock_oplog_store_;
-    std::unique_ptr<OpLogApplier> applier_;
+    std::unique_ptr<P2POpLogApplier> applier_;
 };
 
 TEST_F(OpLogApplierGapTest, RequestMissingOpLog_Success) {
-    std::string payload = MakeValidPayload();
     // Pre-populate seq=2 in mock store
-    OpLogEntry missing = MakeEntry(2, OpType::PUT_END, "key2", payload);
+    OpLogEntry missing =
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "key2", MakeValidPayload("key2"));
     mock_oplog_store_->WriteOpLog(missing);
 
     // Apply seq=1
     EXPECT_TRUE(applier_->ApplyOpLogEntry(
-        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"))));
     // Apply seq=3 (gap at seq=2)
     EXPECT_FALSE(applier_->ApplyOpLogEntry(
-        MakeEntry(3, OpType::PUT_END, "key3", payload)));
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"))));
 
     // First call registers the gap in missing_sequence_ids_
     applier_->ProcessPendingEntries();
@@ -256,19 +255,18 @@ TEST_F(OpLogApplierGapTest, RequestMissingOpLog_Success) {
 
     // After gap resolution, all 3 should be applied
     EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key2"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key3"));
 }
 
 TEST_F(OpLogApplierGapTest, RequestMissingOpLog_StoreError) {
-    std::string payload = MakeValidPayload();
     mock_oplog_store_->SetReadError(ErrorCode::ETCD_OPERATION_ERROR);
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(
-        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"))));
     EXPECT_FALSE(applier_->ApplyOpLogEntry(
-        MakeEntry(3, OpType::PUT_END, "key3", payload)));
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"))));
 
     // First call registers the gap
     applier_->ProcessPendingEntries();
@@ -282,13 +280,12 @@ TEST_F(OpLogApplierGapTest, RequestMissingOpLog_StoreError) {
 }
 
 TEST_F(OpLogApplierGapTest, RequestMissingOpLog_NotFound) {
-    std::string payload = MakeValidPayload();
     // Don't preload seq=2 in mock store
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(
-        MakeEntry(1, OpType::PUT_END, "key1", payload)));
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"))));
     EXPECT_FALSE(applier_->ApplyOpLogEntry(
-        MakeEntry(3, OpType::PUT_END, "key3", payload)));
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"))));
 
     // First call registers the gap
     applier_->ProcessPendingEntries();
@@ -303,29 +300,29 @@ TEST_F(OpLogApplierGapTest, RequestMissingOpLog_NotFound) {
 // ========== 4.1.4 Checksum tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidChecksum) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidChecksum) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry = MakeEntry(1, OpType_WITHDRAW_ROUTE, "key1",
+                                 MakeWithdrawPayload("key1"));
 
     // Tamper with the checksum
     entry.checksum = entry.checksum + 1;
 
     EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());  // Should not advance
-    EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+    EXPECT_FALSE(metadata_store_->RouteExists("key1"));
 }
 
 TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry = MakeEntry(1, OpType_WITHDRAW_ROUTE, "key1",
+                                 MakeWithdrawPayload("key1"));
 
     // Tamper with the checksum
     entry.checksum = entry.checksum + 1;
@@ -337,15 +334,16 @@ TEST_F(OpLogApplierTest, TestChecksumFailureMetric) {
 // ========== 4.1.5 Size validation tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_ValidSize) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
 
     EXPECT_TRUE(OpLogManager::ValidateEntrySize(entry));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidSize) {
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", "");
+    OpLogEntry entry = MakeEntry(1, OpType_WITHDRAW_ROUTE, "key1",
+                                 MakeWithdrawPayload("key1"));
 
     // Make key too large
     entry.object_key.assign(OpLogManager::kMaxObjectKeySize + 1, 'k');
@@ -353,11 +351,12 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidSize) {
     EXPECT_FALSE(OpLogManager::ValidateEntrySize(entry));
     EXPECT_FALSE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());  // Should not advance
-    EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+    EXPECT_FALSE(metadata_store_->RouteExists("key1"));
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_PayloadTooLarge) {
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", "");
+    OpLogEntry entry = MakeEntry(1, OpType_WITHDRAW_ROUTE, "key1",
+                                 MakeWithdrawPayload("key1"));
 
     // Make payload too large
     entry.payload.assign(OpLogManager::kMaxPayloadSize + 1, 'p');
@@ -375,8 +374,8 @@ TEST_F(OpLogApplierTest, TestRecover) {
     EXPECT_EQ(11u, applier_->GetExpectedSequenceId());
 
     // Apply entry with seq=11 should succeed
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(11, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry =
+        MakeEntry(11, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(12u, applier_->GetExpectedSequenceId());
 }
@@ -387,16 +386,17 @@ TEST_F(OpLogApplierTest, TestRecover_ZeroSequenceId) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
     // Apply entry with seq=1 should succeed
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }
 
 TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry3 =
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"));
 
     // Apply entry1
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -418,10 +418,12 @@ TEST_F(OpLogApplierTest, TestRecover_AfterGap) {
 // ========== 4.1.7 Pending entries tests ==========
 
 TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
-    OpLogEntry entry2 = MakeEntry(2, OpType::PUT_END, "key2", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry3 =
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"));
+    OpLogEntry entry2 =
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "key2", MakeValidPayload("key2"));
 
     // Apply entry1
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -442,9 +444,9 @@ TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
     EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
 
     // entry3 should already be processed by ApplyOpLogEntry
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key2"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key3"));
 
     // ProcessPendingEntries may return 0 if entry3 was already processed
     (void)applier_->ProcessPendingEntries();
@@ -452,9 +454,10 @@ TEST_F(OpLogApplierTest, TestProcessPendingEntries) {
 }
 
 TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry3 = MakeEntry(3, OpType::PUT_END, "key3", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry3 =
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3"));
 
     // Apply entry1
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -481,9 +484,10 @@ TEST_F(OpLogApplierTest, TestPendingEntriesTimeout) {
 }
 
 TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry1 = MakeEntry(1, OpType::PUT_END, "key1", payload);
-    OpLogEntry entry4 = MakeEntry(4, OpType::PUT_END, "key4", payload);
+    OpLogEntry entry1 =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
+    OpLogEntry entry4 =
+        MakeEntry(4, OpType_PUBLISH_ROUTE, "key4", MakeValidPayload("key4"));
 
     // Apply entry1
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry1));
@@ -507,80 +511,52 @@ TEST_F(OpLogApplierTest, TestPendingEntriesSkip) {
     // entry4 is still pending, waiting for seq=3
     EXPECT_GE(applier_->GetExpectedSequenceId(), 3u);
     // entry4 should still be pending (not applied yet)
-    EXPECT_FALSE(mock_metadata_store_->Exists("key4"));
+    EXPECT_FALSE(metadata_store_->RouteExists("key4"));
 }
 
 // ========== 4.1.8 Payload deserialization tests ==========
 
-TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidPayload) {
-    std::string payload = MakeValidPayload(1, 2, 2048);
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+TEST_F(OpLogApplierTest, TestApplyPublishRoute_ValidPayload) {
+    OpLogEntry entry = MakeEntry(1, OpType_PUBLISH_ROUTE, "key1",
+                                 MakeValidPayload("key1", 1, 2, 2048));
 
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
 
-    auto meta = mock_metadata_store_->GetMetadata("key1");
+    auto meta = metadata_store_->GetRoute("key1");
     ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(1u, meta->client_id.first);
-    EXPECT_EQ(2u, meta->client_id.second);
-    EXPECT_EQ(2048u, meta->size);
-}
-
-TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidPayload) {
-    std::string invalid_data = "{invalid data}";
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", invalid_data);
-
-    // Should still succeed (fallback to empty metadata)
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-
-    // Metadata should exist but with default values
-    auto meta = mock_metadata_store_->GetMetadata("key1");
-    ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(0u, meta->client_id.first);
-    EXPECT_EQ(0u, meta->client_id.second);
-    EXPECT_EQ(0u, meta->size);
-}
-
-TEST_F(OpLogApplierTest, TestApplyPutEnd_EmptyPayload) {
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", "");
-
-    // Should succeed with empty payload (creates empty metadata)
-    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
-    EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-
-    auto meta = mock_metadata_store_->GetMetadata("key1");
-    ASSERT_TRUE(meta.has_value());
-    EXPECT_EQ(0u, meta->client_id.first);
-    EXPECT_EQ(0u, meta->client_id.second);
-    EXPECT_EQ(0u, meta->size);
+    ASSERT_EQ(1u, meta->locations.size());
+    EXPECT_EQ(1u, meta->locations.front().client_id.first);
+    EXPECT_EQ(2u, meta->locations.front().client_id.second);
+    EXPECT_EQ(2048u, meta->object_size);
 }
 
 // ========== Additional Edge Case Tests ==========
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntries_Batch) {
-    std::string payload = MakeValidPayload();
     std::vector<OpLogEntry> entries;
-    entries.push_back(MakeEntry(1, OpType::PUT_END, "key1", payload));
-    entries.push_back(MakeEntry(2, OpType::PUT_END, "key2", payload));
-    entries.push_back(MakeEntry(3, OpType::PUT_END, "key3", payload));
+    entries.push_back(
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1")));
+    entries.push_back(
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "key2", MakeValidPayload("key2")));
+    entries.push_back(
+        MakeEntry(3, OpType_PUBLISH_ROUTE, "key3", MakeValidPayload("key3")));
 
     size_t applied = applier_->ApplyOpLogEntries(entries);
     EXPECT_EQ(3u, applied);
     EXPECT_EQ(4u, applier_->GetExpectedSequenceId());
-    EXPECT_EQ(3u, mock_metadata_store_->GetKeyCount());
+    EXPECT_EQ(3u, metadata_store_->GetRouteKeyCount());
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
-    std::string payload = MakeValidPayload();
     std::vector<OpLogEntry> entries;
-    entries.push_back(MakeEntry(1, OpType::PUT_END, "key1", payload));
     entries.push_back(
-        MakeEntry(3, OpType::PUT_END, "key3", payload));  // Gap at seq=2
-    entries.push_back(MakeEntry(2, OpType::PUT_END, "key2", payload));
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1")));
+    entries.push_back(MakeEntry(3, OpType_PUBLISH_ROUTE, "key3",
+                                MakeValidPayload("key3")));  // Gap at seq=2
+    entries.push_back(
+        MakeEntry(2, OpType_PUBLISH_ROUTE, "key2", MakeValidPayload("key2")));
 
     size_t applied = applier_->ApplyOpLogEntries(entries);
     // entry1 should be applied, entry3 should be pending, entry2 should be
@@ -591,9 +567,9 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
     // entry2's ApplyOpLogEntry internally calls ProcessPendingEntries(), so
     // entry3 should be processed
     EXPECT_GE(applier_->GetExpectedSequenceId(), 4u);
-    EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key2"));
-    EXPECT_TRUE(mock_metadata_store_->Exists("key3"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key1"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key2"));
+    EXPECT_TRUE(metadata_store_->RouteExists("key3"));
 
     // ProcessPendingEntries may return 0 if entry3 was already processed
     (void)applier_->ProcessPendingEntries();
@@ -603,8 +579,8 @@ TEST_F(OpLogApplierTest, TestApplyOpLogEntries_WithGaps) {
 TEST_F(OpLogApplierTest, TestGetExpectedSequenceId) {
     EXPECT_EQ(1u, applier_->GetExpectedSequenceId());
 
-    std::string payload = MakeValidPayload();
-    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+    OpLogEntry entry =
+        MakeEntry(1, OpType_PUBLISH_ROUTE, "key1", MakeValidPayload("key1"));
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
 }

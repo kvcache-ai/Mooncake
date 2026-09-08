@@ -15,22 +15,20 @@ namespace mooncake::test {
 TEST(P2POpLogTypesTest, OpTypeValuesDoNotConflictWithMain) {
     // Main branch uses OpType 1-4 (PUT_END, PUT_REVOKE, REMOVE, LEASE_RENEW).
     // P2P OpTypes start from 10.
-    EXPECT_EQ(static_cast<int>(OpType_ADD_REPLICA), 10);
-    EXPECT_EQ(static_cast<int>(OpType_REMOVE_REPLICA), 11);
+    EXPECT_EQ(static_cast<int>(OpType_PUBLISH_ROUTE), 10);
+    EXPECT_EQ(static_cast<int>(OpType_WITHDRAW_ROUTE), 11);
     EXPECT_EQ(static_cast<int>(OpType_MOUNT_SEGMENT), 12);
     EXPECT_EQ(static_cast<int>(OpType_UNMOUNT_SEGMENT), 13);
-    EXPECT_EQ(static_cast<int>(OpType_REMOVE_ALL), 14);
     EXPECT_EQ(static_cast<int>(OpType_REGISTER_CLIENT), 15);
     EXPECT_EQ(static_cast<int>(OpType_UNREGISTER_CLIENT), 16);
 }
 
 TEST(P2POpLogTypesTest, OpTypeValuesAreDistinct) {
     std::vector<int> values = {
-        static_cast<int>(OpType_ADD_REPLICA),
-        static_cast<int>(OpType_REMOVE_REPLICA),
+        static_cast<int>(OpType_PUBLISH_ROUTE),
+        static_cast<int>(OpType_WITHDRAW_ROUTE),
         static_cast<int>(OpType_MOUNT_SEGMENT),
         static_cast<int>(OpType_UNMOUNT_SEGMENT),
-        static_cast<int>(OpType_REMOVE_ALL),
         static_cast<int>(OpType_REGISTER_CLIENT),
         static_cast<int>(OpType_UNREGISTER_CLIENT),
     };
@@ -146,18 +144,18 @@ TEST(P2POpLogTypesTest, RoundTrip_UnregisterClientPayload) {
 }
 
 // ============================================================================
-// AddReplicaPayload round-trip
+// PublishRoutePayload round-trip
 // ============================================================================
 
-TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload) {
-    AddReplicaPayload original;
+TEST(P2POpLogTypesTest, RoundTrip_PublishRoutePayload) {
+    PublishRoutePayload original;
     original.object_key = "obj_001";
     original.client_id = {10, 20};
     original.segment_id = {30, 40};
     original.size = 4096;
 
     std::string data = SerializeP2PPayload(original);
-    AddReplicaPayload decoded;
+    PublishRoutePayload decoded;
     ASSERT_TRUE(DeserializeP2PPayload(data, decoded));
 
     EXPECT_EQ(decoded.object_key, "obj_001");
@@ -168,15 +166,15 @@ TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload) {
     EXPECT_EQ(decoded.size, 4096u);
 }
 
-TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload_MinimalFields) {
-    AddReplicaPayload original;
+TEST(P2POpLogTypesTest, RoundTrip_PublishRoutePayload_MinimalFields) {
+    PublishRoutePayload original;
     original.object_key = "obj_minimal_fields";
     original.client_id = {1, 2};
     original.segment_id = {3, 4};
     original.size = 1024;
 
     std::string data = SerializeP2PPayload(original);
-    AddReplicaPayload decoded;
+    PublishRoutePayload decoded;
     ASSERT_TRUE(DeserializeP2PPayload(data, decoded));
 
     EXPECT_EQ(decoded.object_key, "obj_minimal_fields");
@@ -188,17 +186,17 @@ TEST(P2POpLogTypesTest, RoundTrip_AddReplicaPayload_MinimalFields) {
 }
 
 // ============================================================================
-// RemoveReplicaPayload round-trip
+// WithdrawRoutePayload round-trip
 // ============================================================================
 
-TEST(P2POpLogTypesTest, RoundTrip_RemoveReplicaPayload) {
-    RemoveReplicaPayload original;
+TEST(P2POpLogTypesTest, RoundTrip_WithdrawRoutePayload) {
+    WithdrawRoutePayload original;
     original.object_key = "obj_to_remove";
     original.client_id = {100, 200};
     original.segment_id = {300, 400};
 
     std::string data = SerializeP2PPayload(original);
-    RemoveReplicaPayload decoded;
+    WithdrawRoutePayload decoded;
     ASSERT_TRUE(DeserializeP2PPayload(data, decoded));
 
     EXPECT_EQ(decoded.object_key, "obj_to_remove");
@@ -283,13 +281,13 @@ TEST(P2POpLogTypesTest, Deserialize_GarbageData_ReturnsFalse) {
     RegisterClientPayload p1;
     EXPECT_FALSE(DeserializeP2PPayload(garbage, p1));
 
-    AddReplicaPayload p2;
+    PublishRoutePayload p2;
     EXPECT_FALSE(DeserializeP2PPayload(garbage, p2));
 }
 
 TEST(P2POpLogTypesTest, Deserialize_EmptyData_ReturnsFalse) {
     std::string empty;
-    RemoveReplicaPayload p1;
+    WithdrawRoutePayload p1;
     EXPECT_FALSE(DeserializeP2PPayload(empty, p1));
 
     MountSegmentPayload p2;
@@ -297,16 +295,16 @@ TEST(P2POpLogTypesTest, Deserialize_EmptyData_ReturnsFalse) {
 }
 
 TEST(P2POpLogTypesTest, Deserialize_WrongType_ReturnsFalse) {
-    // Serialize an AddReplicaPayload, try to deserialize as
-    // RemoveReplicaPayload
-    AddReplicaPayload original;
+    // Serialize an PublishRoutePayload, try to deserialize as
+    // WithdrawRoutePayload
+    PublishRoutePayload original;
     original.object_key = "cross_type_test";
     original.client_id = {1, 2};
     original.segment_id = {3, 4};
     original.size = 100;
 
     std::string data = SerializeP2PPayload(original);
-    RemoveReplicaPayload wrong;
+    WithdrawRoutePayload wrong;
     // struct_pack should detect the type mismatch
     EXPECT_FALSE(DeserializeP2PPayload(data, wrong));
 }

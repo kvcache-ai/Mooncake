@@ -326,10 +326,10 @@ TEST_F(P2PRecordOplogTest, AddReplicaRecordsOplog) {
     EXPECT_EQ(manager->GetLastSequenceId(), 2);
 
     OpLogEntry entry = ReadEntry(2);
-    EXPECT_EQ(entry.op_type, OpType_ADD_REPLICA);
+    EXPECT_EQ(entry.op_type, OpType_PUBLISH_ROUTE);
     EXPECT_EQ(entry.object_key, "key-a");
 
-    AddReplicaPayload payload;
+    PublishRoutePayload payload;
     ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
     EXPECT_EQ(payload.object_key, "key-a");
     EXPECT_EQ(payload.client_id, client_id);
@@ -351,10 +351,10 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaRecordsOplog) {
     EXPECT_EQ(manager->GetLastSequenceId(), 3);
 
     OpLogEntry entry = ReadEntry(3);
-    EXPECT_EQ(entry.op_type, OpType_REMOVE_REPLICA);
+    EXPECT_EQ(entry.op_type, OpType_WITHDRAW_ROUTE);
     EXPECT_EQ(entry.object_key, "key-r");
 
-    RemoveReplicaPayload payload;
+    WithdrawRoutePayload payload;
     ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
     EXPECT_EQ(payload.object_key, "key-r");
     EXPECT_EQ(payload.client_id, client_id);
@@ -398,8 +398,8 @@ TEST_F(P2PRecordOplogTest, BatchSyncRoutesRecordsSuccessfulOps) {
             });
     };
 
-    EXPECT_TRUE(has_entry(OpType_REMOVE_REPLICA, "old-key"));
-    EXPECT_TRUE(has_entry(OpType_ADD_REPLICA, "new-key"));
+    EXPECT_TRUE(has_entry(OpType_WITHDRAW_ROUTE, "old-key"));
+    EXPECT_TRUE(has_entry(OpType_PUBLISH_ROUTE, "new-key"));
 }
 
 TEST_F(P2PRecordOplogTest,
