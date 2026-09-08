@@ -311,6 +311,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
                        ", func_id: " + std::to_string(func_id) +
                        ", message: " + std::string{call_result.error().msg};
             if (attempt + 1 < max_attempts) continue;
+            if (options.peer_answered) *options.peer_answered = answered;
             // A connection closed without an answer, fresh or pooled, is a
             // stale socket or a peer restarting; only a timeout is silence.
             if (options.peer_unreachable &&

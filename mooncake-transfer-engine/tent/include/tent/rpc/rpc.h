@@ -60,6 +60,7 @@ class ClientPool;
 struct RpcCallOptions {
     std::chrono::milliseconds timeout{-1};
     bool *peer_unreachable = nullptr;
+    bool *peer_answered = nullptr;  // on a failure: the peer replied
 };
 
 class CoroRpcAgent {
