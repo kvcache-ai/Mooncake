@@ -67,9 +67,9 @@ TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
 
     std::shared_ptr<ClientBufferAllocator> allocator;
     try {
-        allocator = ClientBufferAllocator::create(
-            buffer_size, "tcp", /*use_hugepage=*/false,
-            /*use_spdk_dma=*/true);
+        allocator = ClientBufferAllocator::create(buffer_size, "tcp",
+                                                  /*use_hugepage=*/false,
+                                                  /*use_spdk_dma=*/true);
     } catch (const std::bad_alloc&) {
         GTEST_SKIP()
             << "SPDK DMA allocation is unavailable in this environment";

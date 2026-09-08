@@ -18,8 +18,10 @@
   checklist, and AI assistance disclosure.
 - For AI-assisted changes, make sure the human submitter has reviewed every
   changed line and can defend the change end-to-end.
-- Run pre-commit locally on the files touched by the change before handoff when
-  the toolchain is available. If broader hooks or `pre-commit run --all-files`
-  rewrite unrelated files, do not include those unrelated edits in the PR.
+- Before handoff, run pre-commit on the files touched by the change when the
+  toolchain is available (see `CONTRIBUTING.md` for the PR-scoped
+  `pre-commit run --files ...` command). Do not use
+  `pre-commit run --all-files` for routine PRs; if it rewrites unrelated
+  files, leave those edits out of the PR.
 - Keep PRs lean: review `git diff` before staging, and include only changes
   required for the requested task.

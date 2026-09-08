@@ -193,9 +193,9 @@ metadata = result.metadata
 
 ### Structured object transfer policy
 
-By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. This keeps the existing behavior: Mooncake uses the zero-copy `batch_put_from` fast path when buffer registration is available, and falls back to ordinary `store.put` when the fast path is unavailable.
+By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. Non-tensor payloads are staged through a Mooncake BufferPool and written with `batch_put_from` when that path is available; otherwise Mooncake falls back to ordinary `store.put`. Typed-ragged ndarray rows use the native fast-copy extension to copy directly into the staging buffer without an intermediate concatenation.
 
-For very large tensors, buffer registration capacity can be exhausted. If the upper layer does not handle this failure mode yet, force the non-zero-copy path with `copy_mode="copy"`:
+Use `copy_mode="copy"` to force the regular `store.put` path:
 
 ```python
 from mooncake.structured_object_store import BundleTransferPolicy
@@ -208,11 +208,9 @@ ref = transfer.put_structured_object(
 
 Available modes:
 
-- `auto`: prefer zero-copy and fall back to regular `store.put` when zero-copy support is unavailable;
-- `copy`: force the non-zero-copy `store.put` path;
-- `zero_copy`: require the zero-copy `batch_put_from` path and raise an error if it is unavailable.
-
-If a caller has already registered a structured member buffer, pass `pre_registered_buffers={"member_name": True}` to avoid duplicate registration. The buffer must be the same writable, contiguous buffer used for transfer; read-only, non-contiguous, or internally copied buffers are rejected.
+- `auto`: prefer BufferPool staging plus `batch_put_from` for non-tensor payloads and fall back to regular `store.put` when that path is unavailable;
+- `copy`: force the regular `store.put` path;
+- `zero_copy`: require payloads to be explicit `tensor_object_buffer` instances; non-tensor structured payloads are rejected.
 
 ### Partial reads
 
@@ -604,22 +602,69 @@ config = ReplicateConfig()
 #### replica_num
 **Type:** `int`
 **Default:** `1`
-**Description:** Specifies the total number of replicas to create for the stored object.
+**Description:** Specifies the number of memory replicas to create for the
+stored object.
 
 ```python
 config = ReplicateConfig()
-config.replica_num = 3  # Store 3 copies of the data
+config.replica_num = 3  # Store 3 memory replicas
 ```
 
-#### with_soft_pin
-**Type:** `bool`
-**Default:** `False`
-**Description:** Enables soft pinning for the stored object. Soft pinned objects are prioritized to remain in memory during eviction - they are only evicted when memory is insufficient and no other objects are eligible for eviction. This is useful for frequently accessed or important objects like system prompts.
+#### nof_replica_num
+**Type:** `int`
+**Default:** `0`
+**Description:** Specifies the number of replicas to create in the configured
+NVMe-oF SSD pool.
 
 ```python
 config = ReplicateConfig()
-config.with_soft_pin = True  # Keep this object in memory longer
+config.replica_num = 1
+config.nof_replica_num = 1
 ```
+
+#### dfs_replica_num
+**Type:** `int`
+**Default:** `0`
+**Status:** **Work in progress; development and evaluation only.**
+**Description:** Requests an additional replica in the configured shared
+distributed filesystem. The supported values are currently `0` and `1`. When
+set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
+supported. DFS replicas currently support only the `default` tenant.
+
+```python
+config = ReplicateConfig()
+config.replica_num = 1
+config.dfs_replica_num = 1
+```
+
+Writes that request a DFS replica return success after the DFS `WriteAt`
+operation completes, but without an additional `fsync` durability guarantee.
+The master and client DFS backends must be enabled and configured with the same
+absolute shared-root path and shard layout. See the
+{ref}`DFS deployment documentation <dfs-storage>` for the required environment
+variables and current limitations.
+
+For a same-size `upsert`, if either the existing object or the new request has
+a DFS replica, the requested memory, NoF, and DFS replica counts must match the
+existing topology. A different-size update allocates a new topology.
+
+#### soft_pin_action
+**Type:** `SoftPinAction`
+**Default:** `SoftPinAction.PRESERVE`
+**Description:** Controls the soft-pin transition committed when the first replica becomes readable. `PRESERVE` keeps an existing deadline during Upsert, `ENABLE` starts a fixed soft-pin lifetime, and `DISABLE` removes it. Reads do not extend the lifetime.
+
+```python
+from mooncake.store import ReplicateConfig, SoftPinAction
+
+config = ReplicateConfig()
+config.soft_pin_action = SoftPinAction.ENABLE
+config.soft_pin_ttl_ms = 60_000  # Optional; omitted uses the Master default
+```
+
+`soft_pin_ttl_ms` is valid only with `ENABLE`. The Master rejects TTLs above
+`max_kv_soft_pin_ttl`; a value of zero commits the object as ordinary cache.
+Soft-pin state is not persisted in snapshots or the HA OpLog. Restored objects
+therefore become ordinary cache after recovery or Standby promotion.
 
 #### with_hard_pin
 **Type:** `bool`
@@ -650,13 +695,13 @@ config.preferred_segment = self.get_hostname()
 ```
 
 #### prefer_alloc_in_same_node
-**Type:** `str`
-**Default:** `""` (empty string)
-**Description:** Enables the preference for allocating data on the same node. Currently, this only supports `batch_put_from_multi_buffers`. Additionally, it does not support disk segments, and the `replica_num` can only be set to 1.
+**Type:** `bool`
+**Default:** `False`
+**Description:** Enables host-aware local-first allocation for this request, using the writer host identity and the normal ordered remote fallback. This can be used with direct multi-buffer writes and tensor write APIs to avoid staging when the selected segment is local and local memcpy is enabled. It does not support disk segments, and the `replica_num` can only be set to 1. Tensor APIs keep their default staging behavior unless this flag is explicitly enabled.
 
 ```python
 config = ReplicateConfig()
-config.prefer_alloc_in_same_node = "True"
+config.prefer_alloc_in_same_node = True
 ```
 
 #### group_ids
@@ -688,232 +733,52 @@ store.put("key-a", b"value-a", config)
 
 ---
 
-## Unified Parallel Tensor IO API
+## Model Weight Snapshot API
 
-Mooncake Store also provides a unified tensor IO family for tensors that are stored either as full objects or as explicitly identified parallel shards.
-
-This API family is the long-term interface for TP / DP / EP / PP-aware tensor IO:
-
-- write and upsert use `TensorParallelism`
-- reads use `ReadTarget`
-- legacy TP-only APIs remain available as compatibility wrappers
-
-### ParallelAxis
-
-`ParallelAxis` describes one axis in a shard identity.
+Heterogeneous model-weight snapshots use the manifest-backed Reshard API.
+The framework adapter owns model semantics and exports a complete source
+placement plus live runtime bindings. Mooncake Store persists the resulting
+payloads and the immutable stored manifest.
 
 ```python
-axis = mooncake.store.ParallelAxis()
-axis.kind = "tp"      # one of: "tp", "dp", "ep", "pp"
-axis.rank = 0
-axis.size = 8
-axis.split_dim = 1     # used for layout-sharding axes such as TP
-axis.expert_id = 3     # optional, for EP
-axis.stage_id = 1      # optional, for PP
+from mooncake.reshard.weight.store import WeightStore
+
+weight_store = WeightStore(store)
+session = weight_store.begin_weight_snapshot(descriptor, adapter)
+session.write_tensor(tensor_id, tensor)
+manifest = session.commit()
 ```
 
-**Fields:**
-- `kind`: Parallelism axis kind.
-- `rank`: Current shard rank on that axis.
-- `size`: Total number of shards on that axis.
-- `split_dim`: Optional tensor split dimension for layout-sharding axes.
-- `expert_id`: Optional expert identifier for EP layouts.
-- `stage_id`: Optional pipeline stage identifier for PP layouts.
+`MooncakeDistributedStore.begin_weight_snapshot(descriptor, adapter)` provides
+the same session for callers that already hold the native Store object.
 
-### TensorParallelism
+`write_tensor()` validates the adapter-selected source fragments against the
+session placement and runtime bindings. `commit()` publishes one
+`StoredWeightManifest` after complete durable coverage. Restore uses
+`WeightStore.load_manifest()`, `plan_load()`, and `load()` with the target
+placement and runtime binding manifests.
 
-`TensorParallelism` is an ordered list of axes that identifies the stored or requested shard.
+### Breaking Change and Migration
 
-```python
-parallelism = mooncake.store.TensorParallelism()
-parallelism.axes = [
-    tp_axis,
-]
-```
+This release removes the public `*_with_parallelism` API family and the
+associated `ParallelAxis`, `TensorParallelism`, and `ReadTarget` helper types.
+Applications that create heterogeneous model-weight snapshots migrate their
+write path to `begin_weight_snapshot()`, `write_tensor()`, and `commit()`.
+The writer creates manifest-managed payload fragments and one
+`StoredWeightManifest`; it does not create ordinary Store tensor objects.
 
-Examples:
-- TP shard: `axes=[TP(...)]`
-- DP + TP shard: `axes=[DP(...), TP(...)]`
-- PP + TP shard: `axes=[PP(...), TP(...)]`
-- EP shard: `axes=[EP(...)]`
+Applications restore a snapshot through `load_manifest()`, `plan_load()`, and
+`load()` with the target placement and runtime binding manifests. The existing
+single-axis TP APIs named `*_with_tp` remain separate compatibility APIs.
 
-### ReadTarget
-
-`ReadTarget` tells Mooncake whether the caller wants the stored form, a specific shard view, or the reconstructed full tensor.
-
-```python
-target = mooncake.store.ReadTarget()
-target.mode = "full"          # one of: "as_stored", "shard", "full"
-target.parallelism = None      # required for target shard reads
-```
-
-**Fields:**
-- `mode`: Read materialization mode.
-- `parallelism`: Optional `TensorParallelism`. Required when `mode="shard"`.
-
-### put_tensor_with_parallelism()
-
-Store a tensor using the unified parallelism model.
-
-```python
-def put_tensor_with_parallelism(
-    self,
-    key: str,
-    tensor,
-    parallelism: mooncake.store.TensorParallelism | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partition = None,
-) -> int
-```
-
-Use `parallelism=None` to store a full tensor object. Provide `TensorParallelism` to store a shard-scoped object.
-
-`writer_partition` is an optional write-side shorthand for full-tensor inputs that should be stored as one shard. It describes the writer's `(rank, size, split_dim)` and is mutually exclusive with `parallelism`; do not provide both in one call.
-
-For TP-containing multi-axis layouts, the caller may pass the full source tensor; Mooncake derives and persists the uniform shard selected by the requested TP rank/layout. That applies to layouts such as `dp_tp`, `pp_tp`, and `ep_tp`.
-
-Plain single-axis TP remains shard-input for compatibility.
-
-Pure DP still does not imply a split axis by itself.
-
-### batch_put_tensor_with_parallelism()
-
-Batch version of unified tensor writes.
-
-```python
-def batch_put_tensor_with_parallelism(
-    self,
-    keys: list[str],
-    tensors: list,
-    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partitions = None,
-) -> list[int]
-```
-
-`writer_partitions` is an optional write-side convenience input for batch full-tensor writes that should be partitioned into stored shards. Each entry describes the target shard write as `(rank, size, split_dim)`.
-
-Use `writer_partitions` when the caller has full tensors and wants Mooncake to derive the stored shard objects from writer-side partition info instead of constructing full `TensorParallelism` objects per element. TP-containing `parallelisms` can now express the same full-tensor-input behavior too; `writer_partitions` remains the lighter explicit write-side shorthand.
-
-### get_tensor_with_parallelism()
-
-Read a tensor through the unified read path.
-
-```python
-def get_tensor_with_parallelism(
-    self,
-    key: str,
-    target: mooncake.store.ReadTarget | None = None,
-)
-```
-
-Typical modes:
-- `target=None` or `mode="as_stored"`: return the stored local object.
-- `mode="shard"`: return the target shard described by `target.parallelism`.
-- `mode="full"`: reconstruct and return the full tensor.
-
-### batch_get_tensor_with_parallelism()
-
-Batch version of unified tensor reads.
-
-```python
-def batch_get_tensor_with_parallelism(
-    self,
-    keys: list[str],
-    targets: list[mooncake.store.ReadTarget | None] | None = None,
-) -> list
-```
-
-### get_tensor_with_parallelism_into() / batch_get_tensor_with_parallelism_into()
-
-Zero-copy unified read forms. The destination buffers must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
-
-```python
-def get_tensor_with_parallelism_into(
-    self,
-    key: str,
-    buffer_ptr: int,
-    size: int,
-    target: mooncake.store.ReadTarget | None = None,
-)
-```
-
-```python
-def batch_get_tensor_with_parallelism_into(
-    self,
-    keys: list[str],
-    buffer_ptrs: list[int],
-    sizes: list[int],
-    targets: list[mooncake.store.ReadTarget | None] | None = None,
-) -> list
-```
-
-### upsert_tensor_with_parallelism()
-
-Unified upsert form for tensor objects.
-
-```python
-def upsert_tensor_with_parallelism(
-    self,
-    key: str,
-    tensor,
-    parallelism: mooncake.store.TensorParallelism | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partition = None,
-) -> int
-```
-
-The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts and the mutually exclusive `writer_partition` shorthand.
-
-### batch_upsert_tensor_with_parallelism()
-
-Batch unified upsert form.
-
-```python
-def batch_upsert_tensor_with_parallelism(
-    self,
-    keys: list[str],
-    tensors: list,
-    parallelisms: list[mooncake.store.TensorParallelism | None] | None = None,
-    config: ReplicateConfig | None = None,
-    writer_partitions = None,
-) -> list[int]
-```
-
-The write semantics match `put_tensor_with_parallelism()`, including full-tensor input for TP-containing layouts.
-
-### *_from zero-copy write variants
-
-The unified write and upsert family also has `_from` variants for registered-memory inputs, including:
-
-- `put_tensor_with_parallelism_from(...)`
-- `batch_put_tensor_with_parallelism_from(...)`
-- `upsert_tensor_with_parallelism_from(...)`
-- `batch_upsert_tensor_with_parallelism_from(...)`
-
-These APIs accept Store-managed registered buffer pointers that contain serialized tensor objects in the current Mooncake tensor format:
-
-```text
-[TensorObjectHeader + layout metadata][tensor data]
-```
-
-As with other zero-copy APIs, every source pointer must resolve to Store-managed registered memory, either from `BufferPool`/the setup-time local buffer or from an explicit `register_buffer()` call.
-
-### Compatibility wrappers
-
-Legacy TP-only methods such as:
-
-- `put_tensor_with_tp(...)`
-- `batch_put_tensor_with_tp(...)`
-- `get_tensor_with_tp(...)`
-- `batch_get_tensor_with_tp(...)`
-- corresponding `_into`, `_from`, and upsert variants
-
-remain supported for compatibility, but they are wrapper-style APIs around the unified parallel tensor IO model. Prefer the unified `*_with_parallelism` family for new code and new documentation examples.
+When `commit()` reports a manifest publication failure after Store records the
+commit decision, the writer remains open and preserves its payloads. Retry
+`commit()` on that writer to complete manifest publication.
 
 ---
 
 ## Non-Zero-Copy API (Simple Usage)
+
 
 For simpler use cases, use the standard API without memory registration:
 
@@ -1056,30 +921,57 @@ def setup(
     self,
     local_hostname: str,
     metadata_server: str,
-    global_segment_size: int = 16777216,
-    local_buffer_size: int = 1073741824,
-    protocol: str = "tcp",
-    rdma_devices: str = "",
+    global_segment_size: int,
+    local_buffer_size: int,
+    protocol: str,
+    rdma_devices: str,
     master_server_addr: str,
     engine: Optional[TransferEngine] = None,
     enable_ssd_offload: bool = False,
     ssd_offload_path: str = "",
     tenant_id: str = "default",
+    enable_client_http_server: bool = False,
+    client_http_port: int = 9300,
 ) -> int
 ```
+
+The positional overload requires every argument through
+`master_server_addr`. To use defaults for those fields, pass a configuration
+dictionary instead:
+
+```python
+def setup(self, config: Dict[str, object]) -> int
+```
+
+The dictionary overload requires `local_hostname` and `metadata_server`. Its
+other keys are optional; the defaults are `16777216` (16 MiB) for both
+`global_segment_size` and `local_buffer_size`, `"tcp"` for `protocol`, an empty
+string for `rdma_devices`, and `"127.0.0.1:50051"` for
+`master_server_addr`. It also accepts `ipc_socket_path` and the optional
+configuration fields listed below. The `engine` argument is available only in
+the positional overload.
 
 **Parameters:**
 - `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
 - `metadata_server` (str): **Required**. Metadata connection string, e.g. `"P2PHANDSHAKE"` or `"http://localhost:8080/metadata"`.
-- `global_segment_size` (int): Memory segment size in bytes for mounting.
-- `local_buffer_size` (int): Local buffer size in bytes.
-- `protocol` (str): Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
-- `rdma_devices` (str): RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
-- `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
+- `global_segment_size` (int): **Required by the positional overload**. Memory segment size in bytes for mounting.
+- `local_buffer_size` (int): **Required by the positional overload**. Local buffer size in bytes.
+- `protocol` (str): **Required by the positional overload**. Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
+- `rdma_devices` (str): **Required by the positional overload**. RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
+- `master_server_addr` (str): **Required by the positional overload**. Master server address (e.g., "localhost:50051")
 - `engine` (Optional[TransferEngine]): Existing Transfer Engine instance to reuse. Defaults to `None`.
-- `enable_ssd_offload` (bool): Enable client-side SSD offload support. Defaults to `False`.
-- `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
+- `enable_ssd_offload` (bool): Initialize client-side `FileStorage`. With a
+  normal file backend this enables SSD offload; with
+  `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend`,
+  it initializes the DFS backend and is required for DFS reads and writes.
+  Defaults to `False`.
+- `ssd_offload_path` (str): FileStorage directory. When provided, it overrides
+  `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. With the distributed backend, DFS shard
+  data is stored under `MOONCAKE_DFS_ROOT_DIR`, but this separate directory is
+  still validated during FileStorage initialization.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
+- `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, `/metrics/summary`, and `/version` HTTP endpoints. Defaults to `False`.
+- `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
 
 **Store segment pinned memory:** CUDA-enabled builds can register Store-managed
 host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
@@ -1137,8 +1029,9 @@ store.setup_dummy(1024*1024*256, 1024*1024*64, "localhost:8080")
 Dummy clients do not own Store segments. They use a local shared-memory buffer
 that is mapped by a real client process at `server_address`. Tensor APIs that
 stage through this SHM buffer are supported, including tensor put/get,
-`*_tensor_from`, `*_tensor_into`, tensor upsert/pub, TP wrappers, and unified
-parallelism write wrappers.
+`*_tensor_from`, `*_tensor_into`, tensor upsert/pub, and the single-axis TP
+wrappers. Model-weight snapshots use the explicit snapshot API described
+above.
 
 The real client owns the SHM buffer allocator. This keeps tensor writes and
 regular object writes from allocating overlapping offsets when they run
@@ -1919,6 +1812,12 @@ def create_copy_task(self, key: str, targets: List[str]) -> Tuple[UUID, int]
   - If successful: (task UUID, 0)
   - If failed: (UUID{0, 0}, error code)
 
+**Task lifecycle and failure behavior:**
+- New tasks start in `TaskStatus.PENDING`, move to `TaskStatus.PROCESSING` after a client picks them up, and finish as `TaskStatus.SUCCESS` or `TaskStatus.FAILED`.
+- The task payload is executed by a storage client in the background; the client reports the final status back to the master automatically.
+- Only allocation-pressure failures (`NO_AVAILABLE_HANDLE`) are retried automatically by the client, up to the master-side `max_retry_attempts` setting.
+- Submission can fail immediately with errors such as `TASK_PENDING_LIMIT_EXCEEDED` when the master-side pending queue is full.
+
 **Example:**
 ```python
 # Create an asynchronous copy task
@@ -1953,6 +1852,12 @@ def create_move_task(self, key: str, source: str, target: str) -> Tuple[UUID, in
   - If successful: (task UUID, 0)
   - If failed: (UUID{0, 0}, error code)
 
+**Task lifecycle and failure behavior:**
+- Move tasks use the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
+- **Submission-time failures**: If the object or source replica is already missing when `create_move_task` is called, the call returns an error code directly (e.g., `OBJECT_NOT_FOUND` or `INVALID_PARAMS`) and no task is created.
+- **Execution-time failures**: If the object or source replica disappears after the task is successfully submitted, the task transitions to `FAILED` state. Only `NO_AVAILABLE_HANDLE` execution failures are retried automatically.
+- Timeout and retry behavior is controlled on the master side rather than by the Python client API.
+
 **Example:**
 ```python
 # Create an asynchronous move task
@@ -1984,6 +1889,26 @@ def query_task(self, task_id: UUID) -> Tuple[QueryTaskResponse | None, int]
 - `Tuple[QueryTaskResponse | None, int]`: (QueryTaskResponse if success, error code)
   - If successful: (QueryTaskResponse, 0)
   - If failed: (None, error code)
+
+`QueryTaskResponse` includes:
+- `id`: task UUID
+- `type`: `TaskType.REPLICA_COPY` or `TaskType.REPLICA_MOVE`
+- `status`: `TaskStatus.PENDING`, `TaskStatus.PROCESSING`, `TaskStatus.SUCCESS`, or `TaskStatus.FAILED`
+- `created_at_ms_epoch`: creation timestamp in milliseconds
+- `last_updated_at_ms_epoch`: last state-change timestamp in milliseconds
+- `assigned_client`: UUID of the client currently assigned to the task
+- `message`: completion or failure message
+
+Typical query-time failures include:
+- `TASK_NOT_FOUND`: the task ID does not exist or the finished task has already been pruned from the master's in-memory history
+
+**Master-side task manager settings affecting task APIs:**
+- `--max_total_finished_tasks`: number of completed tasks retained for later `query_task` calls
+- `--max_total_pending_tasks`: maximum queued tasks before submissions fail with `TASK_PENDING_LIMIT_EXCEEDED`
+- `--max_total_processing_tasks`: cap on concurrently processing tasks
+- `--pending_task_timeout_sec`: how long a task may stay in `PENDING` before being failed by the master (`0` disables this timeout)
+- `--processing_task_timeout_sec`: how long a task may stay in `PROCESSING` before being failed by the master (`0` disables this timeout)
+- `--max_retry_attempts`: retry budget used only for `NO_AVAILABLE_HANDLE` execution failures
 
 **Example:**
 ```python
@@ -2111,7 +2036,7 @@ def pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = N
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 # Create a tensor
 tensor = torch.randn(100, 100)
@@ -2119,7 +2044,7 @@ tensor = torch.randn(100, 100)
 # Create replication config
 config = ReplicateConfig()
 config.replica_num = 3
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 # Publish tensor with replication settings
 result = store.pub_tensor("my_tensor", tensor, config)
@@ -2525,13 +2450,13 @@ shared-memory staging buffer.
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 tensor = torch.randn(100, 100)
 
 config = ReplicateConfig()
 config.replica_num = 2
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 result = store.upsert_pub_tensor("my_tensor", tensor, config)
 if result == 0:
@@ -2877,6 +2802,197 @@ store.batch_get_into_multi_buffers(keys, all_remote_addrs, all_sizes, True)
 
 store.unregister_buffer(tensor.data_ptr())
 store.unregister_buffer(target_tensor.data_ptr())
+```
+</details>
+
+---
+
+### Session-based ranged multi-buffer transfer
+
+For layerwise KV load/save, resolve Master metadata once per object, then transfer
+object-byte ranges across multiple buffers without re-querying Master on every layer.
+
+Typical flow:
+
+- Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
+- Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
+
+Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
+Range calls only check the cached lease locally (zero Master RPCs). Put sessions
+reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+
+Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
+flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
+`batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
+Reliable multi-replica NoF configs are rejected at session start. `end` / `revoke`
+seal the session (no further range writes) and wait for in-flight range transfers
+before talking to Master.
+
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
+registered memory before ranged zero-copy operations.
+
+#### batch_get_session_start()
+
+Query replicas once and open a get session for the given keys.
+
+```python
+def batch_get_session_start(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_get_into_multi_buffer_ranges()
+
+Ranged get into multiple buffers using an active get session (no Master RPC).
+
+```python
+def batch_get_into_multi_buffer_ranges(
+    self,
+    keys: List[str],
+    all_buffer_ptrs: List[List[int]],
+    all_sizes: List[List[int]],
+    all_src_offsets: List[List[int]],
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers (must have an active get session)
+- `all_buffer_ptrs` (List[List[int]]): Per-key list of destination buffer addresses
+- `all_sizes` (List[List[int]]): Per-key list of transfer sizes in bytes
+- `all_src_offsets` (List[List[int]]): Per-key list of object-byte source offsets
+
+**Returns:**
+- `List[int]`: Bytes transferred per key (positive = success, negative = error)
+
+#### batch_get_session_end()
+
+Drop cached get-session metadata for the given keys.
+
+```python
+def batch_get_session_end(self, keys: List[str]) -> int
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `int`: 0 on success, negative on error
+
+#### batch_put_session_start()
+
+Reserve objects and open a put session without transferring data.
+
+```python
+def batch_put_session_start(
+    self,
+    keys: List[str],
+    sizes: List[int],
+    config: ReplicateConfig = None,
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+- `sizes` (List[int]): Full object sizes in bytes
+- `config` (ReplicateConfig, optional): Replication configuration (applies at start only).
+  If `group_ids` is set, its length must equal `len(keys)`. When some keys already
+  have a put session, they are skipped and `group_ids` is filtered to match the
+  remaining keys.
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_put_from_multi_buffer_ranges()
+
+Ranged put from multiple buffers using an active put session (no Master RPC).
+
+```python
+def batch_put_from_multi_buffer_ranges(
+    self,
+    keys: List[str],
+    all_buffer_ptrs: List[List[int]],
+    all_sizes: List[List[int]],
+    all_dst_offsets: List[List[int]],
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers (must have an active put session)
+- `all_buffer_ptrs` (List[List[int]]): Per-key list of source buffer addresses
+- `all_sizes` (List[List[int]]): Per-key list of transfer sizes in bytes
+- `all_dst_offsets` (List[List[int]]): Per-key list of object-byte destination offsets
+
+**Returns:**
+- `List[int]`: Bytes transferred per key (positive = success, negative = error)
+
+#### batch_put_session_end()
+
+Finalize a put session and make objects readable.
+
+```python
+def batch_put_session_end(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_put_session_revoke()
+
+Abort an incomplete put session and release reserved space.
+
+```python
+def batch_put_session_revoke(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+**Example:**
+
+<details>
+<summary>Click to expand: Session ranged put/get example</summary>
+
+```python
+import numpy as np
+
+page = 1024
+layers = 4
+keys = ["block0", "block1"]
+object_sizes = [page * layers] * len(keys)
+
+# Prepare one registered buffer per layer for each key
+src = [np.full(page, i, dtype=np.uint8) for i in range(layers)]
+dst = [np.zeros(page, dtype=np.uint8) for _ in range(layers)]
+for buf in src + dst:
+    store.register_buffer(buf.ctypes.data, buf.nbytes)
+
+assert all(rc == 0 for rc in store.batch_put_session_start(keys, object_sizes))
+for layer in range(layers):
+    ptrs = [[src[layer].ctypes.data] for _ in keys]
+    sizes = [[page] for _ in keys]
+    offsets = [[layer * page] for _ in keys]
+    rcs = store.batch_put_from_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    assert all(rc == page for rc in rcs)
+assert all(rc == 0 for rc in store.batch_put_session_end(keys))
+
+assert all(rc == 0 for rc in store.batch_get_session_start(keys))
+for layer in range(layers):
+    ptrs = [[dst[layer].ctypes.data] for _ in keys]
+    sizes = [[page] for _ in keys]
+    offsets = [[layer * page] for _ in keys]
+    rcs = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    assert all(rc == page for rc in rcs)
+assert store.batch_get_session_end(keys) == 0
 ```
 </details>
 

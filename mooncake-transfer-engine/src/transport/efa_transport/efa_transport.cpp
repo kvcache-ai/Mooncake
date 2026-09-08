@@ -36,6 +36,7 @@
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/batch_registration.h"
 #include "transport/efa_transport/efa_context.h"
 #include "transport/efa_transport/efa_endpoint.h"
 
@@ -311,8 +312,37 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     size_t total_pages_per_nic = length / page_size;
     bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries());
 
+    // Optionally narrow a single-chunk DEVICE buffer to the NICs the topology
+    // reports as closest to its GPU. See buildLocalNicMap() for where the set
+    // comes from, and the MC_EFA_NIC_SELECTION docs for the trade-off: fewer
+    // NICs can serve a transfer touching this buffer, so this is registration
+    // time bought with potential per-buffer bandwidth, not a free win.
+    //
+    // Registering one buffer on N NICs costs ~N times one registration, and for
+    // device memory the per-domain accumulation described above is paid once
+    // per domain, so the two multiply. Measured on p5.48xlarge, 48 x 391 MB GPU
+    // buffers registered serially: 123.7 s on 32 NICs, 17.6 s on 4, 4.4 s on 1.
+    //
+    // Host memory is deliberately excluded. It has no accumulation to amplify,
+    // it is ~4x cheaper to register in the first place, and a host buffer has
+    // no single owning device -- the topology's "cpu:N" preferred set is a NUMA
+    // node's NICs, which is half the machine rather than a rail group.
+    const std::vector<size_t>* local_nics = nullptr;
+    if (!local_nic_map_.empty() && resolved_name.rfind("cpu", 0) != 0) {
+        auto it = local_nic_map_.find(resolved_name);
+        if (it != local_nic_map_.end()) local_nics = &it->second;
+    }
+
     std::vector<std::vector<size_t>> nic_assignments(num_chunks);
-    if (chunks.size() <= 1) {
+    if (chunks.size() <= 1 && local_nics) {
+        // Single chunk, topology-local NIC selection requested for this device.
+        nic_assignments[0] = *local_nics;
+        if (globalConfig().trace) {
+            LOG(INFO) << "EFA local NIC selection: " << addr << " ("
+                      << resolved_name << ") on " << local_nics->size() << "/"
+                      << num_nics << " NICs";
+        }
+    } else if (chunks.size() <= 1) {
         // Single chunk: all NICs
         for (size_t n = 0; n < num_nics; ++n) {
             nic_assignments[0].push_back(n);
@@ -471,19 +501,21 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                                                                   reg_start)
                 .count();
 
+        // Per-chunk detail is trace-only: a batch registration emits one of
+        // these per chunk, which is ~1450 lines at Kimi-K3 startup. Note that
+        // reg_duration_ms is the wall time this thread spent in the call, so
+        // when several buffers register concurrently it includes time waiting
+        // on the provider's locks, not just this chunk's own work -- compare it
+        // against the batch total logged by registerLocalMemoryBatch().
         if (globalConfig().trace) {
-            LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci
-                      << ", addr=" << chunk_addr << ", length=" << chunk_len
+            LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci << "/"
+                      << chunks.size() << ", addr=" << chunk_addr
+                      << ", length=" << chunk_len
                       << ", nics=" << assigned_nics.size() << "/"
                       << context_list_.size()
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
         }
-
-        LOG(WARNING) << "Chunk " << ci << "/" << chunks.size()
-                     << " registered on " << assigned_nics.size() << " NICs"
-                     << ", addr=" << chunk_addr << ", length=" << chunk_len
-                     << ", duration=" << reg_duration_ms << "ms";
 
         // Collect keys: assigned NICs have valid keys, others get 0
         BufferDesc buffer_desc;
@@ -624,28 +656,90 @@ int EfaTransport::allocateLocalSegmentID() {
     return 0;
 }
 
+// Optional concurrency cap for the batch register/unregister fan-out below, set
+// via MC_MAX_CONCURRENT_REG_MR. Unset (0) means unbounded -- one thread per
+// buffer, which is what these entry points have always done.
+//
+// The cap is PER PROCESS, and registration is CPU-bound page-pinning, so what
+// matters is cap x processes against the core count. Measured on p5.48xlarge
+// (192 cores) replaying Kimi-K3's KV registration as SGLang issues it -- one
+// TransferEngine per TP rank, 182 GPU buffers of 2.5 KB to 391 MB each, slowest
+// rank -- the optimum tracks the cores and not the cap:
+//
+//   8 ranks, 192 cores -> cap 16 (99.8 s);  cap 64 is 1.8x slower
+//   4 ranks, 192 cores -> cap 32 (89.2 s);  same 128 threads as above
+//   8 ranks,  64 cores -> cap  8 (121.3 s); 64 threads, tracks the budget
+//
+// So a good value is roughly cores/processes. Oversubscribing costs more than
+// undersubscribing. This cannot be a built-in default because a single engine
+// does not know how many peer processes share the node; picking one from the
+// core count alone would oversubscribe by exactly the rank count.
+//
+// Input order matters as much as the cap: at cap 16 the same batch takes 43 s
+// in SGLang's pool order but 95-98 s largest-first. Unbounded ignores order
+// (99-128 s) since nothing queues. Largest-first being worst is backwards from
+// longest-processing-time scheduling and is unexplained, so no sort is applied
+// here yet -- another reason the cap stays opt-in rather than a default.
+// Invert the topology's per-location preferred_hca lists into indices into the
+// NIC set the transport actually opened. `Topology::discover()` already
+// computes what matters here: for a "cuda:N" entry, preferred_hca holds the
+// HCAs at the minimum PCI distance from that GPU, restricted to its NUMA node.
+// On p5.48xlarge each GPU and 4 of the 32 EFA devices sit under the same PCIe
+// root complex, so preferred_hca is exactly those 4 -- the same set NIXL's
+// libfabric plugin derives from hwloc in getEfaDevicesForPci(). No new PCI walk
+// needed.
+//
+// Preferred rather than avail: avail_hca is "every other NIC", which is the
+// all-NICs behavior this exists to avoid.
+std::unordered_map<std::string, std::vector<size_t>>
+EfaTransport::buildLocalNicMap(const TopologyMatrix& matrix,
+                               const std::vector<std::string>& device_names) {
+    std::unordered_map<std::string, size_t> name_to_index;
+    for (size_t i = 0; i < device_names.size(); ++i)
+        name_to_index[device_names[i]] = i;
+
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map;
+    for (const auto& entry : matrix) {
+        std::vector<size_t> indices;
+        for (const auto& hca : entry.second.preferred_hca) {
+            auto it = name_to_index.find(hca);
+            // A preferred HCA can be missing here: non-EFA devices are filtered
+            // out of context_list_, and an EFA device whose construct() failed
+            // was dropped. Skipping it leaves the rest of the set usable.
+            if (it != name_to_index.end()) indices.push_back(it->second);
+        }
+        // No entry at all rather than an empty one, so the caller's lookup miss
+        // falls back to all NICs instead of registering the buffer nowhere.
+        if (!indices.empty()) local_nic_map[entry.first] = std::move(indices);
+    }
+    return local_nic_map;
+}
+
 int EfaTransport::registerLocalMemoryBatch(
     const std::vector<EfaTransport::BufferEntry>& buffer_list,
     const std::string& location) {
-    std::vector<std::future<int>> results;
-    for (auto& buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer, location]() -> int {
-                return registerLocalMemoryInternal(buffer.addr, buffer.length,
-                                                   location, true, false, true);
-            }));
-    }
+    auto start = std::chrono::steady_clock::now();
 
-    int first_error = 0;
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        int ret = results[i].get();
+    int first_error = runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
+        int ret = registerLocalMemoryInternal(buffer_list[i].addr,
+                                              buffer_list[i].length, location,
+                                              true, false, true);
         if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to register memory: addr "
                          << buffer_list[i].addr << " length "
                          << buffer_list[i].length;
-            if (!first_error) first_error = ret;
         }
-    }
+        return ret;
+    });
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    LOG(INFO) << "EfaTransport: registered " << buffer_list.size()
+              << " buffers on "
+              << std::min(buffer_list.size(), maxConcurrentRegMr())
+              << " threads in " << elapsed << "ms";
+
     if (first_error) return first_error;
 
     return metadata_->updateLocalSegmentDesc();
@@ -653,23 +747,15 @@ int EfaTransport::registerLocalMemoryBatch(
 
 int EfaTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    std::vector<std::future<int>> results;
-    for (auto& addr : addr_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, addr]() -> int {
-                return unregisterLocalMemoryInternal(addr, false, true);
-            }));
-    }
-
-    int first_error = 0;
-    for (size_t i = 0; i < addr_list.size(); ++i) {
-        int ret = results[i].get();
+    int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
+        int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
-            if (!first_error) first_error = ret;
         }
-    }
+        return ret;
+    });
+
     int metadata_ret = metadata_->updateLocalSegmentDesc();
     return first_error ? first_error : metadata_ret;
 }
@@ -801,13 +887,102 @@ Status EfaTransport::submitTransfer(
     return submitTransferTask(task_list);
 }
 
+// Bytes from `address` to the end of the registered chunk that covers it, or 0
+// if no chunk does.  `last_buffer_idx` caches the previous hit so that slicing
+// one request across a seam does not rescan the buffer list per slice.
+//
+// registerLocalMemoryInternal() splits a buffer larger than
+// min(max_mr_size, per-NIC PTE budget) into several chunks and publishes one
+// BufferDesc per chunk, so what the caller registered as a single contiguous
+// range can be several MRs here -- on either side of the transfer.
+static uint64_t efaBytesUntilChunkEnd(
+    const TransferMetadata::SegmentDesc* segment_desc, uint64_t address,
+    bool require_remote_key, size_t& last_buffer_idx) {
+    if (!segment_desc || segment_desc->buffers.empty()) return 0;
+
+    auto is_valid_buffer = [&](const TransferMetadata::BufferDesc& buffer) {
+        const auto& keys = require_remote_key ? buffer.rkey : buffer.lkey;
+        if (keys.empty()) return false;
+        if (address < buffer.addr || address - buffer.addr >= buffer.length)
+            return false;
+        // A chunk under the disjoint per-NIC partition carries a zero key for
+        // every NIC it was not registered on (see the nic_assignments fan-out
+        // in registerLocalMemoryInternal).  All-zero means no NIC can serve it
+        // and selectDevice() will reject it, so capping a slice at such a chunk
+        // would only turn one miss into several.
+        for (auto key : keys)
+            if (key != 0) return true;
+        return false;
+    };
+
+    if (last_buffer_idx < segment_desc->buffers.size()) {
+        const auto& buffer = segment_desc->buffers[last_buffer_idx];
+        if (is_valid_buffer(buffer)) {
+            return buffer.length - (address - buffer.addr);
+        }
+    }
+
+    uint64_t max_remaining = 0;
+    for (size_t i = 0; i < segment_desc->buffers.size(); ++i) {
+        const auto& buffer = segment_desc->buffers[i];
+        if (is_valid_buffer(buffer)) {
+            uint64_t remaining = buffer.length - (address - buffer.addr);
+            if (remaining > max_remaining) {
+                max_remaining = remaining;
+                last_buffer_idx = i;
+            }
+        }
+    }
+    return max_remaining;
+}
+
+// Slice length for a request, capped at the nearest registration boundary.
+//
+// Unlike RDMA this deliberately does not cut at globalConfig().slice_size: EFA
+// posts one WR per slice and SRD handles multi-MB messages natively, so a
+// request that stays inside one chunk on both sides still becomes exactly one
+// slice, as before.  The one thing that does force a split is an MR boundary --
+// a single fi_write/fi_read carries one lkey and one rkey, so a slice may not
+// straddle two chunks on either side.
+struct EfaSliceLengthCalculator {
+    const Transport::TransferRequest& request;
+    const TransferMetadata::SegmentDesc* local_desc;
+    const TransferMetadata::SegmentDesc* target_desc;
+
+    size_t src_buffer_idx = 0;
+    size_t tgt_buffer_idx = 0;
+
+    inline size_t calculate(uint64_t offset) {
+        uint64_t slice_length = request.length - offset;
+
+        const uint64_t src_rem = efaBytesUntilChunkEnd(
+            local_desc, reinterpret_cast<uint64_t>(request.source) + offset,
+            false, src_buffer_idx);
+        if (src_rem > 0) slice_length = std::min(slice_length, src_rem);
+
+        const uint64_t tgt_rem = efaBytesUntilChunkEnd(
+            target_desc, request.target_offset + offset, true, tgt_buffer_idx);
+        if (tgt_rem > 0) slice_length = std::min(slice_length, tgt_rem);
+
+        return static_cast<size_t>(slice_length);
+    }
+};
+
 Status EfaTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
     std::unordered_map<std::shared_ptr<EfaContext>, std::vector<Slice*>>
         slices_to_post;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        target_segment_descs;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const int kMaxRetryCount = globalConfig().retry_cnt;
+
+    auto fail_unposted_slices = [&]() {
+        for (auto& entry : slices_to_post)
+            for (auto* slice : entry.second) slice->markFailed();
+        slices_to_post.clear();
+    };
 
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -817,7 +992,24 @@ Status EfaTransport::submitTransferTask(
 
         if (request.length == 0) continue;
 
-        // Find which buffer and preferred device covers this request
+        // The slice length is capped against the peer's chunk boundaries too,
+        // so the target descriptor is needed here and not only in
+        // EfaContext::submitPostSend().  Cache it per target_id: a batch
+        // normally aims every request at the same segment.
+        auto target_desc_it = target_segment_descs.find(request.target_id);
+        if (target_desc_it == target_segment_descs.end()) {
+            target_desc_it =
+                target_segment_descs
+                    .emplace(request.target_id,
+                             metadata_->getSegmentDescByID(request.target_id))
+                    .first;
+        }
+        const auto& target_segment_desc = target_desc_it->second;
+
+        // Find which buffer and preferred device covers this request.  This can
+        // only succeed when the whole request fits in one local chunk, which is
+        // the common case; a request that straddles a seam falls through to the
+        // per-slice selection in the loop below.
         int request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
                          request.length, request_buffer_id,
@@ -825,53 +1017,40 @@ Status EfaTransport::submitTransferTask(
             request_buffer_id = -1;
             request_device_id = -1;
         }
+        // selectDevice() returns an index into the HCA space and validates it
+        // against buffer.rkey only, so bound it before indexing context_list_.
+        // Dropping to the retry path is the right recovery: it re-selects, and
+        // its own check covers context_list_ as well.
+        if (request_device_id >= 0 &&
+            (static_cast<size_t>(request_device_id) >= context_list_.size() ||
+             !context_list_[request_device_id] ||
+             !context_list_[request_device_id]->active())) {
+            request_buffer_id = -1;
+            request_device_id = -1;
+        }
 
-        if (request_buffer_id >= 0 && request_device_id >= 0) {
-            // One slice per request.  Round-robin NIC selection is
-            // handled by selectDevice above.
-            auto& context = context_list_[request_device_id];
-            if (!context || !context->active()) {
-                LOG(ERROR) << "EFA Device " << request_device_id
-                           << " is not active";
-                return Status::InvalidArgument(
-                    "EFA Device " + std::to_string(request_device_id) +
-                    " is not active");
-            }
+        EfaSliceLengthCalculator slice_calc{request, local_segment_desc.get(),
+                                            target_segment_desc.get()};
+        for (uint64_t offset = 0; offset < request.length;) {
+            size_t slice_length = slice_calc.calculate(offset);
+            // Neither side reported a covering chunk (nothing registered at
+            // this address): keep the old whole-request behavior and let the
+            // selection below produce the ERR_ADDRESS_NOT_REGISTERED.  A zero
+            // here would otherwise spin forever.
+            if (slice_length == 0) slice_length = request.length - offset;
 
-            Slice* slice = getSliceCache().allocate();
-            assert(slice);
-            slice->peer_nic_path.clear();
-            slice->rdma.dest_rkey = 0;
+            char* source_addr = (char*)request.source + offset;
 
-            slice->source_addr = (char*)request.source;
-            slice->length = request.length;
-            slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset;
-            slice->rdma.retry_cnt = request.advise_retry_cnt;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->status = Slice::PENDING;
-            slice->ts = 0;
-            task.slice_list.push_back(slice);
-
-            slice->rdma.source_lkey =
-                local_segment_desc->buffers[request_buffer_id]
-                    .lkey[request_device_id];
-            slices_to_post[context].push_back(slice);
-            __sync_fetch_and_add(&task.total_bytes, slice->length);
-            __sync_fetch_and_add(&task.slice_count, 1);
-        } else {
-            // FALLBACK: device not found via initial selectDevice.
-            // Try per-slice retry with increasing retry_cnt to find any
-            // available device (handles edge cases like multi-buffer spans).
-            int buffer_id = -1, device_id = -1;
+            // The whole-request selection covers every slice when it succeeded:
+            // it means one local chunk spans the entire request, and only the
+            // target side is forcing the split.
+            int buffer_id = request_buffer_id, device_id = request_device_id;
+            bool found_device = (buffer_id >= 0 && device_id >= 0);
             int retry_cnt = request.advise_retry_cnt;
-            bool found_device = false;
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)request.source, request.length,
-                                 buffer_id, device_id, retry_cnt++))
+                                 (uint64_t)source_addr, slice_length, buffer_id,
+                                 device_id, retry_cnt++))
                     continue;
                 if (device_id >= 0 &&
                     static_cast<size_t>(device_id) < context_list_.size() &&
@@ -884,26 +1063,23 @@ Status EfaTransport::submitTransferTask(
             if (!found_device) {
                 LOG(ERROR) << "Memory region not registered by any active EFA "
                               "device(s): "
-                           << request.source;
-                for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) s->markFailed();
+                           << (void*)source_addr;
+                fail_unposted_slices();
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active EFA "
                     "device(s): " +
-                    std::to_string(
-                        reinterpret_cast<uintptr_t>(request.source)));
+                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
             }
 
-            // Found a device via retry — create single slice
             Slice* slice = getSliceCache().allocate();
             assert(slice);
             slice->peer_nic_path.clear();
             slice->rdma.dest_rkey = 0;
 
-            slice->source_addr = (char*)request.source;
-            slice->length = request.length;
+            slice->source_addr = source_addr;
+            slice->length = slice_length;
             slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset;
+            slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
             slice->rdma.max_retry_cnt = kMaxRetryCount;
             slice->task = &task;
@@ -912,12 +1088,13 @@ Status EfaTransport::submitTransferTask(
             slice->ts = 0;
             task.slice_list.push_back(slice);
 
-            auto& context = context_list_[device_id];
             slice->rdma.source_lkey =
                 local_segment_desc->buffers[buffer_id].lkey[device_id];
-            slices_to_post[context].push_back(slice);
+            slices_to_post[context_list_[device_id]].push_back(slice);
             __sync_fetch_and_add(&task.total_bytes, slice->length);
             __sync_fetch_and_add(&task.slice_count, 1);
+
+            offset += slice_length;
         }
     }
 
@@ -1050,6 +1227,29 @@ int EfaTransport::initializeEfaResources() {
     if (context_list_.empty()) {
         LOG(ERROR) << "EfaTransport: No available EFA devices";
         return ERR_DEVICE_NOT_FOUND;
+    }
+
+    if (globalConfig().efa_nic_selection == EfaNicSelection::LOCAL) {
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (auto& context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ =
+            buildLocalNicMap(local_topology_->getMatrix(), context_names);
+        for (auto& entry : local_nic_map_) {
+            std::string nic_list;
+            for (size_t i = 0; i < entry.second.size(); ++i) {
+                if (i > 0) nic_list += ",";
+                nic_list += context_names[entry.second[i]];
+            }
+            LOG(INFO) << "EfaTransport: local NICs for " << entry.first << ": ["
+                      << nic_list << "]";
+        }
+        if (local_nic_map_.empty()) {
+            LOG(WARNING) << "EfaTransport: MC_EFA_NIC_SELECTION=local but the "
+                            "topology reports no per-location preferred NICs; "
+                            "every buffer will use all NICs as before";
+        }
     }
 
     // Query EFA device max_mr_size via ibverbs and clamp globalConfig.

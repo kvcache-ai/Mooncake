@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "common.h"
 
@@ -344,6 +345,42 @@ TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
     size_t first_call = getHandshakeMaxLength();
     size_t second_call = getHandshakeMaxLength();
     EXPECT_EQ(first_call, second_call);
+}
+
+//------------------------------------------------------------------------------
+// bindToSocket
+//------------------------------------------------------------------------------
+
+// Worker pools bind every thread they spawn, so bindToSocket() races inside
+// libnuma's unlocked lazy cache fill and orphans an allocation. The leak is
+// what this guards, so it only fails under ASAN/LSAN; the barrier is what makes
+// it reliable there.
+TEST(BindToSocketTest, ConcurrentCallsDoNotLeakNumaState) {
+    if (numa_available() < 0) GTEST_SKIP() << "platform does not support NUMA";
+
+    constexpr int kThreads = 32;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    std::vector<int> results(kThreads, -1);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            // Every thread races on the same node, maximizing the window.
+            results[i] = bindToSocket(0);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    for (auto &thread : threads) thread.join();
+
+    // Serializing the cache fill must not change what callers observe.
+    for (int i = 0; i < kThreads; ++i)
+        EXPECT_EQ(results[i], 0) << "thread " << i << " failed to bind";
 }
 
 }  // namespace

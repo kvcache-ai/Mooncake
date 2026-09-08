@@ -14,6 +14,13 @@ add_custom_target(
     DEPENDS ${ETCD_WRAPPER_LIB}
 )
 
+if(BUILD_UNIT_TESTS)
+  add_test(
+    NAME etcd_wrapper_go_test
+    COMMAND go test ./...
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 install(
     FILES ${ETCD_WRAPPER_LIB}
     DESTINATION lib

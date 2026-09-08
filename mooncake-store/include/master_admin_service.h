@@ -23,7 +23,8 @@ class WrappedMasterService;
 
 class MasterAdminServer {
    public:
-    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
+    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting,
+                      std::string http_host = "0.0.0.0");
 
     ~MasterAdminServer();
 
@@ -67,6 +68,8 @@ class MasterAdminServer {
                               coro_http::coro_http_response& resp);
     void HandleHealth(coro_http::coro_http_request& req,
                       coro_http::coro_http_response& resp);
+    void HandleVersion(coro_http::coro_http_request& req,
+                       coro_http::coro_http_response& resp);
     void HandleRole(coro_http::coro_http_request& req,
                     coro_http::coro_http_response& resp);
     void HandleHaStatus(coro_http::coro_http_request& req,
@@ -105,14 +108,19 @@ class MasterAdminServer {
                          coro_http::coro_http_response& resp);
 
     void RegisterHandler();
+    void RefreshStorageMetrics() const;
 
     uint16_t http_port_;
+    std::string http_host_;
     bool enable_metric_reporting_ = false;
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
     std::atomic<bool> metric_report_running_{false};
     std::binary_semaphore metric_report_stop_sem_{0};
     std::atomic<bool> started_{false};
+    // Serializes storage projection with service-plane handoff so a refresh
+    // that sampled the old leader cannot publish after it becomes unavailable.
+    mutable std::mutex storage_metrics_refresh_mutex_;
     mutable std::mutex state_mutex_;
     ha::MasterRuntimeState state_{ha::MasterRuntimeState::kStarting};
     std::optional<ha::MasterView> leader_view_;

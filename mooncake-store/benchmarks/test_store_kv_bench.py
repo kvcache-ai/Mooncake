@@ -1,3 +1,4 @@
+import ctypes
 import importlib.util
 import json
 import os
@@ -8,11 +9,42 @@ from pathlib import Path
 from types import SimpleNamespace
 
 
+class FakeBufferLease:
+    def __init__(self, size):
+        self._buffer = (ctypes.c_ubyte * size)()
+        self.ptr = ctypes.addressof(self._buffer)
+        self.released = False
+
+    def release(self):
+        self.released = True
+
+
+class FakeBufferPool:
+    instances = []
+    acquire_error = None
+
+    def __init__(self, store, **kwargs):
+        self.store = store
+        self.kwargs = kwargs
+        self.lease = None
+        self.closed = False
+        self.instances.append(self)
+
+    def acquire(self, size, block=True):
+        if self.acquire_error is not None:
+            raise self.acquire_error
+        self.lease = FakeBufferLease(size)
+        self.acquire_args = (size, block)
+        return self.lease
+
+    def close(self):
+        self.closed = True
+
+
 store_module = types.ModuleType("mooncake.store")
 store_module.MooncakeDistributedStore = object
 store_module.ReplicateConfig = type("ReplicateConfig", (), {})
-store_module.get_alloc_func_addr = lambda: None
-store_module.get_free_func_addr = lambda: None
+store_module.BufferPool = FakeBufferPool
 sys.modules.setdefault("mooncake", types.ModuleType("mooncake"))
 sys.modules["mooncake.store"] = store_module
 
@@ -21,6 +53,20 @@ SPEC = importlib.util.spec_from_file_location("store_kv_bench_under_test", MODUL
 bench = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = bench
 SPEC.loader.exec_module(bench)
+
+
+class StoreModuleCompatibilityTest(unittest.TestCase):
+    def test_import_does_not_require_buffer_pool(self):
+        del store_module.BufferPool
+        module_name = "store_kv_bench_without_buffer_pool"
+        spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            store_module.BufferPool = FakeBufferPool
+            sys.modules.pop(module_name, None)
 
 
 class MetadataWorkloadModelTest(unittest.TestCase):
@@ -168,6 +214,56 @@ class StoreSessionMetadataTest(unittest.TestCase):
         summary = json.loads((output_dir / "summary.json").read_text())
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["journal_records"], 5)
+
+
+class ZcopyBufferPoolTest(unittest.TestCase):
+    def setUp(self):
+        FakeBufferPool.instances.clear()
+        FakeBufferPool.acquire_error = None
+
+    def test_uses_native_buffer_pool_without_nof_allocators(self):
+        store = object()
+        pool = bench.ZcopyBufferPool(
+            store, value_size=16, slots=2, local_buffer_size=64
+        )
+        native_pool = FakeBufferPool.instances[0]
+
+        self.assertIs(native_pool.store, store)
+        self.assertEqual(native_pool.kwargs, {"max_bytes": 64, "max_regions": 1})
+        self.assertEqual(native_pool.acquire_args, (32, False))
+        self.assertEqual(pool.slot_ptr(1), pool.base_ptr + 16)
+
+        view = bench.ZcopyBufferView(pool, slot_offset=0, slots=2)
+        self.assertEqual(view.fill_write_buffers([b"abc"]), [pool.base_ptr])
+        self.assertEqual(view.read_bytes(0, 3), b"abc")
+
+        lease = native_pool.lease
+        pool.close()
+        self.assertTrue(lease.released)
+        self.assertTrue(native_pool.closed)
+        self.assertEqual(pool.base_ptr, 0)
+
+        pool.close()
+        self.assertTrue(lease.released)
+        self.assertTrue(native_pool.closed)
+
+    def test_rejects_pool_larger_than_store_local_buffer(self):
+        with self.assertRaisesRegex(ValueError, "increase --local-buffer-size"):
+            bench.ZcopyBufferPool(
+                object(), value_size=32, slots=3, local_buffer_size=64
+            )
+        self.assertEqual(FakeBufferPool.instances, [])
+
+    def test_closes_native_pool_when_acquire_fails(self):
+        FakeBufferPool.acquire_error = RuntimeError("buffer pool is exhausted")
+
+        with self.assertRaisesRegex(RuntimeError, "buffer pool is exhausted"):
+            bench.ZcopyBufferPool(
+                object(), value_size=16, slots=2, local_buffer_size=64
+            )
+
+        self.assertEqual(len(FakeBufferPool.instances), 1)
+        self.assertTrue(FakeBufferPool.instances[0].closed)
 
 
 if __name__ == "__main__":

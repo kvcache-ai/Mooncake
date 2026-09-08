@@ -40,9 +40,16 @@ class SPDKTgtCreator:
         'buf_cache_size': '-b',
     }
 
-    def __init__(self, spdk_targets: List[str], transport_options: Dict[str, Any] = None, core_mask: str = '0xff'):
+    def __init__(
+        self,
+        spdk_targets: List[str],
+        transport_options: Dict[str, Any] = None,
+        core_mask: str = '0xff',
+        port: int = 22,
+    ):
         self.spdk_targets = spdk_targets
         self.core_mask = core_mask
+        self.port = port
         self.transport_options = dict(self.DEFAULT_TRANSPORT_OPTIONS)
         if transport_options:
             self.transport_options.update(transport_options)
@@ -120,7 +127,14 @@ class SPDKTgtCreator:
 
         return target_configs
 
-    def _ssh_connect(self, ip: str, username: str = 'root', password: str = None, key_file: str = None) -> paramiko.SSHClient:
+    def _ssh_connect(
+        self,
+        ip: str,
+        username: str = 'root',
+        password: str = None,
+        key_file: str = None,
+        port: int = 22,
+    ) -> paramiko.SSHClient:
         """
         Establish an SSH connection to the target host.
         """
@@ -130,10 +144,10 @@ class SPDKTgtCreator:
         try:
             if key_file:
                 self.logger.info(f"Connecting to {ip} using key file {key_file}")
-                ssh.connect(ip, username=username, key_filename=key_file)
+                ssh.connect(ip, port=port, username=username, key_filename=key_file)
             else:
                 self.logger.info(f"Connecting to {ip} using password authentication")
-                ssh.connect(ip, username=username, password=password)
+                ssh.connect(ip, port=port, username=username, password=password)
             return ssh
         except Exception as e:
             self.logger.error(f"Failed to connect to {ip}: {e}")
@@ -390,7 +404,7 @@ done"""
 
         try:
             # Establish SSH connection
-            ssh = self._ssh_connect(ip)
+            ssh = self._ssh_connect(ip, port=self.port)
 
             try:
                 auto_discovered = not pci_devices
@@ -486,6 +500,8 @@ def parse_arguments():
                         help='Number of shared buffers reserved for each poll group (default: 32)')
     parser.add_argument('--username', type=str, default='root',
                         help='SSH username for target nodes (default: root)')
+    parser.add_argument('--port', type=int, default=22,
+                        help='SSH port for target nodes (default: 22)')
     parser.add_argument('--password', type=str,
                         help='SSH password for target nodes')
     parser.add_argument('--key-file', type=str,
@@ -508,7 +524,12 @@ def main():
     }
 
     try:
-        creator = SPDKTgtCreator(args.spdk_target_info, transport_options, args.core_mask)
+        creator = SPDKTgtCreator(
+            args.spdk_target_info,
+            transport_options,
+            args.core_mask,
+            args.port,
+        )
         success = creator.deploy_all_targets()
         exit(0 if success else 1)
     except Exception as e:

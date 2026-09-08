@@ -8,11 +8,8 @@ on:
   workflow_call:
     inputs:
       variant:
-        # cuda | non-cuda
+        # cuda | cuda13 | non-cuda
         type: string
-        required: true
-      use-cuda:
-        type: boolean
         required: true
       python-versions:
         # JSON array consumed by the called workflow's Python matrix.
@@ -23,10 +20,6 @@ on:
         type: string
         required: true
       cmake-args:
-        type: string
-        required: true
-      variant-flag:
-        # build_wheel.sh package variant, e.g. EFA_BUILD.
         type: string
         required: true
       torch-cuda-arch-list:
@@ -49,8 +42,10 @@ jobs:
       BUILD_PROFILE: ${{ inputs.build-profile }}
       CMAKE_ARGS: ${{ inputs.cmake-args }}
       EFA_VARIANT: ${{ inputs.variant }}
-      USE_CUDA: ${{ inputs.use-cuda }}
-      VARIANT_FLAG: ${{ inputs.variant-flag }}
+      USE_CUDA: ${{ inputs.variant != 'non-cuda' }}
+      VARIANT_FLAG: ${{ fromJSON('{"cuda":"EFA_BUILD","cuda13":"EFA_CU13_BUILD","non-cuda":"EFA_NON_CUDA_BUILD"}')[inputs.variant] }}
+      CUDA_VERSION: ${{ inputs.variant == 'cuda13' && '13.0.2' || '12.8.1' }}
+      TORCH_CUDA_ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
 
     steps:
       - name: Validate build inputs
@@ -60,17 +55,10 @@ jobs:
             *) echo "::error::Unknown EFA build profile: $BUILD_PROFILE"; exit 1 ;;
           esac
 
-          case "$EFA_VARIANT:$USE_CUDA:$VARIANT_FLAG" in
-            cuda:true:EFA_BUILD|non-cuda:false:EFA_NON_CUDA_BUILD) ;;
-            *) echo "::error::Inconsistent EFA variant inputs"; exit 1 ;;
+          case "$EFA_VARIANT" in
+            cuda|cuda13|non-cuda) ;;
+            *) echo "::error::Unknown EFA variant: $EFA_VARIANT"; exit 1 ;;
           esac
-        shell: bash
-
-      - name: Configure CUDA architecture list
-        if: ${{ inputs.torch-cuda-arch-list != '' }}
-        env:
-          ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
-        run: echo "TORCH_CUDA_ARCH_LIST=$ARCH_LIST" >> "$GITHUB_ENV"
         shell: bash
 
       - name: Checkout source
@@ -87,10 +75,10 @@ jobs:
         uses: ./.github/actions/free-disk-space
 
       - name: Install CUDA Toolkit
-        if: ${{ inputs.use-cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.24
+        if: ${{ inputs.variant != 'non-cuda' }}
+        uses: Jimver/cuda-toolkit@v0.2.29
         with:
-          cuda: '12.8.1'
+          cuda: ${{ env.CUDA_VERSION }}
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev"]'
           non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
@@ -194,6 +182,22 @@ jobs:
             exit 1
           fi
           echo "OK: libfabric/libefa correctly excluded (resolve to system EFA at runtime)"
+        shell: bash
+
+      - name: Verify CUDA runtime dependency
+        if: ${{ inputs.variant != 'non-cuda' }}
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
+          inspect_dir=$(mktemp -d)
+          unzip -q "$WHL" mooncake/engine.so -d "$inspect_dir"
+          cuda_major=${CUDA_VERSION%%.*}
+          if ! readelf -d "$inspect_dir/mooncake/engine.so" | \
+              grep -Fq "Shared library: [libcudart.so.${cuda_major}]"; then
+            echo "::error::EFA wheel does not depend on libcudart.so.${cuda_major}"
+            readelf -d "$inspect_dir/mooncake/engine.so" | grep NEEDED
+            exit 1
+          fi
+          echo "OK: EFA wheel depends on libcudart.so.${cuda_major}"
         shell: bash
 
       - name: Upload Python wheel artifact

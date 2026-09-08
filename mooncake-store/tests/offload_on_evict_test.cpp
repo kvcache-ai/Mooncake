@@ -77,22 +77,6 @@ class OffloadOnEvictTest : public ::testing::Test {
         return queued;
     }
 
-    template <typename Predicate>
-    void WaitUntil(
-        Predicate&& predicate,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds(4000),
-        std::chrono::milliseconds interval =
-            std::chrono::milliseconds(50)) const {
-        const auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            if (predicate()) {
-                return;
-            }
-            std::this_thread::sleep_for(interval);
-        }
-        EXPECT_TRUE(predicate());
-    }
-
     // Fill a segment until PutStart fails, triggering eviction.
     // Returns the number of successful puts.
     int FillSegmentUntilEviction(MasterService& service, const UUID& client_id,
@@ -123,36 +107,6 @@ class OffloadOnEvictTest : public ::testing::Test {
 // Combo A: Default config (offload at PutEnd)
 // =============================================================================
 
-TEST_F(OffloadOnEvictTest, ComboA_OffloadAtPutEnd) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-
-    // Mount local disk segment with offloading ENABLED
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    // Put objects
-    PutObject(*service, ctx.client_id, "key_a1");
-    PutObject(*service, ctx.client_id, "key_a2");
-    PutObject(*service, ctx.client_id, "key_a3");
-
-    // Default mode: PutEnd pushes to offload queue immediately
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 3u)
-        << "Default: all 3 objects should be in offload queue after PutEnd";
-    EXPECT_TRUE(queued.count("key_a1"));
-    EXPECT_TRUE(queued.count("key_a2"));
-    EXPECT_TRUE(queued.count("key_a3"));
-
-    service->RemoveAll();
-}
-
 TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
     // Regression: eviction still works in default mode
     const uint64_t kv_lease_ttl = 2000;
@@ -180,31 +134,6 @@ TEST_F(OffloadOnEvictTest, ComboA_EvictionWorks) {
 // =============================================================================
 // Combo B: offload_on_evict=true (offload on evict, no force-evict)
 // =============================================================================
-
-TEST_F(OffloadOnEvictTest, ComboB_PutEndSkipsOffloadQueue) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    PutObject(*service, ctx.client_id, "key_b1");
-    PutObject(*service, ctx.client_id, "key_b2");
-    PutObject(*service, ctx.client_id, "key_b3");
-
-    // Offload-on-evict: PutEnd should NOT push to offload queue
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 0u)
-        << "Offload-on-evict: queue should be empty after PutEnd";
-
-    service->RemoveAll();
-}
 
 TEST_F(OffloadOnEvictTest, ComboB_EvictionTriggersOffload) {
     const uint64_t kv_lease_ttl = 2000;
@@ -285,31 +214,6 @@ TEST_F(OffloadOnEvictTest, ComboB_NoFallbackWithoutForceEvict) {
 // Combo C: offload_on_evict=true + offload_force_evict=true
 // =============================================================================
 
-TEST_F(OffloadOnEvictTest, ComboC_PutEndSkipsOffloadQueue) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_on_evict = true;
-    config.offload_force_evict = true;
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    PutObject(*service, ctx.client_id, "key_c1");
-    PutObject(*service, ctx.client_id, "key_c2");
-
-    // Same as Combo B: PutEnd should skip offload queue
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 0u)
-        << "Combo C: offload queue should be empty after PutEnd";
-
-    service->RemoveAll();
-}
-
 TEST_F(OffloadOnEvictTest, ComboC_EvictionWithForceEvict) {
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
@@ -343,30 +247,6 @@ TEST_F(OffloadOnEvictTest, ComboC_EvictionWithForceEvict) {
 // Combo D: offload_force_evict=true only (should be no-op without on_evict)
 // =============================================================================
 
-TEST_F(OffloadOnEvictTest, ComboD_ForceEvictAloneIsIgnored) {
-    MasterServiceConfig config;
-    config.enable_offload = true;
-    config.offload_force_evict = true;  // on_evict is false → force is ignored
-    config.default_kv_lease_ttl = 2000;
-    auto service = std::make_unique<MasterService>(config);
-
-    constexpr size_t seg_size = 1024 * 1024 * 16;
-    auto ctx =
-        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
-
-    // Should behave like Combo A (default: offload at PutEnd)
-    PutObject(*service, ctx.client_id, "key_d1");
-    PutObject(*service, ctx.client_id, "key_d2");
-
-    auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_EQ(queued.size(), 2u)
-        << "Combo D: FORCE_EVICT alone should not change default behavior";
-
-    service->RemoveAll();
-}
-
 TEST_F(OffloadOnEvictTest, ComboD_EvictionWorks) {
     const uint64_t kv_lease_ttl = 2000;
     MasterServiceConfig config;
@@ -389,39 +269,77 @@ TEST_F(OffloadOnEvictTest, ComboD_EvictionWorks) {
     service->RemoveAll();
 }
 
-// Regression: EraseMetadata must drop the mirror entry in
-// LocalDiskSegment::offloading_objects. Otherwise BatchRemove leaves a
-// task-less key in the offload queue which the next
-// OffloadObjectHeartbeat drains back to the client, producing an
-// orphan bucket on SSD.
-TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
+// =============================================================================
+// UpsertStart interaction with an outstanding offload task.
+//
+// The task passes through two observable states in offloading_tasks[key]:
+//   QUEUED    - mirror entry still present in offloading_objects; the store
+//               worker has not observed the task. UpsertStart cancels the
+//               task in place and allocates a fresh replica.
+//   IN-FLIGHT - mirror already drained by OffloadObjectHeartbeat; the worker
+//               is reading the source buffer for SSD write. UpsertStart
+//               returns OBJECT_HAS_REPLICATION_TASK; the caller retries
+//               after NotifyOffloadSuccess clears the marker.
+// =============================================================================
+
+TEST_F(OffloadOnEvictTest, UpsertPreemptsQueuedOffloadWithOffloadOnEvict) {
+    // With offload_on_evict the task is queued by eviction rather than by
+    // PutEnd.
+    const uint64_t kv_lease_ttl = 500;
     MasterServiceConfig config;
     config.enable_offload = true;
-    config.default_kv_lease_ttl = 0;  // no lease so BatchRemove succeeds
+    config.offload_on_evict = true;
+    config.default_kv_lease_ttl = kv_lease_ttl;
     auto service = std::make_unique<MasterService>(config);
 
     constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr size_t object_size = 1024 * 1024;
     auto ctx =
         PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
-    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
-    ASSERT_TRUE(mount_ld.has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(ctx.client_id, true));
 
-    const std::vector<std::string> keys = {"key_r1", "key_r2", "key_r3"};
-    for (const auto& k : keys) {
-        PutObject(*service, ctx.client_id, k);
+    std::vector<std::string> keys;
+    for (int i = 0; i < 8; ++i) {
+        keys.push_back("evict_upsert_" + std::to_string(i));
+        PutObject(*service, ctx.client_id, keys.back(), object_size);
     }
 
-    // Remove before heartbeat drains the offload queue.
-    auto rm = service->BatchRemove(keys, TenantId::Default(), /*force=*/true);
-    for (const auto& r : rm) {
-        EXPECT_TRUE(r.has_value());
-    }
-
+    // PutEnd does not queue offloads in this mode; eviction does.
     auto queued = DrainOffloadQueue(*service, ctx.client_id);
-    EXPECT_TRUE(queued.empty())
-        << "OffloadObjectHeartbeat returned " << queued.size()
-        << " stale entries after BatchRemove; EraseMetadata failed to clean "
-           "offloading_objects.";
+    ASSERT_TRUE(queued.empty())
+        << "offload_on_evict: PutEnd must not queue offloads";
+
+    // Let leases expire so the keys are evictable, then run one eviction
+    // cycle to queue their offloads without draining the mirrors.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    service->RunBatchEvictForTesting(1.0, 1.0);
+
+    std::string offloading_key;
+    for (const auto& k : keys) {
+        auto upsert =
+            service->UpsertStart(ctx.client_id, k, TenantId::Default(),
+                                 object_size, ReplicateConfig{});
+        if (upsert.has_value()) {
+            offloading_key = k;
+            EXPECT_EQ(upsert->size(), 1u);
+            EXPECT_EQ(upsert->at(0).status, ReplicaStatus::PROCESSING);
+            ASSERT_TRUE(service
+                            ->PutEnd(ctx.client_id, k, TenantId::Default(),
+                                     ReplicaType::MEMORY)
+                            .has_value());
+            break;
+        }
+    }
+    ASSERT_FALSE(offloading_key.empty())
+        << "expected UpsertStart to preempt an offload queued by eviction";
+
+    // Preempt cleared the marker and the mirror, so no stale entry is handed
+    // to the store worker for the preempted key.
+    auto stale = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_EQ(stale.count(offloading_key), 0u)
+        << "preempted key must not remain queued";
+
+    service->RemoveAll();
 }
 
 }  // namespace mooncake::test

@@ -29,6 +29,7 @@
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -239,7 +240,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(ERROR) << "Failed to install UBShmem transport";
         return -1;
     }
-    auto_discover_ = false;
+    auto_discover_config_.enabled = false;
 #endif
 
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
@@ -254,7 +255,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-    if (auto_discover_) {
+    if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
@@ -326,10 +327,37 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using MACA transport";
         }
 
-#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK) || defined(USE_MUSA)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+#ifdef USE_MUSA
+        const char* gpu_p2p_protocol = "musa";
+        const char* gpu_p2p_name = "MUSA";
+        const bool force_gpu_p2p = force_mnnvl || getenv("MC_FORCE_MUSA");
+#else
+        const char* gpu_p2p_protocol = "nvlink";
+        const char* gpu_p2p_name = "NVLink";
+        const bool force_gpu_p2p = force_mnnvl;
+#endif
+        // The cross-node GPU P2P transport is only constructible when its own
+        // build flag is set, so a build that enables USE_INTRA_NVLINK alone
+        // must keep the RDMA/TCP fallback instead of requesting a protocol
+        // MultiTransport cannot create.
+#if defined(USE_MNNVL) || defined(USE_MUSA)
+        constexpr bool kGpuP2PCompiled = true;
+#else
+        constexpr bool kGpuP2PCompiled = false;
+#endif
+        const bool no_hca = local_topology_->getHcaList().empty();
+        // MC_FORCE_HCA keeps the same meaning as on the non-NVLink path:
+        // install RDMA even when topology discovery found no HCA.
+        const bool force_hca = getenv("MC_FORCE_HCA") != nullptr;
+        if (force_gpu_p2p && !kGpuP2PCompiled) {
+            LOG(WARNING) << gpu_p2p_name
+                         << " transport was requested but is not compiled in, "
+                            "falling back to RDMA/TCP";
+        }
         // Explicit env var overrides take priority over HCA auto-detection
         if (intra_env) {
             Transport* t =
@@ -340,16 +368,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
             Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
+                multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
+                LOG(ERROR) << "Failed to install " << gpu_p2p_name
+                           << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using cross-node NVLink transport "
-                      << "(MC_FORCE_MNNVL or no HCA detected)";
-        } else {
+            LOG(INFO) << "Using " << gpu_p2p_name << " transport "
+                      << "(forced or no HCA detected)";
+        } else if (!no_hca || force_hca) {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);
             if (!t) {
@@ -357,6 +386,19 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 return -1;
             }
             LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+        } else {
+#ifdef USE_TCP
+            Transport* t = multi_transports_->installTransport("tcp", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
+            LOG(INFO) << "Using TCP transport (no HCA detected)";
+#else
+            LOG(ERROR) << "No HCA detected and neither " << gpu_p2p_name
+                       << " nor TCP transport is compiled in";
+            return -1;
+#endif
         }
 
 #elif !defined(USE_SUNRISE)
@@ -366,27 +408,26 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         if ((local_topology_->getHcaList().size() > 0 &&
              !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {
-            // only install RDMA transport when there is at least one HCA
-            Transport* rdma_transport = nullptr;
-            if (use_barex_) {
+            const std::string transport_type = autoDiscoverTransport();
+            Transport* transport = nullptr;
+            if (transport_type == "barex") {
 #ifdef USE_BAREX
-                rdma_transport = multi_transports_->installTransport(
+                transport = multi_transports_->installTransport(
                     "barex", local_topology_);
 #else
                 LOG(ERROR) << "Set USE BAREX while barex not compiled";
                 return -1;
 #endif
             } else {
-                rdma_transport = multi_transports_->installTransport(
-                    "rdma", local_topology_);
+                transport = multi_transports_->installTransport(
+                    transport_type, local_topology_);
             }
-            if (rdma_transport == nullptr) {
-                LOG(ERROR) << "Failed to install RDMA transport, type="
-                           << (use_barex_ ? "barex" : "rdma");
+            if (transport == nullptr) {
+                LOG(ERROR) << "Failed to install transport, type="
+                           << transport_type;
                 return -1;
             } else {
-                LOG(INFO) << "installTransport, type="
-                          << (use_barex_ ? "barex" : "rdma");
+                LOG(INFO) << "installTransport, type=" << transport_type;
             }
         } else {
             Transport* tcp_transport =
@@ -521,16 +562,30 @@ int TransferEngineImpl::sendNotifyByID(
         LOG(ERROR) << "sendNotifyByID: invalid segment ID " << target_id;
         return ERR_METADATA;
     }
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-    return ret;
+    return sendNotifyByName(desc->name, std::move(notify_msg));
 }
 
 int TransferEngineImpl::sendNotifyByName(
     std::string remote_agent, TransferMetadata::NotifyDesc notify_msg) {
+    if (globalConfig().rdma_notify_enabled) {
+        Transport* transport = getTransport("rdma_twosided");
+        if (!transport) transport = getTransport("rdma");
+        auto* rdma_twosided = dynamic_cast<RdmaTwoSidedTransport*>(transport);
+        if (rdma_twosided) {
+            int ret = rdma_twosided->sendRdmaNotify(remote_agent, notify_msg);
+            if (ret == 0) return 0;
+            if (!globalConfig().rdma_notify_oob_fallback) {
+                LOG(ERROR) << "sendNotifyByName: RDMA notify failed for "
+                           << remote_agent << " ret=" << ret
+                           << " (OOB fallback disabled)";
+                return ret;
+            }
+            VLOG(1) << "sendNotifyByName: RDMA notify unavailable for "
+                    << remote_agent << ", falling back to OOB";
+        }
+    }
     Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
-    return ret;
+    return metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
 }
 
 int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
@@ -648,10 +703,14 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
+    // Best-effort: try every transport so one failure can't leave the region
+    // registered on the others; mirrors unregisterLocalMemoryBatch (#2869).
+    int first_error = 0;
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
-        if (ret) return ret;
+        if (ret && !first_error) first_error = ret;
     }
+    if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     eraseMemoryRegionLocked(addr);

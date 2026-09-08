@@ -15,6 +15,9 @@ static constexpr int kOpLogBatchIdWidth = 20;
 struct DurablePrefix {
     uint64_t batch_id{0};
     uint64_t last_seq{0};
+
+    friend bool operator==(const DurablePrefix&,
+                           const DurablePrefix&) = default;
 };
 
 struct BatchRecordRange {
@@ -44,6 +47,7 @@ std::string FormatOpLogBatchId(uint64_t batch_id);
 std::string BuildBatchRecordKey(const std::string& cluster_id,
                                 uint64_t batch_id);
 std::string BuildDurablePrefixKey(const std::string& cluster_id);
+std::string BuildProducerViewKey(const std::string& cluster_id);
 BatchRecordRange BuildBatchRecordRange(const std::string& cluster_id,
                                        uint64_t after_batch_id);
 

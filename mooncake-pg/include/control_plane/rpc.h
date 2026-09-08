@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_PG_CONTROL_PLANE_RPC_H
 #define MOONCAKE_PG_CONTROL_PLANE_RPC_H
 
+#include <chrono>
 #include <cstdint>
 #include <string>
 #include <variant>
@@ -10,9 +11,12 @@
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "types.h"
+#include "control_plane/control_types.h"
 
 namespace mooncake {
+
+inline constexpr auto kProposalAdmissionTimeout = std::chrono::seconds(20);
+inline constexpr auto kViewUpdateAckTimeout = std::chrono::seconds(20);
 
 // Agent -> Coordinator RPC messages
 
@@ -270,7 +274,7 @@ struct DisconnectAllLinks {};
 
 struct ClearAllPeerMetadata {};
 
-struct ApplyViewToBackend {
+struct ApplyViewToCommunicator {
     GroupView view;
     std::vector<RankState> rank_states;
     std::vector<uint64_t> rank_epochs;
@@ -301,7 +305,7 @@ struct NotifyRanksActivated {
 using AgentEffect =
     std::variant<EnablePeerProbe, DisconnectLink, RequestLinkHealthCheck,
                  SendLinkEventReport, StopReconnect, DisconnectAllLinks,
-                 ClearAllPeerMetadata, ApplyViewToBackend, ResetPeerState,
+                 ClearAllPeerMetadata, ApplyViewToCommunicator, ResetPeerState,
                  RefreshPeerLink, NotifyLinkRefreshed, NotifyGroupReady,
                  NotifyRanksActivated>;
 

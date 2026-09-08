@@ -182,12 +182,14 @@ bool DecodeDurablePrefix(const std::string& value, DurablePrefix* prefix,
         SetReason(reason, "unsupported durable prefix schema_version");
         return false;
     }
-    if (!GetUInt64Field(root, "batch_id", &prefix->batch_id, reason)) {
+    DurablePrefix decoded;
+    if (!GetUInt64Field(root, "batch_id", &decoded.batch_id, reason)) {
         return false;
     }
-    if (!GetUInt64Field(root, "last_seq", &prefix->last_seq, reason)) {
+    if (!GetUInt64Field(root, "last_seq", &decoded.last_seq, reason)) {
         return false;
     }
+    *prefix = decoded;
     return true;
 }
 

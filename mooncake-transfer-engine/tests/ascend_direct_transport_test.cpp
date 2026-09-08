@@ -18,6 +18,7 @@
 #include <acl/acl.h>
 #include <acl/acl_rt.h>
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -43,9 +44,12 @@ constexpr size_t kTransferBufSize = 4096;
 constexpr size_t kRegisterMemSize = 1024 * 1024;
 constexpr int kTransferStatusMaxRetries = 1000;
 
-static int g_device_id = 0;
+// ACL device/context are per-thread; keep the mock that way so engine worker
+// threads do not clobber the test thread's current device.
+static thread_local int g_device_id = 0;
 static int g_device_count = 1;
-static aclrtContext g_context = reinterpret_cast<aclrtContext>(0x1234);
+static thread_local aclrtContext g_context =
+    reinterpret_cast<aclrtContext>(0x10000);
 static aclError g_memcpy_result = ACL_ERROR_NONE;
 static aclError g_memcpy_async_result = ACL_ERROR_NONE;
 static aclError g_memcpy_batch_result = ACL_ERROR_NONE;
@@ -54,12 +58,31 @@ static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
 static std::map<const void*, aclrtMemLocation> g_memory_locations;
 static std::mutex g_acl_mutex;
+// 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
+static size_t g_malloc_physical_max_success = 0;
+static int g_malloc_physical_call_count = 0;
+
+constexpr uintptr_t kDeviceContextBase = 0x10000;
+
+aclrtContext ContextForDevice(int device_id) {
+    return reinterpret_cast<aclrtContext>(kDeviceContextBase +
+                                          static_cast<uintptr_t>(device_id));
+}
+
+int DeviceForContext(aclrtContext context) {
+    const auto value = reinterpret_cast<uintptr_t>(context);
+    if (value >= kDeviceContextBase && value < kDeviceContextBase + 1024) {
+        return static_cast<int>(value - kDeviceContextBase);
+    }
+    return -1;
+}
 
 namespace mock_acl {
 void reset() {
     std::lock_guard<std::mutex> lock(g_acl_mutex);
     g_device_id = 0;
     g_device_count = 1;
+    g_context = ContextForDevice(0);
     g_memcpy_result = ACL_ERROR_NONE;
     g_memcpy_async_result = ACL_ERROR_NONE;
     g_memcpy_batch_result = ACL_ERROR_NONE;
@@ -67,6 +90,18 @@ void reset() {
     g_set_device_call_count = 0;
     g_set_device_ids.clear();
     g_memory_locations.clear();
+    g_malloc_physical_max_success = 0;
+    g_malloc_physical_call_count = 0;
+}
+
+void set_malloc_physical_max_success(size_t max_success) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_malloc_physical_max_success = max_success;
+}
+
+int malloc_physical_call_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_malloc_physical_call_count;
 }
 
 void set_device_count(int count) {
@@ -136,6 +171,7 @@ aclError aclrtSetDevice(int deviceId) {
         return 1;
     }
     g_device_id = deviceId;
+    g_context = ContextForDevice(deviceId);
     g_set_device_call_count++;
     g_set_device_ids.insert(deviceId);
     return ACL_ERROR_NONE;
@@ -148,6 +184,10 @@ aclError aclrtGetCurrentContext(aclrtContext* context) {
 
 aclError aclrtSetCurrentContext(aclrtContext context) {
     g_context = context;
+    const int device_id = DeviceForContext(context);
+    if (device_id >= 0) {
+        g_device_id = device_id;
+    }
     return ACL_ERROR_NONE;
 }
 
@@ -256,9 +296,14 @@ aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
 
 aclError aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t size,
                              aclrtPhysicalMemProp* prop, uint32_t flags) {
-    (void)size;
     (void)prop;
     (void)flags;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_malloc_physical_call_count;
+    if (g_malloc_physical_max_success > 0 &&
+        size > g_malloc_physical_max_success) {
+        return ACL_ERROR_FAILURE;
+    }
     *handle = reinterpret_cast<aclrtDrvMemHandle>(malloc(1));
     return *handle ? ACL_ERROR_NONE : ACL_ERROR_FAILURE;
 }
@@ -268,7 +313,11 @@ aclError aclrtReserveMemAddress(void** va, size_t size, size_t alignment,
     (void)alignment;
     (void)hint_addr;
     (void)page_type;
-    *va = malloc(size);
+    // Stub VA only — do not malloc(size) (best-effort tests use multi-GB
+    // sizes).
+    (void)size;
+    constexpr size_t kStubVaBytes = 64;
+    *va = malloc(kStubVaBytes);
     return *va ? ACL_ERROR_NONE : ACL_ERROR_FAILURE;
 }
 
@@ -331,6 +380,10 @@ static int g_transfer_async_count = 0;
 static int g_register_mem_count = 0;
 static int g_deregister_mem_count = 0;
 static std::string g_last_connect_target;
+static std::vector<std::string> g_connect_targets;
+static adxl::Status g_get_capability_result = adxl::SUCCESS;
+static int32_t g_get_capability_value = 0;
+static std::map<std::string, std::string> g_last_init_options;
 
 namespace adxl_mock {
 void reset() {
@@ -356,6 +409,16 @@ void reset() {
     g_register_mem_count = 0;
     g_deregister_mem_count = 0;
     g_last_connect_target.clear();
+    g_connect_targets.clear();
+    g_get_capability_result = adxl::SUCCESS;
+    g_get_capability_value = 0;
+    g_last_init_options.clear();
+}
+
+void set_capability_result(adxl::Status status, int32_t value) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_get_capability_result = status;
+    g_get_capability_value = value;
 }
 
 void set_connect_result(adxl::Status status) {
@@ -454,6 +517,16 @@ std::string get_last_connect_target() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_last_connect_target;
 }
+
+std::vector<std::string> get_connect_targets() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_connect_targets;
+}
+
+std::map<std::string, std::string> get_last_init_options() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_last_init_options;
+}
 }  // namespace adxl_mock
 
 }  // namespace
@@ -470,8 +543,12 @@ Status AdxlEngine::Initialize(
     const AscendString& name,
     const std::map<AscendString, AscendString>& options) {
     (void)name;
-    (void)options;
     g_was_initialize_called = true;
+    g_last_init_options.clear();
+    for (const auto& kv : options) {
+        g_last_init_options[std::string(kv.first.GetString())] =
+            std::string(kv.second.GetString());
+    }
     return g_initialize_result;
 }
 
@@ -483,6 +560,7 @@ Status AdxlEngine::Connect(const AscendString& remote_engine,
     std::lock_guard<std::mutex> lock(g_mutex);
     g_connected.insert(std::string(remote_engine.GetString()));
     g_last_connect_target = remote_engine.GetString();
+    g_connect_targets.push_back(g_last_connect_target);
     g_connect_count++;
     return g_connect_result;
 }
@@ -587,6 +665,13 @@ Status AdxlEngine::DeregisterMem(MemHandle mem_handle) {
     return SUCCESS;
 }
 
+Status AdxlEngine::GetCapability(FeatureType feature_type, int32_t& value) {
+    (void)feature_type;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    value = g_get_capability_value;
+    return g_get_capability_result;
+}
+
 }  // namespace adxl
 
 class AscendDirectTransportTest : public ::testing::Test {
@@ -660,12 +745,21 @@ class AscendDirectTransportTest : public ::testing::Test {
     void addMultiEndpointRemoteSegment(
         std::shared_ptr<TransferMetadata> meta, int segment_id,
         const std::string& name, const std::string& host_ip,
-        const std::vector<std::string>& endpoints) {
+        const std::vector<std::string>& endpoints, int32_t dest_device_id = -1,
+        uint64_t dest_addr = 0, uint64_t dest_len = 0) {
         auto remote_desc = std::make_shared<TransferMetadata::SegmentDesc>();
         remote_desc->name = name;
         remote_desc->protocol = "ascend";
         remote_desc->rank_info.hostIp = host_ip;
         remote_desc->rank_info.endpoints = endpoints;
+        if (dest_device_id >= 0 && dest_len > 0) {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = "store";
+            buffer.addr = dest_addr;
+            buffer.length = dest_len;
+            buffer.device_id = dest_device_id;
+            remote_desc->buffers.push_back(buffer);
+        }
         meta->addLocalSegment(segment_id, name, std::move(remote_desc));
     }
 
@@ -761,23 +855,33 @@ class AscendDirectTransportTest : public ::testing::Test {
     }
 
     TransferWaitResult waitForTransfer(AscendDirectTransport* transport,
-                                       uint64_t batch_id) {
+                                       uint64_t batch_id,
+                                       size_t task_count = 1) {
         Transport::TransferStatus status{};
-        for (int i = 0; i < kTransferStatusMaxRetries; ++i) {
-            Status s = transport->getTransferStatus(batch_id, 0, status);
-            if (!s.ok()) {
-                ADD_FAILURE() << "getTransferStatus failed";
+        for (size_t task_id = 0; task_id < task_count; ++task_id) {
+            bool task_done = false;
+            for (int i = 0; i < kTransferStatusMaxRetries; ++i) {
+                Status s =
+                    transport->getTransferStatus(batch_id, task_id, status);
+                if (!s.ok()) {
+                    ADD_FAILURE()
+                        << "getTransferStatus failed for task " << task_id;
+                    return {false, false, status};
+                }
+                if (status.s == Transport::FAILED) {
+                    return {true, true, status};
+                }
+                if (status.s == Transport::COMPLETED) {
+                    task_done = true;
+                    break;
+                }
+                usleep(1000);
+            }
+            if (!task_done) {
                 return {false, false, status};
             }
-            if (status.s == Transport::FAILED) {
-                return {true, true, status};
-            }
-            if (status.s == Transport::COMPLETED) {
-                return {true, false, status};
-            }
-            usleep(1000);
         }
-        return {false, false, status};
+        return {true, false, status};
     }
 
     size_t getLocalBufferCount(AscendDirectTransport* transport) {
@@ -826,21 +930,15 @@ TEST_F(AscendDirectTransportTest,
     ContextManager::getInstance().finalize();
     constexpr int kDeviceCount = 4;
     constexpr int kCallerDeviceId = 1;
-    auto* expected_context = reinterpret_cast<aclrtContext>(0x4321);
 
     mock_acl::set_device_count(kDeviceCount);
     ASSERT_EQ(aclrtSetDevice(kCallerDeviceId), ACL_ERROR_NONE);
-    ASSERT_EQ(aclrtSetCurrentContext(expected_context), ACL_ERROR_NONE);
 
     ASSERT_TRUE(ContextManager::getInstance().initialize());
 
     int current_device_id = -1;
     ASSERT_EQ(aclrtGetDevice(&current_device_id), ACL_ERROR_NONE);
     EXPECT_EQ(current_device_id, kCallerDeviceId);
-
-    aclrtContext current_context = nullptr;
-    ASSERT_EQ(aclrtGetCurrentContext(&current_context), ACL_ERROR_NONE);
-    EXPECT_EQ(current_context, expected_context);
 }
 
 TEST_F(AscendDirectTransportTest,
@@ -1090,12 +1188,12 @@ TEST_F(AscendDirectTransportTest, DummyReal_Roce_LocalCopy_Success) {
 }
 
 TEST_F(AscendDirectTransportTest,
-       DummyReal_Roce_SameHostDifferentProcess_SelectsSameIndex) {
+       DummyReal_Roce_SameHostSelectsDestBufferEngine) {
     globalConfig().ascend_agent_mode = true;
     setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
     constexpr int kDeviceCount = 4;
     mock_acl::set_device_count(kDeviceCount);
-    g_device_id = 0;
+    g_device_id = 1;
     ContextManager::getInstance().finalize();
     ASSERT_TRUE(ContextManager::getInstance().initialize());
     auto transport = createTransport();
@@ -1104,22 +1202,76 @@ TEST_F(AscendDirectTransportTest,
                                              "cpu:0", true, true),
               0);
 
-    // Same host with multiple endpoints - dummy-real should use same-index
     std::vector<std::string> endpoints = {"127.0.0.1:9000", "127.0.0.1:9100",
                                           "127.0.0.1:9200", "127.0.0.1:9300"};
     addMultiEndpointRemoteSegment(transport->meta(), 1, "dummy_real_same_host",
-                                  "127.0.0.1", endpoints);
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
 
     initTestData(kTransferBufSize);
     auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
                                     0x10000, kTransferBufSize);
     ASSERT_TRUE(result.finished);
-    // dummy-real uses same-index pairing: engine_id=0 -> endpoints[0]
-    // Different process so no local copy, ADXL connect happens
-    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:9000")
-        << "Dummy-real should use same-index pairing without offset";
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:9200")
+        << "Target engine follows dest buffer device_id, not local engine";
 
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    globalConfig().ascend_agent_mode = false;
+}
+
+TEST_F(AscendDirectTransportTest,
+       SameSegment_TwoDestBuffers_ConnectsEachEngine) {
+    globalConfig().ascend_agent_mode = true;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    ContextManager::getInstance().finalize();
+    ASSERT_TRUE(ContextManager::getInstance().initialize());
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"10.0.0.1:5000", "10.0.0.1:5100",
+                                          "10.0.0.1:5200", "10.0.0.1:5300"};
+    addMultiEndpointRemoteSegment(transport->meta(), 1, "two_dests", "10.0.0.1",
+                                  endpoints, /*dest_device_id=*/1, 0x10000,
+                                  kTransferBufSize);
+    auto remote_desc = transport->meta()->getSegmentDescByID(1);
+    ASSERT_NE(remote_desc, nullptr);
+    TransferMetadata::BufferDesc second;
+    second.name = "store";
+    second.addr = 0x20000;
+    second.length = kTransferBufSize;
+    second.device_id = 2;
+    remote_desc->buffers.push_back(second);
+
+    auto batch_id = transport->allocateBatchID(2);
+    ASSERT_NE(batch_id, 0);
+    std::vector<Transport::TransferRequest> requests(2);
+    requests[0].opcode = Transport::TransferRequest::WRITE;
+    requests[0].source = test_buffer_src_;
+    requests[0].target_id = 1;
+    requests[0].target_offset = 0x10000;
+    requests[0].length = kTransferBufSize;
+    requests[1].opcode = Transport::TransferRequest::WRITE;
+    requests[1].source = test_buffer_src_;
+    requests[1].target_id = 1;
+    requests[1].target_offset = 0x20000;
+    requests[1].length = kTransferBufSize;
+    ASSERT_TRUE(transport->submitTransfer(batch_id, requests).ok());
+    auto result = waitForTransfer(transport.get(), batch_id, /*task_count=*/2);
+    transport->freeBatchID(batch_id);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+
+    auto targets = adxl_mock::get_connect_targets();
+    EXPECT_NE(std::find(targets.begin(), targets.end(), "10.0.0.1:5100"),
+              targets.end());
+    EXPECT_NE(std::find(targets.begin(), targets.end(), "10.0.0.1:5200"),
+              targets.end());
+
     globalConfig().ascend_agent_mode = false;
 }
 
@@ -1135,6 +1287,21 @@ TEST_F(AscendDirectTransportTest, Memory_RegisterAndUnregister) {
                                              "cpu:0", true, true),
               0);
     EXPECT_EQ(transport->unregisterLocalMemory(test_buffer_src_, true), 0);
+}
+
+TEST_F(AscendDirectTransportTest, Memory_RegisterStampsBufferDeviceId) {
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+
+    constexpr int32_t kStampDeviceId = 2;
+    g_device_id = kStampDeviceId;
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+    auto segment_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    EXPECT_EQ(segment_desc->buffers.back().device_id, kStampDeviceId);
 }
 
 TEST_F(AscendDirectTransportTest, Memory_RegisterFailureRollsBackMetadata) {
@@ -1229,10 +1396,14 @@ TEST_F(AscendDirectTransportTest,
     ASSERT_EQ(transport->registerLocalMemory(store_buffer, kRegisterMemSize,
                                              "cpu:0", true, true),
               0);
-    EXPECT_EQ(adxl_mock::get_register_mem_count(), kEngineCount);
+    EXPECT_EQ(adxl_mock::get_register_mem_count(), 1);
+    auto segment_desc = transport->meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(segment_desc, nullptr);
+    ASSERT_FALSE(segment_desc->buffers.empty());
+    EXPECT_EQ(segment_desc->buffers.back().device_id, 0);
 
     ASSERT_EQ(transport->unregisterLocalMemory(store_buffer, true), 0);
-    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), kEngineCount);
+    EXPECT_EQ(adxl_mock::get_deregister_mem_count(), 1);
 
     auto registered_handles = adxl_mock::get_registered_mem_handles();
     auto deregistered_handles = adxl_mock::get_deregistered_mem_handles();
@@ -1845,7 +2016,8 @@ TEST_F(AscendDirectTransportTest,
 // Standalone mode tests (non-dummy-real, non-fabric-mem)
 // -----------------------------------------------------------------------------
 
-TEST_F(AscendDirectTransportTest, Standalone_RemoteHost_SelectsPhyDevEndpoint) {
+TEST_F(AscendDirectTransportTest,
+       Standalone_RemoteHost_SelectsDestBufferEngine) {
     globalConfig().ascend_agent_mode = false;
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
     constexpr int kDeviceCount = 4;
@@ -1857,23 +2029,21 @@ TEST_F(AscendDirectTransportTest, Standalone_RemoteHost_SelectsPhyDevEndpoint) {
                                              "cpu:0", true, true),
               0);
 
-    // Remote host with multiple endpoints (different from local host)
     std::vector<std::string> endpoints = {"10.0.0.1:5000", "10.0.0.1:5100",
                                           "10.0.0.1:5200", "10.0.0.1:5300"};
     addMultiEndpointRemoteSegment(transport->meta(), 1, "remote_host",
-                                  "10.0.0.1", endpoints);
+                                  "10.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
 
     initTestData(kTransferBufSize);
     auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
                                     0x10000, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
-    // phy_dev=2, different host -> selects endpoints[2]
     EXPECT_EQ(adxl_mock::get_last_connect_target(), "10.0.0.1:5200");
 }
 
-TEST_F(AscendDirectTransportTest,
-       Standalone_SameHostDifferentProcess_OffsetsByOne) {
+TEST_F(AscendDirectTransportTest, Standalone_SameHost_SelectsDestBufferEngine) {
     globalConfig().ascend_agent_mode = false;
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
     constexpr int kDeviceCount = 4;
@@ -1885,27 +2055,28 @@ TEST_F(AscendDirectTransportTest,
                                              "cpu:0", true, true),
               0);
 
-    // Same host (127.0.0.1) with multiple endpoints (different process)
     std::vector<std::string> endpoints = {"127.0.0.1:6000", "127.0.0.1:6100",
                                           "127.0.0.1:6200", "127.0.0.1:6300"};
     addMultiEndpointRemoteSegment(transport->meta(), 1, "same_host_process",
-                                  "127.0.0.1", endpoints);
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
 
     initTestData(kTransferBufSize);
     auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
                                     0x10000, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
-    // phy_dev=1, same host -> offset +1 -> selects endpoints[2]
-    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:6200");
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:6200")
+        << "Same-host transfers must not apply a +1 engine offset";
 }
 
-TEST_F(AscendDirectTransportTest, Standalone_SameHostOffset_WrapsAround) {
+TEST_F(AscendDirectTransportTest,
+       Standalone_MissingDestBuffer_UsesFrontEndpoint) {
     globalConfig().ascend_agent_mode = false;
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
     constexpr int kDeviceCount = 4;
     mock_acl::set_device_count(kDeviceCount);
-    g_device_id = 3;  // last device: (3+1)%4 = 0
+    g_device_id = 3;
     auto transport = createTransport();
     ASSERT_NE(transport, nullptr);
     ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
@@ -1922,12 +2093,39 @@ TEST_F(AscendDirectTransportTest, Standalone_SameHostOffset_WrapsAround) {
                                     0x10000, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
-    // phy_dev=3, same host -> (3+1)%4=0 -> selects endpoints[0]
     EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:7000");
 }
 
 TEST_F(AscendDirectTransportTest,
-       Standalone_FabricMem_SameHostUsesFrontEndpoint) {
+       Standalone_SingleEndpoint_IgnoresDestDeviceId) {
+    globalConfig().ascend_agent_mode = false;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 3;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:7400"};
+    addMultiEndpointRemoteSegment(transport->meta(), 1, "single_endpoint",
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:7400")
+        << "A single remote endpoint is used as-is, even when dest "
+           "buffer device_id is not 0";
+}
+
+TEST_F(AscendDirectTransportTest,
+       Standalone_FabricMem_SameHostSelectsDestBufferEngine) {
     // Fabric mem is a Store-TE feature, so the TE must be store-init for the
     // transport to capture use_fabric_mem_=true.
     globalConfig().ascend_agent_mode = false;
@@ -1946,15 +2144,16 @@ TEST_F(AscendDirectTransportTest,
     std::vector<std::string> endpoints = {"127.0.0.1:8000", "127.0.0.1:8100",
                                           "127.0.0.1:8200", "127.0.0.1:8300"};
     addMultiEndpointRemoteSegment(transport->meta(), 1, "fabric_same_host",
-                                  "127.0.0.1", endpoints);
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
 
     initTestData(kTransferBufSize);
     auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
                                     0x10000, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
-    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:8000")
-        << "Fabric-mem standalone should not apply same-host offset";
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:8200")
+        << "Fabric-mem target engine follows dest buffer device_id";
 
     globalConfig().ascend_use_fabric_mem = false;
     globalConfig().ascend_store_te_init = false;
@@ -1962,9 +2161,8 @@ TEST_F(AscendDirectTransportTest,
 
 // A non-Store (e.g. P2P/HCCS) TE must NOT inherit a Store TE's fabric flag that
 // leaked into the process-global config: with ascend_use_fabric_mem=true but
-// ascend_store_te_init=false, the transport must capture use_fabric_mem_=false
-// and behave like a normal standalone TE (same-host offset +1), not the fabric
-// path (front endpoint).
+// ascend_store_te_init=false, the transport must capture use_fabric_mem_=false.
+// Routing still follows dest buffer device_id (no same-host offset).
 TEST_F(AscendDirectTransportTest,
        Standalone_FabricFlagWithoutStoreTe_DoesNotInheritFabric) {
     globalConfig().ascend_agent_mode = false;
@@ -1983,17 +2181,16 @@ TEST_F(AscendDirectTransportTest,
     std::vector<std::string> endpoints = {"127.0.0.1:9000", "127.0.0.1:9100",
                                           "127.0.0.1:9200", "127.0.0.1:9300"};
     addMultiEndpointRemoteSegment(transport->meta(), 1, "p2p_no_fabric",
-                                  "127.0.0.1", endpoints);
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
 
     initTestData(kTransferBufSize);
     auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
                                     0x10000, kTransferBufSize);
     ASSERT_TRUE(result.finished);
     EXPECT_FALSE(result.failed);
-    // phy_dev=1, same host, fabric NOT inherited -> offset +1 -> endpoints[2]
     EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:9200")
-        << "Non-Store TE must not inherit fabric; should apply same-host "
-           "offset";
+        << "Non-Store TE still routes by dest buffer device_id";
 
     globalConfig().ascend_use_fabric_mem = false;
 }
@@ -2001,6 +2198,227 @@ TEST_F(AscendDirectTransportTest,
 // -----------------------------------------------------------------------------
 // Roce mode detection (HCCL_INTRA_ROCE_ENABLE / ASCEND_GLOBAL_RESOURCE_CONFIG)
 // -----------------------------------------------------------------------------
+
+TEST(FabricMemBestEffortAllocTest, PercentileLadderFindsFeasibleSize) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTargetGiB = 40;
+    constexpr size_t kMaxOkGiB = 35;
+    constexpr size_t kExpectGiB = 32;  // 80% of 40GiB after 100%/90% fail
+    constexpr size_t kTarget = kTargetGiB * kGiB;
+    mock_acl::set_malloc_physical_max_success(kMaxOkGiB * kGiB);
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTarget, "ascend", &actual);
+    ASSERT_NE(ptr, nullptr);
+    if (&adxl::AdxlEngine::MallocMem == nullptr) {
+        EXPECT_EQ(actual, kExpectGiB * kGiB);
+        EXPECT_GT(mock_acl::malloc_physical_call_count(), 1);
+    } else {
+        // AdxlEngine::MallocMem is linked in this CANN build, so the VMM
+        // mock percentile ladder is unused. Still require a feasible step-down.
+        EXPECT_LT(actual, kTarget);
+        EXPECT_GE(actual, kTarget / 2);
+    }
+
+    ascend_free_memory("ascend", ptr);
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+TEST(FabricMemBestEffortAllocTest, BelowFiftyPercentReturnsNull) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTargetGiB = 40;
+    constexpr size_t kMaxOkGiB = 15;  // below 50% of 40GiB (=20GiB)
+    mock_acl::set_malloc_physical_max_success(kMaxOkGiB * kGiB);
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTargetGiB * kGiB, "ascend",
+                                                   &actual);
+    EXPECT_EQ(ptr, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+// 2.1 GiB target: 50% = 1.05 GiB. Align-down of lower percentiles yields 1 GiB
+// (< 50%), which must be rejected even if physical alloc of 1 GiB would
+// succeed.
+TEST(FabricMemBestEffortAllocTest, AlignDownBelowMinPercentIsRejected) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTarget = (2 * kGiB) + (kGiB / 10);  // 2.1 GiB
+    mock_acl::set_malloc_physical_max_success(kGiB);  // 1 GiB ok, 2 GiB fails
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTarget, "ascend", &actual);
+    EXPECT_EQ(ptr, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+TEST(FabricMemBestEffortAllocTest, FullTargetFirstSuccess) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTargetGiB = 40;
+    constexpr size_t kTarget = kTargetGiB * kGiB;
+    // Physical alloc is tried up to 3 attribute tiers per size.
+    constexpr int kMaxPhysicalTiersPerSize = 3;
+    mock_acl::set_malloc_physical_max_success(0);  // unlimited
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTarget, "ascend", &actual);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(actual, kTarget);  // 100% first
+    EXPECT_LE(mock_acl::malloc_physical_call_count(), kMaxPhysicalTiersPerSize);
+
+    ascend_free_memory("ascend", ptr);
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+namespace {
+int32_t CurrentAclDevice() {
+    int32_t device_id = -1;
+    EXPECT_EQ(aclrtGetDevice(&device_id), ACL_ERROR_NONE);
+    return device_id;
+}
+
+struct AgentAllocEnv {
+    explicit AgentAllocEnv(int device_count) {
+        mock_acl::reset();
+        globalConfig().ascend_agent_mode = true;
+        globalConfig().ascend_use_fabric_mem = false;
+        mock_acl::set_device_count(device_count);
+        ContextManager::getInstance().finalize();
+        EXPECT_TRUE(ContextManager::getInstance().initialize());
+    }
+    ~AgentAllocEnv() {
+        ContextManager::getInstance().finalize();
+        globalConfig().ascend_agent_mode = false;
+        globalConfig().ascend_use_fabric_mem = false;
+        mock_acl::reset();
+    }
+};
+}  // namespace
+
+TEST(AgentModeAllocTest, ConsecutiveStoreAllocsRotateDevices) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kAllocSize = 4096;
+    AgentAllocEnv env(kDeviceCount);
+
+    int first = -1;
+    for (int i = 0; i < kDeviceCount; ++i) {
+        size_t actual = 0;
+        void* ptr =
+            ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+        ASSERT_NE(ptr, nullptr);
+        EXPECT_EQ(actual, kAllocSize);
+        if (i == 0) {
+            first = CurrentAclDevice();
+            ASSERT_GE(first, 0);
+            ASSERT_LT(first, kDeviceCount);
+        } else {
+            EXPECT_EQ(CurrentAclDevice(), (first + i) % kDeviceCount);
+        }
+        ascend_free_memory("ascend", ptr);
+    }
+
+    size_t actual = 0;
+    void* wrap =
+        ascend_allocate_memory_best_effort(kAllocSize, "ascend", &actual);
+    ASSERT_NE(wrap, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), first);
+    ascend_free_memory("ascend", wrap);
+}
+
+TEST(AgentModeAllocTest, DirectVmmDoesNotRotateSequencer) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    AgentAllocEnv env(kDeviceCount);
+
+    size_t actual = 0;
+    void* first = ascend_allocate_memory_best_effort(4096, "ascend", &actual);
+    ASSERT_NE(first, nullptr);
+    const int d0 = CurrentAclDevice();
+    ascend_free_memory("ascend", first);
+
+    void* vmm = ascend_allocate_vmm_memory_direct(kGiB);
+    ASSERT_NE(vmm, nullptr);
+
+    actual = 0;
+    void* second = ascend_allocate_memory_best_effort(4096, "ascend", &actual);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount)
+        << "direct VMM must not consume the agent alloc sequencer";
+
+    ascend_free_memory("ascend", second);
+    ascend_free_memory("ascend", vmm);
+}
+
+TEST(AgentModeAllocTest, FailedBestEffortProbesDoNotSkipDevice) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    AgentAllocEnv env(kDeviceCount);
+
+    size_t actual = 0;
+    void* marker = ascend_allocate_memory_best_effort(4096, "ascend", &actual);
+    ASSERT_NE(marker, nullptr);
+    const int d0 = CurrentAclDevice();
+    ascend_free_memory("ascend", marker);
+
+    globalConfig().ascend_use_fabric_mem = true;
+    mock_acl::set_malloc_physical_max_success(35 * kGiB);
+    actual = 0;
+    void* first =
+        ascend_allocate_memory_best_effort(40 * kGiB, "ascend", &actual);
+    ASSERT_NE(first, nullptr);
+    EXPECT_GT(actual, 0);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount)
+        << "failed 100%/90% probes must not consume a device slot";
+    ascend_free_memory("ascend", first);
+
+    actual = 0;
+    void* second = ascend_allocate_memory_best_effort(kGiB, "ascend", &actual);
+    ASSERT_NE(second, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 2) % kDeviceCount);
+    ascend_free_memory("ascend", second);
+}
+
+TEST(AgentModeAllocTest, EntireBestEffortFailureDoesNotConsumeSlot) {
+    constexpr int kDeviceCount = 4;
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    AgentAllocEnv env(kDeviceCount);
+
+    size_t actual = 0;
+    void* marker = ascend_allocate_memory_best_effort(4096, "ascend", &actual);
+    ASSERT_NE(marker, nullptr);
+    const int d0 = CurrentAclDevice();
+    ascend_free_memory("ascend", marker);
+
+    globalConfig().ascend_use_fabric_mem = true;
+    mock_acl::set_malloc_physical_max_success(15 * kGiB);
+    actual = 0;
+    void* failed =
+        ascend_allocate_memory_best_effort(40 * kGiB, "ascend", &actual);
+    EXPECT_EQ(failed, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    mock_acl::set_malloc_physical_max_success(0);
+    actual = 0;
+    void* ok = ascend_allocate_memory_best_effort(kGiB, "ascend", &actual);
+    ASSERT_NE(ok, nullptr);
+    EXPECT_EQ(CurrentAclDevice(), (d0 + 1) % kDeviceCount);
+    ascend_free_memory("ascend", ok);
+}
 
 TEST(RoceModeDetectionTest, GlobalResourceConfig_StringRoceDesc) {
     EXPECT_TRUE(HasRoceProtocolDescInGlobalResourceConfig(
@@ -2043,6 +2461,72 @@ TEST(RoceModeDetectionTest, IsRoceModeEnabled_FromHcclEnv) {
     setenv("HCCL_INTRA_ROCE_ENABLE", "1", 1);
     EXPECT_TRUE(IsRoceModeEnabled());
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
+}
+
+TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_FlatFabricMemory) {
+    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"fabric_memory.max_capacity":32})"));
+    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"fabric_memory.start_address":"72","comm_resource_config.protocol_desc":"hccs:device"})"));
+}
+
+TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_NestedFabricMemory) {
+    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"fabric_memory":{"max_capacity":32,"start_address":40}})"));
+}
+
+TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_NoFabricMemory) {
+    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"hccs:device"})"));
+    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig("{}"));
+    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig(nullptr));
+}
+
+TEST(FabricMemConfigDetectionTest,
+     IsFabricMemEnabled_FromGlobalResourceConfig) {
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_use_fabric_mem = false;
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"fabric_memory.max_capacity":32})", 1);
+    EXPECT_TRUE(IsFabricMemEnabledFromGlobalResourceConfig());
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
+TEST_F(AscendDirectTransportTest,
+       Standalone_FabricMem_FromGlobalResourceConfig) {
+    // Normal/P2P TE enables fabric mem when ASCEND_GLOBAL_RESOURCE_CONFIG
+    // carries fabric_memory, without ASCEND_ENABLE_USE_FABRIC_MEM / store init.
+    globalConfig().ascend_agent_mode = false;
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_use_fabric_mem = false;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"fabric_memory.max_capacity":32})", 1);
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 1;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:8000", "127.0.0.1:8100",
+                                          "127.0.0.1:8200", "127.0.0.1:8300"};
+    addMultiEndpointRemoteSegment(transport->meta(), 1, "fabric_via_grc",
+                                  "127.0.0.1", endpoints, /*dest_device_id=*/2,
+                                  0x10000, kTransferBufSize);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:8200")
+        << "Normal TE with fabric_memory in GLOBAL_RESOURCE_CONFIG routes by "
+           "dest buffer device_id";
+
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
 }
 
 // -----------------------------------------------------------------------------
@@ -2130,6 +2614,53 @@ TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
         EXPECT_FALSE(IsRoceModeEnabled()) << "P2P TE should resolve to HCCS";
     }
     unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
+// -----------------------------------------------------------------------------
+// Client-Server mode: when capability is supported and user did not set
+// ASCEND_LOCAL_COMM_RES, Mooncake auto-injects LocalCommRes={"version":"1.3"}
+// so EngineFactory selects HixlEngine (HixlCS path).
+// -----------------------------------------------------------------------------
+
+class ClientServerModeTest : public AscendDirectTransportTest {
+   protected:
+    void SetUp() override {
+        AscendDirectTransportTest::SetUp();
+        unsetenv("ASCEND_LOCAL_COMM_RES");
+    }
+    void TearDown() override {
+        unsetenv("ASCEND_LOCAL_COMM_RES");
+        AscendDirectTransportTest::TearDown();
+    }
+};
+
+TEST_F(ClientServerModeTest, AutoInjectLocalCommResWhenSupported) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    auto it = opts.find("adxl.LocalCommRes");
+    ASSERT_NE(it, opts.end());
+    EXPECT_EQ(it->second, R"({"version":"1.3"})");
+}
+
+TEST_F(ClientServerModeTest, NoInjectWhenNotSupported) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    EXPECT_EQ(opts.find("adxl.LocalCommRes"), opts.end());
+}
+
+TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_LOCAL_COMM_RES", R"({"version":"1.2"})", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    auto it = opts.find("adxl.LocalCommRes");
+    ASSERT_NE(it, opts.end());
+    EXPECT_EQ(it->second, R"({"version":"1.2"})");
 }
 
 int main(int argc, char** argv) {

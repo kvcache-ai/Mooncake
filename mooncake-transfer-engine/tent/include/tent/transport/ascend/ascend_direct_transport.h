@@ -82,6 +82,8 @@ class AscendDirectTransport : public Transport {
 
     void disconnect(const std::string &remote_hixl, int32_t timeout_in_millis);
 
+    void forgetConnectedSegment(const std::string &remote_hixl);
+
     void startTransfer(SegmentID target_id, Request::OpCode opcode,
                        const std::vector<HixlTask *> &tasks);
 

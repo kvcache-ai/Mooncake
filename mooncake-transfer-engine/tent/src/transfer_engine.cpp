@@ -15,6 +15,7 @@
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/runtime/topology.h"
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -49,6 +50,15 @@ const std::string TransferEngine::getRpcServerAddress() const {
 
 uint16_t TransferEngine::getRpcServerPort() const {
     return impl_->getRpcServerPort();
+}
+
+std::shared_ptr<Topology> TransferEngine::getLocalTopology() const {
+    return impl_->getLocalTopology();
+}
+
+std::string TransferEngine::getLocalTopologyString() const {
+    auto topo = impl_->getLocalTopology();
+    return topo ? topo->toString() : "{}";
 }
 
 Status TransferEngine::exportLocalSegment(std::string& shared_handle) {

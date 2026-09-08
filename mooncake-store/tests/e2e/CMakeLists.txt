@@ -8,7 +8,7 @@ target_link_libraries(clientctl PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -18,7 +18,7 @@ target_link_libraries(e2e_rand_test PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
@@ -29,7 +29,7 @@ target_link_libraries(chaosctl PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -39,7 +39,7 @@ target_link_libraries(client_runner PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -49,7 +49,7 @@ target_link_libraries(oplog_ha_client PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     pthread
     ${ETCD_WRAPPER_LIB}
 )
@@ -59,7 +59,7 @@ target_link_libraries(chaos_test PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
@@ -70,7 +70,7 @@ target_link_libraries(chaos_rand_test PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
@@ -84,7 +84,7 @@ target_link_libraries(storage_backend_e2e_test PUBLIC
     mooncake_store
     transfer_engine
     cachelib_memory_allocator
-    glog
+    glog::glog
     gtest
     pthread
     ${ETCD_WRAPPER_LIB}
@@ -93,6 +93,6 @@ target_link_libraries(storage_backend_e2e_test PUBLIC
 add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)
 
 add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp)
-target_link_libraries(oplog_batch_e2e_test PUBLIC glog gtest pthread)
+target_link_libraries(oplog_batch_e2e_test PUBLIC glog::glog gtest pthread)
 add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
 set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)

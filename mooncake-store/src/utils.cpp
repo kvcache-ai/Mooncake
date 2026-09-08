@@ -1,11 +1,12 @@
 #include "utils.h"
 #include "random.h"
 #include "mmap_arena.h"
-#include "config.h"
 #include "common.h"
-#include "ub_allocator.h"
 
-#include <Slab.h>
+#include "ascii_string.h"
+#include "bool_parser.h"
+#include "environ.h"
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <ifaddrs.h>
@@ -14,8 +15,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <boost/algorithm/string.hpp>
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -29,7 +28,6 @@
 #include <sys/mman.h>
 #include <thread>
 #include <vector>
-
 // Feature flag to enable/disable arena allocator. Disabled by default so the
 // library does not pre-map a large pool unless the operator opts in via gflag
 // or an explicit MC_MMAP_ARENA_POOL_SIZE environment override.
@@ -40,20 +38,6 @@ DEFINE_bool(use_mmap_arena_allocator, false,
 // override).
 DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
               "Arena allocator pool size in bytes");
-#ifdef USE_ASCEND_DIRECT
-#include "acl/acl.h"
-#endif
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-#include "ascend_allocator.h"
-#endif
-#if defined(USE_SUNRISE)
-#include "sunrise_allocator.h"
-#endif
-
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
-
 #include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
@@ -106,42 +90,6 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
-void *allocate_buffer_allocator_memory(size_t total_size,
-                                       const std::string &protocol,
-                                       size_t alignment, bool use_spdk_dma) {
-    const size_t default_alignment = facebook::cachelib::Slab::kSize;
-    // Ensure total_size is a multiple of alignment
-    if (alignment == default_alignment && total_size < alignment) {
-        LOG(ERROR) << "Total size must be at least " << alignment;
-        return nullptr;
-    }
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-    if (protocol == "ascend" || protocol == "ubshmem") {
-        return ascend_allocate_memory(total_size, protocol);
-    }
-#endif
-#if defined(USE_SUNRISE)
-    if (protocol == "sunrise_link") {
-        return sunrise_allocate_memory(
-            total_size, alignment,
-            mooncake::globalConfig().sunrise_use_device_mem);
-    }
-#endif
-#if defined(USE_UB)
-    if (protocol == "ub") {
-        return mooncake::ub_allocate_memory(alignment, total_size);
-    }
-#endif
-#ifdef USE_NOF
-    if (use_spdk_dma && total_size > 0) {
-        return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
-                                                          -1);
-    }
-#endif
-    // Allocate aligned memory
-    return aligned_alloc(alignment, total_size);
-}
-
 // Global arena instance (lazy initialization)
 static std::unique_ptr<MmapArena> g_mmap_arena;
 static std::once_flag g_arena_init_flag;
@@ -150,12 +98,13 @@ static std::atomic<uint64_t> g_arena_noop_free_count{0};
 
 static void initializeGlobalArena() {
     const std::string env_pool_size =
-        GetEnvStringOr("MC_MMAP_ARENA_POOL_SIZE", "");
+        Environ::GetString("MC_MMAP_ARENA_POOL_SIZE", "");
     // Allow env var to override the gflag (useful when loaded as .so from
     // Python). An explicit pool-size env var is also treated as an opt-in,
     // because pybind11 users cannot easily pass gflags.
-    const std::string env_disable = GetEnvStringOr("MC_DISABLE_MMAP_ARENA", "");
-    const std::optional<bool> disable_override = string_to_bool(env_disable);
+    const std::string env_disable =
+        Environ::GetString("MC_DISABLE_MMAP_ARENA", "");
+    const std::optional<bool> disable_override = TryParseBool(env_disable);
     if (!env_disable.empty() && !disable_override.has_value()) {
         LOG(WARNING) << "Ignoring invalid MC_DISABLE_MMAP_ARENA='"
                      << env_disable
@@ -476,6 +425,8 @@ void *allocate_buffer_numa_segments(size_t total_size,
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (page_size == SZ_2MB) {
         flags |= MAP_HUGETLB | MAP_HUGE_2MB;
+    } else if (page_size == SZ_512MB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_512MB;
     } else if (page_size == SZ_1GB) {
         flags |= MAP_HUGETLB | MAP_HUGE_1GB;
     } else if (page_size != static_cast<size_t>(getpagesize())) {
@@ -522,70 +473,6 @@ void *allocate_buffer_numa_segments(size_t total_size,
             return s;
         }() << "]";
     return ptr;
-}
-
-void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-    if (protocol == "ascend" || protocol == "ubshmem") {
-        return ascend_free_memory(protocol, ptr);
-    }
-#endif
-#if defined(USE_SUNRISE)
-    if (protocol == "sunrise_link") {
-        return sunrise_free_memory(ptr);
-    }
-#endif
-#if defined(USE_UB)
-    if (protocol == "ub") {
-        mooncake::ub_free_memory(ptr);
-        return;
-    }
-#endif
-#ifdef USE_NOF
-    // Mirror allocate_buffer_allocator_memory(): a buffer taken from the SPDK
-    // hugepage pool (spdk_zmalloc) must be released with spdk_free, not glibc
-    // free(), which would abort with "free(): invalid pointer".
-    if (use_spdk_dma) {
-        mooncake::SpdkWrapper::GetInstance().Free(ptr);
-        return;
-    }
-#endif
-    free(ptr);
-}
-
-std::string formatDeviceNames(const std::string &device_names) {
-    std::stringstream ss(device_names);
-    std::string item;
-    std::vector<std::string> tokens;
-    while (getline(ss, item, ',')) {
-        tokens.push_back(item);
-    }
-
-    std::string formatted;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        formatted += "\"" + tokens[i] + "\"";
-        if (i < tokens.size() - 1) {
-            formatted += ",";
-        }
-    }
-    return formatted;
-}
-
-std::vector<std::string> splitString(const std::string &str, char delimiter,
-                                     bool trim_spaces, bool keep_empty) {
-    std::vector<std::string> result;
-
-    boost::split(
-        result, str, boost::is_any_of(std::string(1, delimiter)),
-        keep_empty ? boost::token_compress_off : boost::token_compress_on);
-
-    if (trim_spaces) {
-        for (auto &token : result) {
-            boost::trim(token);
-        }
-    }
-
-    return result;
 }
 
 tl::expected<std::string, int> httpGet(const std::string &url) {
@@ -713,38 +600,30 @@ int64_t time_gen() {
         .count();
 }
 
-std::string GetEnvStringOr(const char *name, const std::string &default_value) {
-    const char *env_val = std::getenv(name);
-    return env_val ? std::string(env_val) : default_value;
+static bool IsUsableMooncakeHostId(std::string_view host_id) {
+    return !host_id.empty() &&
+           !AsciiCaseInsensitiveEquals(host_id, "localhost") &&
+           host_id != "127.0.0.1" && host_id != "0.0.0.0" && host_id != "::1" &&
+           host_id != "[::1]" && host_id != "::" && host_id != "[::]";
+}
+
+static std::string NormalizeMooncakeHostId(std::string_view value) {
+    const std::string hostname(TrimAsciiWhitespace(value));
+    const std::string host_id = (hostname == "::1" || hostname == "::")
+                                    ? hostname
+                                    : std::string(TrimAsciiWhitespace(
+                                          getHostNameWithoutPort(hostname)));
+    return IsUsableMooncakeHostId(host_id) ? host_id : "";
 }
 
 std::string ResolveMooncakeHostId(const std::string &local_hostname) {
-    auto trim = [](std::string value) {
-        const auto begin = value.find_first_not_of(" \t\r\n");
-        if (begin == std::string::npos) {
-            return std::string();
-        }
-        const auto end = value.find_last_not_of(" \t\r\n");
-        return value.substr(begin, end - begin + 1);
-    };
-
-    const std::string hostname = trim(local_hostname);
-    const std::string host_id = (hostname == "::1" || hostname == "::")
-                                    ? hostname
-                                    : trim(getHostNameWithoutPort(hostname));
-    if (host_id.empty()) {
-        return "";
+    const std::string configured_host_id(
+        TrimAsciiWhitespace(Environ::GetString("MOONCAKE_HOST_ID", "")));
+    if (!configured_host_id.empty()) {
+        return NormalizeMooncakeHostId(configured_host_id);
     }
 
-    std::string lower = host_id;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
-        lower == "::1" || lower == "[::1]" || lower == "::" ||
-        lower == "[::]") {
-        return "";
-    }
-    return host_id;
+    return NormalizeMooncakeHostId(local_hostname);
 }
 
 static std::string SanitizeKey(const std::string &key) {

@@ -15,7 +15,8 @@
 
 #include <transfer_engine.h>
 
-#include "types.h"
+#include "control_plane/control_types.h"
+#include "error_types.h"
 
 namespace mooncake {
 
@@ -29,7 +30,8 @@ class LinkManager {
    public:
     LinkManager() = default;
 
-    void init(GlobalRank rank, int max_world_size, TransferEngine* engine);
+    PGResult<void> init(GlobalRank rank, int max_world_size,
+                        TransferEngine* engine);
     void start(uint64_t self_rank_epoch);
     void stop();
 

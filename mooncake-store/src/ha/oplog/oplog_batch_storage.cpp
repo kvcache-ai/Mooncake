@@ -1,7 +1,9 @@
 #include "ha/oplog/oplog_batch_storage.h"
 
 #include <algorithm>
+#include <array>
 #include <charconv>
+#include <string_view>
 
 #include <glog/logging.h>
 
@@ -50,6 +52,23 @@ bool TryParseBatchIdFromKey(const std::string& key, uint64_t& batch_id) {
            result.ptr == suffix.data() + suffix.size();
 }
 
+bool TryParseProducerView(std::string_view value,
+                          ViewVersionId& producer_view_version) {
+    ViewVersionId parsed = 0;
+    const auto result =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size() ||
+        parsed <= 0 || std::to_string(parsed) != value) {
+        return false;
+    }
+    producer_view_version = parsed;
+    return true;
+}
+
+bool IsAmbiguousTxnError(ErrorCode error) {
+    return error == ErrorCode::ETCD_OPERATION_ERROR;
+}
+
 }  // namespace
 
 OpLogBatchStorage::OpLogBatchStorage(std::string cluster_id,
@@ -69,7 +88,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
     }
     err = ReadDurablePrefix(prefix);
     if (err == ErrorCode::OK) {
-        return ErrorCode::OK;
+        return ValidateDurablePrefixAtStartup(prefix);
     }
     if (err != ErrorCode::ETCD_KEY_NOT_EXIST) {
         return err;
@@ -98,15 +117,24 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
                             .expected_value = ""});
     txn.puts.push_back(
         {.key = durable_key, .value = EncodeDurablePrefix(initial)});
-    err = backend_.Txn(txn);
-    if (err == ErrorCode::OK) {
+    const ErrorCode txn_err = backend_.Txn(txn);
+    if (txn_err == ErrorCode::OK) {
         prefix = initial;
         return ErrorCode::OK;
     }
-    if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
-        return ReadDurablePrefix(prefix);
+    if (txn_err != ErrorCode::ETCD_TRANSACTION_FAIL &&
+        !IsAmbiguousTxnError(txn_err)) {
+        return txn_err;
     }
-    return err;
+
+    err = ReadDurablePrefix(prefix);
+    if (err != ErrorCode::OK) {
+        return IsAmbiguousTxnError(txn_err) &&
+                       err == ErrorCode::ETCD_KEY_NOT_EXIST
+                   ? txn_err
+                   : err;
+    }
+    return ValidateDurablePrefixAtStartup(prefix);
 }
 
 ErrorCode OpLogBatchStorage::ReadDurablePrefix(DurablePrefix& prefix) {
@@ -127,8 +155,174 @@ ErrorCode OpLogBatchStorage::ReadDurablePrefix(DurablePrefix& prefix) {
     return ErrorCode::OK;
 }
 
+ErrorCode OpLogBatchStorage::ReadProducerView(
+    ViewVersionId& producer_view_version) const {
+    if (!IsValidClusterId()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::string value;
+    ErrorCode err = backend_.Get(BuildProducerViewKey(cluster_id_), value);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (!TryParseProducerView(value, producer_view_version)) {
+        LOG(ERROR) << "Invalid producer view value: cluster=" << cluster_id_;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::ClaimProducerView(
+    ViewVersionId producer_view_version) {
+    if (!IsValidClusterId() || producer_view_version <= 0 ||
+        !backend_.SupportsTxn()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    const std::string key = BuildProducerViewKey(cluster_id_);
+    const std::string requested_value = std::to_string(producer_view_version);
+    while (true) {
+        std::string current_value;
+        ErrorCode err = backend_.Get(key, current_value);
+        if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+            return err;
+        }
+
+        const bool key_missing = err == ErrorCode::ETCD_KEY_NOT_EXIST;
+        if (!key_missing) {
+            ViewVersionId current_view = 0;
+            if (!TryParseProducerView(current_value, current_view)) {
+                LOG(ERROR) << "Invalid producer view value while claiming: "
+                           << "cluster=" << cluster_id_;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            if (current_view > producer_view_version) {
+                LOG(WARNING)
+                    << "Producer view claim fenced: cluster=" << cluster_id_
+                    << ", requested=" << producer_view_version
+                    << ", current=" << current_view;
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+            if (current_view == producer_view_version) {
+                return ErrorCode::OK;
+            }
+        }
+
+        KvTxn txn;
+        txn.compares.push_back(
+            {.key = key,
+             .kind = key_missing ? KvCompareKind::kKeyNotExists
+                                 : KvCompareKind::kValueEquals,
+             .expected_value = key_missing ? "" : current_value});
+        txn.puts.push_back({.key = key, .value = requested_value});
+        err = backend_.Txn(txn);
+        if (err == ErrorCode::OK) {
+            return ErrorCode::OK;
+        }
+        if (IsAmbiguousTxnError(err)) {
+            ViewVersionId current_view = 0;
+            ErrorCode read_err = ReadProducerView(current_view);
+            if (read_err == ErrorCode::OK) {
+                if (current_view == producer_view_version) {
+                    return ErrorCode::OK;
+                }
+                if (current_view > producer_view_version) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else if (read_err != ErrorCode::ETCD_KEY_NOT_EXIST &&
+                       !IsAmbiguousTxnError(read_err)) {
+                return read_err;
+            }
+            return err;
+        }
+        if (err != ErrorCode::ETCD_TRANSACTION_FAIL) {
+            return err;
+        }
+    }
+}
+
+ErrorCode OpLogBatchStorage::ValidateProducerView(
+    ViewVersionId producer_view_version) const {
+    if (!IsValidClusterId() || producer_view_version <= 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    ViewVersionId current_view = 0;
+    ErrorCode err = ReadProducerView(current_view);
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (current_view != producer_view_version) {
+        LOG(WARNING) << "Producer view validation failed: cluster="
+                     << cluster_id_ << ", expected=" << producer_view_version
+                     << ", current=" << current_view;
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::ValidateDurablePrefixAtStartup(
+    const DurablePrefix& prefix) {
+    if ((prefix.batch_id == 0) != (prefix.last_seq == 0)) {
+        LOG(ERROR) << "Durable prefix has inconsistent zero fields: cluster="
+                   << cluster_id_ << ", batch_id=" << prefix.batch_id
+                   << ", last_seq=" << prefix.last_seq;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (prefix.batch_id == 0) {
+        const auto range = BuildBatchRecordRange(cluster_id_, 0);
+        std::vector<KvPair> batches;
+        ErrorCode err =
+            backend_.Range(range.begin_key, range.end_key, 1, batches);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        if (!batches.empty()) {
+            LOG(ERROR) << "Zero durable prefix has batch records: cluster="
+                       << cluster_id_;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        return ErrorCode::OK;
+    }
+
+    OpLogBatchRecord batch;
+    ErrorCode err = ReadBatch(prefix.batch_id, batch);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        LOG(ERROR) << "Durable prefix terminal batch is missing: cluster="
+                   << cluster_id_ << ", batch_id=" << prefix.batch_id;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (batch.last_seq != prefix.last_seq) {
+        LOG(ERROR) << "Durable prefix last sequence does not match batch: "
+                   << "cluster=" << cluster_id_
+                   << ", batch_id=" << prefix.batch_id
+                   << ", prefix_last_seq=" << prefix.last_seq
+                   << ", batch_last_seq=" << batch.last_seq;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
     const OpLogBatchRecord& batch, const DurablePrefix& expected_prefix) {
+    return WriteBatchAndAdvancePrefixImpl(batch, expected_prefix, nullptr);
+}
+
+ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
+    const OpLogBatchRecord& batch, const DurablePrefix& expected_prefix,
+    ViewVersionId producer_view_version) {
+    if (producer_view_version <= 0) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return WriteBatchAndAdvancePrefixImpl(batch, expected_prefix,
+                                          &producer_view_version);
+}
+
+ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefixImpl(
+    const OpLogBatchRecord& batch, const DurablePrefix& expected_prefix,
+    const ViewVersionId* producer_view_version) {
     if (!IsValidClusterId()) {
         return ErrorCode::INVALID_PARAMS;
     }
@@ -164,25 +358,57 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
         encoded_batch.size());
 #endif
     KvTxn txn;
+    if (producer_view_version != nullptr) {
+        txn.compares.push_back(
+            {.key = BuildProducerViewKey(cluster_id_),
+             .kind = KvCompareKind::kValueEquals,
+             .expected_value = std::to_string(*producer_view_version)});
+    }
+    const size_t durable_compare_index = txn.compares.size();
     txn.compares.push_back(
         {.key = durable_key,
          .kind = KvCompareKind::kValueEquals,
          .expected_value = EncodeDurablePrefix(expected_prefix)});
     txn.puts.push_back({.key = BuildBatchRecordKey(cluster_id_, batch.batch_id),
                         .value = encoded_batch});
-    txn.puts.push_back(
-        {.key = durable_key,
-         .value = EncodeDurablePrefix(
-             {.batch_id = batch.batch_id, .last_seq = batch.last_seq})});
+    txn.puts.push_back({.key = durable_key,
+                        .value = EncodeDurablePrefix({
+                            .batch_id = batch.batch_id,
+                            .last_seq = batch.last_seq,
+                        })});
     ErrorCode err = backend_.Txn(txn);
-    if (err != ErrorCode::ETCD_TRANSACTION_FAIL) {
+    if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        std::string raw_prefix;
+        DurablePrefix decoded_prefix;
+        if (backend_.Get(durable_key, raw_prefix) == ErrorCode::OK &&
+            raw_prefix != txn.compares[durable_compare_index].expected_value &&
+            DecodeDurablePrefix(raw_prefix, &decoded_prefix) &&
+            decoded_prefix == expected_prefix) {
+            txn.compares[durable_compare_index].expected_value = raw_prefix;
+            err = backend_.Txn(txn);
+        }
+    }
+    if (err != ErrorCode::ETCD_TRANSACTION_FAIL && !IsAmbiguousTxnError(err)) {
         return err;
+    }
+
+    if (producer_view_version != nullptr) {
+        ViewVersionId current_view = 0;
+        ErrorCode view_err = ReadProducerView(current_view);
+        if (view_err == ErrorCode::ETCD_KEY_NOT_EXIST ||
+            (view_err == ErrorCode::OK &&
+             current_view != *producer_view_version)) {
+            return ErrorCode::ETCD_TRANSACTION_FAIL;
+        }
+        if (view_err != ErrorCode::OK) {
+            return view_err;
+        }
     }
 
     DurablePrefix current_prefix;
     if (ReadDurablePrefix(current_prefix) != ErrorCode::OK ||
-        current_prefix.batch_id != batch.batch_id ||
-        current_prefix.last_seq != batch.last_seq) {
+        current_prefix != DurablePrefix{.batch_id = batch.batch_id,
+                                        .last_seq = batch.last_seq}) {
         return err;
     }
     OpLogBatchRecord current_batch;
@@ -207,6 +433,11 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
     std::string reason;
     if (!DecodeOpLogBatchRecord(value, &batch, &reason)) {
         LOG(ERROR) << "Failed to decode OpLog batch record: " << reason;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (batch.batch_id != batch_id) {
+        LOG(ERROR) << "OpLog batch id does not match key: requested="
+                   << batch_id << ", payload=" << batch.batch_id;
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
@@ -288,17 +519,26 @@ ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
     }
 
     entries.clear();
-    err = backend_.Range(root + "snapshot/", root + "snapshot0",
-                         /*limit=*/1, entries);
+    const std::string snapshot_prefix = root + "snapshot/";
+    constexpr std::array<std::string_view, 4> kBatchSnapshotControlKeys{
+        "latest", "fallback", "maintenance", "compaction_floor"};
+    err = backend_.Range(snapshot_prefix, root + "snapshot0",
+                         kBatchSnapshotControlKeys.size() + 1, entries);
     if (err != ErrorCode::OK) {
         return err;
     }
-    if (!entries.empty()) {
-        LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
-                   << cluster_id_
-                   << "; clear the legacy OpLog namespace before enabling "
-                      "batch-record OpLog";
-        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    for (const auto& entry : entries) {
+        const std::string_view key(entry.key);
+        const std::string_view suffix = key.substr(snapshot_prefix.size());
+        if (std::find(kBatchSnapshotControlKeys.begin(),
+                      kBatchSnapshotControlKeys.end(),
+                      suffix) == kBatchSnapshotControlKeys.end()) {
+            LOG(ERROR) << "Legacy OpLog snapshot sidecar exists for cluster="
+                       << cluster_id_
+                       << "; clear the legacy OpLog namespace before enabling "
+                          "batch-record OpLog";
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
     }
     return ErrorCode::OK;
 }

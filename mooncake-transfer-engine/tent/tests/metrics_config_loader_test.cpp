@@ -151,6 +151,18 @@ TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithPartialVars) {
     EXPECT_EQ(config.http_host, "0.0.0.0");
 }
 
+TEST(MetricsConfigLoaderTest, InvalidNumericEnvironmentValuesUseDefaults) {
+    EnvVarGuard g1(config_keys::ENV_METRICS_HTTP_PORT, "8080junk");
+    EnvVarGuard g2(config_keys::ENV_METRICS_HTTP_SERVER_THREADS, "2x");
+    EnvVarGuard g3(config_keys::ENV_METRICS_REPORT_INTERVAL, "30s");
+
+    MetricsConfig config = MetricsConfigLoader::loadFromEnvironment();
+
+    EXPECT_EQ(config.http_port, 9100);
+    EXPECT_EQ(config.http_server_threads, 2);
+    EXPECT_EQ(config.report_interval_seconds, 30);
+}
+
 //------------------------------------------------------------------------------
 // MetricsConfigLoader::loadWithDefaults Tests
 //------------------------------------------------------------------------------
@@ -301,6 +313,7 @@ TEST(ConfigHelperTest, ParseIntValid) {
 TEST(ConfigHelperTest, ParseIntInvalid) {
     EXPECT_EQ(ConfigHelper::parseInt("not-a-number", 99), 99);
     EXPECT_EQ(ConfigHelper::parseInt("", 50), 50);
+    EXPECT_EQ(ConfigHelper::parseInt("42x", 99), 99);
 }
 
 TEST(ConfigHelperTest, ParsePortValid) {
@@ -312,6 +325,7 @@ TEST(ConfigHelperTest, ParsePortValid) {
 TEST(ConfigHelperTest, ParsePortInvalid) {
     EXPECT_EQ(ConfigHelper::parsePort("not-a-port", 9100), 9100);
     EXPECT_EQ(ConfigHelper::parsePort("", 9100), 9100);
+    EXPECT_EQ(ConfigHelper::parsePort("8080junk", 9100), 9100);
 }
 
 TEST(ConfigHelperTest, ParseDoubleArrayValid) {

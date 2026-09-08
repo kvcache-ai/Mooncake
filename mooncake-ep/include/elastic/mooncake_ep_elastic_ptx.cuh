@@ -3,7 +3,7 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
-#include <cuda_bf16.h>
+#include <cuda_alike.h>
 #include <cstdint>
 
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
@@ -22,7 +22,7 @@ using arrival_phase = uint32_t;
 // More than TMA, `longlong4` requires 32 bytes aligned
 static constexpr int kNumTMAAlignBytes = 32;
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 
 /// Exceptions
 __forceinline__ __device__ void trap() {
@@ -517,6 +517,30 @@ __forceinline__ __device__ void red_add_rel_sys(const int64_t* ptr,
     __threadfence_system();
 #else
     asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(ptr),
+                 "l"(value));
+#endif
+}
+
+__forceinline__ __device__ void red_add_rel_gpu(const int* ptr,
+                                                const int& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<int*>(ptr), value);
+    __threadfence();
+#else
+    asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(ptr),
+                 "r"(value));
+#endif
+}
+
+__forceinline__ __device__ void red_add_rel_gpu(const int64_t* ptr,
+                                                const int64_t& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<unsigned long long*>(
+                  reinterpret_cast<const unsigned long long*>(ptr)),
+              static_cast<unsigned long long>(value));
+    __threadfence();
+#else
+    asm volatile("red.release.gpu.global.add.u64 [%0], %1;" ::"l"(ptr),
                  "l"(value));
 #endif
 }

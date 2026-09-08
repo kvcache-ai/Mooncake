@@ -483,10 +483,11 @@ TEST_F(MasterServiceSSDSnapshotTest, PutStartExpires) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
         }
 
-        // Try PutEnd the discarded replica.
+        // PutEnd must reject a replica discarded after the write expired.
         put_end_result =
             service_->PutEnd(client_id, key, TenantId::Default(), discard_type);
-        EXPECT_TRUE(put_end_result.has_value());
+        ASSERT_FALSE(put_end_result.has_value());
+        EXPECT_EQ(put_end_result.error(), ErrorCode::INVALID_WRITE);
 
         // Check that the key has only one replica.
         auto get_result = service_->GetReplicaList(key, TenantId::Default());

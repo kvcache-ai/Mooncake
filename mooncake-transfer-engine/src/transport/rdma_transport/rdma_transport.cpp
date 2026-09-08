@@ -23,7 +23,6 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
-#include <future>
 #include <set>
 #include <thread>
 #include <utility>
@@ -35,6 +34,7 @@
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/batch_registration.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -394,6 +394,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void *chunk_addr = chunks[ci].first;
         size_t chunk_len = chunks[ci].second;
+        const uint64_t chunk_offset = reinterpret_cast<uintptr_t>(chunk_addr) -
+                                      reinterpret_cast<uintptr_t>(addr);
+        DmabufExport chunk_dmabuf_exp = dmabuf_exp;
+        if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
+            chunk_dmabuf_exp.offset += chunk_offset;
 
         if (do_pre_touch) {
             // Parallel pre-touch the memory to speed up registration.
@@ -429,10 +434,10 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             const int ar = access_rights;  // Local copy for lambda capture
 
             for (size_t i = 0; i < context_list_.size(); ++i) {
-                reg_threads.emplace_back([this, &ret_codes, &dmabuf_exp, i,
+                reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                        chunk_addr, chunk_len, ar, dmabuf_exp);
+                        chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
                 });
             }
 
@@ -453,7 +458,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         } else {
             for (size_t i = 0; i < context_list_.size(); ++i) {
                 int ret = context_list_[i]->registerMemoryRegion(
-                    chunk_addr, chunk_len, access_rights, dmabuf_exp);
+                    chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
                     LOG(ERROR) << "Failed to register memory region (chunk "
                                << ci << ") with context " << i;
@@ -718,7 +723,7 @@ int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     if (!Environ::Get().GetWithNvidiaPeermem()) {
         for (auto &buffer : buffer_list) {
             int ret = registerLocalMemory(buffer.addr, buffer.length, location,
@@ -732,30 +737,31 @@ int RdmaTransport::registerLocalMemoryBatch(
         }
     } else {
 #endif
-        std::vector<std::future<int>> results;
-        for (auto &buffer : buffer_list) {
-            results.emplace_back(std::async(
-                std::launch::async, [this, buffer, location]() -> int {
-                    // Use force_sequential=true to avoid nested parallelism
-                    return registerLocalMemoryInternal(buffer.addr,
-                                                       buffer.length, location,
-                                                       true, false, true);
-                }));
-        }
+        auto start = std::chrono::steady_clock::now();
+        int first_error =
+            runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
+                int ret = registerLocalMemoryInternal(
+                    buffer_list[i].addr, buffer_list[i].length, location, true,
+                    false, true);
+                if (ret) {
+                    LOG(WARNING)
+                        << "RdmaTransport: Failed to register memory: addr "
+                        << buffer_list[i].addr << " length "
+                        << buffer_list[i].length;
+                }
+                return ret;
+            });
 
-        int first_error = 0;
-        for (size_t i = 0; i < buffer_list.size(); ++i) {
-            int ret = results[i].get();
-            if (ret) {
-                LOG(WARNING)
-                    << "RdmaTransport: Failed to register memory: addr "
-                    << buffer_list[i].addr << " length "
-                    << buffer_list[i].length;
-                if (!first_error) first_error = ret;
-            }
-        }
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
+        LOG(INFO) << "RdmaTransport: registered " << buffer_list.size()
+                  << " buffers on "
+                  << std::min(buffer_list.size(), maxConcurrentRegMr())
+                  << " threads in " << elapsed << "ms";
+
         if (first_error) return first_error;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     }  // Environ::Get().GetWithNvidiaPeermem()
 #endif
 
@@ -764,24 +770,15 @@ int RdmaTransport::registerLocalMemoryBatch(
 
 int RdmaTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    std::vector<std::future<int>> results;
-    for (auto &addr : addr_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, addr]() -> int {
-                // Use force_sequential=true to avoid nested parallelism
-                return unregisterLocalMemoryInternal(addr, false, true);
-            }));
-    }
-
-    int first_error = 0;
-    for (size_t i = 0; i < addr_list.size(); ++i) {
-        int ret = results[i].get();
+    int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
+        int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
-            if (!first_error) first_error = ret;
         }
-    }
+        return ret;
+    });
+
     int metadata_ret = metadata_->updateLocalSegmentDesc();
     return first_error ? first_error : metadata_ret;
 }
@@ -860,12 +857,18 @@ Status RdmaTransport::submitTransferTask(
         fail_unstarted_tasks(task_index + 1);
     };
     uint64_t nr_slices;
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto &task = *task_list[index];
+    size_t task_index = 0, request_index = 0;
+    while (task_index < task_list.size()) {
+        assert(task_list[task_index]);
+        auto &task = *task_list[task_index];
+        const size_t current_task_index = task_index;
         nr_slices = 0;
         assert(task.request);
-        auto &request = *task.request;
+        auto &request = task.request[request_index++];
+        if (request_index == task.request_count) {
+            ++task_index;
+            request_index = 0;
+        }
         auto target_desc_it = target_segment_descs.find(request.target_id);
         if (target_desc_it == target_segment_descs.end()) {
             target_desc_it =
@@ -940,7 +943,7 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                fail_task_and_cleanup(task, slice, index);
+                fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -950,7 +953,7 @@ Status RdmaTransport::submitTransferTask(
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
-                    fail_task_and_cleanup(task, slice, index);
+                    fail_task_and_cleanup(task, slice, current_task_index);
                     LOG(ERROR) << "Device " << device_id << " is not active";
                     return Status::InvalidArgument("Device " +
                                                    std::to_string(device_id) +
@@ -992,8 +995,10 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto &task = batch_desc.task_list[task_id];
         status[task_id].transferred_bytes = task.transferred_bytes;
-        uint64_t success_slice_count = task.success_slice_count;
-        uint64_t failed_slice_count = task.failed_slice_count;
+        uint64_t success_slice_count =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed_slice_count =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
         if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
@@ -1018,8 +1023,10 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
@@ -1062,6 +1069,8 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
     }
 
     // Use existing endpoint or create new one.
+    auto endpoint_lifecycle_lock =
+        context->lockEndpointLifecycle(peer_desc.local_nic_path);
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
     if (!endpoint) {
         local_desc.reply_msg = "Local RDMA endpoint unavailable for " +
@@ -1099,13 +1108,29 @@ int RdmaTransport::initializeRdmaResources() {
     for (auto &device_name : hca_list) {
         auto context = std::make_shared<RdmaContext>(*this, device_name);
         auto &config = globalConfig();
-        int ret = context->construct(config.num_cq_per_ctx,
-                                     config.num_comp_channels_per_ctx,
-                                     config.port, config.gid_index,
-                                     config.max_cqe, config.max_ep_per_ctx);
+        size_t cq_per_ctx = config.num_cq_per_ctx;
+        if (cq_per_ctx < static_cast<size_t>(config.workers_per_ctx)) {
+            cq_per_ctx = static_cast<size_t>(config.workers_per_ctx);
+            LOG(INFO) << "Increasing RDMA CQ count for " << device_name
+                      << " to match workers_per_ctx=" << config.workers_per_ctx
+                      << " for worker-owned endpoint polling";
+        }
+        int ret = context->construct(
+            cq_per_ctx, config.num_comp_channels_per_ctx, config.port,
+            config.gid_index, config.max_cqe, config.max_ep_per_ctx);
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
+            // Keep context_list_ index-aligned with getHcaList(): both it and
+            // BufferDesc::lkey are subscripted by the HCA index, which
+            // disableDevice() leaves in place. Dropping a slot would make a
+            // later device_id name the wrong RNIC or run off the end. A
+            // never-constructed context is an inert placeholder; the partially
+            // built one is released so it does not pin an open uverbs fd.
+            auto placeholder =
+                std::make_shared<RdmaContext>(*this, device_name);
+            placeholder->set_active(false);
+            context_list_.push_back(std::move(placeholder));
         } else {
             context_list_.push_back(context);
         }

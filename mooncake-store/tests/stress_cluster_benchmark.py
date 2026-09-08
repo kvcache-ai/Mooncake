@@ -2,7 +2,6 @@ import argparse
 import time
 import statistics
 import logging
-import ctypes
 import numpy as np
 from dataclasses import dataclass
 from typing import List, Dict, Any

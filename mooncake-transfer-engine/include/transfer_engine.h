@@ -15,7 +15,14 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <span>
+#include <string>
+#include <vector>
 
 #include "memory_location.h"
 #include "multi_transport.h"
@@ -53,6 +60,11 @@ using NicLoadStats = Transport::NicLoadStats;
 enum class PeerLiveness : uint8_t {
     Alive = 0,
     Unreachable = 1,
+};
+
+struct AutoDiscoverConfig {
+    bool enabled = false;
+    std::string protocol;
 };
 
 class TransferEngine {
@@ -121,6 +133,51 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    struct ScatterTransferRange {
+        TransferRequest::OpCode opcode;
+        std::string remote_segment;
+        uint64_t remote_base_offset;
+        size_t remote_size;
+        void* local_buffer;
+        size_t local_capacity;
+        std::span<const size_t> local_offsets;
+        std::span<const size_t> remote_offsets;
+        std::span<const size_t> lengths;
+        std::function<void(size_t, const Status&)> on_fragment_complete;
+    };
+
+    class ScatterTransferOperation {
+       public:
+        ScatterTransferOperation(ScatterTransferOperation&&) noexcept;
+        ScatterTransferOperation& operator=(
+            ScatterTransferOperation&&) noexcept;
+
+        // Destruction waits for physical completion before releasing state.
+        ~ScatterTransferOperation();
+
+        ScatterTransferOperation(const ScatterTransferOperation&) = delete;
+        ScatterTransferOperation& operator=(const ScatterTransferOperation&) =
+            delete;
+
+        // Single-consumer operation: do not wait concurrently or from a
+        // fragment completion callback.
+        Status wait();
+
+        // A wait timeout does not cancel the transfer. Keep this operation and
+        // its CPU/GPU buffers alive until a later wait reaches completion.
+        Status waitFor(std::chrono::nanoseconds timeout);
+
+       private:
+        class Impl;
+        explicit ScatterTransferOperation(std::unique_ptr<Impl> impl);
+        std::unique_ptr<Impl> impl_;
+        friend class TransferEngine;
+    };
+
+    ScatterTransferOperation submitScatter(
+        const std::vector<ScatterTransferRange>& ranges);
+    Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
@@ -204,6 +261,7 @@ class TransferEngine {
     bool checkOverlap(void* addr, uint64_t length);
 
     void setAutoDiscover(bool auto_discover);
+    void setAutoDiscover(const AutoDiscoverConfig& config);
 
     void* getBaseAddr();
 
@@ -213,6 +271,11 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    // String dump of the live local topology. Under TENT this is the native
+    // {"nics","mems"} JSON (with rank0/1/2). Under classic TE it is the
+    // priority-matrix JSON.
+    std::string getLocalTopologyString();
+
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 
@@ -221,6 +284,7 @@ class TransferEngine {
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
+    friend class TransferEngineImplTestPeer;
 };
 }  // namespace mooncake
 

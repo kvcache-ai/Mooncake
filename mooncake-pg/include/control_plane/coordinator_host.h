@@ -8,12 +8,11 @@
 #include <string>
 #include <unordered_map>
 
-#include <torch/csrc/distributed/c10d/Store.hpp>
-
 #include "coordinator.h"
 #include "rpc.h"
 #include "rpc_runtime.h"
 #include "serialized_executor.h"
+#include "error_types.h"
 
 namespace mooncake {
 
@@ -100,14 +99,16 @@ class CoordinatorRpcServiceImpl : public CoordinatorRpcService {
 // CoordinatorHost - execution host for the Coordinator state machine.
 class CoordinatorHost {
    public:
-    CoordinatorHost(c10::intrusive_ptr<c10d::Store> store,
-                    const std::string& host_ip, int max_world_size,
+    CoordinatorHost(const std::string& host_ip, int max_world_size,
                     int64_t fault_reconciliation_window_us);
 
     ~CoordinatorHost();
 
-    void start();
+    PGResult<void> start();
     void shutdown();
+    PGResult<void> setFaultReconciliationWindow(int64_t timeout_us);
+
+    const std::string& getListenAddr() const { return listen_addr_; }
 
     void postRegisterAgent(coro_rpc::context<RegisterAgentResponse> ctx,
                            RegisterAgentRequest req);
@@ -147,8 +148,8 @@ class CoordinatorHost {
     CentralizedCoordinatorStateMachine state_machine_;
     SerializedExecutor executor_;
 
-    c10::intrusive_ptr<c10d::Store> store_;
     std::string host_ip_;
+    std::string listen_addr_;
     int max_world_size_;
 
     // RPC infrastructure.

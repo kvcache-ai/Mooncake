@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 
 namespace mooncake {
 

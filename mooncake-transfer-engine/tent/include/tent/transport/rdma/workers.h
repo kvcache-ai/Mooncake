@@ -38,6 +38,8 @@ class RdmaTransport;
 class DeviceSelector;
 
 class Workers {
+    friend class RdmaTransportTestPeer;
+
    public:
     static constexpr size_t kCapacity = 1024 * 8;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
@@ -50,6 +52,12 @@ class Workers {
     Status start();
 
     Status stop();
+
+    // Stop accepting new submits and wait until every worker's inflight
+    // count hits 0. Workers keep polling CQ so in-flight GPUDirect writes
+    // can complete. timeout_ns bounds the wait so teardown cannot hang.
+    static constexpr uint64_t kDefaultQuiesceTimeoutNs = 10000000000ull;
+    Status quiesce(uint64_t timeout_ns = kDefaultQuiesceTimeoutNs);
 
     Status submit(RdmaSlice* slice);
 
@@ -69,13 +77,141 @@ class Workers {
 
     void asyncPollCq();
 
-    bool cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice);
+    // Resolve one completion: give back what the slice's lane accounts for,
+    // feed the transmit meter, and either finish, retry or fail it. Split
+    // from asyncPollCq so a test can drive it with a synthesized ibv_wc.
+    // `last_in_pass` is true for the final work completion of a poll pass:
+    // the meter is only offered a sample there, so an interval never ends
+    // partway through a group of completions that share one timestamp.
+    void handleCompletion(WorkerContext& worker, RdmaContext& context,
+                          const ibv_wc& wc, uint64_t poll_ts,
+                          bool last_in_pass = true);
 
-    void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
+    // The lane whose inflight_slice_set holds `slice`'s entry, or nullptr
+    // when it cannot be resolved (no lane recorded, or the worker array is
+    // not up yet).
+    WorkerContext* ownerContext(const RdmaSlice* slice);
+
+    // Index of `worker` in the lane array, or -1 when that array is not up
+    // yet: the inverse of ownerContext().
+    int laneIndex(const WorkerContext& worker) const;
+
+    // Give back everything a slice swept off a queue pair with a terminal
+    // status still holds: its selector charge, its place in whichever
+    // lane's inflight count has it, and its entry in whichever lane's set.
+    // Unless `bytes_moved` (the sweep finished it with COMPLETED and its own
+    // completion will credit the bytes), a posted slice also ends a stretch
+    // of busy time with nothing to show for it, so the transmit meter
+    // starts over. `deferred`, when given, collects the entries `self` is
+    // to erase, so the caller can do it after it stops iterating that set.
+    void retireSweptSlice(WorkerContext& self, RdmaSlice* slice,
+                          uint64_t now_ns, std::vector<RdmaSlice*>* deferred,
+                          bool bytes_moved = false);
+
+    // Take `slice` out of whichever lane's inflight count holds it, exactly
+    // once (`counted_lane` comes back -1 for everyone after): for a slice
+    // popped off a queue pair that is still in flight, for one dropped
+    // before it was posted, and for one finished by any path that leaves
+    // the count to be settled here. A re-submit needs no prior discount;
+    // submitFromTick moves the count itself.
+    void discountFromOwner(WorkerContext& self, RdmaSlice* slice);
+
+    // Decide who takes `slice` out of an inflight set. Returns true when the
+    // entry is `self`'s to erase -- because `self` holds it, or because
+    // nobody else does -- and false when it has been handed to the owning
+    // lane's reclaim list instead.
+    bool routeSetRemoval(WorkerContext& self, RdmaSlice* slice);
+
+    // Take out the slices other lanes swept on this lane's behalf.
+    void drainReclaimed(WorkerContext& worker);
+
+    // This lane's pass over its inflight set: take out what other lanes
+    // handed back, retire entries that turned terminal behind its back, and
+    // fail every slice that has waited longer than slice_timeout_ns_ since
+    // it was enqueued (software timeout). Split from asyncPollCq so it can
+    // be driven with a synthetic clock in tests.
+    void expireTimedOutSlices(WorkerContext& worker, uint64_t now_ns);
+
+    // Reorder `slices` (all contending for one NIC path) most-urgent-first
+    // by predicted MLU, RFC #2792. Split from asyncPostSend so a test can
+    // drive it with a live DeviceSelector and no endpoint.
+    void orderByDeadline(std::vector<RdmaSlice*>& slices, int dev_id,
+                         uint64_t now_ns);
+
+    // Charge `slice` to `dev_id`, moving or establishing the selector's
+    // accounting for it. Called when a retry or a fallback settles on a
+    // device: a retry's charge was returned by the failure path that
+    // re-submitted it, a fallback's still sits on the NIC the allocator
+    // picked. A device the selector does not know cannot be charged; the
+    // slice then keeps whatever charge it has, so the release still balances.
+    void rechargeSlice(RdmaSlice* slice, int dev_id);
+
+    // True when `slice` must not be posted -- the transfer was cancelled, or
+    // another lane resolved the slice while it waited for a re-post. Retires
+    // it like a sweep would (retireSweptSlice), so the caller can simply
+    // skip it.
+    bool dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice);
+
+    // Hand back everything the selector accounts for this slice: its
+    // allocation charge and, if it reached the hardware, its share of the
+    // NIC's posted backlog. `now_ns` closes the NIC's busy stretch when
+    // that share was the last of it, so it must come from the same clock as
+    // the timestamps the slice was posted with. `latency` is a successful
+    // attempt's post->completion time in seconds; 0 = no sample. See
+    // DeviceSelector::release.
+    void releaseSliceQuota(RdmaSlice* slice, uint64_t now_ns,
+                           double latency = 0.0);
+
+    // Record that `slice` has reached its source device's hardware. Its
+    // submit_ts opens the device's busy stretch when nothing else was
+    // posted to it.
+    void notePostedSlice(RdmaSlice* slice);
+
+    // What a posting lane writes for a slice the moment it goes on the
+    // wire: the post timestamp, the device's posted backlog and the lane's
+    // set entry. Runs inside submitSlices, before ibv_post_send, so a
+    // completion polled on a shared queue pair finds all three in place.
+    void markPosted(WorkerContext& worker, RdmaSlice* slice, uint64_t post_ts);
 
     void monitorThread();
 
-    int handleContextEvents(std::shared_ptr<RdmaContext>& context);
+    // 1 Hz heartbeat from monitorThread(): drains every context's retiring
+    // endpoints so reclaim is not gated on new insertions, which stall under
+    // failure load.
+    void reclaimEndpoints();
+
+    // dev_id is the NicID (context_set_ index), which is also the
+    // DeviceSelector id, so port events can flip that device's availability.
+    // Drains the whole async event queue: the async fd is edge-triggered and
+    // ibv_get_async_event() dequeues one record per call, so an event left
+    // behind waits for an unrelated later event to release it.
+    int handleContextEvents(int dev_id, std::shared_ptr<RdmaContext>& context);
+
+    // The decision half of handleContextEvents, kept apart from
+    // ibv_get_async_event/ibv_ack_async_event so a synthesized event can
+    // drive it in tests. Port events (PORT_ERR/PORT_ACTIVE) name their port;
+    // a device's async fd delivers them for every port of the device, and a
+    // context opens exactly one, so events for another port are ignored.
+    void applyContextEvent(int dev_id, RdmaContext& context,
+                           const ibv_async_event& event);
+
+    // Everything a recovered port needs: resume the context, re-seed its
+    // bandwidth and make it selectable again. Shared by the
+    // IBV_EVENT_PORT_ACTIVE path and by resumePausedContexts().
+    void activateContext(int dev_id, RdmaContext& context);
+
+    // Re-read the link speed after a port event and re-seed the selector if
+    // it changed; a link that returns at the same speed keeps what it
+    // learned.
+    void refreshLinkSpeed(int dev_id, RdmaContext& context);
+
+    // 1 Hz heartbeat from monitorThread(): safety net for a lost
+    // IBV_EVENT_PORT_ACTIVE. Nothing else ever leaves DEVICE_PAUSED, so a
+    // context whose recovery event was dropped (edge-triggered fd, event
+    // queue overflow, ...) would fail every transfer on that NIC forever.
+    // Polls the port state of paused contexts and activates the ones the
+    // hardware reports as up.
+    void resumePausedContexts();
 
     Status generatePostPath(RdmaSlice* slice);
 
@@ -102,6 +238,14 @@ class Workers {
 
     int getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx);
 
+    bool strictLocalNuma() const;
+
+    // True if the (sdev -> tdev) NIC pair is known-unable to GPUDirect-DMA to
+    // the source/target GPU (learned from prior completion errors). Used to
+    // steer selection away from dead rails before posting.
+    bool gdrPairExcluded(const RouteHint& source, const RouteHint& target,
+                         int sdev, int tdev, int src_gpu, int dst_gpu);
+
     int getDeviceRank(const RouteHint& hint, int device_id);
 
     void showLatencyInfo();
@@ -112,6 +256,7 @@ class Workers {
     std::thread monitor_;
 
     std::atomic<bool> running_;
+    std::atomic<bool> accepting_submits_{true};
 
     struct PostPath {
         int local_device_id;
@@ -196,7 +341,13 @@ class Workers {
         std::thread thread;
         BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
+        // Only this lane may touch its own set, so slices swept by another
+        // lane are handed over here and erased on this lane's next pass.
+        // Empty unless queue pairs are shared (qp_pools), so the mutex is
+        // cold.
         std::unordered_set<RdmaSlice*> inflight_slice_set;
+        std::mutex reclaim_mutex;
+        std::vector<RdmaSlice*> reclaimed;
         std::atomic<int64_t> inflight_slices = 0;
 
         std::mutex mutex;
@@ -205,6 +356,14 @@ class Workers {
 
         // Next time to check for priority promotions (nanoseconds)
         uint64_t next_promotion_check_ns = 0;
+
+        // Tick-internal re-enqueues that found their target queue full
+        // (target priority, entry). Parked items stay counted in
+        // inflight_slices, which both keeps the accounting continuous and
+        // keeps the worker from suspending while they are pending. The
+        // asyncPostSend drain consumes this list before the shared queues,
+        // so parked entries can never starve behind contending producers.
+        std::vector<std::pair<int, RdmaSliceList>> requeue_overflow;
 
         // Values are held via unique_ptr so that map rehashing does not
         // invalidate pointers into RailMonitor stored on in-flight slices
@@ -217,13 +376,18 @@ class Workers {
     // Promote timed-out low priority requests to higher priority queues
     void promoteTimedOutRequests(WorkerContext& worker);
 
+    // Tick-internal re-enqueue: the worker thread must never block on its own
+    // queue (issue #3637), so these park into requeue_overflow on a full queue
+    // and the asyncPostSend drain consumes them first. Moves the slice's
+    // inflight count to `worker` from whichever lane still holds it.
+    void submitFromTick(WorkerContext& worker, RdmaSlice* slice);
+
     WorkerContext* worker_context_;
     uint64_t slice_timeout_ns_;
     uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
     // Opt-in (issue #2528): when true, a promotion pass promotes exactly the
-    // entries that have themselves timed out, instead of promoting the whole
-    // queue whenever only the head has timed out. Default false keeps the
-    // historical "flush the tier" behavior.
+    // entries that have themselves timed out (DecidePromotionPerEntry).
+    // Default false keeps DecidePromotionHeadOnly ("flush the tier").
     bool priority_promotion_per_entry_ = false;
 
     std::unique_ptr<DeviceSelector> device_selector_;

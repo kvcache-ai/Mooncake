@@ -67,7 +67,7 @@ if(USE_UBSHMEM)
   target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
 endif()
 
-# Device Transport Example — two-rank P2P write + signal via Device API.
+# Device Transport Example - two-rank P2P write + signal via Device API.
 # Requires 2 GPUs with P2P access.  Built but not registered with CTest
 # (manual execution only, like rdma_transport_test).
 #
@@ -107,8 +107,13 @@ if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
     set_target_properties(device_transport_example PROPERTIES
       CUDA_ARCHITECTURES "${_cuda_arch_list}")
   else()
-    set_target_properties(device_transport_example PROPERTIES
-      CUDA_ARCHITECTURES "80;90")
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+      set_target_properties(device_transport_example PROPERTIES
+        CUDA_ARCHITECTURES "80;90;103")
+    else()
+      set_target_properties(device_transport_example PROPERTIES
+        CUDA_ARCHITECTURES "80;90")
+    endif()
   endif()
 endif()
 
@@ -144,8 +149,13 @@ if(USE_NCCL_DEVICE AND BUILD_NCCL_DEVICE_TRANSPORT_EXAMPLE)
       set_target_properties(nccl_device_transport_example PROPERTIES
         CUDA_ARCHITECTURES "${_nccl_cuda_arch_list}")
     else()
-      set_target_properties(nccl_device_transport_example PROPERTIES
-        CUDA_ARCHITECTURES "80;90")
+      if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+        set_target_properties(nccl_device_transport_example PROPERTIES
+          CUDA_ARCHITECTURES "80;90;103")
+      else()
+        set_target_properties(nccl_device_transport_example PROPERTIES
+          CUDA_ARCHITECTURES "80;90")
+      endif()
     endif()
   endif()
 endif()

@@ -55,6 +55,9 @@ enum TransportType : int {
     AscendDirect,
     SUNRISE_LINK,
     TPU,
+    UB,
+    MPCOMM,
+    HP_TCP,
     // Sentinel: must remain the last enumerator.
     kNumTransportTypes,
 };
@@ -90,6 +93,12 @@ inline const char* transportTypeName(TransportType type) {
             return "sunrise_link";
         case TPU:
             return "tpu";
+        case UB:
+            return "ub";
+        case MPCOMM:
+            return "mpcomm";
+        case HP_TCP:
+            return "hp_tcp";
         case kNumTransportTypes:
             return "unknown";
     }
@@ -108,6 +117,9 @@ inline TransportType parseTransportType(const std::string& str) {
     if (str == "ascend") return AscendDirect;
     if (str == "sunrise_link") return SUNRISE_LINK;
     if (str == "tpu") return TPU;
+    if (str == "ub") return UB;
+    if (str == "mpcomm") return MPCOMM;
+    if (str == "hp_tcp") return HP_TCP;
     return UNSPEC;
 }
 
@@ -154,11 +166,35 @@ enum TransferStatusEnum {
     FAILED
 };
 
+// Rank for aggregating batch status. Unknown values rank with FAILED so
+// getBatchStatus never throws from unordered_map::at during teardown.
+inline int transferStatusSeverity(TransferStatusEnum s) {
+    switch (s) {
+        case INITIAL:
+        case PENDING:
+        case COMPLETED:
+            return 0;
+        case INVALID:
+            return 1;
+        case CANCELED:
+            return 2;
+        case TIMEOUT:
+            return 3;
+        case FAILED:
+            return 4;
+        default:
+            return 4;
+    }
+}
+
 struct TransferStatus {
     TransferStatusEnum s;
     size_t transferred_bytes;
 };
 
+// One RDMA NIC's load snapshot. Only NICs currently able to carry traffic
+// are reported: a NIC whose context failed to construct or whose port is
+// down is omitted rather than listed with a meaningless bandwidth.
 struct NicLoadStats {
     std::string device_name;
     uint64_t inflight_bytes{0};

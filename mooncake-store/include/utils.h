@@ -9,6 +9,7 @@
 #include <linux/mman.h>
 #include <string>
 #include <limits>
+#include <type_traits>
 #include <ylt/util/tl/expected.hpp>
 
 #include "rpc_types.h"
@@ -258,50 +259,21 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     return parsed.value_or(0);
 }
 
-/**
- * @brief Convert a boolean-like string to a bool
- * @param str String representation ("1"/"true"/"yes"/"on" or
- * "0"/"false"/"no"/"off")
- * @return std::optional<bool> Parsed value, or std::nullopt if parsing fails
- */
-[[nodiscard]] inline std::optional<bool> string_to_bool(std::string str) {
-    if (str.empty()) {
-        return std::nullopt;
-    }
-
-    str.erase(0, str.find_first_not_of(" \t\r\n"));
-    str.erase(str.find_last_not_of(" \t\r\n") + 1);
-    std::transform(str.begin(), str.end(), str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-
-    if (str == "1" || str == "true" || str == "yes" || str == "on") {
-        return true;
-    }
-    if (str == "0" || str == "false" || str == "no" || str == "off") {
-        return false;
-    }
-
-    return std::nullopt;
-}
-
-/**
- * @brief Split a string by delimiter into a vector of strings
- * @param str The string to split
- * @param delimiter The delimiter to split by (default is comma)
- * @param trim_spaces Whether to trim leading/trailing spaces from each token
- * @param keep_empty Whether to keep empty tokens in the result
- * @return Vector of split strings
- */
-std::vector<std::string> splitString(const std::string& str,
-                                     char delimiter = ',',
-                                     bool trim_spaces = true,
-                                     bool keep_empty = false);
-
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+constexpr size_t SZ_512MB = 512 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
+
+// 512MiB hugepages (PMD size on arm64 kernels with 64K base pages) are not
+// defined by older glibc/kernel headers; provide fallbacks.
+#ifndef MAP_HUGE_512MB
+#define MAP_HUGE_512MB (29 << 26)  // MAP_HUGE_SHIFT = 26
+#endif
+#ifndef MFD_HUGE_512MB
+#define MFD_HUGE_512MB (29 << 26)  // MFD_HUGE_SHIFT = 26
+#endif
 
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
@@ -324,7 +296,7 @@ inline size_t align_up(size_t size, size_t alignment) {
  * @brief Get hugepage size from env and optionally set the corresponding memfd
  * flags.
  * * @param out_flags Optional pointer to an int. If provided,
- * MAP_HUGETLB and MAP_HUGE_2MB/1GB will be OR-ed into it.
+ * MAP_HUGETLB and MAP_HUGE_2MB/512MB/1GB will be OR-ed into it.
  * @return size_t Hugepage size in bytes, or 0 if disabled.
  */
 [[nodiscard]] inline size_t get_hugepage_size_from_env(
@@ -340,11 +312,12 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (size_env != nullptr) {
         size_t parsed_size = string_to_byte_size(size_env);
 
-        if (parsed_size == SZ_2MB || parsed_size == SZ_1GB) {
+        if (parsed_size == SZ_2MB || parsed_size == SZ_512MB ||
+            parsed_size == SZ_1GB) {
             size = parsed_size;
         } else {
             LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << size_env
-                         << "'. Supported: 2MB, 1GB. Fallback to 2MB.";
+                         << "'. Supported: 2MB, 512MB, 1GB. Fallback to 2MB.";
             size = SZ_2MB;
         }
     }
@@ -363,6 +336,12 @@ inline size_t align_up(size_t size, size_t alignment) {
             } else {
                 *out_flags |= MAP_HUGE_2MB;
             }
+        } else if (size == SZ_512MB) {
+            if (use_memfd) {
+                *out_flags |= MFD_HUGE_512MB;
+            } else {
+                *out_flags |= MAP_HUGE_512MB;
+            }
         } else if (size == SZ_1GB) {
             if (use_memfd) {
                 *out_flags |= MFD_HUGE_1GB;
@@ -371,7 +350,9 @@ inline size_t align_up(size_t size, size_t alignment) {
             }
         }
         LOG(INFO) << "Using hugepage size: "
-                  << (size == SZ_2MB ? "2MB" : "1GB");
+                  << (size == SZ_2MB     ? "2MB"
+                      : size == SZ_512MB ? "512MB"
+                                         : "1GB");
     }
 
     return size;
@@ -513,27 +494,6 @@ int getFreeTcpPort();
 std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();
-
-// Helper: Get integer from environment variable, fallback to default
-template <typename T>
-T GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
-        return default_value;
-    }
-    try {
-        long long value = std::stoll(env_val);
-        // Check range for unsigned types
-        if constexpr (std::is_same_v<T, uint32_t>) {
-            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
-        }
-        return static_cast<T>(value);
-    } catch (...) {
-        return default_value;
-    }
-}
-
-std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
 std::string ResolveMooncakeHostId(const std::string& local_hostname);
 

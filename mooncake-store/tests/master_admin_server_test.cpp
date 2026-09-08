@@ -21,6 +21,7 @@
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "utils.h"
+#include "version.h"
 
 #include <ylt/reflection/user_reflect_macro.hpp>
 
@@ -204,6 +205,35 @@ TEST_F(MasterAdminServerTest, HealthEndpointReturns200InServing) {
     auto resp = HttpGet(port, "/health");
     EXPECT_EQ(resp.http_status, 200);
     EXPECT_NE(resp.body.find("\"role\":\"leader\""), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, VersionEndpointReturnsVersion) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kServing);
+
+    auto resp = HttpGet(port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("\"version\""), std::string::npos);
+    EXPECT_NE(resp.body.find("\"display_version\""), std::string::npos);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos);
+    EXPECT_NE(resp.body.find(MOONCAKE_DISPLAY_VERSION), std::string::npos);
+
+    admin.Stop();
+}
+
+TEST_F(MasterAdminServerTest, VersionEndpointAvailableInStandby) {
+    int port = getFreeTcpPort();
+    MasterAdminServer admin(static_cast<uint16_t>(port), false);
+    ASSERT_TRUE(admin.Start());
+    admin.SetRuntimeState(ha::MasterRuntimeState::kStandby);
+
+    auto resp = HttpGet(port, "/version");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find(GetMooncakeStoreVersion()), std::string::npos);
 
     admin.Stop();
 }
@@ -535,7 +565,8 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
 
     auto one = HttpGet(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
     EXPECT_EQ(one.http_status, 200);
-    EXPECT_NE(one.body.find("\"committed_count\":0"), std::string::npos);
+    EXPECT_NE(one.body.find("\"charged_bytes\":0"), std::string::npos);
+    EXPECT_NE(one.body.find("\"admission_closed\":false"), std::string::npos);
     EXPECT_NE(one.body.find("\"over_quota\":false"), std::string::npos);
 
     ReplicateConfig cfg;
@@ -548,6 +579,21 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
                              ObjectMeta{"quota_admin_key", std::nullopt},
                              ReplicaType::MEMORY, "tenant-a")
                     .has_value());
+
+    auto metrics = HttpGet(port, "/metrics");
+    EXPECT_EQ(metrics.http_status, 200);
+    EXPECT_NE(
+        metrics.body.find(
+            "mooncake_tenant_quota_charged_bytes{tenant_id=\"tenant-a\"} 100"),
+        std::string::npos);
+    EXPECT_NE(metrics.body.find(
+                  "mooncake_tenant_quota_admission_closed{tenant_id=\"tenant-a"
+                  "\"} 0"),
+              std::string::npos);
+    EXPECT_EQ(metrics.body.find("mooncake_tenant_quota_reserved_bytes"),
+              std::string::npos);
+    EXPECT_EQ(metrics.body.find("mooncake_tenant_quota_used_bytes"),
+              std::string::npos);
 
     auto delete_non_empty =
         HttpDelete(port, "/api/v1/tenant_quotas?tenant_id=tenant-a");
@@ -597,6 +643,11 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminValidationErrors) {
         HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
                     "{\"requested_quota_bytes\":0}");
     EXPECT_EQ(zero_explicit.http_status, 400);
+
+    auto above_atomic_range =
+        HttpPutJson(port, "/api/v1/tenant_quotas?tenant_id=tenant-a",
+                    "{\"requested_quota_bytes\":9223372036854775808}");
+    EXPECT_EQ(above_atomic_range.http_status, 400);
 
     auto reserved_tenant =
         HttpGet(port, "/api/v1/tenant_quotas?tenant_id=_system");

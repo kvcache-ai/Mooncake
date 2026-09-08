@@ -1,8 +1,6 @@
 import subprocess
 import time
-import signal
 import sys
-import os
 from typing import Optional
 
 def start_process(cmd: list[str]) -> subprocess.Popen:

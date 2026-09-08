@@ -9,35 +9,21 @@ jobs:
   # Skip semver pre-release tags (e.g. v1.0.0-rc1); those are handled by pre-release.yaml.
   build:
     if: ${{ !contains(github.ref_name, '-') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - architecture: x86_64
+            artifact-prefix: mooncake-wheel
+          - architecture: arm64
+            artifact-prefix: mooncake-wheel-arm64
     uses: ./.github/workflows/_build-wheel.yaml
     with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
-      cuda: container
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: mooncake-wheel
-
-  build-arm64:
-    if: ${{ !contains(github.ref_name, '-') }}
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04-arm
-      container: pytorch/manylinuxaarch64-builder:cuda12.8
-      cuda: container
-      cmake-generator: Ninja
-      torch-cuda-arch-list: '9.0'
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
-        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: mooncake-wheel-arm64
+      architecture: ${{ matrix.architecture }}
+      artifact-prefix: ${{ matrix.artifact-prefix }}
 
   publish-release:
-    needs: [build, build-arm64]
+    needs: build
     permissions:
       contents: write
       id-token: write

@@ -39,6 +39,8 @@ constexpr const char* kProtocolDescFlatKey =
     "comm_resource_config.protocol_desc";
 constexpr const char* kRocePrefix = "roce:";
 constexpr const char* kStoreConfigKey = "store";
+constexpr const char* kFabricMemoryKey = "fabric_memory";
+constexpr const char* kFabricMemoryFlatPrefix = "fabric_memory.";
 
 std::string SerializeCompactJson(const Json::Value& value) {
     Json::StreamWriterBuilder writer;
@@ -76,15 +78,32 @@ const Json::Value* FindProtocolDescValue(const Json::Value& root) {
     }
     return nullptr;
 }
-}  // namespace
 
-bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
+bool RootHasFabricMemoryConfig(const Json::Value& root) {
+    if (!root.isObject()) {
+        return false;
+    }
+    if (root.isMember(kFabricMemoryKey)) {
+        return true;
+    }
+    const auto names = root.getMemberNames();
+    const size_t prefix_len = std::strlen(kFabricMemoryFlatPrefix);
+    for (const auto& name : names) {
+        if (name.size() > prefix_len &&
+            name.compare(0, prefix_len, kFabricMemoryFlatPrefix) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ParseGlobalResourceConfigObject(const char* config_str,
+                                     Json::Value& root) {
     if (config_str == nullptr || config_str[0] == '\0') {
         return false;
     }
     Json::CharReaderBuilder builder;
     builder["collectComments"] = false;
-    Json::Value root;
     std::string errs;
     const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
     if (!reader->parse(config_str, config_str + std::strlen(config_str), &root,
@@ -98,11 +117,43 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
         LOG(WARNING) << "ASCEND_GLOBAL_RESOURCE_CONFIG must be a JSON object";
         return false;
     }
+    return true;
+}
+}  // namespace
+
+bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
     const Json::Value* protocol_desc = FindProtocolDescValue(root);
     if (protocol_desc == nullptr) {
         return false;
     }
     return ProtocolDescValueContainsRoce(*protocol_desc);
+}
+
+bool HasFabricMemoryInGlobalResourceConfig(const char* config_str) {
+    Json::Value root;
+    if (!ParseGlobalResourceConfigObject(config_str, root)) {
+        return false;
+    }
+    return RootHasFabricMemoryConfig(root);
+}
+
+bool IsFabricMemEnabledFromGlobalResourceConfig() {
+    char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    std::string resolved =
+        ResolveAscendGlobalResourceConfig(global_resource_config);
+    if (resolved.empty()) {
+        return false;
+    }
+    if (HasFabricMemoryInGlobalResourceConfig(resolved.c_str())) {
+        LOG(INFO) << "[AscendTE] fabric mem enabled via "
+                     "ASCEND_GLOBAL_RESOURCE_CONFIG fabric_memory.";
+        return true;
+    }
+    return false;
 }
 
 std::string ResolveAscendGlobalResourceConfig(const char* config_str) {

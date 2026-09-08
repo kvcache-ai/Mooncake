@@ -15,7 +15,6 @@ from collections import defaultdict
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from queue import Queue
 from os import getenv
 from typing import TYPE_CHECKING, Any, Optional
 

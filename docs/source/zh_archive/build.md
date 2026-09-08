@@ -71,7 +71,7 @@
                    libnuma-dev \
                    libcurl4-openssl-dev \
                    libhiredis-dev
-    
+
     # For centos/alibaba linux os
     yum install cmake \
                 gflags-devel \
@@ -157,17 +157,7 @@
     make -j
     ```
 
-7. 安装 yalantinglibs
-    ```bash
-    git clone https://github.com/alibaba/yalantinglibs.git
-    cd yalantinglibs
-    mkdir build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    make -j$(nproc)
-    make install
-    ```
-
-8. 进入项目根目录，运行下列命令进行编译
+7. 进入项目根目录，运行下列命令进行编译
    ```bash
    mkdir build
    cd build
@@ -175,7 +165,7 @@
    make -j
    ```
 
-9. 安装 Mooncake python 包和 mooncake_master 可执行文件
+8. 安装 Mooncake python 包和 mooncake_master 可执行文件
    ```bash
    make install
    ```
@@ -253,4 +243,3 @@ cd /app/build/mooncake-transfer-engine/example
 --ulimit memlock=-1 解除内存锁定限制，RDMA 操作需要
 
 --net=host 让容器使用宿主机的网络命名空间
-

@@ -31,6 +31,11 @@
 namespace mooncake {
 
 class PutOperation;
+class DistributedStorageBackend;
+class RealClient;
+
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol);
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -67,6 +72,10 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    using WriteBufferStager =
+        std::function<tl::expected<std::vector<Slice>, ErrorCode>(
+            const std::vector<Slice>&)>;
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
@@ -187,6 +196,9 @@ class Client {
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
+    std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -222,6 +234,41 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager);
+
+    /**
+     * @brief Write slices into a memory replica at an object-byte offset.
+     */
+    ErrorCode TransferWriteRange(const Replica::Descriptor& replica_descriptor,
+                                 std::vector<Slice>& slices,
+                                 uint64_t dst_offset);
+
+    /**
+     * @brief Batch ranged read against cached replicas. Fragments from all
+     * entries are issued as one scatter transfer so the transport can coalesce
+     * everything bound for the same segment, then awaited together. Requires
+     * memory replicas. Returns per-entry total bytes transferred or an
+     * ErrorCode. Used by RealClient get sessions. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets);
+
+    /**
+     * @brief Batch ranged write into cached replicas (replication). Fragments
+     * from all entries and all memory replicas are issued as one scatter
+     * transfer, then awaited together. Returns per-entry logical bytes
+     * transferred (counted once, not per replica) or an ErrorCode. Used by
+     * RealClient put sessions.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
+        const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& dst_offsets);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -244,6 +291,10 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager);
 
     /**
      * @brief Removes an object and all its replicas
@@ -422,6 +473,25 @@ class Client {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
     /**
+     * @brief Deregisters this client's local disk segment from the master.
+     * Idempotent. The master drops the LOCAL_DISK replicas this client owns, so
+     * readers stop being handed a disk whose owner is about to stop serving.
+     * Callers must stop offloading first, otherwise the storage heartbeat
+     * re-mounts the segment on its next tick.
+     */
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment();
+
+    /**
+     * @brief Installs the existence probe used by the dangling-replica heal.
+     * The probe lives outside this class because the offload file storage is
+     * owned by the caller (RealClient), not by Client.
+     */
+    void SetLocalDiskProbe(
+        std::function<std::optional<bool>(const std::string& key)> probe) {
+        local_disk_probe_fn_ = std::move(probe);
+    }
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this
@@ -492,13 +562,6 @@ class Client {
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
-     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
-     * "ip:port").
-     * @param keys List of keys identifying the data objects to be transferred
-     * @param pointers Array of destination memory addresses on the remote node
-     *                         where data will be written (one per key)
-     * @param batch_slices Map from object key to its data slice
-     * (`mooncake::Slice`), containing raw bytes to be written.
      */
     tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
@@ -506,6 +569,13 @@ class Client {
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_slices);
+
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
+        OffloadBufferAccess buffer_access);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -521,6 +591,8 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+    void SetDfsStorageBackend(
+        std::shared_ptr<DistributedStorageBackend> backend);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -581,6 +653,11 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
+        return transfer_submitter_ != nullptr &&
+               transfer_submitter_->canUseLocalMemcpy(endpoint);
+    }
+
     /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
@@ -605,6 +682,12 @@ class Client {
             endpoints.insert(segment.te_endpoint);
         }
         return endpoints;
+    }
+
+    bool CanUseLocalMemcpy(const Replica::Descriptor& replica) const {
+        if (!replica.is_memory_replica()) return false;
+        return CanUseLocalMemcpy(replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_);
     }
 
     /**
@@ -659,6 +742,23 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
+    // First half of BatchPut only (size-only slices → StartBatchPut).
+    // Used by RealClient put sessions; not a Master API facade.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    StartBatchPutForSizes(const std::vector<std::string>& keys,
+                          const std::vector<uint64_t>& object_sizes,
+                          const ReplicateConfig& config);
+
+    // Finalize/revoke a put session for a batch of keys. Thin wrappers over
+    // the master client, exposed so RealClient put sessions can end/revoke
+    // without touching Client internals. Same RPC path as FinalizeBatchPut.
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -685,6 +785,24 @@ class Client {
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
+    // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
+    // completed replica is a LOCAL_DISK replica owned by this client, and ask
+    // the installed probe (FileStorage::Exists over the offload files) whether
+    // the backing file is gone (issue #3709). Only then evict the dangling
+    // replica so the Put can be retried; any other outcome keeps the old
+    // idempotent path. Returns true only when a replica was actually evicted.
+    bool healDanglingLocalDiskReplica(const ObjectKey& key);
+    // The BatchPutStart counterpart: heals the OBJECT_ALREADY_EXISTS subset
+    // with one batched replica-list query and one batched evict, then retries
+    // PutStart for just the evicted keys and splices the responses back, so a
+    // healthy idempotent batch pays one extra RPC and no evictions.
+    void healDanglingLocalDiskBatchStarts(
+        std::vector<PutOperation>& ops,
+        const std::vector<size_t>& active_indices,
+        const std::vector<size_t>& already_exists,
+        const std::vector<std::string>& keys,
+        const std::vector<std::vector<uint64_t>>& slice_lengths,
+        const ReplicateConfig& config);
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
@@ -696,6 +814,15 @@ class Client {
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
+    // Internal async range submission helpers (return the transfer future).
+    // Used by the synchronous TransferReadRange/WriteRange and the batch
+    // range transfer methods; not part of the public API.
+    std::optional<TransferFuture> SubmitRangeRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    std::optional<TransferFuture> SubmitRangeWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
@@ -703,6 +830,9 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
+    ErrorCode ReadDfsReplica(const std::string& key,
+                             const Replica::Descriptor& replica_descriptor,
+                             std::vector<Slice>& slices);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -712,8 +842,8 @@ class Client {
                         const DiskDescriptor& disk_descriptor);
     /**
      * @brief Initialize local hot cache
-     * @return ErrorCode::OK if use local hot cache,
-     * ErrorCode::INVALID_PARAMS if invalid MC_STORE_LOCAL_HOT_CACHE_SIZE config
+     * @return ErrorCode::OK if disabled or initialized successfully;
+     * ErrorCode::INVALID_PARAMS if cache allocation or registration fails
      */
     ErrorCode InitLocalHotCache();
 
@@ -721,21 +851,6 @@ class Client {
      * @brief Unregister local hot cache backing memory from TransferEngine.
      */
     void UnregisterLocalHotCacheMemory();
-
-    /**
-     * @brief Read MC_STORE_LOCAL_HOT_CACHE_SIZE from environment variable
-     * @return Cache size in bytes, or 0 if not set or invalid
-     */
-    size_t GetLocalHotCacheSizeFromEnv();
-
-    /**
-     * @brief Read MC_STORE_LOCAL_HOT_BLOCK_SIZE from environment variable
-     * @param default_value Default block size to use if env var is not set or
-     * invalid
-     * @return Parsed block size from environment, or default_value if not
-     * set/invalid
-     */
-    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
 
     /**
      * @brief Redirect replica descriptor to local hot cache if cache hit
@@ -778,8 +893,11 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
+    void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
+                                            const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
@@ -787,8 +905,13 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
-        std::vector<PutOperation>& ops);
+    std::vector<ErrorCode> WriteDfsReplicas(
+        const std::vector<std::string>& keys,
+        const std::vector<const std::vector<Slice>*>& slice_lists,
+        const std::vector<DistributedFSDescriptor>& descriptors);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
+        std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
@@ -846,6 +969,15 @@ class Client {
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+    std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
+
+    // Probe used by healDanglingLocalDiskReplica to prove a completed
+    // LOCAL_DISK replica's backing file is gone. Installed by the owner of
+    // the offload file storage (RealClient); unset means no local-disk
+    // offload is active and the heal stays inert. true: file is gone,
+    // false: file present, nullopt: unknown (keep the old path).
+    std::function<std::optional<bool>(const std::string& key)>
+        local_disk_probe_fn_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
@@ -901,6 +1033,11 @@ class Client {
                                        const std::string& tenant_id,
                                        const std::string& source,
                                        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::vector<std::string>& targets,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     /**
      * @brief Move an object's replica from source segment to target segment

@@ -56,6 +56,7 @@ struct RdmaSubBatch : public Transport::SubBatch {
 class RdmaTransport : public Transport {
     friend class Workers;
     friend class RdmaEndPoint;
+    friend class RdmaTransportTestPeer;
 
    public:
     RdmaTransport();
@@ -68,6 +69,8 @@ class RdmaTransport : public Transport {
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
+
+    Status quiesce() override;
 
     virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size);
 
@@ -124,6 +127,11 @@ class RdmaTransport : public Transport {
     std::shared_ptr<Config> config() const { return conf_; }
 
    private:
+    // Builds context_set_ with one slot per NicID; returns how many RNICs
+    // came up. Remaining slots hold inert contexts.
+    size_t initializeContexts();
+
+   private:
     bool installed_;
     std::shared_ptr<Config> conf_;
     std::string local_segment_name_;
@@ -149,6 +157,19 @@ class RdmaTransport : public Transport {
     RWSpinlock notify_endpoint_map_lock_;
     std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>>
         notify_qp_to_endpoint_;
+
+    enum class NotifyCompletionAction {
+        SkipSilently,         // expected flush from a retiring or gone endpoint
+        ReportOnly,           // no live endpoint left to act on
+        DisableNotification,  // fault confined to the notify QP
+        RetireEndpoint,       // the peer or the path may be gone
+    };
+
+    // Decides what a failed notification completion costs. Only defined for
+    // error completions; endpoint_ready means the endpoint is still EP_READY.
+    static NotifyCompletionAction classifyNotifyCompletion(ibv_wc_status status,
+                                                           bool endpoint_alive,
+                                                           bool endpoint_ready);
 
     // Register/unregister notification QP (called by Endpoint)
     void registerNotifyQp(uint32_t qp_num,

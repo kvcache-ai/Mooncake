@@ -67,9 +67,10 @@ ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
     char* err_msg = nullptr;
     char* value_ptr = nullptr;
     int value_size = 0;
+    GoInt64 go_revision_id = 0;
     int ret =
         EtcdStoreGetWrapper(const_cast<char*>(key), (int)key_size, &value_ptr,
-                            &value_size, &revision_id, &err_msg);
+                            &value_size, &go_revision_id, &err_msg);
     if (ret == -2) {
         LOG(ERROR) << "key=" << std::string(key, key_size)
                    << ", error=" << err_msg;
@@ -83,6 +84,7 @@ ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     value = std::string(value_ptr, value_size);
+    revision_id = static_cast<EtcdRevisionId>(go_revision_id);
     free(value_ptr);
     return ErrorCode::OK;
 }
@@ -93,9 +95,11 @@ ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
                                       EtcdLeaseId lease_id,
                                       EtcdRevisionId& revision_id) {
     char* err_msg = nullptr;
+    GoInt64 go_revision_id = 0;
     int ret = EtcdStoreCreateWithLeaseWrapper(
         const_cast<char*>(key), (int)key_size, const_cast<char*>(value),
-        (int)value_size, lease_id, &revision_id, &err_msg);
+        (int)value_size, static_cast<GoInt64>(lease_id), &go_revision_id,
+        &err_msg);
     if (ret == -2) {
         VLOG(1) << "key=" << std::string(key, key_size)
                 << ", lease_id=" << lease_id << ", error=" << err_msg;
@@ -107,8 +111,71 @@ ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
     } else {
+        revision_id = static_cast<EtcdRevisionId>(go_revision_id);
         return ErrorCode::OK;
     }
+}
+
+ErrorCode EtcdHelper::AcquireMaintenanceSession(
+    std::string_view key, int64_t lease_ttl, int64_t& session_handle,
+    EtcdLeaseId& lease_id, EtcdRevisionId& create_revision) {
+    char* err_msg = nullptr;
+    GoInt64 go_session_handle = 0;
+    GoInt64 go_lease_id = 0;
+    GoInt64 go_create_revision = 0;
+    int ret = EtcdStoreAcquireMaintenanceSessionWrapper(
+        const_cast<char*>(key.data()), static_cast<int>(key.size()),
+        static_cast<GoInt64>(lease_ttl), &go_session_handle, &go_lease_id,
+        &go_create_revision, &err_msg);
+    if (ret == -2) {
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to acquire maintenance session: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    session_handle = static_cast<int64_t>(go_session_handle);
+    lease_id = static_cast<EtcdLeaseId>(go_lease_id);
+    create_revision = static_cast<EtcdRevisionId>(go_create_revision);
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::CloseMaintenanceSession(int64_t session_handle) {
+    char* err_msg = nullptr;
+    int ret = EtcdStoreCloseMaintenanceSessionWrapper(
+        static_cast<GoInt64>(session_handle), &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to close maintenance session: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+tl::expected<bool, ErrorCode> EtcdHelper::MaintenanceSessionAlive(
+    int64_t session_handle) {
+    char* err_msg = nullptr;
+    int ret = EtcdStoreMaintenanceSessionAliveWrapper(
+        static_cast<GoInt64>(session_handle), &err_msg);
+    if (ret < 0) {
+        LOG(ERROR) << "Failed to check maintenance session: "
+                   << (err_msg == nullptr ? "" : err_msg);
+        if (err_msg != nullptr) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+    }
+    return ret == 1;
 }
 
 ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
@@ -158,11 +225,13 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
     std::vector<int> compare_kinds;
     std::vector<char*> compare_values;
     std::vector<int> compare_value_sizes;
+    std::vector<GoInt64> compare_revisions;
     compare_keys.reserve(compares.size());
     compare_key_sizes.reserve(compares.size());
     compare_kinds.reserve(compares.size());
     compare_values.reserve(compares.size());
     compare_value_sizes.reserve(compares.size());
+    compare_revisions.reserve(compares.size());
     for (const auto& compare : compares) {
         compare_keys.push_back(const_cast<char*>(compare.key.data()));
         compare_key_sizes.push_back(static_cast<int>(compare.key.size()));
@@ -171,6 +240,8 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
             const_cast<char*>(compare.expected_value.data()));
         compare_value_sizes.push_back(
             static_cast<int>(compare.expected_value.size()));
+        compare_revisions.push_back(
+            static_cast<GoInt64>(compare.expected_revision));
     }
 
     std::vector<char*> put_keys;
@@ -192,9 +263,9 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
     int ret = EtcdStoreTxnCompareAndPutWrapper(
         compare_keys.data(), compare_key_sizes.data(), compare_kinds.data(),
         compare_values.data(), compare_value_sizes.data(),
-        static_cast<int>(compares.size()), put_keys.data(),
-        put_key_sizes.data(), put_values.data(), put_value_sizes.data(),
-        static_cast<int>(puts.size()), &err_msg);
+        compare_revisions.data(), static_cast<int>(compares.size()),
+        put_keys.data(), put_key_sizes.data(), put_values.data(),
+        put_value_sizes.data(), static_cast<int>(puts.size()), &err_msg);
     if (ret == -2) {
         if (err_msg != nullptr) {
             free(err_msg);
@@ -214,17 +285,21 @@ ErrorCode EtcdHelper::TxnCompareAndPut(const std::vector<TxnCompare>& compares,
 
 ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     char* err_msg = nullptr;
-    if (0 != EtcdStoreGrantLeaseWrapper(lease_ttl, &lease_id, &err_msg)) {
+    GoInt64 go_lease_id = 0;
+    if (0 != EtcdStoreGrantLeaseWrapper(static_cast<GoInt64>(lease_ttl),
+                                        &go_lease_id, &err_msg)) {
         LOG(ERROR) << "lease_ttl=" << lease_ttl << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
+    lease_id = static_cast<EtcdLeaseId>(go_lease_id);
     return ErrorCode::OK;
 }
 
 ErrorCode EtcdHelper::RevokeLease(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
-    if (0 != EtcdStoreRevokeLeaseWrapper(lease_id, &err_msg)) {
+    if (0 !=
+        EtcdStoreRevokeLeaseWrapper(static_cast<GoInt64>(lease_id), &err_msg)) {
         LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
@@ -264,7 +339,8 @@ ErrorCode EtcdHelper::CancelWatch(const char* key, const size_t key_size) {
 
 ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
-    int err_code = EtcdStoreKeepAliveWrapper(lease_id, &err_msg);
+    int err_code =
+        EtcdStoreKeepAliveWrapper(static_cast<GoInt64>(lease_id), &err_msg);
     if (err_code != 0) {
         LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
         free(err_msg);
@@ -279,7 +355,8 @@ ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
 
 ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     char* err_msg = nullptr;
-    if (0 != EtcdStoreCancelKeepAliveWrapper(lease_id, &err_msg)) {
+    if (0 != EtcdStoreCancelKeepAliveWrapper(static_cast<GoInt64>(lease_id),
+                                             &err_msg)) {
         LOG(ERROR) << "Failed to cancel keep lease: " << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
@@ -289,8 +366,8 @@ ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
 
 ErrorCode EtcdHelper::WaitKeepAliveReady(EtcdLeaseId lease_id, int timeout_ms) {
     char* err_msg = nullptr;
-    if (0 !=
-        EtcdStoreWaitKeepAliveReadyWrapper(lease_id, timeout_ms, &err_msg)) {
+    if (0 != EtcdStoreWaitKeepAliveReadyWrapper(static_cast<GoInt64>(lease_id),
+                                                timeout_ms, &err_msg)) {
         LOG(ERROR) << "lease_id=" << lease_id << ", error=" << err_msg;
         free(err_msg);
         return ErrorCode::ETCD_OPERATION_ERROR;
@@ -341,11 +418,12 @@ ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
     char* err_msg = nullptr;
     char* json_ptr = nullptr;
     int json_size = 0;
+    GoInt64 go_revision_id = 0;
     // Go wrapper takes int limit.
     int ret = EtcdStoreGetRangeAsJsonWrapper(
         const_cast<char*>(start_key), (int)start_key_size,
         const_cast<char*>(end_key), (int)end_key_size, (int)limit, &json_ptr,
-        &json_size, (GoInt64*)&revision_id, &err_msg);
+        &json_size, &go_revision_id, &err_msg);
     if (ret != 0) {
         LOG(ERROR) << "start_key=" << std::string(start_key, start_key_size)
                    << ", end_key=" << std::string(end_key, end_key_size)
@@ -354,6 +432,7 @@ ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     json = std::string(json_ptr, json_size);
+    revision_id = static_cast<EtcdRevisionId>(go_revision_id);
     free(json_ptr);
     return ErrorCode::OK;
 }
@@ -432,8 +511,9 @@ ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
     char* err_msg = nullptr;
     void* callback_func_ptr = reinterpret_cast<void*>(callback_func);
     int ret = EtcdStoreWatchWithPrefixFromRevisionWrapper(
-        const_cast<char*>(prefix), (int)prefix_size, (GoInt64)start_revision,
-        callback_context, callback_func_ptr, &err_msg);
+        const_cast<char*>(prefix), (int)prefix_size,
+        static_cast<GoInt64>(start_revision), callback_context,
+        callback_func_ptr, &err_msg);
     if (ret != 0) {
         LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
                    << ", start_revision=" << (int64_t)start_revision
@@ -481,6 +561,31 @@ ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     (void)etcd_endpoints;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::AcquireMaintenanceSession(
+    std::string_view key, int64_t lease_ttl, int64_t& session_handle,
+    EtcdLeaseId& lease_id, EtcdRevisionId& create_revision) {
+    (void)key;
+    (void)lease_ttl;
+    (void)session_handle;
+    (void)lease_id;
+    (void)create_revision;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CloseMaintenanceSession(int64_t session_handle) {
+    (void)session_handle;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+tl::expected<bool, ErrorCode> EtcdHelper::MaintenanceSessionAlive(
+    int64_t session_handle) {
+    (void)session_handle;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
 }
 
 ErrorCode EtcdHelper::ResetEtcdStoreClient(const std::string& etcd_endpoints) {

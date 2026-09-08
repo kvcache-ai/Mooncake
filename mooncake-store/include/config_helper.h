@@ -20,14 +20,8 @@ class RequiredParam {
     RequiredParam() : name_(nullptr) {}
     RequiredParam(const char* name) : name_(name) {}
 
-    // Add copy constructor
-    RequiredParam(const RequiredParam& other) { value_ = other.value_; }
-
-    // Add copy assignment operator
-    RequiredParam& operator=(const RequiredParam& other) {
-        value_ = other.value_;
-        return *this;
-    }
+    RequiredParam(const RequiredParam&) = default;
+    RequiredParam& operator=(const RequiredParam&) = default;
 
     /**
      * @brief Assignment operator to set the value

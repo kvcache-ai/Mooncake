@@ -151,6 +151,7 @@ def _p2p_fault_detection_worker(
         return dist.batch_isend_irecv(ops)
 
     device = ctx.init_group()
+    backend = ctx.get_backend()
 
     # Round 1: all healthy
     works = p2p_all_to_all(ctx, device)
@@ -190,6 +191,14 @@ def _p2p_fault_detection_worker(
         if peer == BROKEN_RANK:
             assert not pg.get_local_success(w), \
                 f"rank {ctx.rank} round 2: P2P with broken peer should fail locally"
+
+    expected_active_ranks = [1] * ctx.world_size
+    expected_active_ranks[BROKEN_RANK] = 0
+    active_ranks = pg.get_active_ranks(backend).cpu().tolist()
+    assert active_ranks == expected_active_ranks, (
+        "auto_sync_on_failure should apply the group view before "
+        f"failed P2P completion, got active_ranks={active_ranks}"
+    )
 
     ctx.record_result({"role": "survivor"})
 

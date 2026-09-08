@@ -8,6 +8,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "client_metric.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "pyclient.h"
 #include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
@@ -74,6 +75,9 @@ class DummyClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    std::vector<int64_t> batch_get_into_cuda_ipc(
+        const std::vector<CudaIpcReadRequest> &requests);
+
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
@@ -99,6 +103,19 @@ class DummyClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
+    std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
@@ -190,6 +207,40 @@ class DummyClient : public PyClient {
     std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
+    struct PreparedBuffer {
+        void *original = nullptr;
+        void *dummy = nullptr;
+        size_t size = 0;
+        std::unique_ptr<BufferHandle> staging;
+        bool copy_back = false;
+    };
+
+    bool is_device_buffer(void *buffer) const;
+    bool is_dummy_shm_buffer(void *buffer, size_t size) const;
+    std::optional<size_t> external_buffer_remaining(void *buffer) const;
+    bool is_registered_buffer(void *buffer, size_t size) const;
+    int register_external_buffer(void *buffer, size_t size);
+    int unregister_external_buffer(void *buffer);
+    std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
+                                                 bool copy_to_staging,
+                                                 bool copy_back = false);
+    bool copy_from_staging(const PreparedBuffer &buffer, size_t size) const;
+
+    struct ExternalBufferRegistration {
+        size_t size = 0;
+        size_t references = 0;
+    };
+    using BufferRegistrationMap =
+        std::unordered_map<uintptr_t, ExternalBufferRegistration>;
+    enum class BufferRegistrationAction { kReject, kFirst, kRetained };
+    enum class BufferReleaseAction { kReject, kFinal, kRetained };
+    static BufferRegistrationAction retain_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base, size_t size);
+    static BufferReleaseAction release_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base);
+    mutable std::mutex registered_external_buffers_mutex_;
+    BufferRegistrationMap registered_external_buffers_;
+
     ErrorCode connect(const std::string &server_address);
 
     int register_ascend_shm(const ShmHelper::ShmSegment *shm,
@@ -203,8 +254,9 @@ class DummyClient : public PyClient {
 
     int unregister_device_buffer_for_reconnect(void *buffer);
 
-    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
-    get_registered_device_buffers() const;
+    int reregister_fabric_buffers();
+
+    int reregister_device_buffers();
 #endif
 
     /**
@@ -278,8 +330,9 @@ class DummyClient : public PyClient {
     std::atomic<bool> connected_{false};
 
 #if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex external_fabric_registration_mutex_;
     mutable std::mutex registered_device_buffers_mutex_;
-    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+    BufferRegistrationMap registered_device_buffers_;
 #endif
 
     // Ascend physical device id for dummy-real RPC to real, set in setup_dummy

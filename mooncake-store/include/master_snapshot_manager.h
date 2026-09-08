@@ -31,18 +31,11 @@ class SnapshotChildProcessTest;
 }  // namespace test
 
 struct MasterSnapshotManagerOptions {
-    bool enable_snapshot{false};
     uint64_t snapshot_interval_seconds{0};
     uint64_t snapshot_child_timeout_seconds{0};
     uint32_t snapshot_retention_count{0};
     std::string snapshot_backup_dir;
     bool use_snapshot_backup_dir{false};
-    std::string snapshot_catalog_store_type;
-    std::string snapshot_catalog_store_connstring;
-    std::string ha_backend_type;
-    std::string ha_backend_connstring;
-    std::string cluster_id;
-    bool enable_ha{false};
 };
 
 /**

@@ -76,18 +76,23 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id,
         const UUID task_id = queue.front();
         queue.pop();
 
-        if (manager_->total_pending_tasks_ > 0) {
-            manager_->total_pending_tasks_--;
-        }
-
         auto it = manager_->all_tasks_.find(task_id);
         if (it == manager_->all_tasks_.end()) {
             LOG(ERROR) << "Task " << task_id
                        << " not found in all_tasks_ while popping";
+            if (manager_->total_pending_tasks_ > 0) {
+                manager_->total_pending_tasks_--;
+            }
             continue;
         }
 
         Task& task = it->second;
+        if (task.status != TaskStatus::PENDING) {
+            continue;
+        }
+        if (manager_->total_pending_tasks_ > 0) {
+            manager_->total_pending_tasks_--;
+        }
         task.mark_processing();
 
         const auto [_, inserted] = processing_set.insert(task_id);
@@ -277,6 +282,26 @@ void ScopedTaskWriteAccess::restore_task(Task&& task) {
             break;
         }
     }
+}
+
+ErrorCode ScopedTaskWriteAccess::fail_task_if_pending(
+    const UUID& task_id, const std::string& message) {
+    auto it = manager_->all_tasks_.find(task_id);
+    if (it == manager_->all_tasks_.end()) {
+        return ErrorCode::TASK_NOT_FOUND;
+    }
+
+    Task& task = it->second;
+    if (task.status != TaskStatus::PENDING) {
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    }
+
+    task.mark_complete(TaskStatus::FAILED, message);
+    if (manager_->total_pending_tasks_ > 0) {
+        manager_->total_pending_tasks_--;
+    }
+    manager_->finished_task_history_.push_back(task_id);
+    return ErrorCode::OK;
 }
 
 void ScopedTaskWriteAccess::clear_all() {

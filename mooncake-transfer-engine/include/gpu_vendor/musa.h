@@ -2,6 +2,7 @@
 
 #include <string>
 #include <musa.h>
+#include <musa_bf16.h>
 #include <musa_runtime.h>
 
 const static std::string GPU_PREFIX = "musa:";
@@ -60,6 +61,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define CUDA_ERROR_NOT_SUPPORTED MUSA_ERROR_NOT_SUPPORTED
 #define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
+#define cudaDeviceGetStreamPriorityRange musaDeviceGetStreamPriorityRange
 #define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaError_t musaError_t
@@ -67,8 +69,14 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaFreeHost musaFreeHost
 #define cudaGetDevice musaGetDevice
 #define cudaGetDeviceCount musaGetDeviceCount
+#define cudaGetErrorName musaGetErrorName
 #define cudaGetErrorString musaGetErrorString
 #define cudaGetLastError musaGetLastError
+#define cudaHostAlloc musaHostAlloc
+#define cudaHostAllocDefault musaHostAllocDefault
+#define cudaHostAllocMapped musaHostAllocMapped
+#define cudaHostAllocPortable musaHostAllocPortable
+#define cudaHostAllocWriteCombined musaHostAllocWriteCombined
 #define cudaHostRegister musaHostRegister
 #define cudaHostRegisterPortable musaHostRegisterPortable
 #define cudaHostUnregister musaHostUnregister
@@ -95,10 +103,14 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaSetDevice musaSetDevice
 #define cudaStreamCreate musaStreamCreate
 #define cudaStreamCreateWithFlags musaStreamCreateWithFlags
+#define cudaStreamCreateWithPriority musaStreamCreateWithPriority
 #define cudaStreamNonBlocking musaStreamNonBlocking
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamPerThread musaStreamPerThread
 #define cudaStreamQuery musaStreamQuery
+#define cudaStreamCaptureStatus musaStreamCaptureStatus
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#define cudaStreamIsCapturing musaStreamIsCapturing
 #define cudaStreamWaitEvent musaStreamWaitEvent
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaStreamSynchronize musaStreamSynchronize
@@ -108,20 +120,28 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaEvent_t musaEvent_t
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
-#define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventDisableTiming MU_EVENT_DISABLE_TIMING
 #define cudaEventDestroy musaEventDestroy
+#define cudaEventQuery musaEventQuery
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaDeviceProp musaDeviceProp
 #define cudaGetDeviceProperties musaGetDeviceProperties
 #define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaDevAttrClockRate musaDevAttrClockRate
+#define cudaDevAttrMaxSharedMemoryPerBlockOptin \
+    musaDevAttrMaxSharedMemoryPerBlockOptin
+#define cudaEventCreate musaEventCreate
+#define cudaEventElapsedTime musaEventElapsedTime
 #define cudaLaunchConfig_t musaLaunchConfig_t
 #define cudaLaunchAttribute musaLaunchAttribute
 #define cudaLaunchAttributeCooperative musaLaunchAttributeCooperative
 #define cudaLaunchKernelEx musaLaunchKernelEx
 #define CUDA_R_16BF MUSA_R_16BF
 #define CUDA_R_32F MUSA_R_32F
+
+#define nv_bfloat16 __mt_bfloat16
+#define nv_bfloat162 __mt_bfloat162
 
 // IBGDA-specific mappings
 #define cuInit muInit

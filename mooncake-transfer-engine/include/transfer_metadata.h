@@ -57,7 +57,7 @@ class TransferMetadata {
         std::string name;
         uint64_t addr;
         uint64_t length;
-        int32_t device_id = -1;  // CUDA device for NCCL buffers
+        int32_t device_id = -1;  // CUDA device (NCCL) or Ascend engine index
 #ifdef ENABLE_MULTI_PROTOCOL
         std::string protocol;  // for multi-protocol mode (cxl/tcp/rdma)
 #endif
@@ -107,6 +107,7 @@ class TransferMetadata {
     struct SegmentDesc {
         std::string name;
         std::string protocol;
+        uint64_t metadata_version{0};
         // this is for rdma/shm/urma
         std::vector<DeviceDesc> devices;
         Topology topology;
@@ -121,7 +122,12 @@ class TransferMetadata {
         // this is for ascend
         RankInfoDesc rank_info;
 
-        int tcp_data_port;
+        // TCP data-plane endpoint. Keeping the routable host beside the port
+        // makes one SegmentDesc an immutable endpoint snapshot for clients.
+        // Older descriptors may omit tcp_data_host; getSegmentDesc() fills it
+        // once from legacy RPC metadata before caching the descriptor.
+        std::string tcp_data_host;
+        int tcp_data_port{0};
         // TCP data-plane protocol version advertised by this segment's
         // server. v2 adds acknowledged WRITE framing and status-prefixed
         // READ responses (#2086); absent/1 = legacy unacknowledged framing.
@@ -150,6 +156,7 @@ class TransferMetadata {
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
+        uint64_t metadata_version{0};
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
@@ -173,6 +180,12 @@ class TransferMetadata {
         // Capability marker. Encoded only by transports that opt into
         // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
+        // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
+        // When ctrl_channel is true, this handshake only sets up the control
+        // path (qp_num may be empty).
+        uint32_t notify_qp_num = 0;
+        uint16_t notify_rq_depth = 0;
+        bool ctrl_channel = false;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
         std::string efa_addr;  // EFA endpoint address (hex encoded)
@@ -231,6 +244,8 @@ class TransferMetadata {
 
     int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
     int getNotifies(std::vector<NotifyDesc> &notifies);
+    // Push a notify received from an alternate path (e.g. RDMA CtrlChannel).
+    void pushNotify(const NotifyDesc &notify);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }
 
@@ -253,6 +268,12 @@ class TransferMetadata {
     void dumpMetadataContentUnlocked();
 
    private:
+    std::shared_ptr<SegmentDesc> getSegmentDescInternal(
+        const std::string &segment_name, bool force_rpc_update);
+    int getRpcMetaEntryInternal(const std::string &server_name,
+                                RpcMetaDesc &desc, bool force_update);
+    int publishSegmentDesc(const std::string &segment_name,
+                           const SegmentDesc &desc);
     int encodeSegmentDesc(const SegmentDesc &desc, Json::Value &segmentJSON);
     std::shared_ptr<TransferMetadata::SegmentDesc> decodeSegmentDesc(
         Json::Value &segmentJSON, const std::string &segment_name);

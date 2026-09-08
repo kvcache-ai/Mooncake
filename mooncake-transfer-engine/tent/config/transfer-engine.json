@@ -60,12 +60,41 @@
                 "rail_topo_path": "/path/to/rail_topo.json"
             }
         },
+        "ub": {
+            "enable": false,
+            "device_filter": [],
+            "worker_count": 4,
+            "poller_count": 1,
+            "jfc_per_context": 1,
+            "jetty_per_endpoint": 4,
+            "max_endpoints": 4096,
+            "slice_size": 65536,
+            "max_retries": 3,
+            "slice_timeout_ms": 10000,
+            "endpoint_cooldown_ms": 30000,
+            "enable_bandwidth_estimation": true,
+            "enable_notifications": false
+        },
         "tcp": {
             "enable": true,
             "max_retry_count": 3,
             "retry_base_delay_ms": 100,
             "retry_max_delay_ms": 2000,
             "max_concurrent_tasks": 16
+        },
+        "hp_tcp": {
+            "enable": false,
+            "bind_address": "",
+            "advertise_address": "",
+            "rail_addresses": [],
+            "port": 0,
+            "worker_count": 16,
+            "connections_per_peer": 4,
+            "max_outstanding_tasks": 4096,
+            "max_outstanding_bytes": 4294967296,
+            "max_transfer_bytes": 1073741824,
+            "connect_timeout_ms": 2000,
+            "progress_timeout_ms": 30000
         },
         "gds": {
             "enable" : true
@@ -83,7 +112,7 @@
             "name": "default_memory",
             "segment_type": "memory",
             "devices": ["mlx5_0", "mlx5_2"],
-            "transports": ["nvlink", "rdma", "shm"]
+            "transports": ["nvlink", "rdma", "shm", "hp_tcp"]
         },
         {
             "name": "file_storage",

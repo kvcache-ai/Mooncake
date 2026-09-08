@@ -43,10 +43,13 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
 // Helper function to create a valid struct_pack payload for PUT_END
 std::string MakeValidPayload(uint64_t client_id_first = 1,
                              uint64_t client_id_second = 2,
-                             uint64_t size = 1024) {
+                             uint64_t size = 1024, bool hard_pinned = false) {
     mooncake::MetadataPayload payload;
     payload.client_id = {client_id_first, client_id_second};
     payload.size = size;
+    if (hard_pinned) {
+        payload.hard_pinned = true;
+    }
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
@@ -289,6 +292,17 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidPayload) {
     EXPECT_EQ(1u, meta->client_id.first);
     EXPECT_EQ(2u, meta->client_id.second);
     EXPECT_EQ(2048u, meta->size);
+    EXPECT_FALSE(meta->hard_pinned.value_or(false));
+}
+
+TEST_F(OpLogApplierTest, TestApplyPutEnd_PreservesHardPinned) {
+    std::string payload = MakeValidPayload(1, 2, 2048, true);
+    OpLogEntry entry = MakeEntry(1, OpType::PUT_END, "key1", payload);
+
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(entry));
+    auto meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_TRUE(meta->hard_pinned.value_or(false));
 }
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidPayload) {

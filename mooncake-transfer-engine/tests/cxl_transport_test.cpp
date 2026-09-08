@@ -230,7 +230,6 @@ TEST_F(CXLTransportTest, MultipleRead) {
 
         freeMemoryPool(src, kDataLength);
     }
-    engine->unregisterLocalMemory(addr);
 }
 
 }  // namespace mooncake

@@ -65,9 +65,21 @@ committing again. Use `./scripts/code_format.sh --all` only when intentionally
 formatting the whole project.
 
 #### Usage
-Run hooks on all files (the first run installs hook environments). The C/C++
-hook remains limited to staged line ranges; use `./scripts/code_format.sh --all`
-for an intentional whole-project C/C++ format:
+After `pre-commit install`, hooks run on each commit. To run them manually on
+staged files (the first run may install hook environments):
+```bash
+pre-commit run
+```
+Before opening a PR, run hooks only on files changed against the PR base
+(default `origin/main`). The C/C++ hook remains limited to staged or changed
+line ranges:
+```bash
+git fetch origin main
+pre-commit run --files $(git diff --name-only --diff-filter=ACMR origin/main...HEAD)
+```
+Use full-repo checks only for intentional whole-project cleanup; do not fold
+unrelated rewrites into a feature PR. Prefer `./scripts/code_format.sh --all`
+for a deliberate whole-project C/C++ format:
 ```bash
 pre-commit run --all-files
 ```

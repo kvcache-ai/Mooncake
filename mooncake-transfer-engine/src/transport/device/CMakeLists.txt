@@ -16,9 +16,10 @@ endif()
 
 add_library(device_transport OBJECT ${DEVICE_TRANSPORT_SOURCES})
 target_include_directories(device_transport PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(device_transport PRIVATE glog::glog)
 
 if(USE_CUDA)
-  target_include_directories(device_transport PRIVATE /usr/local/cuda/include)
+  target_include_directories(device_transport PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
 endif()
 if(USE_NCCL_DEVICE)
   target_link_libraries(device_transport PRIVATE NCCL::nccl)

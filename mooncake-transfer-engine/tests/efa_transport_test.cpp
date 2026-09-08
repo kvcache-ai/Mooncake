@@ -19,6 +19,8 @@
 
 #include <cstdlib>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "transfer_engine.h"
 #include "transport/efa_transport/efa_transport.h"
@@ -403,6 +405,47 @@ TEST_F(EFATransportTest, RegisterMemoryBatch) {
     EXPECT_EQ(rc, 0) << "unregisterLocalMemoryBatch should succeed";
 
     for (void *a : addrs) freeMemoryPool(a, kBufSize);
+}
+
+// MC_EFA_NIC_SELECTION=local narrows a device buffer to the NICs the topology
+// reports as closest to its GPU. Pure map inversion, so no hardware needed.
+TEST(EFALocalNicMapTest, InvertsPreferredHca) {
+    // Two GPUs, two NICs each, shaped like a p5 rail group.
+    TopologyMatrix matrix;
+    matrix["cuda:0"] = TopologyEntry{.name = "cuda:0",
+                                     .preferred_hca = {"efa0", "efa1"},
+                                     .avail_hca = {"efa2", "efa3"}};
+    matrix["cuda:1"] = TopologyEntry{.name = "cuda:1",
+                                     .preferred_hca = {"efa2", "efa3"},
+                                     .avail_hca = {"efa0", "efa1"}};
+    std::vector<std::string> devices{"efa0", "efa1", "efa2", "efa3"};
+
+    auto map = EfaTransport::buildLocalNicMap(matrix, devices);
+    ASSERT_EQ(map.size(), 2u);
+    EXPECT_EQ(map["cuda:0"], (std::vector<size_t>{0, 1}));
+    EXPECT_EQ(map["cuda:1"], (std::vector<size_t>{2, 3}));
+
+    // A preferred HCA absent from the opened set is skipped, not mapped to a
+    // bogus index -- this happens when a device's construct() failed.
+    auto partial = EfaTransport::buildLocalNicMap(matrix, {"efa0", "efa3"});
+    EXPECT_EQ(partial["cuda:0"], (std::vector<size_t>{0}));
+    EXPECT_EQ(partial["cuda:1"], (std::vector<size_t>{1}));
+
+    // A location with no surviving preferred NIC is omitted entirely, so the
+    // caller's lookup misses and falls back to all NICs rather than registering
+    // the buffer on none.
+    auto none = EfaTransport::buildLocalNicMap(matrix, {"efa2"});
+    EXPECT_EQ(none.count("cuda:0"), 0u);
+    EXPECT_EQ(none["cuda:1"], (std::vector<size_t>{0}));
+
+    // An entry that has only avail_hca contributes nothing: avail_hca is "every
+    // other NIC", which is the all-NICs behavior this exists to avoid.
+    TopologyMatrix avail_only;
+    avail_only["cuda:0"] = TopologyEntry{
+        .name = "cuda:0", .preferred_hca = {}, .avail_hca = {"efa0", "efa1"}};
+    EXPECT_TRUE(EfaTransport::buildLocalNicMap(avail_only, devices).empty());
+
+    EXPECT_TRUE(EfaTransport::buildLocalNicMap({}, devices).empty());
 }
 
 // Test 9: Larger transfer (64 MB total split into 1 MB slices) to exercise

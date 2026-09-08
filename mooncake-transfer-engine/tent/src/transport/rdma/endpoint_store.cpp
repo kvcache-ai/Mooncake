@@ -119,12 +119,49 @@ void FIFOEndpointStore::evictOne() {
     LOG(INFO) << victim << " evicted from FIFOEndpointStore";
 }
 
+void FIFOEndpointStore::evictAll() {
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_evict;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        to_evict.reserve(endpoint_map_.size());
+        for (auto& entry : endpoint_map_) {
+            to_evict.push_back(entry.second);
+            // Publish into waiting_list_ under the same lock: reclaim()
+            // iterates waiting_list_ under endpoint_map_lock_, so inserting
+            // here avoids an unsynchronized read/write on the unordered_set.
+            waiting_list_.insert(entry.second);
+        }
+        endpoint_map_.clear();
+        fifo_list_.clear();
+        fifo_map_.clear();
+    }
+    // beginDestroy() may call back into reclaim() (which takes
+    // endpoint_map_lock_), so it must run after the lock is released.
+    for (auto& ep : to_evict) {
+        ep->beginDestroy();
+    }
+    LOG(INFO) << "FIFOEndpointStore: evicted all " << to_evict.size()
+              << " endpoints on port recovery";
+}
+
 void FIFOEndpointStore::reclaim() {
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    std::vector<std::shared_ptr<RdmaEndPoint>> candidates;
+    {
+        // Only protect the waiting_list_ iteration. finishDestroy() may wait
+        // for CQ drain and take the endpoint lock, so it must run after this
+        // store lock has been released.
+        RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+        candidates.reserve(waiting_list_.size());
+        for (auto& endpoint : waiting_list_) candidates.push_back(endpoint);
+    }
+
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto& endpoint : waiting_list_) {
+    for (auto& endpoint : candidates) {
         if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
     }
+    if (to_delete.empty()) return;
+
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
     for (auto& endpoint : to_delete) waiting_list_.erase(endpoint);
 }
 
@@ -288,15 +325,54 @@ void SIEVEEndpointStore::evictOne() {
     return;
 }
 
+void SIEVEEndpointStore::evictAll() {
+    std::vector<std::shared_ptr<RdmaEndPoint>> to_evict;
+    {
+        RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+        to_evict.reserve(endpoint_map_.size());
+        for (auto& entry : endpoint_map_) {
+            to_evict.push_back(entry.second.first);
+            // Publish into waiting_list_ under the same lock: reclaim()
+            // iterates waiting_list_ under endpoint_map_lock_, so inserting
+            // here avoids an unsynchronized read/write on the unordered_set.
+            waiting_list_.insert(entry.second.first);
+            waiting_list_len_.fetch_add(1, std::memory_order_relaxed);
+        }
+        endpoint_map_.clear();
+        fifo_list_.clear();
+        fifo_map_.clear();
+        hand_ = std::nullopt;
+    }
+    for (auto& ep : to_evict) {
+        ep->beginDestroy();
+    }
+    LOG(INFO) << "SIEVEEndpointStore: evicted all " << to_evict.size()
+              << " endpoints on port recovery";
+}
+
 void SIEVEEndpointStore::reclaim() {
     if (waiting_list_len_.load(std::memory_order_relaxed) == 0) return;
-    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+
+    std::vector<std::shared_ptr<RdmaEndPoint>> candidates;
+    {
+        // Only protect the waiting_list_ iteration. finishDestroy() may wait
+        // for CQ drain and take the endpoint lock, so it must run after this
+        // store lock has been released.
+        RWSpinlock::ReadGuard guard(endpoint_map_lock_);
+        candidates.reserve(waiting_list_.size());
+        for (auto& endpoint : waiting_list_) candidates.push_back(endpoint);
+    }
+
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
-    for (auto& endpoint : waiting_list_) {
+    for (auto& endpoint : candidates) {
         if (endpoint->finishDestroy()) to_delete.push_back(endpoint);
     }
-    for (auto& endpoint : to_delete) waiting_list_.erase(endpoint);
-    waiting_list_len_ -= to_delete.size();
+    if (to_delete.empty()) return;
+
+    size_t erased = 0;
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto& endpoint : to_delete) erased += waiting_list_.erase(endpoint);
+    waiting_list_len_.fetch_sub(erased, std::memory_order_relaxed);
 }
 
 size_t SIEVEEndpointStore::size() { return endpoint_map_.size(); }

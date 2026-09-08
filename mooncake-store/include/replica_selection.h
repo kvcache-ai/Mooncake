@@ -21,7 +21,6 @@
 
 #pragma once
 
-#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <mutex>
@@ -30,6 +29,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "config/replica_selection_config.h"
 #include "replica.h"
 
 namespace mooncake {
@@ -82,11 +82,8 @@ inline double BuiltinRemoteReplicaScore(const Replica::Descriptor &r) {
 // scorer has been injected. Env is read once; the injected-scorer check is
 // live so tests / late injection take effect.
 inline bool RemoteReplicaScoringEnabled() {
-    static const bool env_enabled = [] {
-        const char *env = std::getenv("MC_STORE_REPLICA_SCORING");
-        return env && std::string(env) == "1";
-    }();
-    if (env_enabled) return true;
+    static const auto config = ReplicaSelectionConfig::FromEnvironment();
+    if (config.remote_scoring_enabled) return true;
     std::shared_lock lk(detail::ScorerMutex());
     return static_cast<bool>(detail::ScorerStorage());
 }
@@ -115,10 +112,11 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
     return best;
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any MEMORY,
-// then LOCAL_DISK, then DISK. Master may return replicas in any order, so we
-// always scan. When scoring is enabled and there are multiple remote MEMORY
-// replicas, the best-scoring one is chosen instead of the first encountered.
+// Select the best replica from a list: prefer local MEMORY, local NOF_SSD,
+// remote MEMORY, remote NOF_SSD, LOCAL_DISK, DFS, then DISK. Master may return
+// replicas in any order, so we always scan. When scoring is enabled and there
+// are multiple remote MEMORY replicas, the best-scoring one is chosen instead
+// of the first encountered.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
@@ -157,7 +155,9 @@ inline const Replica::Descriptor *SelectBestReplica(
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
+            best = &r;  // LOCAL_DISK always overrides DFS and DISK
+        } else if (r.is_dfs_replica()) {
+            if (!best || !best->is_local_disk_replica()) best = &r;
         } else if (r.is_disk_replica() && !best) {
             best = &r;
         }

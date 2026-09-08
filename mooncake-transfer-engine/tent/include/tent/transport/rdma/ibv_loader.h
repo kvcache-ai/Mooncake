@@ -31,6 +31,11 @@ struct IbvSymbols {
                          int index, union ibv_gid* gid);
     int (*ibv_query_port_default)(ibv_context* context, uint8_t port_num,
                                   ibv_port_attr* port_attr);
+    // Optional (rdma-core >= 62): effective port speed in 100 Mb/s units,
+    // LAG-aware. nullptr on older libraries; callers fall back to the
+    // ibv_port_attr encodings.
+    int (*ibv_query_port_speed)(ibv_context* context, uint32_t port_num,
+                                uint64_t* port_speed);
     const char* (*ibv_get_device_name)(struct ibv_device* device);
 
     ibv_pd* (*ibv_alloc_pd)(ibv_context* context);

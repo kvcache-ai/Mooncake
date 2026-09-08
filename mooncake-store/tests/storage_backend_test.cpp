@@ -3,17 +3,26 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cerrno>
+#include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <ranges>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -108,7 +117,9 @@ class StorageBackendTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("StorageBackendTest");
         FLAGS_logtostderr = true;
-        data_path = std::filesystem::current_path().string() + "/data";
+        data_path =
+            (std::filesystem::current_path() / "storage_backend_test_data")
+                .string();
         // Remove all leftover files and subdirectories from previous runs
         if (fs::exists(data_path)) {
             for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -187,6 +198,123 @@ TEST_F(StorageBackendTest, CreateAcceptsValidConfig) {
     auto result = StorageBackend::Create(data_path, "fsdir", true);
     ASSERT_TRUE(result.has_value());
     EXPECT_NE(result.value(), nullptr);
+}
+
+TEST_F(StorageBackendTest, RemoveFileWaitsForStoreInWriteCriticalSection) {
+    StorageBackend backend(data_path, "unused", false);
+    ASSERT_TRUE(backend.Init(0));
+
+    const std::string path = data_path + "/concurrent_remove_fifo";
+    std::error_code cleanup_ec;
+    fs::remove(path, cleanup_ec);
+    ASSERT_FALSE(cleanup_ec);
+    ASSERT_EQ(mkfifo(path.c_str(), 0600), 0) << strerror(errno);
+
+    const int reader_fd = open(path.c_str(), O_RDONLY | O_NONBLOCK);
+    if (reader_fd < 0) {
+        fs::remove(path);
+        FAIL() << "Failed to open FIFO reader: " << strerror(errno);
+    }
+    const int pipe_capacity = fcntl(reader_fd, F_GETPIPE_SZ);
+    if (pipe_capacity <= 0) {
+        close(reader_fd);
+        fs::remove(path);
+        FAIL() << "Failed to query FIFO capacity: " << strerror(errno);
+    }
+
+    // With no reader draining the FIFO, this write fills the pipe and blocks
+    // after StoreObject has acquired the path mutex.
+    const std::string value(static_cast<size_t>(pipe_capacity) * 2, 'x');
+    std::atomic<bool> store_done{false};
+    auto store_future = std::async(std::launch::async, [&]() {
+        auto result = backend.StoreObject(path, value);
+        store_done.store(true, std::memory_order_release);
+        return result;
+    });
+
+    bool queue_probe_ok = true;
+    bool writer_blocked = false;
+    const auto write_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < write_deadline) {
+        int queued_bytes = 0;
+        if (ioctl(reader_fd, FIONREAD, &queued_bytes) != 0) {
+            queue_probe_ok = false;
+            break;
+        }
+        const auto status = store_future.wait_for(std::chrono::milliseconds(0));
+        if (queued_bytes > 0 && status == std::future_status::timeout) {
+            writer_blocked = true;
+            break;
+        }
+        if (status == std::future_status::ready) {
+            break;
+        }
+        std::this_thread::yield();
+    }
+
+    bool remove_blocked = false;
+    std::optional<std::future<void>> remove_future;
+    if (writer_blocked) {
+        std::promise<void> remove_started_promise;
+        auto remove_started = remove_started_promise.get_future();
+        remove_future.emplace(std::async(std::launch::async, [&]() {
+            remove_started_promise.set_value();
+            backend.RemoveFile(path);
+        }));
+        remove_started.wait();
+        remove_blocked =
+            remove_future->wait_for(std::chrono::milliseconds(200)) ==
+            std::future_status::timeout;
+    }
+
+    // Drain the FIFO only after checking that RemoveFile is blocked. This
+    // lets StoreObject finish and release the path mutex.
+    auto drain_future = std::async(std::launch::async, [&]() {
+        std::vector<char> buffer(64 * 1024);
+        size_t drained_bytes = 0;
+        for (;;) {
+            const ssize_t n = read(reader_fd, buffer.data(), buffer.size());
+            if (n > 0) {
+                drained_bytes += static_cast<size_t>(n);
+                continue;
+            }
+            if (n == 0) {
+                if (store_done.load(std::memory_order_acquire)) {
+                    return std::optional<size_t>{drained_bytes};
+                }
+                std::this_thread::yield();
+                continue;
+            }
+            if (errno == EINTR || errno == EAGAIN) {
+                std::this_thread::yield();
+                continue;
+            }
+            return std::optional<size_t>{};
+        }
+    });
+
+    auto store_result = store_future.get();
+    auto drain_result = drain_future.get();
+    if (remove_future.has_value()) {
+        remove_future->get();
+    } else {
+        backend.RemoveFile(path);
+    }
+    close(reader_fd);
+
+    const bool path_exists = fs::exists(path);
+    if (path_exists) {
+        fs::remove(path);
+    }
+
+    EXPECT_TRUE(queue_probe_ok);
+    EXPECT_TRUE(writer_blocked);
+    EXPECT_TRUE(remove_blocked);
+    ASSERT_TRUE(store_result.has_value());
+    ASSERT_TRUE(drain_result.has_value());
+    EXPECT_EQ(drain_result.value(), value.size());
+    EXPECT_FALSE(path_exists);
 }
 
 // Regression tests for StorageBackendAdaptor::Init validation (issue #3134
@@ -474,16 +602,6 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
 }
 
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
-    std::string data_path = std::filesystem::current_path().string() + "/data";
-    fs::create_directories(data_path);
-
-    // Clean up any existing files
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            fs::remove(entry.path());
-        }
-    }
-
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -4723,6 +4841,290 @@ TEST_F(StorageBackendTest,
         << "record with unknown flags must be dropped on recovery";
     EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
               std::make_optional(value_b));
+}
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_OffloadSetsBucketAccessTimestamp) {
+    // Regression test for "update bucket ts after offload": BatchOffload must
+    // stamp the new bucket's last_access_ns_ with the current time when
+    // committing metadata. The timestamp itself is private, so we verify it
+    // through LRU eviction behavior:
+    //   - Bucket A is offloaded and then read, so its timestamp is t1 > 0.
+    //   - Bucket B is offloaded afterwards; with the fix its timestamp is
+    //     t2 > t1, without the fix it stays 0.
+    //   - Offloading bucket C overflows the quota and evicts exactly one
+    //     bucket. The LRU victim must be A (oldest timestamp). If B's
+    //     timestamp were 0, B would be evicted immediately instead.
+    // Additionally, a failing complete_handler must roll back the committed
+    // bucket, including its lru_index_ entry (checked via
+    // GetLruIndexSizeForTest at every stage).
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    // Each bucket holds one 64 KB object (plus a small metadata blob); the
+    // quota fits two buckets but not three, so the third offload evicts
+    // exactly one bucket.
+    constexpr size_t kValueSize = 64 * 1024;
+    bucket_config.max_total_size = 150 * 1024;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    auto offload_one = [&](const std::string& key,
+                           std::vector<std::string>* evicted_keys) {
+        auto buf = std::make_unique<char[]>(kValueSize);
+        std::memset(buf.get(), 'x', kValueSize);
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), kValueSize}});
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+            [evicted_keys](const std::vector<std::string>& keys)
+                -> tl::expected<void, ErrorCode> {
+                if (evicted_keys != nullptr) {
+                    evicted_keys->insert(evicted_keys->end(), keys.begin(),
+                                         keys.end());
+                }
+                return {};
+            });
+        ASSERT_TRUE(result.has_value()) << "Offload failed for key " << key;
+    };
+
+    // Bucket A: offload, then read so its access timestamp becomes t1 > 0.
+    offload_one("lru_ts_key_a", nullptr);
+    EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 1u);
+
+    // Rollback on complete_handler failure: the committed bucket must be
+    // rolled back and its lru_index_ entry removed. Use a small value so this
+    // offload stays under the quota and does not trigger eviction.
+    {
+        std::string rollback_key = "lru_ts_rollback_key";
+        std::string rollback_data = "rollback_data";
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(rollback_key,
+                      std::vector<Slice>{
+                          Slice{rollback_data.data(), rollback_data.size()}});
+        auto rollback_res = storage_backend.BatchOffload(
+            batch, [](const std::vector<std::string>&,
+                      std::vector<StorageObjectMetadata>&) {
+                return ErrorCode::INTERNAL_ERROR;
+            });
+        ASSERT_FALSE(rollback_res.has_value());
+        EXPECT_EQ(rollback_res.error(), ErrorCode::INTERNAL_ERROR);
+
+        auto exist_res = storage_backend.IsExist(rollback_key);
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value()) << "Rolled-back key must not exist";
+
+        EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 1u)
+            << "Rolled-back bucket's lru_index_ entry must be removed";
+    }
+
+    {
+        auto read_buf = std::make_unique<char[]>(kValueSize);
+        std::unordered_map<std::string, Slice> load_slices;
+        load_slices.emplace("lru_ts_key_a", Slice{read_buf.get(), kValueSize});
+        ASSERT_TRUE(storage_backend.BatchLoad(load_slices).has_value());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+    // Bucket B: freshly offloaded. Its timestamp must be t2 > t1 (it would
+    // be 0 without the timestamp update in BatchOffload).
+    offload_one("lru_ts_key_b", nullptr);
+    EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 2u);
+
+    // Bucket C: overflows the quota and forces eviction of one bucket.
+    std::vector<std::string> evicted_keys;
+    offload_one("lru_ts_key_c", &evicted_keys);
+    EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 2u)
+        << "lru_index_ must stay in sync with buckets_ after eviction";
+
+    ASSERT_EQ(evicted_keys.size(), 1u)
+        << "Exactly one bucket should be evicted";
+    EXPECT_EQ(evicted_keys[0], "lru_ts_key_a")
+        << "LRU victim should be the previously read bucket A, not the "
+           "freshly offloaded bucket B";
+
+    auto exist_b = storage_backend.IsExist("lru_ts_key_b");
+    ASSERT_TRUE(exist_b.has_value());
+    EXPECT_TRUE(exist_b.value())
+        << "Freshly offloaded bucket must not be evicted immediately "
+           "(its access timestamp must not be 0)";
+}
+
+#ifdef USE_URING
+TEST_F(StorageBackendTest, BucketBatchLoadUsesUringAcrossQueueDepth) {
+    constexpr int kKeyCount = 40;
+    constexpr size_t kValueSize = 1024;
+    constexpr size_t kReadBufferSize = 8192;
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = kKeyCount;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    bucket_config.max_total_size = 4 * 1024 * 1024;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<std::string> keys(kKeyCount);
+    std::vector<std::string> values(kKeyCount);
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    for (int i = 0; i < kKeyCount; ++i) {
+        keys[i] = "uring_batch_key_" + std::to_string(i);
+        values[i] = std::string(kValueSize, static_cast<char>('A' + i % 26));
+        offload_batch.emplace(
+            keys[i],
+            std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+    }
+
+    auto offload_result = storage_backend.BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+
+    using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
+    std::vector<AlignedBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    read_buffers.reserve(kKeyCount);
+    for (int i = 0; i < kKeyCount; ++i) {
+        void* buffer = nullptr;
+        ASSERT_EQ(posix_memalign(&buffer, 4096, kReadBufferSize), 0);
+        read_buffers.emplace_back(buffer, &std::free);
+        load_batch.emplace(keys[i], Slice{buffer, kValueSize});
+    }
+
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_TRUE(load_result.has_value()) << load_result.error();
+    for (int i = 0; i < kKeyCount; ++i) {
+        const auto& loaded = load_batch.at(keys[i]);
+        EXPECT_EQ(std::string_view(static_cast<char*>(loaded.ptr), loaded.size),
+                  values[i]);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
+    constexpr int kKeyCount = 2;
+    constexpr size_t kValueSize = 4096;
+    constexpr size_t kReadBufferSize = 8192;
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = kKeyCount;
+    bucket_config.bucket_size_limit = 64 * 1024;
+    bucket_config.max_total_size = 1024 * 1024;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<std::string> keys{"short_read_key_0", "short_read_key_1"};
+    std::vector<std::string> values{std::string(kValueSize, 'A'),
+                                    std::string(kValueSize, 'B')};
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    for (int i = 0; i < kKeyCount; ++i) {
+        offload_batch.emplace(
+            keys[i],
+            std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+    }
+
+    auto offload_result = storage_backend.BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+
+    std::filesystem::path bucket_path;
+    for (const auto& entry : std::filesystem::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".bucket") {
+            bucket_path = entry.path();
+            break;
+        }
+    }
+    ASSERT_FALSE(bucket_path.empty());
+    auto bucket_size = std::filesystem::file_size(bucket_path);
+    ASSERT_GT(bucket_size, kValueSize / 2);
+    std::filesystem::resize_file(bucket_path, bucket_size - kValueSize / 2);
+
+    using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
+    std::vector<AlignedBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    for (int i = 0; i < kKeyCount; ++i) {
+        void* buffer = nullptr;
+        ASSERT_EQ(posix_memalign(&buffer, 4096, kReadBufferSize), 0);
+        read_buffers.emplace_back(buffer, &std::free);
+        load_batch.emplace(keys[i], Slice{buffer, kValueSize});
+    }
+
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_FALSE(load_result.has_value());
+    EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
+}
+
+#endif
+
+TEST_F(StorageBackendTest, DatasyncFailureRemovesOrphanBucketFile) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Enable datasync-failure injection: WriteBucket's datasync() call will
+    // return a failure, exercising the same !sync_result cleanup path as a
+    // real fdatasync() failure (CleanupOrphanedBucket + error return).
+    storage_backend.SetDatasyncFailureForTest(true);
+
+    std::string key = "datasync_fail_key";
+    std::string value = "datasync_fail_payload";
+    void* buf = nullptr;
+    ASSERT_EQ(posix_memalign(&buf, 4096, value.size()), 0);
+    std::unique_ptr<void, decltype(&std::free)> buf_guard(buf, &std::free);
+    memcpy(buf, value.data(), value.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{buf, value.size()}});
+
+    // BatchOffload must return an error (datasync was injected to fail).
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    EXPECT_FALSE(offload_result.has_value());
+    EXPECT_EQ(offload_result.error(), ErrorCode::FILE_WRITE_FAIL);
+
+    // The .bucket file must have been cleaned up by CleanupOrphanedBucket.
+    int orphan_bucket_count = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".bucket") {
+            ++orphan_bucket_count;
+        }
+    }
+    EXPECT_EQ(orphan_bucket_count, 0)
+        << "datasync failure must not leave an orphan .bucket file on disk";
+
+    // No .meta file should have been written either (metadata commit comes
+    // after datasync, so it was never reached).
+    int meta_count = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".meta") {
+            ++meta_count;
+        }
+    }
+    EXPECT_EQ(meta_count, 0)
+        << "metadata must not be committed when datasync fails";
+
+    // The key must not be queryable.
+    auto exists = storage_backend.IsExist(key);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(exists.value());
 }
 
 }  // namespace mooncake::test

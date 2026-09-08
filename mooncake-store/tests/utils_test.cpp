@@ -2,6 +2,7 @@
 #include "random.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <future>
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -108,19 +109,6 @@ TEST(UtilsTest, StringToByteSize) {
     EXPECT_EQ(string_to_byte_size("-5"), 0);
 }
 
-TEST(UtilsTest, StringToBool) {
-    EXPECT_EQ(string_to_bool("1"), true);
-    EXPECT_EQ(string_to_bool("true"), true);
-    EXPECT_EQ(string_to_bool("YES"), true);
-    EXPECT_EQ(string_to_bool(" on "), true);
-    EXPECT_EQ(string_to_bool("0"), false);
-    EXPECT_EQ(string_to_bool("false"), false);
-    EXPECT_EQ(string_to_bool("No"), false);
-    EXPECT_EQ(string_to_bool(" off "), false);
-    EXPECT_EQ(string_to_bool("maybe"), std::nullopt);
-    EXPECT_EQ(string_to_bool(""), std::nullopt);
-}
-
 TEST(UtilsTest, IsPortAvailable) {
     // Find an available port
     int test_port = -1;
@@ -219,17 +207,6 @@ TEST(UtilsTest, AutoPortBinderMultipleInstances) {
     EXPECT_NE(port1, port2);
 }
 
-TEST(UtilsTest, SplitStringBasic) {
-    std::string input = "a, b ,c, d";
-    auto tokens = splitString(input, ',', true, false);
-
-    ASSERT_EQ(tokens.size(), 4);
-    EXPECT_EQ(tokens[0], "a");
-    EXPECT_EQ(tokens[1], "b");
-    EXPECT_EQ(tokens[2], "c");
-    EXPECT_EQ(tokens[3], "d");
-}
-
 TEST(UtilsTest, GetInterfaceIPv4AddressLoopback) {
     auto address = GetInterfaceIPv4Address("lo");
     ASSERT_TRUE(address.has_value()) << address.error();
@@ -291,4 +268,34 @@ TEST(UtilsTest, AutoPortBinderCustomRange) {
 
     EXPECT_GE(port, 50000);
     EXPECT_LE(port, 50100);
+}
+
+TEST(HugepageSizeEnvTest, Accepts512Mb) {
+    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    setenv("MC_STORE_HUGEPAGE_SIZE", "512MB", 1);
+
+    unsigned int flags = 0;
+    EXPECT_EQ(get_hugepage_size_from_env(&flags), SZ_512MB);
+    EXPECT_TRUE(flags & MAP_HUGETLB);
+    EXPECT_TRUE(flags & MAP_HUGE_512MB);
+
+    flags = 0;
+    EXPECT_EQ(get_hugepage_size_from_env(&flags, /*use_memfd=*/true), SZ_512MB);
+    EXPECT_TRUE(flags & MFD_HUGETLB);
+    EXPECT_TRUE(flags & MFD_HUGE_512MB);
+
+    unsetenv("MC_STORE_HUGEPAGE_SIZE");
+    unsetenv("MC_STORE_USE_HUGEPAGE");
+}
+
+TEST(HugepageSizeEnvTest, FallsBackTo2MbOnInvalidSize) {
+    setenv("MC_STORE_USE_HUGEPAGE", "1", 1);
+    setenv("MC_STORE_HUGEPAGE_SIZE", "256MB", 1);
+
+    unsigned int flags = 0;
+    EXPECT_EQ(get_hugepage_size_from_env(&flags), SZ_2MB);
+    EXPECT_TRUE(flags & MAP_HUGE_2MB);
+
+    unsetenv("MC_STORE_HUGEPAGE_SIZE");
+    unsetenv("MC_STORE_USE_HUGEPAGE");
 }

@@ -712,6 +712,24 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::DFS: {
+            const auto *dfs_data = std::get_if<DfsReplicaData>(&replica.data_);
+            if (!dfs_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing DfsReplicaData"));
+            }
+            // Format: [file_path, offset, object_size, aligned_size, shard_idx]
+            packer.pack_array(5);
+            packer.pack(dfs_data->descriptor.file_path);
+            packer.pack(static_cast<uint64_t>(dfs_data->descriptor.offset));
+            packer.pack(
+                static_cast<uint64_t>(dfs_data->descriptor.object_size));
+            packer.pack(
+                static_cast<uint64_t>(dfs_data->descriptor.aligned_size));
+            packer.pack(static_cast<int32_t>(dfs_data->descriptor.shard_idx));
+            break;
+        }
         default:
             // Unsupported replica type
             packer.pack(static_cast<int8_t>(255));
@@ -810,6 +828,26 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::DFS): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 5) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "deserialize_msgpack Replica DFS "
+                                       "payload is not valid array[5]"));
+            }
+            auto *payload_items = payload.via.array.ptr;
+            DistributedFSDescriptor descriptor;
+            descriptor.file_path = payload_items[0].as<std::string>();
+            descriptor.offset = payload_items[1].as<uint64_t>();
+            descriptor.object_size = payload_items[2].as<uint64_t>();
+            descriptor.aligned_size = payload_items[3].as<uint64_t>();
+            descriptor.shard_idx = payload_items[4].as<int32_t>();
+
+            replica = std::make_shared<Replica>(std::move(descriptor), status);
             break;
         }
         default:
@@ -945,7 +983,7 @@ Serializer<OffsetBufferAllocator>::serialize(
     packer.pack(allocator.segment_name_);
     packer.pack(static_cast<uint64_t>(allocator.base_));
     packer.pack(static_cast<uint64_t>(allocator.total_size_));
-    packer.pack(static_cast<uint64_t>(allocator.cur_size_.load()));
+    packer.pack(static_cast<uint64_t>(allocator.size()));
     packer.pack(allocator.transport_endpoint_);
 
     // Serialize offset_allocator
@@ -998,12 +1036,12 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
 
         // Set internal member variable values
         allocator->offset_allocator_ = offset_allocator_result.value();
-        allocator->cur_size_ = cur_size;
+        allocator->RestoreUsageBytes(cur_size);
 
-        // The snapshot restores cur_size_ directly from persisted data
+        // The snapshot restores usage directly from persisted data
         // without going through the live allocate()/adoptImportedBuffer()
         // paths, so no inc_allocated_mem_size() was paired with it. The
-        // allocator destructor still calls dec_allocated_mem_size(cur_size_)
+        // allocator destructor still calls dec_allocated_mem_size(usage)
         // to undo its contribution to the global metric; without a matching
         // inc the gauge would go negative and wrap to ~16M TB when formatted
         // as uint64. Pair it here so the accounting stays symmetric and the

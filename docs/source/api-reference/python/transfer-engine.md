@@ -636,7 +636,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_LEGACY_RPC_PORT_BINDING`: Enables legacy RPC port binding behavior
 - `MC_TCP_BIND_ADDRESS`: Specifies the TCP bind address
 - `MC_RDMA_BIND_ADDRESS`: Specifies the RDMA bind address for NIC path construction in dual-NIC environments. When set, RDMA NIC paths use this address while TCP handshake uses the address from `local_hostname`. This is useful when TCP and RDMA traffic use separate network interfaces (e.g., `eth0` for TCP and `rdma-net1` for RDMA).
-- `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file
+- `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file (classic NIC priority matrix, or under TENT also native `nics`/`mems` JSON). Honored by classic Transfer Engine and by TENT when `MC_USE_TENT=1` (maps to `topology/custom_json_path`). For TENT, prefer inlining `topology/priority_matrix` in `MC_TENT_CONF` when possible; see the {ref}`TENT C++ API <custom-nic-priority-matrix>`.
 - `MC_TE_FILTERS`: Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
 - `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds
@@ -849,6 +849,7 @@ The `mooncake.engine` module provides boolean attributes that indicate whether s
 - `engine.SUPPORT_EFA`: Whether EFA (Elastic Fabric Adapter) support is enabled
 - `engine.SUPPORT_HIP`: Whether HIP (Heterogeneous-compute Interface for Portability) support is enabled
 - `engine.SUPPORT_MNNVL`: Whether MNNVL transport protocol support is enabled
+- `engine.SUPPORT_MUSA`: Whether the Moore Threads MUSA GPU IPC transport is enabled
 - `engine.SUPPORT_INTRA_NVLINK`: Whether intra-node NVLink support is enabled
 
 ### Usage Example
@@ -865,5 +866,6 @@ print(f"CUDA: {engine.SUPPORT_CUDA}")
 print(f"EFA: {engine.SUPPORT_EFA}")
 print(f"HIP: {engine.SUPPORT_HIP}")
 print(f"MNNVL: {engine.SUPPORT_MNNVL}")
+print(f"MUSA: {engine.SUPPORT_MUSA}")
 print(f"Intra-NVLink: {engine.SUPPORT_INTRA_NVLINK}")
 ```

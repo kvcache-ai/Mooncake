@@ -1,9 +1,6 @@
 #include "environ.h"
-#include <cerrno>
-#include <climits>
-#include <cstring>
+
 #include <algorithm>
-#include <cctype>
 #include <iostream>
 #include <thread>
 
@@ -29,70 +26,69 @@ const EnvironSource& GetOsEnvironSource() {
     return source;
 }
 
-int ReadInt(const EnvironSource& source, const char* name, int default_value) {
-    const char* val = source.Get(name);
-    if (val) {
-        char* endptr = nullptr;
-        errno = 0;
-        long result = std::strtol(val, &endptr, 10);
-        if (endptr == val || *endptr != '\0' || errno == ERANGE ||
-            result < INT_MIN || result > INT_MAX) {
-            std::cerr << "[Mooncake] Warning: invalid value '" << val
-                      << "' for env " << name << ", using default "
-                      << default_value << std::endl;
-            return default_value;
-        }
-        return static_cast<int>(result);
+template <typename Integer>
+Integer ReadInteger(const EnvironSource& source, const char* name,
+                    Integer default_value) {
+    const char* value = source.Get(name);
+    if (value == nullptr) {
+        return default_value;
     }
+
+    const auto parsed = TryParseEnvironmentValue<Integer>(value);
+    if (parsed.has_value()) {
+        return *parsed;
+    }
+
+    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
+              << name << ", using default " << default_value << std::endl;
     return default_value;
+}
+
+int ReadInt(const EnvironSource& source, const char* name, int default_value) {
+    return ReadInteger(source, name, default_value);
 }
 
 int64_t ReadInt64(const EnvironSource& source, const char* name,
                   int64_t default_value) {
-    const char* val = source.Get(name);
-    if (val) {
-        char* endptr = nullptr;
-        errno = 0;
-        long long result = std::strtoll(val, &endptr, 10);
-        if (endptr == val || *endptr != '\0' || errno == ERANGE) {
-            std::cerr << "[Mooncake] Warning: invalid value '" << val
-                      << "' for env " << name << ", using default "
-                      << default_value << std::endl;
-            return default_value;
-        }
-        return static_cast<int64_t>(result);
-    }
-    return default_value;
+    return ReadInteger(source, name, default_value);
 }
 
 size_t ReadSizeT(const EnvironSource& source, const char* name,
                  size_t default_value) {
-    const char* val = source.Get(name);
-    if (val) {
-        char* endptr = nullptr;
-        errno = 0;
-        long long result = std::strtoll(val, &endptr, 10);
-        if (endptr == val || *endptr != '\0' || errno == ERANGE || result < 0 ||
-            static_cast<unsigned long long>(result) > SIZE_MAX) {
-            std::cerr << "[Mooncake] Warning: invalid value '" << val
-                      << "' for env " << name << ", using default "
-                      << default_value << std::endl;
-            return default_value;
-        }
-        return static_cast<size_t>(result);
+    return ReadInteger(source, name, default_value);
+}
+
+double ReadDouble(const EnvironSource& source, const char* name,
+                  double default_value) {
+    const char* value = source.Get(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
     }
+
+    const auto parsed = TryParseEnvironmentValue<double>(value);
+    if (parsed.has_value()) {
+        return *parsed;
+    }
+
+    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
+              << name << ", using default " << default_value << std::endl;
     return default_value;
 }
 
 bool ReadBool(const EnvironSource& source, const char* name,
               bool default_value) {
-    const char* val = source.Get(name);
-    if (val) {
-        std::string s(val);
-        std::transform(s.begin(), s.end(), s.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        return s == "1" || s == "true" || s == "on" || s == "yes";
+    const char* value = source.Get(name);
+    if (value == nullptr) {
+        return default_value;
     }
+
+    const auto parsed = TryParseEnvironmentValue<bool>(value);
+    if (parsed.has_value()) {
+        return *parsed;
+    }
+
+    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
+              << name << ", using default " << default_value << std::endl;
     return default_value;
 }
 
@@ -122,6 +118,18 @@ int Environ::GetInt(const char* name, int default_value) {
 
 int64_t Environ::GetInt64(const char* name, int64_t default_value) {
     return ReadInt64(GetOsEnvironSource(), name, default_value);
+}
+
+uint32_t Environ::GetUInt32(const char* name, uint32_t default_value) {
+    return ReadInteger(GetOsEnvironSource(), name, default_value);
+}
+
+uint64_t Environ::GetUInt64(const char* name, uint64_t default_value) {
+    return ReadInteger(GetOsEnvironSource(), name, default_value);
+}
+
+double Environ::GetDouble(const char* name, double default_value) {
+    return ReadDouble(GetOsEnvironSource(), name, default_value);
 }
 
 size_t Environ::GetSizeT(const char* name, size_t default_value) {

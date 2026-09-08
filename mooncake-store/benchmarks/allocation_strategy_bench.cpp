@@ -18,6 +18,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "allocator.h"
 #include "allocation_strategy.h"
+#include "local_ssd/manager.h"
 
 // --- gflags definitions ---
 DEFINE_int64(segment_capacity, 1024,
@@ -669,7 +670,8 @@ static void computeLatencyStats(std::vector<double>& latencies, double total_us,
 static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     std::vector<double> latencies;
     latencies.reserve(cfg.num_allocations);
@@ -788,7 +790,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
 static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     const double convergence_threshold = FLAGS_convergence_threshold;
 
@@ -1113,7 +1116,8 @@ static SizeClassPrefillStats prefillSizeClassChurn(
 static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     const size_t total_capacity = computeTotalCapacity(manager);
     const size_t avg_obj_size =
@@ -1236,7 +1240,8 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
 static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
     auto specs = getSizeClassSpecs(cfg.size_class_pattern);
 
     std::vector<SizeClassStat> per_class_stats;

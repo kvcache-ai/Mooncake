@@ -6,6 +6,7 @@
 
 - [ ] Transfer Engine (`mooncake-transfer-engine`)
 - [ ] Mooncake Store (`mooncake-store`)
+- [ ] Reshard (`mooncake-reshard`)
 - [ ] Mooncake EP (`mooncake-ep`)
 - [ ] Mooncake PG (`mooncake-pg`)
 - [ ] Integration (`mooncake-integration`)
@@ -45,7 +46,7 @@
 
 - [ ] I have performed a self-review of my own code
 - [ ] I have formatted my code using `./scripts/code_format.sh`
-- [ ] I have run `pre-commit run --all-files` and all hooks pass
+- [ ] I have run pre-commit on the files changed in this PR and all hooks pass
 - [ ] I have updated the documentation (if applicable)
 - [ ] I have added tests to prove my changes are effective
 - [ ] For changes >500 LOC: I have filed an RFC issue

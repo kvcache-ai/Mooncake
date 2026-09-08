@@ -9,302 +9,43 @@ on:
     branches:
       - "main"
       - "release/**"
-    types: [opened, synchronize, reopened, labeled]
+    # `labeled` is intentionally omitted. Auto-labeler already applies
+    # `run-ci`, so any new label (including `run-e2e-ci`) would retrigger
+    # this whole workflow and cancel the in-progress run. Same-SHA
+    # retrigger via the `run-ci` label lives in ci-on-label.yml.
+    types: [opened, synchronize, reopened]
   workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
-  build:
-    needs: [spell-check, clang-format, check-paths]
-    if: &run-ci-for-source-changes >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      SCCACHE_GHA_ENABLED: "true"
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install and start etcd
-      run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3 # Give etcd time to start
-        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
-      with:
-        cuda: '12.8.1'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc"]'
-
-    - name: Install coverage tools and build utilities
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y lcov gcovr ninja-build
-
-    - name: Test HugeTLB sizing helper
-      run: |
-        python3 scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
-    - name: Set up coverage compilation flags
-      run: |
-        echo "Setting up coverage compilation flags..."
-        echo "CXXFLAGS=--coverage" >> $GITHUB_ENV
-        echo "CFLAGS=--coverage" >> $GITHUB_ENV
-        echo "LDFLAGS=--coverage" >> $GITHUB_ENV
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project with coverage support
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Start Metadata Server
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-      shell: bash
-
-    - name: Run Mooncake Store Rust smoke test and benchmark
-      env:
-        MOONCAKE_STORE_CLUSTER_ID: ci_rust_test_cluster
-        MOONCAKE_STORE_RUST_LINK_ASAN: "1"
-      run: ./scripts/ci/run_store_rust_smoke.sh
-      shell: bash
-
-    - name: Run Go store binding integration tests
-      env:
-        MOONCAKE_STORE_CLUSTER_ID: ci_go_test_cluster
-        MOONCAKE_STORE_GO_LINK_COMMON: "1"
-        MOONCAKE_STORE_GO_SANITIZED: "1"
-      run: ./scripts/ci/run_store_go_integration.sh
-      shell: bash
-
-    - name: Test (in build env) with coverage
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
-      shell: bash
-
-    - name: Drain HTTP E2E test
-      if: matrix.python-version == '3.12'
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        # Keep the sanitizer gate on the C++ integration test. The Python
-        # drain script is manual/nightly only because pybind + ASan teardown in
-        # a Python host process is not stable.
-        DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
-      shell: bash
-
-    - name: Generate coverage report
-      id: coverage
-      run: |
-        cd build
-        echo "=== Starting coverage report generation ==="
-        echo "Current directory: $(pwd)"
-
-        echo "=== Looking for .gcda files ==="
-        find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
-
-        echo "=== Running lcov ==="
-        lcov --capture --directory . --output-file coverage.info 2>&1 || {
-          echo "WARNING: lcov failed to capture coverage data"
-          echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
-          echo "TN:dummy" > coverage.filtered.info
-          echo "SF:/dev/null" >> coverage.filtered.info
-          echo "DA:0,0" >> coverage.filtered.info
-          echo "end_of_record" >> coverage.filtered.info
-          echo "coverage_failed=true" >> $GITHUB_OUTPUT
-          exit 0  # Exit successfully, do not block CI
-        }
-
-        echo "=== Processing coverage data ==="
-        lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' '*/benchmarks/*' --output-file coverage.filtered.info 2>&1 || true
-
-        echo "=== Generating HTML report ==="
-        genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
-
-        echo "=== Coverage summary ==="
-        lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
-
-        echo "=== Coverage report generation completed ==="
-      shell: bash
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        files: build/coverage.filtered.info
-        flags: unittests
-        name: code-coverage-report
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: false
-      continue-on-error: true
-
-    - name: Check coverage status
-      if: always()
-      run: |
-        if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
-          echo "⚠️ Coverage collection failed but CI continued"
-          echo "::warning::Code coverage collection failed. Please check the build logs."
-        else
-          echo "✅ Coverage collected successfully"
-        fi
-
-  build-musa:
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
-    runs-on: ubuntu-22.04
-    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Mark repository as safe
-      run: git config --global --add safe.directory $GITHUB_WORKSPACE
-      shell: bash
-
-    - name: Configure project
-      run: |
-        apt update -y
-        apt install -y ninja-build
-        bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        source ~/.bashrc
-        cmake --build . --parallel 1
-        cmake --install .
-      shell: bash
-
-  build-arm64:
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04-arm
-      container: pytorch/manylinuxaarch64-builder:cuda13.0
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      cmake-generator: Ninja
-      variant-flag: CU13_BUILD
-      torch-cuda-arch-list: '9.0'
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
-        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: wheel-arm64-cuda13
-      version-override: 0.0.0.dev0
-
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
   build-wheel:
     needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
+    if: &run-ci-for-source-changes needs.check-paths.outputs.src == 'true'
     uses: ./.github/workflows/_build-wheel.yaml
     with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
       python-versions: '["3.10", "3.12"]'
-      cuda: container
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-ci
       version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-wheel]
-    if: >-
-      needs.build-wheel.result == 'success' &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    needs: [build-wheel]
     strategy:
       matrix:
-        ubuntu-version: [ubuntu-22.04, ubuntu-24.04]
-        python-version: ['3.10', '3.12']
+        include:
+          - ubuntu-version: ubuntu-22.04
+            python-version: '3.12'
+            artifact: mooncake-wheel-ci-py312
+          - ubuntu-version: ubuntu-24.04
+            python-version: '3.10'
+            artifact: mooncake-wheel-ci-py310
     runs-on: ${{ matrix.ubuntu-version }}
     steps:
     - uses: actions/checkout@v4
@@ -316,16 +57,10 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Generate Python version tag
-      id: generate_tag_test
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ci-py${{ steps.generate_tag_test.outputs.python_version_tag }}
+        name: ${{ matrix.artifact }}
         path: mooncake-wheel/dist
 
     - name: Verify wheel file exists
@@ -352,137 +87,192 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
-    - name: Start metadata server
-      run: |
-        source test_env/bin/activate
-        mooncake_http_metadata_server --port 8080 &
-      shell: bash
-
-    - name: Run tests with ssd
-      run: |
-        # Reserve port 50052 (mooncake_client RPC port) so the kernel never
-        # auto-allocates it as ephemeral source port for other outbound
-        # connections in the test suite. Without this, a random Python test
-        # connection can pick src_port=50052, leave a TIME_WAIT on
-        # <eth0_ip>:50052 for 60s, and block mooncake_client's bind to
-        # 0.0.0.0:50052 even with SO_REUSEADDR (Linux only relaxes
-        # TIME_WAIT+bind conflict for same-IP or loopback).
-        sudo sysctl -w net.ipv4.ip_local_reserved_ports=50052
-        source test_env/bin/activate
-        MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
-        rm -rf /tmp/mooncake_test_ssd
-        deactivate
-      shell: bash
-
-    - name: Start Mooncake Master
-      run: |
-        source test_env/bin/activate
-        mkdir -p /tmp/mooncake_storage
-        mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_test_cluster \
-          --port 50051 &
-        sleep 3
-      shell: bash
-
-    - name: Run Python Tensor API Performance Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_tensor_api.py -n 1
-      shell: bash
-
-    - name: Run Python Async API Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_async_store.py
-      shell: bash
-
-    - name: Test Mooncake Copy/Move API
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        python scripts/test_copy_move_api.py
-      shell: bash
-
-    - name: Run Python Drain HTTP E2E Test (CI check)
-      env:
-        MOONCAKE_MASTER: "127.0.0.1:50051"
-        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
-        MOONCAKE_PROTOCOL: "tcp"
-        LOCAL_HOSTNAME: "127.0.0.1"
-      run: |
-        source test_env/bin/activate
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        python scripts/test_drain_http_api.py --timeout-sec 90
-      shell: bash
-
-    - name: Run RPC Communicator Bandwidth Test
-      run: |
-        source test_env/bin/activate
-        python mooncake-transfer-engine/tests/rpc_communicator_test.py server --url 127.0.0.1:9004 --data-size 1 &
-        SERVER_PID=$!
-        sleep 5
-        timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
-        kill $SERVER_PID 2>/dev/null || true
-        wait $SERVER_PID 2>/dev/null || true
-
-    - name: Test Mooncake PyTorch Backend (CPU Only)
+    - name: Run all PG CPU tests with latest PyTorch
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
         MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
-        python mooncake-pg/tests/test_pg_collectives.py
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m unittest discover -s mooncake-pg/tests -k CPU -v
       shell: bash
 
-    - name: Test PyTorch 2.13 Single-Buffer Collectives (CPU Only)
-      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.10'
+    - name: Run Store API and RPC smoke tests
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
-        MC_FORCE_TCP: "true"
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
       run: |
         source test_env/bin/activate
-        python -m pip install --force-reinstall "torch==2.13.0" \
-          --index-url https://download.pytorch.org/whl/cu126 \
-          --extra-index-url https://pypi.org/simple
-        python mooncake-pg/tests/test_pg_collectives.py \
-          TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
-          TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        python -m pip install safetensors
+
+        reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+        sudo sysctl -w \
+          "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
+
+        ./scripts/ci/run_store_api_smoke.sh
+        ./scripts/ci/run_rpc_smoke.sh
       shell: bash
 
-    - name: Test Safetensor Functions
+    - name: Run SSD offload and promotion end-to-end tests
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       run: |
         source test_env/bin/activate
-        pip install safetensors
-        python -m unittest mooncake-wheel.tests.test_safetensor_functions
+        ./scripts/ci/run_ssd_offload_smoke.sh
       shell: bash
 
-  build-flags:
-    needs: [spell-check, clang-format, check-paths]
+  unit-tests:
+    name: CTest unit tests (Python 3.12)
+    needs: [check-paths]
     if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
     env:
       CI: "true"
-      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Install and start etcd
+      run: |
+        wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+        sleep 3
+        ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+      shell: bash
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+        sub-packages: '["nvcc"]'
+
+    - name: Install build utilities and dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y ninja-build
+        sudo bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+      shell: bash
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Configure project with unit tests
+      run: |
+        cmake -S . -B build -G Ninja \
+          -DUSE_HTTP=ON \
+          -DUSE_CXL=ON \
+          -DUSE_UB=ON \
+          -DUSE_ETCD=ON \
+          -DUSE_CUDA=ON \
+          -DWITH_P2P_STORE=ON \
+          -DWITH_CONDUCTOR=ON \
+          -DSTORE_USE_ETCD=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DBUILD_UNIT_TESTS=ON \
+          -DENABLE_SCCACHE=ON
+      shell: bash
+
+    - name: Configure CUDA driver runtime
+      run: |
+        cuda_driver_library=$(sed -n \
+          's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
+        if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
+          echo "::error::CMake did not resolve the CUDA driver library"
+          exit 1
+        fi
+
+        cuda_driver_dir=$(dirname "$cuda_driver_library")
+        if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
+          sudo ln -s "$(basename "$cuda_driver_library")" \
+            "$cuda_driver_dir/libcuda.so.1"
+        fi
+        echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+        echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+      shell: bash
+
+    - name: Build project and unit tests
+      run: |
+        cmake --build build --parallel 128
+        sudo -E cmake --install build
+      shell: bash
+
+    - name: Run Mooncake Store Rust unit tests
+      env:
+        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build
+        MOONCAKE_STORE_LIB_DIR: ${{ github.workspace }}/build/mooncake-store/src
+        MOONCAKE_STORE_INCLUDE_DIR: ${{ github.workspace }}/mooncake-store/include
+      run: |
+        export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        cargo test --manifest-path mooncake-store/rust/Cargo.toml --lib
+      shell: bash
+
+    - name: Start Metadata Server
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+        sleep 2
+      shell: bash
+
+    - name: Run all CTest unit tests
+      id: ctest
+      run: |
+        reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+        sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
+        mkdir -p build/test-results
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+        DEFAULT_KV_LEASE_TTL=500 \
+          ctest --test-dir build --parallel "$(nproc)" --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
+      shell: bash
+
+    - name: Preserve CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: PR CTest failure
+        artifact-name: ctest-diagnostics-pr
+        junit-report: build/test-results/ctest.xml
+        failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build/Testing/Temporary/LastTest.log
+
+  build-flags:
+    needs: [check-paths]
+    if: *run-ci-for-source-changes
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
       SCCACHE_GHA_ENABLED: "true"
       PIP_NO_CACHE_DIR: "1"
-      MAX_JOBS: "2"
-      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1;2.13.0"
       CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
 
     steps:
@@ -490,10 +280,10 @@ jobs:
       with:
         persist-credentials: false
 
-    - name: Set up Python ${{ matrix.python-version }}
+    - name: Set up Python 3.12
       uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
+        python-version: '3.12'
 
     - name: Free up disk space
       uses: ./.github/actions/free-disk-space
@@ -524,9 +314,6 @@ jobs:
         sudo bash -x dependencies.sh -y
         df -h
       shell: bash
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
 
     - name: Build transfer engine only
       run: |
@@ -559,160 +346,8 @@ jobs:
         df -h
       shell: bash
 
-    - name: Configure project with all settings are ON
-      run: |
-        mkdir build
-        cd build
-        # ENABLE_DEBUG_SYMBOLS=OFF alone still leaves CMake's RelWithDebInfo -g.
-        cmake -G Ninja .. \
-          -DUSE_ETCD=ON \
-          -DUSE_CXL=ON \
-          -DUSE_REDIS=ON \
-          -DUSE_HTTP=ON \
-          -DWITH_STORE=ON \
-          -DWITH_P2P_STORE=ON \
-          -DWITH_METRICS=ON \
-          -DBUILD_UNIT_TESTS=ON \
-          -DBUILD_EXAMPLES=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CUDA=ON \
-          -DUSE_MNNVL=OFF \
-          -DUSE_UB=OFF \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-      # TODO: lack USE_NVMEOF,USE_MNNVL
-
-    - name: Build project with all settings are ON
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-        df -h
-      shell: bash
-
-    - name: Configure project with unit tests and examples
-      run: |
-        cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project with unit tests and examples
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Check Mooncake Store Rust bindings, examples, and tests
-      run: |
-        # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
-        # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
-        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
-           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
-          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-        fi
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cd mooncake-store/rust
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        cargo test --lib
-        MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
-        MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
-          cargo test --examples --tests --no-run
-        cargo clean
-      shell: bash
-
-    - name: Verify Mooncake Store Rust dlopen bindings and packaging
-      run: |
-        cd mooncake-store/rust
-        # 1. Committed dlopen bindings must stay in sync with store_c.h.
-        cargo run --locked --example generate_dlopen_bindings
-        git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
-        # 2. The published dlopen crate must build with no header/bindgen: package
-        #    it, extract, and check the dlopen feature against the packaged files.
-        cargo package --no-verify --allow-dirty
-        crate=$(ls target/package/mooncake_store-*.crate | head -1)
-        dest=$(mktemp -d)
-        tar xzf "$crate" -C "$dest"
-        (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
-      shell: bash
-
-    - name: Configure project
-      run: |
-        cd build
-        rm -r */tests
-        cmake -G Ninja .. \
-          -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF \
-          -DUSE_HTTP=ON \
-          -DENABLE_SCCACHE=ON \
-          -DUSE_CXL=ON \
-          -DWITH_EP=ON \
-          "-DEP_TORCH_VERSIONS=${EP_TORCH_VERSIONS}" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-  build-docker:
-    name: Build Docker Image
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-
-    - name: Build Docker image
-      run: |
-        docker build -f docker/mooncake.Dockerfile \
-          --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.13.0" \
-          --build-arg CLEAN_BUILD_ARTIFACTS=1 \
-          -t mooncake:from-source .
-
   spell-check:
     name: Spell Check with Typos
-    if: &run-ci >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -722,9 +357,50 @@ jobs:
     - name: Spell Check Repo
       uses: crate-ci/typos@v1.30.2
 
+  reshard-type-check:
+    name: Check reshard manifest types
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Check canonical reshard contract types
+      run: |
+        python -m pip install --disable-pip-version-check pyright==1.1.411
+        bash scripts/check_reshard_types.sh
+      shell: bash
+
+  ci-script-tests:
+    name: Test CI scripts
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Run focused release gate tests
+      run: |
+        python -m pip install --disable-pip-version-check \
+          packaging pytest==8.3.5
+        python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+      shell: bash
+
+    - name: Test CI service and smoke scripts
+      run: python -m unittest discover -s scripts/ci/tests -v
+
   clang-format:
     name: Check code format
-    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -767,59 +443,86 @@ jobs:
         ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
-
-  docs-check:
-    name: Check Sphinx docs build
-    if: *run-ci
+  python-lint:
+    name: Check Python with Ruff
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 2
+        fetch-depth: 0
         persist-credentials: false
 
-    - uses: dorny/paths-filter@v3
-      id: filter
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
       with:
-        filters: |
-          docs:
-            - 'docs/**'
-            - 'docs/requirements-docs.txt'
+        python-version: '3.12'
+
+    - name: Install Ruff
+      run: python -m pip install --disable-pip-version-check ruff==0.6.9
+
+    - name: Check changed Python files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base_ref="origin/${{ github.base_ref }}"
+        elif [ "${{ github.event.before }}" = \
+               "0000000000000000000000000000000000000000" ]; then
+          base_ref="origin/${{ github.event.repository.default_branch }}"
+        elif [ -n "${{ github.event.before }}" ]; then
+          base_ref="${{ github.event.before }}"
+        else
+          base_ref="HEAD^"
+        fi
+
+        mapfile -d '' python_files < <(
+          git diff --name-only --diff-filter=ACMR -z "$base_ref"...HEAD -- \
+            '*.py' \
+            ':(exclude)extern/**' \
+            ':(exclude)FAST25-release/**'
+        )
+        if [ "${#python_files[@]}" -eq 0 ]; then
+          echo "No changed Python files to check."
+          exit 0
+        fi
+
+        ruff check "${python_files[@]}"
+        ruff format --check "${python_files[@]}"
+      shell: bash
+
+
+  docs-check:
+    name: Check Sphinx docs build
+    needs: check-paths
+    if: needs.check-paths.outputs.docs == 'true'
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
 
     - name: Set up Python
-      if: steps.filter.outputs.docs == 'true'
       uses: actions/setup-python@v5
       with:
         python-version: '3.12'
 
     - name: Install documentation dependencies
-      if: steps.filter.outputs.docs == 'true'
       run: |
         python -m pip install --upgrade pip
         pip install -r docs/requirements-docs.txt
 
     - name: Build docs with strict mode
-      if: steps.filter.outputs.docs == 'true'
-      run: |
-        cd docs
-        make html SPHINXOPTS=-W
-      shell: bash
-
+      working-directory: docs
+      run: make html SPHINXOPTS=-W
 
   check-paths:
-    if: *run-ci
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
-      should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
-      should-run-tent: ${{ steps.dispatch-override.outputs.tent || steps.filter.outputs.tent }}
+      src: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.src }}
+      tent: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.tent }}
+      docs: ${{ github.event_name == 'workflow_dispatch' && 'true' || steps.filter.outputs.docs }}
     steps:
-      # workflow_dispatch has no PR/push diff context — skip paths-filter and default to true
-      - name: Default to true for workflow_dispatch
-        id: dispatch-override
-        if: github.event_name == 'workflow_dispatch'
-        run: |
-          echo "src=true" >> $GITHUB_OUTPUT
-          echo "tent=true" >> $GITHUB_OUTPUT
       - uses: actions/checkout@v4
         if: github.event_name != 'workflow_dispatch'
         with:
@@ -829,10 +532,14 @@ jobs:
         if: github.event_name != 'workflow_dispatch'
         id: filter
         with:
+          # PRs use their base branch; pushes compare against the previous push
+          # on this ref, including release branches.
+          base: ${{ github.event_name == 'push' && github.ref || '' }}
           filters: |
             src:
               - 'mooncake-*/**'
               - 'extern/**'
+              - 'cmake/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/**'
@@ -841,15 +548,26 @@ jobs:
             tent:
               - 'mooncake-transfer-engine/**'
               - 'mooncake-common/**'
+              - 'extern/**'
+              - 'cmake/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
+              - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
+              - '.github/actions/**'
+              - '.github/workflows/ci.yml'
+            docs:
+              - 'docs/**'
               - '.github/workflows/ci.yml'
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
-    uses: ./.github/workflows/ci_cu13.yml
-    secrets: inherit
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      python-versions: '["3.12"]'
+      artifact-prefix: mooncake-wheel-cu130
+      version-override: 0.0.0.dev0
 
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
@@ -857,27 +575,15 @@ jobs:
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
-  ascend-test:
-    needs: [build, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/ci_ascend.yml
-    secrets: inherit
-
-  integration-test:
-    needs: [build, build-wheel-cu13, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/integration-test.yml
+  build-wheel-rocm:
+    needs: [spell-check, clang-format, check-paths]
+    if: needs.check-paths.outputs.src == 'true'
+    uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
   tent-ci:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-tent == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: needs.check-paths.outputs.tent == 'true'
     runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
@@ -895,6 +601,12 @@ jobs:
             cmake_flags: '-DUSE_CUDA=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+          # Exercise the native UB target with its injected mock adapter. A
+          # Debug build also catches ODR/link errors hidden by optimization.
+          - name: ub-mock
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -936,6 +648,9 @@ jobs:
         df -h
       shell: bash
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Configure project with TENT
       run: |
         mkdir build-tent
@@ -954,16 +669,69 @@ jobs:
         sudo cmake --install .
       shell: bash
 
+    # Check the Transfer Engine Rust crate against the freshly built C++
+    # libraries. This is a compile/link check, so it is safe to run on every
+    # matrix leg (including the cuda-on leg, which only verifies that the
+    # USE_CUDA code paths compile).
+    - name: Check Transfer Engine Rust bindings, examples, and tests
+      run: |
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        if [ "${{ matrix.need_cuda }}" = "true" ]; then
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        fi
+        cd mooncake-transfer-engine/rust
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build-tent
+        export MOONCAKE_TE_LIB_DIR=$GITHUB_WORKSPACE/build-tent/mooncake-transfer-engine/src
+        export MOONCAKE_TE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-transfer-engine/include
+        cargo test --lib
+        cargo test --examples --tests --no-run
+        cargo clean
+      shell: bash
+
     # Only run tests on the cuda-off leg. GitHub runners have no real GPU;
     # with USE_CUDA=ON tent's cuda_probe hits the CUDA stub library at
     # runtime and drives some dispatch paths past the fake objects the
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
+      id: ctest
       if: '!matrix.need_cuda'
       run: |
         cd build-tent
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
+      shell: bash
+
+    - name: Preserve TENT CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (${{ matrix.name }})
+        artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
+        junit-report: build-tent/test-results/ctest.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+
+    - name: Start Metadata Server
+      if: '!matrix.need_cuda'
+      run: |
+        cd mooncake-transfer-engine/example/http-metadata-server-python
+        pip install aiohttp
+        python ./bootstrap_server.py &
+        sleep 2
+      shell: bash
+
+    - name: Run Transfer Engine Rust smoke test
+      if: '!matrix.need_cuda'
+      env:
+        MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
+        MOONCAKE_TE_RUST_LINK_ASAN: "0"
+      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
 
     - name: Run sccache stat for check
@@ -975,34 +743,63 @@ jobs:
     name: CI Gate
     if: always()
     needs:
+      - check-paths
       - spell-check
       - clang-format
+      - python-lint
       - docs-check
-      - build
-      - build-musa
-      - build-arm64
+      - reshard-type-check
+      - ci-script-tests
       - build-wheel
+      - unit-tests
       - build-flags
-      - build-docker
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-efa
+      - build-wheel-rocm
       - tent-ci
-      - ascend-test
-      - integration-test
     runs-on: ubuntu-latest
     steps:
-      - name: Check required job results
-        run: |
-          failing=$(echo "$NEEDS_JSON" | jq -r '
-            to_entries[] |
-            select(.value.result != "success" and .value.result != "skipped") |
-            "\(.key): \(.value.result)"')
-          if [ -n "$failing" ]; then
-            echo "::error::The following jobs failed or were cancelled:"
-            echo "$failing"
-            exit 1
-          fi
-          echo "All checks passed or were acceptably skipped."
+      # Each path-gated group must succeed when selected and be skipped otherwise.
+      # A failed selector must never turn skipped builds into a successful gate.
+      - name: Check unconditional jobs
         env:
           NEEDS_JSON: ${{ toJSON(needs) }}
+          PASSED: >-
+            ${{ needs.check-paths.result == 'success' &&
+                needs.spell-check.result == 'success' &&
+                needs.clang-format.result == 'success' &&
+                needs.python-lint.result == 'success' &&
+                needs.reshard-type-check.result == 'success' &&
+                needs.ci-script-tests.result == 'success' }}
+        run: |
+          echo "$NEEDS_JSON"
+          test "$PASSED" = true
+
+      - name: Check source jobs
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.src == 'true' && 'success' || 'skipped' }}
+          RESULTS: >-
+            ${{ needs.build-wheel.result }}
+            ${{ needs.unit-tests.result }}
+            ${{ needs.build-flags.result }}
+            ${{ needs.test-wheel-ubuntu.result }}
+            ${{ needs.build-wheel-cu13.result }}
+            ${{ needs.build-wheel-efa.result }}
+            ${{ needs.build-wheel-rocm.result }}
+        run: |
+          for result in $RESULTS; do
+            test "$result" = "$EXPECTED" || exit 1
+          done
+
+      - name: Check TENT jobs
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.tent == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.tent-ci.result }}
+        run: test "$RESULT" = "$EXPECTED"
+
+      - name: Check documentation job
+        env:
+          EXPECTED: ${{ needs.check-paths.outputs.docs == 'true' && 'success' || 'skipped' }}
+          RESULT: ${{ needs.docs-check.result }}
+        run: test "$RESULT" = "$EXPECTED"

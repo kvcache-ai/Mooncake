@@ -9,6 +9,8 @@
 #include <glog/logging.h>
 
 #include "types.h"
+#include "ascii_string.h"
+#include "integer_parser.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -43,11 +45,11 @@ tl::expected<long long, ErrorCode> ParseSnapshotScore(
         }
     }
 
-    try {
-        return std::stoll(digits);
-    } catch (const std::exception&) {
+    const auto score = TryParseInteger<long long>(digits);
+    if (!score.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    return *score;
 }
 
 tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
@@ -211,9 +213,8 @@ RedisSnapshotCatalogStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
-    auto latest_snapshot_id =
-        snapshot_catalog_store_detail::TrimAsciiWhitespace(
-            std::string(reply->str, reply->len));
+    std::string latest_snapshot_id(reply->str, reply->len);
+    latest_snapshot_id = std::string(TrimAsciiWhitespace(latest_snapshot_id));
     if (latest_snapshot_id.empty()) {
         return std::optional<SnapshotDescriptor>();
     }

@@ -21,6 +21,9 @@ namespace mooncake {
 class HttpMetadataServer;
 class WrappedMasterService {
    public:
+    void SetBatchOpLogTerminalCallback(
+        OrderedOpLogWriter::TerminalCallback callback);
+    void StopBatchOpLogWriter();
     // Constructor with optional metadata-cleanup-on-timeout configuration.
     // - http_metadata_server: in-process pointer used when the HTTP metadata
     //   server is co-located in the master process (nullptr = not co-located).
@@ -187,6 +190,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
+
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
     ListTenantQuotaSnapshots();
     tl::expected<TenantQuotaSnapshot, ErrorCode> GetTenantQuotaSnapshot(
@@ -209,6 +214,9 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
+
+    tl::expected<void, ErrorCode> UnmountLocalDiskSegment(
+        const UUID& client_id);
 
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
@@ -253,9 +261,13 @@ class WrappedMasterService {
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
-    void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
-                            uint64_t initial_oplog_sequence_id,
-                            const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromStandby(
+        const std::vector<StandbyObjectEntry>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
+        BatchOpLogPromotionHandoff handoff,
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
@@ -279,13 +291,28 @@ class WrappedMasterService {
         const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
+    tl::expected<CopyStartResponse, ErrorCode> DynamicReplicaCopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,

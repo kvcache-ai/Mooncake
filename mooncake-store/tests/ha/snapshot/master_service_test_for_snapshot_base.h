@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -165,6 +166,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
+        std::unique_lock<std::shared_mutex> snapshot_lock(
+            service->snapshot_mutex_);
         // If snapshot_manager_ exists, use it; otherwise create a temporary one
         if (service->snapshot_manager_) {
             return service->snapshot_manager_->PersistState(snapshot_id);
@@ -176,20 +179,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         EnsureSnapshotStores(service);
 
         MasterSnapshotManagerOptions options;
-        options.enable_snapshot = true;
         options.snapshot_interval_seconds = 300;
         options.snapshot_child_timeout_seconds = 300;
         options.snapshot_retention_count = 3;
         options.snapshot_backup_dir = "";
         options.use_snapshot_backup_dir = false;
-        options.snapshot_catalog_store_type =
-            service->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring =
-            service->snapshot_catalog_store_connstring_;
-        options.ha_backend_type = service->ha_backend_type_;
-        options.ha_backend_connstring = service->ha_backend_connstring_;
-        options.cluster_id = service->cluster_id_;
-        options.enable_ha = service->enable_ha_;
 
         auto temp_manager = std::make_unique<MasterSnapshotManager>(
             service, options, service->snapshot_mutex_,
@@ -207,7 +201,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         if (!service->snapshot_catalog_store_ &&
             service->snapshot_object_store_) {
             service->snapshot_catalog_store_ =
-                service->CreateSnapshotCatalogStore();
+                service->CreateSnapshotCatalogStore(MasterServiceConfig{});
         }
     }
 
@@ -283,23 +277,20 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // === Enhanced State ===
         state.key_count = service->GetKeyCount();
 
-        // === LocalDiskSegment State (via friend access) ===
+        // === LocalSSD persisted state ===
         {
-            auto access = service->segment_manager_.getLocalDiskSegmentAccess();
-            // Copy client_by_name_ to sorted map
-            for (const auto& [name, client_id] : access.getClientByName()) {
-                state.client_by_name[name] = client_id;
-            }
-            // Copy local_disk_segments with full state
-            for (const auto& [client_id, segment] :
-                 access.getClientLocalDiskSegment()) {
-                LocalDiskSegmentState seg_state;
-                seg_state.enable_offloading = segment->enable_offloading;
-                // Copy offloading_objects to sorted map
-                std::lock_guard<Mutex> lock(segment->offloading_mutex_);
-                for (const auto& [key, task] : segment->offloading_objects) {
-                    seg_state.offloading_objects[key] = task;
+            auto access = service->segment_manager_.getAllocatorAccess();
+            for (const auto& name : state.all_segments) {
+                auto client_id = access.GetOwnerClientId(name);
+                if (client_id) {
+                    state.client_by_name[name] = *client_id;
                 }
+            }
+            for (const auto& [client_id, client] :
+                 service->local_ssd_manager_.ExportPersistedState()) {
+                LocalDiskSegmentState seg_state;
+                seg_state.enable_offloading = client.enable_offloading;
+                seg_state.offloading_objects = client.pending_offloads;
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }
         }
@@ -838,6 +829,15 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                "shadows the base class member. "
             << "Use 'service_.reset(new MasterService(...))' instead of "
                "'std::unique_ptr<MasterService> service_(...)'";
+
+        // Freeze the original service before snapshot/restore validation. The
+        // eviction worker can otherwise mutate replica metadata while the
+        // snapshot is being serialized, making the post-restore comparison
+        // compare two different points in time.
+        service_->eviction_running_ = false;
+        if (service_->eviction_thread_.joinable()) {
+            service_->eviction_thread_.join();
+        }
 
         // Some test configs may not enable snapshot/restore, so the backend
         // is not created in the constructor. We create it here for TearDown

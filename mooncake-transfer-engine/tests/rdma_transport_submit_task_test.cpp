@@ -25,6 +25,7 @@
 #include <string>
 
 #include "config.h"
+#include "multi_transport.h"
 #include "rdma_test_peers.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -165,4 +166,34 @@ TEST_F(SubmitTransferTaskTest, PartialSubmitFailsAllTasks) {
     EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
 }
 
+TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
+    std::vector<Transport::TransferRequest> requests(2);
+    for (auto &request : requests) {
+        request.opcode = Transport::TransferRequest::WRITE;
+        request.source = reinterpret_cast<void *>(kBufferAddr);
+        request.length = block_size_;
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = 0;
+    }
+    requests[1].length = 2 * block_size_;
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(metadata_, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    auto &task = reinterpret_cast<Transport::BatchDesc *>(batch_id)
+                     ->task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.request = requests.data();
+    task.request_count = requests.size();
+    EXPECT_TRUE(
+        transport_->submitTransferTask({&task}).IsAddressNotRegistered());
+    Transport::TransferStatus status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, status), Status::OK());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::FAILED);
+    std::vector<Transport::TransferStatusEnum> request_statuses;
+    ASSERT_EQ(multi_transport.getScatterRequestStatuses(batch_id, 0,
+                                                        request_statuses),
+              Status::OK());
+    EXPECT_EQ(request_statuses, std::vector(2, status.s));
+    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+}
 }  // namespace
