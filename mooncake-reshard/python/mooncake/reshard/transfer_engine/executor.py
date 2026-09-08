@@ -77,7 +77,57 @@ class MooncakeTransferEngineExecutor:
         if not isinstance(direction, TransferDirection):
             raise TypeError("direction must be a TransferDirection")
 
-        if direction is TransferDirection.READ:
+        scatter_method_name = (
+            "scatter_transfer_sync_read_with_ticket"
+            if direction is TransferDirection.READ
+            else "scatter_transfer_sync_write_with_ticket"
+        )
+        scatter_method = getattr(self.engine, scatter_method_name, None)
+        if batch.ranges and callable(scatter_method):
+            ticket_method_name = scatter_method_name
+            legacy_method_name = (
+                "batch_transfer_sync_read"
+                if direction is TransferDirection.READ
+                else "batch_transfer_sync_write"
+            )
+            if direction is TransferDirection.READ:
+                local_base_addresses = [
+                    item.target_base_address for item in batch.ranges
+                ]
+                local_capacities = [item.target_capacity for item in batch.ranges]
+                remote_base_addresses = [
+                    item.source_base_address for item in batch.ranges
+                ]
+                remote_capacities = [item.source_capacity for item in batch.ranges]
+                local_offsets = [list(item.target_offsets) for item in batch.ranges]
+                remote_offsets = [list(item.source_offsets) for item in batch.ranges]
+            else:
+                local_base_addresses = [
+                    item.source_base_address for item in batch.ranges
+                ]
+                local_capacities = [item.source_capacity for item in batch.ranges]
+                remote_base_addresses = [
+                    item.target_base_address for item in batch.ranges
+                ]
+                remote_capacities = [item.target_capacity for item in batch.ranges]
+                local_offsets = [list(item.source_offsets) for item in batch.ranges]
+                remote_offsets = [list(item.target_offsets) for item in batch.ranges]
+            arguments = (
+                batch.endpoint,
+                local_base_addresses,
+                local_capacities,
+                remote_base_addresses,
+                remote_capacities,
+                local_offsets,
+                remote_offsets,
+                [list(item.sizes) for item in batch.ranges],
+            )
+            failure_label = (
+                f"from {batch.endpoint}"
+                if direction is TransferDirection.READ
+                else f"to {batch.endpoint}"
+            )
+        elif direction is TransferDirection.READ:
             ticket_method_name = "batch_transfer_sync_read_with_ticket"
             legacy_method_name = "batch_transfer_sync_read"
             arguments = (
