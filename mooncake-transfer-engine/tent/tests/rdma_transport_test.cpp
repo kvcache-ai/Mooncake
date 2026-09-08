@@ -20,10 +20,14 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -31,6 +35,7 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint.h"
@@ -89,6 +94,14 @@ class RdmaTransportTestPeer {
 
     static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
         return transport.context_set_;
+    }
+
+    static void setNumWorkers(RdmaTransport& transport, int num_workers) {
+        transport.params_->workers.num_workers = num_workers;
+    }
+
+    static void addInflight(Workers& workers, size_t worker_id, int64_t delta) {
+        workers.worker_context_[worker_id].inflight_slices.fetch_add(delta);
     }
 
     using NotifyAction = RdmaTransport::NotifyCompletionAction;
@@ -224,7 +237,23 @@ class RdmaEndPointTestPeer {
         ASSERT_TRUE(endpoint->reserveQuota(qp_index, 1));
         slice->qp_index = qp_index;
         slice->ep_weak_ptr = endpoint;
+        std::lock_guard<TicketLock> guard(endpoint->queue_lock_list_[qp_index]);
         endpoint->slice_queue_[qp_index].push(slice);
+    }
+    static void markReady(const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        endpoint->status_.store(RdmaEndPoint::EP_READY,
+                                std::memory_order_relaxed);
+    }
+    static bool queueEmpty(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                           int qp_index) {
+        return endpoint->slice_queue_[qp_index].empty();
+    }
+    static int wrDepth(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                       int qp_index) {
+        return endpoint->wr_depth_list_[qp_index].value.load();
+    }
+    static int inflightSlices(const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        return endpoint->inflight_slices_.load();
     }
 };
 
@@ -1507,6 +1536,10 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ibv_mr mr{};
     };
     static FakeState fake;
+    // Posting order as the hardware saw it: postSend appends every work
+    // request it is handed, so a poller can replay completions in that order.
+    static std::mutex post_mutex;
+    static std::vector<RdmaSlice*> post_order;
 
     static ibv_cq* createCq(ibv_context*, int, void*, ibv_comp_channel*, int) {
         return &fake.cq;
@@ -1519,10 +1552,25 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     static int modifyQp(ibv_qp*, ibv_qp_attr*, int) { return 0; }
     static ibv_mr* regMr(ibv_pd*, void*, size_t, int) { return &fake.mr; }
     static int deregMr(ibv_mr*) { return 0; }
+    // ibv_post_send is an inline over qp->context->ops, so a fake context
+    // with this op lets submitSlices run for real against the fake QPs.
+    static int postSend(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
+        std::lock_guard<std::mutex> guard(post_mutex);
+        for (auto* w = wr; w; w = w->next)
+            post_order.push_back(reinterpret_cast<RdmaSlice*>(w->wr_id));
+        *bad_wr = nullptr;
+        return 0;
+    }
 
     void SetUp() override {
         fake = FakeState{};
+        {
+            std::lock_guard<std::mutex> guard(post_mutex);
+            post_order.clear();
+        }
         fake.native.num_comp_vectors = 1;
+        fake.native.ops.post_send = postSend;
+        for (auto& qp : fake.qp) qp.context = &fake.native;
 
         auto topology = std::make_shared<Topology>();
         ASSERT_TRUE(topology
@@ -1582,6 +1630,25 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
             RdmaContextTestPeer::unbindResources(*context_);
             RdmaContextTestPeer::unbindDevice(*context_);
         }
+    }
+
+    // A slice with a task behind it, not yet posted anywhere.
+    RdmaSlice* makeSlice() {
+        auto* task = RdmaTaskStorage::Get().allocate();
+        task->num_slices = 1;
+        task->status_word = PENDING;
+        task->first_error = PENDING;
+        task->request.opcode = Request::WRITE;
+        task->ref();  // the batch's reference
+        task->ref();  // the slice's, dropped by updateSliceStatus()
+        auto* slice = RdmaSliceStorage::Get().allocate();
+        slice->task = task;
+        slice->length = kLen;
+        slice->word = PENDING;
+        slice->rail_monitor = nullptr;
+        tasks_.push_back(task);
+        slices_.push_back(slice);
+        return slice;
     }
 
     // A slice charged to the NIC, owned by `lane`, and posted on the shared
@@ -1653,6 +1720,8 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 };
 
 RdmaWorkersSharedQpTest::FakeState RdmaWorkersSharedQpTest::fake;
+std::mutex RdmaWorkersSharedQpTest::post_mutex;
+std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
 
 TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
     // Lane 1 posted first, so lane 0's timeout sweeps it off the queue pair
@@ -1870,6 +1939,111 @@ TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
     EXPECT_TRUE(
         RdmaTransportTestPeer::dropUnpostableSlice(*workers_, lane0, slice));
     EXPECT_EQ(lane0.inflight_slices.load(), 0);
+}
+
+// A qp_pools layout with fewer queue pairs than lanes has two lanes posting
+// to and acknowledging on one queue pair at once. They share the endpoint's
+// read guard, so the queue pair's slice queue has to serialize them itself:
+// every slice posted is acknowledged exactly once, and the queue and its
+// work-request depth end empty.
+TEST_F(RdmaWorkersSharedQpTest, TwoLanesOnOneQueuePairKeepTheSliceQueueIntact) {
+    constexpr int kSlices = 20000;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int i = 0; i < kSlices; ++i) slices.push_back(makeSlice());
+
+    std::atomic<int> posted{0};
+    std::atomic<int> overflows{0};
+    std::thread poster([&] {
+        for (int i = 0; i < kSlices; ++i) {
+            std::vector<RdmaSlice*> one{slices[i]};
+            for (;;) {
+                int n = 0;
+                try {
+                    n = endpoint_->submitSlices(one, /*qp_index=*/0, nullptr);
+                } catch (const std::runtime_error&) {
+                    overflows.fetch_add(1);
+                    break;
+                }
+                if (n == 1) break;
+                std::this_thread::yield();  // queue pair full; the poller
+                                            // drains
+            }
+            posted.store(i + 1, std::memory_order_release);
+        }
+    });
+    std::thread poller([&] {
+        for (int i = 0; i < kSlices; ++i) {
+            while (posted.load(std::memory_order_acquire) <= i)
+                std::this_thread::yield();
+            endpoint_->acknowledge(slices[i], COMPLETED);
+        }
+    });
+    poster.join();
+    poller.join();
+
+    EXPECT_EQ(overflows.load(), 0);
+    int completed = 0, tasks_completed = 0;
+    for (auto* slice : slices) {
+        completed += (slice->word == COMPLETED);
+        tasks_completed += (slice->task->status_word == COMPLETED);
+    }
+    EXPECT_EQ(completed, kSlices);
+    EXPECT_EQ(tasks_completed, kSlices);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
+}
+
+// Two lanes posting to one queue pair must leave the slice queue in the order
+// the hardware received the work requests: acknowledge() retires everything
+// ahead of a completed slice, so a queue that disagrees with the QP would
+// stamp a later slice with an earlier one's outcome. The fake post_send
+// records the hardware order; replaying completions in that order must find
+// each slice at the head and pop exactly one.
+TEST_F(RdmaWorkersSharedQpTest, TwoPostersOnOneQueuePairKeepPostingOrder) {
+    constexpr size_t kPerLane = 10000;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> lane0, lane1;
+    for (size_t i = 0; i < kPerLane; ++i) {
+        lane0.push_back(makeSlice());
+        lane1.push_back(makeSlice());
+    }
+
+    auto post_all = [&](std::vector<RdmaSlice*>& mine) {
+        for (auto* slice : mine) {
+            std::vector<RdmaSlice*> one{slice};
+            while (endpoint_->submitSlices(one, /*qp_index=*/0, nullptr) != 1)
+                std::this_thread::yield();  // queue pair full; the poller
+                                            // drains
+        }
+    };
+    std::atomic<size_t> popped_one{0};
+    std::thread poster0(post_all, std::ref(lane0));
+    std::thread poster1(post_all, std::ref(lane1));
+    std::thread poller([&] {
+        for (size_t i = 0; i < 2 * kPerLane; ++i) {
+            RdmaSlice* next = nullptr;
+            while (!next) {
+                {
+                    std::lock_guard<std::mutex> guard(post_mutex);
+                    if (post_order.size() > i) next = post_order[i];
+                }
+                if (!next) std::this_thread::yield();
+            }
+            if (endpoint_->acknowledge(next, COMPLETED) == 1u)
+                popped_one.fetch_add(1);
+        }
+    });
+    poster0.join();
+    poster1.join();
+    poller.join();
+
+    // Every completion found its slice at the head of the queue.
+    EXPECT_EQ(popped_one.load(), 2 * kPerLane);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
 }
 
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
@@ -2094,6 +2268,71 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     const int status = child_guard.finish();
     ASSERT_TRUE(WIFEXITED(status));
     EXPECT_EQ(WEXITSTATUS(status), 0);
+}
+
+TEST(RdmaQuiesceTest, TransportQuiesceWithoutInstallIsOk) {
+    RdmaTransport transport;
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(transport.quiesce().ok());
+}
+
+TEST(RdmaQuiesceTest, TransportQuiesceSyncsTopologyDevicesViaPlatform) {
+    auto topology = std::make_shared<Topology>();
+    Topology::MemEntry memory;
+    memory.name = "cuda:0";
+    memory.type = Topology::MEM_CUDA;
+    memory.numa_node = 0;
+    topology->mem_list_.push_back(std::move(memory));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(Platform::getLoader().synchronizeDevices(topology.get()).ok());
+}
+
+TEST(RdmaQuiesceTest, WorkersQuiesceWithoutStartRejectsSubmit) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+
+    EXPECT_TRUE(workers->quiesce().ok());
+    EXPECT_TRUE(workers->quiesce().ok());
+
+    RdmaSliceList slice_list;
+    EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
+}
+
+TEST(RdmaQuiesceTest, IdleWorkersDrainAndRejectSubmit) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+
+    EXPECT_TRUE(workers->quiesce().ok());
+    RdmaSliceList slice_list;
+    EXPECT_TRUE(workers->submit(slice_list).IsInternalError());
+    EXPECT_TRUE(workers->quiesce().ok());
+    ASSERT_TRUE(workers->stop().ok());
+}
+
+TEST(RdmaQuiesceTest, DrainTimeoutLeavesInflight) {
+    auto topology = std::make_shared<Topology>();
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setNumWorkers(transport, 1);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    ASSERT_TRUE(workers->start().ok());
+    RdmaTransportTestPeer::addInflight(*workers, 0, 1);
+
+    const auto started = std::chrono::steady_clock::now();
+    EXPECT_TRUE(workers->quiesce(50'000'000ull).IsInternalError());
+    EXPECT_LT(std::chrono::steady_clock::now() - started,
+              std::chrono::milliseconds(500));
+
+    ASSERT_TRUE(workers->stop().ok());
 }
 
 }  // namespace

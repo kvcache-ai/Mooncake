@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/local_file_snapshot_config.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
@@ -96,10 +97,13 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     file_storage.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
+    config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
     config/local_hot_cache_config.cpp
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
+    config/rpc_timeout_config.cpp
+    config/transfer_submitter_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -385,8 +389,9 @@ add_library(mooncake_store_master_objects OBJECT
             ${MOONCAKE_STORE_MASTER_SOURCES})
 set_target_properties(mooncake_store_master_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_master_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_master_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects

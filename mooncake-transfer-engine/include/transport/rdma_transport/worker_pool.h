@@ -110,32 +110,15 @@ class WorkerPool {
 
     bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
 
-    // Context-level health tracking for catastrophic hardware failure.
-    // When all rails through a local RNIC are unavailable, increment the
-    // failure counter. Reset on any success. Mark context inactive after
-    // consecutive failures exceed threshold.
-    bool contextHealthy() const {
-        return context_failure_count_.load(std::memory_order_relaxed) <
-               kContextFailureThreshold;
-    }
-    void markContextSuccess() {
-        context_failure_count_.store(0, std::memory_order_relaxed);
-    }
-    bool markContextFailure() {
-        auto failure_count =
-            context_failure_count_.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (failure_count >= kContextFailureThreshold) {
-            if (context_.active()) {
-                LOG(WARNING)
-                    << "All rails failed for context " << context_.deviceName()
-                    << " for " << failure_count
-                    << " consecutive attempts, marking inactive";
-                context_.set_active(false);
-                return true;
-            }
-        }
-        return false;
-    }
+    // Only direct local completion errors charge the context breaker.
+    // Submit-side all-rails-unavailable failures remain peer/rail scoped.
+    bool markLocalContextFailure();
+    void markContextSuccess();
+    bool tryReactivateContext(uint64_t now_ns);
+    void maybeReactivateContext();
+    // Serialize breaker transitions with physical-event recovery so a late
+    // completion cannot arm TTL recovery after a fatal event.
+    void resetContextBreaker(bool context_active);
 
    private:
     RdmaContext &context_;
@@ -183,10 +166,12 @@ class WorkerPool {
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
 
-    // Context-level health tracking
+    // Local-completion context breaker. Protected by context_state_lock_ so
+    // fatal events, GID recovery and TTL recovery have one state owner.
+    std::mutex context_state_lock_;
     std::atomic<int> context_failure_count_{0};
-    const static int kContextFailureThreshold =
-        32;  // consecutive all-rails-failed
+    uint64_t breaker_reactivate_after_ns_{0};
+    static constexpr int kLocalCompletionFailureThreshold = 32;
 };
 }  // namespace mooncake
 

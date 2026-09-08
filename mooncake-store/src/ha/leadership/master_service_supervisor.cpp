@@ -5,6 +5,7 @@
 #include <csignal>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -424,13 +425,39 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
+        auto writer_terminal = std::make_shared<std::atomic<bool>>(false);
+        auto serving_gate = std::make_shared<std::mutex>();
+        wrapped_master_service->SetBatchOpLogTerminalCallback(
+            [&](const OrderedOpLogWriterTerminalState& state) {
+                std::lock_guard<std::mutex> lock(*serving_gate);
+                if (writer_terminal->exchange(true)) return;
+                LOG(ERROR) << "Batch OpLog writer terminal: "
+                           << toString(state.error);
+                admin_server.SetServiceAvailable(false);
+                admin_server.SetServiceDelegate(nullptr);
+                label_reconciler.SetLeader(false);
+                SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
+                server.stop();
+            });
 
         // Restore is the serving gate: do not register or expose a candidate
         // service until the complete promotion context has been applied.
         SetRuntimeState(admin_server, MasterRuntimeState::kRecovering);
-        auto restore_result = wrapped_master_service->RestoreFromStandby(
-            promotion_ctx->objects, promotion_ctx->applied_seq_id,
-            promotion_ctx->segments);
+        auto restore_result =
+            promotion_ctx->metadata_store
+                ? wrapped_master_service->RestoreFromBatchOpLogPromotion(
+                      BatchOpLogPromotionHandoff{
+                          .metadata_store =
+                              std::move(promotion_ctx->metadata_store),
+                          .segments = std::move(promotion_ctx->segments),
+                          .applied_cursor = promotion_ctx->applied_cursor,
+                          .producer_view_version =
+                              promotion_ctx->producer_view_version,
+                          .max_replica_id = promotion_ctx->max_replica_id,
+                      })
+                : wrapped_master_service->RestoreFromStandby(
+                      promotion_ctx->objects, promotion_ctx->applied_seq_id,
+                      promotion_ctx->segments);
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());
@@ -524,15 +551,20 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return -1;
         }
 
-        if (!serve_shutdown_requested.load(std::memory_order_acquire)) {
-            ActivateServingState(admin_server, wrapped_master_service,
-                                 label_reconciler);
+        {
+            std::lock_guard<std::mutex> lock(*serving_gate);
+            if (!serve_shutdown_requested.load(std::memory_order_acquire) &&
+                !writer_terminal->load(std::memory_order_acquire)) {
+                ActivateServingState(admin_server, wrapped_master_service,
+                                     label_reconciler);
+            }
         }
 
         auto server_err = std::move(ec).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);
+        wrapped_master_service->StopBatchOpLogWriter();
         DeactivateServingState(admin_server, label_reconciler);
         auto err = leader_coordinator.ReleaseLeadership(*leadership_session);
         LOG(INFO) << "Release leadership: " << toString(err);

@@ -66,6 +66,8 @@ class StandbyMetadataStore final : public MetadataStore {
     void Clear();
 
     void Snapshot(std::vector<StandbyObjectEntry>& out) const;
+    bool ValidateReplicaIds(ReplicaID& max_replica_id) const;
+    bool DrainChunk(size_t count, std::vector<StandbyObjectEntry>& out);
     // Mutations must remain frozen for the lifetime of the returned cursor.
     SnapshotCursor BeginSnapshotTraversal() const;
     bool CopyNextSnapshotChunk(size_t count, SnapshotCursor& cursor,
