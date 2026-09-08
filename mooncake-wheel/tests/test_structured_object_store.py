@@ -1725,6 +1725,44 @@ def test_dataproto_immutable_result_does_not_commit_matrix_destination() -> None
     assert np.all(destination == -1)
 
 
+def test_dataproto_destination_rebind_failure_does_not_commit_destination() -> None:
+    matrix = np.arange(30, dtype=np.int32).reshape(5, 6)
+    destination = np.full((2, 3), -1, dtype=np.int32)
+
+    class RejectingBatch(dict):
+        def __setitem__(self, name, value):
+            if value is destination:
+                raise TypeError("destination binding rejected")
+            super().__setitem__(name, value)
+
+    class RejectingDataProto(SimpleDataProto):
+        @classmethod
+        def from_dict(cls, batch, non_tensor_batch=None, meta_info=None):
+            copied_batch = RejectingBatch()
+            for name, value in batch.items():
+                copied_batch[name] = value
+            return cls(
+                batch=copied_batch,
+                non_tensor_batch=dict(non_tensor_batch or {}),
+                meta_info=dict(meta_info or {}),
+            )
+
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
+
+    with pytest.raises(TypeError, match="destination binding rejected"):
+        transfer.get_dataproto(
+            ref,
+            batch_fields=["matrix"],
+            rows=[3, 1],
+            batch_slices={"matrix": slice(2, 5)},
+            destinations={"matrix": destination},
+            data_cls=RejectingDataProto,
+        )
+
+    assert np.all(destination == -1)
+
+
 def test_dataproto_copied_result_keeps_matrix_destination() -> None:
     class CopyingDataProto(SimpleDataProto):
         @classmethod

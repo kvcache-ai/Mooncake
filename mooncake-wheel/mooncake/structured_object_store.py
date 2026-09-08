@@ -978,11 +978,14 @@ class MooncakeBundleTransfer:
             if any(read.destination is not None for read in matrix_reads)
             else None
         )
+        if destination_batch is not None:
+            for read in matrix_reads:
+                if read.destination is not None:
+                    # Validate every result rebinding before writing any caller
+                    # destination. The assignments are local until finish().
+                    destination_batch[read.name] = read.destination
         for read in matrix_reads:
-            value = read.finish(staged_matrices[read.name])
-            if destination_batch is not None and read.destination is not None:
-                batch[read.name] = value
-                destination_batch[read.name] = value
+            read.finish(staged_matrices[read.name])
         return result
 
     def _read_dataproto_matrices(
