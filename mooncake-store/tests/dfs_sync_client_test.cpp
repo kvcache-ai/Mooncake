@@ -361,6 +361,48 @@ TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
     EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
 }
 
+TEST_F(DfsSyncClientTest, GetVerifiesDfsChecksumAndRecordsError) {
+    const char* checksum_enabled = std::getenv("MOONCAKE_STORE_CHECKSUM");
+    if (checksum_enabled == nullptr || std::string(checksum_enabled) != "1") {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+
+    const std::string key = "dfs_single_checksum";
+    std::string value(4096, 'V');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_TRUE(query->object_checksum.has_value());
+
+    const std::array<std::string, 1> mismatch_label{
+        toString(ErrorCode::CHECKSUM_MISMATCH)};
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+    const int64_t base_errors = metric->dfs_read_errors.value(mismatch_label);
+
+    const std::optional<uint64_t> bad_checksum(*query->object_checksum ^
+                                               uint64_t{1});
+    std::vector<Replica::Descriptor> replicas = query->replicas;
+    QueryResult corrupted(std::move(replicas), query->lease_timeout,
+                          bad_checksum);
+
+    std::vector<char> output(value.size());
+    std::vector<Slice> read_slices{{output.data(), output.size()}};
+    auto result = writer_->Get(key, corrupted, read_slices);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::CHECKSUM_MISMATCH);
+
+    // The I/O completed, so it still counts as a read op, exactly as in the
+    // batch path; the rejection lands in the error family instead.
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+    EXPECT_EQ(metric->dfs_read_errors.value(mismatch_label), base_errors + 1);
+}
+
 TEST_F(DfsSyncClientTest, DfsMetricsCountSuccessfulWriteAndRead) {
     auto* metric = writer_->GetDfsMetricPtr();
     if (metric == nullptr) {

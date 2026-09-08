@@ -1396,6 +1396,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
                              query_result.object_checksum);
     if (!checksum_result) {
+        // add checksum err for single-key
+        auto* dfs_metric = GetDfsMetricPtr();
+        if (replica.is_dfs_replica() && dfs_metric) {
+            dfs_metric->RecordReadErrors(toString(checksum_result.error()));
+        }
         return tl::unexpected(checksum_result.error());
     }
 
@@ -1998,6 +2003,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
             }
         }
+    } else if (transfer_summary.allocated_dfs_replicas > 0) {
+        // A DFS replica was allocated but is abandoned because a peer replica
+        // failed first. Without this counter the write simply disappears: no
+        // error is recorded against DFS and no I/O is attempted. Counted per
+        // key, matching SubmitDfsWrites.
+        VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                << ", reason=non_dfs_transfer_failed";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordSkippedWrites(1);
+        }
     }
 
     auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2135,6 +2150,15 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             } else {
                 transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
             }
+        }
+    } else if (transfer_summary.allocated_dfs_replicas > 0) {
+        // Same abandoned-write case as in Put: the DFS replica was allocated
+        // but a peer replica failed first, so no I/O is attempted and no DFS
+        // error is recorded. Counted per key, matching SubmitDfsWrites.
+        VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                << ", reason=non_dfs_transfer_failed";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordSkippedWrites(1);
         }
     }
 
