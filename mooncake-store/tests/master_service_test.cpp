@@ -641,6 +641,50 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.default_kv_lease_ttl = 10 * 1000;
+    MasterService service(service_config);
+
+    constexpr size_t kSegmentSize = 1024 * 1024;
+    const auto context =
+        PrepareSimpleSegment(service, "leased_upsert_segment",
+                             kDefaultSegmentBase, kSegmentSize);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string key = "leased_upsert_allocation_failure";
+    auto initial = service.PutStart(context.client_id, key,
+                                    TenantId::Default(), kSegmentSize, config);
+    ASSERT_TRUE(initial.has_value()) << toString(initial.error());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    // Retain a read lease so UpsertStart must allocate a replacement instead
+    // of reusing the old buffer.
+    auto snapshot = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(snapshot.has_value());
+
+    auto failed = service.UpsertStart(context.client_id, key,
+                                      TenantId::Default(), kSegmentSize, config);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    auto still_readable = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(still_readable.has_value());
+    ASSERT_EQ(still_readable->replicas.size(), snapshot->replicas.size());
+    EXPECT_EQ(
+        still_readable->replicas[0]
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_,
+        snapshot->replicas[0]
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_);
+}
+
 // DFS replicas live in their own variant branch, so is_disk_replica() does not
 // match them. KV subscribers still expect one logical tier per storage class,
 // which is what these assertions pin down.
