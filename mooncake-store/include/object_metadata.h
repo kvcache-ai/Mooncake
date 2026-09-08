@@ -37,135 +37,15 @@ struct ResolvedSoftPinRequest {
     uint64_t ttl_ms{0};
 };
 
-class ObjectMetadata {
+// The object replica list, extracted from ObjectMetadata so the
+// container logic (add/pop/erase/visit/query) lives in one focused,
+// independently testable place. ObjectMetadata owns one and forwards its
+// replica API to it.
+class ObjectReplicaList {
    public:
-    struct SoftPinEvaluation {
-        bool active{false};
-        int metric_delta{0};
-        std::optional<std::chrono::system_clock::time_point> removed_deadline;
-        std::optional<std::chrono::system_clock::time_point> deadline_to_index;
-    };
-
-    struct PendingSoftPinAction {
-        SoftPinAction action{SoftPinAction::PRESERVE};
-        uint64_t ttl_ms{0};
-        std::vector<ReplicaID> eligible_replica_ids;
-    };
-
-    // RAII-style metric management
-    ~ObjectMetadata() {
-        MasterMetricManager::instance().dec_key_count(1);
-        if (soft_pin_timeout) {
-            MasterMetricManager::instance().dec_soft_pin_key_count(1);
-        }
-    }
-
-    ObjectMetadata() = delete;
-
-    ObjectMetadata(const UUID& client_id_,
-                   const std::chrono::system_clock::time_point put_start_time_,
-                   size_t value_length, std::vector<Replica>&& reps,
-                   std::optional<std::chrono::system_clock::time_point>
-                       committed_soft_pin_timeout = std::nullopt,
-                   bool enable_hard_pin = false,
-                   ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-                   std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-                   std::string user_key_ = {})
-        : client_id(client_id_),
-          put_start_time(put_start_time_),
-          size(value_length),
-          data_type(data_type_),
-          group_id(std::move(group_id_)),
-          tenant_id(std::move(tenant_id_)),
-          user_key(std::move(user_key_)),
-          soft_pin_timeout(std::move(committed_soft_pin_timeout)),
-          hard_pinned(enable_hard_pin),
-          replicas_(std::move(reps)) {
-        MasterMetricManager::instance().inc_key_count(1);
-        if (soft_pin_timeout) {
-            MasterMetricManager::instance().inc_soft_pin_key_count(1);
-        }
-        MasterMetricManager::instance().observe_value_size(value_length);
-    }
-
-    ObjectMetadata(const ObjectMetadata&) = delete;
-    ObjectMetadata& operator=(const ObjectMetadata&) = delete;
-    ObjectMetadata(ObjectMetadata&&) = delete;
-    ObjectMetadata& operator=(ObjectMetadata&&) = delete;
-
-    // Updated by UpsertStart (Case B) to reflect the new writer.
-    UUID client_id;
-    // Updated by UpsertStart (Case B) to reset the discard timeout.
-    std::chrono::system_clock::time_point put_start_time;
-    const size_t size;
-    std::optional<uint64_t> object_checksum;
-    const ObjectDataType data_type{ObjectDataType::UNKNOWN};
-    const std::string group_id;
-    const TenantId tenant_id;
-    const std::string user_key;
-
-    mutable SpinLock lock;
-    // Authoritative lease: ungrouped objects own one; grouped objects share
-    // the group's. Never null after construction.
-    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
-    mutable std::optional<std::chrono::system_clock::time_point>
-        soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
-                                            // deadline
-    // Replica IDs scope this action to the current write. PutEnd does not
-    // carry a generation token, so a stale End from the same client cannot
-    // otherwise be distinguished from the current write.
-    std::optional<PendingSoftPinAction> pending_soft_pin_action;
-    const bool hard_pinned{false};  // immutable, set at creation
-    bool memory_cache_total_accounted{false};
-    bool disk_cache_total_accounted{false};
-    TenantQuotaLedger quota_ledger;
-
-    struct DynamicReplicaRecord {
-        std::chrono::system_clock::time_point created_at;
-        std::string source_segment;
-        std::string target_segment;
-        std::string target_domain;
-        bool complete{false};
-    };
-
-    std::unordered_map<ReplicaID, DynamicReplicaRecord> dynamic_replicas;
-    std::chrono::steady_clock::time_point dynamic_replication_recreate_after{};
-
-    void MarkDynamicReplica(ReplicaID replica_id, DynamicReplicaRecord record) {
-        dynamic_replicas[replica_id] = std::move(record);
-    }
-
-    void MarkDynamicReplicasComplete(
-        const std::vector<ReplicaID>& replica_ids) {
-        for (const auto& replica_id : replica_ids) {
-            auto it = dynamic_replicas.find(replica_id);
-            if (it != dynamic_replicas.end()) {
-                it->second.complete = true;
-            }
-        }
-    }
-
-    size_t ForgetDynamicReplicas(const std::vector<ReplicaID>& replica_ids) {
-        size_t forgotten = 0;
-        for (const auto& replica_id : replica_ids) {
-            forgotten += dynamic_replicas.erase(replica_id);
-        }
-        return forgotten;
-    }
-
-    size_t DynamicReplicaCount() const { return dynamic_replicas.size(); }
-
-    bool DynamicReplicationRecreateBlocked(
-        std::chrono::steady_clock::time_point now) const {
-        return now < dynamic_replication_recreate_after;
-    }
-
-    void SetDynamicReplicationRecreateAfter(
-        std::chrono::steady_clock::time_point deadline) {
-        dynamic_replication_recreate_after =
-            std::max(dynamic_replication_recreate_after, deadline);
-    }
+    ObjectReplicaList() = default;
+    explicit ObjectReplicaList(std::vector<Replica>&& replicas)
+        : replicas_(std::move(replicas)) {}
 
     void AddReplicas(std::vector<Replica>&& replicas) {
         replicas_.insert(replicas_.end(), std::move_iterator(replicas.begin()),
@@ -313,6 +193,227 @@ class ObjectMetadata {
         });
     }
 
+    std::vector<std::string> GetReplicaSegmentNames() const {
+        std::vector<std::string> segment_names;
+        for (const auto& replica : replicas_) {
+            const auto& segment_name_options = replica.get_segment_names();
+            for (const auto& segment_name_opt : segment_name_options) {
+                if (segment_name_opt.has_value()) {
+                    segment_names.push_back(segment_name_opt.value());
+                }
+            }
+        }
+        return segment_names;
+    }
+
+   private:
+    std::vector<Replica> replicas_;
+};
+
+class ObjectMetadata {
+   public:
+    struct SoftPinEvaluation {
+        bool active{false};
+        int metric_delta{0};
+        std::optional<std::chrono::system_clock::time_point> removed_deadline;
+        std::optional<std::chrono::system_clock::time_point> deadline_to_index;
+    };
+
+    struct PendingSoftPinAction {
+        SoftPinAction action{SoftPinAction::PRESERVE};
+        uint64_t ttl_ms{0};
+        std::vector<ReplicaID> eligible_replica_ids;
+    };
+
+    // RAII-style metric management
+    ~ObjectMetadata() {
+        MasterMetricManager::instance().dec_key_count(1);
+        if (soft_pin_timeout) {
+            MasterMetricManager::instance().dec_soft_pin_key_count(1);
+        }
+    }
+
+    ObjectMetadata() = delete;
+
+    ObjectMetadata(const UUID& client_id_,
+                   const std::chrono::system_clock::time_point put_start_time_,
+                   size_t value_length, std::vector<Replica>&& reps,
+                   std::optional<std::chrono::system_clock::time_point>
+                       committed_soft_pin_timeout = std::nullopt,
+                   bool enable_hard_pin = false,
+                   ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
+                   std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
+                   std::string user_key_ = {})
+        : client_id(client_id_),
+          put_start_time(put_start_time_),
+          size(value_length),
+          data_type(data_type_),
+          group_id(std::move(group_id_)),
+          tenant_id(std::move(tenant_id_)),
+          user_key(std::move(user_key_)),
+          soft_pin_timeout(std::move(committed_soft_pin_timeout)),
+          hard_pinned(enable_hard_pin),
+          replicas_(std::move(reps)) {
+        MasterMetricManager::instance().inc_key_count(1);
+        if (soft_pin_timeout) {
+            MasterMetricManager::instance().inc_soft_pin_key_count(1);
+        }
+        MasterMetricManager::instance().observe_value_size(value_length);
+    }
+
+    ObjectMetadata(const ObjectMetadata&) = delete;
+    ObjectMetadata& operator=(const ObjectMetadata&) = delete;
+    ObjectMetadata(ObjectMetadata&&) = delete;
+    ObjectMetadata& operator=(ObjectMetadata&&) = delete;
+
+    // Updated by UpsertStart (Case B) to reflect the new writer.
+    UUID client_id;
+    // Updated by UpsertStart (Case B) to reset the discard timeout.
+    std::chrono::system_clock::time_point put_start_time;
+    const size_t size;
+    std::optional<uint64_t> object_checksum;
+    const ObjectDataType data_type{ObjectDataType::UNKNOWN};
+    const std::string group_id;
+    const TenantId tenant_id;
+    const std::string user_key;
+
+    mutable SpinLock lock;
+    // Authoritative lease: ungrouped objects own one; grouped objects share
+    // the group's. Never null after construction.
+    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
+        std::make_shared<Lease>();
+    const bool hard_pinned{false};  // immutable, set at creation
+    bool memory_cache_total_accounted{false};
+    bool disk_cache_total_accounted{false};
+    TenantQuotaLedger quota_ledger;
+
+    struct DynamicReplicaRecord {
+        std::chrono::system_clock::time_point created_at;
+        std::string source_segment;
+        std::string target_segment;
+        std::string target_domain;
+        bool complete{false};
+    };
+
+    std::unordered_map<ReplicaID, DynamicReplicaRecord> dynamic_replicas;
+
+    void MarkDynamicReplica(ReplicaID replica_id, DynamicReplicaRecord record) {
+        dynamic_replicas[replica_id] = std::move(record);
+    }
+
+    void MarkDynamicReplicasComplete(
+        const std::vector<ReplicaID>& replica_ids) {
+        for (const auto& replica_id : replica_ids) {
+            auto it = dynamic_replicas.find(replica_id);
+            if (it != dynamic_replicas.end()) {
+                it->second.complete = true;
+            }
+        }
+    }
+
+    size_t ForgetDynamicReplicas(const std::vector<ReplicaID>& replica_ids) {
+        size_t forgotten = 0;
+        for (const auto& replica_id : replica_ids) {
+            forgotten += dynamic_replicas.erase(replica_id);
+        }
+        return forgotten;
+    }
+
+    size_t DynamicReplicaCount() const { return dynamic_replicas.size(); }
+
+    bool DynamicReplicationRecreateBlocked(
+        std::chrono::steady_clock::time_point now) const {
+        return now < dynamic_replication_recreate_after;
+    }
+
+    void SetDynamicReplicationRecreateAfter(
+        std::chrono::steady_clock::time_point deadline) {
+        dynamic_replication_recreate_after =
+            std::max(dynamic_replication_recreate_after, deadline);
+    }
+
+    void AddReplicas(std::vector<Replica>&& replicas) {
+        replicas_.AddReplicas(std::move(replicas));
+    }
+
+    std::vector<Replica> PopReplicas(
+        const std::function<bool(const Replica&)>& pred_fn) {
+        return replicas_.PopReplicas(pred_fn);
+    }
+
+    std::vector<Replica> PopReplicas() { return replicas_.PopReplicas(); }
+
+    size_t EraseReplicas(const std::function<bool(const Replica&)>& pred_fn) {
+        return replicas_.EraseReplicas(pred_fn);
+    }
+
+    size_t EraseReplicas() { return replicas_.EraseReplicas(); }
+
+    size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
+                         const std::function<void(Replica&)>& visit_fn) {
+        return replicas_.VisitReplicas(pred_fn, visit_fn);
+    }
+
+    size_t VisitReplicas(
+        const std::function<bool(const Replica&)>& pred_fn,
+        const std::function<void(const Replica&)>& visit_fn) const {
+        return replicas_.VisitReplicas(pred_fn, visit_fn);
+    }
+
+    bool HasReplica(const std::function<bool(const Replica&)>& pred_fn) const {
+        return replicas_.HasReplica(pred_fn);
+    }
+
+    bool AllReplicas(const std::function<bool(const Replica&)>& pred_fn) const {
+        return replicas_.AllReplicas(pred_fn);
+    }
+
+    size_t CountReplicas(
+        const std::function<bool(const Replica&)>& pred_fn) const {
+        return replicas_.CountReplicas(pred_fn);
+    }
+
+    size_t CountReplicas() const { return replicas_.CountReplicas(); }
+
+    const std::vector<Replica>& GetAllReplicas() const {
+        return replicas_.GetAllReplicas();
+    }
+
+    std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
+        return replicas_.HasDiffRepStatus(status);
+    }
+
+    Replica* GetFirstReplica(
+        const std::function<bool(const Replica&)>& pred_fn) {
+        return replicas_.GetFirstReplica(pred_fn);
+    }
+
+    Replica* GetReplicaByID(const ReplicaID& id) {
+        return replicas_.GetReplicaByID(id);
+    }
+
+    bool EraseReplicaByID(const ReplicaID& id) {
+        return replicas_.EraseReplicaByID(id);
+    }
+
+    std::size_t EraseReplica(ReplicaType replica_type) {
+        return replicas_.EraseReplica(replica_type);
+    }
+
+    bool HasMemReplica() const { return replicas_.HasMemReplica(); }
+
+    bool HasNoFReplica() const { return replicas_.HasNoFReplica(); }
+
+    size_t GetMemReplicaCount() const {
+        return replicas_.GetMemReplicaCount();
+    }
+
+    size_t GetNoFReplicaCount() const { return replicas_.GetNoFReplicaCount(); }
+
+    Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+        return replicas_.GetReplicaBySegmentName(segment_name);
+    }
+
     // Grant a read lease at now() + ttl. Grouped objects extend the shared
     // group TTL; a zero ttl is a no-op on a live lease (PutEnd cannot
     // expire a live group).
@@ -341,7 +442,8 @@ class ObjectMetadata {
         return lease_->IsExpired(std::chrono::system_clock::now());
     }
 
-    bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
+    bool IsLeaseExpired(
+        const std::chrono::system_clock::time_point& now) const {
         SpinLocker locker(&lock);
         return lease_->IsExpired(now);
     }
@@ -403,6 +505,15 @@ class ObjectMetadata {
     GetCommittedSoftPinTimeout() const {
         SpinLocker locker(&lock);
         return soft_pin_timeout;
+    }
+
+    // Test hook (eviction DSL and fixtures): overwrite the committed soft-pin
+    // deadline directly, bypassing the Begin/Commit state machine and its
+    // metric accounting. Takes `lock` like the other accessors.
+    void SetCommittedSoftPinTimeoutForTesting(
+        std::optional<std::chrono::system_clock::time_point> deadline) const {
+        SpinLocker locker(&lock);
+        soft_pin_timeout = std::move(deadline);
     }
 
     void BeginSoftPinAction(const ResolvedSoftPinRequest& request,
@@ -483,8 +594,9 @@ class ObjectMetadata {
             return;
         }
         const auto& eligible = pending_soft_pin_action->eligible_replica_ids;
+        const auto& replicas = replicas_.GetAllReplicas();
         const bool has_viable_replica = std::any_of(
-            replicas_.begin(), replicas_.end(),
+            replicas.begin(), replicas.end(),
             [&eligible](const Replica& replica) {
                 const bool belongs_to_write =
                     std::find(eligible.begin(), eligible.end(), replica.id()) !=
@@ -512,21 +624,26 @@ class ObjectMetadata {
     }
 
     std::vector<std::string> GetReplicaSegmentNames() const {
-        std::vector<std::string> segment_names;
-        for (const auto& replica : replicas_) {
-            const auto& segment_name_options = replica.get_segment_names();
-            for (const auto& segment_name_opt : segment_name_options) {
-                if (segment_name_opt.has_value()) {
-                    segment_names.push_back(segment_name_opt.value());
-                }
-            }
-        }
-        return segment_names;
+        return replicas_.GetReplicaSegmentNames();
     }
 
    private:
+    // Committed object soft-pin deadline. Mutated only through the soft-pin
+    // accessors above, always under `lock`; kept out of the public API so the
+    // GUARDED_BY contract cannot be bypassed.
+    mutable std::optional<std::chrono::system_clock::time_point>
+        soft_pin_timeout GUARDED_BY(lock);  // committed object soft-pin
+                                            // deadline
+    // Replica IDs scope a pending soft-pin action to the current write.
+    // PutEnd does not carry a generation token, so a stale End from the same
+    // client cannot otherwise be distinguished from the current write.
+    // Only touched through the Begin/Commit/Clear methods above.
+    std::optional<PendingSoftPinAction> pending_soft_pin_action;
+    // Dynamic-replication recreate backoff deadline, reachable only through
+    // DynamicReplicationRecreateBlocked/SetDynamicReplicationRecreateAfter.
+    std::chrono::steady_clock::time_point dynamic_replication_recreate_after{};
     // Use the accessors to visit and modify the replicas.
-    std::vector<Replica> replicas_;
+    ObjectReplicaList replicas_;
 };
 
 }  // namespace mooncake

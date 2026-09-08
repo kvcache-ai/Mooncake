@@ -114,11 +114,7 @@ class MasterServiceTest : public ::testing::Test {
         auto entry = tenant_handle->Pin(key);
         ASSERT_TRUE(entry != nullptr && entry->has_metadata());
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
-        auto& metadata = *entry->metadata();
-        {
-            SpinLocker locker(&metadata.lock);
-            metadata.soft_pin_timeout = deadline;
-        }
+        entry->metadata()->SetCommittedSoftPinTimeoutForTesting(deadline);
         service.soft_pin_deadline_index_.Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);
     }
