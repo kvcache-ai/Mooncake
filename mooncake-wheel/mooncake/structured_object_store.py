@@ -5,7 +5,6 @@ import io
 import json
 import sys
 import uuid
-from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -2101,11 +2100,16 @@ def _rebind_dataproto_batch_value(result: Any, name: str, value: Any) -> None:
         batch = result.get("batch")
     else:
         batch = getattr(result, "batch", None)
-    if not isinstance(batch, MutableMapping):
+    if batch is None:
         raise TypeError(
-            "DataProto result batch must be a mutable mapping when using destinations"
+            "DataProto result has no batch mapping when using destinations"
         )
-    batch[name] = value
+    try:
+        batch[name] = value
+    except (AttributeError, TypeError) as error:
+        raise TypeError(
+            "DataProto result batch must be mutable when using destinations"
+        ) from error
 
 
 def _split_dataproto_like(
@@ -3463,11 +3467,7 @@ class _StructuredObjectLayer:
             )
         if encoding == "torch_tensor":
             return self._read_torch_tensor_member(
-                name,
-                payload_spec,
-                field_spec,
-                member_slice,
-                destination,
+                name, payload_spec, field_spec, member_slice, destination
             )
         if encoding != "ndarray":
             raise ValueError(f"unsupported structured field encoding: {encoding}")
