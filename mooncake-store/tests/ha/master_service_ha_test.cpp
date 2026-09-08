@@ -748,8 +748,7 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
-        SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_->SetDeadline(deadline);
+        accessor.Get().SetLeaseDeadlineForTesting(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
@@ -761,8 +760,7 @@ class MasterServiceHATest : public ::testing::Test {
         if (!accessor.Exists()) {
             return {};
         }
-        SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_->ExpiresAt();
+        return accessor.Get().EvictionDeadline();
     }
 
     static uint64_t EvictTenantMemoryForQuotaForTesting(

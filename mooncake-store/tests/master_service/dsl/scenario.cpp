@@ -1059,10 +1059,7 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         return *this;
     }
     std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
-    {
-        SpinLocker locker(&entry->metadata()->lock);
-        entry->metadata()->lease_->SetDeadline(action.lease_timeout);
-    }
+    entry->metadata()->SetLeaseDeadlineForTesting(action.lease_timeout);
     entry->metadata()->SetCommittedSoftPinTimeoutForTesting(
         action.soft_pin_timeout);
     return *this;

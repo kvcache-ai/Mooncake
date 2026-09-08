@@ -185,12 +185,9 @@ class BatchEvictBench {
                             return;
                         }
                         auto& metadata = *entry->metadata();
-                        {
-                            SpinLocker locker(&metadata.lock);
-                            metadata.lease_->SetDeadline(
-                                base_expiration +
-                                std::chrono::nanoseconds(ordinal++));
-                        }
+                        metadata.SetLeaseDeadlineForTesting(
+                            base_expiration +
+                            std::chrono::nanoseconds(ordinal++));
 
                         ++stats.object_count;
                         if (!metadata.IsLeaseExpired(now)) {

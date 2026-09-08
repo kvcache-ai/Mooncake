@@ -277,11 +277,6 @@ class ObjectMetadata {
     const TenantId tenant_id;
     const std::string user_key;
 
-    mutable SpinLock lock;
-    // Authoritative lease: ungrouped objects own one; grouped objects share
-    // the group's. Never null after construction.
-    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
-        std::make_shared<Lease>();
     const bool hard_pinned{false};  // immutable, set at creation
     bool memory_cache_total_accounted{false};
     bool disk_cache_total_accounted{false};
@@ -440,6 +435,14 @@ class ObjectMetadata {
     bool IsLeaseExpired() const {
         SpinLocker locker(&lock);
         return lease_->IsExpired(std::chrono::system_clock::now());
+    }
+
+    // Test/benchmark hook: overwrite the lease deadline outright instead of
+    // extending it. Takes `lock` like the other lease accessors.
+    void SetLeaseDeadlineForTesting(
+        std::chrono::system_clock::time_point deadline) const {
+        SpinLocker locker(&lock);
+        lease_->SetDeadline(deadline);
     }
 
     bool IsLeaseExpired(
@@ -628,6 +631,15 @@ class ObjectMetadata {
     }
 
    private:
+    // Guards the enclosed lease/soft-pin state below. A path that touches
+    // both this and the owning ObjectEntry takes the entry mutex first and
+    // this lock second (never the reverse).
+    mutable SpinLock lock;
+    // Authoritative lease: ungrouped objects own one; grouped objects share
+    // the group's. Never null after construction. Reached only through the
+    // lease accessors above.
+    mutable std::shared_ptr<Lease> lease_ GUARDED_BY(lock) =
+        std::make_shared<Lease>();
     // Committed object soft-pin deadline. Mutated only through the soft-pin
     // accessors above, always under `lock`; kept out of the public API so the
     // GUARDED_BY contract cannot be bypassed.
