@@ -54,9 +54,7 @@ struct OffloadingTask {
     std::vector<UUID> mirror_clients;
 };
 
-// Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
-// LOCAL_DISK replica is refcnt-pinned for the duration of the task
-// so it cannot be evicted.
+// Outcome of admitting a promotion candidate into the retry queue.
 enum class PromotionQueueResult {
     kQueued,
     kDisabled,
@@ -77,6 +75,9 @@ enum class PromotionCandidateReason {
     kExecutionFailed,
 };
 
+// Tracks an in-flight LOCAL_DISK -> MEMORY copy admission attempt. The
+// source LOCAL_DISK replica is refcnt-pinned for the duration of the task so
+// it cannot be evicted.
 struct PromotionCandidate {
     uint8_t sketch_score{0};
     std::chrono::steady_clock::time_point first_seen;

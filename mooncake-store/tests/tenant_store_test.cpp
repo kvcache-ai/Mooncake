@@ -105,7 +105,10 @@ TEST(TenantStoreTest, InsertPinEraseContainsObjectCount) {
     EXPECT_EQ(pinned.get(), e1.get());  // same underlying entry
 
     EXPECT_EQ(store.Pin("missing"), nullptr);
-    EXPECT_TRUE(store.Erase("k1"));
+    // Identity-checked erase: only the pinned entry's slot may go, and the
+    // second call is a no-op (slot already gone).
+    EXPECT_TRUE(store.EraseIf("k1", e1.get()));
+    EXPECT_FALSE(store.EraseIf("k1", e1.get()));
     EXPECT_FALSE(store.Contains("k1"));
     EXPECT_EQ(store.ObjectCount(), 0u);
 }
@@ -120,16 +123,16 @@ TEST(TenantStoreTest, DuplicateInsertIsRejected) {
     EXPECT_EQ(store.Pin("k1")->key(), "k1");
 }
 
-TEST(TenantStoreTest, VisitObjectsEnumeratesEveryEntry) {
+TEST(TenantStoreTest, SnapshotObjectsEnumeratesEveryEntry) {
     TenantStore store;
     store.Insert("k1", std::make_shared<ObjectEntry>("k1", ""));
     store.Insert("k2", std::make_shared<ObjectEntry>("k2", "g1"));
     store.Insert("k3", std::make_shared<ObjectEntry>("k3", "g1"));
 
     std::vector<std::string> keys;
-    store.VisitObjects([&](const std::shared_ptr<ObjectEntry>& entry) {
+    for (const auto& entry : store.SnapshotObjects()) {
         keys.push_back(entry->key());
-    });
+    }
     EXPECT_EQ(keys.size(), 3u);
     EXPECT_TRUE(std::find(keys.begin(), keys.end(), "k1") != keys.end());
     EXPECT_TRUE(std::find(keys.begin(), keys.end(), "k2") != keys.end());
@@ -150,7 +153,9 @@ TEST(TenantStoreTest,
 
     // Erasing the object does not mutate group membership in the flat model
     // (membership is a parallel structure; cleanup is the caller's concern).
-    store.Erase("k2");
+    auto member_handle = store.Pin("k2");
+    ASSERT_NE(member_handle, nullptr);
+    store.EraseIf("k2", member_handle.get());
     EXPECT_EQ(store.ObjectCount(), 0u);
     EXPECT_EQ(store.Members("g1").size(), 1u);
 }
@@ -233,7 +238,7 @@ TEST(TenantStoreTest, EmptyTracksRouteGroupsAndLeases) {
     // A routed object makes the container non-empty.
     store.Insert("k1", std::make_shared<ObjectEntry>("k1", ""));
     EXPECT_FALSE(store.Empty());
-    store.Erase("k1");
+    ASSERT_TRUE(store.EraseIf("k1", store.Pin("k1").get()));
     EXPECT_TRUE(store.Empty());
 
     // Group membership also counts.

@@ -178,36 +178,33 @@ class BatchEvictBench {
                     return;
                 }
                 auto& tenant_state = *handle;
-                tenant_state.VisitObjects(
-                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                            entry) {
-                        if (!entry->has_metadata()) {
-                            return;
-                        }
-                        auto& metadata = *entry->metadata();
-                        metadata.SetLeaseDeadlineForTesting(
-                            base_expiration +
-                            std::chrono::nanoseconds(ordinal++));
+                for (const auto& entry : tenant_state.SnapshotObjects()) {
+                    if (!entry->has_metadata()) {
+                        continue;
+                    }
+                    auto& metadata = *entry->metadata();
+                    metadata.SetLeaseDeadlineForTesting(
+                        base_expiration + std::chrono::nanoseconds(ordinal++));
 
-                        ++stats.object_count;
-                        if (!metadata.IsLeaseExpired(now)) {
-                            ++stats.unexpired_leases;
-                        }
-                        for (const auto& replica : metadata.GetAllReplicas()) {
-                            if (replica.is_memory_replica()) {
-                                if (replica.is_completed()) {
-                                    ++stats.completed_memory_replicas;
-                                } else {
-                                    ++stats.incomplete_replicas;
-                                }
-                                if (replica.get_refcnt() != 0) {
-                                    ++stats.busy_memory_replicas;
-                                }
+                    ++stats.object_count;
+                    if (!metadata.IsLeaseExpired(now)) {
+                        ++stats.unexpired_leases;
+                    }
+                    for (const auto& replica : metadata.GetAllReplicas()) {
+                        if (replica.is_memory_replica()) {
+                            if (replica.is_completed()) {
+                                ++stats.completed_memory_replicas;
                             } else {
-                                ++stats.non_memory_replicas;
+                                ++stats.incomplete_replicas;
                             }
+                            if (replica.get_refcnt() != 0) {
+                                ++stats.busy_memory_replicas;
+                            }
+                        } else {
+                            ++stats.non_memory_replicas;
                         }
-                    });
+                    }
+                }
             });
 
         return stats;

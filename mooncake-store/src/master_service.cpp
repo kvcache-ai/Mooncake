@@ -10860,23 +10860,22 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                         TenantStateAccessorRW tenant_accessor(handle.get());
                         auto& tenant_state = *handle;
-                        tenant_state.VisitObjects(
-                            [&](const std::shared_ptr<
-                                mooncake::tenant::ObjectEntry>& entry) {
-                                if (!entry->has_metadata()) {
-                                    return;
-                                }
-                                ObjectMetadata& metadata = *entry->metadata();
-                                if (!metadata.IsHardPinned() &&
-                                    now >= metadata.EvictionDeadline() &&
-                                    metadata.EvictionDeadline() <=
-                                        target_timeout &&
-                                    !IsSoftPinActive(metadata, now) &&
-                                    can_evict_replicas(metadata)) {
-                                    to_evict.emplace_back(tenant_id,
-                                                          entry->key());
-                                }
-                            });
+                        for (const auto& entry :
+                             tenant_state.SnapshotObjects()) {
+                            if (!entry->has_metadata()) {
+                                continue;
+                            }
+                            ObjectMetadata& metadata = *entry->metadata();
+                            if (!metadata.IsHardPinned() &&
+                                now >= metadata.EvictionDeadline() &&
+                                metadata.EvictionDeadline() <=
+                                    target_timeout &&
+                                !IsSoftPinActive(metadata, now) &&
+                                can_evict_replicas(metadata)) {
+                                to_evict.emplace_back(tenant_id,
+                                                      entry->key());
+                            }
+                        }
                     });
                 for (auto& c : to_evict) {
                     if (target_evict_num <= 0 || stop_eviction_scan) break;
@@ -10916,25 +10915,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         }
                         TenantStateAccessorRW tenant_accessor(handle.get());
                         auto& tenant_state = *handle;
-                        tenant_state.VisitObjects(
-                            [&](const std::shared_ptr<
-                                mooncake::tenant::ObjectEntry>& entry) {
-                                if (!entry->has_metadata()) {
-                                    return;
-                                }
-                                ObjectMetadata& metadata = *entry->metadata();
-                                if (metadata.IsHardPinned() ||
-                                    now < metadata.EvictionDeadline() ||
-                                    !can_evict_replicas(metadata)) {
-                                    return;
-                                }
-                                if (!IsSoftPinActive(metadata, now) ||
-                                    metadata.EvictionDeadline() <=
-                                        soft_target_timeout) {
-                                    to_evict.emplace_back(tenant_id,
-                                                          entry->key());
-                                }
-                            });
+                        for (const auto& entry :
+                             tenant_state.SnapshotObjects()) {
+                            if (!entry->has_metadata()) {
+                                continue;
+                            }
+                            ObjectMetadata& metadata = *entry->metadata();
+                            if (metadata.IsHardPinned() ||
+                                now < metadata.EvictionDeadline() ||
+                                !can_evict_replicas(metadata)) {
+                                continue;
+                            }
+                            if (!IsSoftPinActive(metadata, now) ||
+                                metadata.EvictionDeadline() <=
+                                    soft_target_timeout) {
+                                to_evict.emplace_back(tenant_id,
+                                                      entry->key());
+                            }
+                        }
                     });
                 for (auto& c : to_evict) {
                     if (target_evict_num <= 0 || stop_eviction_scan) break;

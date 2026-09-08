@@ -510,12 +510,7 @@ class MasterServiceTest : public ::testing::Test {
             [&](const TenantId&,
                 const std::shared_ptr<MasterService::TenantState>& handle) {
                 auto& tenant_state = *handle;
-                std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
-                    objs;
-                tenant_state.VisitObjects(
-                    [&](const std::shared_ptr<mooncake::tenant::ObjectEntry>&
-                            entry) { objs.push_back(entry); });
-                for (const auto& entry : objs) {
+                for (const auto& entry : tenant_state.SnapshotObjects()) {
                     if (!entry->group_id().empty()) {
                         tenant_state.object_route.RemoveMember(
                             entry->group_id(), entry->key());

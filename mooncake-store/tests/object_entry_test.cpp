@@ -24,7 +24,6 @@ TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
     // Not wired yet: metadata is null and callback accessors are no-ops.
     EXPECT_FALSE(entry->has_metadata());
     EXPECT_EQ(entry->metadata(), nullptr);
-    EXPECT_FALSE(entry->TakeMetadata());
     bool called = false;
     entry->WithMetadata([&](ObjectMetadata&) { called = true; });
     EXPECT_FALSE(called);
@@ -36,7 +35,7 @@ TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
     EXPECT_EQ(prior, nullptr);  // nothing owned before
     EXPECT_TRUE(entry->has_metadata());
     EXPECT_EQ(entry->metadata(), raw);
-    entry->metadata()->size;  // readable through the accessor
+    EXPECT_EQ(entry->metadata()->size, 128u);  // readable through the accessor
 
     // WithMetadata runs the callback while the per-object lock is held, and the
     // callback observes the same envelope the accessor exposed.
@@ -50,11 +49,7 @@ TEST(ObjectEntryTest, HoldsAndScopesMetadataEnvelope) {
     EXPECT_TRUE(entry->metadata()->object_checksum.has_value());
     EXPECT_EQ(*entry->metadata()->object_checksum, 42u);
 
-    // Taking ownership returns the previously-wired envelope and empties the
-    // slot.
-    auto recovered = entry->TakeMetadata();
-    EXPECT_EQ(recovered.get(), raw);
-    EXPECT_FALSE(entry->has_metadata());
+    EXPECT_EQ(entry->metadata(), raw);  // envelope stays wired
 }
 
 }  // namespace

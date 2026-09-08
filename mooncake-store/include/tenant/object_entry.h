@@ -27,8 +27,6 @@ class ObjectEntry {
    public:
     ObjectEntry(std::string key, std::string group_id)
         : key_(std::move(key)), group_id_(std::move(group_id)) {}
-    ~ObjectEntry() = default;
-
     // Not copyable/movable: it owns per-object state and a per-object lock.
     ObjectEntry(const ObjectEntry&) = delete;
     ObjectEntry& operator=(const ObjectEntry&) = delete;
@@ -67,9 +65,9 @@ class ObjectEntry {
     mutable std::shared_mutex mutex;
 
     // Metadata is NON-movable / NON-copyable and self-locking, so it is owned
-    // through a pointer here. A live routed object has metadata wired in; an
-    // entry that has not yet materialized metadata (teardown, or a module-level
-    // unit test exercising only task state) has a null metadata_.
+    // through a pointer here. A published entry always has metadata wired in;
+    // only a module-level unit test exercising bare task state holds an entry
+    // with a null metadata_.
     ObjectMetadata* metadata() const { return metadata_.get(); }
     bool has_metadata() const { return metadata_ != nullptr; }
 
@@ -79,9 +77,6 @@ class ObjectEntry {
     std::unique_ptr<ObjectMetadata> SetMetadata(
         std::unique_ptr<ObjectMetadata> metadata) {
         return std::exchange(metadata_, std::move(metadata));
-    }
-    std::unique_ptr<ObjectMetadata> TakeMetadata() {
-        return std::move(metadata_);
     }
 
     // Callback-scoped test/diagnostic access; production paths pin + lock

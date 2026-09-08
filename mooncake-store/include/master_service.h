@@ -1074,9 +1074,6 @@ class MasterService {
             std::shared_ptr<mooncake::tenant::ObjectEntry> entry) {
             return object_route.InsertObject(std::move(key), std::move(entry));
         }
-        bool EraseObject(const std::string& key) {
-            return object_route.Erase(key);
-        }
         // Only erase when the route still resolves to `expected`; see
         // TenantStore::EraseIf.
         bool EraseObjectIf(const std::string& key,
@@ -1090,12 +1087,6 @@ class MasterService {
         std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>
         SnapshotObjects() const {
             return object_route.SnapshotObjects();
-        }
-        void VisitObjects(
-            const std::function<
-                void(const std::shared_ptr<mooncake::tenant::ObjectEntry>&)>&
-                visitor) const {
-            object_route.VisitObjects(visitor);
         }
         // Callback-scoped test/diagnostic access; production paths pin + lock
         // explicitly.

@@ -108,11 +108,6 @@ class TenantStore {
         return route_.emplace(std::move(key), std::move(entry)).second;
     }
 
-    bool Erase(const std::string& key) {
-        std::unique_lock<std::shared_mutex> lock(route_lock_);
-        return route_.erase(key) > 0;
-    }
-
     // Erase the route slot for `key` ONLY if it still resolves to `expected`.
     // A teardown that pinned an entry must not blindly erase by key: the
     // per-object lock is released before the route mutation, so a concurrent
@@ -181,9 +176,8 @@ class TenantStore {
 
     // Collect strong handles to every live object under this tenant. The
     // route lock is released before returning, so callers can take each
-    // entry's own mutex without holding the route lock. Equivalent to the
-    // collect-then-iterate VisitObjects idiom, without re-stating it at every
-    // call site.
+    // entry's own mutex without holding the route lock — the single primitive
+    // every "walk this tenant's objects" loop composes from.
     std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects() const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         std::vector<std::shared_ptr<ObjectEntry>> entries;
@@ -192,26 +186,6 @@ class TenantStore {
             entries.push_back(entry);
         }
         return entries;
-    }
-
-    // Visit every live object under this tenant. Collect the strong handles
-    // under the shared route lock, then run the visitor after releasing it, so
-    // the visitor never holds the route lock and may freely re-enter route ops.
-    // Processing under each ObjectEntry::mutex is the caller's responsibility.
-    void VisitObjects(
-        const std::function<void(const std::shared_ptr<ObjectEntry>&)>& visitor)
-        const {
-        std::vector<std::shared_ptr<ObjectEntry>> entries;
-        {
-            std::shared_lock<std::shared_mutex> lock(route_lock_);
-            entries.reserve(route_.size());
-            for (const auto& [key, entry] : route_) {
-                entries.push_back(entry);
-            }
-        }
-        for (const auto& entry : entries) {
-            visitor(entry);
-        }
     }
 
     // Callback-scoped test/diagnostic access; production paths pin + lock
