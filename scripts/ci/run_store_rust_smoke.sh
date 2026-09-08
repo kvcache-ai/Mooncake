@@ -2,6 +2,11 @@
 
 set -e -o pipefail
 
+# shellcheck source=scripts/ci/services.sh
+source "$(dirname "${BASH_SOURCE[0]}")/services.sh"
+: "${RUNNER_TEMP:=${TMPDIR:-/tmp}}"
+trap 'ci_cleanup_services "$?"' EXIT
+
 : "${GITHUB_WORKSPACE:?GITHUB_WORKSPACE must be set}"
 : "${MOONCAKE_STORE_CLUSTER_ID:?MOONCAKE_STORE_CLUSTER_ID must be set}"
 
@@ -16,12 +21,12 @@ case "${MOONCAKE_STORE_RUST_LINK_ASAN:-0}" in
         ;;
 esac
 
-"$GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master" \
+ci_start_service master "$RUNNER_TEMP/mooncake-master.log" \
+    "$GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master" \
     --eviction_high_watermark_ratio=0.95 \
     --cluster_id="$MOONCAKE_STORE_CLUSTER_ID" \
-    --port 50051 &
-master_pid=$!
-sleep 3
+    --port 50051
+ci_wait_service master 50051
 
 cd "$GITHUB_WORKSPACE/mooncake-store/rust"
 export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
@@ -40,5 +45,3 @@ MC_RUST_BENCH_ITERATIONS=4 \
     MC_RUST_BENCH_VALUE_SIZE=4096 \
     MC_RUST_BENCH_WARMUP=1 \
     cargo run --release --example store_benchmark
-
-kill "$master_pid" 2>/dev/null || true
