@@ -338,6 +338,9 @@ Status TransferEngineImpl::setupLocalSegment() {
 
 Status TransferEngineImpl::construct() {
     CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
+    std::atomic_store_explicit(&runtime_config_snapshot_,
+                               buildTentConfigBundle(*conf_).runtime,
+                               std::memory_order_relaxed);
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 
@@ -358,9 +361,6 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
                                                rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
-    max_failover_attempts_ = conf_->get("max_failover_attempts", 3);
-    enable_auto_failover_on_poll_ =
-        conf_->get("enable_auto_failover_on_poll", true);
     enable_progress_worker_ = conf_->get("enable_progress_worker", false);
     runtime_queue_config_.enabled = conf_->get("enable_runtime_queue", false);
     if (runtime_queue_config_.enabled) enable_progress_worker_ = true;
@@ -1502,6 +1502,7 @@ struct TransferEngineImpl::PreparedSubmit {
     };
 
     std::chrono::steady_clock::time_point submit_time{};
+    LogicalTransferRuntimePolicy runtime_policy;
     std::vector<Task> tasks;
     std::vector<Owner> owners;
 };
@@ -1804,6 +1805,13 @@ Status TransferEngineImpl::prepareSubmit(
     }
 
     prepared = PreparedSubmit{};
+    auto runtime_config = std::atomic_load_explicit(&runtime_config_snapshot_,
+                                                    std::memory_order_acquire);
+    prepared.runtime_policy.config_generation = runtime_config->generation;
+    prepared.runtime_policy.max_failover_attempts =
+        runtime_config->max_failover_attempts;
+    prepared.runtime_policy.enable_auto_failover_on_poll =
+        runtime_config->enable_auto_failover_on_poll;
     const size_t start_task_id = batch->task_list.size();
     prepared.submit_time = std::chrono::steady_clock::now();
     auto merge_boundaries =
@@ -1893,6 +1901,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         task.failover_count = 0;
         task.xport_priority = 0;
+        task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
@@ -2097,6 +2106,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         const auto& owner = prepared.owners[task_plan.merged_task_index];
         task.failover_count = 0;
         task.xport_priority = 0;
+        task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = owner.request;
         task.staging = false;
@@ -2505,9 +2515,9 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     auto prev_type = task.type;
 
-    if (++task.failover_count > max_failover_attempts_) {
+    if (++task.failover_count > task.runtime_policy.max_failover_attempts) {
         LOG(WARNING) << "Task failover limit reached ("
-                     << max_failover_attempts_
+                     << task.runtime_policy.max_failover_attempts
                      << "), last transport=" << transportTypeName(prev_type);
         return Status::InvalidEntry(
             "Failover limit exceeded, all transports exhausted");
@@ -2528,7 +2538,9 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
 
     LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
               << " -> " << transportTypeName(type) << " (attempt "
-              << task.failover_count << "/" << max_failover_attempts_ << ")";
+              << task.failover_count << "/"
+              << task.runtime_policy.max_failover_attempts << ", generation "
+              << task.runtime_policy.config_generation << ")";
     TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     auto& transport = transport_list_[type];
@@ -2563,7 +2575,8 @@ bool TransferEngineImpl::attemptSubmitStageFailover(Batch* batch,
     // failover in updateTaskStatusAfterPoll, which sets task.status = FAILED
     // before calling resubmitTransferTask).
     task.status = FAILED;
-    for (int attempt = 0; attempt < max_failover_attempts_; ++attempt) {
+    for (int attempt = 0; attempt < task.runtime_policy.max_failover_attempts;
+         ++attempt) {
         if (resubmitTransferTask(batch, task_id).ok()) {
             task.status = PENDING;
             return true;
@@ -2765,7 +2778,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     auto prev_status = task.status;
     CHECK_STATUS(pollTaskStatus(batch, poll_task_id, task_status));
     updateTaskStatusAfterPoll(batch, poll_task_id, task_status,
-                              enable_auto_failover_on_poll_);
+                              task.runtime_policy.enable_auto_failover_on_poll);
     if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
         task_status.s != PENDING) {
         QueueOwnerId owner_id = 0;
@@ -2803,7 +2816,7 @@ Status TransferEngineImpl::getTransferStatus(
 
 Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
                                           TransferStatus& overall_status,
-                                          bool allow_failover) {
+                                          bool force_failover) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
     std::lock_guard<std::recursive_mutex> lk(progressLockFor(batch_id));
     if (!isBatchAlive(batch_id))
@@ -2865,7 +2878,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         }
         auto prev_status = task.status;
         CHECK_STATUS(pollTaskStatus(batch, task_id, task_status));
-        updateTaskStatusAfterPoll(batch, task_id, task_status, allow_failover);
+        updateTaskStatusAfterPoll(
+            batch, task_id, task_status,
+            force_failover || task.runtime_policy.enable_auto_failover_on_poll);
         if (runtime_queue_config_.enabled && batch->queue_token != 0 &&
             task_status.s != PENDING) {
             QueueOwnerId owner_id = 0;
@@ -2911,8 +2926,7 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                                              TransferStatus& overall_status) {
-    return getBatchStatus(batch_id, overall_status,
-                          enable_auto_failover_on_poll_);
+    return getBatchStatus(batch_id, overall_status, false);
 }
 
 Status TransferEngineImpl::progressBatch(BatchID batch_id,
