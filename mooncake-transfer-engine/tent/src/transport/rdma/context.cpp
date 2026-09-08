@@ -503,8 +503,14 @@ void RdmaContext::cleanupResources() {
 
 int RdmaContext::pause() {
     DeviceStatus expected = DEVICE_ENABLED;
-    status_.compare_exchange_strong(expected, DEVICE_PAUSED);
-    return (expected == DEVICE_PAUSED) ? 0 : -1;
+    if (status_.compare_exchange_strong(expected, DEVICE_PAUSED,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        return 0;
+    }
+    // Pausing is idempotent. Other states (UNINIT/DISABLED) must not proceed
+    // into hardware reprobe or metadata publication.
+    return expected == DEVICE_PAUSED ? 0 : -1;
 }
 
 void RdmaContext::evictEndpoints() {

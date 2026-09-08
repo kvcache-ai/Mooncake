@@ -1300,7 +1300,15 @@ RdmaAddressRefreshResult Workers::refreshAddress(RdmaContext& context) {
 bool Workers::activateContext(int dev_id, RdmaContext& context) {
     // Stop new work from selecting this NIC while its address generation is
     // being replaced. Incoming bootstrap also rejects paused contexts.
-    context.pause();
+    if (context.pause() != 0 ||
+        context.status() != RdmaContext::DEVICE_PAUSED) {
+        if (device_selector_)
+            device_selector_->setDeviceAvailable(dev_id, false);
+        LOG(WARNING) << "Action: " << context.name()
+                     << " cannot refresh RDMA address from context state "
+                     << context.status();
+        return false;
+    }
     if (device_selector_) device_selector_->setDeviceAvailable(dev_id, false);
 
     auto result = refreshAddress(context);

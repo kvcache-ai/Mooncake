@@ -1026,6 +1026,28 @@ TEST_F(RdmaAddressRefreshEventTest, AddressEventForAnotherPortIsIgnored) {
 }
 
 TEST_F(RdmaAddressRefreshEventTest,
+       NonPausableContextSkipsAddressAndMetadataRefresh) {
+    ibv_gid old_gid{};
+    old_gid.raw[15] = kOldGidByte;
+    RdmaContextTestPeer::seedAddress(*context_, kDeviceName, kOldLid,
+                                     fake_port.expected_gid_index, old_gid,
+                                     RdmaContext::DEVICE_DISABLED);
+    const auto before = context_->address();
+
+    fire(IBV_EVENT_GID_CHANGE);
+
+    EXPECT_EQ(fake_port.query_gid_calls, 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_DISABLED);
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+    const auto after = context_->address();
+    EXPECT_EQ(after.lid, before.lid);
+    EXPECT_EQ(after.gid, before.gid);
+    const auto published = publishedDevice();
+    EXPECT_EQ(published.lid, before.lid);
+    EXPECT_EQ(published.gid, before.gid);
+}
+
+TEST_F(RdmaAddressRefreshEventTest,
        AddressChangeWhilePortDownKeepsNicUnavailable) {
     fake_port.state = IBV_PORT_DOWN;
     const auto before = context_->address();
@@ -2197,6 +2219,36 @@ TEST_F(RdmaContextEventTest, RecoveryPollLeavesInertContextsAlone) {
     RdmaTransportTestPeer::resumePausedContexts(*workers_);
 
     EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST(RdmaContextPauseTest, TransitionAndAlreadyPausedAreSuccessful) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    ibv_gid gid{};
+    gid.raw[15] = 1;
+    RdmaContextTestPeer::seedAddress(context, "fake-rnic", /*lid=*/1,
+                                     /*gid_index=*/0, gid,
+                                     RdmaContext::DEVICE_ENABLED);
+
+    EXPECT_EQ(context.pause(), 0);
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_PAUSED);
+    EXPECT_EQ(context.pause(), 0);  // idempotent
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_PAUSED);
+}
+
+TEST(RdmaContextPauseTest, RejectsUninitializedAndDisabledStates) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    EXPECT_EQ(context.pause(), -1);
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_UNINIT);
+
+    ibv_gid gid{};
+    gid.raw[15] = 1;
+    RdmaContextTestPeer::seedAddress(context, "fake-rnic", /*lid=*/1,
+                                     /*gid_index=*/0, gid,
+                                     RdmaContext::DEVICE_DISABLED);
+    EXPECT_EQ(context.pause(), -1);
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_DISABLED);
 }
 
 TEST(RdmaContextPortStateTest, QueryOnInertContextIsRejected) {
