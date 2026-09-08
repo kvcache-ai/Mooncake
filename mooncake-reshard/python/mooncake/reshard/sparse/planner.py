@@ -203,6 +203,11 @@ class SparseObjectIndex:
     nnz: int
     base_generation: int
     delta_generation: int
+    # Keep the source object's declared geometry alongside the compact index.
+    # Older callers that construct an index directly may omit these fields;
+    # such indexes are interpreted as complete global objects.
+    global_offset: tuple[int, ...] | None = None
+    local_shape: tuple[int, ...] | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.object_ref, str) or not self.object_ref:
@@ -213,6 +218,20 @@ class SparseObjectIndex:
         tile_shape = normalize_shape(self.tile_shape, "tile_shape", positive=True)
         if len(shape) != len(tile_shape):
             raise ValueError("global_shape and tile_shape rank differ")
+        offset = (
+            normalize_shape(self.global_offset, "global_offset", positive=False)
+            if self.global_offset is not None
+            else (0,) * len(shape)
+        )
+        local = (
+            normalize_shape(self.local_shape, "local_shape", positive=True)
+            if self.local_shape is not None
+            else shape
+        )
+        if len(offset) != len(shape) or len(local) != len(shape):
+            raise ValueError("source geometry rank differs from global_shape")
+        if any(offset[d] + local[d] > shape[d] for d in range(len(shape))):
+            raise ValueError("source geometry exceeds global_shape")
         coords = tuple(
             normalize_shape(coord, "tile_coords", positive=False)
             for coord in self.tile_coords
@@ -251,6 +270,8 @@ class SparseObjectIndex:
             raise ValueError("delta_generation must be newer than base_generation")
         object.__setattr__(self, "global_shape", shape)
         object.__setattr__(self, "tile_shape", tile_shape)
+        object.__setattr__(self, "global_offset", offset)
+        object.__setattr__(self, "local_shape", local)
         object.__setattr__(self, "tile_coords", coords)
         object.__setattr__(self, "tile_ptr", ptr)
 
@@ -381,6 +402,8 @@ class SparseObjectIndex:
             nnz=int(shape[0]),
             base_generation=int(metadata.get("base_generation", -1)),
             delta_generation=int(metadata.get("delta_generation", -1)),
+            global_offset=global_offset,
+            local_shape=local_shape,
         )
 
 
@@ -417,6 +440,7 @@ class SparseObjectRegion:
         start, end = self.indices_range
         if type(start) is not int or type(end) is not int or start < 0 or end <= start:
             raise ValueError("COO ranges must be non-empty")
+        normalize_placement(tuple(self.target_placement))
         object.__setattr__(self, "source_global_box", box)
         object.__setattr__(self, "target_global_offset", offset)
         object.__setattr__(self, "target_local_shape", shape)
@@ -451,6 +475,55 @@ class SparseObjectPlan:
     base_generation: int
     delta_generation: int
     regions: tuple[SparseObjectRegion, ...]
+    physical_node: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.tensor_id, str) or not self.tensor_id:
+            raise ValueError("tensor_id must be a non-empty string")
+        target_offset = normalize_shape(
+            self.target_global_offset, "target_global_offset", positive=False
+        )
+        target_shape = normalize_shape(
+            self.target_local_shape, "target_local_shape", positive=True
+        )
+        if len(target_offset) != len(target_shape):
+            raise ValueError("target geometry rank differs")
+        normalize_placement(tuple(self.target_placement))
+        if (
+            type(self.base_generation) is not int
+            or type(self.delta_generation) is not int
+            or self.base_generation < 0
+            or self.delta_generation <= self.base_generation
+        ):
+            raise ValueError("invalid sparse plan generation")
+        if self.physical_node is not None and (
+            not isinstance(self.physical_node, str) or not self.physical_node
+        ):
+            raise ValueError("physical_node must be a non-empty string")
+        target_end = tuple(
+            target_offset[d] + target_shape[d] for d in range(len(target_offset))
+        )
+        for region in self.regions:
+            if region.tensor_id != self.tensor_id:
+                raise ValueError("region tensor_id does not match sparse plan")
+            if (
+                region.target_global_offset != target_offset
+                or region.target_local_shape != target_shape
+                or region.target_placement
+                != normalize_placement(tuple(self.target_placement))
+            ):
+                raise ValueError("region target geometry does not match sparse plan")
+            region_begin, region_end = region.target_global_box
+            if any(
+                region_begin[d] < target_offset[d] or region_end[d] > target_end[d]
+                for d in range(len(target_offset))
+            ):
+                raise ValueError("region lies outside sparse plan target geometry")
+        object.__setattr__(self, "target_global_offset", target_offset)
+        object.__setattr__(self, "target_local_shape", target_shape)
+        object.__setattr__(
+            self, "target_placement", normalize_placement(tuple(self.target_placement))
+        )
 
     @property
     def source_ranges(self) -> tuple[tuple[str, tuple[int, int]], ...]:
@@ -482,6 +555,17 @@ class SparseObjectStorePlanner:
             tuple[tuple[int, ...], tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]],
         ] = {}
 
+    def clear_index_cache(self, object_ref: object | None = None) -> None:
+        """Drop metadata-only tile lookup caches for one object or all objects."""
+
+        key = None if object_ref is None else object_ref_key(object_ref)
+        if key is None:
+            self._tile_row_cache.clear()
+            self._tile_col_cache.clear()
+        else:
+            self._tile_row_cache.pop(key, None)
+            self._tile_col_cache.pop(key, None)
+
     @staticmethod
     def _intersection(source: Any, target: Any) -> Box | None:
         return box_intersection(
@@ -498,18 +582,109 @@ class SparseObjectStorePlanner:
         target: Any,
         source_fragments: Iterable[Any],
         tensor: TensorDescriptor,
+        source_indexes: Mapping[str, SparseObjectIndex] | None = None,
+        base_generation: int | None = None,
+        delta_generation: int | None = None,
     ) -> tuple[Any, ...]:
-        """Filter source inventory before any source-object index is read.
+        """Filter source inventory before reading source-object indexes by default.
 
         The source manifest can contain all tensors and all placements.  This
         method is intentionally part of the address-free planner so Store
         adapters do not duplicate placement and box-intersection rules.
+
+        When compact indexes and an expected generation are supplied, stale
+        replicas are filtered before choosing the deterministic representative.
+        Store adapters should read indexes for all geometrically eligible
+        replicas before calling this mode.
         """
 
         if tensor.tensor_id != tensor_id:
             raise ValueError("tensor descriptor does not match tensor_id")
+        target_tensor_id = getattr(target, "tensor_id", tensor_id)
+        if target_tensor_id != tensor_id:
+            raise ValueError("target tensor_id does not match tensor_id")
+        if (source_indexes is None) != (
+            base_generation is None and delta_generation is None
+        ):
+            raise ValueError(
+                "source_indexes and expected generations must be provided together"
+            )
+        if source_indexes is not None:
+            if (
+                type(base_generation) is not int
+                or type(delta_generation) is not int
+                or base_generation < 0
+                or delta_generation <= base_generation
+            ):
+                raise ValueError("expected source generations must be integers")
         self._validate_target_fragment(target, tensor=tensor)
         target_placement = normalize_placement(tuple(target.target_placement))
+        groups = self._source_groups(
+            tensor_id=tensor_id,
+            source_fragments=source_fragments,
+            tensor=tensor,
+        )
+        if source_indexes is not None:
+            groups = self._filter_groups_by_generation(
+                groups,
+                target=target,
+                tensor=tensor,
+                target_placement=target_placement,
+                source_indexes=source_indexes,
+                tensor_id=tensor_id,
+                base_generation=base_generation,
+                delta_generation=delta_generation,
+            )
+        return self._select_from_groups(
+            target=target,
+            tensor=tensor,
+            target_placement=target_placement,
+            groups=groups,
+        )
+
+    def candidate_source_fragments(
+        self,
+        *,
+        tensor_id: str,
+        target: Any,
+        source_fragments: Iterable[Any],
+        tensor: TensorDescriptor,
+    ) -> tuple[Any, ...]:
+        """Return all eligible source replicas before representative selection."""
+
+        if tensor.tensor_id != tensor_id:
+            raise ValueError("tensor descriptor does not match tensor_id")
+        target_tensor_id = getattr(target, "tensor_id", tensor_id)
+        if target_tensor_id != tensor_id:
+            raise ValueError("target tensor_id does not match tensor_id")
+        self._validate_target_fragment(target, tensor=tensor)
+        target_placement = normalize_placement(tuple(target.target_placement))
+        groups = self._source_groups(
+            tensor_id=tensor_id,
+            source_fragments=source_fragments,
+            tensor=tensor,
+        )
+        candidates: list[Any] = []
+        for group in groups.values():
+            candidates.extend(
+                source
+                for source in group
+                if placement_matches(
+                    tensor,
+                    normalize_placement(tuple(source.source_placement)),
+                    target_placement,
+                )
+                and self._intersection(source, target) is not None
+            )
+        return tuple(candidates)
+
+    def _source_groups(
+        self,
+        *,
+        tensor_id: str,
+        source_fragments: Iterable[Any],
+        tensor: TensorDescriptor,
+    ) -> dict[tuple[tuple[int, ...], tuple[int, ...]], list[Any]]:
         groups: dict[tuple[tuple[int, ...], tuple[int, ...]], list[Any]] = {}
         for source in source_fragments:
             if source.tensor_id != tensor_id:
@@ -520,12 +695,7 @@ class SparseObjectStorePlanner:
                 tuple(source.local_shape),
             )
             groups.setdefault(geometry_key, []).append(source)
-        return self._select_from_groups(
-            target=target,
-            tensor=tensor,
-            target_placement=target_placement,
-            groups=groups,
-        )
+        return groups
 
     def _select_from_groups(
         self,
@@ -581,6 +751,74 @@ class SparseObjectStorePlanner:
             raise ValueError("sparse source fragment placement is invalid")
         normalize_placement(tuple(source.source_placement))
         object_ref_key(source.object_ref)
+
+    @staticmethod
+    def _validate_index_identity(
+        index: SparseObjectIndex,
+        *,
+        source: Any,
+        tensor_id: str,
+    ) -> None:
+        key = object_ref_key(source.object_ref)
+        if index.object_ref != key:
+            raise ValueError("tile index object_ref does not match source fragment")
+        if index.tensor_id != tensor_id:
+            raise ValueError("tile index tensor_id does not match source fragment")
+        if tuple(index.global_shape) != tuple(source.global_shape):
+            raise ValueError("tile index global_shape does not match source fragment")
+        if tuple(index.global_offset) != tuple(source.global_offset) or tuple(
+            index.local_shape
+        ) != tuple(source.local_shape):
+            raise ValueError(
+                "tile index source geometry (global_offset/local_shape) does not "
+                "match source fragment"
+            )
+
+    @classmethod
+    def _filter_groups_by_generation(
+        cls,
+        groups: Mapping[tuple[tuple[int, ...], tuple[int, ...]], list[Any]],
+        *,
+        target: Any,
+        tensor: TensorDescriptor,
+        target_placement: Placement,
+        source_indexes: Mapping[str, SparseObjectIndex],
+        tensor_id: str,
+        base_generation: int,
+        delta_generation: int,
+    ) -> dict[tuple[tuple[int, ...], tuple[int, ...]], list[Any]]:
+        filtered: dict[tuple[tuple[int, ...], tuple[int, ...]], list[Any]] = {}
+        for geometry_key, group in groups.items():
+            eligible: list[Any] = []
+            for source in group:
+                if (
+                    not placement_matches(
+                        tensor,
+                        normalize_placement(tuple(source.source_placement)),
+                        target_placement,
+                    )
+                    or cls._intersection(source, target) is None
+                ):
+                    continue
+                key = object_ref_key(source.object_ref)
+                index = source_indexes.get(key)
+                if index is None:
+                    raise ValueError(
+                        f"missing sparse tile index for source object {key!r}"
+                    )
+                cls._validate_index_identity(
+                    index,
+                    source=source,
+                    tensor_id=tensor_id,
+                )
+                if (
+                    index.base_generation == base_generation
+                    and index.delta_generation == delta_generation
+                ):
+                    eligible.append(source)
+            if eligible:
+                filtered[geometry_key] = eligible
+        return filtered
 
     @staticmethod
     def _validate_target_fragment(target: Any, *, tensor: TensorDescriptor) -> None:
@@ -776,12 +1014,17 @@ class SparseObjectStorePlanner:
     ) -> SparseObjectPlan:
         """Plan one target without materializing ``indices`` or ``values``."""
 
+        if getattr(target, "tensor_id", tensor_id) != tensor_id:
+            raise ValueError("target tensor_id does not match tensor_id")
         self._validate_target_fragment(target, tensor=tensor)
         candidates = self.select_source_fragments(
             tensor_id=tensor_id,
             target=target,
             source_fragments=source_fragments,
             tensor=tensor,
+            source_indexes=source_indexes,
+            base_generation=base_generation,
+            delta_generation=delta_generation,
         )
         return self._plan_target_candidates(
             tensor_id=tensor_id,
@@ -810,6 +1053,11 @@ class SparseObjectStorePlanner:
             target.local_shape, "target.local_shape", positive=True
         )
         target_placement = normalize_placement(tuple(target.target_placement))
+        physical_node = getattr(target, "physical_node", None)
+        if physical_node is not None and (
+            not isinstance(physical_node, str) or not physical_node
+        ):
+            raise ValueError("target.physical_node must be a non-empty string")
         overlap_boxes: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
         for source in candidates:
             overlap = self._intersection(source, target)
@@ -831,17 +1079,16 @@ class SparseObjectStorePlanner:
                 raise ValueError(
                     f"missing sparse tile index for source object {key!r}"
                 ) from error
-            if index.tensor_id != tensor_id:
-                raise ValueError("tile index tensor_id does not match source fragment")
+            self._validate_index_identity(
+                index,
+                source=source,
+                tensor_id=tensor_id,
+            )
             if (index.base_generation, index.delta_generation) != (
                 base_generation,
                 delta_generation,
             ):
                 raise ValueError("tile index generation does not match manifest")
-            if tuple(index.global_shape) != tuple(source.global_shape):
-                raise ValueError(
-                    "tile index global_shape does not match source fragment"
-                )
             for start, stop in self._tile_ranges(index, overlap):
                 regions.append(
                     SparseObjectRegion(
@@ -871,6 +1118,7 @@ class SparseObjectStorePlanner:
             base_generation=base_generation,
             delta_generation=delta_generation,
             regions=tuple(regions),
+            physical_node=physical_node,
         )
 
     def plan_targets(
@@ -902,13 +1150,6 @@ class SparseObjectStorePlanner:
                     (tuple(source.global_offset), tuple(source.local_shape)), []
                 ).append(source)
             groups_by_tensor[tensor_id] = groups
-        candidate_indexes = {
-            tensor_id: _CandidateBoxIndex.build(
-                tuple(tuple(group) for group in groups.values())
-            )
-            for tensor_id, groups in groups_by_tensor.items()
-            if groups
-        }
         plans: list[SparseObjectPlan] = []
         for target in targets:
             tensor_id = target.tensor_id
@@ -918,14 +1159,33 @@ class SparseObjectStorePlanner:
                 raise ValueError(
                     f"missing tensor descriptor for {tensor_id!r}"
                 ) from error
+            if getattr(target, "tensor_id", tensor_id) != tensor_id:
+                raise ValueError("target tensor_id does not match tensor_id")
             self._validate_target_fragment(target, tensor=tensor)
             target_placement = normalize_placement(tuple(target.target_placement))
+            filtered_groups = self._filter_groups_by_generation(
+                groups_by_tensor.get(tensor_id, {}),
+                target=target,
+                tensor=tensor,
+                target_placement=target_placement,
+                source_indexes=source_indexes,
+                tensor_id=tensor_id,
+                base_generation=base_generation,
+                delta_generation=delta_generation,
+            )
+            candidate_index = (
+                _CandidateBoxIndex.build(
+                    tuple(tuple(group) for group in filtered_groups.values())
+                )
+                if filtered_groups
+                else None
+            )
             candidates = self._select_from_groups(
                 target=target,
                 tensor=tensor,
                 target_placement=target_placement,
-                groups=groups_by_tensor.get(tensor_id, {}),
-                candidate_index=candidate_indexes.get(tensor_id),
+                groups=filtered_groups,
+                candidate_index=candidate_index,
             )
             plans.append(
                 self._plan_target_candidates(
