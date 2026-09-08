@@ -17,7 +17,6 @@
 
 #include "p2p/master/p2p_client_meta.h"
 #include "p2p/common/p2p_rpc_types.h"
-#include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -73,7 +72,7 @@ class P2PMasterServiceTest : public ::testing::Test {
         return req.client_id;
     }
 
-    /// Helper to add a replica via AddReplica
+    /// Helper to add a replica via PublishRoute
     void AddReplicaHelper(P2PMasterService& service, const std::string& key,
                           size_t size, const UUID& client_id,
                           const UUID& segment_id) {
@@ -82,7 +81,7 @@ class P2PMasterServiceTest : public ::testing::Test {
         req.object_size = size;
         req.client_id = client_id;
         req.segment_id = segment_id;
-        auto res = service.AddReplica(req);
+        auto res = service.PublishRoute(req);
         EXPECT_TRUE(res.has_value())
             << "Failed to add replica: " << res.error();
     }
@@ -614,7 +613,7 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfigSecondContradiction) {
 }
 
 // ============================================================
-// AddReplica Tests
+// PublishRoute Tests
 // ============================================================
 
 TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
@@ -629,7 +628,7 @@ TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
     req.object_size = 1024;
     req.client_id = client_id;
     req.segment_id = seg.id;
-    auto res = service->AddReplica(req);
+    auto res = service->PublishRoute(req);
     ASSERT_TRUE(res.has_value());
 
     // Verify it shows up in GetReadRoute
@@ -655,11 +654,11 @@ TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
     req.segment_id = seg.id;
 
     // First add
-    auto res1 = service->AddReplica(req);
+    auto res1 = service->PublishRoute(req);
     ASSERT_TRUE(res1.has_value());
 
     // Duplicate add
-    auto res2 = service->AddReplica(req);
+    auto res2 = service->PublishRoute(req);
     EXPECT_FALSE(res2.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_ALREADY_EXISTS, res2.error());
 }
@@ -679,7 +678,7 @@ TEST_F(P2PMasterServiceTest, AddReplicaRejectsObjectSizeMismatch) {
     mismatch.object_size = 2048;
     mismatch.client_id = client2;
     mismatch.segment_id = seg2.id;
-    auto result = service->AddReplica(mismatch);
+    auto result = service->PublishRoute(mismatch);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 
@@ -710,7 +709,7 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
 
     // GetReadRoute aggregates per client: client1's two segment-replicas
-    // collapse to one route, plus client2 -> 2 routes. (Both AddReplica calls
+    // collapse to one route, plus client2 -> 2 routes. (Both PublishRoute calls
     // on client1 already succeeded above, confirming multiple replicas per
     // client are allowed.)
     auto get_res = service->GetReadRoute("key1");
@@ -723,7 +722,7 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     req.object_size = 1024;
     req.client_id = client3;
     req.segment_id = seg3.id;
-    auto res = service->AddReplica(req);
+    auto res = service->PublishRoute(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NUM_EXCEEDED, res.error());
 }
@@ -737,7 +736,7 @@ TEST_F(P2PMasterServiceTest, AddReplicaClientNotFound) {
     req.object_size = 1024;
     req.client_id = generate_uuid();  // non-existent
     req.segment_id = seg.id;
-    auto res = service->AddReplica(req);
+    auto res = service->PublishRoute(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::CLIENT_NOT_FOUND, res.error());
 }
@@ -753,13 +752,13 @@ TEST_F(P2PMasterServiceTest, AddReplicaSegmentNotFound) {
     req.object_size = 1024;
     req.client_id = client_id;
     req.segment_id = generate_uuid();  // non-existent segment
-    auto res = service->AddReplica(req);
+    auto res = service->PublishRoute(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, res.error());
 }
 
 // ============================================================
-// RemoveReplica Tests
+// WithdrawRoute Tests
 // ============================================================
 
 TEST_F(P2PMasterServiceTest, RemoveReplicaBasic) {
@@ -775,7 +774,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaBasic) {
     req.key = "key1";
     req.client_id = client_id;
     req.segment_id = seg.id;
-    auto res = service->RemoveReplica(req);
+    auto res = service->WithdrawRoute(req);
     ASSERT_TRUE(res.has_value());
 
     // Verify key is gone (last replica removed → object removed)
@@ -801,7 +800,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaPartial) {
     req.key = "key1";
     req.client_id = client1;
     req.segment_id = seg1.id;
-    auto res = service->RemoveReplica(req);
+    auto res = service->WithdrawRoute(req);
     ASSERT_TRUE(res.has_value());
 
     // Object still exists with one replica
@@ -823,7 +822,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
     req.key = "key1";
     req.client_id = client_id;
     req.segment_id = generate_uuid();  // wrong segment
-    auto res = service->RemoveReplica(req);
+    auto res = service->WithdrawRoute(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, res.error());
 }
@@ -835,7 +834,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaObjectNotFound) {
     req.key = "non_existent_key";
     req.client_id = generate_uuid();
     req.segment_id = generate_uuid();
-    auto res = service->RemoveReplica(req);
+    auto res = service->WithdrawRoute(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, res.error());
 }
@@ -898,7 +897,7 @@ TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
             request.object_size = 1024;
             request.client_id = client_id;
             request.segment_id = segments[index].id;
-            auto result = service->AddReplica(request);
+            auto result = service->PublishRoute(request);
             errors[index] =
                 result.has_value() ? ErrorCode::OK : result.error();
         });
@@ -919,7 +918,7 @@ TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
             request.key = key;
             request.client_id = client_id;
             request.segment_id = segments[index].id;
-            auto result = service->RemoveReplica(request);
+            auto result = service->WithdrawRoute(request);
             errors[index] =
                 result.has_value() ? ErrorCode::OK : result.error();
         });
@@ -1287,7 +1286,7 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     a_req.object_size = 4096;
     a_req.client_id = candidate.client_id;
     a_req.segment_id = seg.id;
-    auto a_res = service->AddReplica(a_req);
+    auto a_res = service->PublishRoute(a_req);
     ASSERT_TRUE(a_res.has_value());
 
     // Step 3: Read — GetReadRoute
@@ -1300,7 +1299,7 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     rm_req.key = "data_001";
     rm_req.client_id = candidate.client_id;
     rm_req.segment_id = seg.id;
-    auto rm_res = service->RemoveReplica(rm_req);
+    auto rm_res = service->WithdrawRoute(rm_req);
     ASSERT_TRUE(rm_res.has_value());
 
     // Verify gone
@@ -1310,7 +1309,7 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
 }
 
 // ============================================================
-// SetSyncCompleted Tests
+// CompleteRouteSync Tests
 // ============================================================
 
 TEST_F(P2PMasterServiceTest, SetSyncCompletedSuccess) {
@@ -1324,15 +1323,15 @@ TEST_F(P2PMasterServiceTest, SetSyncCompletedSuccess) {
     ASSERT_NE(p2p_client, nullptr);
     EXPECT_TRUE(p2p_client->IsSyncing());
 
-    // SetSyncCompleted should clear is_syncing
-    auto result = service->SetSyncCompleted(client_id);
+    // CompleteRouteSync should clear is_syncing
+    auto result = service->CompleteRouteSync(client_id);
     ASSERT_TRUE(result.has_value());
     EXPECT_FALSE(p2p_client->IsSyncing());
 }
 
 TEST_F(P2PMasterServiceTest, SetSyncCompletedClientNotFound) {
     auto service = CreateService();
-    auto result = service->SetSyncCompleted(generate_uuid());
+    auto result = service->CompleteRouteSync(generate_uuid());
     EXPECT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::CLIENT_NOT_FOUND);
 }
@@ -1344,8 +1343,8 @@ TEST_F(P2PMasterServiceTest, SetSyncCompletedIdempotent) {
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
     // Call twice — should succeed both times
-    EXPECT_TRUE(service->SetSyncCompleted(client_id).has_value());
-    EXPECT_TRUE(service->SetSyncCompleted(client_id).has_value());
+    EXPECT_TRUE(service->CompleteRouteSync(client_id).has_value());
+    EXPECT_TRUE(service->CompleteRouteSync(client_id).has_value());
 
     auto p2p_client = service->client_manager_->GetClient(client_id);
     EXPECT_FALSE(p2p_client->IsSyncing());

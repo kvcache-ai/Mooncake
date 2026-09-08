@@ -5,7 +5,7 @@
 #include <iomanip>
 #include <sstream>
 
-#include "p2p/client/p2p_client_metric.h"
+#include "p2p/util/metric_util.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -82,10 +82,10 @@ ClientMetricsAggregator::ClientMetricsAggregator()
     // Mark retention gauges changed once so zero values are serialized.
     key_live_count_.inc(0);
     key_removed_count_.inc(0);
-    key_live_age_buckets_.assign(
-        KeyRetentionMetric::LifetimeBuckets().size() + 1, 0);
+    key_live_age_buckets_.assign(p2p::metric_util::LifetimeBuckets().size() + 1,
+                                 0);
     key_removed_age_buckets_.assign(
-        KeyRetentionMetric::LifetimeBuckets().size() + 1, 0);
+        p2p::metric_util::LifetimeBuckets().size() + 1, 0);
 }
 
 void ClientMetricsAggregator::Update(const UUID& client_id,
@@ -146,7 +146,7 @@ void ClientMetricsAggregator::OnClientRemoved(const UUID& client_id) {
 }
 
 void ClientMetricsAggregator::RefreshRetentionAggregates() {
-    const size_t num_buckets = KeyRetentionMetric::LifetimeBuckets().size() + 1;
+    const size_t num_buckets = p2p::metric_util::LifetimeBuckets().size() + 1;
 
     int64_t live_sum = 0;
     int64_t removed_sum = 0;
@@ -237,28 +237,28 @@ void ClientMetricsAggregator::Serialize(std::string& out) {
     serialize_metric(key_removed_count_);
     // Merged retention distributions, rendered as scrape-time histograms
     // (quantiles via histogram_quantile() at query time).
-    KeyRetentionMetric::SerializeBucketHistogram(
+    p2p::metric_util::SerializeBucketHistogram(
         out, "master_cluster_key_retention_live_age_seconds",
         "Cluster-wide current age distribution of live keys on clients "
         "(seconds; approximate, merged from per-client birth cohorts; sum "
         "estimated from bucket midpoints)",
-        {}, KeyRetentionMetric::LifetimeBuckets(), key_live_age_buckets_);
-    KeyRetentionMetric::SerializeBucketHistogram(
+        {}, p2p::metric_util::LifetimeBuckets(), key_live_age_buckets_);
+    p2p::metric_util::SerializeBucketHistogram(
         out, "master_cluster_key_retention_removed_age_seconds",
         "Cluster-wide lifetime distribution of removed keys on clients "
         "(seconds; sum estimated from bucket midpoints)",
-        {}, KeyRetentionMetric::LifetimeBuckets(), key_removed_age_buckets_);
+        {}, p2p::metric_util::LifetimeBuckets(), key_removed_age_buckets_);
     std::vector<int64_t> all_buckets(key_live_age_buckets_.size(), 0);
     for (size_t i = 0;
          i < all_buckets.size() && i < key_removed_age_buckets_.size(); ++i) {
         all_buckets[i] = key_live_age_buckets_[i] + key_removed_age_buckets_[i];
     }
-    KeyRetentionMetric::SerializeBucketHistogram(
+    p2p::metric_util::SerializeBucketHistogram(
         out, "master_cluster_key_retention_all_lifetime_seconds",
         "Cluster-wide lifetime distribution of all keys seen by clients "
         "(seconds): live keys censored at current age + removed keys' "
         "exact lifetime; sum estimated from bucket midpoints)",
-        {}, KeyRetentionMetric::LifetimeBuckets(), all_buckets);
+        {}, p2p::metric_util::LifetimeBuckets(), all_buckets);
 }
 
 std::string ClientMetricsAggregator::Summary() {
@@ -304,19 +304,18 @@ std::string ClientMetricsAggregator::Summary() {
 
     const std::vector<double> kQuantiles = {0.30, 0.50, 0.80, 0.95};
     const std::vector<double>& lifetime_buckets =
-        KeyRetentionMetric::LifetimeBuckets();
+        p2p::metric_util::LifetimeBuckets();
     std::vector<int64_t> all_buckets(key_live_age_buckets_.size(), 0);
     for (size_t i = 0;
          i < all_buckets.size() && i < key_removed_age_buckets_.size(); ++i) {
         all_buckets[i] = key_live_age_buckets_[i] + key_removed_age_buckets_[i];
     }
-    const std::vector<int64_t> live_q =
-        KeyRetentionMetric::InterpolateQuantiles(
-            lifetime_buckets, key_live_age_buckets_, kQuantiles);
+    const std::vector<int64_t> live_q = p2p::metric_util::InterpolateQuantiles(
+        lifetime_buckets, key_live_age_buckets_, kQuantiles);
     const std::vector<int64_t> removed_q =
-        KeyRetentionMetric::InterpolateQuantiles(
+        p2p::metric_util::InterpolateQuantiles(
             lifetime_buckets, key_removed_age_buckets_, kQuantiles);
-    const std::vector<int64_t> all_q = KeyRetentionMetric::InterpolateQuantiles(
+    const std::vector<int64_t> all_q = p2p::metric_util::InterpolateQuantiles(
         lifetime_buckets, all_buckets, kQuantiles);
     ss << " | Retention: live=" << key_live_count_.value()
        << ", removed=" << key_removed_count_.value()

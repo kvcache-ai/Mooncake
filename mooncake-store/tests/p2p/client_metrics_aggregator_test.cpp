@@ -13,7 +13,7 @@
 #include <vector>
 
 #include "p2p/client/heartbeat_type.h"
-#include "p2p/client/p2p_client_metric.h"
+#include "p2p/util/metric_util.h"
 #include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
@@ -333,7 +333,7 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
 namespace {
 
 size_t NumRetentionBuckets() {
-    return KeyRetentionMetric::LifetimeBuckets().size() + 1;
+    return p2p::metric_util::LifetimeBuckets().size() + 1;
 }
 
 std::vector<int64_t> ZeroRetentionBuckets() {

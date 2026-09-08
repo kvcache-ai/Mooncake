@@ -155,15 +155,15 @@ class P2PMasterMetricManager {
     // Operation Statistics (Counters)
     void inc_get_write_route_requests(int64_t val = 1);
     void inc_get_write_route_failures(int64_t val = 1);
-    void inc_add_replica_requests(int64_t val = 1);
-    void inc_add_replica_failures(int64_t val = 1);
-    void inc_remove_replica_requests(int64_t val = 1);
-    void inc_remove_replica_failures(int64_t val = 1);
+    void inc_publish_route_requests(int64_t val = 1);
+    void inc_publish_route_failures(int64_t val = 1);
+    void inc_withdraw_route_requests(int64_t val = 1);
+    void inc_withdraw_route_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
-    void inc_batch_remove_replica_requests(int64_t items);
-    void inc_batch_remove_replica_failures(int64_t failed_items);
-    void inc_batch_remove_replica_partial_success(int64_t failed_items);
+    void inc_batch_withdraw_route_requests(int64_t items);
+    void inc_batch_withdraw_route_failures(int64_t failed_items);
+    void inc_batch_withdraw_route_partial_success(int64_t failed_items);
     void inc_batch_get_write_route_requests(int64_t items);
     void inc_batch_get_write_route_failures(int64_t failed_items);
     void inc_batch_get_write_route_partial_success(int64_t failed_items);
@@ -171,17 +171,17 @@ class P2PMasterMetricManager {
     // Operation Statistics Getters
     int64_t get_get_write_route_requests();
     int64_t get_get_write_route_failures();
-    int64_t get_add_replica_requests();
-    int64_t get_add_replica_failures();
-    int64_t get_remove_replica_requests();
-    int64_t get_remove_replica_failures();
+    int64_t get_publish_route_requests();
+    int64_t get_publish_route_failures();
+    int64_t get_withdraw_route_requests();
+    int64_t get_withdraw_route_failures();
 
     // Batch Operation Statistics Getters
-    int64_t get_batch_remove_replica_requests();
-    int64_t get_batch_remove_replica_failures();
-    int64_t get_batch_remove_replica_partial_successes();
-    int64_t get_batch_remove_replica_items();
-    int64_t get_batch_remove_replica_failed_items();
+    int64_t get_batch_withdraw_route_requests();
+    int64_t get_batch_withdraw_route_failures();
+    int64_t get_batch_withdraw_route_partial_successes();
+    int64_t get_batch_withdraw_route_items();
+    int64_t get_batch_withdraw_route_failed_items();
     int64_t get_batch_get_write_route_requests();
     int64_t get_batch_get_write_route_failures();
     int64_t get_batch_get_write_route_partial_successes();
@@ -289,17 +289,17 @@ class P2PMasterMetricManager {
     // Operation Statistics
     ylt::metric::counter_t get_write_route_requests_;
     ylt::metric::counter_t get_write_route_failures_;
-    ylt::metric::counter_t add_replica_requests_;
-    ylt::metric::counter_t add_replica_failures_;
-    ylt::metric::counter_t remove_replica_requests_;
-    ylt::metric::counter_t remove_replica_failures_;
+    ylt::metric::counter_t publish_route_requests_;
+    ylt::metric::counter_t publish_route_failures_;
+    ylt::metric::counter_t withdraw_route_requests_;
+    ylt::metric::counter_t withdraw_route_failures_;
 
     // Batch Operation Statistics
-    ylt::metric::counter_t batch_remove_replica_requests_;
-    ylt::metric::counter_t batch_remove_replica_failures_;
-    ylt::metric::counter_t batch_remove_replica_partial_successes_;
-    ylt::metric::counter_t batch_remove_replica_items_;
-    ylt::metric::counter_t batch_remove_replica_failed_items_;
+    ylt::metric::counter_t batch_withdraw_route_requests_;
+    ylt::metric::counter_t batch_withdraw_route_failures_;
+    ylt::metric::counter_t batch_withdraw_route_partial_successes_;
+    ylt::metric::counter_t batch_withdraw_route_items_;
+    ylt::metric::counter_t batch_withdraw_route_failed_items_;
     ylt::metric::counter_t batch_get_write_route_requests_;
     ylt::metric::counter_t batch_get_write_route_failures_;
     ylt::metric::counter_t batch_get_write_route_partial_successes_;

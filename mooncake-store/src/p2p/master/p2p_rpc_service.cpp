@@ -93,8 +93,7 @@ void P2PMasterRpcService::init_http_server() {
         [&](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(
-                status_type::ok,
-                std::to_string(master_service_.GetKeyCount()));
+                status_type::ok, std::to_string(master_service_.GetKeyCount()));
         });
 
     http_server_.set_http_handler<GET>(
@@ -104,7 +103,7 @@ void P2PMasterRpcService::init_http_server() {
         });
 
     http_server_.set_http_handler<GET>(
-        "/batch_query_keys",
+        "/batch_query_routes",
         [&](coro_http_request& req, coro_http_response& resp) {
             auto keys_view = req.get_query_value("keys");
             std::vector<std::string> keys;
@@ -130,42 +129,10 @@ void P2PMasterRpcService::init_http_server() {
             for (const auto& key : keys) {
                 key_views.push_back(key);
             }
-            auto results = BatchGetReadRoute(key_views);
-            const size_t count = std::min(keys.size(), results.size());
-
-            std::string response{"{\"success\":true,\"data\":{"};
-            response.reserve(count * 512);
-            for (size_t i = 0; i < count; ++i) {
-                if (i > 0) response += ",";
-                response += "\"" + keys[i] + "\":";
-                if (!results[i].has_value()) {
-                    response += "{\"ok\":false,\"error\":\"";
-                    response += toString(results[i].error());
-                    response += "\"}";
-                    continue;
-                }
-
-                response += "{\"ok\":true,\"values\":[";
-                bool first = true;
-                for (const auto& replica : results[i].value().replicas) {
-                    if (!replica.is_memory_replica()) continue;
-                    std::string json;
-                    struct_json::to_json(
-                        replica.get_memory_descriptor().buffer_descriptor,
-                        json);
-                    if (!first) response += ",";
-                    response += json;
-                    first = false;
-                }
-                response += "]}";
-            }
-            response += "}}";
-
-            if (results.size() != keys.size()) {
-                LOG(WARNING)
-                    << "BatchGetReadRoute size mismatch: keys=" << keys.size()
-                    << " results=" << results.size();
-            }
+            const auto results = BatchGetReadRoute(
+                P2PBatchGetReadRouteRequest{.keys = std::move(key_views)});
+            std::string response;
+            struct_json::to_json(results, response);
             resp.set_status_and_content(status_type::ok, std::move(response));
         });
 
@@ -437,22 +404,24 @@ P2PBatchGetWriteRouteResponse P2PMasterRpcService::BatchGetWriteRoute(
 tl::expected<void, ErrorCode> P2PMasterRpcService::PublishRoute(
     const P2PPublishRouteRequest& req) {
     return execute_rpc(
-        "PublishRoute", [&] { return master_service_.AddReplica(req); },
+        "PublishRoute", [&] { return master_service_.PublishRoute(req); },
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
-        [] { P2PMasterMetricManager::instance().inc_add_replica_requests(); },
-        [] { P2PMasterMetricManager::instance().inc_add_replica_failures(); });
+        [] { P2PMasterMetricManager::instance().inc_publish_route_requests(); },
+        [] {
+            P2PMasterMetricManager::instance().inc_publish_route_failures();
+        });
 }
 
 tl::expected<void, ErrorCode> P2PMasterRpcService::WithdrawRoute(
     const P2PWithdrawRouteRequest& req) {
     return execute_rpc(
-        "WithdrawRoute", [&] { return master_service_.RemoveReplica(req); },
+        "WithdrawRoute", [&] { return master_service_.WithdrawRoute(req); },
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
         [] {
-            P2PMasterMetricManager::instance().inc_remove_replica_requests();
+            P2PMasterMetricManager::instance().inc_withdraw_route_requests();
         },
         [] {
-            P2PMasterMetricManager::instance().inc_remove_replica_failures();
+            P2PMasterMetricManager::instance().inc_withdraw_route_failures();
         });
 }
 
@@ -462,10 +431,10 @@ P2PMasterRpcService::BatchWithdrawRoute(
     ScopedVLogTimer timer(1, "BatchWithdrawRoute");
     const size_t total_requests = req.segment_ids.size();
     timer.LogRequest("key=", req.key, "segment_count=", total_requests);
-    P2PMasterMetricManager::instance().inc_batch_remove_replica_requests(
+    P2PMasterMetricManager::instance().inc_batch_withdraw_route_requests(
         total_requests);
 
-    auto results = master_service_.BatchRemoveReplica(req);
+    auto results = master_service_.BatchWithdrawRoute(req);
 
     size_t failure_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
@@ -479,11 +448,11 @@ P2PMasterRpcService::BatchWithdrawRoute(
     }
 
     if (failure_count == total_requests && total_requests > 0) {
-        P2PMasterMetricManager::instance().inc_batch_remove_replica_failures(
+        P2PMasterMetricManager::instance().inc_batch_withdraw_route_failures(
             failure_count);
     } else if (failure_count != 0) {
         P2PMasterMetricManager::instance()
-            .inc_batch_remove_replica_partial_success(failure_count);
+            .inc_batch_withdraw_route_partial_success(failure_count);
     }
 
     timer.LogResponse("total=", results.size(),
@@ -510,12 +479,12 @@ P2PBatchSyncRoutesResponse P2PMasterRpcService::BatchSyncRoutes(
         if (ec != ErrorCode::OK) remove_failures++;
     }
 
-    P2PMasterMetricManager::instance().inc_add_replica_requests(
+    P2PMasterMetricManager::instance().inc_publish_route_requests(
         req.publish_operations.size());
-    P2PMasterMetricManager::instance().inc_add_replica_failures(add_failures);
-    P2PMasterMetricManager::instance().inc_remove_replica_requests(
+    P2PMasterMetricManager::instance().inc_publish_route_failures(add_failures);
+    P2PMasterMetricManager::instance().inc_withdraw_route_requests(
         req.withdraw_operations.size());
-    P2PMasterMetricManager::instance().inc_remove_replica_failures(
+    P2PMasterMetricManager::instance().inc_withdraw_route_failures(
         remove_failures);
     timer.LogResponse("add_failures=", add_failures,
                       ", remove_failures=", remove_failures);
@@ -527,7 +496,7 @@ tl::expected<void, ErrorCode> P2PMasterRpcService::CompleteRouteSync(
     ScopedVLogTimer timer(1, "CompleteRouteSync");
     timer.LogRequest("client_id=", client_id);
 
-    auto result = master_service_.SetSyncCompleted(client_id);
+    auto result = master_service_.CompleteRouteSync(client_id);
     if (!result) {
         LOG(ERROR) << "CompleteRouteSync failed: " << toString(result.error());
     }

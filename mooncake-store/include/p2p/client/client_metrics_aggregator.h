@@ -65,7 +65,7 @@ class ClientMetricsAggregator {
     ylt::metric::gauge_t remote_write_retries_;
 
     // Cluster-wide key retention. The bucket arrays hold the merged
-    // distributions (non-cumulative) over KeyRetentionMetric::LifetimeBuckets()
+    // distributions (non-cumulative) over p2p::metric_util::LifetimeBuckets()
     // and are rendered as histograms at serialize time.
     ylt::metric::gauge_t key_live_count_;
     ylt::metric::gauge_t key_removed_count_;

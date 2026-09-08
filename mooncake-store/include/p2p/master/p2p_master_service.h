@@ -35,7 +35,7 @@ namespace mooncake {
  * 2. P2PClientManager::clients_mutex_
  * 3. P2PSegmentManager::segments_mutex_
  */
-class P2PMasterService {
+class P2PMasterService final {
    public:
     explicit P2PMasterService(const P2PMasterConfig& config,
                               ViewVersionId view_version = 0);
@@ -82,11 +82,10 @@ class P2PMasterService {
                       const P2PReadRouteConfig& config = P2PReadRouteConfig())
         -> tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>;
 
-    auto Remove(std::string_view key, bool force = false)
-        -> tl::expected<void, ErrorCode>;
-    auto RemoveByRegex(std::string_view regex_pattern, bool force = false)
+    auto Remove(std::string_view key) -> tl::expected<void, ErrorCode>;
+    auto RemoveByRegex(std::string_view regex_pattern)
         -> tl::expected<long, ErrorCode>;
-    long RemoveAll(bool force = false);
+    long RemoveAll();
     size_t GetKeyCount() const;
 
     OpLogManager* GetOpLogManager() const { return oplog_manager_.get(); }
@@ -102,21 +101,21 @@ class P2PMasterService {
         -> P2PBatchGetWriteRouteResponse;
 
     /**
-     * @brief Add a route replica to master
+     * @brief Publish a route location to master
      */
-    auto AddReplica(const P2PPublishRouteRequest& req)
+    auto PublishRoute(const P2PPublishRouteRequest& req)
         -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Remove a route replica from master
+     * @brief Withdraw a route location from master
      */
-    auto RemoveReplica(const P2PWithdrawRouteRequest& req)
+    auto WithdrawRoute(const P2PWithdrawRouteRequest& req)
         -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Remove replicas from multiple segments in one call
+     * @brief Withdraw route locations from multiple segments in one call
      */
-    auto BatchRemoveReplica(const P2PBatchWithdrawRouteRequest& req)
+    auto BatchWithdrawRoute(const P2PBatchWithdrawRouteRequest& req)
         -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**
@@ -128,7 +127,7 @@ class P2PMasterService {
     /**
      * @brief Client notifies Master that metadata sync is complete
      */
-    auto SetSyncCompleted(UUID client_id) -> tl::expected<void, ErrorCode>;
+    auto CompleteRouteSync(UUID client_id) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Restore P2P metadata exported by P2PHotStandbyService promotion.
@@ -159,11 +158,11 @@ class P2PMasterService {
     std::vector<P2PRouteDescriptor> FilterRoutes(
         const P2PReadRouteConfig& config, const P2PRouteEntry& route) const;
 
-    auto InnerAddReplica(std::string_view key, const UUID& client_id,
-                         const UUID& segment_id, size_t size,
-                         const std::shared_ptr<P2PClientMeta>& client)
+    auto InnerPublishRoute(std::string_view key, const UUID& client_id,
+                           const UUID& segment_id, size_t size,
+                           const std::shared_ptr<P2PClientMeta>& client)
         -> tl::expected<void, ErrorCode>;
-    auto InnerRemoveReplica(std::string_view key, const UUID& client_id,
+    auto InnerWithdrawRoute(std::string_view key, const UUID& client_id,
                             const UUID& segment_id)
         -> tl::expected<void, ErrorCode>;
 

@@ -1,5 +1,4 @@
-# Tests for the P2P architecture (P2P split, Phase 1). Mirrors add_store_test
-# from tests/CMakeLists.txt; assertions are unchanged, only location moved.
+# P2P client tests use the aggregate until the client facade is split.
 function(add_p2p_store_test name)
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PUBLIC
@@ -16,13 +15,19 @@ function(add_p2p_store_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(add_p2p_master_test name)
+    add_executable(${name} ${ARGN})
+    target_link_libraries(${name} PRIVATE mooncake_p2p_master_core gtest gtest_main)
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
 # master side
-add_p2p_store_test(p2p_route_table_test p2p_route_table_test.cpp)
-add_p2p_store_test(p2p_rpc_types_test p2p_rpc_types_test.cpp)
-add_p2p_store_test(p2p_master_service_test p2p_master_service_test.cpp)
-add_p2p_store_test(p2p_master_http_endpoints_test p2p_master_http_endpoints_test.cpp)
-add_p2p_store_test(p2p_master_metrics_test p2p_master_metrics_test.cpp)
-add_p2p_store_test(p2p_segment_manager_test p2p_segment_manager_test.cpp)
+add_p2p_master_test(p2p_route_table_test p2p_route_table_test.cpp)
+add_p2p_master_test(p2p_rpc_types_test p2p_rpc_types_test.cpp)
+add_p2p_master_test(p2p_master_service_test p2p_master_service_test.cpp)
+add_p2p_master_test(p2p_master_http_endpoints_test p2p_master_http_endpoints_test.cpp)
+add_p2p_master_test(p2p_master_metrics_test p2p_master_metrics_test.cpp)
+add_p2p_master_test(p2p_segment_manager_test p2p_segment_manager_test.cpp)
 
 add_executable(stress_workload_test_p2p stress_workload_test.cpp)
 target_link_libraries(stress_workload_test_p2p PUBLIC
@@ -40,8 +45,8 @@ target_link_libraries(stress_workload_test_p2p PUBLIC
 add_p2p_store_test(p2p_client_integration_test p2p_client_integration_test.cpp)
 add_p2p_store_test(p2p_client_ha_test p2p_client_ha_test.cpp)
 add_p2p_store_test(p2p_client_http_endpoints_test p2p_client_http_endpoints_test.cpp)
-add_p2p_store_test(p2p_client_manager_test p2p_client_manager_test.cpp)
-add_p2p_store_test(p2p_client_meta_test p2p_client_meta_test.cpp)
+add_p2p_master_test(p2p_client_manager_test p2p_client_manager_test.cpp)
+add_p2p_master_test(p2p_client_meta_test p2p_client_meta_test.cpp)
 add_p2p_store_test(p2p_register_concurrency_test p2p_register_concurrency_test.cpp)
 add_p2p_store_test(peer_client_test peer_client_test.cpp)
 add_p2p_store_test(peer_client_perf_test peer_client_perf_test.cpp)

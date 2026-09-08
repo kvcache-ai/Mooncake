@@ -9,9 +9,47 @@
 #include <ylt/struct_pack.hpp>
 
 #include "p2p/common/p2p_rpc_types.h"
+#include "p2p/master/p2p_rpc_service.h"
 
 namespace mooncake {
 namespace {
+
+// Pin retained native RPC method IDs across internal refactors.
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::RegisterClient>() ==
+              554672570u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::UnregisterClient>() ==
+              3195950100u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::Heartbeat>() ==
+              1220160476u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::QueryClientStatus>() ==
+              2240222209u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::MountSegment>() ==
+              1836414514u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::UnmountSegment>() ==
+              1378916896u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::GetReadRoute>() ==
+              4226816141u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::BatchGetReadRoute>() ==
+              1029360511u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::GetWriteRoute>() ==
+              3979753808u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::BatchGetWriteRoute>() ==
+              3935710653u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::PublishRoute>() ==
+              4114711953u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::WithdrawRoute>() ==
+              1498064915u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::BatchWithdrawRoute>() ==
+              1805314735u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::BatchSyncRoutes>() ==
+              3376879306u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::CompleteRouteSync>() ==
+              1587901567u);
+static_assert(coro_rpc::func_id<&P2PMasterRpcService::ServiceReady>() ==
+              1460324940u);
+static_assert(
+    coro_rpc::func_id<&P2PMasterRpcService::HeartbeatServiceReady>() ==
+    1980024971u);
 
 static_assert(std::is_same_v<decltype(P2PGetReadRouteRequest::key),
                              std::string_view>);

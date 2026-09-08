@@ -7,7 +7,6 @@
 #include <tuple>
 #include <unordered_map>
 #include <utility>
-#include <variant>
 
 #include <glog/logging.h>
 
@@ -244,9 +243,8 @@ auto P2PMasterService::GetReadRoute(
     return descriptors;
 }
 
-auto P2PMasterService::Remove(std::string_view key, bool force)
+auto P2PMasterService::Remove(std::string_view key)
     -> tl::expected<void, ErrorCode> {
-    (void)force;
     auto& shard = route_shards_[GetRouteShardIndex(key)];
     SharedMutexLocker lock(&shard.mutex);
     if (!shard.table.RemoveKey(key)) {
@@ -259,9 +257,8 @@ auto P2PMasterService::Remove(std::string_view key, bool force)
     return {};
 }
 
-auto P2PMasterService::RemoveByRegex(std::string_view regex_pattern, bool force)
+auto P2PMasterService::RemoveByRegex(std::string_view regex_pattern)
     -> tl::expected<long, ErrorCode> {
-    (void)force;
     std::regex pattern;
 
     try {
@@ -295,8 +292,7 @@ auto P2PMasterService::RemoveByRegex(std::string_view regex_pattern, bool force)
     return removed_count;
 }
 
-long P2PMasterService::RemoveAll(bool force) {
-    (void)force;
+long P2PMasterService::RemoveAll() {
     size_t removed = 0;
     for (auto& shard : route_shards_) {
         SharedMutexLocker lock(&shard.mutex);
@@ -715,7 +711,7 @@ auto P2PMasterService::BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& re
     return response;
 }
 
-auto P2PMasterService::AddReplica(const P2PPublishRouteRequest& req)
+auto P2PMasterService::PublishRoute(const P2PPublishRouteRequest& req)
     -> tl::expected<void, ErrorCode> {
     auto client = client_manager_->GetClient(req.client_id);
     if (!client) {
@@ -723,11 +719,11 @@ auto P2PMasterService::AddReplica(const P2PPublishRouteRequest& req)
                    << ", client_id: " << req.client_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
-    return InnerAddReplica(req.key, req.client_id, req.segment_id,
-                           req.object_size, client);
+    return InnerPublishRoute(req.key, req.client_id, req.segment_id,
+                             req.object_size, client);
 }
 
-auto P2PMasterService::InnerAddReplica(
+auto P2PMasterService::InnerPublishRoute(
     std::string_view key, const UUID& client_id, const UUID& segment_id,
     size_t size, const std::shared_ptr<P2PClientMeta>& client)
     -> tl::expected<void, ErrorCode> {
@@ -752,7 +748,7 @@ auto P2PMasterService::ApplyPublishLocked(
 
     const P2PRouteLocation location{.client_id = client_id,
                                     .segment_id = segment_id};
-    // AddReplica commits the in-memory route first. OpLog is best-effort;
+    // PublishRoute commits the in-memory route first. OpLog is best-effort;
     // returning an OpLog error could make the client delete its local replica.
     auto mutation = table.Publish(key, size, location, max_client_per_key_);
     if (!mutation.has_value()) {
@@ -775,7 +771,7 @@ auto P2PMasterService::ApplyPublishLocked(
         const auto error = RecordOplog(OpType_PUBLISH_ROUTE, payload.object_key,
                                        SerializeP2PPayload(payload));
         if (error != ErrorCode::OK) {
-            LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
+            LOG(ERROR) << "PublishRoute(P2P): failed to record oplog"
                        << ", client_id=" << client_id
                        << ", segment_id=" << segment_id
                        << ", error=" << toString(error)
@@ -785,12 +781,12 @@ auto P2PMasterService::ApplyPublishLocked(
     return {};
 }
 
-auto P2PMasterService::RemoveReplica(const P2PWithdrawRouteRequest& req)
+auto P2PMasterService::WithdrawRoute(const P2PWithdrawRouteRequest& req)
     -> tl::expected<void, ErrorCode> {
-    return InnerRemoveReplica(req.key, req.client_id, req.segment_id);
+    return InnerWithdrawRoute(req.key, req.client_id, req.segment_id);
 }
 
-auto P2PMasterService::InnerRemoveReplica(std::string_view key,
+auto P2PMasterService::InnerWithdrawRoute(std::string_view key,
                                           const UUID& client_id,
                                           const UUID& segment_id)
     -> tl::expected<void, ErrorCode> {
@@ -816,7 +812,7 @@ auto P2PMasterService::ApplyWithdrawLocked(
             RecordOplog(OpType_WITHDRAW_ROUTE, payload.object_key,
                         SerializeP2PPayload(payload));
         if (error != ErrorCode::OK) {
-            LOG(ERROR) << "RemoveReplica(P2P): failed to record oplog"
+            LOG(ERROR) << "WithdrawRoute(P2P): failed to record oplog"
                        << ", client_id=" << client_id
                        << ", segment_id=" << segment_id
                        << ", error=" << toString(error);
@@ -837,7 +833,8 @@ auto P2PMasterService::ApplyWithdrawLocked(
     return {};
 }
 
-auto P2PMasterService::BatchRemoveReplica(const P2PBatchWithdrawRouteRequest& req)
+auto P2PMasterService::BatchWithdrawRoute(
+    const P2PBatchWithdrawRouteRequest& req)
     -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(req.segment_ids.size());
@@ -944,16 +941,16 @@ auto P2PMasterService::BatchSyncRoutes(
     return response;
 }
 
-auto P2PMasterService::SetSyncCompleted(UUID client_id)
+auto P2PMasterService::CompleteRouteSync(UUID client_id)
     -> tl::expected<void, ErrorCode> {
     auto client = client_manager_->GetClient(client_id);
     if (!client) {
-        LOG(WARNING) << "SetSyncCompleted: client not found"
+        LOG(WARNING) << "CompleteRouteSync: client not found"
                      << ", client_id=" << client_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
     client->SetSyncing(false);
-    LOG(INFO) << "SetSyncCompleted: client_id=" << client_id;
+    LOG(INFO) << "CompleteRouteSync: client_id=" << client_id;
     return {};
 }
 

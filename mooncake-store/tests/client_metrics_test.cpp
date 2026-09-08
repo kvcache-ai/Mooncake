@@ -13,6 +13,7 @@
 
 #include "client_metric.h"
 #include "p2p/client/p2p_client_metric.h"
+#include "p2p/util/metric_util.h"
 #include "p2p/client/tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake::test {
@@ -889,7 +890,7 @@ TEST_F(ClientMetricsTest, TierMetricMovementCountersTest) {
 }
 
 // ============================================================================
-// KeyRetentionMetric::InterpolateQuantiles
+// p2p::metric_util::InterpolateQuantiles
 // ============================================================================
 
 namespace {
@@ -897,8 +898,8 @@ namespace {
 // Alias to keep the golden-value assertions readable.
 int64_t Quantile(const std::vector<double>& boundaries,
                  const std::vector<int64_t>& bucket_counts, double q) {
-    return KeyRetentionMetric::InterpolateQuantiles(boundaries, bucket_counts,
-                                                    {q})[0];
+    return p2p::metric_util::InterpolateQuantiles(boundaries, bucket_counts,
+                                                  {q})[0];
 }
 
 }  // namespace
@@ -934,24 +935,22 @@ TEST(InterpolateQuantilesTest, SkewedDistributionQuantiles) {
 TEST(InterpolateQuantilesTest, ResolvesAllRequestedQuantilesInOrder) {
     const std::vector<double> boundaries = {10, 50, 100};
     const std::vector<int64_t> buckets = {4, 0, 1};
-    const std::vector<int64_t> result =
-        KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets,
-                                                 {0.30, 0.50, 0.80, 0.95});
+    const std::vector<int64_t> result = p2p::metric_util::InterpolateQuantiles(
+        boundaries, buckets, {0.30, 0.50, 0.80, 0.95});
     EXPECT_EQ(result, (std::vector<int64_t>{3, 6, 10, 87}));
 }
 
 TEST(InterpolateQuantilesTest, RejectsUnsortedOrOutOfRangeQuantiles) {
     const std::vector<double> boundaries = {10, 20};
     const std::vector<int64_t> buckets = {1, 2, 3};
-    EXPECT_EQ(KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets,
-                                                       {0.80, 0.50}),
+    EXPECT_EQ(p2p::metric_util::InterpolateQuantiles(boundaries, buckets,
+                                                     {0.80, 0.50}),
               (std::vector<int64_t>{0, 0}));
-    EXPECT_EQ(KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets,
-                                                       {0.0, 0.50}),
+    EXPECT_EQ(p2p::metric_util::InterpolateQuantiles(boundaries, buckets,
+                                                     {0.0, 0.50}),
               (std::vector<int64_t>{0, 0}));
-    EXPECT_TRUE(
-        KeyRetentionMetric::InterpolateQuantiles(boundaries, buckets, {})
-            .empty());
+    EXPECT_TRUE(p2p::metric_util::InterpolateQuantiles(boundaries, buckets, {})
+                    .empty());
 }
 
 // ============================================================================
@@ -969,7 +968,7 @@ int64_t SumBuckets(const std::vector<int64_t>& buckets) {
 }
 
 size_t NumRetentionBuckets() {
-    return KeyRetentionMetric::LifetimeBuckets().size() + 1;
+    return p2p::metric_util::LifetimeBuckets().size() + 1;
 }
 
 }  // namespace
@@ -1107,8 +1106,8 @@ TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
     const std::vector<double> boundaries = {1, 10};
     // Non-cumulative counts: 2 in (0,1], 0 in (1,10], 3 in (10,+Inf).
     std::string out;
-    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "help text", {},
-                                                 boundaries, {2, 0, 3});
+    p2p::metric_util::SerializeBucketHistogram(out, "m", "help text", {},
+                                               boundaries, {2, 0, 3});
     EXPECT_TRUE(out.find("# HELP m help text") != std::string::npos);
     EXPECT_TRUE(out.find("# TYPE m histogram") != std::string::npos);
     // Exposition is cumulative: 2, 2, 5.
@@ -1122,7 +1121,7 @@ TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
 
     // Labels are rendered on every sample.
     out.clear();
-    KeyRetentionMetric::SerializeBucketHistogram(
+    p2p::metric_util::SerializeBucketHistogram(
         out, "m", "h", {{"client", "c1"}}, boundaries, {2, 0, 3});
     EXPECT_TRUE(out.find("m_bucket{client=\"c1\",le=\"1\"} 2") !=
                 std::string::npos);
@@ -1132,22 +1131,22 @@ TEST_F(ClientMetricsTest, SerializeBucketHistogramFormat) {
     // Fractional boundaries keep their significant digits ("2.5", not
     // "2.500000" nor "2").
     out.clear();
-    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {}, {1, 2.5},
-                                                 {1, 1, 1});
+    p2p::metric_util::SerializeBucketHistogram(out, "m", "h", {}, {1, 2.5},
+                                               {1, 1, 1});
     EXPECT_TRUE(out.find("m_bucket{le=\"1\"} 1") != std::string::npos);
     EXPECT_TRUE(out.find("m_bucket{le=\"2.5\"} 2") != std::string::npos);
     EXPECT_TRUE(out.find("m_bucket{le=\"+Inf\"} 3") != std::string::npos);
 
     // Empty distribution emits nothing (consistent with ylt histograms).
     out.clear();
-    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {}, boundaries,
-                                                 {0, 0, 0});
+    p2p::metric_util::SerializeBucketHistogram(out, "m", "h", {}, boundaries,
+                                               {0, 0, 0});
     EXPECT_TRUE(out.empty());
 
     // Malformed bucket arrays are rejected with an error log, no output.
     out.clear();
-    KeyRetentionMetric::SerializeBucketHistogram(out, "m", "h", {}, boundaries,
-                                                 {1, 2});
+    p2p::metric_util::SerializeBucketHistogram(out, "m", "h", {}, boundaries,
+                                               {1, 2});
     EXPECT_TRUE(out.empty());
 }
 

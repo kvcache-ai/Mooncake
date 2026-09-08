@@ -2,7 +2,7 @@
  * @file p2p_master_http_endpoints_test.cpp
  * @brief Integration tests for the P2P master HTTP endpoints
  *        (GET /health, GET /get_key_count, GET /get_all_keys,
- *         GET /batch_query_keys, GET /metrics).
+ *         GET /batch_query_routes, GET /metrics).
  *
  * Brings up an in-process P2PMasterRpcService with the embedded HTTP
  * server bound to a free port (no RPC server)
@@ -35,31 +35,6 @@
 
 namespace mooncake {
 namespace testing {
-
-// Mirrors of the JSON shapes emitted by GET /batch_query_keys (see
-// WrappedMasterService::init_http_server in rpc_service.cpp).
-struct BatchQueryBufferDescriptor {
-    uint64_t size_ = 0;
-    uint64_t buffer_address_ = 0;
-    std::string protocol_;
-    std::string transport_endpoint_;
-    YLT_REFL(BatchQueryBufferDescriptor, size_, buffer_address_, protocol_,
-             transport_endpoint_);
-};
-
-struct BatchQueryKeyResult {
-    bool ok = false;
-    std::string error;
-    std::vector<BatchQueryBufferDescriptor> values;
-    YLT_REFL(BatchQueryKeyResult, ok, error, values);
-};
-
-struct BatchQueryResponse {
-    bool success = false;
-    std::string error;
-    std::unordered_map<std::string, BatchQueryKeyResult> data;
-    YLT_REFL(BatchQueryResponse, success, error, data);
-};
 
 class P2PMasterHttpEndpointsTest : public ::testing::Test {
    protected:
@@ -182,7 +157,7 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         req.segment_id = segment_id;
         auto res = wrapped_->PublishRoute(req);
         ASSERT_TRUE(res.has_value())
-            << "AddReplica failed for " << key << ": " << res.error();
+            << "PublishRoute failed for " << key << ": " << res.error();
     }
 
     static void RemoveKey(const std::string& key, const UUID& segment_id) {
@@ -192,7 +167,7 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         req.segment_id = segment_id;
         auto res = wrapped_->WithdrawRoute(req);
         ASSERT_TRUE(res.has_value())
-            << "RemoveReplica failed for " << key << ": " << res.error();
+            << "WithdrawRoute failed for " << key << ": " << res.error();
     }
 
     // ---- Prometheus text-format helpers ----------------------------------
@@ -342,15 +317,24 @@ TEST_F(P2PMasterHttpEndpointsTest,
                         "," + key1 + "," + missing_key);
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
 
-    EXPECT_NE(resp.resp_body.find("\"object_size\":1024"),
-              std::string::npos);
-    EXPECT_NE(resp.resp_body.find("\"object_size\":2048"),
-              std::string::npos);
-    const std::string expected_errors =
-        "\"error_codes\":[0,0," +
-        std::to_string(toInt(ErrorCode::OBJECT_NOT_FOUND)) + "]";
-    EXPECT_NE(resp.resp_body.find(expected_errors), std::string::npos)
-        << "body=" << resp.resp_body;
+    const auto body =
+        ParseJson<P2PBatchGetReadRouteResponse>(resp.resp_body, "batch routes");
+    ASSERT_EQ(body.responses.size(), 3u);
+    ASSERT_EQ(body.error_codes.size(), 3u);
+    EXPECT_EQ(body.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
+                                      ErrorCode::OBJECT_NOT_FOUND}));
+    ASSERT_EQ(body.responses[0].size(), 1u);
+    ASSERT_EQ(body.responses[1].size(), 1u);
+    EXPECT_TRUE(body.responses[2].empty());
+    const auto& route = body.responses[0][0];
+    EXPECT_EQ(route.client_id, client_id_);
+    EXPECT_EQ(route.segment_id, segment_id_a_);
+    EXPECT_EQ(route.ip_address, "127.0.0.1");
+    EXPECT_EQ(route.rpc_port, 50051);
+    EXPECT_EQ(route.object_size, 1024u);
+    EXPECT_EQ(body.responses[1][0].segment_id, segment_id_b_);
+    EXPECT_EQ(body.responses[1][0].object_size, 2048u);
 
     RemoveKey(key0, segment_id_a_);
     RemoveKey(key1, segment_id_b_);
@@ -361,13 +345,40 @@ TEST_F(P2PMasterHttpEndpointsTest,
                 key1);
     ASSERT_EQ(resp_after_remove.status, 200)
         << "body=" << resp_after_remove.resp_body;
-    const auto missing_code =
-        std::to_string(toInt(ErrorCode::OBJECT_NOT_FOUND));
-    EXPECT_NE(resp_after_remove.resp_body.find(
-                  "\"error_codes\":[" + missing_code + "," + missing_code +
-                  "]"),
-              std::string::npos)
-        << "body=" << resp_after_remove.resp_body;
+    const auto removed = ParseJson<P2PBatchGetReadRouteResponse>(
+        resp_after_remove.resp_body, "removed routes");
+    ASSERT_EQ(removed.responses.size(), 2u);
+    EXPECT_TRUE(removed.responses[0].empty());
+    EXPECT_TRUE(removed.responses[1].empty());
+    EXPECT_EQ(removed.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OBJECT_NOT_FOUND,
+                                      ErrorCode::OBJECT_NOT_FOUND}));
+}
+
+TEST_F(P2PMasterHttpEndpointsTest,
+       BatchQueryRoutesPreservesDuplicatePositions) {
+    const std::string key = "batchquery_duplicate";
+    AddKey(key, 1024, segment_id_a_);
+    const auto response =
+        HttpGet(http_base_url_ + "/batch_query_routes?keys=" + key + "," + key);
+    ASSERT_EQ(response.status, 200);
+    const auto body = ParseJson<P2PBatchGetReadRouteResponse>(
+        response.resp_body, "duplicate routes");
+    ASSERT_EQ(body.responses.size(), 2u);
+    ASSERT_EQ(body.error_codes.size(), 2u);
+    EXPECT_EQ(body.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK}));
+    for (const auto& routes : body.responses) {
+        ASSERT_EQ(routes.size(), 1u);
+        EXPECT_EQ(routes[0].segment_id, segment_id_a_);
+    }
+    RemoveKey(key, segment_id_a_);
+}
+
+TEST_F(P2PMasterHttpEndpointsTest, CentralizedBatchQueryEndpointIsAbsent) {
+    const auto response =
+        HttpGet(http_base_url_ + "/batch_query_keys?keys=key");
+    EXPECT_EQ(response.status, 404);
 }
 
 TEST_F(P2PMasterHttpEndpointsTest, BatchQueryRoutesRejectsEmptyKeyList) {

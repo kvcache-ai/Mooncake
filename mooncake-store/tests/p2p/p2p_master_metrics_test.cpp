@@ -35,8 +35,8 @@ TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     metrics.inc_get_read_route_by_regex_requests();
     metrics.inc_batch_get_read_route_requests(3);
     metrics.inc_get_write_route_requests();
-    metrics.inc_add_replica_requests(2);
-    metrics.inc_batch_remove_replica_requests(5);
+    metrics.inc_publish_route_requests(2);
+    metrics.inc_batch_withdraw_route_requests(5);
     metrics.inc_batch_get_write_route_requests(7);
     metrics.inc_batch_get_write_route_partial_success(2);
     EXPECT_EQ(metrics.get_get_read_route_requests(), 1);
@@ -44,9 +44,9 @@ TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     EXPECT_EQ(metrics.get_batch_get_read_route_requests(), 1);
     EXPECT_EQ(metrics.get_batch_get_read_route_items(), 3);
     EXPECT_EQ(metrics.get_get_write_route_requests(), 1);
-    EXPECT_EQ(metrics.get_add_replica_requests(), 2);
-    EXPECT_EQ(metrics.get_batch_remove_replica_requests(), 1);
-    EXPECT_EQ(metrics.get_batch_remove_replica_items(), 5);
+    EXPECT_EQ(metrics.get_publish_route_requests(), 2);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_requests(), 1);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_items(), 5);
     EXPECT_EQ(metrics.get_batch_get_write_route_requests(), 1);
     EXPECT_EQ(metrics.get_batch_get_write_route_items(), 7);
     EXPECT_EQ(metrics.get_batch_get_write_route_partial_successes(), 1);
@@ -57,9 +57,9 @@ TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     EXPECT_EQ(metrics.get_get_read_route_by_regex_requests(), 0);
     EXPECT_EQ(metrics.get_batch_get_read_route_items(), 0);
     EXPECT_EQ(metrics.get_get_write_route_requests(), 0);
-    EXPECT_EQ(metrics.get_add_replica_requests(), 0);
-    EXPECT_EQ(metrics.get_batch_remove_replica_requests(), 0);
-    EXPECT_EQ(metrics.get_batch_remove_replica_items(), 0);
+    EXPECT_EQ(metrics.get_publish_route_requests(), 0);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_requests(), 0);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_items(), 0);
     EXPECT_EQ(metrics.get_batch_get_write_route_items(), 0);
     EXPECT_EQ(metrics.get_batch_get_write_route_failed_items(), 0);
     // Shared metrics must still be reachable through the same instance.
@@ -105,6 +105,13 @@ TEST_F(P2PMasterMetricsTest, SerializeMetricsContentTest) {
     EXPECT_NE(text.find("master_batch_get_write_route_failed_items_total"),
               std::string::npos);
 
+    EXPECT_NE(text.find("master_remove_requests_total"), std::string::npos);
+    EXPECT_NE(text.find("master_remove_by_regex_requests_total"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_remove_all_requests_total"), std::string::npos);
+    EXPECT_NE(text.find("master_batch_query_ip_requests_total"),
+              std::string::npos);
+
     EXPECT_EQ(text.find("master_put_start_requests_total"), std::string::npos);
     EXPECT_EQ(text.find("master_attempted_evictions_total"), std::string::npos);
     EXPECT_EQ(text.find("master_copy_start_requests_total"), std::string::npos);
@@ -121,10 +128,10 @@ TEST_F(P2PMasterMetricsTest, SummaryArchTagTest) {
     EXPECT_NE(summary.find("GetReadRoute="), std::string::npos);
     EXPECT_NE(summary.find("GetReadRoute:(Req="), std::string::npos);
     EXPECT_NE(summary.find("GetWriteRoute="), std::string::npos);
-    EXPECT_NE(summary.find("AddReplica="), std::string::npos);
-    EXPECT_NE(summary.find("RemoveReplica="), std::string::npos);
+    EXPECT_NE(summary.find("PublishRoute="), std::string::npos);
+    EXPECT_NE(summary.find("WithdrawRoute="), std::string::npos);
     EXPECT_NE(summary.find("GetWriteRoute:(Req="), std::string::npos);
-    EXPECT_NE(summary.find("RemoveReplica:(Req="), std::string::npos);
+    EXPECT_NE(summary.find("WithdrawRoute:(Req="), std::string::npos);
 }
 
 TEST_F(P2PMasterMetricsTest, ResetClearsClusterMetrics) {
