@@ -2194,12 +2194,17 @@ PYBIND11_MODULE(store, m) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return real_client->setup_real(
-                    local_hostname, metadata_server, global_segment_size,
-                    local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port);
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = real_client->setup_real(
+                        local_hostname, metadata_server, global_segment_size,
+                        local_buffer_size, protocol, rdma_devices,
+                        master_server_addr, transfer_engine, "",
+                        enable_ssd_offload, ssd_offload_path, tenant_id,
+                        enable_client_http_server, client_http_port);
+                }
+                return ret;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2222,9 +2227,14 @@ PYBIND11_MODULE(store, m) {
                     config[key] = value;
                 }
 
-                auto result = real_client->setup_internal(config);
-                return result.has_value() ? 0
-                                          : static_cast<int>(result.error());
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    auto result = real_client->setup_internal(config);
+                    ret = result.has_value() ? 0
+                                             : static_cast<int>(result.error());
+                }
+                return ret;
             },
             py::arg("config"),
             "Setup the store with a configuration dictionary.\n"
