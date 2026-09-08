@@ -79,6 +79,7 @@ RdmaEndPoint::RdmaEndPoint()
     : status_(EP_UNINIT),
       context_(nullptr),
       params_(nullptr),
+      queue_lock_list_(nullptr),
       wr_depth_list_(nullptr),
       inflight_slices_(0),
       destroy_start_time_(0) {}
@@ -119,6 +120,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     // Value-initialize the full array because cleanup may run after only a
     // prefix of QPs has been created.
     wr_depth_list_ = new WrDepthBlock[total_qp]();
+    queue_lock_list_ = new TicketLock[total_qp];
 
     for (int i = 0; i < total_qp; ++i) {
         wr_depth_list_[i].value.store(0, std::memory_order_relaxed);
@@ -294,6 +296,8 @@ int RdmaEndPoint::deconstructUnlocked() {
     if (all_qps_destroyed) {
         qp_list_.clear();
         slice_queue_.clear();
+        delete[] queue_lock_list_;
+        queue_lock_list_ = nullptr;
         delete[] wr_depth_list_;
         wr_depth_list_ = nullptr;
     }
@@ -815,23 +819,29 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         sge_idx += wr.num_sge;
     }
 
-    int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+    int rc = 0;
+    {
+        // The queue mirrors the QP's posting order, so posting and
+        // enqueueing must not interleave with another lane's post or
+        // acknowledge on this QP.
+        std::lock_guard<TicketLock> qp_guard(queue_lock_list_[qp_index]);
+        rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
+        if (rc) {
+            while (bad_wr) {
+                slice_list[bad_wr - wr_list.data()]->failed = true;
+                cancelQuota(qp_index, 1);
+                bad_wr = bad_wr->next;
+            }
+        }
+        auto& queue = slice_queue_[qp_index];
+        for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
+            auto current = slice_list[wr_idx];
+            if (!current->failed) queue.push(current);
+        }
+    }
     if (rc) {
         LOG(ERROR) << "ibv_post_send: " << strerror(abs(rc)) << " [" << rc
                    << "]";
-        while (bad_wr) {
-            slice_list[bad_wr - wr_list.data()]->failed = true;
-            cancelQuota(qp_index, 1);
-            bad_wr = bad_wr->next;
-        }
-    }
-
-    auto& queue = slice_queue_[qp_index];
-    for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
-        auto current = slice_list[wr_idx];
-        if (!current->failed) {
-            queue.push(current);
-        }
     }
     return wr_count;
 }
@@ -874,6 +884,9 @@ size_t RdmaEndPoint::acknowledge(
     RWSpinlock::ReadGuard guard(lock_);
     auto qp_index = slice->qp_index;
     if (qp_index < 0 || qp_index >= (int)slice_queue_.size()) return 0;
+    // Everything below, on_each and updateSliceStatus included, runs under
+    // the QP lock: keep the callbacks cheap and free of endpoint re-entry.
+    std::lock_guard<TicketLock> qp_guard(queue_lock_list_[qp_index]);
     auto& queue = slice_queue_[qp_index];
     if (!queue.contains(slice)) return 0;
     int num_entries = 0;
