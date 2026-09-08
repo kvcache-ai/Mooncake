@@ -341,6 +341,10 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -385,6 +389,11 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
@@ -433,7 +442,14 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
         }());
 }
 
-MasterClient::~MasterClient() = default;
+MasterClient::~MasterClient() {
+    // Never release the pool under a suspended request coroutine (#3909).
+    // 30s is generous: every request carries its own RPC timeout.
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "MasterClient teardown: RPCs still in flight after "
+                      "30s drain; releasing the pool regardless";
+    }
+}
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");

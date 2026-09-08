@@ -88,6 +88,7 @@ class MasterClient {
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~MasterClient();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
@@ -697,6 +698,7 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     RpcClientPool client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;

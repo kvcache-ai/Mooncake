@@ -51,7 +51,11 @@ TEST(RpcClientIoContextPoolTest, ReplacesPoolWhenTargetChanges) {
     auto second = pools.GetOrCreateClientPool("127.0.0.1:10002");
     EXPECT_NE(first, second);
     first.reset();
-    EXPECT_TRUE(old_pool.expired());
+    // Pools live in the process-wide registry by design: a ylt pool owns
+    // background reconnect coroutines that reference pool storage, so freeing
+    // one mid-retry is a use-after-free regardless of request draining
+    // (#3909). Switching address only re-points the holder.
+    EXPECT_FALSE(old_pool.expired());
     EXPECT_EQ(pools.GetClientPool(), second);
 }
 
@@ -92,6 +96,40 @@ TEST(RpcClientIoContextPoolTest, SendsToNewAddressAfterSwitch) {
 
     first_server.stop();
     second_server.stop();
+}
+
+TEST(RpcClientIoContextPoolTest, RegistryKeepsFirstConfigForSameAddress) {
+    const std::string address = "127.0.0.1:59998";
+    RpcClientPool first(GetFirstTestRpcClientIoContextPool());
+    auto first_pool = first.GetOrCreateClientPool(address);
+
+    RpcClientPool::PoolConfig different;
+    different.max_connection = 7;
+    different.client_config.connect_timeout_duration =
+        std::chrono::milliseconds(1234);
+    different.client_config.request_timeout_duration =
+        std::chrono::milliseconds(5678);
+    RpcClientPool second(GetFirstTestRpcClientIoContextPool(), different);
+    auto second_pool = second.GetOrCreateClientPool(address);
+
+    // First configuration wins: the registry hands back the original pool
+    // (with a warning) instead of silently applying the second config.
+    EXPECT_EQ(first_pool.get(), second_pool.get());
+}
+
+TEST(RpcClientIoContextPoolTest, KeepClientPoolsAliveRetainsCollection) {
+    using Pools = coro_io::client_pools<coro_rpc::coro_rpc_client>;
+    std::weak_ptr<Pools> weak;
+    {
+        auto pools = std::make_shared<Pools>(
+            coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config{},
+            GetFirstTestRpcClientIoContextPool());
+        weak = pools;
+        detail::KeepClientPoolsAlive(std::move(pools));
+    }
+    // The collection must outlive its owner (#3909/#3943): pools inside host
+    // reconnect coroutines that reference pool storage past teardown.
+    EXPECT_FALSE(weak.expired());
 }
 
 }  // namespace
