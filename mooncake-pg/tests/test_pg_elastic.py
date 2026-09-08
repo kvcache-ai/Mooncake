@@ -864,6 +864,7 @@ def _run_p2p_ping_pong(
 
 def _recovery_p2p_worker(
     ctx: MooncakePGWorkerContext,
+    pre_failure_barrier: mp.Barrier,
     broken_exited: mp.Event,
     start_recovery: mp.Event,
     graceful_group_destroy: bool,
@@ -875,6 +876,11 @@ def _recovery_p2p_worker(
         device = ctx.init_group(rank=logical_rank)
         backend = ctx.get_backend()
         _run_p2p_ping_pong(ctx, device, logical_rank)
+        # Local completion does not mean the peer has consumed its final ack.
+        # Finish the healthy round on both ranks before changing the group epoch
+        # or exiting, so failure injection cannot invalidate that exchange.
+        ctx.synchronize()
+        pre_failure_barrier.wait(timeout=30.0)
 
         if logical_rank == BROKEN_RANK:
             if graceful_group_destroy:
@@ -1283,11 +1289,13 @@ class _ElasticMixin:
     def _run_recovery_p2p(self, graceful_group_destroy: bool) -> None:
         recovery_world_size = 2
         spawn_ctx = mp.get_context("spawn")
+        pre_failure_barrier = spawn_ctx.Barrier(recovery_world_size)
         broken_exited = spawn_ctx.Event()
         start_recovery = spawn_ctx.Event()
 
         rows = self.spawn_backend_and_collect(
             _recovery_p2p_worker,
+            pre_failure_barrier,
             broken_exited,
             start_recovery,
             graceful_group_destroy,
