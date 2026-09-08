@@ -16,6 +16,9 @@ struct HostProxyCommandSlot;
 // The caller decides how lanes map to its work.
 inline constexpr uint32_t kTransferLaneCount = 32;
 
+// Drain timeout for device recovery and host-side shutdown.
+inline constexpr uint64_t kTransferDrainTimeoutMs = 5000;
+
 enum class DeviceRouteKind : uint32_t {
     Unreachable = 0,
     P2p = 1,
@@ -104,7 +107,6 @@ struct DeviceTransferHandle {
     DeviceLocalRegion local_staging_region;
     DeviceRouteContext route_context;             // Per device.
     const DeviceTransferRoute* routes = nullptr;  // One entry per peer.
-    uint64_t* lane_results = nullptr;             // One result per lane.
     uint64_t drain_timeout_ticks = 0;
 
     uint32_t max_world_size = 0;

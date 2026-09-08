@@ -28,6 +28,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -387,6 +388,62 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int recreateQueuePairs(void* stream_ptr) override {
         destroyQueuePairs();
         return createQueuePairs(stream_ptr);
+    }
+
+    int drainQueuePairs(void* stream_ptr, uint64_t timeout_ms) override {
+        if (qps_.empty()) return 0;
+        auto stream = static_cast<cudaStream_t>(stream_ptr);
+        std::vector<mlx5gda_qp_devctx> devctxs(qps_.size());
+        auto result =
+            cudaMemcpyAsync(devctxs.data(), qp_devctxs_,
+                            devctxs.size() * sizeof(mlx5gda_qp_devctx),
+                            cudaMemcpyDeviceToHost, stream);
+        if (result == cudaSuccess) result = cudaStreamSynchronize(stream);
+        if (result != cudaSuccess) return -1;
+
+        const bool host_cq =
+            ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
+            ctrl_buf_mode_ == ControlMemoryMode::kPerQpGpuVaHostMappedCq;
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(timeout_ms);
+        int status = 0;
+        for (size_t i = 0; i < devctxs.size(); ++i) {
+            const auto& qp = devctxs[i];
+            if (qp.wq_head == qp.wq_tail) continue;
+            const uint16_t expect = static_cast<uint16_t>(qp.wq_head - 1);
+            while (true) {
+                mlx5_cqe64 completion{};
+                if (host_cq) {
+                    const auto* cq = static_cast<volatile mlx5_cqe64*>(
+                        qps_[i]->send_cq->cq_buf);
+                    completion.wqe_counter = cq->wqe_counter;
+                    completion.op_own = cq->op_own;
+                } else {
+                    result = cudaMemcpyAsync(
+                        &completion, qps_[i]->send_cq->dev_cq_buf,
+                        sizeof(completion), cudaMemcpyDeviceToHost, stream);
+                    if (result == cudaSuccess)
+                        result = cudaStreamSynchronize(stream);
+                    if (result != cudaSuccess) return -1;
+                }
+
+                const uint8_t opcode = completion.op_own >> 4;
+                if (opcode != 0x0 && opcode != 0xF) {
+                    LOG(WARNING)
+                        << "[EP IBGDA] QP " << i << " drain failed: CQE opcode="
+                        << static_cast<unsigned>(opcode);
+                    status = -1;
+                    break;
+                }
+                const uint16_t tail = ntohs(completion.wqe_counter) + 1;
+                if (static_cast<int16_t>(tail - expect) > 0) break;
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    LOG(WARNING) << "[EP IBGDA] QP " << i << " drain timed out";
+                    return -1;
+                }
+            }
+        }
+        return status;
     }
 
     int resetQueuePairs(int qp_offset, int num_qps, void* stream_ptr) override {

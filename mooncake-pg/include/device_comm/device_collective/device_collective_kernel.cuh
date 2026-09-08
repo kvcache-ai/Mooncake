@@ -178,11 +178,11 @@ __device__ __noinline__ void completeChannel(
         const uint32_t previous_arrival_count =
             completion_arrival_count.fetch_add(1, cuda::memory_order_acq_rel);
         if (previous_arrival_count + 1 == gridDim.x) {
-            // All channels have stopped submitting. Drain on this thread
-            // before recovery or kernel exit can make their buffers reusable.
-            drain_transfers();
-
             if (failure_latched.load(cuda::memory_order_relaxed) != 0) {
+                // A failed channel may leave payload transfers outstanding.
+                // Drain before recovery can replace protocol state.
+                drain_transfers();
+
                 const uint64_t generation =
                     device::mc_ld_acquire_u64(
                         &control_mailbox->failure_generation) +

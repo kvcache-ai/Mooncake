@@ -21,8 +21,6 @@
 namespace mooncake {
 namespace {
 
-constexpr uint64_t kDrainTimeoutMs = 5000;
-
 const char* routeKindName(DeviceRouteKind kind) {
     switch (kind) {
         case DeviceRouteKind::Unreachable:
@@ -91,14 +89,12 @@ struct DeviceTransferService::DeviceState {
         void* allocation = nullptr;
         DeviceTransferHandle* handle = nullptr;
         DeviceTransferRoute* routes = nullptr;
-        uint64_t* lane_results = nullptr;
     };
 
     struct DeviceMetadataLayout {
         uint64_t size = 0;
         uint64_t handle_offset = 0;
         uint64_t routes_offset = 0;
-        uint64_t lane_results_offset = 0;
 
         static DeviceMetadataLayout make(uint32_t max_world_size);
 
@@ -160,9 +156,8 @@ struct DeviceTransferService::DeviceState {
         state->endpoints.resize(max_world_size);
         state->endpoints[self_rank] = state->local_endpoint;
 
-        // Route selection and lane results are local device metadata, not
-        // remotely addressed memory, so keep them outside the registered
-        // region.
+        // These are local device metadata, not remotely addressed memory, so
+        // keep them outside the registered region.
         const auto layout = DeviceMetadataLayout::make(max_world_size);
         void* metadata_allocation = nullptr;
         PG_TRY_CUDA(cudaMalloc(&metadata_allocation, layout.size));
@@ -199,8 +194,7 @@ struct DeviceTransferService::DeviceState {
             .local_staging_region = {},
             .route_context = state->deviceRouteContext(),
             .routes = state->device_metadata.routes,
-            .lane_results = state->device_metadata.lane_results,
-            .drain_timeout_ticks = kDrainTimeoutMs * clock_rate_khz,
+            .drain_timeout_ticks = kTransferDrainTimeoutMs * clock_rate_khz,
             .max_world_size = max_world_size,
         };
         PG_TRY_CUDA(cudaMemcpy(state->device_metadata.handle, &handle_image,
@@ -419,6 +413,9 @@ struct DeviceTransferService::DeviceState {
         if (shutdown_requested_) return {};
 
         PG_TRY(auto device_guard, GpuDeviceGuard::create(device_index));
+        // Kernel completion permits payload reuse but need not empty transport
+        // queues. Stop their remaining work before releasing registered memory.
+        for (auto* provider : route_providers) PG_TRY(provider->shutdown());
         if (local_staging_region) {
             PG_TRY(unregisterRegion(DeviceRegionKind::LocalStaging,
                                     *local_staging_region));
@@ -432,7 +429,6 @@ struct DeviceTransferService::DeviceState {
             peer_accessible_region_registered = false;
         }
         PG_TRY(peer_accessible_region.release());
-        for (auto* provider : route_providers) PG_TRY(provider->shutdown());
 
         if (host_route_image) {
             const auto result = cudaFreeHost(host_route_image);
@@ -472,7 +468,7 @@ struct DeviceTransferService::DeviceState {
     std::unique_ptr<P2pRoute> p2p_route;
     std::unique_ptr<RdmaRoute> rdma_route;
     std::unique_ptr<HostProxyRoute> host_proxy_route;
-    // Selection order is policy order: direct P2P, device RDMA, host fallback.
+    // Selection follows provider order: direct P2P, device RDMA, host fallback.
     std::vector<RouteProvider*> route_providers;
     DeviceMetadata device_metadata;
     // Pinned host image copied into device_metadata.routes.
@@ -492,8 +488,6 @@ DeviceTransferService::DeviceState::DeviceMetadataLayout::make(
     layout.handle_offset = reserveLayoutItems<DeviceTransferHandle>(cursor);
     layout.routes_offset =
         reserveLayoutItems<DeviceTransferRoute>(cursor, max_world_size);
-    layout.lane_results_offset =
-        reserveLayoutItems<uint64_t>(cursor, kTransferLaneCount);
     layout.size = cursor;
     return layout;
 }
@@ -506,8 +500,6 @@ DeviceTransferService::DeviceState::DeviceMetadataLayout::bind(
         .handle =
             layoutItemsAt<DeviceTransferHandle>(allocation, handle_offset),
         .routes = layoutItemsAt<DeviceTransferRoute>(allocation, routes_offset),
-        .lane_results =
-            layoutItemsAt<uint64_t>(allocation, lane_results_offset),
     };
 }
 

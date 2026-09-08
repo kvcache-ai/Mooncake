@@ -21,32 +21,24 @@ class HostProxyTransferTicket {
 
     __device__ __forceinline__ HostProxyTransferTicket() = default;
 
-    __device__ __forceinline__ explicit HostProxyTransferTicket(
-        uint64_t* wait_result)
-        : wait_result_(wait_result) {}
-
     __device__ __forceinline__ HostProxyTransferTicket(
         State state, HostProxyCommandSlot* slot, uint64_t expected_sequence,
-        uint64_t start_ticks, uint64_t timeout_ticks, uint64_t* wait_result)
+        uint64_t start_ticks, uint64_t timeout_ticks)
         : state_(state),
           slot_(slot),
           expected_sequence_(expected_sequence),
           start_ticks_(start_ticks),
-          timeout_ticks_(timeout_ticks),
-          wait_result_(wait_result) {}
+          timeout_ticks_(timeout_ticks) {}
 
     // Every thread in the lane CTA must enter wait() together.
     __device__ __forceinline__ TransferResult
     wait(cooperative_groups::thread_block block) const {
-        PG_DEVICE_ASSERT(wait_result_);
-
+        __shared__ TransferResult block_wait_result;
         if (block.thread_rank() == 0) {
-            device::mc_st_release_u64(wait_result_,
-                                      static_cast<uint64_t>(waitLeader()));
+            block_wait_result = waitLeader();
         }
         block.sync();
-        const auto result = static_cast<TransferResult>(
-            device::mc_ld_acquire_u64(wait_result_));
+        const auto result = block_wait_result;
         block.sync();
         return result;
     }
@@ -59,7 +51,6 @@ class HostProxyTransferTicket {
     uint64_t expected_sequence_ = 0;
     uint64_t start_ticks_ = 0;
     uint64_t timeout_ticks_ = 0;
-    uint64_t* wait_result_ = nullptr;
 };
 
 __device__ __forceinline__ bool hostProxyTimedOut(uint64_t start,
@@ -76,25 +67,22 @@ __device__ __forceinline__ void publishHostProxyCommand(
     device::mc_st_release_u64(&slot.submitted_sequence, sequence);
 }
 
-static __device__ __noinline__ HostProxyTransferTicket
-hostProxyPut(const DeviceHostProxyRoute& route,
-             const DeviceHostProxyContext& context, GlobalRank target_rank,
-             const void* source, uint64_t remote_payload_offset, uint64_t size,
-             const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
-             uint64_t* wait_result, cooperative_groups::thread_block block) {
-    HostProxyTransferTicket ticket(wait_result);
-
+static __device__ __noinline__ HostProxyTransferTicket hostProxyPut(
+    const DeviceHostProxyRoute& route, const DeviceHostProxyContext& context,
+    GlobalRank target_rank, const void* source, uint64_t remote_payload_offset,
+    uint64_t size, const SignalAction& signal, uint64_t timeout_ticks,
+    uint32_t lane, cooperative_groups::thread_block block) {
     // Every producer publishes its source writes to system scope before the
     // leader hands the device address to the host worker.
     __threadfence_system();
     block.sync();
 
-    // Submission is leader-only. Other threads only carry wait_result; wait()
-    // reads the leader's private ticket state and broadcasts its result.
-    if (block.thread_rank() != 0) return ticket;
+    // Only the leader submits; wait() broadcasts the result from its private
+    // ticket state to the CTA.
+    if (block.thread_rank() != 0) return {};
 
     PG_DEVICE_ASSERT(context.command_slots && lane < kTransferLaneCount &&
-                     route.remote_region_address != 0 && wait_result);
+                     route.remote_region_address != 0);
     auto* const slot = context.command_slots + lane;
     const uint64_t start_ticks = clock64();
 
@@ -105,7 +93,7 @@ hostProxyPut(const DeviceHostProxyRoute& route,
             device::mc_ld_acquire_u64(&slot->completed_sequence);
         if (completed == submitted) break;
         PG_DEVICE_ASSERT(completed < submitted);
-        if (hostProxyTimedOut(start_ticks, timeout_ticks)) return ticket;
+        if (hostProxyTimedOut(start_ticks, timeout_ticks)) return {};
     }
     PG_DEVICE_ASSERT(submitted != UINT64_MAX);
 
@@ -119,19 +107,16 @@ hostProxyPut(const DeviceHostProxyRoute& route,
     command.target_rank = target_rank;
     publishHostProxyCommand(*slot, command, sequence);
     return HostProxyTransferTicket(HostProxyTransferTicket::State::Submitted,
-                                   slot, sequence, start_ticks, timeout_ticks,
-                                   wait_result);
+                                   slot, sequence, start_ticks, timeout_ticks);
 }
 
 __device__ __forceinline__ HostProxyTransferTicket hostProxySignal(
     const DeviceHostProxyRoute& route, const DeviceHostProxyContext& context,
     GlobalRank target_rank, const SignalAction& signal, uint64_t timeout_ticks,
-    uint32_t lane, uint64_t* wait_result,
-    cooperative_groups::thread_block block) {
+    uint32_t lane, cooperative_groups::thread_block block) {
     return hostProxyPut(route, context, target_rank,
                         /*source=*/nullptr, /*remote_payload_offset=*/0,
-                        /*size=*/0, signal, timeout_ticks, lane, wait_result,
-                        block);
+                        /*size=*/0, signal, timeout_ticks, lane, block);
 }
 
 __device__ __forceinline__ TransferResult

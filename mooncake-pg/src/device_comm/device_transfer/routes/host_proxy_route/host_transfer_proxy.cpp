@@ -479,10 +479,23 @@ PGResult<HostProxyCommandSlot*> HostTransferProxy::initializeDevice(
 
 PGResult<void> HostTransferProxy::shutdown() {
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if (shutdown_requested_) return {};
-        PG_VALIDATE_STATE(lanesIdle(),
-                          "HostTransferProxy still has in-flight commands");
+        // Keep the worker running until those commands finish before freeing
+        // its slots or unregistering any DTS memory.
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(kTransferDrainTimeoutMs);
+        while (!lanesIdle()) {
+            PG_VALIDATE_STATE(!terminated_with_error_,
+                              "HostTransferProxy worker has failed");
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return makePGError(PGErrorCode::Timeout,
+                                   "HostTransferProxy still has in-flight "
+                                   "commands at shutdown");
+            }
+            state_changed_.wait_for(lock, kWorkerPollInterval);
+        }
         shutdown_requested_ = true;
     }
     stopWorker();

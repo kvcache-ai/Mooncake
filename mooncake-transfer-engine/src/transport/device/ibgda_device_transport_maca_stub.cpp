@@ -11,6 +11,7 @@ class NullRdmaTransport : public RdmaTransport {
     int allocateControlBuffer() override { return -1; }
     int createQueuePairs(void*) override { return -1; }
     int recreateQueuePairs(void*) override { return -1; }
+    int drainQueuePairs(void*, uint64_t) override { return -1; }
     int resetQueuePairs(int, int, void*) override { return -1; }
     int connectPeers(int, bool, uint32_t, const std::vector<int64_t>&,
                      const std::vector<int32_t>&, const std::vector<int32_t>&,

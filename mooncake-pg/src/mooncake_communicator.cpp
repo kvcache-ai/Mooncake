@@ -53,8 +53,8 @@ PGResult<void> applyRouteDisableEnvironment(const char* variable,
     return {};
 }
 
-PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment(
-    DeviceRouteConfig config) {
+PGResult<DeviceRouteConfig> loadDeviceRouteConfigFromEnvironment() {
+    DeviceRouteConfig config;
     PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_P2P_ROUTE",
                                         config.p2p.enabled));
     PG_TRY(applyRouteDisableEnvironment("MOONCAKE_PG_DISABLE_RDMA_ROUTE",
@@ -204,10 +204,8 @@ PGResult<void> MooncakePGContext::initialize(int rank, int world_size) {
     }
 
 #if MOONCAKE_PG_HAS_COLLECTIVE_V2
-    DeviceRouteConfig base_route_config;
-    base_route_config.rdma.device_filter = device_filters_;
-    PG_TRY(auto route_config,
-           loadDeviceRouteConfigFromEnvironment(std::move(base_route_config)));
+    PG_TRY(auto route_config, loadDeviceRouteConfigFromEnvironment());
+    route_config.rdma.device_filter = device_filters_;
 #endif
 
     // Ordering constraint: AgentHost::start() sends registerAgent immediately,
