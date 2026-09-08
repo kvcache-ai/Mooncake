@@ -141,21 +141,6 @@ bool HasFabricMemoryInGlobalResourceConfig(const char* config_str) {
     return RootHasFabricMemoryConfig(root);
 }
 
-bool IsFabricMemEnabledFromGlobalResourceConfig() {
-    char* global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
-    std::string resolved =
-        ResolveAscendGlobalResourceConfig(global_resource_config);
-    if (resolved.empty()) {
-        return false;
-    }
-    if (HasFabricMemoryInGlobalResourceConfig(resolved.c_str())) {
-        LOG(INFO) << "[AscendTE] fabric mem enabled via "
-                     "ASCEND_GLOBAL_RESOURCE_CONFIG fabric_memory.";
-        return true;
-    }
-    return false;
-}
-
 std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
     if (config_str == nullptr || config_str[0] == '\0') {
         return std::string();
