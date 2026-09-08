@@ -19,6 +19,7 @@
 #include <iomanip>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <unordered_map>
@@ -165,6 +166,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
+        std::unique_lock<std::shared_mutex> snapshot_lock(
+            service->snapshot_mutex_);
         // If snapshot_manager_ exists, use it; otherwise create a temporary one
         if (service->snapshot_manager_) {
             return service->snapshot_manager_->PersistState(snapshot_id);
@@ -826,6 +829,15 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                "shadows the base class member. "
             << "Use 'service_.reset(new MasterService(...))' instead of "
                "'std::unique_ptr<MasterService> service_(...)'";
+
+        // Freeze the original service before snapshot/restore validation. The
+        // eviction worker can otherwise mutate replica metadata while the
+        // snapshot is being serialized, making the post-restore comparison
+        // compare two different points in time.
+        service_->eviction_running_ = false;
+        if (service_->eviction_thread_.joinable()) {
+            service_->eviction_thread_.join();
+        }
 
         // Some test configs may not enable snapshot/restore, so the backend
         // is not created in the constructor. We create it here for TearDown

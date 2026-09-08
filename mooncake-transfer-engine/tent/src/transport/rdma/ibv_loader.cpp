@@ -32,6 +32,19 @@ bool LoadSymbol(void* handle, const char* name, Fn& out) {
     return true;
 }
 
+// A symbol newer libibverbs add; its absence must not disable RDMA.
+template <typename Fn>
+void LoadOptionalSymbol(void* handle, const char* name, Fn& out) {
+    void* sym = dlsym(handle, name);
+    if (!sym) {
+        LOG(INFO) << "libibverbs lacks optional symbol " << name
+                  << "; the fallback path will be used";
+        out = nullptr;
+        return;
+    }
+    out = reinterpret_cast<Fn>(sym);
+}
+
 IbvLoader& IbvLoader::Instance() {
     static IbvLoader instance;
     return instance;
@@ -55,6 +68,8 @@ IbvLoader::IbvLoader() {
     ok &= LoadSymbol(handle_, "ibv_query_gid", symbols_.ibv_query_gid);
     ok &=
         LoadSymbol(handle_, "ibv_query_port", symbols_.ibv_query_port_default);
+    LoadOptionalSymbol(handle_, "ibv_query_port_speed",
+                       symbols_.ibv_query_port_speed);
     ok &= LoadSymbol(handle_, "ibv_get_device_name",
                      symbols_.ibv_get_device_name);
 

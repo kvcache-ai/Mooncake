@@ -70,6 +70,18 @@ inline double ibLinkSpeedGbps(int active_speed, int active_width) {
     return ibLaneSpeedGbps(active_speed) * ibLinkWidthLanes(active_width);
 }
 
+// Port speed in Gbps, preferring the effective speed ibv_query_port_speed()
+// reports (rdma-core >= 62, here in Mb/s) over the encoded link rate.
+// The two differ for a VF over LAG: a PF dropping out of the bond halves
+// the VF's bandwidth while its port stays ACTIVE at the same encoding, and
+// only the effective speed reflects that. 0 for effective_mbps means the
+// verb is unavailable or reported nothing, and the encodings decide.
+inline double ibPortSpeedGbps(unsigned long long effective_mbps,
+                              int active_speed, int active_width) {
+    if (effective_mbps > 0) return effective_mbps / 1000.0;
+    return ibLinkSpeedGbps(active_speed, active_width);
+}
+
 }  // namespace mooncake
 
 #endif  // MOONCAKE_IB_LINK_SPEED_H_

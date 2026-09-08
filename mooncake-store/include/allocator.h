@@ -2,10 +2,13 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
+
+#include <ylt/util/tl/expected.hpp>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.h"
@@ -29,12 +32,18 @@ enum class ReplicaType {
     DFS = 100,       // Distributed filesystem page-offset replica
 };
 
+struct LiveAllocation {
+    uint64_t offset_from_base{0};
+    uint64_t requested_size{0};
+};
+
 // Constant for unknown free space in allocators that don't track it precisely
 static constexpr size_t kAllocatorUnknownFreeSpace =
     std::numeric_limits<size_t>::max();
 
 // Forward declarations
 class BufferAllocatorBase;
+class Replica;
 
 class AllocatedBuffer {
    public:
@@ -70,6 +79,10 @@ class AllocatedBuffer {
         return !allocator_.expired();
     }
 
+    [[nodiscard]] std::shared_ptr<BufferAllocatorBase> getAllocator() const {
+        return allocator_.lock();
+    }
+
     // Serialize the buffer into a descriptor for transfer
     [[nodiscard]] Descriptor get_descriptor() const;
 
@@ -93,6 +106,8 @@ class AllocatedBuffer {
     void* get_vaddr_from_cxl();
 
    private:
+    bool copyTransferProtocolFrom(const AllocatedBuffer& source);
+
     std::weak_ptr<BufferAllocatorBase> allocator_;
     std::string segment_name_;
     void* buffer_ptr_{nullptr};
@@ -103,6 +118,7 @@ class AllocatedBuffer {
         std::nullopt};
 
     friend class Serializer<AllocatedBuffer>;
+    friend class Replica;
 };
 
 /**
@@ -117,6 +133,7 @@ class BufferAllocatorBase {
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
+    virtual uintptr_t base() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
 
@@ -175,6 +192,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
         return kAllocatorUnknownFreeSpace;
     }
     size_t size() const override { return 0; }
+    uintptr_t base() const override { return 0; }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -189,12 +207,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
  * CachelibBufferAllocator manages memory allocation using CacheLib's slab
  * allocation strategy.
  *
- * Important alignment requirements:
- * 1. Base address must be at least 8-byte aligned (CacheLib requirement)
- * 2. Base address should be 4MB aligned since the total size must be a multiple
- * of 4MB
- * 3. Use sufficiently high base addresses (e.g., 0x100000000 for 4GB) to avoid
- * memory conflicts
+ * The base address and size must both be aligned to CacheLib's slab size.
  *
  * Example usage:
  * ```cpp
@@ -202,7 +215,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
  * const size_t base = 0x100000000;  // 4GB aligned
  * const size_t base = 0x200000000;  // 8GB aligned
  *
- * // Bad - will likely crash
+ * // Bad - Create() returns ErrorCode::INVALID_PARAMS
  * const size_t base = 0x1234;       // Too low, unaligned
  * const size_t base = 0x100000001;  // Not 4MB aligned
  * ```
@@ -211,9 +224,10 @@ class CachelibBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
-    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
-                            std::string transport_endpoint,
-                            ReplicaType replica_type = ReplicaType::MEMORY);
+    static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
+    Create(std::string segment_name, size_t base, size_t size,
+           std::string transport_endpoint,
+           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
@@ -223,6 +237,7 @@ class CachelibBufferAllocator
 
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -238,8 +253,12 @@ class CachelibBufferAllocator
     }
 
    private:
+    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
+                            std::string transport_endpoint,
+                            ReplicaType replica_type);
+
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
-        const AllocatedBuffer::Descriptor& descriptor);
+        const LiveAllocation& allocation);
     // metadata
     const std::string segment_name_;
     const size_t base_;
@@ -257,10 +276,10 @@ class CachelibBufferAllocator
 
     friend struct RestoredCachelibBufferAllocator;
     friend std::optional<struct RestoredCachelibBufferAllocator>
-    RestoreCachelibBufferAllocator(
+    ImportCachelibBufferAllocator(
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint,
-        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        const std::vector<LiveAllocation>& allocations,
         ReplicaType replica_type);
 };
 
@@ -269,10 +288,10 @@ struct RestoredCachelibBufferAllocator {
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
 };
 
-std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
+std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
 
 /**
@@ -296,6 +315,7 @@ class OffsetBufferAllocator
 
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return GetUsageBytes(); }
+    uintptr_t base() const override { return base_; }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -335,14 +355,20 @@ struct RestoredOffsetBufferAllocator {
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
 };
 
-// Reconstructs an empty OffsetBufferAllocator from final live descriptors.
-// The returned buffers follow descriptor input order. No state is exposed on
+// Reconstructs an empty OffsetBufferAllocator from final live allocations.
+// The returned buffers follow allocation input order. No state is exposed on
 // validation or allocation failure.
-std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
+std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    const std::vector<LiveAllocation>& allocations,
     ReplicaType replica_type = ReplicaType::MEMORY);
+
+tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
+CreateBufferAllocator(BufferAllocatorType allocator_type,
+                      std::string segment_name, size_t base, size_t size,
+                      std::string transport_endpoint,
+                      ReplicaType replica_type = ReplicaType::MEMORY);
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address

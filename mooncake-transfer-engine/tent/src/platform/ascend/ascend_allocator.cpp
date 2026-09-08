@@ -51,6 +51,12 @@ Status AscendPlatform::free(void* ptr, size_t size) {
 }
 
 Status AscendPlatform::copy(void* dst, void* src, size_t length) {
+    // Unlike CUDA/ROCm, the copy is not routed to the device owning the
+    // buffer; aclrtMemcpy runs in the caller thread's ACL context. Routing it
+    // needs a driver-id -> user-id lookup ACL does not expose: location.id is
+    // a driver id, aclrtSetDevice takes an ASCEND_RT_VISIBLE_DEVICES user id.
+    // TODO: left to someone with Ascend expertise and NPU hardware to verify;
+    // getting that id mapping wrong picks the wrong device silently.
     CHECK_ASCEND(aclrtMemcpy(dst, length, src, length, ACL_MEMCPY_DEFAULT));
     return Status::OK();
 }

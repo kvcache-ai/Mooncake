@@ -114,9 +114,9 @@ class RdmaTransport : public Transport {
     virtual int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                        HandShakeDesc &local_desc);
 
-    int sendHandshake(const std::string &peer_server_name,
-                      const HandShakeDesc &local_desc,
-                      HandShakeDesc &peer_desc) {
+    virtual int sendHandshake(const std::string &peer_server_name,
+                              const HandShakeDesc &local_desc,
+                              HandShakeDesc &peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
     }

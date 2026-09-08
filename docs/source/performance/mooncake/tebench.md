@@ -197,6 +197,20 @@ computed from each class's actual transfer size.
 `--qos_classes_json`, and the global `--tent_intent_type`. Non-default
 per-class intents and deadlines require the TENT backend.
 
+### 4.3 Per-Target Metrics
+
+Multi-target runs print one `[target-summary]` line per target. Use
+`--result_output_jsonl=<path>` to also append a schema-versioned JSON record for
+each benchmark configuration. The record keeps the aggregate operation, byte,
+and throughput totals plus each target's segment name, assigned thread count,
+completed operations, transferred bytes, throughput, and latency distribution.
+The aggregate throughput uses the pooled average worker duration, matching the
+existing `BW (GB/s)` table calculation.
+
+Targets with no assigned worker are retained with zero-valued metrics. This
+makes an under-provisioned run (`threads < targets`) visible instead of silently
+dropping targets from the result.
+
 ## 5. Runtime Configuration
 
 This section summarizes the key runtime options that control workload behavior,
@@ -371,6 +385,8 @@ gpu_id + thread_id
 * `--qos_link_capacity_gbps` : measured usable link capacity in decimal GB/s
 * `--qos_output_jsonl` : append one schema-versioned JSON object per benchmark
   configuration
+* `--result_output_jsonl` : append aggregate and per-target metrics for each
+  benchmark configuration
 
 QoS mode intentionally requires a fixed thread count. Sweep offered load by
 running explicit cases with different class thread allocations so every output

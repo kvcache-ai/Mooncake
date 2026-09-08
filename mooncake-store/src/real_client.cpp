@@ -24,7 +24,7 @@
 #include "config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
-#include "environ.h"
+#include "client_auto_port_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -815,25 +815,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         client_ = *client_opt;
     } else {
         // Auto port binding with retry on metadata registration failure
-        const int kMaxRetries =
-            Environ::GetInt("MC_STORE_CLIENT_SETUP_RETRIES", 20);
-        const int rawMinPort =
-            Environ::GetInt("MC_STORE_CLIENT_MIN_PORT", 12300);
-        const int rawMaxPort =
-            Environ::GetInt("MC_STORE_CLIENT_MAX_PORT", 14300);
-        constexpr int kDefaultMinPort = 12300;
-        constexpr int kDefaultMaxPort = 14300;
-        auto [minPort, maxPort] = ValidatePortRange(
-            rawMinPort, rawMaxPort, kDefaultMinPort, kDefaultMaxPort);
+        const auto auto_port_config = ClientAutoPortConfig::FromEnvironment();
         bool success = false;
 
-        for (int retry = 0; retry < kMaxRetries; ++retry) {
+        for (int retry = 0; retry < auto_port_config.max_retries; ++retry) {
             // Create port binder to hold a port
-            port_binder_ = std::make_unique<AutoPortBinder>(minPort, maxPort);
+            port_binder_ = std::make_unique<AutoPortBinder>(
+                auto_port_config.min_port, auto_port_config.max_port);
             int port = port_binder_->getPort();
             if (port < 0) {
-                LOG(WARNING) << "Failed to bind available port, retry "
-                             << (retry + 1) << "/" << kMaxRetries;
+                LOG(WARNING)
+                    << "Failed to bind available port, retry " << (retry + 1)
+                    << "/" << auto_port_config.max_retries;
                 port_binder_.reset();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
@@ -857,14 +850,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             // Failed to create client (possibly due to metadata registration
             // conflict), release port and retry with a different port
             LOG(WARNING) << "Failed to create client on port " << port
-                         << ", retry " << (retry + 1) << "/" << kMaxRetries;
+                         << ", retry " << (retry + 1) << "/"
+                         << auto_port_config.max_retries;
             port_binder_.reset();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (!success) {
-            LOG(ERROR) << "Failed to create client after " << kMaxRetries
-                       << " retries";
+            LOG(ERROR) << "Failed to create client after "
+                       << auto_port_config.max_retries << " retries";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
@@ -1142,6 +1136,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+        // The dangling-replica heal in Client::Put needs an existence check
+        // against this process's offload files, which only the FileStorage
+        // owns. true: backing file is gone, false: present, nullopt: unknown.
+        std::weak_ptr<FileStorage> weak_storage = file_storage_;
+        client_->SetLocalDiskProbe(
+            [weak_storage](const std::string &key) -> std::optional<bool> {
+                auto storage = weak_storage.lock();
+                if (!storage) {
+                    return std::nullopt;
+                }
+                auto exists = storage->Exists(key);
+                if (!exists) {
+                    return std::nullopt;
+                }
+                return !*exists;
+            });
     }
     client_requester_ = std::make_shared<ClientRequester>();
     const bool should_start_http_server =
@@ -2763,8 +2773,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        // Per-buffer unregistration is idempotent so a DummyClient can safely
+        // retry after the RealClient completed an earlier request but its
+        // response was lost.
+        return {};
     }
     auto &context = it->second;
 
@@ -2779,11 +2791,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     }
 
     if (shm_it == context.mapped_shms.end()) {
-        std::stringstream addr_stream;
-        addr_stream << "0x" << std::hex << dummy_base_addr;
-        LOG(ERROR) << "Share memory not found for dummy address: "
-                   << addr_stream.str() << " (client_id: " << client_id << ")";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return {};
     }
 
     // Unmap and clean up the shm
@@ -6981,7 +6989,8 @@ ClientRequester::ClientRequester() {
     // peer which is gone blocks for connect_retry_count * 30s plus the waits
     // between retries -- 91s with the defaults above -- and no configuration
     // can shorten it. Defaults are unchanged when the variables are unset.
-    detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
+    detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
+                                     RpcTimeoutConfig::FromEnvironment());
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(

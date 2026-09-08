@@ -254,6 +254,33 @@ WaitForOpLogFailureAction WaitForOpLogFailure() { return {}; }
 
 PingAction Ping(std::string actor) { return {.actor = std::move(actor)}; }
 
+MountLocalDiskAction MountLocalDisk(std::string actor) {
+    return {.actor = std::move(actor)};
+}
+
+UnmountLocalDiskAction UnmountLocalDisk(std::string actor) {
+    return {.actor = std::move(actor)};
+}
+
+ReportSsdCapacityAction ReportSsdCapacity(std::string actor,
+                                          int64_t capacity_bytes) {
+    return {.actor = std::move(actor), .capacity_bytes = capacity_bytes};
+}
+
+OffloadHeartbeatAction OffloadHeartbeat(std::string actor) {
+    return {.actor = std::move(actor)};
+}
+
+CompleteOffloadAction CompleteOffload(std::initializer_list<std::string> keys) {
+    CompleteOffloadAction action;
+    action.keys.assign(keys.begin(), keys.end());
+    return action;
+}
+
+EvictDiskReplicaAction EvictDiskReplica(std::string key) {
+    return {.key = std::move(key)};
+}
+
 MasterScenario::MasterScenario(std::string name) : name_(std::move(name)) {}
 
 MasterScenario::MasterScenario(std::string name, MasterServiceConfig config,
@@ -1101,6 +1128,145 @@ MasterScenario& MasterScenario::When(PingAction action) {
     const auto result = service_->Ping(ActorId(action.actor));
     ValidateActionResult("Ping(" + action.actor + ")", action.expected_error,
                          result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(MountLocalDiskAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->MountLocalDiskSegment(
+        ActorId(action.actor), action.enable_offloading);
+    ValidateActionResult("MountLocalDisk(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(UnmountLocalDiskAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result =
+        service_->UnmountLocalDiskSegment(ActorId(action.actor));
+    ValidateActionResult("UnmountLocalDisk(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(ReportSsdCapacityAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->ReportSsdCapacity(ActorId(action.actor),
+                                                    action.capacity_bytes);
+    ValidateActionResult("ReportSsdCapacity(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(OffloadHeartbeatAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->OffloadObjectHeartbeat(
+        ActorId(action.actor), action.enable_offloading);
+    ValidateActionResult("OffloadHeartbeat(" + action.actor + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    if (!result || !action.expected_task_keys.has_value()) {
+        return *this;
+    }
+    if (result->size() != action.expected_task_keys->size()) {
+        Fail("OffloadHeartbeat(" + action.actor + ") returned " +
+             std::to_string(result->size()) + " offload tasks; expected " +
+             std::to_string(action.expected_task_keys->size()));
+        return *this;
+    }
+    for (const auto& key : *action.expected_task_keys) {
+        const auto match = std::find_if(
+            result->begin(), result->end(), [&](const OffloadTaskItem& task) {
+                return task.tenant_id == action.tenant && task.key == key &&
+                       task.size == action.expected_task_size;
+            });
+        if (match == result->end()) {
+            Fail("OffloadHeartbeat(" + action.actor +
+                 ") is missing an offload task for " + key);
+        }
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(CompleteOffloadAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (action.keys.empty()) {
+        Fail("CompleteOffload requires at least one key");
+        return *this;
+    }
+    if (action.node.empty()) {
+        Fail("CompleteOffload requires OnNode");
+        return *this;
+    }
+    const auto segment = segments_.find(action.node);
+    const std::string endpoint =
+        segment != segments_.end() ? segment->second.te_endpoint : action.node;
+    std::vector<OffloadTaskItem> tasks;
+    std::vector<StorageObjectMetadata> metadatas;
+    tasks.reserve(action.keys.size());
+    metadatas.reserve(action.keys.size());
+    for (const auto& key : action.keys) {
+        int64_t size = 0;
+        if (action.size.has_value()) {
+            size = *action.size;
+        } else {
+            const auto record =
+                last_start_results_.find(action.tenant + "\n" + key);
+            const Replica::Descriptor* descriptor = nullptr;
+            if (record != last_start_results_.end()) {
+                for (const auto& candidate : record->second) {
+                    if (candidate.is_memory_replica()) {
+                        descriptor = &candidate;
+                        break;
+                    }
+                }
+            }
+            if (descriptor == nullptr) {
+                Fail("CompleteOffload(" + key +
+                     ") has no PutStart-recorded size; use OfSize");
+                return *this;
+            }
+            size = static_cast<int64_t>(
+                descriptor->get_memory_descriptor().buffer_descriptor.size_);
+        }
+        tasks.push_back(OffloadTaskItem{
+            .tenant_id = action.tenant, .key = key, .size = size});
+        StorageObjectMetadata metadata{};
+        metadata.data_size = size;
+        metadata.transport_endpoint = endpoint;
+        metadatas.push_back(std::move(metadata));
+    }
+    const auto result =
+        service_->NotifyOffloadSuccess(ActorId(action.actor), tasks, metadatas);
+    ValidateActionResult("CompleteOffload(" + action.keys.front() + ")",
+                         action.expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(EvictDiskReplicaAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const auto result = service_->EvictDiskReplica(
+        ActorId(action.actor), action.key, TenantId(action.tenant),
+        action.replica_type);
+    ValidateActionResult("EvictDiskReplica(" + action.key + ")",
+                         action.expected_error, result.has_value(),
                          result ? ErrorCode::OK : result.error());
     return *this;
 }

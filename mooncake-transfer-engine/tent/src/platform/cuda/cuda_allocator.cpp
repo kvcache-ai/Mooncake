@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <numa.h>
 #include <glog/logging.h>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -60,11 +61,74 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
+    //
+    // cudaMemcpyAsync routes the copy through its stream's device context, so
+    // the stream must live on the device owning the device-side buffer.
+    // Control-plane RPC worker threads sit on cuda:0 while a registered buffer
+    // may live on cuda:R; taking the stream from the buffer's device routes the
+    // copy correctly without mutating the calling thread's current device.
+    // Host-only copies keep the current device.
+    int device_id = getPointerDeviceId(dst);
+    if (device_id == CUDAStreamPool::kCurrentDevice) {
+        device_id = getPointerDeviceId(src);
+    }
+
     CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+    return Status::OK();
+}
+
+Status CudaPlatform::synchronizeDevices(const Topology* topology) {
+    const std::vector<int> devices =
+        topologyDeviceIndices(topology, Topology::MEM_CUDA);
+    if (devices.empty()) return Status::OK();
+
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0) {
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "CudaPlatform::synchronizeDevices "
+                            "cudaGetDeviceCount failed: "
+                         << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+        return Status::OK();
+    }
+
+    int saved = 0;
+    const bool have_saved = cudaGetDevice(&saved) == cudaSuccess;
+    if (!have_saved) (void)cudaGetLastError();
+
+    for (int device : devices) {
+        if (device >= device_count) continue;
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "CudaPlatform::synchronizeDevices cudaSetDevice("
+                         << device << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            continue;
+        }
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            LOG(WARNING)
+                << "CudaPlatform::synchronizeDevices cudaDeviceSynchronize "
+                   "device "
+                << device << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
+    if (have_saved) {
+        err = cudaSetDevice(saved);
+        if (err != cudaSuccess) {
+            LOG(WARNING)
+                << "CudaPlatform::synchronizeDevices restore cudaSetDevice("
+                << saved << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
     return Status::OK();
 }
 }  // namespace tent
