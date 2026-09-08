@@ -7038,6 +7038,13 @@ ClientRequester::ClientRequester() {
             pool_conf, GetStoreRpcClientIoContextPool());
 }
 
+ClientRequester::~ClientRequester() {
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "ClientRequester teardown: offload RPCs still in "
+                      "flight after 30s drain; releasing the pools regardless";
+    }
+}
+
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 ClientRequester::batch_get_offload_object(const std::string &client_addr,
                                           const std::vector<std::string> &keys,
@@ -7073,6 +7080,10 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     const std::string &client_addr, Args &&...args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto client_pool = client_pools_->at(client_addr);
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {

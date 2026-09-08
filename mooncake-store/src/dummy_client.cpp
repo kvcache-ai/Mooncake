@@ -183,6 +183,10 @@ constexpr bool can_invoke_when_disconnected() {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto pool = client_accessor_.GetClientPool();
 
     if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
@@ -216,6 +220,11 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
     if (!connected_.load()) {
         LOG(ERROR) << "Dummy Client not connected";
@@ -266,7 +275,14 @@ DummyClient::DummyClient()
     mooncake::init_ylt_log_level();
 }
 
-DummyClient::~DummyClient() { tearDownAll(); }
+DummyClient::~DummyClient() {
+    // Never release the pool under a suspended request coroutine (#3909).
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "DummyClient teardown: RPCs still in flight after 30s "
+                      "drain; releasing the pool regardless";
+    }
+    tearDownAll();
+}
 
 void DummyClient::ObserveTransferMetric(TransferOperationKind kind,
                                         const char* op_name, size_t bytes,

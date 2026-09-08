@@ -51,7 +51,11 @@ TEST(RpcClientIoContextPoolTest, ReplacesPoolWhenTargetChanges) {
     auto second = pools.GetOrCreateClientPool("127.0.0.1:10002");
     EXPECT_NE(first, second);
     first.reset();
-    EXPECT_TRUE(old_pool.expired());
+    // Pools live in the process-wide registry by design: a ylt pool owns
+    // background reconnect coroutines that reference pool storage, so freeing
+    // one mid-retry is a use-after-free regardless of request draining
+    // (#3909). Switching address only re-points the holder.
+    EXPECT_FALSE(old_pool.expired());
     EXPECT_EQ(pools.GetClientPool(), second);
 }
 
