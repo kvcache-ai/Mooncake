@@ -314,15 +314,6 @@ func buffersFromLists(addrList []uintptr, sizeList []uint64) []Buffer {
 	return buffers
 }
 
-// unregisterBuffersTimes undoes `times` rounds of registration. Each successful
-// doGetReplica pass increments the refcount of every buffer once, so rollback
-// must unregister the same number of times to actually release them.
-func (store *P2PStore) unregisterBuffersTimes(bufferList []Buffer, maxShardSize uint64, times int) {
-	for i := 0; i < times; i++ {
-		store.unregisterBuffers(bufferList, maxShardSize)
-	}
-}
-
 func contains(slice []Location, value Location) bool {
 	for _, item := range slice {
 		if item == value {
@@ -351,6 +342,24 @@ func isSubsetOf(old *Payload, new *Payload) bool {
 	return true
 }
 
+func hasSameLayout(old *Payload, new *Payload) bool {
+	if old.Size != new.Size || old.MaxShardSize != new.MaxShardSize ||
+		len(old.SizeList) != len(new.SizeList) || len(old.Shards) != len(new.Shards) {
+		return false
+	}
+	for i := range old.SizeList {
+		if old.SizeList[i] != new.SizeList[i] {
+			return false
+		}
+	}
+	for i := range old.Shards {
+		if old.Shards[i].Length != new.Shards[i].Length {
+			return false
+		}
+	}
+	return true
+}
+
 // reconcilePayloadAfterTransfer decides whether a transfer must be retried
 // after its metadata snapshot changed. A retry is only needed when at least
 // one source used by the completed transfer disappeared.
@@ -362,19 +371,13 @@ func reconcilePayloadAfterTransfer(payload *Payload, revision int64,
 	if revision == newRevision {
 		return payload, revision, false, nil
 	}
+	if !hasSameLayout(payload, newPayload) {
+		return nil, newRevision, false, ErrInvalidArgument
+	}
 	// Carry the latest revision forward even when the completed transfer is
 	// still valid (for example, another replica was added). This avoids
 	// finalizing against a stale CAS revision and preserves concurrent updates.
 	return newPayload, newRevision, !isSubsetOf(payload, newPayload), nil
-}
-
-// releaseRetryRegistrations leaves the one registration round owned by the
-// catalog and releases the extra references acquired by transfer retries.
-func (store *P2PStore) releaseRetryRegistrations(bufferList []Buffer,
-	maxShardSize uint64, successfulRounds int) {
-	if successfulRounds > 1 {
-		store.unregisterBuffersTimes(bufferList, maxShardSize, successfulRounds-1)
-	}
 }
 
 func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []uintptr, sizeList []uint64) error {
@@ -394,38 +397,37 @@ func (store *P2PStore) GetReplica(ctx context.Context, name string, addrList []u
 		return ErrPayloadNotFound
 	}
 	replicaBuffers := buffersFromLists(addrList, sizeList)
-	registrationMaxShardSize := payload.MaxShardSize
-	successfulRounds := 0
 	for {
+		registrationMaxShardSize := payload.MaxShardSize
 		err = store.doGetReplica(ctx, payload, addrList, sizeList)
 		if err != nil {
-			// doGetReplica rolled back its own round; undo earlier rounds.
-			store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
+			// doGetReplica rolls back the current round on failure.
 			return err
 		}
-		successfulRounds++
 		newPayload, newRevision, err := store.metadata.Get(ctx, name)
 		if err != nil {
-			store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
+			store.unregisterBuffers(replicaBuffers, registrationMaxShardSize)
 			return err
 		}
 		var retry bool
 		payload, revision, retry, err = reconcilePayloadAfterTransfer(
 			payload, revision, newPayload, newRevision)
 		if err != nil {
-			store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
+			store.unregisterBuffers(replicaBuffers, registrationMaxShardSize)
 			return err
 		}
 		if !retry {
 			break
 		}
+		// The completed transfer used a source that disappeared. Drop this
+		// round's registration before retrying against the latest snapshot.
+		store.unregisterBuffers(replicaBuffers, registrationMaxShardSize)
 	}
 	err = store.updatePayloadMetadata(ctx, name, addrList, sizeList, payload, revision)
 	if err != nil {
-		store.unregisterBuffersTimes(replicaBuffers, registrationMaxShardSize, successfulRounds)
+		store.unregisterBuffers(replicaBuffers, payload.MaxShardSize)
 		return err
 	}
-	store.releaseRetryRegistrations(replicaBuffers, registrationMaxShardSize, successfulRounds)
 	return nil
 }
 
