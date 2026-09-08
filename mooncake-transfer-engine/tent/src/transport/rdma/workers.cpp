@@ -763,7 +763,9 @@ void Workers::asyncPostSend() {
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
+                    VLOG(1)
+                        << "Slice " << slice << " failed: retry count exceeded";
+                    LOG_EVERY_N(WARNING, 100)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
