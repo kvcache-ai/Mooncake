@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -45,7 +46,9 @@ def _collective_payload(
         return {"value": int(tensor.cpu().item())}
 
     if case_name == "broadcast":
-        tensor = torch.tensor([111 if rank == 0 else -1], dtype=torch.int32, device=device)
+        tensor = torch.tensor(
+            [111 if rank == 0 else -1], dtype=torch.int32, device=device
+        )
         dist.broadcast(tensor, src=0)
         return {"value": int(tensor.cpu().item())}
 
@@ -72,7 +75,9 @@ def _collective_payload(
         if hasattr(dist, "reduce_scatter_tensor"):
             dist.reduce_scatter_tensor(output, input_buf, op=dist.ReduceOp.SUM)
         else:
-            dist.reduce_scatter(output, list(input_buf.chunk(world_size)), op=dist.ReduceOp.SUM)
+            dist.reduce_scatter(
+                output, list(input_buf.chunk(world_size)), op=dist.ReduceOp.SUM
+            )
         return {"value": output.cpu().tolist()}
 
     if case_name == "barrier":
@@ -126,9 +131,47 @@ def _collective_worker(
     ctx.record_result(payload)
 
 
+def _async_ops_on_independent_streams_worker(
+    ctx: MooncakePGWorkerContext,
+    allow_rank_one_to_start,
+) -> None:
+    device = ctx.init_group()
+    stream_a = torch.cuda.Stream(device=device)
+    stream_b = torch.cuda.Stream(device=device)
+
+    rank_zero_submitted_both = True
+    if ctx.rank == 1:
+        rank_zero_submitted_both = allow_rank_one_to_start.wait(timeout=5.0)
+
+    with torch.cuda.stream(stream_a):
+        tensor_a = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
+        work_a = dist.all_reduce(tensor_a, op=dist.ReduceOp.SUM, async_op=True)
+    with torch.cuda.stream(stream_b):
+        tensor_b = torch.tensor([(ctx.rank + 1) * 10], dtype=torch.int32, device=device)
+        work_b = dist.all_reduce(tensor_b, op=dist.ReduceOp.SUM, async_op=True)
+
+    if ctx.rank == 0:
+        # Rank 1 does not submit either operation until both calls on rank 0
+        # return.
+        allow_rank_one_to_start.set()
+
+    work_a.wait()
+    work_b.wait()
+    stream_a.synchronize()
+    stream_b.synchronize()
+    ctx.record_result(
+        {
+            "rank_zero_submitted_both": rank_zero_submitted_both,
+            "values": [int(tensor_a.cpu().item()), int(tensor_b.cpu().item())],
+        }
+    )
+
+
 class _CollectiveTestMixin:
     def test_world_init_without_pg_options(self) -> None:
-        rows = self.spawn_backend_and_collect(_collective_worker, "world_init_without_pg_options")
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "world_init_without_pg_options"
+        )
         self.assert_all_ok(rows)
 
         expected = sum(range(1, self.world_size + 1))
@@ -156,9 +199,11 @@ class _CollectiveTestMixin:
             self.assertEqual(row["value"], expected)
 
     def test_allreduce_product(self) -> None:
-        rows = self.spawn_backend_and_collect(_collective_worker, "allreduce", "product")
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "allreduce", "product"
+        )
         self.assert_all_ok(rows)
-        expected = 2 ** self.world_size
+        expected = 2**self.world_size
         for row in rows:
             self.assertEqual(row["value"], expected)
 
@@ -169,7 +214,9 @@ class _CollectiveTestMixin:
             self.assertEqual(row["value"], 111)
 
     def test_all_gather_into_tensor(self) -> None:
-        rows = self.spawn_backend_and_collect(_collective_worker, "all_gather_into_tensor")
+        rows = self.spawn_backend_and_collect(
+            _collective_worker, "all_gather_into_tensor"
+        )
         self.assert_all_ok(rows)
         expected = list(range(self.world_size))
         for row in rows:
@@ -187,7 +234,9 @@ class _CollectiveTestMixin:
         self.assert_all_ok(rows)
         for row in rows:
             rank = row["rank"]
-            expected = self.world_size * (self.world_size * (self.world_size - 1) // 2 + rank)
+            expected = self.world_size * (
+                self.world_size * (self.world_size - 1) // 2 + rank
+            )
             self.assertEqual(row["value"], [expected])
 
     def test_barrier(self) -> None:
@@ -222,11 +271,32 @@ class TestMooncakePGCollectivesCPU(_CollectiveTestMixin, MooncakePGCPUBackendTes
     world_size = 4
 
 
-class TestMooncakePGCollectivesCUDA(_CollectiveTestMixin, MooncakePGCUDABackendTestCase):
+class TestMooncakePGCollectivesCUDA(
+    _CollectiveTestMixin, MooncakePGCUDABackendTestCase
+):
     world_size = 2
 
+    def test_async_ops_on_independent_streams(self) -> None:
+        spawn_ctx = mp.get_context("spawn")
+        allow_rank_one_to_start = spawn_ctx.Event()
+        rows = self.spawn_backend_and_collect(
+            _async_ops_on_independent_streams_worker,
+            allow_rank_one_to_start,
+        )
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["values"], [3, 30])
 
-class TestMooncakePGCollectivesMUSA(_CollectiveTestMixin, MooncakePGMUSABackendTestCase):
+        rank_one = next(row for row in rows if row["rank"] == 1)
+        self.assertTrue(
+            rank_one["rank_zero_submitted_both"],
+            "rank 0 blocked before submitting both async operations",
+        )
+
+
+class TestMooncakePGCollectivesMUSA(
+    _CollectiveTestMixin, MooncakePGMUSABackendTestCase
+):
     world_size = 2
 
 

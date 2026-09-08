@@ -692,6 +692,11 @@ TEST_F(HighAvailabilityTest, LeadershipMonitorReportsKeepAliveLoss) {
         });
     ASSERT_TRUE(monitor.has_value());
 
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::ResetEtcdStoreClient(FLAGS_etcd_endpoints));
+    EXPECT_EQ(loss_future.wait_for(std::chrono::seconds(1)),
+              std::future_status::timeout);
+
     const auto lease_id =
         static_cast<EtcdLeaseId>(std::stoll(session.owner_token));
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::CancelKeepAlive(lease_id));
@@ -738,7 +743,7 @@ TEST_F(HighAvailabilityTest, EtcdStoreClientResetKeepsBasicOperationsWorking) {
     ASSERT_EQ(ErrorCode::OK, EtcdHelper::RevokeLease(lease_id));
 }
 
-TEST_F(HighAvailabilityTest, EtcdStoreClientResetStopsOldKeepAlive) {
+TEST_F(HighAvailabilityTest, EtcdStoreClientResetKeepsOldKeepAlive) {
     if (auto skip_reason = GetEtcdSkipReason(); skip_reason.has_value()) {
         GTEST_SKIP() << *skip_reason;
     }
@@ -770,12 +775,20 @@ TEST_F(HighAvailabilityTest, EtcdStoreClientResetStopsOldKeepAlive) {
     }
     ASSERT_EQ(ErrorCode::OK, reset_err);
 
-    auto keep_alive_status = future.wait_for(std::chrono::seconds(5));
-    if (keep_alive_status != std::future_status::ready) {
+    auto keep_alive_status = future.wait_for(std::chrono::seconds(1));
+    if (keep_alive_status != std::future_status::timeout) {
+        keep_alive_thread.join();
+    }
+    ASSERT_EQ(keep_alive_status, std::future_status::timeout);
+
+    auto cancel_err = EtcdHelper::CancelKeepAlive(lease_id);
+    if (cancel_err != ErrorCode::OK) {
         cleanup_keep_alive();
     }
-    ASSERT_EQ(keep_alive_status, std::future_status::ready);
-    EXPECT_NE(ErrorCode::OK, future.get());
+    ASSERT_EQ(ErrorCode::OK, cancel_err);
+    ASSERT_EQ(future.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, future.get());
     keep_alive_thread.join();
 
     EtcdLeaseId new_lease_id = 0;

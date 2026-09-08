@@ -93,6 +93,14 @@ metrics
 transport-selector
 :::
 
+## TENT High-Performance TCP
+
+:::{toctree}
+:maxdepth: 1
+
+hp-tcp
+:::
+
 ## TENT Quality of Service
 
 :::{toctree}

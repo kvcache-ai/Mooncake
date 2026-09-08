@@ -144,7 +144,7 @@ jobs:
         run: |
           docker build -f docker/mooncake.Dockerfile \
             --build-arg PYTHON_VERSION=3.10 \
-            --build-arg EP_TORCH_VERSIONS="2.13.0" \
+            --build-arg EP_TORCH_VERSIONS="2.14.0" \
             --build-arg CLEAN_BUILD_ARTIFACTS=1 \
             -t mooncake:from-source .
 
@@ -401,7 +401,7 @@ jobs:
           master_pid=$!
           trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
           sleep 3
-          python scripts/test_tensor_api.py -n 1
+          python -m unittest mooncake-wheel.tests.test_weight_snapshot_api
           python scripts/test_async_store.py
           python scripts/test_copy_move_api.py
           python scripts/test_drain_http_api.py --timeout-sec 90

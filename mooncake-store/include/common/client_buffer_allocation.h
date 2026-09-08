@@ -15,6 +15,16 @@
 namespace mooncake {
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+constexpr size_t SZ_512MB = 512 * 1024 * 1024;
+
+// 512MiB hugepages on arm64 kernels with 64K base pages may not be
+// defined by older glibc/kernel headers.
+#ifndef MAP_HUGE_512MB
+#define MAP_HUGE_512MB (29 << 26)  // MAP_HUGE_SHIFT = 26
+#endif
+#ifndef MFD_HUGE_512MB
+#define MFD_HUGE_512MB (29 << 26)  // MFD_HUGE_SHIFT = 26
+#endif
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
@@ -42,11 +52,12 @@ inline size_t align_up(size_t size, size_t alignment) {
     size_t size = SZ_2MB;
     if (const char* size_env = std::getenv("MC_STORE_HUGEPAGE_SIZE")) {
         const size_t parsed_size = string_to_byte_size(size_env);
-        if (parsed_size == SZ_2MB || parsed_size == SZ_1GB) {
+        if (parsed_size == SZ_2MB || parsed_size == SZ_512MB ||
+            parsed_size == SZ_1GB) {
             size = parsed_size;
         } else {
             LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << size_env
-                         << "'. Supported: 2MB, 1GB. Fallback to 2MB.";
+                         << "'. Supported: 2MB, 512MB, 1GB. Fallback to 2MB.";
         }
     }
 
@@ -55,12 +66,19 @@ inline size_t align_up(size_t size, size_t alignment) {
     }
     if (use_memfd) {
         *out_flags |= MFD_HUGETLB;
-        *out_flags |= size == SZ_2MB ? MFD_HUGE_2MB : MFD_HUGE_1GB;
+        *out_flags |= size == SZ_2MB     ? MFD_HUGE_2MB
+                      : size == SZ_512MB ? MFD_HUGE_512MB
+                                         : MFD_HUGE_1GB;
     } else {
         *out_flags |= MAP_HUGETLB;
-        *out_flags |= size == SZ_2MB ? MAP_HUGE_2MB : MAP_HUGE_1GB;
+        *out_flags |= size == SZ_2MB     ? MAP_HUGE_2MB
+                      : size == SZ_512MB ? MAP_HUGE_512MB
+                                         : MAP_HUGE_1GB;
     }
-    LOG(INFO) << "Using hugepage size: " << (size == SZ_2MB ? "2MB" : "1GB");
+    LOG(INFO) << "Using hugepage size: "
+              << (size == SZ_2MB     ? "2MB"
+                  : size == SZ_512MB ? "512MB"
+                                     : "1GB");
     return size;
 }
 

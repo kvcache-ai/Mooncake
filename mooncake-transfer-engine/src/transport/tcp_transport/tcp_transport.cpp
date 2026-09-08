@@ -329,10 +329,10 @@ TcpTransport::TcpTransport()
     }
 
     constexpr size_t kDefaultLanesPerPeer = 4;
-    constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
-    constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
-    constexpr size_t kDefaultPendingAdmissionsPerPeer = 1024;
-    constexpr size_t kMaxPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kDefaultQueuedTransfersPerPeer = 65535;
+    constexpr size_t kMaxQueuedTransfersPerPeer = 1048576;
+    constexpr size_t kDefaultPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kMaxPendingAdmissionsPerPeer = 1048576;
     constexpr size_t kDefaultAdmissionTimeoutMs = 1000;
     constexpr size_t kMaxAdmissionTimeoutMs = 600000;
 

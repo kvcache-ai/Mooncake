@@ -500,15 +500,21 @@ master publisher <mooncake-store-master-publisher>` reference.
 | `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
 | `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
 | `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
-| `--kv_events_emit_object_key` | `true` | Include the Mooncake `object_key`; unparsable sequence hashes are still published when this is enabled |
-| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full. Set to `0` for an unbounded queue |
+| `--kv_events_emit_object_key` | `true` | Emit the raw Mooncake `object_key`. Setting this to `false` suppresses `stored` and `removed` entirely, since those events then carry no object identity; `cleared` is unaffected |
+| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full and reserves its sequence number so the loss stays visible. Set to `0` for an unbounded queue |
 
-The legacy flags `--kv_events_model_name`, `--kv_events_tenant_id`,
-`--kv_events_additional_salt`, `--kv_events_lora_name`,
-`--kv_events_block_size`, and `--kv_events_dp_rank` are retained for config
-compatibility but are not emitted in event payloads. Supply model, block-size,
-hash-namespace, LoRA, and data-parallel metadata when registering the publisher
-with the indexer; each event carries its object's tenant ID.
+One master publisher serves one fixed model and parallel context, so the
+remaining flags below are emitted verbatim in every event envelope. Empty
+strings and `--kv_events_block_size=0` are encoded as nil.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--kv_events_model_name` | empty | Emitted as `model_name` |
+| `--kv_events_additional_salt` | empty | Emitted as `additional_salt`; the hash namespace this publisher's keys belong to |
+| `--kv_events_lora_name` | empty | Emitted as `lora_name` |
+| `--kv_events_block_size` | `0` | Emitted as `block_size` |
+| `--kv_events_dp_rank` | `0` | Emitted as `dp_rank`, both per event and in the batch trailer |
+| `--kv_events_tenant_id` | `default` | Accepted for configuration compatibility but not emitted. Every event carries the tenant of the Store operation that produced it |
 
 ### HTTP Metadata Server (Embedded)
 
@@ -929,7 +935,23 @@ allocation_strategy: "local_first"
 
 When enabled, the master applies local-first allocation only for memory replicas with `replica_num == 1`. Explicit `preferred_segment` or `preferred_segments` are tried first; if they are unavailable or full, Mooncake falls back through active hosts in cyclic lexicographic host-id order, starting from the writer host when it has active segments, or otherwise from the next greater active host id. Within the same host, segment names are sorted and rotated by key hash so multiple segments on one host do not always receive the first allocation attempt.
 
-The client derives the host id from `local_hostname` by removing the port. For example, `host-a:50051` and `host-a:50052` map to the same host id, `host-a`. For local-first allocation to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`. In deployments with multiple NIC IPs, hostname aliases, or container/pod networking, choose one canonical host name or IP and use it consistently across processes on that host. Empty, loopback, and wildcard values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `::1`, and `::` are treated as unknown and do not trigger automatic local-first placement for that client.
+By default, the client derives the host id from `local_hostname` by removing the port. For example, `host-a:50051` and `host-a:50052` map to the same host id, `host-a`. Set `MOONCAKE_HOST_ID` to override this derived value with a stable, globally unique node identifier. The override is read directly by the C++ client, so it applies to every client initialization method. It must be set before creating the client, and all writer and store processes on the same physical or logical host must use the same value. An empty or whitespace-only override falls back to `local_hostname`. Loopback and wildcard values such as `localhost`, `127.0.0.1`, `0.0.0.0`, `::1`, and `::` are treated as unknown and do not trigger automatic local-first placement.
+
+In Kubernetes, keep `MOONCAKE_LOCAL_HOSTNAME` as the routable pod IP for the transfer endpoint and use `spec.nodeName` as the shared placement identity:
+
+```yaml
+env:
+  - name: MOONCAKE_LOCAL_HOSTNAME
+    valueFrom:
+      fieldRef:
+        fieldPath: status.podIP
+  - name: MOONCAKE_HOST_ID
+    valueFrom:
+      fieldRef:
+        fieldPath: spec.nodeName
+```
+
+Apply the same `MOONCAKE_HOST_ID` mapping to every writer and store pod. This separates the per-pod network address from the node-level placement identity, allowing colocated pods with different IPs to match for local-first allocation.
 
 ---
 
@@ -1186,7 +1208,7 @@ Do not run binaries from before and after checksum support was introduced in the
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `MC_STORE_USE_HUGEPAGE` | unset | Set `1` to request HugeTLB-backed `mmap()` |
-| `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
+| `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `512MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
 

@@ -12,6 +12,7 @@
 
 #include "client_metric.h"
 #include "common/network.h"
+#include "environment_variables.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "version.h"
@@ -296,15 +297,18 @@ TEST_F(ClientMetricsTest, ZeroSumHybridHistogramPreservesExistingMetrics) {
 }
 
 TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {
-    setenv("MC_STORE_CLIENT_METRIC_BANDWIDTH", "0", 1);
+    ScopedEnv bandwidth_env(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH
+            .name);
+    setenv(
+        ClientMetricEnvironmentVariables::MC_STORE_CLIENT_METRIC_BANDWIDTH.name,
+        "0", 1);
     auto metrics = ClientMetric::Create();
     ASSERT_NE(metrics, nullptr);
 
     metrics->transfer_metric.total_read_bytes.inc(1024);
     std::string summary = metrics->summary_metrics();
     EXPECT_TRUE(summary.find("Average Read Throughput:") == std::string::npos);
-
-    unsetenv("MC_STORE_CLIENT_METRIC_BANDWIDTH");
 }
 
 TEST_F(ClientMetricsTest, SummaryCanOmitMasterRpcMetrics) {
