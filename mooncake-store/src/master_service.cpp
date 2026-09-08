@@ -1647,7 +1647,7 @@ void MasterService::UnregisterGroupMember(TenantCatalog& tenant_state,
     if (group_id.empty()) {
         return;
     }
-    tenant_state.object_index.RemoveMember(group_id, key);
+    tenant_state.group_index.RemoveMember(group_id, key);
 }
 
 MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
@@ -1669,7 +1669,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
 
-    std::vector<std::string> member_keys = tenant_state.object_index.Members(
+    std::vector<std::string> member_keys = tenant_state.group_index.Members(
         group_id);
     if (member_keys.empty()) {
         member_keys.push_back(key);
@@ -2379,8 +2379,8 @@ void MasterService::RebuildGroupState() {
             }
             auto lk = entry->LockUnique();
             ObjectMetadata& metadata = entry->metadata();
-            auto lease = tenant_state.object_index.LeaseFor(metadata.group_id);
-            tenant_state.object_index.AddMember(metadata.group_id,
+            auto lease = tenant_state.group_index.LeaseFor(metadata.group_id);
+            tenant_state.group_index.AddMember(metadata.group_id,
                                                 entry->key());
             auto it = max_deadline_by_group.find(
                 tenant_id.MakeScopedKey(metadata.group_id));

@@ -501,7 +501,7 @@ class MasterServiceTest : public ::testing::Test {
         if (!tenant_handle) {
             return {};
         }
-        return tenant_handle->object_index.Members(group_id);
+        return tenant_handle->group_index.Members(group_id);
     }
 
     void ClearGroupStateForTest(MasterService& service) {
@@ -513,7 +513,7 @@ class MasterServiceTest : public ::testing::Test {
                 auto& tenant_state = *handle;
                 for (const auto& entry : tenant_state.SnapshotObjects()) {
                     if (!entry->group_id().empty()) {
-                        tenant_state.object_index.RemoveMember(
+                        tenant_state.group_index.RemoveMember(
                             entry->group_id(), entry->key());
                     }
                 }
@@ -536,7 +536,7 @@ class MasterServiceTest : public ::testing::Test {
         }
         // The shared group Lease is single-sourced in the tenant's
         // object_index.
-        return tenant_handle->object_index.LeaseFor(group_id);
+        return tenant_handle->group_index.LeaseFor(group_id);
     }
 
     void ReRouteRestoredObjectsMigrationForTest(MasterService& service) {

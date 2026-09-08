@@ -28,72 +28,6 @@ namespace mooncake {
 class MasterService;  // friend: the service owns and operates the store
 namespace tenant {
 
-// GroupIndex: group_id -> {shared Lease, member keys}. A group is not a
-// container of objects: it is a thin membership table plus a single shared
-// Lease. The lease is the all-or-none unit consulted by eviction (the
-// per-member ObjectMetadata entry points at it); the read path extends that
-// shared lease on a member hit without touching this index.
-class GroupIndex {
-   public:
-    // Return (creating on demand) the single shared Lease for a group_id.
-    std::shared_ptr<Lease> LeaseFor(const std::string& group_id) {
-        std::unique_lock<std::shared_mutex> lock(lock_);
-        auto [it, inserted] = groups_.try_emplace(group_id);
-        if (inserted) {
-            it->second.lease = std::make_shared<Lease>();
-        }
-        return it->second.lease;
-    }
-
-    bool AddMember(const std::string& group_id, const std::string& member_key) {
-        std::unique_lock<std::shared_mutex> lock(lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return false;  // group must be materialized via LeaseFor first
-        }
-        return it->second.member_keys.insert(member_key).second;
-    }
-
-    bool RemoveMember(const std::string& group_id,
-                      const std::string& member_key) {
-        std::unique_lock<std::shared_mutex> lock(lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return false;
-        }
-        const bool erased = it->second.member_keys.erase(member_key) > 0;
-        if (erased && it->second.Empty()) {
-            groups_.erase(it);
-        }
-        return erased;
-    }
-
-    std::vector<std::string> Members(const std::string& group_id) const {
-        std::shared_lock<std::shared_mutex> lock(lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return {};
-        }
-        return {it->second.member_keys.begin(), it->second.member_keys.end()};
-    }
-
-    bool Empty() const {
-        std::shared_lock<std::shared_mutex> lock(lock_);
-        return groups_.empty();
-    }
-
-   private:
-    struct GroupState {
-        std::unordered_set<std::string> member_keys;
-        std::shared_ptr<Lease> lease;
-
-        bool Empty() const { return member_keys.empty(); }
-    };
-
-    mutable std::shared_mutex lock_;
-    std::unordered_map<std::string, GroupState> groups_;
-};
-
 // The per-tenant ObjectIndex: the primary hash map (object key -> strong
 // ObjectEntry handle) plus the GroupIndex and the in-flight dynamic-
 // replication lease table. The group TTL is single-source (one Lease per
@@ -103,28 +37,6 @@ class ObjectIndex {
    public:
     ObjectIndex() = default;
     ~ObjectIndex() = default;
-
-    // --- GroupIndex operations (delegated; the GroupIndex owns its lock) ---
-
-    // Return (creating on demand) the single shared Lease for a group_id.
-    // Callers wire the returned lease into each member object's own lease slot,
-    // so the read path can extend the group TTL without touching this table.
-    std::shared_ptr<Lease> LeaseFor(const std::string& group_id) {
-        return group_index.LeaseFor(group_id);
-    }
-
-    bool AddMember(const std::string& group_id, const std::string& member_key) {
-        return group_index.AddMember(group_id, member_key);
-    }
-
-    bool RemoveMember(const std::string& group_id,
-                      const std::string& member_key) {
-        return group_index.RemoveMember(group_id, member_key);
-    }
-
-    std::vector<std::string> Members(const std::string& group_id) const {
-        return group_index.Members(group_id);
-    }
 
     // The object route is a flat map key -> strong ObjectEntry handle. Read
     // pins the entry under the shared route lock (fast), releases it, then
@@ -170,35 +82,6 @@ class ObjectIndex {
         return true;
     }
 
-    // Insert an object and, if it has a non-empty group_id, join the group:
-    // wire the group's shared Lease into the entry and register it as a member.
-    // Returns false if the key already exists. Group membership is wired and
-    // checked before the object is published, and rolled back if the publish
-    // fails, so a concurrently-pinned entry never observes a non-wired grouped
-    // member or a stale membership entry.
-    bool InsertObject(std::string key, std::shared_ptr<ObjectEntry> entry) {
-        // Enforce the route/membership invariant: the caller's `key` and the
-        // entry's key() must agree, otherwise the route and the grouped
-        // membership would disagree for this object.
-        if (key != entry->key()) {
-            return false;
-        }
-        const std::string group_id = entry->group_id();
-        if (!group_id.empty()) {
-            entry->metadata().SetLease(LeaseFor(group_id));
-            if (!AddMember(group_id, entry->key())) {
-                return false;
-            }
-        }
-        if (!Insert(entry->key(), entry)) {
-            if (!group_id.empty()) {
-                RemoveMember(group_id, entry->key());
-            }
-            return false;
-        }
-        return true;
-    }
-
     bool Contains(const std::string& key) const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         return route_.find(key) != route_.end();
@@ -211,10 +94,9 @@ class ObjectIndex {
 
     // True when the tenant holds no object route, no group membership, and no
     // in-flight dynamic-replication lease. Callers hold no locks when invoking.
+    // Empty of in-flight dynamic-replication leases and routed objects. Group
+    // membership lives in TenantCatalog's GroupIndex.
     bool Empty() const {
-        if (!group_index.Empty()) {
-            return false;
-        }
         std::shared_lock<std::shared_mutex> ll(leases_lock_);
         if (!dynamic_replication_leases.empty()) {
             return false;
@@ -339,8 +221,8 @@ class ObjectIndex {
     // Monotonic publication counter backing ObjectEntry::generation().
     std::atomic<uint64_t> generation_counter_{0};
 
-    // GroupIndex sub-index (see the class comment above).
-    GroupIndex group_index;
+    // In-flight dynamic-replication leases (proposal-id keyed). Group
+    // membership lives in TenantCatalog's GroupIndex.
 
     // In-flight dynamic-replication leases, keyed by proposal UUID (not by
     // object key), so they cannot fold into a per-object ObjectEntry. Guarded

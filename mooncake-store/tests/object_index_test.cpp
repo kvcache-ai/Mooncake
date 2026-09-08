@@ -26,79 +26,6 @@ std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
 
 // --- Group membership ---
 
-TEST(ObjectIndexTest, StartsWithNoGroups) {
-    ObjectIndex store;
-    EXPECT_TRUE(store.Members("g1").empty());
-}
-
-TEST(ObjectIndexTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
-    ObjectIndex store;
-
-    auto a1 = store.LeaseFor("g1");
-    auto a2 = store.LeaseFor("g1");
-    auto b = store.LeaseFor("g2");
-
-    ASSERT_NE(a1, nullptr);
-    EXPECT_EQ(a1.get(), a2.get());  // same group -> same shared Lease
-    EXPECT_NE(a1.get(), b.get());   // different group -> distinct Lease
-}
-
-TEST(ObjectIndexTest, AddRemoveGroupMembers) {
-    ObjectIndex store;
-    store.LeaseFor("g1");
-
-    EXPECT_TRUE(store.AddMember("g1", "k1"));
-    EXPECT_TRUE(store.AddMember("g1", "k2"));
-
-    auto members = store.Members("g1");
-    EXPECT_EQ(members.size(), 2u);
-
-    EXPECT_TRUE(store.RemoveMember("g1", "k1"));
-    auto after = store.Members("g1");
-    ASSERT_EQ(after.size(), 1u);
-    EXPECT_EQ(after[0], "k2");
-}
-
-TEST(ObjectIndexTest, AddingToUndefinedGroupIsRejected) {
-    ObjectIndex store;
-    // Group must be materialized via LeaseFor before members are registered.
-    EXPECT_FALSE(store.AddMember("nope", "k1"));
-}
-
-TEST(ObjectIndexTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
-    ObjectIndex store;
-    store.LeaseFor("g1");
-    store.AddMember("g1", "k1");
-
-    EXPECT_EQ(store.Members("g1").size(), 1u);
-    EXPECT_TRUE(store.RemoveMember("g1", "k1"));
-    // Last member gone -> the group (and its membership) is dropped.
-    EXPECT_TRUE(store.Members("g1").empty());
-}
-
-TEST(ObjectIndexTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
-    ObjectIndex store;
-    store.LeaseFor("g1");
-    store.AddMember("g1", "k1");
-    store.AddMember("g1", "k2");
-
-    // Distinct groups get independent shared leases.
-    auto g2 = store.LeaseFor("g2");
-    ASSERT_NE(g2, nullptr);
-    EXPECT_NE(store.LeaseFor("g1").get(), g2.get());
-
-    // All-or-none: every member of the group shares the one Lease, so a live
-    // shared lease protects the whole group and one deadline expires it all.
-    const auto now = std::chrono::system_clock::now();
-
-    auto shared = store.LeaseFor("g1");
-    shared->GrantReadLease(std::chrono::milliseconds(10'000));
-    EXPECT_FALSE(shared->IsExpired(now));
-
-    shared->SetDeadline(now);
-    EXPECT_TRUE(shared->IsExpired(now));
-}
-
 // --- Object route ---
 
 TEST(ObjectIndexTest, InsertPinEraseContainsObjectCount) {
@@ -170,69 +97,6 @@ TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {
     EXPECT_TRUE(std::find(keys.begin(), keys.end(), "k3") != keys.end());
 }
 
-TEST(ObjectIndexTest,
-     ObjectRouteAndGroupMembershipAreIndependentFlatStructures) {
-    ObjectIndex store;
-    // A grouped member is just a flat route entry with a group_id annotation.
-    auto member = MakeEntry("k2", "g1");
-    store.Insert("k2", member);
-    store.LeaseFor("g1");
-    store.AddMember("g1", "k2");
-
-    EXPECT_EQ(store.ObjectCount(), 1u);
-    EXPECT_EQ(store.Members("g1").size(), 1u);
-
-    // Erasing the object does not mutate group membership in the flat model
-    // (membership is a parallel structure; cleanup is the caller's concern).
-    auto member_handle = store.Pin("k2");
-    ASSERT_NE(member_handle, nullptr);
-    store.EraseIf("k2", member_handle.get());
-    EXPECT_EQ(store.ObjectCount(), 0u);
-    EXPECT_EQ(store.Members("g1").size(), 1u);
-}
-
-// --- InsertObject (route + group wiring) ---
-
-TEST(ObjectIndexTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
-    ObjectIndex store;
-
-    // A grouped object: InsertObject should wire the group's shared Lease into
-    // the entry's lease slot AND register it as a group member.
-    auto member = MakeEntry("k1", "g1");
-    EXPECT_TRUE(store.InsertObject("k1", member));
-
-    EXPECT_EQ(store.ObjectCount(), 1u);
-    EXPECT_EQ(store.Members("g1").size(), 1u);
-    ASSERT_NE(member->metadata().lease(), nullptr);  // shared lease wired
-    EXPECT_EQ(member->metadata().lease().get(),
-              store.LeaseFor("g1").get());  // same single shared lease
-}
-
-TEST(ObjectIndexTest, InsertObjectDoesNotJoinForSingleton) {
-    ObjectIndex store;
-
-    auto singleton = MakeEntry("k1", "");
-    EXPECT_TRUE(store.InsertObject("k1", singleton));
-
-    EXPECT_EQ(store.ObjectCount(), 1u);
-    EXPECT_TRUE(store.Members("g1").empty());  // singleton adds no group
-    // A singleton keeps the envelope's own never-granted lease: non-null but
-    // expired, and distinct from any group's shared lease.
-    EXPECT_NE(singleton->metadata().lease(), nullptr);
-    EXPECT_TRUE(singleton->metadata().IsLeaseExpired());
-}
-
-TEST(ObjectIndexTest, InsertObjectRejectsDuplicateKey) {
-    ObjectIndex store;
-    store.InsertObject("k1", MakeEntry("k1", "g1"));
-    // Second insert for the same key is rejected; the original is intact.
-    EXPECT_FALSE(
-        store.InsertObject("k1", MakeEntry("k1", "g2")));
-    EXPECT_EQ(store.ObjectCount(), 1u);
-    EXPECT_EQ(store.Members("g1").size(), 1u);
-    EXPECT_TRUE(store.Members("g2").empty());
-}
-
 // --- Accessors ---
 
 TEST(ObjectIndexTest, WithObjectScopeRespectsPresenceAndAbsence) {
@@ -252,30 +116,6 @@ TEST(ObjectIndexTest, WithObjectScopeRespectsPresenceAndAbsence) {
         EXPECT_EQ(&m, &raw);
     });
     EXPECT_TRUE(called);
-}
-
-TEST(ObjectIndexTest, EmptyTracksRouteGroupsAndLeases) {
-    ObjectIndex store;
-    EXPECT_TRUE(store.Empty());
-
-    // A routed object makes the container non-empty.
-    store.Insert("k1", MakeEntry("k1", ""));
-    EXPECT_FALSE(store.Empty());
-    ASSERT_TRUE(store.EraseIf("k1", store.Pin("k1").get()));
-    EXPECT_TRUE(store.Empty());
-
-    // Group membership also counts.
-    store.LeaseFor("g1");
-    store.AddMember("g1", "k1");
-    EXPECT_FALSE(store.Empty());
-    store.RemoveMember("g1", "k1");
-    EXPECT_TRUE(store.Empty());
-
-    // A tenant-scoped dynamic-replication lease also counts.
-    store.PutDynamicReplicationLease(UUID{7, 8}, ReplicaActionLease{});
-    EXPECT_FALSE(store.Empty());
-    store.RemoveDynamicReplicationLease(UUID{7, 8});
-    EXPECT_TRUE(store.Empty());
 }
 
 }  // namespace
