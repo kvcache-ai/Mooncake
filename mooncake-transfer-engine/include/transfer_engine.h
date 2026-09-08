@@ -142,6 +142,9 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
 
+    Status submitCancellableTransfer(
+        BatchID batch_id, const std::vector<TransferRequest>& entries);
+
     struct ScatterTransferRange {
         TransferRequest::OpCode opcode;
         std::string remote_segment;

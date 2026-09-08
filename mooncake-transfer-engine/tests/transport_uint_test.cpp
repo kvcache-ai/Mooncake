@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstdlib>
 #include <fstream>
@@ -310,6 +311,141 @@ class TerminalFailureTransport : public BatchResultTransport {
    private:
     bool initially_finished_;
     std::vector<TransferTask*> tasks_;
+};
+
+enum class ScatterPollFailure { kStatusError, kTimeout };
+
+class ScatterDrainProbeTransport : public BatchResultTransport {
+   public:
+    explicit ScatterDrainProbeTransport(ScatterPollFailure failure)
+        : failure_(failure) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        tasks_ = tasks;
+        for (auto* task : tasks_) {
+            task->slice_count = task->request_count;
+            auto* slice = new Slice{};
+            slice->task = task;
+            slice->length = task->request[0].length;
+            slice->status = Slice::POSTED;
+            slice->source_addr = this;
+            slice->cleanup_callback = [](Slice* released) {
+                auto* transport = static_cast<ScatterDrainProbeTransport*>(
+                    released->source_addr);
+                transport->released_before_physical_completion_.store(
+                    !transport->physical_completion_.load());
+                transport->batch_released_.store(true);
+            };
+            task->slice_list.push_back(slice);
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        first_poll_seen_ = true;
+        cv_.notify_all();
+        if (allow_terminal_status_) {
+            status.s = TransferStatusEnum::FAILED;
+            return Status::OK();
+        }
+        if (failure_ == ScatterPollFailure::kStatusError)
+            return Status::Context("synthetic scatter status failure");
+        status.s = TransferStatusEnum::TIMEOUT;
+        return Status::OK();
+    }
+
+    bool waitForFirstPoll() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return cv_.wait_for(lock, std::chrono::seconds(1),
+                            [this] { return first_poll_seen_; });
+    }
+
+    void finishPhysicalTransfer() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        physical_completion_.store(true);
+        for (auto* task : tasks_) {
+            __atomic_store_n(&task->failed_slice_count, task->slice_count,
+                             __ATOMIC_RELEASE);
+            for (auto* slice : task->slice_list) slice->status = Slice::FAILED;
+        }
+    }
+
+    void allowTerminalStatus() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        allow_terminal_status_ = true;
+    }
+
+    bool batchReleased() const { return batch_released_.load(); }
+
+    bool releasedBeforePhysicalCompletion() const {
+        return released_before_physical_completion_.load();
+    }
+
+   private:
+    ScatterPollFailure failure_;
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+    std::vector<TransferTask*> tasks_;
+    std::atomic<bool> physical_completion_{false};
+    std::atomic<bool> batch_released_{false};
+    std::atomic<bool> released_before_physical_completion_{false};
+    bool first_poll_seen_ = false;
+    bool allow_terminal_status_ = false;
+};
+
+class PrePublishFailureTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        return Status::InvalidArgument("synthetic pre-publish failure");
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        if (!allow_cleanup_) {
+            return Status::Context("synthetic unpublished status failure");
+        }
+        for (auto* task : tasks_) task->is_finished = true;
+        status.s = TransferStatusEnum::FAILED;
+        return Status::OK();
+    }
+
+    void allowCleanup() { allow_cleanup_ = true; }
+
+   private:
+    std::vector<TransferTask*> tasks_;
+    bool allow_cleanup_ = false;
+};
+
+class GroupedDrainResultTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        for (auto* task : tasks) {
+            for (size_t i = 0; i < task->request_count; ++i) {
+                auto* slice = new Slice{};
+                slice->task = task;
+                slice->length = task->request[i].length;
+                task->slice_list.push_back(slice);
+                __atomic_add_fetch(&task->slice_count, 1, __ATOMIC_ACQ_REL);
+                if (i == 0) {
+                    slice->markSuccess();
+                } else {
+                    slice->markFailed();
+                }
+            }
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::Context("synthetic grouped status failure");
+    }
+
+    bool supportsGroupedScatter() const override { return true; }
 };
 
 class TransportTest : public ::testing::Test {
@@ -832,6 +968,165 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
     transport->addExtraSlice();
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
+}
+
+TEST_F(TransportTest, ScatterPrePublishFailureDoesNotWaitForPhysicalSlices) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<PrePublishFailureTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"pre-publish-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 14;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "pre-publish-remote";
+    descriptor->protocol = "pre-publish-failure";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "pre-publish-remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    size_t callback_count = 0;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "pre-publish-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                EXPECT_FALSE(status.ok());
+                ++callback_count;
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    auto status = operation.waitFor(std::chrono::milliseconds(20));
+    EXPECT_FALSE(status.IsClock());
+    EXPECT_EQ(callback_count, 1u);
+
+    transport->allowCleanup();
+    EXPECT_FALSE(operation.wait().ok());
+}
+
+TEST_F(TransportTest, GroupedScatterDrainPreservesFragmentResults) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<GroupedDrainResultTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"grouped-drain-results", transport}});
+
+    constexpr SegmentID kSegmentId = 15;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "grouped-drain-remote";
+    descriptor->protocol = "grouped-drain-results";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "grouped-drain-remote",
+                                        std::move(descriptor));
+
+    std::array<char, 2> buffer{};
+    std::array<size_t, 2> offsets{0, 1};
+    std::array<size_t, 2> lengths{1, 1};
+    std::vector<bool> fragment_ok;
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "grouped-drain-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                fragment_ok.push_back(status.ok());
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    EXPECT_FALSE(operation.wait().ok());
+    EXPECT_EQ(fragment_ok, (std::vector<bool>{true, false}));
+}
+
+void expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure failure) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<ScatterDrainProbeTransport>(failure);
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"scatter-drain-probe", transport}});
+
+    constexpr SegmentID kSegmentId = 13;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "scatter-drain-remote";
+    descriptor->protocol = "scatter-drain-probe";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "scatter-drain-remote",
+                                        std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
+    std::atomic<size_t> callback_count{0};
+    std::atomic<bool> callback_ok{true};
+    TransferEngine::ScatterTransferRange range{
+        .opcode = TransferRequest::READ,
+        .remote_segment = "scatter-drain-remote",
+        .remote_base_offset = 0,
+        .remote_size = buffer.size(),
+        .local_buffer = buffer.data(),
+        .local_capacity = buffer.size(),
+        .local_offsets = offsets,
+        .remote_offsets = offsets,
+        .lengths = lengths,
+        .on_fragment_complete =
+            [&](size_t, const Status& status) {
+                callback_ok.store(status.ok());
+                callback_count.fetch_add(1);
+            },
+    };
+
+    auto operation = engine.submitScatter({range});
+    auto destruction = std::async(
+        std::launch::async, [operation = std::move(operation)]() mutable {
+            auto local_operation = std::move(operation);
+        });
+
+    const bool polled = transport->waitForFirstPoll();
+    EXPECT_TRUE(polled);
+    EXPECT_EQ(destruction.wait_for(std::chrono::milliseconds(20)),
+              std::future_status::timeout);
+    EXPECT_FALSE(transport->batchReleased());
+    EXPECT_EQ(callback_count.load(), 0u);
+
+    transport->finishPhysicalTransfer();
+    const auto drained = destruction.wait_for(std::chrono::milliseconds(500));
+    EXPECT_EQ(drained, std::future_status::ready);
+    if (drained != std::future_status::ready) {
+        transport->allowTerminalStatus();
+        ASSERT_EQ(destruction.wait_for(std::chrono::seconds(1)),
+                  std::future_status::ready);
+    }
+    destruction.get();
+
+    EXPECT_TRUE(transport->batchReleased());
+    EXPECT_FALSE(transport->releasedBeforePhysicalCompletion());
+    EXPECT_EQ(callback_count.load(), 1u);
+    EXPECT_FALSE(callback_ok.load());
+}
+
+TEST_F(TransportTest, LegacyScatterDrainsAfterStatusQueryFailure) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kStatusError);
+}
+
+TEST_F(TransportTest, LegacyScatterDrainsAfterTimeout) {
+    expectLegacyScatterDrainAfterPollFailure(ScatterPollFailure::kTimeout);
 }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION

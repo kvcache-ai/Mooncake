@@ -321,6 +321,10 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    // Pins a direct cancellable route before publishing transport work.
+    Status submitCancellableTransfer(BatchID batch_id,
+                                     const std::vector<Request>& request_list);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
