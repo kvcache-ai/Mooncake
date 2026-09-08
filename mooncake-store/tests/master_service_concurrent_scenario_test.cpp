@@ -120,7 +120,7 @@ TEST(MasterServiceConcurrentScenarioTest, LeasedReadsHoldOffARacingRemoveAll) {
 }
 
 TEST(MasterServiceConcurrentScenarioTest,
-     ConcurrentRemoveAllsPartitionTheStore) {
+     ConcurrentRemoveAllOperationsPartitionTheStore) {
     constexpr size_t kObjectCount = 1000;
     MasterScenario scenario("two RemoveAll sweeps partition the objects");
     scenario.Given(MemoryNode("memory").Capacity(256 * 1024 * 1024))
