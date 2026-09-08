@@ -219,7 +219,7 @@ class HARecoveryManagerTest : public ::testing::Test {
         auto& svc = master_.GetWrapped().GetMasterService();
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         do {
-            if (svc.GetReplicaList(key).has_value()) {
+            if (svc.GetReadRoute(key).has_value()) {
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -417,9 +417,9 @@ TEST_F(HARecoveryManagerTest, ReconnectResyncsLocalReplicaToP2PMaster) {
         << "Replica did not become visible on the P2P master";
 
     auto& svc = master_.GetWrapped().GetMasterService();
-    auto result = svc.GetReplicaList(key);
+    auto result = svc.GetReadRoute(key);
     ASSERT_TRUE(result.has_value())
-        << "GetReplicaList failed: " << result.error();
+        << "GetReadRoute failed: " << result.error();
     ASSERT_EQ(result.value().replicas.size(), 1);
     const auto& replica = result.value().replicas[0];
     ASSERT_TRUE(replica.is_p2p_proxy_replica());
@@ -450,7 +450,7 @@ TEST_F(HARecoveryManagerTest, RegisterOnlyRecoverySkipsLocalReplicaResync) {
     WaitUntilFull(*mgr);
 
     auto& svc = master_.GetWrapped().GetMasterService();
-    auto result = svc.GetReplicaList(key);
+    auto result = svc.GetReadRoute(key);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }

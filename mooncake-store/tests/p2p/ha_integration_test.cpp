@@ -112,7 +112,7 @@ class HAIntegrationTest : public ::testing::Test {
     }
 
     // For cross-client reads immediately after a Put on another client, the
-    // async BatchSyncReplica notification may not have reached master yet.
+    // async BatchSyncRoutes notification may not have reached master yet.
     // Retry on OBJECT_NOT_FOUND until master learns about the replica.
     static tl::expected<std::string, ErrorCode> GetDataWithRetry(
         std::shared_ptr<P2PClientService>& client, const std::string& key,
@@ -334,7 +334,7 @@ TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
     ASSERT_TRUE(put.has_value());
 
     // Verify data is accessible before degradation (client1 → master →
-    // client2). Use retry: async BatchSyncReplica may not have reached master
+    // client2). Use retry: async BatchSyncRoutes may not have reached master
     // yet.
     auto get_before = GetDataWithRetry(client1_, "a3_client2_key", 10);
     ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
@@ -364,7 +364,7 @@ TEST_F(HAIntegrationTest, RecoverFromDegradedRemoteGet) {
     ASSERT_TRUE(put.has_value());
 
     // Verify data is accessible before degradation (client1 → master →
-    // client2). Use retry: async BatchSyncReplica may not have reached master
+    // client2). Use retry: async BatchSyncRoutes may not have reached master
     // yet.
     auto get_before = GetDataWithRetry(client1_, "a4_client2_key", 11);
     ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
@@ -498,10 +498,7 @@ TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
     ASSERT_FALSE(expected_segments.empty());
 
     auto& svc = master_.GetWrapped().GetMasterService();
-    P2PUnregisterClientRequest unreg;
-    unreg.client_id = client1_->GetClientID();
-    unreg.deployment_mode = DeploymentMode::P2P;
-    auto unreg_result = svc.UnregisterClient(unreg);
+    auto unreg_result = svc.UnregisterClient(client1_->GetClientID());
     ASSERT_TRUE(unreg_result.has_value())
         << "UnregisterClient failed: " << unreg_result.error();
 
@@ -617,13 +614,11 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
 
     // Verify both are HEALTH initially
     {
-        P2PQueryClientStatusRequest req;
-        req.client_id = tmp1->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp1->GetClientID());
         ASSERT_TRUE(res.has_value());
-        ASSERT_EQ(res.value().status, P2PClientStatus::HEALTH);
+        ASSERT_EQ(res.value(), P2PClientStatus::HEALTH);
     }
 
     // Simulate client1 network failure: stop its heartbeat
@@ -634,25 +629,21 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
 
     // Verify master side: tmp1 is DISCONNECTION
     {
-        P2PQueryClientStatusRequest req;
-        req.client_id = tmp1->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp1->GetClientID());
         ASSERT_TRUE(res.has_value());
-        EXPECT_EQ(res.value().status, P2PClientStatus::DISCONNECTION)
+        EXPECT_EQ(res.value(), P2PClientStatus::DISCONNECTION)
             << "Master should have marked disconnected client";
     }
 
     // Verify tmp2 is still HEALTH
     {
-        P2PQueryClientStatusRequest req;
-        req.client_id = tmp2->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp2->GetClientID());
         ASSERT_TRUE(res.has_value());
-        EXPECT_EQ(res.value().status, P2PClientStatus::HEALTH);
+        EXPECT_EQ(res.value(), P2PClientStatus::HEALTH);
     }
 
     // Recover: manually send heartbeat from tmp1
@@ -667,13 +658,11 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
 
     // Verify master side: tmp1 is HEALTH again
     {
-        P2PQueryClientStatusRequest req;
-        req.client_id = tmp1->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp1->GetClientID());
         ASSERT_TRUE(res.has_value());
-        EXPECT_EQ(res.value().status, P2PClientStatus::HEALTH)
+        EXPECT_EQ(res.value(), P2PClientStatus::HEALTH)
             << "Client should be HEALTH after recovery heartbeat";
     }
 

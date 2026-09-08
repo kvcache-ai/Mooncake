@@ -202,11 +202,15 @@ class P2PClientService final : public ClientService {
 
     P2PMasterClient& GetMasterClient() { return master_client_; }
 
+    // TODO(C4 / external interface; see p2p-split-plan-v2.md): Implement the
+    // P2P BatchQueryIp facade after architecture-specific query APIs are split.
     tl::expected<
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids) override;
 
+    // TODO(C4 / external interface; see p2p-split-plan-v2.md): Return
+    // P2PRouteDescriptor directly after QueryResult is split by architecture.
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
@@ -338,7 +342,7 @@ class P2PClientService final : public ClientService {
                               std::vector<std::vector<Slice>>& batched_slices,
                               const std::vector<size_t>& sizes,
                               const WriteRouteRequestConfig& route_config,
-                              BatchGetWriteRouteResponse& batch_resp);
+                              P2PBatchGetWriteRouteResponse& batch_resp);
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
     CreatePutHandleFromLocal(std::string_view key, std::vector<Slice>& slices);
@@ -349,9 +353,10 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys, P2PClientMetric* metrics = nullptr,
         const std::vector<size_t>* sizes = nullptr);
 
-    tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
-        const std::vector<ObjectKey>& keys, const std::vector<size_t>& sizes,
-        const WriteRouteRequestConfig& config);
+    tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
+    BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
+                          const std::vector<size_t>& sizes,
+                          const WriteRouteRequestConfig& config);
 
     struct WriteOp {
         virtual ~WriteOp() = default;
@@ -438,7 +443,7 @@ class P2PClientService final : public ClientService {
     tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
     BuildWriteOps(std::string_view key, std::vector<Slice>& slices,
                   size_t object_size, const WriteRouteRequestConfig& config,
-                  std::vector<WriteCandidate> candidates);
+                  std::vector<P2PWriteCandidate> candidates);
 
     async_simple::coro::Lazy<void> RunWriteWithRetry(
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
@@ -488,8 +493,8 @@ class P2PClientService final : public ClientService {
 
     std::vector<ResolvedRoute> LoadCachedRoutes(std::string_view key);
 
-    std::vector<ResolvedRoute> ReplicasToRoutes(
-        const std::vector<Replica::Descriptor>& replicas);
+    std::vector<ResolvedRoute> RouteDescriptorsToRoutes(
+        const std::vector<P2PRouteDescriptor>& descriptors);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
         std::string_view key, const ReadRouteConfig& config);

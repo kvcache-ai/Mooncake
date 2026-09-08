@@ -58,7 +58,7 @@ void HARecoveryManager::EnterLocalOnly() {
 }
 
 tl::expected<void, ErrorCode> HARecoveryManager::SetSyncCompleted() {
-    auto result = master_client_.SetSyncCompleted(client_id_);
+    auto result = master_client_.CompleteRouteSync(client_id_);
     if (!result) {
         LOG(ERROR) << "SetSyncCompleted RPC failed: " << result.error();
     }

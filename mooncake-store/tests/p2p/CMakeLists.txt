@@ -18,6 +18,7 @@ endfunction()
 
 # master side
 add_p2p_store_test(p2p_route_table_test p2p_route_table_test.cpp)
+add_p2p_store_test(p2p_rpc_types_test p2p_rpc_types_test.cpp)
 add_p2p_store_test(p2p_master_service_test p2p_master_service_test.cpp)
 add_p2p_store_test(p2p_master_http_endpoints_test p2p_master_http_endpoints_test.cpp)
 add_p2p_store_test(p2p_master_metrics_test p2p_master_metrics_test.cpp)

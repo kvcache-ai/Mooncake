@@ -112,20 +112,20 @@ class ScopedStandbyRegistryProviders final {
 };
 #endif
 
-std::unique_ptr<WrappedP2PMasterService> CreateActiveService(
+std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version) {
     auto service =
-        std::make_unique<WrappedP2PMasterService>(config, view_version);
+        std::make_unique<P2PMasterRpcService>(config, view_version);
     service->init();
     return service;
 }
 
 int RunActiveRpcServers(const P2PMasterConfig& config,
                         coro_rpc::coro_rpc_server& server,
-                        WrappedP2PMasterService& wrapped_service,
+                        P2PMasterRpcService& p2p_service,
                         std::function<void()> before_start = {}) {
     const bool dedicated_heartbeat = config.rpc.heartbeat_port > 0;
-    RegisterP2PRpcService(server, wrapped_service,
+    RegisterP2PRpcService(server, p2p_service,
                           /*include_heartbeat=*/!dedicated_heartbeat);
     if (before_start) {
         before_start();
@@ -138,7 +138,7 @@ int RunActiveRpcServers(const P2PMasterConfig& config,
             config.rpc.heartbeat_port, config.rpc.address,
             std::chrono::seconds(config.rpc.connection_timeout_seconds),
             config.rpc.enable_tcp_no_delay);
-        RegisterP2PHeartbeatRpcService(*heartbeat_server, wrapped_service);
+        RegisterP2PHeartbeatRpcService(*heartbeat_server, p2p_service);
         auto heartbeat_result = heartbeat_server->async_start();
         if (heartbeat_result.hasResult()) {
             LOG(ERROR) << "Failed to start heartbeat RPC server: "

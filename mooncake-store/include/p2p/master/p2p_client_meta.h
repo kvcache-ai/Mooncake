@@ -84,15 +84,15 @@ class P2PClientMeta final {
      *
      * Performs health check and capacity filtering (tag_filters /
      * priority_limit / top_tier_only) internally and, on success, returns a
-     * WriteCandidate whose `score` is the raw free ratio (free/total over
+     * P2PWriteCandidate whose `score` is the raw free ratio (free/total over
      * eligible tiers).
      *
-     * @return A populated WriteCandidate when this client is routable;
+     * @return A populated P2PWriteCandidate when this client is routable;
      *         std::nullopt when it is not a candidate (unhealthy, no eligible
      *         tier, or insufficient free capacity).
      */
-    std::optional<WriteCandidate> GetWriteRouteCandidate(
-        const WriteRouteRequest& req);
+    std::optional<P2PWriteCandidate> GetWriteRouteCandidate(
+        const P2PGetWriteRouteRequest& req);
 
     void SetSyncing(bool syncing) {
         is_syncing_.store(syncing, std::memory_order_release);

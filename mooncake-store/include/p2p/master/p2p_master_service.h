@@ -1,6 +1,8 @@
 #pragma once
 
-#include <boost/functional/hash.hpp>
+#include <array>
+#include <cstddef>
+#include <functional>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -8,15 +10,16 @@
 #include <unordered_set>
 #include <vector>
 
+#include <boost/functional/hash.hpp>
 #include <ylt/util/tl/expected.hpp>
 
+#include "mutex.h"
 #include "p2p/common/p2p_master_config.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/p2p_standby_metadata_store.h"
 #include "p2p/master/p2p_client_manager.h"
 #include "p2p/master/p2p_route_table.h"
-#include "replica.h"
 #include "types.h"
 
 namespace mooncake {
@@ -28,7 +31,7 @@ namespace mooncake {
  * metadata to P2PClientManager.
  *
  * Lock order:
- * 1. P2PRouteTable route shard mutex
+ * 1. P2PMasterService route shard mutex
  * 2. P2PClientManager::clients_mutex_
  * 3. P2PSegmentManager::segments_mutex_
  */
@@ -44,13 +47,13 @@ class P2PMasterService {
     }
 
     auto RegisterClient(const P2PRegisterClientRequest& req)
-        -> tl::expected<P2PRegisterClientResponse, ErrorCode>;
-    auto UnregisterClient(const P2PUnregisterClientRequest& req)
-        -> tl::expected<P2PUnregisterClientResponse, ErrorCode>;
+        -> tl::expected<ViewVersionId, ErrorCode>;
+    auto UnregisterClient(const UUID& client_id)
+        -> tl::expected<ViewVersionId, ErrorCode>;
     auto Heartbeat(const P2PHeartbeatRequest& req)
         -> tl::expected<P2PHeartbeatResponse, ErrorCode>;
-    auto QueryClientStatus(const P2PQueryClientStatusRequest& req)
-        -> tl::expected<P2PQueryClientStatusResponse, ErrorCode>;
+    auto QueryClientStatus(const UUID& client_id)
+        -> tl::expected<P2PClientStatus, ErrorCode>;
 
     auto MountSegment(const P2PSegment& segment, const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
@@ -72,16 +75,12 @@ class P2PMasterService {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>;
 
-    // TODO(M8.3; see p2p-master-final-refactor-plan.md): Return P2P-owned route
-    // descriptors instead of Replica::Descriptor.
-    auto GetReplicaListByRegex(const std::string& regex_pattern)
-        -> tl::expected<
-            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-            ErrorCode>;
-    auto GetReplicaList(std::string_view key,
-                        const P2PGetReplicaListRequestConfig& config =
-                            P2PGetReplicaListRequestConfig())
-        -> tl::expected<P2PGetReplicaListResponse, ErrorCode>;
+    auto GetReadRouteByRegex(std::string_view regex_pattern) -> tl::expected<
+        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
+        ErrorCode>;
+    auto GetReadRoute(std::string_view key,
+                      const P2PReadRouteConfig& config = P2PReadRouteConfig())
+        -> tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>;
 
     auto Remove(std::string_view key, bool force = false)
         -> tl::expected<void, ErrorCode>;
@@ -92,39 +91,39 @@ class P2PMasterService {
 
     OpLogManager* GetOpLogManager() const { return oplog_manager_.get(); }
 
-    auto GetWriteRoute(const WriteRouteRequest& req)
-        -> tl::expected<WriteRouteResponse, ErrorCode>;
+    auto GetWriteRoute(const P2PGetWriteRouteRequest& req)
+        -> tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>;
 
     /**
      * @brief Batch get write routes for multiple keys.
      *        Reuses GetWriteRoute logic per key.
      */
-    auto BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
-        -> BatchGetWriteRouteResponse;
+    auto BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req)
+        -> P2PBatchGetWriteRouteResponse;
 
     /**
      * @brief Add a route replica to master
      */
-    auto AddReplica(const AddReplicaRequest& req)
+    auto AddReplica(const P2PPublishRouteRequest& req)
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Remove a route replica from master
      */
-    auto RemoveReplica(const RemoveReplicaRequest& req)
+    auto RemoveReplica(const P2PWithdrawRouteRequest& req)
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Remove replicas from multiple segments in one call
      */
-    auto BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
+    auto BatchRemoveReplica(const P2PBatchWithdrawRouteRequest& req)
         -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**
-     * @brief Batch sync replicas with mixed ADD and REMOVE ops
+     * @brief Batch sync routes with mixed publish and withdraw operations.
      */
-    auto BatchSyncReplica(const BatchSyncReplicaRequest& req)
-        -> BatchSyncReplicaResponse;
+    auto BatchSyncRoutes(const P2PBatchSyncRoutesRequest& request)
+        -> P2PBatchSyncRoutesResponse;
 
     /**
      * @brief Client notifies Master that metadata sync is complete
@@ -151,20 +150,14 @@ class P2PMasterService {
 
     void InitializeClientManager();
     void OnSegmentRemoved(const P2PRouteLocation& location);
-    static OwnerClientSet CollectRouteOwnerClients(
-        const P2PRouteEntry& route);
+    static OwnerClientSet CollectRouteOwnerClients(const P2PRouteEntry& route);
 
-    // TODO(M8.3; see p2p-master-final-refactor-plan.md): Return a P2P-owned
-    // route descriptor instead of Replica::Descriptor.
-    auto BuildReplicaDescriptor(const P2PRouteLocation& location,
-                                uint64_t object_size) const
-        -> tl::expected<Replica::Descriptor, ErrorCode>;
+    auto BuildRouteDescriptor(const P2PRouteLocation& location,
+                              uint64_t object_size) const
+        -> tl::expected<P2PRouteDescriptor, ErrorCode>;
 
-    // TODO(M8.3; see p2p-master-final-refactor-plan.md): Return P2P-owned route
-    // descriptors instead of Replica::Descriptor.
-    std::vector<Replica::Descriptor> FilterRoutes(
-        const P2PGetReplicaListRequestConfig& config,
-        const P2PRouteEntry& route) const;
+    std::vector<P2PRouteDescriptor> FilterRoutes(
+        const P2PReadRouteConfig& config, const P2PRouteEntry& route) const;
 
     auto InnerAddReplica(std::string_view key, const UUID& client_id,
                          const UUID& segment_id, size_t size,
@@ -174,8 +167,32 @@ class P2PMasterService {
                             const UUID& segment_id)
         -> tl::expected<void, ErrorCode>;
 
-    P2PRouteTable route_table_;
-    uint64_t max_client_per_key_;
+    auto ApplyPublishLocked(P2PRouteTable& table, std::string_view key,
+                            const UUID& client_id, const UUID& segment_id,
+                            size_t size,
+                            const std::shared_ptr<P2PClientMeta>& client)
+        -> tl::expected<void, ErrorCode> NO_THREAD_SAFETY_ANALYSIS;
+    auto ApplyWithdrawLocked(P2PRouteTable& table, std::string_view key,
+                             const UUID& client_id, const UUID& segment_id)
+        -> tl::expected<void, ErrorCode> NO_THREAD_SAFETY_ANALYSIS;
+
+   private:
+    static constexpr size_t kRouteShardCount = 1024;
+
+    struct RouteShard {
+        mutable SharedMutex mutex;
+        P2PRouteTable table GUARDED_BY(mutex);
+    };
+
+    size_t GetRouteShardIndex(std::string_view key) const {
+        return std::hash<std::string_view>{}(key) % kRouteShardCount;
+    }
+    std::optional<P2PRouteEntry> GetRouteSnapshot(std::string_view key) const;
+    std::vector<std::string> ListRouteKeys() const;
+
+   private:
+    std::array<RouteShard, kRouteShardCount> route_shards_;
+    const uint64_t max_client_per_key_;
     bool enable_async_oplog_write_{false};
     ViewVersionId view_version_;
     std::unique_ptr<OpLogManager> oplog_manager_;

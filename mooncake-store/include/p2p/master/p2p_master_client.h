@@ -68,44 +68,27 @@ class P2PMasterClient final {
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string_view>& object_keys);
 
-    [[nodiscard]] tl::expected<P2PGetReplicaListResponse, ErrorCode>
-    GetReplicaList(std::string_view key,
-                   const P2PGetReplicaListRequestConfig& config =
-                       P2PGetReplicaListRequestConfig());
+    [[nodiscard]] tl::expected<
+        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
+        ErrorCode>
+    GetReadRouteByRegex(std::string_view regex);
+
+    [[nodiscard]] tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>
+    GetReadRoute(std::string_view key, const P2PReadRouteConfig& config);
 
     [[nodiscard]] async_simple::coro::Lazy<
-        tl::expected<P2PGetReplicaListResponse, ErrorCode>>
-    AsyncGetReplicaList(std::string_view key,
-                        const P2PGetReplicaListRequestConfig& config =
-                            P2PGetReplicaListRequestConfig());
+        tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
+    AsyncGetReadRoute(std::string_view key, const P2PReadRouteConfig& config);
 
-    [[nodiscard]] std::vector<tl::expected<P2PGetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string_view>& keys,
-                        const P2PGetReplicaListRequestConfig& config =
-                            P2PGetReplicaListRequestConfig());
-
-    [[nodiscard]] tl::expected<
-        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
-        ErrorCode>
-    BatchQueryIp(const std::vector<UUID>& client_ids);
-
-    [[nodiscard]] tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode>
-    GetReplicaListByRegex(const std::string& str);
-
-    [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key,
-                                                       bool force = false);
-
-    [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
-        std::string_view str, bool force = false);
-
-    [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
+    BatchGetReadRoute(const std::vector<std::string_view>& keys,
+                      const P2PReadRouteConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
         const UUID& segment_id);
 
-    [[nodiscard]] tl::expected<P2PQueryClientStatusResponse, ErrorCode>
+    [[nodiscard]] tl::expected<P2PClientStatus, ErrorCode>
     QueryClientStatus(const UUID& client_id);
 
     [[nodiscard]] tl::expected<P2PHeartbeatResponse, ErrorCode> Heartbeat(
@@ -114,55 +97,55 @@ class P2PMasterClient final {
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const P2PSegment& segment);
 
-    [[nodiscard]] tl::expected<P2PRegisterClientResponse, ErrorCode>
+    [[nodiscard]] tl::expected<ViewVersionId, ErrorCode>
     RegisterClient(const P2PRegisterClientRequest& req);
 
-    [[nodiscard]] tl::expected<P2PUnregisterClientResponse, ErrorCode>
-    UnregisterClient(const P2PUnregisterClientRequest& req);
+    [[nodiscard]] tl::expected<ViewVersionId, ErrorCode>
+    UnregisterClient(const UUID& client_id);
 
-    [[nodiscard]] tl::expected<WriteRouteResponse, ErrorCode> GetWriteRoute(
-        const WriteRouteRequest& req);
+    [[nodiscard]] tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>
+    GetWriteRoute(const P2PGetWriteRouteRequest& req);
 
     /**
      * @brief Batch gets write candidate routes for multiple keys in one RPC
      */
-    [[nodiscard]] tl::expected<BatchGetWriteRouteResponse, ErrorCode>
-    BatchGetWriteRoute(const BatchGetWriteRouteRequest& req);
+    [[nodiscard]] tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
+    BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req);
 
     /**
-     * @brief Adds a replica to master
+     * @brief Publishes a route to master
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> AddReplica(
-        const AddReplicaRequest& req);
+    [[nodiscard]] tl::expected<void, ErrorCode> PublishRoute(
+        const P2PPublishRouteRequest& req);
 
     /**
-     * @brief Removes a replica from master
+     * @brief Withdraws a route from master
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> RemoveReplica(
-        const RemoveReplicaRequest& req);
+    [[nodiscard]] tl::expected<void, ErrorCode> WithdrawRoute(
+        const P2PWithdrawRouteRequest& req);
 
     /**
-     * @brief Removes replicas from multiple segments in one call
+     * @brief Withdraws routes from multiple segments in one call
      */
-    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
-        const BatchRemoveReplicaRequest& req);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchWithdrawRoute(
+        const P2PBatchWithdrawRouteRequest& req);
 
     /**
-     * @brief Batch sync replicas with mixed ADD and REMOVE ops
+     * @brief Batch sync routes with mixed publish and withdraw operations
      */
-    [[nodiscard]] tl::expected<BatchSyncReplicaResponse, ErrorCode>
-    BatchSyncReplica(const BatchSyncReplicaRequest& req);
+    [[nodiscard]] tl::expected<P2PBatchSyncRoutesResponse, ErrorCode>
+    BatchSyncRoutes(const P2PBatchSyncRoutesRequest& req);
 
     /**
-     * @brief Notify Master that this client has finished syncing metadata
+     * @brief Notify Master that this client has finished syncing routes
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> SetSyncCompleted(
-        UUID client_id);
+    [[nodiscard]] tl::expected<void, ErrorCode> CompleteRouteSync(
+        const UUID& client_id);
 
    private:
-    // TODO(M8): Re-evaluate extracting the pool access, invoke, batch-failure
-    // and RPC-metric plumbing into a stateless shared transport helper after the
-    // architecture-specific protocols stabilize. Keep this implementation
+    // TODO: Re-evaluate extracting the pool access, invoke, batch-failure
+    // and RPC-metric plumbing into a stateless shared transport helper after
+    // the architecture-specific protocols stabilize. Keep this implementation
     // local for now so centralized MasterClient remains identical to the A00
     // baseline.
     template <auto ServiceMethod, typename ReturnType, typename... Args>

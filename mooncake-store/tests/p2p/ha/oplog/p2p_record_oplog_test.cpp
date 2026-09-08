@@ -119,10 +119,7 @@ class P2PRecordOplogTest : public ::testing::Test {
 
     void UnregisterClient(P2PMasterService& service,
                           const UUID& client_id) const {
-        P2PUnregisterClientRequest req;
-        req.client_id = client_id;
-        req.deployment_mode = DeploymentMode::P2P;
-        auto result = service.UnregisterClient(req);
+        auto result = service.UnregisterClient(client_id);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
@@ -141,18 +138,18 @@ class P2PRecordOplogTest : public ::testing::Test {
     void AddReplica(P2PMasterService& service, const std::string& key,
                     const UUID& client_id, const UUID& segment_id,
                     size_t size = 4096) const {
-        AddReplicaRequest req;
+        P2PPublishRouteRequest req;
         req.key = key;
         req.client_id = client_id;
         req.segment_id = segment_id;
-        req.size = size;
+        req.object_size = size;
         auto result = service.AddReplica(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
     void RemoveReplica(P2PMasterService& service, const std::string& key,
                        const UUID& client_id, const UUID& segment_id) const {
-        RemoveReplicaRequest req;
+        P2PWithdrawRouteRequest req;
         req.key = key;
         req.client_id = client_id;
         req.segment_id = segment_id;
@@ -364,26 +361,30 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaRecordsOplog) {
     EXPECT_EQ(payload.segment_id, segment_id);
 }
 
-TEST_F(P2PRecordOplogTest, BatchSyncReplicaRecordsSuccessfulOps) {
+TEST_F(P2PRecordOplogTest, BatchSyncRoutesRecordsSuccessfulOps) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{12, 12};
     const UUID segment_id{13, 13};
     RegisterClient(service, client_id, MakeSegment(segment_id));
     AddReplica(service, "old-key", client_id, segment_id);
 
-    BatchSyncReplicaRequest req;
+    P2PBatchSyncRoutesRequest req;
     req.client_id = client_id;
-    req.add_keys = {"new-key"};
-    req.add_segment_ids = {segment_id};
-    req.add_sizes = {2048};
-    req.remove_keys = {"old-key"};
-    req.remove_segment_ids = {segment_id};
+    req.publish_operations = {{
+        .key = "new-key",
+        .object_size = 2048,
+        .segment_id = segment_id,
+    }};
+    req.withdraw_operations = {{
+        .key = "old-key",
+        .segment_id = segment_id,
+    }};
 
-    auto response = service.BatchSyncReplica(req);
-    ASSERT_EQ(response.add_results.size(), 1);
-    ASSERT_EQ(response.remove_results.size(), 1);
-    EXPECT_EQ(response.add_results[0], ErrorCode::OK);
-    EXPECT_EQ(response.remove_results[0], ErrorCode::OK);
+    auto response = service.BatchSyncRoutes(req);
+    ASSERT_EQ(response.publish_results.size(), 1);
+    ASSERT_EQ(response.withdraw_results.size(), 1);
+    EXPECT_EQ(response.publish_results[0], ErrorCode::OK);
+    EXPECT_EQ(response.withdraw_results[0], ErrorCode::OK);
 
     auto* manager = service.GetOpLogManager();
     ASSERT_NE(manager, nullptr);
@@ -399,6 +400,42 @@ TEST_F(P2PRecordOplogTest, BatchSyncReplicaRecordsSuccessfulOps) {
 
     EXPECT_TRUE(has_entry(OpType_REMOVE_REPLICA, "old-key"));
     EXPECT_TRUE(has_entry(OpType_ADD_REPLICA, "new-key"));
+}
+
+TEST_F(P2PRecordOplogTest,
+       BatchSyncRoutesPreservesMutationPolicyWhenPersistenceFails) {
+    P2PMasterService service(MakeConfig());
+    const UUID client_id{20, 20};
+    const UUID segment_id{21, 21};
+    RegisterClient(service, client_id, MakeSegment(segment_id));
+    AddReplica(service, "old-key", client_id, segment_id);
+    InjectFailingOpLogStore(service);
+
+    P2PBatchSyncRoutesRequest req;
+    req.client_id = client_id;
+    req.publish_operations = {{
+        .key = "new-key",
+        .object_size = 2048,
+        .segment_id = segment_id,
+    }};
+    req.withdraw_operations = {{
+        .key = "old-key",
+        .segment_id = segment_id,
+    }};
+
+    auto response = service.BatchSyncRoutes(req);
+    ASSERT_EQ(response.publish_results.size(), 1);
+    ASSERT_EQ(response.withdraw_results.size(), 1);
+    EXPECT_EQ(response.publish_results[0], ErrorCode::OK);
+    EXPECT_EQ(response.withdraw_results[0], ErrorCode::INTERNAL_ERROR);
+
+    auto published = service.GetReadRoute("new-key");
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(published->size(), 1);
+
+    auto retained = service.GetReadRoute("old-key");
+    ASSERT_TRUE(retained.has_value());
+    EXPECT_EQ(retained->size(), 1);
 }
 
 TEST_F(P2PRecordOplogTest,
@@ -429,18 +466,18 @@ TEST_F(P2PRecordOplogTest, AddReplicaSucceedsWhenOplogPersistenceFails) {
     RegisterClient(service, client_id, MakeSegment(segment_id));
     InjectFailingOpLogStore(service);
 
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "failed-add";
     req.client_id = client_id;
     req.segment_id = segment_id;
-    req.size = 4096;
+    req.object_size = 4096;
 
     auto result = service.AddReplica(req);
     ASSERT_TRUE(result.has_value());
 
-    auto replicas = service.GetReplicaList(req.key);
+    auto replicas = service.GetReadRoute(req.key);
     ASSERT_TRUE(replicas.has_value());
-    ASSERT_EQ(1u, replicas->replicas.size());
+    ASSERT_EQ(1u, replicas.value().size());
 }
 
 TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
@@ -451,7 +488,7 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
     AddReplica(service, "failed-remove", client_id, segment_id);
     InjectFailingOpLogStore(service);
 
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = "failed-remove";
     req.client_id = client_id;
     req.segment_id = segment_id;
@@ -460,11 +497,10 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
 
-    auto replicas = service.GetReplicaList(req.key);
+    auto replicas = service.GetReadRoute(req.key);
     ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
-    ASSERT_EQ(replicas->replicas.size(), 1);
-    EXPECT_EQ(replicas->replicas[0].get_p2p_proxy_descriptor().client_id,
-              client_id);
+    ASSERT_EQ(replicas.value().size(), 1);
+    EXPECT_EQ(replicas.value()[0].client_id, client_id);
 }
 
 TEST_F(P2PRecordOplogTest, EnabledOplogFailsFastWhenStoreInitFails) {

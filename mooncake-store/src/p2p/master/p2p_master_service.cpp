@@ -1,10 +1,12 @@
 #include "p2p/master/p2p_master_service.h"
 
 #include <algorithm>
+#include <iterator>
 #include <regex>
 #include <stdexcept>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 
 #include <glog/logging.h>
@@ -19,8 +21,7 @@ namespace mooncake {
 
 P2PMasterService::P2PMasterService(const P2PMasterConfig& config,
                                    ViewVersionId view_version)
-    : route_table_(config.routes.max_clients_per_key),
-      max_client_per_key_(config.routes.max_clients_per_key),
+    : max_client_per_key_(config.routes.max_clients_per_key),
       enable_async_oplog_write_(ParseOpLogStoreType(config.oplog.store_type) ==
                                 OpLogStoreType::REDIS),
       view_version_(view_version) {
@@ -68,19 +69,40 @@ void P2PMasterService::InitializeClientManager() {
         });
 }
 
+std::optional<P2PRouteEntry> P2PMasterService::GetRouteSnapshot(
+    std::string_view key) const {
+    const auto& shard = route_shards_[GetRouteShardIndex(key)];
+    SharedMutexLocker lock(&shard.mutex, shared_lock);
+    return shard.table.GetRoute(key);
+}
+
+std::vector<std::string> P2PMasterService::ListRouteKeys() const {
+    std::vector<std::string> keys;
+    for (const auto& shard : route_shards_) {
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        auto shard_keys = shard.table.ListRouteKeys();
+        keys.reserve(keys.size() + shard_keys.size());
+        std::move(shard_keys.begin(), shard_keys.end(),
+                  std::back_inserter(keys));
+    }
+    return keys;
+}
+
 auto P2PMasterService::Heartbeat(const P2PHeartbeatRequest& req)
     -> tl::expected<P2PHeartbeatResponse, ErrorCode> {
     return client_manager_->Heartbeat(req);
 }
 
-auto P2PMasterService::QueryClientStatus(const P2PQueryClientStatusRequest& req)
-    -> tl::expected<P2PQueryClientStatusResponse, ErrorCode> {
-    return client_manager_->QueryClientStatus(req);
+auto P2PMasterService::QueryClientStatus(const UUID& client_id)
+    -> tl::expected<P2PClientStatus, ErrorCode> {
+    return client_manager_->QueryClientStatus(client_id);
 }
 
 auto P2PMasterService::ExistKey(std::string_view key)
     -> tl::expected<bool, ErrorCode> {
-    return route_table_.RouteExists(key);
+    const auto& shard = route_shards_[GetRouteShardIndex(key)];
+    SharedMutexLocker lock(&shard.mutex, shared_lock);
+    return shard.table.RouteExists(key);
 }
 
 std::vector<tl::expected<bool, ErrorCode>> P2PMasterService::BatchExistKey(
@@ -95,7 +117,7 @@ std::vector<tl::expected<bool, ErrorCode>> P2PMasterService::BatchExistKey(
 
 auto P2PMasterService::GetAllKeys()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    return route_table_.ListRouteKeys();
+    return ListRouteKeys();
 }
 
 auto P2PMasterService::GetAllSegments()
@@ -158,36 +180,37 @@ auto P2PMasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
     return results;
 }
 
-auto P2PMasterService::GetReplicaListByRegex(const std::string& regex_pattern)
+auto P2PMasterService::GetReadRouteByRegex(std::string_view regex_pattern)
     -> tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
         ErrorCode> {
     std::regex pattern;
 
     try {
-        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+        pattern =
+            std::regex(std::string(regex_pattern), std::regex::ECMAScript);
     } catch (const std::regex_error& e) {
         LOG(ERROR) << "Invalid regex pattern: " << regex_pattern
                    << ", error: " << e.what();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>> results;
-    for (const auto& key : route_table_.ListRouteKeys()) {
+    std::unordered_map<std::string, std::vector<P2PRouteDescriptor>> results;
+    for (const auto& key : ListRouteKeys()) {
         if (!std::regex_search(key, pattern)) {
             continue;
         }
-        auto route = route_table_.GetRoute(key);
+        auto route = GetRouteSnapshot(key);
         if (!route.has_value()) {
             VLOG(1) << "Route was removed during regex query"
                     << ", key=" << key;
             continue;
         }
-        std::vector<Replica::Descriptor> descriptors;
+        std::vector<P2PRouteDescriptor> descriptors;
         descriptors.reserve(route->locations.size());
         for (const auto& location : route->locations) {
             auto descriptor =
-                BuildReplicaDescriptor(location, route->object_size);
+                BuildRouteDescriptor(location, route->object_size);
             if (descriptor.has_value()) {
                 descriptors.push_back(std::move(*descriptor));
             }
@@ -202,12 +225,12 @@ auto P2PMasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     return results;
 }
 
-auto P2PMasterService::GetReplicaList(
-    std::string_view key, const P2PGetReplicaListRequestConfig& config)
-    -> tl::expected<P2PGetReplicaListResponse, ErrorCode> {
-    auto route = route_table_.GetRoute(key);
+auto P2PMasterService::GetReadRoute(
+    std::string_view key, const P2PReadRouteConfig& config)
+    -> tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode> {
+    auto route = GetRouteSnapshot(key);
     if (!route.has_value()) {
-        LOG(WARNING) << "GetReplicaList failed: key not found"
+        LOG(WARNING) << "GetReadRoute failed: key not found"
                      << ", key=" << key;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -218,15 +241,15 @@ auto P2PMasterService::GetReplicaList(
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    P2PGetReplicaListResponse response;
-    response.replicas = std::move(descriptors);
-    return response;
+    return descriptors;
 }
 
 auto P2PMasterService::Remove(std::string_view key, bool force)
     -> tl::expected<void, ErrorCode> {
     (void)force;
-    if (!route_table_.RemoveKey(key)) {
+    auto& shard = route_shards_[GetRouteShardIndex(key)];
+    SharedMutexLocker lock(&shard.mutex);
+    if (!shard.table.RemoveKey(key)) {
         LOG(WARNING) << "Remove route failed: key not found"
                      << ", key=" << key;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -251,11 +274,17 @@ auto P2PMasterService::RemoveByRegex(std::string_view regex_pattern, bool force)
     }
 
     long removed_count = 0;
-    for (const auto& key : route_table_.ListRouteKeys()) {
-        if (std::regex_search(key, pattern) && route_table_.RemoveKey(key)) {
-            VLOG(1) << "key=" << key << " matched by regex. Removing.";
-            ++removed_count;
+    for (const auto& key : ListRouteKeys()) {
+        if (!std::regex_search(key, pattern)) {
+            continue;
         }
+        auto& shard = route_shards_[GetRouteShardIndex(key)];
+        SharedMutexLocker lock(&shard.mutex);
+        if (!shard.table.RemoveKey(key)) {
+            continue;
+        }
+        VLOG(1) << "key=" << key << " matched by regex. Removing.";
+        ++removed_count;
     }
 
     if (removed_count > 0) {
@@ -268,7 +297,11 @@ auto P2PMasterService::RemoveByRegex(std::string_view regex_pattern, bool force)
 
 long P2PMasterService::RemoveAll(bool force) {
     (void)force;
-    const auto removed = route_table_.Clear();
+    size_t removed = 0;
+    for (auto& shard : route_shards_) {
+        SharedMutexLocker lock(&shard.mutex);
+        removed += shard.table.Clear();
+    }
     if (removed > 0) {
         P2PMasterMetricManager::instance().dec_key_count(removed);
     }
@@ -278,14 +311,23 @@ long P2PMasterService::RemoveAll(bool force) {
 }
 
 size_t P2PMasterService::GetKeyCount() const {
-    return route_table_.GetRouteKeyCount();
+    size_t count = 0;
+    for (const auto& shard : route_shards_) {
+        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        count += shard.table.GetRouteKeyCount();
+    }
+    return count;
 }
 
 void P2PMasterService::OnSegmentRemoved(const P2PRouteLocation& location) {
-    auto cleanup = route_table_.RemoveLocation(location);
-    if (!cleanup.removed_keys.empty()) {
-        P2PMasterMetricManager::instance().dec_key_count(
-            cleanup.removed_keys.size());
+    size_t removed_key_count = 0;
+    for (auto& shard : route_shards_) {
+        SharedMutexLocker lock(&shard.mutex);
+        auto cleanup = shard.table.RemoveLocation(location);
+        removed_key_count += cleanup.removed_keys.size();
+    }
+    if (removed_key_count > 0) {
+        P2PMasterMetricManager::instance().dec_key_count(removed_key_count);
     }
 }
 
@@ -308,7 +350,7 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
 }
 
 auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
-    -> tl::expected<P2PRegisterClientResponse, ErrorCode> {
+    -> tl::expected<ViewVersionId, ErrorCode> {
     if (req.ip_address.empty() || req.rpc_port == 0) {
         LOG(ERROR) << "RegisterClient(P2P): missing endpoint"
                    << ", client_id=" << req.client_id;
@@ -316,13 +358,11 @@ auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
     }
 
     auto make_idempotent_response = [&]() {
-        P2PRegisterClientResponse response;
-        response.view_version = view_version_;
         LOG(INFO) << "RegisterClient(P2P): client already registered, "
                      "treating as idempotent re-register"
                   << ", client_id=" << req.client_id
-                  << ", view_version=" << response.view_version;
-        return response;
+                  << ", view_version=" << view_version_;
+        return view_version_;
     };
 
     if (client_manager_->GetClient(req.client_id)) {
@@ -357,23 +397,23 @@ auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
     return result;
 }
 
-auto P2PMasterService::UnregisterClient(const P2PUnregisterClientRequest& req)
-    -> tl::expected<P2PUnregisterClientResponse, ErrorCode> {
-    auto result = client_manager_->UnregisterClient(req);
+auto P2PMasterService::UnregisterClient(const UUID& client_id)
+    -> tl::expected<ViewVersionId, ErrorCode> {
+    auto result = client_manager_->UnregisterClient(client_id);
     if (!result.has_value()) {
         LOG(ERROR) << "UnregisterClient(P2P): failed"
-                   << ", client_id=" << req.client_id
+                   << ", client_id=" << client_id
                    << ", error=" << result.error();
         return result;
     }
 
     UnregisterClientPayload payload;
-    payload.client_id = req.client_id;
+    payload.client_id = client_id;
     auto err =
         RecordOplog(OpType_UNREGISTER_CLIENT, "", SerializeP2PPayload(payload));
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "UnregisterClient(P2P): failed to record oplog"
-                   << ", client_id=" << req.client_id
+                   << ", client_id=" << client_id
                    << ", error=" << toString(err);
         return tl::make_unexpected(err);
     }
@@ -457,11 +497,9 @@ P2PMasterService::OwnerClientSet P2PMasterService::CollectRouteOwnerClients(
     return clients;
 }
 
-// TODO(M8.3; see p2p-master-final-refactor-plan.md): Return a P2P-owned route
-// descriptor instead of Replica::Descriptor.
-auto P2PMasterService::BuildReplicaDescriptor(const P2PRouteLocation& location,
-                                              uint64_t object_size) const
-    -> tl::expected<Replica::Descriptor, ErrorCode> {
+auto P2PMasterService::BuildRouteDescriptor(const P2PRouteLocation& location,
+                                            uint64_t object_size) const
+    -> tl::expected<P2PRouteDescriptor, ErrorCode> {
     auto client = client_manager_->GetClient(location.client_id);
     if (!client) {
         LOG(WARNING) << "Route references a missing client"
@@ -478,29 +516,19 @@ auto P2PMasterService::BuildReplicaDescriptor(const P2PRouteLocation& location,
         return tl::make_unexpected(segment.error());
     }
 
-    P2PProxyDescriptor proxy;
-    proxy.client_id = location.client_id;
-    proxy.segment_id = location.segment_id;
-    proxy.ip_address = client->get_ip_address();
-    proxy.rpc_port = client->get_rpc_port();
-    proxy.object_size = object_size;
-
-    Replica::Descriptor descriptor{};
-    descriptor.id = 0;
-    descriptor.descriptor_variant = std::move(proxy);
-    descriptor.status = ReplicaStatus::COMPLETE;
-    return descriptor;
+    return P2PRouteDescriptor{
+        .client_id = location.client_id,
+        .segment_id = location.segment_id,
+        .ip_address = client->get_ip_address(),
+        .rpc_port = client->get_rpc_port(),
+        .object_size = object_size,
+    };
 }
 
-// TODO(M8.3; see p2p-master-final-refactor-plan.md): Return P2P-owned route
-// descriptors instead of Replica::Descriptor.
-std::vector<Replica::Descriptor> P2PMasterService::FilterRoutes(
-    const P2PGetReplicaListRequestConfig& config,
-    const P2PRouteEntry& route) const {
-    const auto& p2p_config = config.p2p_config ? config.p2p_config.value()
-                                               : P2PReadRouteConfigExtra();
+std::vector<P2PRouteDescriptor> P2PMasterService::FilterRoutes(
+    const P2PReadRouteConfig& config, const P2PRouteEntry& route) const {
     // Candidates are kept at client granularity.
-    std::vector<std::pair<int, Replica::Descriptor>> candidates;
+    std::vector<std::pair<int, P2PRouteDescriptor>> candidates;
     std::unordered_map<UUID, size_t, boost::hash<UUID>> best_by_client;
 
     // 1. Filter qualified routes.
@@ -523,7 +551,7 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterRoutes(
         // 1.1 Exclude routes whose segment contains a filtered tag.
         bool excluded_by_tag = false;
         const auto& p2p_tags = segment.tags;
-        for (const auto& tag : p2p_config.tag_filters) {
+        for (const auto& tag : config.tag_filters) {
             if (std::find(p2p_tags.begin(), p2p_tags.end(), tag) !=
                 p2p_tags.end()) {
                 excluded_by_tag = true;
@@ -533,12 +561,12 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterRoutes(
         if (excluded_by_tag) continue;
 
         // 1.2 Filter by segment priority.
-        if (segment.priority < p2p_config.priority_limit) {
+        if (segment.priority < config.priority_limit) {
             continue;
         }
 
         // 1.3 client-granularity: keep the highest-priority client.
-        auto descriptor = BuildReplicaDescriptor(location, route.object_size);
+        auto descriptor = BuildRouteDescriptor(location, route.object_size);
         if (!descriptor.has_value()) {
             continue;
         }
@@ -553,10 +581,10 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterRoutes(
     }  // for over
 
     if (config.max_candidates ==
-            P2PGetReplicaListRequestConfig::RETURN_ALL_CANDIDATES ||
+            P2PReadRouteConfig::RETURN_ALL_CANDIDATES ||
         config.max_candidates >= candidates.size() || candidates.empty()) {
         // return all candidates
-        std::vector<Replica::Descriptor> result;
+        std::vector<P2PRouteDescriptor> result;
         result.reserve(candidates.size());
         for (auto& candidate : candidates) {
             result.push_back(std::move(candidate.second));
@@ -568,7 +596,7 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterRoutes(
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) { return a.first > b.first; });
 
-    std::vector<Replica::Descriptor> result;
+    std::vector<P2PRouteDescriptor> result;
     result.reserve(config.max_candidates);
     for (size_t i = 0; i < config.max_candidates; ++i) {
         result.push_back(std::move(candidates[i].second));
@@ -576,8 +604,8 @@ std::vector<Replica::Descriptor> P2PMasterService::FilterRoutes(
     return result;
 }
 
-auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
-    -> tl::expected<WriteRouteResponse, ErrorCode> {
+auto P2PMasterService::GetWriteRoute(const P2PGetWriteRouteRequest& req)
+    -> tl::expected<std::vector<P2PWriteCandidate>, ErrorCode> {
     if (!req.config.IsValid()) {
         LOG(ERROR) << "invalid write route config: " << req.config
                    << ", client_id: " << req.client_id;
@@ -587,7 +615,7 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     // 1. Collect existing route owners and enforce the client limit.
     OwnerClientSet owners;
     if (!req.key.empty()) {
-        auto route = route_table_.GetRoute(req.key);
+        auto route = GetRouteSnapshot(req.key);
         if (route.has_value()) {
             owners = CollectRouteOwnerClients(*route);
             if (max_client_per_key_ > 0 &&
@@ -605,11 +633,11 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     // 2. Single pass: collect and score all candidates.
     //    score = free_ratio * (is_local ? (1 - remote_weight) : remote_weight)
     const double remote_weight = std::clamp(req.config.remote_weight, 0.0, 1.0);
-    std::vector<WriteCandidate> candidates;
+    std::vector<P2PWriteCandidate> candidates;
     const bool can_early_stop =
         req.config.early_return &&
         req.config.max_candidates !=
-            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
 
     client_manager_->ForEachClient(
         req.config.strategy,
@@ -638,7 +666,7 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
     if (candidates.empty()) {
         LOG(ERROR) << "no candidate found for key: " << req.key
                    << ", client_id: " << req.client_id
-                   << ", size: " << req.size;
+                   << ", size: " << req.object_size;
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_CANDIDATE);
     }
     // 3. Sort by score descending, using capacity as the tiebreaker, then
@@ -649,36 +677,34 @@ auto P2PMasterService::GetWriteRoute(const WriteRouteRequest& req)
                          std::tie(a.score, a.available_capacity);
               });
     if (req.config.max_candidates !=
-            WriteRouteRequestConfig::RETURN_ALL_CANDIDATES &&
+            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES &&
         candidates.size() > req.config.max_candidates) {
         candidates.resize(req.config.max_candidates);
     }
-    WriteRouteResponse response;
-    response.candidates = std::move(candidates);
-    return response;
+    return candidates;
 }
 
-auto P2PMasterService::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
-    -> BatchGetWriteRouteResponse {
-    BatchGetWriteRouteResponse response;
+auto P2PMasterService::BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req)
+    -> P2PBatchGetWriteRouteResponse {
+    P2PBatchGetWriteRouteResponse response;
     response.responses.resize(req.keys.size());
     response.error_codes.resize(req.keys.size(), ErrorCode::OK);
 
-    if (req.keys.size() != req.sizes.size()) {
+    if (req.keys.size() != req.object_sizes.size()) {
         LOG(ERROR) << "BatchGetWriteRoute rejected inconsistent request arrays"
                    << ", keys=" << req.keys.size()
-                   << ", sizes=" << req.sizes.size();
+                   << ", sizes=" << req.object_sizes.size();
         std::fill(response.error_codes.begin(), response.error_codes.end(),
                   ErrorCode::INVALID_PARAMS);
         return response;
     }
 
-    WriteRouteRequest single_req;
+    P2PGetWriteRouteRequest single_req;
     single_req.client_id = req.client_id;
     single_req.config = req.config;
     for (size_t i = 0; i < req.keys.size(); ++i) {
         single_req.key = req.keys[i];
-        single_req.size = req.sizes[i];
+        single_req.object_size = req.object_sizes[i];
         auto result = GetWriteRoute(single_req);
         if (result.has_value()) {
             response.responses[i] = std::move(*result);
@@ -689,7 +715,7 @@ auto P2PMasterService::BatchGetWriteRoute(const BatchGetWriteRouteRequest& req)
     return response;
 }
 
-auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
+auto P2PMasterService::AddReplica(const P2PPublishRouteRequest& req)
     -> tl::expected<void, ErrorCode> {
     auto client = client_manager_->GetClient(req.client_id);
     if (!client) {
@@ -697,13 +723,24 @@ auto P2PMasterService::AddReplica(const AddReplicaRequest& req)
                    << ", client_id: " << req.client_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
-    return InnerAddReplica(req.key, req.client_id, req.segment_id, req.size,
-                           client);
+    return InnerAddReplica(req.key, req.client_id, req.segment_id,
+                           req.object_size, client);
 }
 
 auto P2PMasterService::InnerAddReplica(
     std::string_view key, const UUID& client_id, const UUID& segment_id,
     size_t size, const std::shared_ptr<P2PClientMeta>& client)
+    -> tl::expected<void, ErrorCode> {
+    auto& shard = route_shards_[GetRouteShardIndex(key)];
+    SharedMutexLocker lock(&shard.mutex);
+    return ApplyPublishLocked(shard.table, key, client_id, segment_id, size,
+                              client);
+}
+
+auto P2PMasterService::ApplyPublishLocked(
+    P2PRouteTable& table, std::string_view key, const UUID& client_id,
+    const UUID& segment_id, size_t size,
+    const std::shared_ptr<P2PClientMeta>& client)
     -> tl::expected<void, ErrorCode> {
     auto segment = client->QuerySegment(segment_id);
     if (!segment.has_value()) {
@@ -717,7 +754,7 @@ auto P2PMasterService::InnerAddReplica(
                                     .segment_id = segment_id};
     // AddReplica commits the in-memory route first. OpLog is best-effort;
     // returning an OpLog error could make the client delete its local replica.
-    auto mutation = route_table_.Publish(key, size, location);
+    auto mutation = table.Publish(key, size, location, max_client_per_key_);
     if (!mutation.has_value()) {
         LOG(WARNING) << "fail to publish route"
                      << ", key: " << key << ", client_id: " << client_id
@@ -729,24 +766,26 @@ auto P2PMasterService::InnerAddReplica(
         P2PMasterMetricManager::instance().observe_value_size(size);
     }
 
-    AddReplicaPayload payload;
-    payload.object_key = std::string(key);
-    payload.client_id = client_id;
-    payload.segment_id = segment_id;
-    payload.size = size;
-    const auto error = RecordOplog(OpType_ADD_REPLICA, payload.object_key,
-                                   SerializeP2PPayload(payload));
-    if (error != ErrorCode::OK) {
-        LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
-                   << ", client_id=" << client_id
-                   << ", segment_id=" << segment_id
-                   << ", error=" << toString(error)
-                   << "; keeping the in-memory route";
+    if (GetOpLogManager() != nullptr) {
+        AddReplicaPayload payload;
+        payload.object_key = std::string(key);
+        payload.client_id = client_id;
+        payload.segment_id = segment_id;
+        payload.size = size;
+        const auto error = RecordOplog(OpType_ADD_REPLICA, payload.object_key,
+                                       SerializeP2PPayload(payload));
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "AddReplica(P2P): failed to record oplog"
+                       << ", client_id=" << client_id
+                       << ", segment_id=" << segment_id
+                       << ", error=" << toString(error)
+                       << "; keeping the in-memory route";
+        }
     }
     return {};
 }
 
-auto P2PMasterService::RemoveReplica(const RemoveReplicaRequest& req)
+auto P2PMasterService::RemoveReplica(const P2PWithdrawRouteRequest& req)
     -> tl::expected<void, ErrorCode> {
     return InnerRemoveReplica(req.key, req.client_id, req.segment_id);
 }
@@ -755,39 +794,36 @@ auto P2PMasterService::InnerRemoveReplica(std::string_view key,
                                           const UUID& client_id,
                                           const UUID& segment_id)
     -> tl::expected<void, ErrorCode> {
-    auto route = route_table_.GetRoute(key);
-    if (!route.has_value()) {
-        LOG(WARNING) << "object not found"
-                     << ", key: " << key << ", client_id: " << client_id
-                     << ", segment_id: " << segment_id;
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
+    auto& shard = route_shards_[GetRouteShardIndex(key)];
+    SharedMutexLocker lock(&shard.mutex);
+    return ApplyWithdrawLocked(shard.table, key, client_id, segment_id);
+}
+
+auto P2PMasterService::ApplyWithdrawLocked(
+    P2PRouteTable& table, std::string_view key, const UUID& client_id,
+    const UUID& segment_id) -> tl::expected<void, ErrorCode> {
     const P2PRouteLocation location{.client_id = client_id,
                                     .segment_id = segment_id};
-    if (std::find(route->locations.begin(), route->locations.end(), location) ==
-        route->locations.end()) {
-        LOG(WARNING) << "route location not found"
-                     << ", key: " << key << ", client_id: " << client_id
-                     << ", segment_id: " << segment_id;
-        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
-    }
-
-    RemoveReplicaPayload payload;
-    payload.object_key = std::string(key);
-    payload.client_id = client_id;
-    payload.segment_id = segment_id;
-    const auto record_error =
-        RecordOplog(OpType_REMOVE_REPLICA, payload.object_key,
-                    SerializeP2PPayload(payload));
-    if (record_error != ErrorCode::OK) {
-        LOG(ERROR) << "RemoveReplica(P2P): failed to record oplog"
-                   << ", client_id=" << client_id
-                   << ", segment_id=" << segment_id
-                   << ", error=" << toString(record_error);
-        return tl::make_unexpected(record_error);
-    }
-
-    auto mutation = route_table_.Withdraw(key, location);
+    auto record_oplog = [&] {
+        if (GetOpLogManager() == nullptr) {
+            return ErrorCode::OK;
+        }
+        RemoveReplicaPayload payload;
+        payload.object_key = std::string(key);
+        payload.client_id = client_id;
+        payload.segment_id = segment_id;
+        const auto error =
+            RecordOplog(OpType_REMOVE_REPLICA, payload.object_key,
+                        SerializeP2PPayload(payload));
+        if (error != ErrorCode::OK) {
+            LOG(ERROR) << "RemoveReplica(P2P): failed to record oplog"
+                       << ", client_id=" << client_id
+                       << ", segment_id=" << segment_id
+                       << ", error=" << toString(error);
+        }
+        return error;
+    };
+    auto mutation = table.Withdraw(key, location, record_oplog);
     if (!mutation.has_value()) {
         LOG(ERROR) << "Route changed while withdrawing after OpLog persistence"
                    << ", key=" << key << ", client_id=" << client_id
@@ -801,12 +837,15 @@ auto P2PMasterService::InnerRemoveReplica(std::string_view key,
     return {};
 }
 
-auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
+auto P2PMasterService::BatchRemoveReplica(const P2PBatchWithdrawRouteRequest& req)
     -> std::vector<tl::expected<void, ErrorCode>> {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(req.segment_ids.size());
+    auto& shard = route_shards_[GetRouteShardIndex(req.key)];
+    SharedMutexLocker lock(&shard.mutex);
     for (const auto& segment_id : req.segment_ids) {
-        auto result = InnerRemoveReplica(req.key, req.client_id, segment_id);
+        auto result = ApplyWithdrawLocked(shard.table, req.key, req.client_id,
+                                          segment_id);
         if (!result.has_value()) {
             if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
                 // The object may have been removed by another thread.
@@ -837,59 +876,69 @@ auto P2PMasterService::BatchRemoveReplica(const BatchRemoveReplicaRequest& req)
     return results;
 }
 
-auto P2PMasterService::BatchSyncReplica(const BatchSyncReplicaRequest& req)
-    -> BatchSyncReplicaResponse {
-    BatchSyncReplicaResponse response;
-    // Validate that the structure-of-arrays fields have consistent lengths.
-    if (req.add_keys.size() != req.add_sizes.size() ||
-        req.add_keys.size() != req.add_segment_ids.size() ||
-        req.remove_keys.size() != req.remove_segment_ids.size()) {
-        LOG(ERROR) << "BatchSyncReplica rejected inconsistent request arrays"
-                   << ", add_keys=" << req.add_keys.size()
-                   << ", add_sizes=" << req.add_sizes.size()
-                   << ", add_segment_ids=" << req.add_segment_ids.size()
-                   << ", remove_keys=" << req.remove_keys.size()
-                   << ", remove_segment_ids=" << req.remove_segment_ids.size();
-        response.add_results.assign(req.add_keys.size(),
-                                    ErrorCode::INVALID_PARAMS);
-        response.remove_results.assign(req.remove_keys.size(),
-                                       ErrorCode::INVALID_PARAMS);
-        return response;
-    }
-    response.add_results.resize(req.add_keys.size(), ErrorCode::OK);
-    response.remove_results.resize(req.remove_keys.size(), ErrorCode::OK);
+auto P2PMasterService::BatchSyncRoutes(
+    const P2PBatchSyncRoutesRequest& request) -> P2PBatchSyncRoutesResponse {
+    P2PBatchSyncRoutesResponse response;
+    response.publish_results.resize(request.publish_operations.size(),
+                                    ErrorCode::OK);
+    response.withdraw_results.resize(request.withdraw_operations.size(),
+                                     ErrorCode::OK);
 
-    // Resolve the client once for all add operations.
-    auto client = client_manager_->GetClient(req.client_id);
+    auto client = client_manager_->GetClient(request.client_id);
     if (!client) {
-        LOG(ERROR) << "BatchSyncReplica: client not found"
-                   << ", client_id=" << req.client_id;
-        std::fill(response.add_results.begin(), response.add_results.end(),
+        LOG(ERROR) << "BatchSyncRoutes: client not found"
+                   << ", client_id=" << request.client_id;
+        std::fill(response.publish_results.begin(),
+                  response.publish_results.end(),
                   ErrorCode::CLIENT_NOT_FOUND);
-        std::fill(response.remove_results.begin(),
-                  response.remove_results.end(), ErrorCode::CLIENT_NOT_FOUND);
+        std::fill(response.withdraw_results.begin(),
+                  response.withdraw_results.end(),
+                  ErrorCode::CLIENT_NOT_FOUND);
         return response;
     }
 
-    // TODO(M8.3; see p2p-master-final-refactor-plan.md): Replace the SoA batch
-    // request with owning AoS publish/withdraw operations and pass them
-    // directly to P2PRouteTable. Preserve one write lock per touched shard and
-    // the existing publish-after/withdraw-before OpLog ordering.
-    for (size_t i = 0; i < req.add_keys.size(); ++i) {
-        auto result =
-            InnerAddReplica(req.add_keys[i], req.client_id,
-                            req.add_segment_ids[i], req.add_sizes[i], client);
-        if (!result.has_value()) {
-            response.add_results[i] = result.error();
-        }
+    struct ShardBatch {
+        std::vector<size_t> publish_indices;
+        std::vector<size_t> withdraw_indices;
+    };
+    std::unordered_map<size_t, ShardBatch> batches;
+    const size_t operation_count = request.publish_operations.size() +
+                                   request.withdraw_operations.size();
+    batches.reserve(std::min(operation_count, kRouteShardCount));
+    for (size_t index = 0; index < request.publish_operations.size(); ++index) {
+        const auto shard_index =
+            GetRouteShardIndex(request.publish_operations[index].key);
+        batches[shard_index].publish_indices.push_back(index);
     }
-    for (size_t i = 0; i < req.remove_keys.size(); ++i) {
-        auto result = InnerRemoveReplica(req.remove_keys[i], req.client_id,
-                                         req.remove_segment_ids[i]);
-        if (!result.has_value() &&
-            result.error() != ErrorCode::OBJECT_NOT_FOUND &&
-            result.error() != ErrorCode::REPLICA_NOT_FOUND) {
-            response.remove_results[i] = result.error();
+    for (size_t index = 0; index < request.withdraw_operations.size();
+         ++index) {
+        const auto shard_index =
+            GetRouteShardIndex(request.withdraw_operations[index].key);
+        batches[shard_index].withdraw_indices.push_back(index);
+    }
+
+    for (const auto& [shard_index, batch] : batches) {
+        auto& shard = route_shards_[shard_index];
+        SharedMutexLocker lock(&shard.mutex);
+        for (size_t index : batch.publish_indices) {
+            const auto& operation = request.publish_operations[index];
+            auto result = ApplyPublishLocked(
+                shard.table, operation.key, request.client_id,
+                operation.segment_id, operation.object_size, client);
+            if (!result.has_value()) {
+                response.publish_results[index] = result.error();
+            }
+        }
+        for (size_t index : batch.withdraw_indices) {
+            const auto& operation = request.withdraw_operations[index];
+            auto result = ApplyWithdrawLocked(
+                shard.table, operation.key, request.client_id,
+                operation.segment_id);
+            if (!result.has_value() &&
+                result.error() != ErrorCode::OBJECT_NOT_FOUND &&
+                result.error() != ErrorCode::REPLICA_NOT_FOUND) {
+                response.withdraw_results[index] = result.error();
+            }
         }
     }
     return response;
@@ -987,10 +1036,13 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
             const uint64_t object_size = standby_metadata.size != 0
                                              ? standby_metadata.size
                                              : p2p_desc.object_size;
-            auto mutation = route_table_.Publish(
+            auto& shard = route_shards_[GetRouteShardIndex(key)];
+            SharedMutexLocker lock(&shard.mutex);
+            auto mutation = shard.table.Publish(
                 key, object_size,
                 P2PRouteLocation{.client_id = p2p_desc.client_id,
-                                 .segment_id = p2p_desc.segment_id});
+                                 .segment_id = p2p_desc.segment_id},
+                max_client_per_key_);
             if (!mutation.has_value()) {
                 HAMetricManager::instance().inc_promotion_restore_failures();
                 LOG(ERROR) << "RestoreFromStandbyMetadata: failed to restore "
@@ -1009,7 +1061,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         }
         if (restored_object) {
             ++restored_objects;
-        } else if (!route_table_.RouteExists(key)) {
+        } else if (!GetRouteSnapshot(key).has_value()) {
             ++skipped_objects;
         }
     }

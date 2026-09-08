@@ -31,11 +31,18 @@ TEST_F(P2PMasterMetricsTest, SingletonRoutingTest) {
 TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     auto& metrics = P2PMasterMetricManager::instance();
 
+    metrics.inc_get_read_route_requests();
+    metrics.inc_get_read_route_by_regex_requests();
+    metrics.inc_batch_get_read_route_requests(3);
     metrics.inc_get_write_route_requests();
     metrics.inc_add_replica_requests(2);
     metrics.inc_batch_remove_replica_requests(5);
     metrics.inc_batch_get_write_route_requests(7);
     metrics.inc_batch_get_write_route_partial_success(2);
+    EXPECT_EQ(metrics.get_get_read_route_requests(), 1);
+    EXPECT_EQ(metrics.get_get_read_route_by_regex_requests(), 1);
+    EXPECT_EQ(metrics.get_batch_get_read_route_requests(), 1);
+    EXPECT_EQ(metrics.get_batch_get_read_route_items(), 3);
     EXPECT_EQ(metrics.get_get_write_route_requests(), 1);
     EXPECT_EQ(metrics.get_add_replica_requests(), 2);
     EXPECT_EQ(metrics.get_batch_remove_replica_requests(), 1);
@@ -46,6 +53,9 @@ TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     EXPECT_EQ(metrics.get_batch_get_write_route_failed_items(), 2);
 
     metrics.reset_all_metrics();
+    EXPECT_EQ(metrics.get_get_read_route_requests(), 0);
+    EXPECT_EQ(metrics.get_get_read_route_by_regex_requests(), 0);
+    EXPECT_EQ(metrics.get_batch_get_read_route_items(), 0);
     EXPECT_EQ(metrics.get_get_write_route_requests(), 0);
     EXPECT_EQ(metrics.get_add_replica_requests(), 0);
     EXPECT_EQ(metrics.get_batch_remove_replica_requests(), 0);
@@ -66,6 +76,19 @@ TEST_F(P2PMasterMetricsTest, SerializeMetricsContentTest) {
     EXPECT_NE(text.find("master_active_clients"), std::string::npos);
     EXPECT_NE(text.find("master_heartbeat_requests_total"), std::string::npos);
     EXPECT_NE(text.find("master_allocated_bytes"), std::string::npos);
+
+    EXPECT_NE(text.find("master_get_read_route_requests_total"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_get_read_route_by_regex_requests_total"),
+              std::string::npos);
+    EXPECT_NE(text.find("master_batch_get_read_route_requests_total"),
+              std::string::npos);
+    EXPECT_EQ(text.find("master_get_replica_list_requests_total"),
+              std::string::npos);
+    EXPECT_EQ(text.find("master_get_replica_list_by_regex_requests_total"),
+              std::string::npos);
+    EXPECT_EQ(text.find("master_batch_get_replica_list_requests_total"),
+              std::string::npos);
 
     EXPECT_NE(text.find("master_get_write_route_requests_total"),
               std::string::npos);
@@ -95,6 +118,8 @@ TEST_F(P2PMasterMetricsTest, SummaryArchTagTest) {
     std::string summary =
         P2PMasterMetricManager::instance().get_summary_string();
     EXPECT_EQ(summary.find("[Arch: P2P] "), 0u);
+    EXPECT_NE(summary.find("GetReadRoute="), std::string::npos);
+    EXPECT_NE(summary.find("GetReadRoute:(Req="), std::string::npos);
     EXPECT_NE(summary.find("GetWriteRoute="), std::string::npos);
     EXPECT_NE(summary.find("AddReplica="), std::string::npos);
     EXPECT_NE(summary.find("RemoveReplica="), std::string::npos);

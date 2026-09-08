@@ -189,15 +189,11 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
         // Verify via master that the replica is on client_ (local).
-        auto resp = client_->GetMasterClient().GetReplicaList(key);
+        auto resp = client_->GetMasterClient().GetReadRoute(
+            key, P2PReadRouteConfig{});
         ASSERT_TRUE(resp.has_value());
-        ASSERT_FALSE(resp->replicas.empty());
-        const auto& desc = resp->replicas[0];
-        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
-            desc.descriptor_variant));
-        EXPECT_EQ(
-            std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
-            client_->GetClientID());
+        ASSERT_FALSE(resp.value().empty());
+        EXPECT_EQ(resp.value()[0].client_id, client_->GetClientID());
     }
 
     // remote_weight=1: client_ writes to client2_ via master routing.
@@ -222,15 +218,11 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
         // Verify via master that the replica is on client2_ (remote).
-        auto resp = client_->GetMasterClient().GetReplicaList(key);
+        auto resp = client_->GetMasterClient().GetReadRoute(
+            key, P2PReadRouteConfig{});
         ASSERT_TRUE(resp.has_value());
-        ASSERT_FALSE(resp->replicas.empty());
-        const auto& desc = resp->replicas[0];
-        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
-            desc.descriptor_variant));
-        EXPECT_EQ(
-            std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
-            client2_->GetClientID());
+        ASSERT_FALSE(resp.value().empty());
+        EXPECT_EQ(resp.value()[0].client_id, client2_->GetClientID());
     }
 }
 
@@ -259,14 +251,11 @@ TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
     // Verify via master that the replica is on client_ (local).
-    auto resp = client_->GetMasterClient().GetReplicaList(key);
+    auto resp = client_->GetMasterClient().GetReadRoute(
+        key, P2PReadRouteConfig{});
     ASSERT_TRUE(resp.has_value());
-    ASSERT_FALSE(resp->replicas.empty());
-    const auto& desc = resp->replicas[0];
-    ASSERT_TRUE(
-        std::holds_alternative<P2PProxyDescriptor>(desc.descriptor_variant));
-    EXPECT_EQ(std::get<P2PProxyDescriptor>(desc.descriptor_variant).client_id,
-              client_->GetClientID());
+    ASSERT_FALSE(resp.value().empty());
+    EXPECT_EQ(resp.value()[0].client_id, client_->GetClientID());
 }
 
 // Contradictory config (waterline=0 + remote_weight=0, a dead-end combo)
@@ -537,8 +526,8 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
     const std::string data1 = "version_1";
     const std::string data2 = "version_2_longer";
 
-    P2PGetReplicaListRequestConfig config;
-    config.max_candidates = P2PGetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+    P2PReadRouteConfig config;
+    config.max_candidates = P2PReadRouteConfig::RETURN_ALL_CANDIDATES;
 
     // First put
     {
@@ -547,13 +536,13 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
         auto r = client_->Put(key, s, WriteRouteRequestConfig{});
         ASSERT_TRUE(r.has_value());
 
-        auto replicas = master_.GetWrapped().GetReplicaList(key, config);
-        ASSERT_TRUE(replicas.has_value());
-        ASSERT_EQ(replicas.value().replicas.size(), 1);
-        auto p2p_proxy_descriptor =
-            replicas.value().replicas[0].get_p2p_proxy_descriptor();
-        ASSERT_EQ(p2p_proxy_descriptor.client_id, client_->GetClientID());
-        ASSERT_EQ(p2p_proxy_descriptor.object_size, data1.size());
+        auto routes = master_.GetWrapped().GetReadRoute(
+            P2PGetReadRouteRequest{.key = key, .config = config});
+        ASSERT_TRUE(routes.has_value());
+        ASSERT_EQ(routes.value().size(), 1);
+        ASSERT_EQ(routes.value()[0].client_id,
+                  client_->GetClientID());
+        ASSERT_EQ(routes.value()[0].object_size, data1.size());
     }
 
     // Overwrite
@@ -566,13 +555,13 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
 
         // due to the write operation is canceled,
         // the object size of read route must not be changed
-        auto replicas = master_.GetWrapped().GetReplicaList(key, config);
-        ASSERT_TRUE(replicas.has_value());
-        ASSERT_EQ(replicas.value().replicas.size(), 1);
-        auto p2p_proxy_descriptor =
-            replicas.value().replicas[0].get_p2p_proxy_descriptor();
-        ASSERT_EQ(p2p_proxy_descriptor.client_id, client_->GetClientID());
-        ASSERT_EQ(p2p_proxy_descriptor.object_size, data1.size());
+        auto routes = master_.GetWrapped().GetReadRoute(
+            P2PGetReadRouteRequest{.key = key, .config = config});
+        ASSERT_TRUE(routes.has_value());
+        ASSERT_EQ(routes.value().size(), 1);
+        ASSERT_EQ(routes.value()[0].client_id,
+                  client_->GetClientID());
+        ASSERT_EQ(routes.value()[0].object_size, data1.size());
     }
 
     // Read back – should see data1 (first version)
@@ -917,7 +906,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
 
         ReadRouteConfig rcfg;
         rcfg.max_candidates =
-            P2PGetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+            ReadRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<char> buf(payload.size(), 0);
         auto get_res =
@@ -988,7 +977,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
 
         ReadRouteConfig read_config;
         read_config.max_candidates =
-            P2PGetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+            ReadRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
@@ -1089,7 +1078,7 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
 
         ReadRouteConfig read_config;
         read_config.max_candidates =
-            P2PGetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+            ReadRouteConfig::RETURN_ALL_CANDIDATES;
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
         std::vector<std::vector<size_t>> all_sizes(batch_size);
@@ -1165,7 +1154,7 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
 
         ReadRouteConfig read_config;
         read_config.max_candidates =
-            P2PGetReplicaListRequestConfig::RETURN_ALL_CANDIDATES;
+            ReadRouteConfig::RETURN_ALL_CANDIDATES;
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
         std::vector<std::vector<size_t>> all_sizes(batch_size);

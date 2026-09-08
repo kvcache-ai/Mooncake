@@ -396,8 +396,8 @@ P2PClientMeta::CapacityStat P2PClientMeta::GetWriteScoreCapacity(
 }
 
 // Returns std::nullopt when this client is not a write-route candidate
-std::optional<WriteCandidate> P2PClientMeta::GetWriteRouteCandidate(
-    const WriteRouteRequest& req) {
+std::optional<P2PWriteCandidate> P2PClientMeta::GetWriteRouteCandidate(
+    const P2PGetWriteRouteRequest& req) {
     SharedMutexLocker lock(&client_mutex_, shared_lock);
 
     // Check health status under lock protection.
@@ -416,12 +416,12 @@ std::optional<WriteCandidate> P2PClientMeta::GetWriteRouteCandidate(
         GetWriteScoreCapacity(req.config.tag_filters, req.config.priority_limit,
                               req.config.top_tier_only);
     if (cap.total == 0) return std::nullopt;  // no eligible tier
-    if (cap.free < req.size)
+    if (cap.free < req.object_size)
         return std::nullopt;  // cannot hold (master's view)
 
     const double free_ratio = static_cast<double>(cap.free) / cap.total;
 
-    WriteCandidate candidate;
+    P2PWriteCandidate candidate;
     candidate.client_id = client_id_;
     candidate.ip_address = ip_address_;
     candidate.rpc_port = rpc_port_;

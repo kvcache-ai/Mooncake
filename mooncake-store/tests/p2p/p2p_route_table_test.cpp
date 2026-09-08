@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <vector>
 
 #include "p2p/master/p2p_route_table.h"
 
@@ -63,18 +64,58 @@ TEST(P2PRouteTableTest, RejectsInvalidSizeAndDuplicateLocation) {
 }
 
 TEST(P2PRouteTableTest, CountsUniqueClientsForRouteLimit) {
-    P2PRouteTable table(/*max_client_per_key=*/1);
+    P2PRouteTable table;
     ASSERT_TRUE(
-        table.Publish("key", 1024, Location(kClientA, UUID{11, 11}))
+        table.Publish("key", 1024, Location(kClientA, UUID{11, 11}),
+                      /*max_client_per_key=*/1)
             .has_value());
     EXPECT_TRUE(
-        table.Publish("key", 1024, Location(kClientA, UUID{12, 12}))
+        table.Publish("key", 1024, Location(kClientA, UUID{12, 12}),
+                      /*max_client_per_key=*/1)
             .has_value());
 
-    auto second_client =
-        table.Publish("key", 1024, Location(kClientB, UUID{13, 13}));
+    auto second_client = table.Publish(
+        "key", 1024, Location(kClientB, UUID{13, 13}),
+        /*max_client_per_key=*/1);
     ASSERT_FALSE(second_client.has_value());
     EXPECT_EQ(second_client.error(), ErrorCode::REPLICA_NUM_EXCEEDED);
+}
+
+TEST(P2PRouteTableTest, WithdrawPreconditionFailureKeepsRoute) {
+    P2PRouteTable table;
+    const UUID segment_id{11, 11};
+    const auto location = Location(kClientA, segment_id);
+    ASSERT_TRUE(table.Publish("key", 1024, location).has_value());
+
+    auto result = table.Withdraw(
+        "key", location, [] { return ErrorCode::INTERNAL_ERROR; });
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_TRUE(table.RouteExists("key"));
+}
+
+TEST(P2PRouteTableTest, WithdrawSkipsPreconditionForMissingTarget) {
+    P2PRouteTable table;
+    const auto location = Location(kClientA, UUID{11, 11});
+    const auto other_location = Location(kClientA, UUID{12, 12});
+    ASSERT_TRUE(table.Publish("key", 1024, location).has_value());
+
+    bool precondition_called = false;
+    const auto precondition = [&] {
+        precondition_called = true;
+        return ErrorCode::OK;
+    };
+    auto missing_key = table.Withdraw("missing", location, precondition);
+    ASSERT_FALSE(missing_key.has_value());
+    EXPECT_EQ(missing_key.error(), ErrorCode::OBJECT_NOT_FOUND);
+    EXPECT_FALSE(precondition_called);
+
+    auto missing_location =
+        table.Withdraw("key", other_location, precondition);
+    ASSERT_FALSE(missing_location.has_value());
+    EXPECT_EQ(missing_location.error(), ErrorCode::REPLICA_NOT_FOUND);
+    EXPECT_FALSE(precondition_called);
+    EXPECT_TRUE(table.RouteExists("key"));
 }
 
 TEST(P2PRouteTableTest, CleanupUsesClientAndSegmentIdentity) {

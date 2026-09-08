@@ -85,10 +85,10 @@ class P2PMasterMetricManager {
     int64_t get_clients_crashed_total();
 
     // Operation Statistics (Counters)
-    void inc_get_replica_list_by_regex_requests(int64_t val = 1);
-    void inc_get_replica_list_by_regex_failures(int64_t val = 1);
-    void inc_get_replica_list_requests(int64_t val = 1);
-    void inc_get_replica_list_failures(int64_t val = 1);
+    void inc_get_read_route_by_regex_requests(int64_t val = 1);
+    void inc_get_read_route_by_regex_failures(int64_t val = 1);
+    void inc_get_read_route_requests(int64_t val = 1);
+    void inc_get_read_route_failures(int64_t val = 1);
     void inc_exist_key_requests(int64_t val = 1);
     void inc_exist_key_failures(int64_t val = 1);
     void inc_remove_requests(int64_t val = 1);
@@ -111,15 +111,15 @@ class P2PMasterMetricManager {
     void inc_batch_query_ip_requests(int64_t items);
     void inc_batch_query_ip_failures(int64_t failed_items);
     void inc_batch_query_ip_partial_success(int64_t failed_items);
-    void inc_batch_get_replica_list_requests(int64_t items);
-    void inc_batch_get_replica_list_failures(int64_t failed_items);
-    void inc_batch_get_replica_list_partial_success(int64_t failed_items);
+    void inc_batch_get_read_route_requests(int64_t items);
+    void inc_batch_get_read_route_failures(int64_t failed_items);
+    void inc_batch_get_read_route_partial_success(int64_t failed_items);
 
     // Operation Statistics Getters
-    int64_t get_get_replica_list_requests();
-    int64_t get_get_replica_list_failures();
-    int64_t get_get_replica_list_by_regex_requests();
-    int64_t get_get_replica_list_by_regex_failures();
+    int64_t get_get_read_route_requests();
+    int64_t get_get_read_route_failures();
+    int64_t get_get_read_route_by_regex_requests();
+    int64_t get_get_read_route_by_regex_failures();
     int64_t get_exist_key_requests();
     int64_t get_exist_key_failures();
     int64_t get_remove_requests();
@@ -146,11 +146,11 @@ class P2PMasterMetricManager {
     int64_t get_batch_query_ip_partial_successes();
     int64_t get_batch_query_ip_items();
     int64_t get_batch_query_ip_failed_items();
-    int64_t get_batch_get_replica_list_requests();
-    int64_t get_batch_get_replica_list_failures();
-    int64_t get_batch_get_replica_list_partial_successes();
-    int64_t get_batch_get_replica_list_items();
-    int64_t get_batch_get_replica_list_failed_items();
+    int64_t get_batch_get_read_route_requests();
+    int64_t get_batch_get_read_route_failures();
+    int64_t get_batch_get_read_route_partial_successes();
+    int64_t get_batch_get_read_route_items();
+    int64_t get_batch_get_read_route_failed_items();
 
     // Operation Statistics (Counters)
     void inc_get_write_route_requests(int64_t val = 1);
@@ -250,10 +250,10 @@ class P2PMasterMetricManager {
     ylt::metric::counter_t clients_crashed_total_;
 
     // Operation Statistics
-    ylt::metric::counter_t get_replica_list_requests_;
-    ylt::metric::counter_t get_replica_list_failures_;
-    ylt::metric::counter_t get_replica_list_by_regex_requests_;
-    ylt::metric::counter_t get_replica_list_by_regex_failures_;
+    ylt::metric::counter_t get_read_route_requests_;
+    ylt::metric::counter_t get_read_route_failures_;
+    ylt::metric::counter_t get_read_route_by_regex_requests_;
+    ylt::metric::counter_t get_read_route_by_regex_failures_;
     ylt::metric::counter_t exist_key_requests_;
     ylt::metric::counter_t exist_key_failures_;
     ylt::metric::counter_t remove_requests_;
@@ -280,11 +280,11 @@ class P2PMasterMetricManager {
     ylt::metric::counter_t batch_query_ip_partial_successes_;
     ylt::metric::counter_t batch_query_ip_items_;
     ylt::metric::counter_t batch_query_ip_failed_items_;
-    ylt::metric::counter_t batch_get_replica_list_requests_;
-    ylt::metric::counter_t batch_get_replica_list_failures_;
-    ylt::metric::counter_t batch_get_replica_list_partial_successes_;
-    ylt::metric::counter_t batch_get_replica_list_items_;
-    ylt::metric::counter_t batch_get_replica_list_failed_items_;
+    ylt::metric::counter_t batch_get_read_route_requests_;
+    ylt::metric::counter_t batch_get_read_route_failures_;
+    ylt::metric::counter_t batch_get_read_route_partial_successes_;
+    ylt::metric::counter_t batch_get_read_route_items_;
+    ylt::metric::counter_t batch_get_read_route_failed_items_;
 
     // Operation Statistics
     ylt::metric::counter_t get_write_route_requests_;

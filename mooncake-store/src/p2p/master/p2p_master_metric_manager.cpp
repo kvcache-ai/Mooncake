@@ -67,18 +67,18 @@ P2PMasterMetricManager::P2PMasterMetricManager()
           "master_clients_crashed_total",
           "Total number of client crashes detected by heartbeat"),
 
-      get_replica_list_requests_(
-          "master_get_replica_list_requests_total",
-          "Total number of GetReplicaList requests received"),
-      get_replica_list_failures_(
-          "master_get_replica_list_failures_total",
-          "Total number of failed GetReplicaList requests"),
-      get_replica_list_by_regex_requests_(
-          "master_get_replica_list_by_regex_requests_total",
-          "Total number of GetReplicaListByRegex requests received"),
-      get_replica_list_by_regex_failures_(
-          "master_get_replica_list_by_regex_failures_total",
-          "Total number of failed GetReplicaListByRegex requests"),
+      get_read_route_requests_(
+          "master_get_read_route_requests_total",
+          "Total number of GetReadRoute requests received"),
+      get_read_route_failures_(
+          "master_get_read_route_failures_total",
+          "Total number of failed GetReadRoute requests"),
+      get_read_route_by_regex_requests_(
+          "master_get_read_route_by_regex_requests_total",
+          "Total number of GetReadRouteByRegex requests received"),
+      get_read_route_by_regex_failures_(
+          "master_get_read_route_by_regex_failures_total",
+          "Total number of failed GetReadRouteByRegex requests"),
       exist_key_requests_("master_exist_key_requests_total",
                           "Total number of ExistKey requests received"),
       exist_key_failures_("master_exist_key_failures_total",
@@ -143,21 +143,21 @@ P2PMasterMetricManager::P2PMasterMetricManager()
       batch_query_ip_failed_items_(
           "master_batch_query_ip_failed_items_total",
           "Total number of failed items in BatchQueryIp requests"),
-      batch_get_replica_list_requests_(
-          "master_batch_get_replica_list_requests_total",
-          "Total number of BatchGetReplicaList requests received"),
-      batch_get_replica_list_failures_(
-          "master_batch_get_replica_list_failures_total",
-          "Total number of failed BatchGetReplicaList requests"),
-      batch_get_replica_list_partial_successes_(
-          "master_batch_get_replica_list_partial_successes_total",
-          "Total number of partially successful BatchGetReplicaList requests"),
-      batch_get_replica_list_items_(
-          "master_batch_get_replica_list_items_total",
-          "Total number of items processed in BatchGetReplicaList requests"),
-      batch_get_replica_list_failed_items_(
-          "master_batch_get_replica_list_failed_items_total",
-          "Total number of failed items in BatchGetReplicaList requests"),
+      batch_get_read_route_requests_(
+          "master_batch_get_read_route_requests_total",
+          "Total number of BatchGetReadRoute requests received"),
+      batch_get_read_route_failures_(
+          "master_batch_get_read_route_failures_total",
+          "Total number of failed BatchGetReadRoute requests"),
+      batch_get_read_route_partial_successes_(
+          "master_batch_get_read_route_partial_successes_total",
+          "Total number of partially successful BatchGetReadRoute requests"),
+      batch_get_read_route_items_(
+          "master_batch_get_read_route_items_total",
+          "Total number of items processed in BatchGetReadRoute requests"),
+      batch_get_read_route_failed_items_(
+          "master_batch_get_read_route_failed_items_total",
+          "Total number of failed items in BatchGetReadRoute requests"),
       get_write_route_requests_("master_get_write_route_requests_total",
                                 "Total number of get write route requests"),
       get_write_route_failures_(
@@ -229,10 +229,10 @@ void P2PMasterMetricManager::update_metrics_for_zero_output() {
     clients_disconnected_total_.inc(0);
     clients_recovered_total_.inc(0);
     clients_crashed_total_.inc(0);
-    get_replica_list_requests_.inc(0);
-    get_replica_list_failures_.inc(0);
-    get_replica_list_by_regex_requests_.inc(0);
-    get_replica_list_by_regex_failures_.inc(0);
+    get_read_route_requests_.inc(0);
+    get_read_route_failures_.inc(0);
+    get_read_route_by_regex_requests_.inc(0);
+    get_read_route_by_regex_failures_.inc(0);
     exist_key_requests_.inc(0);
     exist_key_failures_.inc(0);
     remove_requests_.inc(0);
@@ -259,11 +259,11 @@ void P2PMasterMetricManager::update_metrics_for_zero_output() {
     batch_query_ip_partial_successes_.inc(0);
     batch_query_ip_items_.inc(0);
     batch_query_ip_failed_items_.inc(0);
-    batch_get_replica_list_requests_.inc(0);
-    batch_get_replica_list_failures_.inc(0);
-    batch_get_replica_list_partial_successes_.inc(0);
-    batch_get_replica_list_items_.inc(0);
-    batch_get_replica_list_failed_items_.inc(0);
+    batch_get_read_route_requests_.inc(0);
+    batch_get_read_route_failures_.inc(0);
+    batch_get_read_route_partial_successes_.inc(0);
+    batch_get_read_route_items_.inc(0);
+    batch_get_read_route_failed_items_.inc(0);
 
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
@@ -457,20 +457,20 @@ void P2PMasterMetricManager::inc_exist_key_failures(int64_t val) {
     exist_key_failures_.inc(val);
 }
 
-void P2PMasterMetricManager::inc_get_replica_list_requests(int64_t val) {
-    get_replica_list_requests_.inc(val);
+void P2PMasterMetricManager::inc_get_read_route_requests(int64_t val) {
+    get_read_route_requests_.inc(val);
 }
 
-void P2PMasterMetricManager::inc_get_replica_list_failures(int64_t val) {
-    get_replica_list_failures_.inc(val);
+void P2PMasterMetricManager::inc_get_read_route_failures(int64_t val) {
+    get_read_route_failures_.inc(val);
 }
 
-void P2PMasterMetricManager::inc_get_replica_list_by_regex_requests(int64_t val) {
-    get_replica_list_by_regex_requests_.inc(val);
+void P2PMasterMetricManager::inc_get_read_route_by_regex_requests(int64_t val) {
+    get_read_route_by_regex_requests_.inc(val);
 }
 
-void P2PMasterMetricManager::inc_get_replica_list_by_regex_failures(int64_t val) {
-    get_replica_list_by_regex_failures_.inc(val);
+void P2PMasterMetricManager::inc_get_read_route_by_regex_failures(int64_t val) {
+    get_read_route_by_regex_failures_.inc(val);
 }
 
 void P2PMasterMetricManager::inc_remove_requests(int64_t val) {
@@ -546,36 +546,36 @@ void P2PMasterMetricManager::inc_batch_query_ip_partial_success(
     batch_query_ip_partial_successes_.inc(1);
     batch_query_ip_failed_items_.inc(failed_items);
 }
-void P2PMasterMetricManager::inc_batch_get_replica_list_requests(int64_t items) {
-    batch_get_replica_list_requests_.inc(1);
-    batch_get_replica_list_items_.inc(items);
+void P2PMasterMetricManager::inc_batch_get_read_route_requests(int64_t items) {
+    batch_get_read_route_requests_.inc(1);
+    batch_get_read_route_items_.inc(items);
 }
-void P2PMasterMetricManager::inc_batch_get_replica_list_failures(
+void P2PMasterMetricManager::inc_batch_get_read_route_failures(
     int64_t failed_items) {
-    batch_get_replica_list_failures_.inc(1);
-    batch_get_replica_list_failed_items_.inc(failed_items);
+    batch_get_read_route_failures_.inc(1);
+    batch_get_read_route_failed_items_.inc(failed_items);
 }
-void P2PMasterMetricManager::inc_batch_get_replica_list_partial_success(
+void P2PMasterMetricManager::inc_batch_get_read_route_partial_success(
     int64_t failed_items) {
-    batch_get_replica_list_partial_successes_.inc(1);
-    batch_get_replica_list_failed_items_.inc(failed_items);
+    batch_get_read_route_partial_successes_.inc(1);
+    batch_get_read_route_failed_items_.inc(failed_items);
 }
 
 // Operation Statistics Getters
-int64_t P2PMasterMetricManager::get_get_replica_list_requests() {
-    return get_replica_list_requests_.value();
+int64_t P2PMasterMetricManager::get_get_read_route_requests() {
+    return get_read_route_requests_.value();
 }
 
-int64_t P2PMasterMetricManager::get_get_replica_list_failures() {
-    return get_replica_list_failures_.value();
+int64_t P2PMasterMetricManager::get_get_read_route_failures() {
+    return get_read_route_failures_.value();
 }
 
-int64_t P2PMasterMetricManager::get_get_replica_list_by_regex_requests() {
-    return get_replica_list_by_regex_requests_.value();
+int64_t P2PMasterMetricManager::get_get_read_route_by_regex_requests() {
+    return get_read_route_by_regex_requests_.value();
 }
 
-int64_t P2PMasterMetricManager::get_get_replica_list_by_regex_failures() {
-    return get_replica_list_by_regex_failures_.value();
+int64_t P2PMasterMetricManager::get_get_read_route_by_regex_failures() {
+    return get_read_route_by_regex_failures_.value();
 }
 
 int64_t P2PMasterMetricManager::get_exist_key_requests() {
@@ -674,24 +674,24 @@ int64_t P2PMasterMetricManager::get_batch_query_ip_failed_items() {
     return batch_query_ip_failed_items_.value();
 }
 
-int64_t P2PMasterMetricManager::get_batch_get_replica_list_requests() {
-    return batch_get_replica_list_requests_.value();
+int64_t P2PMasterMetricManager::get_batch_get_read_route_requests() {
+    return batch_get_read_route_requests_.value();
 }
 
-int64_t P2PMasterMetricManager::get_batch_get_replica_list_failures() {
-    return batch_get_replica_list_failures_.value();
+int64_t P2PMasterMetricManager::get_batch_get_read_route_failures() {
+    return batch_get_read_route_failures_.value();
 }
 
-int64_t P2PMasterMetricManager::get_batch_get_replica_list_partial_successes() {
-    return batch_get_replica_list_partial_successes_.value();
+int64_t P2PMasterMetricManager::get_batch_get_read_route_partial_successes() {
+    return batch_get_read_route_partial_successes_.value();
 }
 
-int64_t P2PMasterMetricManager::get_batch_get_replica_list_items() {
-    return batch_get_replica_list_items_.value();
+int64_t P2PMasterMetricManager::get_batch_get_read_route_items() {
+    return batch_get_read_route_items_.value();
 }
 
-int64_t P2PMasterMetricManager::get_batch_get_replica_list_failed_items() {
-    return batch_get_replica_list_failed_items_.value();
+int64_t P2PMasterMetricManager::get_batch_get_read_route_failed_items() {
+    return batch_get_read_route_failed_items_.value();
 }
 
 // --- Serialization ---
@@ -731,10 +731,10 @@ std::string P2PMasterMetricManager::serialize_metrics() {
     // Serialize Request Counters
     serialize_metric(exist_key_requests_);
     serialize_metric(exist_key_failures_);
-    serialize_metric(get_replica_list_requests_);
-    serialize_metric(get_replica_list_failures_);
-    serialize_metric(get_replica_list_by_regex_requests_);
-    serialize_metric(get_replica_list_by_regex_failures_);
+    serialize_metric(get_read_route_requests_);
+    serialize_metric(get_read_route_failures_);
+    serialize_metric(get_read_route_by_regex_requests_);
+    serialize_metric(get_read_route_by_regex_failures_);
     serialize_metric(remove_requests_);
     serialize_metric(remove_failures_);
     serialize_metric(remove_by_regex_requests_);
@@ -753,11 +753,11 @@ std::string P2PMasterMetricManager::serialize_metrics() {
     serialize_metric(batch_exist_key_failures_);
     serialize_metric(batch_query_ip_requests_);
     serialize_metric(batch_query_ip_failures_);
-    serialize_metric(batch_get_replica_list_requests_);
-    serialize_metric(batch_get_replica_list_failures_);
-    serialize_metric(batch_get_replica_list_partial_successes_);
-    serialize_metric(batch_get_replica_list_items_);
-    serialize_metric(batch_get_replica_list_failed_items_);
+    serialize_metric(batch_get_read_route_requests_);
+    serialize_metric(batch_get_read_route_failures_);
+    serialize_metric(batch_get_read_route_partial_successes_);
+    serialize_metric(batch_get_read_route_items_);
+    serialize_metric(batch_get_read_route_failed_items_);
 
     serialize_metric(get_write_route_requests_);
     serialize_metric(get_write_route_failures_);
@@ -799,23 +799,23 @@ std::string P2PMasterMetricManager::get_summary_string() {
     // Request counters
     int64_t exist_keys = exist_key_requests_.value();
     int64_t exist_key_fails = exist_key_failures_.value();
-    int64_t get_replicas = get_replica_list_requests_.value();
-    int64_t get_replica_fails = get_replica_list_failures_.value();
+    int64_t get_replicas = get_read_route_requests_.value();
+    int64_t get_replica_fails = get_read_route_failures_.value();
     int64_t removes = remove_requests_.value();
     int64_t remove_fails = remove_failures_.value();
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
 
     int64_t batch_get_replica_list_requests =
-        batch_get_replica_list_requests_.value();
+        batch_get_read_route_requests_.value();
     int64_t batch_get_replica_list_fails =
-        batch_get_replica_list_failures_.value();
+        batch_get_read_route_failures_.value();
     int64_t batch_get_replica_list_partial_successes =
-        batch_get_replica_list_partial_successes_.value();
+        batch_get_read_route_partial_successes_.value();
     int64_t batch_get_replica_list_items =
-        batch_get_replica_list_items_.value();
+        batch_get_read_route_items_.value();
     int64_t batch_get_replica_list_failed_items =
-        batch_get_replica_list_failed_items_.value();
+        batch_get_read_route_failed_items_.value();
     int64_t batch_exist_key_requests = batch_exist_key_requests_.value();
     int64_t batch_exist_key_fails = batch_exist_key_failures_.value();
     int64_t batch_exist_key_partial_successes =
@@ -848,8 +848,8 @@ std::string P2PMasterMetricManager::get_summary_string() {
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
-    ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
-       << ", ";
+    ss << "GetReadRoute=" << get_replicas - get_replica_fails << "/"
+       << get_replicas << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
@@ -859,7 +859,7 @@ std::string P2PMasterMetricManager::get_summary_string() {
     // Batch request summary
     ss << " | Batch Requests "
           "(Req=Success/PartialSuccess/Total, Item=Success/Total): ";
-    ss << "Get:(Req="
+    ss << "GetReadRoute:(Req="
        << batch_get_replica_list_requests - batch_get_replica_list_fails -
               batch_get_replica_list_partial_successes
        << "/" << batch_get_replica_list_partial_successes << "/"

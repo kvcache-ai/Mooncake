@@ -1,8 +1,12 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <functional>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define private public
@@ -73,9 +77,9 @@ class P2PMasterServiceTest : public ::testing::Test {
     void AddReplicaHelper(P2PMasterService& service, const std::string& key,
                           size_t size, const UUID& client_id,
                           const UUID& segment_id) {
-        AddReplicaRequest req;
+        P2PPublishRouteRequest req;
         req.key = key;
-        req.size = size;
+        req.object_size = size;
         req.client_id = client_id;
         req.segment_id = segment_id;
         auto res = service.AddReplica(req);
@@ -130,17 +134,17 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteBasic) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = generate_uuid();  // different client requesting
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
-    req.config.strategy = ObjectIterateStrategy::CAPACITY_PRIORITY;
+    req.config.strategy = P2PClientSelectionStrategy::CAPACITY_PRIORITY;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << "GetWriteRoute failed: " << res.error();
-    EXPECT_EQ(1, res.value().candidates.size());
-    EXPECT_EQ(client_id, res.value().candidates[0].client_id);
+    EXPECT_EQ(1, res.value().size());
+    EXPECT_EQ(client_id, res.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteNoCapacity) {
@@ -149,10 +153,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteNoCapacity) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = generate_uuid();
-    req.size = 2048;  // larger than segment capacity
+    req.object_size = 2048;  // larger than segment capacity
     req.config.max_candidates = 1;
 
     auto res = service->GetWriteRoute(req);
@@ -173,17 +177,17 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteTagFilter) {
     RegisterP2PClient(*service, client2, {seg_disk}, "10.0.0.2", 50052);
 
     // Request with tag filter "disk" — only seg_memory remains
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = generate_uuid();
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 10;
     req.config.tag_filters = {"disk"};
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(1, res.value().candidates.size());
-    EXPECT_EQ(client1, res.value().candidates[0].client_id);
+    EXPECT_EQ(1, res.value().size());
+    EXPECT_EQ(client1, res.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRoutePriorityFilter) {
@@ -197,17 +201,17 @@ TEST_F(P2PMasterServiceTest, GetWriteRoutePriorityFilter) {
     RegisterP2PClient(*service, client2, {seg_high}, "10.0.0.2", 50052);
 
     // Request with priority_limit = 5 — only seg_high qualifies
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = generate_uuid();
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 10;
     req.config.priority_limit = 5;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(1, res.value().candidates.size());
-    EXPECT_EQ(client2, res.value().candidates[0].client_id);
+    EXPECT_EQ(1, res.value().size());
+    EXPECT_EQ(client2, res.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteForceRemoteExcludesLocal) {
@@ -218,10 +222,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteForceRemoteExcludesLocal) {
 
     // Same client requesting, remote_weight = 1 (force remote) — should skip
     // self
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = client_id;
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
     req.config.remote_weight = 1.0;
 
@@ -232,8 +236,8 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteForceRemoteExcludesLocal) {
     req.config.remote_weight = 0.5;
     auto res2 = service->GetWriteRoute(req);
     ASSERT_TRUE(res2.has_value());
-    EXPECT_EQ(1, res2.value().candidates.size());
-    EXPECT_EQ(client_id, res2.value().candidates[0].client_id);
+    EXPECT_EQ(1, res2.value().size());
+    EXPECT_EQ(client_id, res2.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteEarlyReturn) {
@@ -248,17 +252,17 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteEarlyReturn) {
                           "10.0.0." + std::to_string(i + 1), 50051 + i);
     }
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = generate_uuid();
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 2;
     req.config.early_return = true;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value());
     // With early_return, should stop at max_candidates
-    EXPECT_EQ(2, res.value().candidates.size());
+    EXPECT_EQ(2, res.value().size());
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteMultipleSegments) {
@@ -274,18 +278,18 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteMultipleSegments) {
     RegisterP2PClient(*service, client_id2, {seg2}, "127.0.0.2", 50051);
     RegisterP2PClient(*service, client_id3, {seg3, seg4}, "127.0.0.3", 50051);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "test_key";
     req.client_id = client_id;
-    req.size = 1024;
-    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+    req.object_size = 1024;
+    req.config.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
     req.config.remote_weight =
         1.0;  // force remote: exclude the requesting client
     req.config.early_return = false;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(2, res.value().candidates.size());
+    EXPECT_EQ(2, res.value().size());
 }
 
 TEST_F(P2PMasterServiceTest, GetWriteRouteRejectsWhenOwnerClientLimitReached) {
@@ -303,10 +307,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteRejectsWhenOwnerClientLimitReached) {
     AddReplicaHelper(*service, "key1", 1024, owner1, owner_seg1.id);
     AddReplicaHelper(*service, "key1", 1024, owner2, owner_seg2.id);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "key1";
     req.client_id = generate_uuid();
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
     req.config.early_return = false;
 
@@ -332,18 +336,18 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteLocalFirstBeatsCapacityOrdering) {
                           "10.0.0." + std::to_string(i + 2), 50052 + i);
     }
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = local_id;  // the requesting client is the local one
-    req.size = 50;
+    req.object_size = 50;
     req.config.max_candidates = 1;
     req.config.early_return = false;  // collect all, then sort
     req.config.remote_weight = 0.02;  // strong local preference
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << res.error();
-    ASSERT_EQ(1u, res.value().candidates.size());
-    EXPECT_EQ(local_id, res.value().candidates[0].client_id);
+    ASSERT_EQ(1u, res.value().size());
+    EXPECT_EQ(local_id, res.value()[0].client_id);
 }
 
 // With a weak local preference, a much-emptier remote out-scores the
@@ -360,18 +364,18 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteWeightedRemoteCanWin) {
     auto remote_id = generate_uuid();
     RegisterP2PClient(*service, remote_id, {remote_seg}, "10.0.0.2", 50052);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = local_id;
-    req.size = 50;
+    req.object_size = 50;
     req.config.max_candidates = 1;
     req.config.early_return = false;  // collect all, then sort
     req.config.remote_weight = 0.4;   // weak local preference
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << res.error();
-    ASSERT_EQ(1u, res.value().candidates.size());
-    EXPECT_EQ(remote_id, res.value().candidates[0].client_id);
+    ASSERT_EQ(1u, res.value().size());
+    EXPECT_EQ(remote_id, res.value()[0].client_id);
 }
 
 // With early_return=true and max_candidates=1, ForEachClient stops after the
@@ -389,19 +393,19 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteEarlyReturnStopsAtFirstCandidate) {
     auto remote_id = generate_uuid();
     RegisterP2PClient(*service, remote_id, {remote_seg}, "10.0.0.2", 50052);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = local_id;
-    req.size = 50;
+    req.object_size = 50;
     req.config.max_candidates = 1;
     req.config.early_return = true;
     req.config.remote_weight = 0.4;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << res.error();
-    ASSERT_EQ(1u, res.value().candidates.size());
+    ASSERT_EQ(1u, res.value().size());
     // CAPACITY_PRIORITY visits the 100 000-capacity remote first; early stop.
-    EXPECT_EQ(remote_id, res.value().candidates[0].client_id);
+    EXPECT_EQ(remote_id, res.value()[0].client_id);
 }
 
 // Problem 3: top_tier_only changes which client wins by scoring only the
@@ -426,11 +430,11 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteTopTierCapacityAffectsScore) {
     auto b_id = generate_uuid();
     RegisterP2PClient(*service, b_id, {b_dram, b_nvme}, "10.0.0.2", 50052);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = generate_uuid();  // non-local requester
-    req.size = 50;
-    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+    req.object_size = 50;
+    req.config.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
     req.config.early_return = false;
     req.config.remote_weight = 0.5;
 
@@ -438,13 +442,13 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteTopTierCapacityAffectsScore) {
     req.config.top_tier_only = false;
     auto res_all = service->GetWriteRoute(req);
     ASSERT_TRUE(res_all.has_value()) << res_all.error();
-    EXPECT_EQ(b_id, res_all.value().candidates[0].client_id);
+    EXPECT_EQ(b_id, res_all.value()[0].client_id);
 
     // Top tier only: A's DRAM tier is emptier than B's -> A wins.
     req.config.top_tier_only = true;
     auto res_top = service->GetWriteRoute(req);
     ASSERT_TRUE(res_top.has_value()) << res_top.error();
-    EXPECT_EQ(a_id, res_top.value().candidates[0].client_id);
+    EXPECT_EQ(a_id, res_top.value()[0].client_id);
 }
 
 // A client that already owns the key is excluded from write-route candidates so
@@ -461,18 +465,18 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteExcludesExistingOwner) {
     // owner already holds "k".
     AddReplicaHelper(*service, "k", 1024, owner, owner_seg.id);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = generate_uuid();  // non-local, non-owner requester
-    req.size = 1024;
-    req.config.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+    req.object_size = 1024;
+    req.config.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
     req.config.early_return = false;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << res.error();
-    ASSERT_EQ(1u, res.value().candidates.size());
-    EXPECT_EQ(other, res.value().candidates[0].client_id);
-    for (const auto& c : res.value().candidates) {
+    ASSERT_EQ(1u, res.value().size());
+    EXPECT_EQ(other, res.value()[0].client_id);
+    for (const auto& c : res.value()) {
         EXPECT_NE(owner, c.client_id);
     }
 }
@@ -489,10 +493,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteExcludesSelfOwner) {
     // self already holds "k".
     AddReplicaHelper(*service, "k", 1024, self, seg.id);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = self;  // requester is the existing owner
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
 
     // The only registered client is the existing owner -> no candidate.
@@ -515,9 +519,9 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteRejectsAllWhenOwnerLimitReached) {
     // owner already holds "k" -> 1 owner == limit.
     AddReplicaHelper(*service, "k", 1024, owner, seg_a.id);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
 
     // owner requests write route: rejected (limit reached).
@@ -540,27 +544,27 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteLocalOnlyFallback) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "10.0.0.1", 50051);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = client_id;
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
     req.config.remote_weight = 0.0;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << res.error();
-    ASSERT_EQ(1u, res.value().candidates.size());
-    EXPECT_EQ(client_id, res.value().candidates[0].client_id);
+    ASSERT_EQ(1u, res.value().size());
+    EXPECT_EQ(client_id, res.value()[0].client_id);
 }
 
 // w=0 fallback via master with no registered clients: NO_AVAILABLE_CANDIDATE.
 TEST_F(P2PMasterServiceTest, GetWriteRouteLocalOnlyFallbackNoClient) {
     auto service = CreateService();
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = generate_uuid();  // not registered
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.max_candidates = 1;
     req.config.remote_weight = 0.0;
 
@@ -577,10 +581,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfig) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "10.0.0.1", 50051);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = client_id;
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.remote_weight = 0.0;
     req.config.local_write_waterline = 0.0;  // contradictory: dead end
 
@@ -597,10 +601,10 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfigSecondContradiction) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "10.0.0.1", 50051);
 
-    WriteRouteRequest req;
+    P2PGetWriteRouteRequest req;
     req.key = "k";
     req.client_id = client_id;
-    req.size = 1024;
+    req.object_size = 1024;
     req.config.remote_weight = 1.0;
     req.config.local_write_waterline = 1.0;  // contradictory: dead end
 
@@ -620,23 +624,22 @@ TEST_F(P2PMasterServiceTest, AddReplicaBasic) {
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
     // Add a replica
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "key1";
-    req.size = 1024;
+    req.object_size = 1024;
     req.client_id = client_id;
     req.segment_id = seg.id;
     auto res = service->AddReplica(req);
     ASSERT_TRUE(res.has_value());
 
-    // Verify it shows up in GetReplicaList
-    auto get_res = service->GetReplicaList(req.key);
+    // Verify it shows up in GetReadRoute
+    auto get_res = service->GetReadRoute(req.key);
     ASSERT_TRUE(get_res.has_value());
-    EXPECT_EQ(1, get_res.value().replicas.size());
+    EXPECT_EQ(1, get_res.value().size());
 
-    auto& desc = get_res.value().replicas[0];
-    EXPECT_TRUE(desc.is_p2p_proxy_replica());
-    EXPECT_EQ(client_id, desc.get_p2p_proxy_descriptor().client_id);
-    EXPECT_EQ(seg.id, desc.get_p2p_proxy_descriptor().segment_id);
+    auto& desc = get_res.value()[0];
+    EXPECT_EQ(client_id, desc.client_id);
+    EXPECT_EQ(seg.id, desc.segment_id);
 }
 
 TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
@@ -645,9 +648,9 @@ TEST_F(P2PMasterServiceTest, AddReplicaDuplicate) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "key1";
-    req.size = 1024;
+    req.object_size = 1024;
     req.client_id = client_id;
     req.segment_id = seg.id;
 
@@ -671,22 +674,19 @@ TEST_F(P2PMasterServiceTest, AddReplicaRejectsObjectSizeMismatch) {
     RegisterP2PClient(*service, client2, {seg2}, "10.0.0.2", 50052);
 
     AddReplicaHelper(*service, "key1", 1024, client1, seg1.id);
-    AddReplicaRequest mismatch;
+    P2PPublishRouteRequest mismatch;
     mismatch.key = "key1";
-    mismatch.size = 2048;
+    mismatch.object_size = 2048;
     mismatch.client_id = client2;
     mismatch.segment_id = seg2.id;
     auto result = service->AddReplica(mismatch);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 
-    auto route = service->GetReplicaList("key1");
+    auto route = service->GetReadRoute("key1");
     ASSERT_TRUE(route.has_value());
-    EXPECT_EQ(route->replicas.size(), 1);
-    EXPECT_EQ(route->replicas.front()
-                  .get_p2p_proxy_descriptor()
-                  .object_size,
-              1024);
+    EXPECT_EQ(route.value().size(), 1);
+    EXPECT_EQ(route.value().front().object_size, 1024);
 }
 
 TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
@@ -709,18 +709,18 @@ TEST_F(P2PMasterServiceTest, AddReplicaMaxLimit) {
     // The second owner client is allowed.
     AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
 
-    // GetReplicaList aggregates per client: client1's two segment-replicas
+    // GetReadRoute aggregates per client: client1's two segment-replicas
     // collapse to one route, plus client2 -> 2 routes. (Both AddReplica calls
     // on client1 already succeeded above, confirming multiple replicas per
     // client are allowed.)
-    auto get_res = service->GetReplicaList("key1");
+    auto get_res = service->GetReadRoute("key1");
     ASSERT_TRUE(get_res.has_value());
-    EXPECT_EQ(2, get_res.value().replicas.size());
+    EXPECT_EQ(2, get_res.value().size());
 
     // The third owner client should exceed the limit.
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "key1";
-    req.size = 1024;
+    req.object_size = 1024;
     req.client_id = client3;
     req.segment_id = seg3.id;
     auto res = service->AddReplica(req);
@@ -732,9 +732,9 @@ TEST_F(P2PMasterServiceTest, AddReplicaClientNotFound) {
     auto service = CreateService();
     auto seg = MakeP2PSegment();
 
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "key1";
-    req.size = 1024;
+    req.object_size = 1024;
     req.client_id = generate_uuid();  // non-existent
     req.segment_id = seg.id;
     auto res = service->AddReplica(req);
@@ -748,9 +748,9 @@ TEST_F(P2PMasterServiceTest, AddReplicaSegmentNotFound) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "key1";
-    req.size = 1024;
+    req.object_size = 1024;
     req.client_id = client_id;
     req.segment_id = generate_uuid();  // non-existent segment
     auto res = service->AddReplica(req);
@@ -771,7 +771,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaBasic) {
     AddReplicaHelper(*service, "key1", 1024, client_id, seg.id);
 
     // Remove the replica
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = "key1";
     req.client_id = client_id;
     req.segment_id = seg.id;
@@ -779,7 +779,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaBasic) {
     ASSERT_TRUE(res.has_value());
 
     // Verify key is gone (last replica removed → object removed)
-    auto get_res = service->GetReplicaList("key1");
+    auto get_res = service->GetReadRoute("key1");
     EXPECT_FALSE(get_res.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
 }
@@ -797,7 +797,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaPartial) {
     AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
 
     // Remove one replica
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = "key1";
     req.client_id = client1;
     req.segment_id = seg1.id;
@@ -805,9 +805,9 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaPartial) {
     ASSERT_TRUE(res.has_value());
 
     // Object still exists with one replica
-    auto get_res = service->GetReplicaList("key1");
+    auto get_res = service->GetReadRoute("key1");
     ASSERT_TRUE(get_res.has_value());
-    EXPECT_EQ(1, get_res.value().replicas.size());
+    EXPECT_EQ(1, get_res.value().size());
 }
 
 TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
@@ -819,7 +819,7 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
     AddReplicaHelper(*service, "key1", 1024, client_id, seg.id);
 
     // Try removing non-existent replica
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = "key1";
     req.client_id = client_id;
     req.segment_id = generate_uuid();  // wrong segment
@@ -831,13 +831,106 @@ TEST_F(P2PMasterServiceTest, RemoveReplicaNotFound) {
 TEST_F(P2PMasterServiceTest, RemoveReplicaObjectNotFound) {
     auto service = CreateService();
 
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = "non_existent_key";
     req.client_id = generate_uuid();
     req.segment_id = generate_uuid();
     auto res = service->RemoveReplica(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, res.error());
+}
+
+TEST_F(P2PMasterServiceTest, BatchSyncRoutesAppliesMixedOperations) {
+    auto service = CreateService();
+    auto segment = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {segment});
+    AddReplicaHelper(*service, "existing", 1024, client_id, segment.id);
+
+    P2PBatchSyncRoutesRequest request;
+    request.client_id = client_id;
+    request.publish_operations = {
+        {.key = "new", .object_size = 1024, .segment_id = segment.id},
+        {.key = "invalid-segment",
+         .object_size = 1024,
+         .segment_id = generate_uuid()},
+        {.key = "cycle", .object_size = 1024, .segment_id = segment.id},
+    };
+    request.withdraw_operations = {
+        {.key = "existing", .segment_id = segment.id},
+        {.key = "missing", .segment_id = segment.id},
+        {.key = "cycle", .segment_id = segment.id},
+    };
+
+    auto response = service->BatchSyncRoutes(request);
+    EXPECT_EQ(response.publish_results,
+              (std::vector<ErrorCode>{ErrorCode::OK,
+                                      ErrorCode::SEGMENT_NOT_FOUND,
+                                      ErrorCode::OK}));
+    EXPECT_EQ(response.withdraw_results,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
+                                      ErrorCode::OK}));
+    EXPECT_TRUE(*service->ExistKey("new"));
+    EXPECT_FALSE(*service->ExistKey("existing"));
+    EXPECT_FALSE(*service->ExistKey("cycle"));
+}
+
+TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
+    constexpr size_t kReplicaCount = 16;
+    auto service = CreateService();
+    auto client_id = generate_uuid();
+    std::vector<P2PSegment> segments;
+    segments.reserve(kReplicaCount);
+    for (size_t index = 0; index < kReplicaCount; ++index) {
+        segments.push_back(MakeP2PSegment("segment-" +
+                                         std::to_string(index)));
+    }
+    RegisterP2PClient(*service, client_id, segments);
+
+    const std::string key = "concurrent-route";
+    std::vector<ErrorCode> errors(kReplicaCount, ErrorCode::INTERNAL_ERROR);
+    std::vector<std::thread> workers;
+    workers.reserve(kReplicaCount);
+    for (size_t index = 0; index < kReplicaCount; ++index) {
+        workers.emplace_back([&, index] {
+            P2PPublishRouteRequest request;
+            request.key = key;
+            request.object_size = 1024;
+            request.client_id = client_id;
+            request.segment_id = segments[index].id;
+            auto result = service->AddReplica(request);
+            errors[index] =
+                result.has_value() ? ErrorCode::OK : result.error();
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    EXPECT_TRUE(std::all_of(errors.begin(), errors.end(), [](ErrorCode error) {
+        return error == ErrorCode::OK;
+    }));
+    EXPECT_TRUE(*service->ExistKey(key));
+
+    std::fill(errors.begin(), errors.end(), ErrorCode::INTERNAL_ERROR);
+    workers.clear();
+    for (size_t index = 0; index < kReplicaCount; ++index) {
+        workers.emplace_back([&, index] {
+            P2PWithdrawRouteRequest request;
+            request.key = key;
+            request.client_id = client_id;
+            request.segment_id = segments[index].id;
+            auto result = service->RemoveReplica(request);
+            errors[index] =
+                result.has_value() ? ErrorCode::OK : result.error();
+        });
+    }
+    for (auto& worker : workers) {
+        worker.join();
+    }
+    EXPECT_TRUE(std::all_of(errors.begin(), errors.end(), [](ErrorCode error) {
+        return error == ErrorCode::OK;
+    }));
+    EXPECT_FALSE(*service->ExistKey(key));
 }
 
 // ============================================================
@@ -852,18 +945,17 @@ TEST_F(P2PMasterServiceTest, UnregisterClientRemovesReplicasAndSegments) {
     AddReplicaHelper(*service, "key1", 1024, client_id, seg.id);
 
     // Sanity: replica + segment + client present.
-    ASSERT_TRUE(service->GetReplicaList("key1").has_value());
+    ASSERT_TRUE(service->GetReadRoute("key1").has_value());
     ASSERT_TRUE(service->QuerySegments(seg.name).has_value());
     ASSERT_NE(service->GetClientManager().GetClient(client_id), nullptr);
 
     // Unregister cascades: segment unmount -> replica/object removal.
-    auto res = service->UnregisterClient(
-        P2PUnregisterClientRequest{client_id, DeploymentMode::P2P});
+    auto res = service->UnregisterClient(client_id);
     ASSERT_TRUE(res.has_value());
 
     EXPECT_EQ(service->GetClientManager().GetClient(client_id), nullptr);
     EXPECT_FALSE(service->QuerySegments(seg.name).has_value());
-    auto get_res = service->GetReplicaList("key1");
+    auto get_res = service->GetReadRoute("key1");
     EXPECT_FALSE(get_res.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_res.error());
 }
@@ -880,19 +972,16 @@ TEST_F(P2PMasterServiceTest, UnregisterClientPartialKeepsOtherOwner) {
     AddReplicaHelper(*service, "key1", 1024, client2, seg2.id);
 
     // Unregister client1 -> only its replica is removed.
-    ASSERT_TRUE(service
-                    ->UnregisterClient(
-                        P2PUnregisterClientRequest{client1, DeploymentMode::P2P})
-                    .has_value());
+    ASSERT_TRUE(service->UnregisterClient(client1).has_value());
 
     EXPECT_EQ(service->GetClientManager().GetClient(client1), nullptr);
     EXPECT_NE(service->GetClientManager().GetClient(client2), nullptr);
 
-    auto get_res = service->GetReplicaList("key1");
+    auto get_res = service->GetReadRoute("key1");
     ASSERT_TRUE(get_res.has_value());
-    EXPECT_EQ(1, get_res.value().replicas.size());
+    EXPECT_EQ(1, get_res.value().size());
     EXPECT_EQ(client2,
-              get_res.value().replicas[0].get_p2p_proxy_descriptor().client_id);
+              get_res.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest,
@@ -910,15 +999,12 @@ TEST_F(P2PMasterServiceTest,
     AddReplicaHelper(*service, "key1", 1024, client1, shared_segment_id);
     AddReplicaHelper(*service, "key1", 1024, client2, shared_segment_id);
 
-    ASSERT_TRUE(service
-                    ->UnregisterClient(
-                        P2PUnregisterClientRequest{client1, DeploymentMode::P2P})
-                    .has_value());
+    ASSERT_TRUE(service->UnregisterClient(client1).has_value());
 
-    auto route = service->GetReplicaList("key1");
+    auto route = service->GetReadRoute("key1");
     ASSERT_TRUE(route.has_value());
-    ASSERT_EQ(route->replicas.size(), 1);
-    EXPECT_EQ(route->replicas.front().get_p2p_proxy_descriptor().client_id,
+    ASSERT_EQ(route.value().size(), 1);
+    EXPECT_EQ(route.value().front().client_id,
               client2);
 }
 
@@ -928,19 +1014,13 @@ TEST_F(P2PMasterServiceTest, UnregisterClientIdempotent) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    ASSERT_TRUE(service
-                    ->UnregisterClient(
-                        P2PUnregisterClientRequest{client_id, DeploymentMode::P2P})
-                    .has_value());
+    ASSERT_TRUE(service->UnregisterClient(client_id).has_value());
     // Second call: client already gone -> still OK (idempotent).
-    EXPECT_TRUE(service
-                    ->UnregisterClient(
-                        P2PUnregisterClientRequest{client_id, DeploymentMode::P2P})
-                    .has_value());
+    EXPECT_TRUE(service->UnregisterClient(client_id).has_value());
 }
 
 // ============================================================
-// GetReplicaList + FilterReplicas Tests
+// GetReadRoute + FilterReplicas Tests
 // ============================================================
 
 TEST_F(P2PMasterServiceTest, GetReplicaListBasic) {
@@ -951,19 +1031,19 @@ TEST_F(P2PMasterServiceTest, GetReplicaListBasic) {
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
     AddReplicaHelper(*service, "key1", 1024, client_id, seg.id);
 
-    auto res = service->GetReplicaList("key1");
+    auto res = service->GetReadRoute("key1");
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(1, res.value().replicas.size());
+    EXPECT_EQ(1, res.value().size());
 }
 
 TEST_F(P2PMasterServiceTest, GetReplicaListNotFound) {
     auto service = CreateService();
-    auto res = service->GetReplicaList("non_existent");
+    auto res = service->GetReadRoute("non_existent");
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, res.error());
 }
 
-TEST_F(P2PMasterServiceTest, GetReplicaListByRegexReturnsMatchingRoutes) {
+TEST_F(P2PMasterServiceTest, GetReadRouteByRegexReturnsMatchingRoutes) {
     auto service = CreateService();
     auto segment = MakeP2PSegment();
     auto client_id = generate_uuid();
@@ -972,7 +1052,7 @@ TEST_F(P2PMasterServiceTest, GetReplicaListByRegexReturnsMatchingRoutes) {
     AddReplicaHelper(*service, "prefix-b", 1024, client_id, segment.id);
     AddReplicaHelper(*service, "other", 1024, client_id, segment.id);
 
-    auto result = service->GetReplicaListByRegex("^prefix-");
+    auto result = service->GetReadRouteByRegex("^prefix-");
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(result->size(), 2);
     EXPECT_TRUE(result->contains("prefix-a"));
@@ -994,18 +1074,16 @@ TEST_F(P2PMasterServiceTest, FilterReplicasWithTagAndPriority) {
     AddReplicaHelper(*service, "key1", 1024, client2, seg_b.id);
 
     // Filter out replicas with tag "memory" — only seg_b remains
-    P2PGetReplicaListRequestConfig config;
+    P2PReadRouteConfig config;
     config.max_candidates = 10;
-    config.p2p_config = P2PReadRouteConfigExtra{
-        .tag_filters = {"memory"},
-        .priority_limit = 0,
-    };
+    config.tag_filters = {"memory"};
+    config.priority_limit = 0;
 
-    auto res = service->GetReplicaList("key1", config);
+    auto res = service->GetReadRoute("key1", config);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(1, res.value().replicas.size());
+    EXPECT_EQ(1, res.value().size());
     EXPECT_EQ(client2,
-              res.value().replicas[0].get_p2p_proxy_descriptor().client_id);
+              res.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest, FilterReplicasWithMaxCandidates) {
@@ -1024,21 +1102,18 @@ TEST_F(P2PMasterServiceTest, FilterReplicasWithMaxCandidates) {
     }
 
     // Limit to 3 candidates — should return top 3 by priority
-    P2PGetReplicaListRequestConfig config;
+    P2PReadRouteConfig config;
     config.max_candidates = 3;
-    config.p2p_config = P2PReadRouteConfigExtra{
-        .tag_filters = {},
-        .priority_limit = 0,
-    };
+    config.priority_limit = 0;
 
-    auto res = service->GetReplicaList("key1", config);
+    auto res = service->GetReadRoute("key1", config);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(3, res.value().replicas.size());
+    EXPECT_EQ(3, res.value().size());
 
     // The top 3 should have priorities 5, 4, 3 (descending)
     // Verify the first one has the highest priority
     EXPECT_EQ(client_ids[4],
-              res.value().replicas[0].get_p2p_proxy_descriptor().client_id);
+              res.value()[0].client_id);
 }
 
 // A client holding the key on multiple segments (tiers) is aggregated into a
@@ -1052,15 +1127,15 @@ TEST_F(P2PMasterServiceTest, GetReplicaListAggregatesPerClient) {
     AddReplicaHelper(*service, "key1", 1024, client_id, seg_hi.id);
     AddReplicaHelper(*service, "key1", 1024, client_id, seg_lo.id);
 
-    auto res = service->GetReplicaList("key1");
+    auto res = service->GetReadRoute("key1");
     ASSERT_TRUE(res.has_value());
     // Two segment-replicas on the same client collapse to one route.
-    EXPECT_EQ(1, res.value().replicas.size());
+    EXPECT_EQ(1, res.value().size());
     EXPECT_EQ(client_id,
-              res.value().replicas[0].get_p2p_proxy_descriptor().client_id);
+              res.value()[0].client_id);
     // Representative is the highest-priority segment.
     EXPECT_EQ(seg_hi.id,
-              res.value().replicas[0].get_p2p_proxy_descriptor().segment_id);
+              res.value()[0].segment_id);
 }
 
 // ============================================================
@@ -1191,37 +1266,37 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     RegisterP2PClient(*service, reader_id, {}, "10.0.0.2", 50052);
 
     // Step 1: Get write route
-    WriteRouteRequest w_req;
+    P2PGetWriteRouteRequest w_req;
     w_req.key = "data_001";
     w_req.client_id = reader_id;  // reader asks for write route
-    w_req.size = 4096;
+    w_req.object_size = 4096;
     w_req.config.max_candidates = 1;
 
     auto w_res = service->GetWriteRoute(w_req);
     ASSERT_TRUE(w_res.has_value());
-    EXPECT_EQ(1, w_res.value().candidates.size());
+    EXPECT_EQ(1, w_res.value().size());
 
-    auto& candidate = w_res.value().candidates[0];
+    auto& candidate = w_res.value()[0];
     EXPECT_EQ(writer_id, candidate.client_id);
 
     // Step 2: Add replica (simulate write completion). The route is
     // client-only; the client registers the concrete segment it actually wrote
     // (here seg.id).
-    AddReplicaRequest a_req;
+    P2PPublishRouteRequest a_req;
     a_req.key = "data_001";
-    a_req.size = 4096;
+    a_req.object_size = 4096;
     a_req.client_id = candidate.client_id;
     a_req.segment_id = seg.id;
     auto a_res = service->AddReplica(a_req);
     ASSERT_TRUE(a_res.has_value());
 
-    // Step 3: Read — GetReplicaList
-    auto r_res = service->GetReplicaList("data_001");
+    // Step 3: Read — GetReadRoute
+    auto r_res = service->GetReadRoute("data_001");
     ASSERT_TRUE(r_res.has_value());
-    EXPECT_EQ(1, r_res.value().replicas.size());
+    EXPECT_EQ(1, r_res.value().size());
 
     // Step 4: Remove
-    RemoveReplicaRequest rm_req;
+    P2PWithdrawRouteRequest rm_req;
     rm_req.key = "data_001";
     rm_req.client_id = candidate.client_id;
     rm_req.segment_id = seg.id;
@@ -1229,7 +1304,7 @@ TEST_F(P2PMasterServiceTest, FullWriteReadCycle) {
     ASSERT_TRUE(rm_res.has_value());
 
     // Verify gone
-    auto r_res2 = service->GetReplicaList("data_001");
+    auto r_res2 = service->GetReadRoute("data_001");
     EXPECT_FALSE(r_res2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, r_res2.error());
 }

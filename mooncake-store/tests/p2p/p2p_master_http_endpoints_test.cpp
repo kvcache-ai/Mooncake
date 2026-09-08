@@ -4,7 +4,7 @@
  *        (GET /health, GET /get_key_count, GET /get_all_keys,
  *         GET /batch_query_keys, GET /metrics).
  *
- * Brings up an in-process WrappedP2PMasterService with the embedded HTTP
+ * Brings up an in-process P2PMasterRpcService with the embedded HTTP
  * server bound to a free port (no RPC server)
  */
 
@@ -74,7 +74,7 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         wms_cfg.routes.max_clients_per_key = 0;  // no limit for P2P
         wms_cfg.metrics.http_port = http_port;
 
-        wrapped_ = std::make_unique<WrappedP2PMasterService>(wms_cfg);
+        wrapped_ = std::make_unique<P2PMasterRpcService>(wms_cfg);
         wrapped_->init();
         // Give the HTTP server a moment to come up (mirrors InProcP2PMaster).
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -175,24 +175,22 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
 
     static void AddKey(const std::string& key, size_t size,
                        const UUID& segment_id) {
-        // AddReplicaRequest::key is a string_view; `key` outlives the
-        // synchronous AddReplica call.
-        AddReplicaRequest req;
+        P2PPublishRouteRequest req;
         req.key = key;
-        req.size = size;
+        req.object_size = size;
         req.client_id = client_id_;
         req.segment_id = segment_id;
-        auto res = wrapped_->AddReplica(req);
+        auto res = wrapped_->PublishRoute(req);
         ASSERT_TRUE(res.has_value())
             << "AddReplica failed for " << key << ": " << res.error();
     }
 
     static void RemoveKey(const std::string& key, const UUID& segment_id) {
-        RemoveReplicaRequest req;
+        P2PWithdrawRouteRequest req;
         req.key = key;
         req.client_id = client_id_;
         req.segment_id = segment_id;
-        auto res = wrapped_->RemoveReplica(req);
+        auto res = wrapped_->WithdrawRoute(req);
         ASSERT_TRUE(res.has_value())
             << "RemoveReplica failed for " << key << ": " << res.error();
     }
@@ -235,14 +233,14 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
     }
 
     static constexpr size_t kSegmentSize = 16 * 1024 * 1024;
-    static std::unique_ptr<WrappedP2PMasterService> wrapped_;
+    static std::unique_ptr<P2PMasterRpcService> wrapped_;
     static std::string http_base_url_;
     static UUID client_id_;
     static UUID segment_id_a_;
     static UUID segment_id_b_;
 };
 
-std::unique_ptr<WrappedP2PMasterService> P2PMasterHttpEndpointsTest::wrapped_;
+std::unique_ptr<P2PMasterRpcService> P2PMasterHttpEndpointsTest::wrapped_;
 std::string P2PMasterHttpEndpointsTest::http_base_url_;
 UUID P2PMasterHttpEndpointsTest::client_id_;
 UUID P2PMasterHttpEndpointsTest::segment_id_a_;
@@ -332,7 +330,7 @@ TEST_F(P2PMasterHttpEndpointsTest, GetAllKeysReturnsExactlyThePopulatedKeySet) {
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
-       BatchQueryKeysDistinguishesPopulatedAndMissingKeys) {
+       BatchQueryRoutesReturnsDescriptorsAndErrors) {
     const std::string key0 = "batchquery_test_key_0";
     const std::string key1 = "batchquery_test_key_1";
     const std::string missing_key = "batchquery_test_missing_key";
@@ -340,65 +338,46 @@ TEST_F(P2PMasterHttpEndpointsTest,
     AddKey(key0, /*size=*/1024, segment_id_a_);
     AddKey(key1, /*size=*/2048, segment_id_b_);
 
-    auto resp = HttpGet(http_base_url_ + "/batch_query_keys?keys=" + key0 +
+    auto resp = HttpGet(http_base_url_ + "/batch_query_routes?keys=" + key0 +
                         "," + key1 + "," + missing_key);
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
 
-    auto parsed =
-        ParseJson<BatchQueryResponse>(resp.resp_body, "/batch_query_keys");
-    ASSERT_TRUE(parsed.success) << "body=" << resp.resp_body;
-    ASSERT_EQ(parsed.data.size(), 3u);
-
-    // Populated keys are reported as ok.
-    ASSERT_EQ(parsed.data.count(key0), 1u);
-    EXPECT_TRUE(parsed.data[key0].ok);
-    EXPECT_TRUE(parsed.data[key0].error.empty());
-    ASSERT_EQ(parsed.data.count(key1), 1u);
-    EXPECT_TRUE(parsed.data[key1].ok);
-    // P2P replicas are proxy replicas (client/segment references), not
-    // memory descriptors, so the endpoint currently emits no buffer values
-    // for them.
-    EXPECT_TRUE(parsed.data[key0].values.empty());
-    EXPECT_TRUE(parsed.data[key1].values.empty());
-
-    // A key that was never populated is reported with the lookup error.
-    ASSERT_EQ(parsed.data.count(missing_key), 1u);
-    EXPECT_FALSE(parsed.data[missing_key].ok);
-    EXPECT_EQ(parsed.data[missing_key].error,
-              toString(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_NE(resp.resp_body.find("\"object_size\":1024"),
+              std::string::npos);
+    EXPECT_NE(resp.resp_body.find("\"object_size\":2048"),
+              std::string::npos);
+    const std::string expected_errors =
+        "\"error_codes\":[0,0," +
+        std::to_string(toInt(ErrorCode::OBJECT_NOT_FOUND)) + "]";
+    EXPECT_NE(resp.resp_body.find(expected_errors), std::string::npos)
+        << "body=" << resp.resp_body;
 
     RemoveKey(key0, segment_id_a_);
     RemoveKey(key1, segment_id_b_);
 
     // Once removed, the same keys must now be reported as missing.
     auto resp_after_remove =
-        HttpGet(http_base_url_ + "/batch_query_keys?keys=" + key0 + "," + key1);
+        HttpGet(http_base_url_ + "/batch_query_routes?keys=" + key0 + "," +
+                key1);
     ASSERT_EQ(resp_after_remove.status, 200)
         << "body=" << resp_after_remove.resp_body;
-    auto parsed_after_remove = ParseJson<BatchQueryResponse>(
-        resp_after_remove.resp_body, "/batch_query_keys after remove");
-    ASSERT_TRUE(parsed_after_remove.success);
-    ASSERT_EQ(parsed_after_remove.data.size(), 2u);
-    for (const auto& key : {key0, key1}) {
-        ASSERT_EQ(parsed_after_remove.data.count(key), 1u);
-        EXPECT_FALSE(parsed_after_remove.data[key].ok)
-            << "removed key " << key << " still reported as present";
-    }
+    const auto missing_code =
+        std::to_string(toInt(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_NE(resp_after_remove.resp_body.find(
+                  "\"error_codes\":[" + missing_code + "," + missing_code +
+                  "]"),
+              std::string::npos)
+        << "body=" << resp_after_remove.resp_body;
 }
 
-TEST_F(P2PMasterHttpEndpointsTest, BatchQueryKeysRejectsEmptyKeyList) {
+TEST_F(P2PMasterHttpEndpointsTest, BatchQueryRoutesRejectsEmptyKeyList) {
     // No query parameter at all.
-    auto resp = HttpGet(http_base_url_ + "/batch_query_keys");
+    auto resp = HttpGet(http_base_url_ + "/batch_query_routes");
     ASSERT_EQ(resp.status, 400) << "body=" << resp.resp_body;
-    auto parsed =
-        ParseJson<BatchQueryResponse>(resp.resp_body, "/batch_query_keys");
-    EXPECT_FALSE(parsed.success);
-    EXPECT_NE(parsed.error.find("No keys provided"), std::string::npos)
-        << "body=" << resp.resp_body;
-    EXPECT_TRUE(parsed.data.empty());
+    EXPECT_NE(resp.resp_body.find("No keys provided"), std::string::npos);
 
     // Empty `keys` query parameter.
-    auto resp_empty = HttpGet(http_base_url_ + "/batch_query_keys?keys=");
+    auto resp_empty = HttpGet(http_base_url_ + "/batch_query_routes?keys=");
     ASSERT_EQ(resp_empty.status, 400) << "body=" << resp_empty.resp_body;
 }
 

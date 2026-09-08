@@ -73,7 +73,7 @@ TEST_F(P2PClientManagerTest, RegisterClientSuccess) {
 
     auto res = mgr->RegisterClient(req);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(res.value().view_version, 1);
+    EXPECT_EQ(res.value(), 1);
 }
 
 TEST_F(P2PClientManagerTest, RegisterClientDuplicate) {
@@ -146,8 +146,7 @@ TEST_F(P2PClientManagerTest, UnregisterClientSuccess) {
     ASSERT_TRUE(mgr->RegisterClient(req).has_value());
     EXPECT_EQ(mgr->GetAllClients().size(), 1);
 
-    auto res = mgr->UnregisterClient(
-        P2PUnregisterClientRequest{client_id, DeploymentMode::P2P});
+    auto res = mgr->UnregisterClient(client_id);
     ASSERT_TRUE(res.has_value());
 
     // Client and all its segments are gone.
@@ -162,8 +161,7 @@ TEST_F(P2PClientManagerTest, UnregisterClientNotFoundIsIdempotent) {
     mgr->Start();
 
     // Unregistering an absent client is a no-op success.
-    auto res = mgr->UnregisterClient(
-        P2PUnregisterClientRequest{{999, 999}, DeploymentMode::P2P});
+    auto res = mgr->UnregisterClient({999, 999});
     EXPECT_TRUE(res.has_value());
 }
 
@@ -177,9 +175,7 @@ TEST_F(P2PClientManagerTest, UnregisterThenReRegister) {
                                         client_id, "10.0.0.1", 50051, {seg}))
                     .has_value());
 
-    ASSERT_TRUE(mgr->UnregisterClient(
-                       P2PUnregisterClientRequest{client_id, DeploymentMode::P2P})
-                    .has_value());
+    ASSERT_TRUE(mgr->UnregisterClient(client_id).has_value());
     EXPECT_EQ(mgr->GetClient(client_id), nullptr);
 
     // Re-registering the same client_id succeeds (no CLIENT_ALREADY_EXISTS).
@@ -210,9 +206,7 @@ TEST_F(P2PClientManagerTest, RegisterUnregisterActiveGauge) {
     EXPECT_EQ(m.get_active_clients(), 2);
 
     // Proactively unregister a HEALTH client: active-- and NOT counted a crash.
-    ASSERT_TRUE(mgr->UnregisterClient(
-                       P2PUnregisterClientRequest{{1, 0}, DeploymentMode::P2P})
-                    .has_value());
+    ASSERT_TRUE(mgr->UnregisterClient({1, 0}).has_value());
     EXPECT_EQ(m.get_active_clients(), 1);
     EXPECT_EQ(m.get_clients_crashed_total(), 0);
 }
@@ -581,9 +575,9 @@ TEST_F(P2PClientManagerTest, ForEachClientOrdered) {
         return false;
     };
 
-    ASSERT_TRUE(mgr->ForEachClient(ObjectIterateStrategy::ORDERED, visitor1)
+    ASSERT_TRUE(mgr->ForEachClient(P2PClientSelectionStrategy::ORDERED, visitor1)
                     .has_value());
-    ASSERT_TRUE(mgr->ForEachClient(ObjectIterateStrategy::ORDERED, visitor2)
+    ASSERT_TRUE(mgr->ForEachClient(P2PClientSelectionStrategy::ORDERED, visitor2)
                     .has_value());
     EXPECT_EQ(ids1, ids2);
     EXPECT_EQ(ids1.size(), 3);
@@ -610,7 +604,7 @@ TEST_F(P2PClientManagerTest, ForEachClientCapacityPriority) {
     };
 
     ASSERT_TRUE(
-        mgr->ForEachClient(ObjectIterateStrategy::CAPACITY_PRIORITY, visitor)
+        mgr->ForEachClient(P2PClientSelectionStrategy::CAPACITY_PRIORITY, visitor)
             .has_value());
     ASSERT_EQ(ids.size(), 3);
     EXPECT_EQ(ids[0], (UUID{2, 0}));
@@ -628,7 +622,7 @@ TEST_F(P2PClientManagerTest, ForEachClientCapacityPriority) {
     // New capacity for {2,0} is 3072 - 2500 = 572.
     // Order should be: {1,0} (2048), {0,0} (1024), {2,0} (572)
     ASSERT_TRUE(
-        mgr->ForEachClient(ObjectIterateStrategy::CAPACITY_PRIORITY, visitor)
+        mgr->ForEachClient(P2PClientSelectionStrategy::CAPACITY_PRIORITY, visitor)
             .has_value());
     ASSERT_EQ(ids.size(), 3);
     EXPECT_EQ(ids[0], (UUID{1, 0}));
@@ -679,7 +673,7 @@ TEST_F(P2PClientManagerTest, ForEachClientHealthEffect) {
     int count = 0;
     std::set<UUID> found_ids;
     mgr->ForEachClient(
-        ObjectIterateStrategy::ORDERED,
+        P2PClientSelectionStrategy::ORDERED,
         [&count, &found_ids](const std::shared_ptr<P2PClientMeta>& client)
             -> tl::expected<bool, ErrorCode> {
             count++;
@@ -732,7 +726,7 @@ TEST_F(P2PClientManagerTest, ConcurrentRegister) {
     // Verify all clients registered via ForEachClient
     std::set<UUID> registered_ids;
     auto res = mgr->ForEachClient(
-        ObjectIterateStrategy::ORDERED,
+        P2PClientSelectionStrategy::ORDERED,
         [&registered_ids](const std::shared_ptr<P2PClientMeta>& client)
             -> tl::expected<bool, ErrorCode> {
             registered_ids.insert(client->get_client_id());
@@ -816,7 +810,7 @@ TEST_F(P2PClientManagerTest, ConcurrentRegisterSameClient) {
 
     int count = 0;
     auto res =
-        mgr->ForEachClient(ObjectIterateStrategy::ORDERED,
+        mgr->ForEachClient(P2PClientSelectionStrategy::ORDERED,
                            [&count](
                                const std::shared_ptr<P2PClientMeta>& client)
                                -> tl::expected<bool, ErrorCode> {
@@ -861,9 +855,7 @@ TEST_F(P2PClientManagerTest, MonitorDoesNotEraseReRegisteredClient) {
                                               [&] { return entered; }));
     }
 
-    ASSERT_TRUE(mgr->UnregisterClient(P2PUnregisterClientRequest{
-                                        client_id, DeploymentMode::P2P})
-                    .has_value());
+    ASSERT_TRUE(mgr->UnregisterClient(client_id).has_value());
     auto new_segment = MakeP2PSegment({2, 2}, "new");
     ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest(
                                       client_id, "10.0.0.2", 50052,

@@ -130,6 +130,9 @@ struct LocalDiskReplicaData {
     std::string transport_endpoint;
 };
 
+// TODO(M8.5; see p2p-master-final-refactor-plan.md): Remove this unused
+// runtime Replica variant after the P2P master cleanup audit. P2P master route
+// storage no longer constructs it.
 struct P2PProxyReplicaData {
     P2PProxyReplicaData() = default;
     P2PProxyReplicaData(std::shared_ptr<P2PClientMeta> client,
@@ -162,6 +165,9 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
+// TODO(M8.4/C4; see p2p-split-plan-v2.md): Migrate HA metadata to
+// P2PRouteDescriptor in M8.4, then migrate the public QueryResult/route-cache
+// facade in C4 before removing this Descriptor variant.
 struct P2PProxyDescriptor {
     UUID client_id;
     UUID segment_id;

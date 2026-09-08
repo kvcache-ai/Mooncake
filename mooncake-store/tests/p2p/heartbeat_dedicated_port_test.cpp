@@ -38,6 +38,7 @@
 #include <string_view>
 #include <thread>
 #include <utility>
+#include <vector>
 
 #include "p2p/master/p2p_master_client.h"
 #include "rpc_types.h"
@@ -108,6 +109,11 @@ class HeartbeatTestClient {
 
     tl::expected<bool, ErrorCode> ExistKey(std::string_view key) {
         return client_.ExistKey(key);
+    }
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string_view>& keys) {
+        return client_.BatchExistKey(keys);
     }
 
    private:
@@ -197,8 +203,17 @@ TEST_F(HeartbeatDedicatedPortTest, NonHeartbeatRpcStillServedOnMainPort) {
     ASSERT_EQ(client->Connect(master_->master_address()), ErrorCode::OK);
 
     auto exists = client->ExistKey("nonexistent_key_for_heartbeat_test");
-    EXPECT_TRUE(exists.has_value())
+    ASSERT_TRUE(exists.has_value())
         << "ExistKey should reach the main port and succeed";
+    EXPECT_FALSE(exists.value());
+
+    const std::vector<std::string_view> keys{"missing-a", "missing-b"};
+    auto batch_exists = client->BatchExistKey(keys);
+    ASSERT_EQ(batch_exists.size(), keys.size());
+    for (const auto& result : batch_exists) {
+        ASSERT_TRUE(result.has_value());
+        EXPECT_FALSE(result.value());
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -32,98 +32,67 @@ inline constexpr uint64_t kP2PMetricReportIntervalSeconds = 10;
  * compatibility is intentionally out of scope because this code is still
  * under development and has not been deployed.
  */
-class WrappedP2PMasterService final {
+class P2PMasterRpcService final {
    public:
-    explicit WrappedP2PMasterService(const P2PMasterConfig& config,
-                                     ViewVersionId view_version = 0);
-    ~WrappedP2PMasterService();
+    explicit P2PMasterRpcService(const P2PMasterConfig& config,
+                                 ViewVersionId view_version = 0);
+    ~P2PMasterRpcService();
 
-    WrappedP2PMasterService(const WrappedP2PMasterService&) = delete;
-    WrappedP2PMasterService& operator=(const WrappedP2PMasterService&) = delete;
+    P2PMasterRpcService(const P2PMasterRpcService&) = delete;
+    P2PMasterRpcService& operator=(const P2PMasterRpcService&) = delete;
 
     void init();
-
     uint16_t GetHttpPort() const { return http_server_.port(); }
-
     P2PMasterService& GetMasterService() { return master_service_; }
     const P2PMasterService& GetMasterService() const { return master_service_; }
 
-    // TODO(M8): Replace ExistKey/BatchExistKey with owning
-    // RouteExists/BatchRouteExists requests.
     tl::expected<bool, ErrorCode> ExistKey(std::string_view key);
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string_view>& keys);
 
-    // TODO(M8): Remove BatchQueryIp and GetReplicaListByRegex from the P2P
-    // business RPC surface.
     tl::expected<
-        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
         ErrorCode>
-    BatchQueryIp(const std::vector<UUID>& client_ids);
+    GetReadRouteByRegex(std::string_view regex);
 
-    tl::expected<
-        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-        ErrorCode>
-    GetReplicaListByRegex(const std::string& str);
+    tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode> GetReadRoute(
+        const P2PGetReadRouteRequest& req);
+    P2PBatchGetReadRouteResponse BatchGetReadRoute(
+        const P2PBatchGetReadRouteRequest& req);
 
-    // TODO(M8): Replace with GetReadRoute/BatchGetReadRoute and P2P route
-    // descriptors.
-    tl::expected<P2PGetReplicaListResponse, ErrorCode> GetReplicaList(
-        std::string_view key, const P2PGetReplicaListRequestConfig& config =
-                                  P2PGetReplicaListRequestConfig());
-
-    std::vector<tl::expected<P2PGetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string_view>& keys,
-                        const P2PGetReplicaListRequestConfig& config =
-                            P2PGetReplicaListRequestConfig());
-
-    // TODO(M8): Remove the master-level remove/regex/remove-all compatibility
-    // RPCs from P2P.
-    tl::expected<void, ErrorCode> Remove(std::string_view key,
-                                         bool force = false);
-    tl::expected<long, ErrorCode> RemoveByRegex(std::string_view str,
-                                                bool force = false);
-    long RemoveAll(bool force = false);
-
-    // TODO(M8): Replace the positional segment parameters with owning
-    // P2PMountSegmentRequest/P2PUnmountSegmentRequest DTOs.
-    tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
-                                                 const UUID& client_id);
-    tl::expected<void, ErrorCode> MountSegment(const P2PSegment& segment,
-                                               const UUID& client_id);
+    tl::expected<void, ErrorCode> UnmountSegment(
+        const P2PUnmountSegmentRequest& req);
+    tl::expected<void, ErrorCode> MountSegment(
+        const P2PMountSegmentRequest& req);
 
     tl::expected<P2PHeartbeatResponse, ErrorCode> Heartbeat(
         const P2PHeartbeatRequest& req);
-    tl::expected<P2PQueryClientStatusResponse, ErrorCode> QueryClientStatus(
-        const P2PQueryClientStatusRequest& req);
-    tl::expected<P2PRegisterClientResponse, ErrorCode> RegisterClient(
+    tl::expected<P2PClientStatus, ErrorCode> QueryClientStatus(
+        const UUID& client_id);
+    tl::expected<ViewVersionId, ErrorCode> RegisterClient(
         const P2PRegisterClientRequest& req);
-    tl::expected<P2PUnregisterClientResponse, ErrorCode> UnregisterClient(
-        const P2PUnregisterClientRequest& req);
+    tl::expected<ViewVersionId, ErrorCode> UnregisterClient(
+        const UUID& client_id);
 
     tl::expected<std::string, ErrorCode> ServiceReady();
-    tl::expected<P2PHeartbeatServiceReadyResponse, ErrorCode>
-    HeartbeatServiceReady();
+    tl::expected<uint32_t, ErrorCode> HeartbeatServiceReady();
 
-    tl::expected<WriteRouteResponse, ErrorCode> GetWriteRoute(
-        const WriteRouteRequest& req);
+    tl::expected<std::vector<P2PWriteCandidate>, ErrorCode> GetWriteRoute(
+        const P2PGetWriteRouteRequest& req);
+    P2PBatchGetWriteRouteResponse BatchGetWriteRoute(
+        const P2PBatchGetWriteRouteRequest& req);
 
-    BatchGetWriteRouteResponse BatchGetWriteRoute(
-        const BatchGetWriteRouteRequest& req);
-
-    tl::expected<void, ErrorCode> AddReplica(const AddReplicaRequest& req);
-
-    tl::expected<void, ErrorCode> RemoveReplica(
-        const RemoveReplicaRequest& req);
-
-    std::vector<tl::expected<void, ErrorCode>> BatchRemoveReplica(
-        const BatchRemoveReplicaRequest& req);
-
-    BatchSyncReplicaResponse BatchSyncReplica(
-        const BatchSyncReplicaRequest& req);
-
-    tl::expected<void, ErrorCode> SetSyncCompleted(UUID client_id);
+    tl::expected<void, ErrorCode> PublishRoute(
+        const P2PPublishRouteRequest& req);
+    tl::expected<void, ErrorCode> WithdrawRoute(
+        const P2PWithdrawRouteRequest& req);
+    std::vector<tl::expected<void, ErrorCode>> BatchWithdrawRoute(
+        const P2PBatchWithdrawRouteRequest& req);
+    P2PBatchSyncRoutesResponse BatchSyncRoutes(
+        const P2PBatchSyncRoutesRequest& req);
+    tl::expected<void, ErrorCode> CompleteRouteSync(
+        const UUID& client_id);
 
    private:
     void init_http_server();
@@ -137,11 +106,11 @@ class WrappedP2PMasterService final {
 
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedP2PMasterService& wrapped_master_service,
+    mooncake::P2PMasterRpcService& wrapped_master_service,
     bool include_heartbeat = true);
 
 void RegisterP2PHeartbeatRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedP2PMasterService& wrapped_master_service);
+    mooncake::P2PMasterRpcService& wrapped_master_service);
 
 }  // namespace mooncake

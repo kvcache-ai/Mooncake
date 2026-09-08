@@ -36,13 +36,13 @@ class P2PClientManager final {
     void StopClientMonitor();
 
     auto RegisterClient(const P2PRegisterClientRequest& req)
-        -> tl::expected<P2PRegisterClientResponse, ErrorCode>;
-    auto UnregisterClient(const P2PUnregisterClientRequest& req)
-        -> tl::expected<P2PUnregisterClientResponse, ErrorCode>;
+        -> tl::expected<ViewVersionId, ErrorCode>;
+    auto UnregisterClient(const UUID& client_id)
+        -> tl::expected<ViewVersionId, ErrorCode>;
     auto Heartbeat(const P2PHeartbeatRequest& req)
         -> tl::expected<P2PHeartbeatResponse, ErrorCode>;
-    auto QueryClientStatus(const P2PQueryClientStatusRequest& req)
-        -> tl::expected<P2PQueryClientStatusResponse, ErrorCode>;
+    auto QueryClientStatus(const UUID& client_id)
+        -> tl::expected<P2PClientStatus, ErrorCode>;
 
     auto GetAllSegments() -> tl::expected<std::vector<std::string>, ErrorCode>;
     auto GetClientSegments(const UUID& client_id)
@@ -62,7 +62,7 @@ class P2PClientManager final {
 
     using ClientVisitor = std::function<tl::expected<bool, ErrorCode>(
         const std::shared_ptr<P2PClientMeta>& client)>;
-    auto ForEachClient(ObjectIterateStrategy strategy,
+    auto ForEachClient(P2PClientSelectionStrategy strategy,
                        const ClientVisitor& visitor)
         -> tl::expected<void, ErrorCode>;
 
@@ -77,7 +77,7 @@ class P2PClientManager final {
     HeartbeatTaskResult ProcessTask(
         const std::shared_ptr<P2PClientMeta>& client,
         const HeartbeatTask& task);
-    auto BuildClientList(ObjectIterateStrategy strategy) const
+    auto BuildClientList(P2PClientSelectionStrategy strategy) const
         -> std::optional<std::vector<std::shared_ptr<P2PClientMeta>>>;
 
     mutable SharedMutex clients_mutex_;

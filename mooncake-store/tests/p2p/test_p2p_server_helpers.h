@@ -61,7 +61,7 @@ class InProcP2PMasterConfigBuilder {
 /**
  * @brief Lightweight in-process P2P master server for tests (non-HA).
  *
- * Mirrors InProcMaster but uses WrappedP2PMasterService and
+ * Mirrors InProcMaster but uses P2PMasterRpcService and
  * RegisterP2PRpcService so that P2P-specific RPCs (GetWriteRoute,
  * AddReplica, RemoveReplica) are registered alongside the base RPCs.
  */
@@ -101,7 +101,7 @@ class InProcP2PMaster {
                     DEFAULT_CLIENT_CRASHED_TTL_SEC;
             }
 
-            wrapped_ = std::make_unique<WrappedP2PMasterService>(wms_cfg);
+            wrapped_ = std::make_unique<P2PMasterRpcService>(wms_cfg);
             wrapped_->init();
             const bool dedicated_heartbeat =
                 config.heartbeat_rpc_port.has_value() &&
@@ -158,12 +158,12 @@ class InProcP2PMaster {
     std::string master_address() const {
         return std::string("127.0.0.1:") + std::to_string(rpc_port_);
     }
-    WrappedP2PMasterService& GetWrapped() { return *wrapped_; }
+    P2PMasterRpcService& GetWrapped() { return *wrapped_; }
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::unique_ptr<coro_rpc::coro_rpc_server> heartbeat_server_;
-    std::unique_ptr<WrappedP2PMasterService> wrapped_;
+    std::unique_ptr<P2PMasterRpcService> wrapped_;
     int rpc_port_ = 0;
     int heartbeat_rpc_port_ = 0;
 };
