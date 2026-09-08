@@ -124,15 +124,13 @@ class TransferLane {
                 return TransferTicket(rdmaPut(
                     route.rdma, service_->route_context.rdma, request.local_ptr,
                     request.remote_offset, request.size, request.signal,
-                    request.timeout_ticks, lane_index_,
-                    service_->lane_results + lane_index_, block));
+                    request.timeout_ticks, lane_index_, block));
 
             case DeviceRouteType::HostProxy:
                 return TransferTicket(hostProxyPut(
                     route.host_proxy, service_->route_context.host_proxy, rank,
                     request.local_ptr, request.remote_offset, request.size,
-                    request.signal, request.timeout_ticks, lane_index_,
-                    service_->lane_results + lane_index_, block));
+                    request.signal, request.timeout_ticks, lane_index_, block));
 
             case DeviceRouteType::Unreachable:
                 return TransferTicket();
@@ -158,14 +156,12 @@ class TransferLane {
             case DeviceRouteType::Rdma:
                 return TransferTicket(rdmaSignal(
                     route.rdma, service_->route_context.rdma, request.signal,
-                    request.timeout_ticks, lane_index_,
-                    service_->lane_results + lane_index_, block));
+                    request.timeout_ticks, lane_index_, block));
 
             case DeviceRouteType::HostProxy:
                 return TransferTicket(hostProxySignal(
                     route.host_proxy, service_->route_context.host_proxy, rank,
-                    request.signal, request.timeout_ticks, lane_index_,
-                    service_->lane_results + lane_index_, block));
+                    request.signal, request.timeout_ticks, lane_index_, block));
 
             case DeviceRouteType::Unreachable:
                 return TransferTicket();

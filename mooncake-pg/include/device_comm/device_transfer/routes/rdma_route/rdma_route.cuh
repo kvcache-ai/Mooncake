@@ -30,32 +30,25 @@ class RdmaTransferTicket {
     __device__ __forceinline__ RdmaTransferTicket() = default;
 
     __device__ __forceinline__ explicit RdmaTransferTicket(
-        uint64_t* wait_result)
-        : wait_result_(wait_result) {}
-
-    __device__ __forceinline__
-    RdmaTransferTicket(device::IbgdaPollResult result, uint64_t* wait_result)
-        : wait_result_(wait_result), result_(result) {}
+        device::IbgdaPollResult result)
+        : result_(result) {}
 
     __device__ __forceinline__ RdmaTransferTicket(mlx5gda_qp_devctx* qp,
                                                   uint16_t expected_wqe,
-                                                  uint64_t deadline_ticks,
-                                                  uint64_t* wait_result)
+                                                  uint64_t deadline_ticks)
         : submitted_(true),
           qp_(qp),
           expected_wqe_(expected_wqe),
-          deadline_ticks_(deadline_ticks),
-          wait_result_(wait_result) {}
+          deadline_ticks_(deadline_ticks) {}
 
     __device__ __forceinline__ TransferResult
     wait(cooperative_groups::thread_block block) const {
+        __shared__ TransferResult block_wait_result;
         if (block.thread_rank() == 0) {
-            device::mc_st_release_u64(wait_result_,
-                                      static_cast<uint64_t>(waitLeader()));
+            block_wait_result = waitLeader();
         }
         block.sync();
-        const auto result = static_cast<TransferResult>(
-            device::mc_ld_acquire_u64(wait_result_));
+        const auto result = block_wait_result;
         block.sync();
         return result;
     }
@@ -77,7 +70,6 @@ class RdmaTransferTicket {
     mlx5gda_qp_devctx* qp_ = nullptr;
     uint16_t expected_wqe_ = 0;
     uint64_t deadline_ticks_ = 0;
-    uint64_t* wait_result_ = nullptr;
     device::IbgdaPollResult result_ = device::IbgdaPollResult::Completed;
 };
 
@@ -128,16 +120,14 @@ static __device__ __noinline__ RdmaTransferTicket
 rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
         const void* source, uint64_t remote_payload_offset, uint64_t size,
         const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
-        uint64_t* wait_result, cooperative_groups::thread_block block) {
-    RdmaTransferTicket ticket(wait_result);
-
+        cooperative_groups::thread_block block) {
     // Every producer makes its source writes visible before the leader exposes
     // the source address to the NIC.
     __threadfence_system();
     block.sync();
-    if (block.thread_rank() != 0) return ticket;
+    if (block.thread_rank() != 0) return {};
 
-    if (size == 0 && signal.kind == SignalAction::Kind::None) return ticket;
+    if (size == 0 && signal.kind == SignalAction::Kind::None) return {};
 
     auto* qp = rdmaQueuePair(route, context, lane);
     const uint64_t deadline_ticks =
@@ -149,11 +139,22 @@ rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
         size / kMaxWriteBytes + (size % kMaxWriteBytes != 0 ? 1 : 0);
     const uint64_t batch_size =
         write_count + (signal.kind != SignalAction::Kind::None ? 1 : 0);
-    const auto space_result = device::mc_ibgda_wait_for_sq_space(
-        qp, static_cast<uint32_t>(batch_size), deadline_ticks);
-    if (space_result != device::IbgdaPollResult::Completed) {
-        device::mc_ibgda_unlock(qp);
-        return RdmaTransferTicket(space_result, wait_result);
+    const uint32_t capacity = qp->wqeid_mask + 1;
+    PG_DEVICE_ASSERT(batch_size != 0 && batch_size <= capacity);
+    const uint32_t outstanding =
+        static_cast<uint16_t>(qp->wq_head - qp->wq_tail);
+    if (outstanding + batch_size > capacity) {
+        // Wait only for enough oldest WQEs to fit this batch.
+        const uint32_t completions_needed =
+            static_cast<uint32_t>(batch_size) - (capacity - outstanding);
+        const uint16_t expect =
+            static_cast<uint16_t>(qp->wq_tail + completions_needed - 1);
+        const auto space_result =
+            device::mc_ibgda_poll_cq(qp, expect, deadline_ticks);
+        if (space_result != device::IbgdaPollResult::Completed) {
+            device::mc_ibgda_unlock(qp);
+            return RdmaTransferTicket(space_result);
+        }
     }
 
     if (size != 0) {
@@ -175,16 +176,18 @@ rdmaPut(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
         }
     }
     appendRdmaSignal(route, context, qp, signal);
-    const uint16_t expected_wqe = device::mc_ibgda_submit(qp);
-    return RdmaTransferTicket(qp, expected_wqe, deadline_ticks, wait_result);
+    const uint16_t expected_wqe = static_cast<uint16_t>(qp->wq_head - 1);
+    device::mc_ibgda_post_send_db(qp);
+    device::mc_ibgda_unlock(qp);
+    return RdmaTransferTicket(qp, expected_wqe, deadline_ticks);
 }
 
 __device__ __forceinline__ RdmaTransferTicket
 rdmaSignal(const DeviceRdmaRoute& route, const DeviceRdmaContext& context,
            const SignalAction& signal, uint64_t timeout_ticks, uint32_t lane,
-           uint64_t* wait_result, cooperative_groups::thread_block block) {
+           cooperative_groups::thread_block block) {
     return rdmaPut(route, context, nullptr, 0, 0, signal, timeout_ticks, lane,
-                   wait_result, block);
+                   block);
 }
 
 __device__ __forceinline__ void drainRdmaTransfers(
