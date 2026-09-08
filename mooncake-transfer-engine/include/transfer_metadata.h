@@ -241,8 +241,8 @@ class TransferMetadata {
     // Fetch a segment descriptor from the metadata backend. When |status|
     // is non-null it receives the GetResult so the caller (syncSegmentCache)
     // can distinguish an authoritative key removal from a transient outage.
-    std::shared_ptr<SegmentDesc> getSegmentDesc(
-        const std::string &segment_name, GetResult *status = nullptr);
+    std::shared_ptr<SegmentDesc> getSegmentDesc(const std::string &segment_name,
+                                                GetResult *status = nullptr);
 
     SegmentID getSegmentID(const std::string &segment_name);
 
