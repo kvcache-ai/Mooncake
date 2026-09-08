@@ -54,7 +54,7 @@ inline uint64_t LoadBigEndian64(const uint8_t* p) {
 }
 
 inline uint64_t UpdateByteAtATime(uint64_t crc, const uint8_t* bytes,
-                                 size_t size) {
+                                  size_t size) {
     for (size_t i = 0; i < size; ++i) {
         const auto index = static_cast<uint8_t>((crc >> 56) ^ bytes[i]);
         crc = kCrc64EcmaTable[index] ^ (crc << 8);
@@ -67,10 +67,11 @@ inline uint64_t UpdateByteAtATime(uint64_t crc, const uint8_t* bytes,
 void CrcChecksum::Update(const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
 
-    // The byte-at-a-time loop is latency bound: every table index depends on the
-    // previous iteration's register value. Slicing-by-8 folds eight byte steps
-    // into one, and the eight lookups are independent, so the CPU can issue them
-    // in parallel. Measured ~4.8x on an Ice Lake Xeon (3.13 -> 0.65 ns/byte).
+    // The byte-at-a-time loop is latency bound: every table index depends on
+    // the previous iteration's register value. Slicing-by-8 folds eight byte
+    // steps into one, and the eight lookups are independent, so the CPU can
+    // issue them in parallel. Measured ~4.8x on an Ice Lake Xeon (3.13 -> 0.65
+    // ns/byte).
     uint64_t crc = crc_;
     while (size >= 8) {
         crc ^= LoadBigEndian64(bytes);

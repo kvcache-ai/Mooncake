@@ -19,8 +19,8 @@ uint64_t ReferenceCrc64Ecma(const uint8_t* data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         crc ^= static_cast<uint64_t>(data[i]) << 56;
         for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & (1ULL << 63)) != 0 ? (crc << 1) ^ kPolynomial
-                                            : crc << 1;
+            crc =
+                (crc & (1ULL << 63)) != 0 ? (crc << 1) ^ kPolynomial : crc << 1;
         }
     }
     return crc;
@@ -74,8 +74,7 @@ TEST(CrcChecksumTest, MatchesBitwiseReferenceForEveryTailLength) {
 // contiguous computation for every split point.
 TEST(CrcChecksumTest, StreamingMatchesContiguousForEverySplitPoint) {
     const std::vector<uint8_t> buffer = MakePattern(64);
-    const uint64_t expected =
-        ReferenceCrc64Ecma(buffer.data(), buffer.size());
+    const uint64_t expected = ReferenceCrc64Ecma(buffer.data(), buffer.size());
     for (size_t split = 0; split <= buffer.size(); ++split) {
         CrcChecksum streaming;
         streaming.Update(buffer.data(), split);
