@@ -177,6 +177,12 @@ target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
                                              gtest_main)
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
+if(MOONCAKE_USE_ROCKSDB)
+  add_executable(rocksdb_backend_test storage/local/rocksdb/backend_test.cpp)
+  target_link_libraries(rocksdb_backend_test PRIVATE mooncake_store gtest
+                                                     gtest_main)
+  add_test(NAME rocksdb_backend_test COMMAND rocksdb_backend_test)
+endif()
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)

@@ -92,6 +92,9 @@
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
+#ifdef MOONCAKE_USE_ROCKSDB
+#include "storage/local/rocksdb/rocksdb_backend.h"
+#endif
 #include "storage_backend.h"
 
 namespace fs = std::filesystem;
@@ -102,7 +105,8 @@ namespace fs = std::filesystem;
 
 // === Core Parameters ===
 DEFINE_string(backend, "offset_allocator",
-              "Backend type: offset_allocator, bucket, file_per_key, or all");
+              "Backend type: offset_allocator, bucket, file_per_key, rocksdb, "
+              "or all");
 DEFINE_uint64(value_size, 128 * 1024, "Value size in bytes (default: 128KB)");
 DEFINE_uint64(batch_size, 32, "Batch size for operations (default: 32)");
 DEFINE_uint64(num_operations, 1000,
@@ -242,7 +246,14 @@ AccessPattern StringToAccessPattern(const std::string& str) {
 // Backend Types
 // ============================================================================
 
-enum class BackendType { OFFSET_ALLOCATOR, BUCKET, FILE_PER_KEY };
+enum class BackendType {
+    OFFSET_ALLOCATOR,
+    BUCKET,
+    FILE_PER_KEY,
+#ifdef MOONCAKE_USE_ROCKSDB
+    ROCKSDB
+#endif
+};
 
 std::string BackendTypeToString(BackendType type) {
     switch (type) {
@@ -252,6 +263,10 @@ std::string BackendTypeToString(BackendType type) {
             return "bucket";
         case BackendType::FILE_PER_KEY:
             return "file_per_key";
+#ifdef MOONCAKE_USE_ROCKSDB
+        case BackendType::ROCKSDB:
+            return "rocksdb";
+#endif
     }
     return "unknown";
 }
@@ -260,6 +275,9 @@ BackendType StringToBackendType(const std::string& str) {
     if (str == "offset_allocator") return BackendType::OFFSET_ALLOCATOR;
     if (str == "bucket") return BackendType::BUCKET;
     if (str == "file_per_key") return BackendType::FILE_PER_KEY;
+#ifdef MOONCAKE_USE_ROCKSDB
+    if (str == "rocksdb") return BackendType::ROCKSDB;
+#endif
     LOG(FATAL) << "Unknown backend type: " << str;
     return BackendType::OFFSET_ALLOCATOR;
 }
@@ -831,6 +849,13 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
             return std::make_shared<mooncake::StorageBackendAdaptor>(
                 config, fpk_config);
         }
+#ifdef MOONCAKE_USE_ROCKSDB
+        case BackendType::ROCKSDB: {
+            config.storage_backend_type =
+                mooncake::StorageBackendType::kRocksDb;
+            return std::make_shared<mooncake::RocksDBStorageBackend>(config);
+        }
+#endif
     }
     return nullptr;
 }
@@ -2282,7 +2307,12 @@ struct BenchmarkResult {
 void RunAllBenchmarks(const std::string& storage_path, size_t capacity) {
     std::vector<BackendType> backends = {BackendType::OFFSET_ALLOCATOR,
                                          BackendType::BUCKET,
-                                         BackendType::FILE_PER_KEY};
+                                         BackendType::FILE_PER_KEY
+#ifdef MOONCAKE_USE_ROCKSDB
+                                         ,
+                                         BackendType::ROCKSDB
+#endif
+    };
 
     std::vector<BenchmarkResult> results;
 

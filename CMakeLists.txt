@@ -30,6 +30,7 @@ option(
   OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
+option(MOONCAKE_USE_ROCKSDB "build Mooncake Store with RocksDB backend" OFF)
 option(MOONCAKE_ENABLE_TEST_FAILPOINTS
        "Enable file-handshake failpoints for integration tests" OFF)
 if(MOONCAKE_ENABLE_TEST_FAILPOINTS)

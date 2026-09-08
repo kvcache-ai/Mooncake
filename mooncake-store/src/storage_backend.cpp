@@ -51,6 +51,9 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef MOONCAKE_USE_ROCKSDB
+#include "storage/local/rocksdb/rocksdb_backend.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
@@ -5525,6 +5528,14 @@ CreateStorageBackend(const FileStorageConfig& config) {
         }
         case StorageBackendType::kNvmeKv:
             return std::make_shared<NvmeKvStorageBackend>(config);
+
+        case StorageBackendType::kRocksDb:
+#ifdef MOONCAKE_USE_ROCKSDB
+            return std::make_shared<RocksDBStorageBackend>(config);
+#else
+            LOG(ERROR) << "RocksDB backend was not enabled at build time";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
 
         case StorageBackendType::kDistributed: {
             auto distributed_config =

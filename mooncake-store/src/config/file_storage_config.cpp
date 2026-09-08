@@ -64,6 +64,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         config.enable_dfs = true;
     } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
         config.storage_backend_type = StorageBackendType::kNvmeKv;
+    } else if (storage_backend_descriptor == "rocksdb_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kRocksDb;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }

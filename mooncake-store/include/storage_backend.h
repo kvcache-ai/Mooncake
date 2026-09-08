@@ -166,7 +166,8 @@ enum class StorageBackendType {
     kBucket,
     kOffsetAllocator,
     kDistributed,
-    kNvmeKv
+    kNvmeKv,
+    kRocksDb
 };
 
 static constexpr size_t kKB = 1024;

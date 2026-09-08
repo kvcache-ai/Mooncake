@@ -71,6 +71,20 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     standby_state_machine.cpp
     ha_metric_manager.cpp)
 
+if(MOONCAKE_USE_ROCKSDB)
+  set(ROCKSDB_EXTRA_LIBRARIES
+      ""
+      CACHE STRING "Additional libraries required by a static RocksDB build")
+  find_path(ROCKSDB_INCLUDE_DIR rocksdb/db.h)
+  find_library(ROCKSDB_LIBRARY NAMES rocksdb)
+  if(NOT ROCKSDB_INCLUDE_DIR OR NOT ROCKSDB_LIBRARY)
+    message(
+      FATAL_ERROR
+        "MOONCAKE_USE_ROCKSDB=ON requires ROCKSDB_INCLUDE_DIR and ROCKSDB_LIBRARY"
+    )
+  endif()
+endif()
+
 set(MOONCAKE_STORE_CLIENT_SOURCES
     client_buffer_allocation.cpp
     client_service.cpp
@@ -117,6 +131,11 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     memory_alloc.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
+
+if(MOONCAKE_USE_ROCKSDB)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
+       storage/local/rocksdb/rocksdb_backend.cpp)
+endif()
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
@@ -433,6 +452,12 @@ set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(mooncake_store_client_objects
                            PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(MOONCAKE_USE_ROCKSDB)
+  target_include_directories(mooncake_store_client_objects
+                             PRIVATE ${ROCKSDB_INCLUDE_DIR})
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_USE_ROCKSDB=1)
+endif()
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects
@@ -537,6 +562,12 @@ target_link_libraries(
          transfer_engine
          yalantinglibs::yalantinglibs
   PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash numa)
+if(MOONCAKE_USE_ROCKSDB)
+  target_compile_definitions(mooncake_store PUBLIC MOONCAKE_USE_ROCKSDB=1)
+  target_include_directories(mooncake_store PUBLIC ${ROCKSDB_INCLUDE_DIR})
+  target_link_libraries(mooncake_store PUBLIC ${ROCKSDB_LIBRARY}
+                                              ${ROCKSDB_EXTRA_LIBRARIES})
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
