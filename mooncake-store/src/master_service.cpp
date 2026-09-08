@@ -2728,73 +2728,117 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 void MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     for (size_t i = 0; i < kNumShards; i++) {
-        MetadataShardAccessorRW shard(this, i);
-        for (auto tenant_it = shard->tenants.begin();
-             tenant_it != shard->tenants.end();) {
-            auto& tenant_state = tenant_it->second;
-            auto it = tenant_state.metadata.begin();
-            while (it != tenant_state.metadata.end()) {
-                const auto cleanup_plan =
-                    BuildStaleHandleCleanupPlan(it->second, is_stale);
-                if (!cleanup_plan.removed_ids.empty()) {
-                    if (enable_ha_) {
-                        if (enable_oplog_) {
-                            auto persist_result =
-                                PersistStaleHandleCleanupForHA(
-                                    "ClearStaleHandles", tenant_it->first,
-                                    it->first, it->second, cleanup_plan);
-                            if (!persist_result) {
-                                ++it;
-                                continue;
-                            }
-                            ++it;
-                            continue;
-                        }
-                    }
-                    if (CleanupStaleHandles(it->first, tenant_it->first,
-                                            tenant_state, it->second, is_stale,
-                                            &shard)) {
-                        it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                           QuotaEraseMode::kFull, &shard);
-                    } else {
-                        ++it;
-                    }
-                } else if (!it->second.IsValid()) {
-                    if (enable_ha_) {
-                        if (enable_oplog_) {
-                            auto persist_result =
-                                AppendOpLogWithDurableFinalize(
-                                    OpType::REMOVE, tenant_it->first.value(),
-                                    it->first, {},
-                                    [this](const OpLogEntry& durable_entry) {
-                                        FinalizeMetadataEraseAfterDurable(
-                                            durable_entry,
-                                            QuotaEraseMode::kFull);
-                                    });
-                            if (!persist_result) {
-                                LOG(WARNING)
-                                    << "ClearStaleHandles(last replica)"
-                                    << ": REMOVE persist failed for key="
-                                    << it->first << ", err="
-                                    << static_cast<int>(persist_result.error());
-                                ++it;
-                                continue;
-                            }
-                            ++it;
-                            continue;
-                        }
-                    }
-                    it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
-                } else {
-                    ++it;
+        // Pass 1 (read-only): collect the (tenant, key) pairs whose current
+        // state needs cleanup. The sweep used to hold the shard write lock
+        // for the whole shard and run the HA persist path inline per key,
+        // which blocked every RPC on that shard for minutes at large key
+        // counts (#3940). Candidates are committed one key at a time below,
+        // each under its own short write lock, so other work interleaves.
+        // Pass 1 (read-only, chunked): snapshot the shard's keys under one
+        // short read lock, then evaluate the stale predicate in bounded
+        // chunks, releasing the lock between chunks so writes interleave
+        // during the scan itself.
+        std::vector<std::pair<TenantId, std::string>> shard_keys;
+        {
+            MetadataShardAccessorRO shard(this, i);
+            for (const auto& [tenant_id, tenant_state] : shard->tenants) {
+                for (const auto& [key, metadata] : tenant_state.metadata) {
+                    shard_keys.emplace_back(tenant_id, key);
                 }
             }
-            if (tenant_state.Empty()) {
-                tenant_it = shard->tenants.erase(tenant_it);
-            } else {
-                ++tenant_it;
+        }
+        constexpr size_t kScanChunkSize = 256;
+        std::vector<std::pair<TenantId, std::string>> candidates;
+        for (size_t start = 0; start < shard_keys.size();
+             start += kScanChunkSize) {
+            const size_t end =
+                std::min(start + kScanChunkSize, shard_keys.size());
+            std::this_thread::yield();
+            MetadataShardAccessorRO shard(this, i);
+            for (size_t k = start; k < end; ++k) {
+                const auto& [tenant_id, key] = shard_keys[k];
+                auto tenant_it = shard->tenants.find(tenant_id);
+                if (tenant_it == shard->tenants.end()) {
+                    continue;
+                }
+                auto it = tenant_it->second.metadata.find(key);
+                if (it == tenant_it->second.metadata.end()) {
+                    continue;
+                }
+                const auto cleanup_plan =
+                    BuildStaleHandleCleanupPlan(it->second, is_stale);
+                if (!cleanup_plan.removed_ids.empty() ||
+                    !it->second.IsValid()) {
+                    candidates.emplace_back(tenant_id, key);
+                }
             }
+        }
+
+        // Pass 2: commit each candidate under a fresh short write lock,
+        // re-verifying against the current state (it may have moved between
+        // the passes, so a candidate that is clean now is skipped).
+        for (const auto& [tenant_id, key] : candidates) {
+            MetadataShardAccessorRW shard(this, i);
+            auto tenant_it = shard->tenants.find(tenant_id);
+            if (tenant_it == shard->tenants.end()) {
+                continue;
+            }
+            auto& tenant_state = tenant_it->second;
+            auto it = tenant_state.metadata.find(key);
+            if (it == tenant_state.metadata.end()) {
+                continue;
+            }
+            const auto cleanup_plan =
+                BuildStaleHandleCleanupPlan(it->second, is_stale);
+            if (!cleanup_plan.removed_ids.empty()) {
+                if (enable_ha_) {
+                    if (enable_oplog_) {
+                        auto persist_result = PersistStaleHandleCleanupForHA(
+                            "ClearStaleHandles", tenant_it->first, it->first,
+                            it->second, cleanup_plan);
+                        if (!persist_result) {
+                            continue;
+                        }
+                        continue;
+                    }
+                }
+                if (CleanupStaleHandles(it->first, tenant_it->first,
+                                        tenant_state, it->second, is_stale,
+                                        &shard)) {
+                    EraseMetadata(tenant_state, it, tenant_it->first,
+                                  QuotaEraseMode::kFull, &shard);
+                }
+            } else if (!it->second.IsValid()) {
+                if (enable_ha_) {
+                    if (enable_oplog_) {
+                        auto persist_result = AppendOpLogWithDurableFinalize(
+                            OpType::REMOVE, tenant_it->first.value(), it->first,
+                            {}, [this](const OpLogEntry& durable_entry) {
+                                FinalizeMetadataEraseAfterDurable(
+                                    durable_entry, QuotaEraseMode::kFull);
+                            });
+                        if (!persist_result) {
+                            LOG(WARNING)
+                                << "ClearStaleHandles(last replica)"
+                                << ": REMOVE persist failed for key="
+                                << it->first << ", err="
+                                << static_cast<int>(persist_result.error());
+                            continue;
+                        }
+                        continue;
+                    }
+                }
+                EraseMetadata(tenant_state, it, tenant_it->first,
+                              QuotaEraseMode::kFull, &shard);
+            } else {
+                // Moved out of stale between the passes; leave it alone.
+                continue;
+            }
+            if (tenant_state.Empty()) {
+                shard->tenants.erase(tenant_it);
+            }
+            // Let a waiting writer win the lock between candidates.
+            std::this_thread::yield();
         }
     }
 }

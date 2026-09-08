@@ -49,6 +49,18 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
 
+    static void RunStaleHandleSweepForTesting(
+        MasterService& service,
+        const std::function<bool(const Replica&)>& is_stale) {
+        service.ClearStaleHandles(is_stale);
+    }
+
+    static size_t ShardIndexForTesting(MasterService& service,
+                                       const TenantId& tenant_id,
+                                       const std::string& key) {
+        return service.getShardIndex(tenant_id, key);
+    }
+
     void PauseReplicaCleanup(MasterService& service) {
         service.replica_cleanup_worker_.Stop();
     }

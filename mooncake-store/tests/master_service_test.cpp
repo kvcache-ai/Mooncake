@@ -2506,6 +2506,73 @@ TEST_F(MasterServiceTest, DrainJobFailsAfterRetryBudgetExhausted) {
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
 }
 
+// ===================== Stale Handle Sweep Tests =====================
+
+TEST_F(MasterServiceTest, StaleHandleSweepInterleavesConcurrentWrites) {
+    // #3940: the sweep used to hold each shard's write lock for the whole
+    // shard, so a concurrent write waited out the entire sweep. With a
+    // chunked scan and per-key commit locks, a write lands between them.
+    // The long sweep must not outlive the client TTL or the writer's client
+    // expires mid-test.
+    MasterService service(
+        MasterServiceConfig::builder().set_client_live_ttl_sec(3600).build());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(service);
+    const UUID client = context.client_id;
+    const TenantId tenant = TenantId::Default();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const auto writer_shard =
+        ShardIndexForTesting(service, tenant, "writer_key");
+    int seeded = 0;
+    for (int i = 0; seeded < 600; ++i) {
+        const std::string key = "sweep_" + std::to_string(i);
+        if (ShardIndexForTesting(service, tenant, key) != writer_shard) {
+            continue;
+        }
+        ASSERT_TRUE(
+            service.PutStart(client, key, tenant, 128, config).has_value());
+        ASSERT_TRUE(service.PutEnd(client, key, tenant, ReplicaType::MEMORY)
+                        .has_value());
+        ++seeded;
+    }
+
+    std::atomic<bool> sweep_started{false};
+    std::atomic<bool> sweep_done{false};
+    std::atomic<long long> sweep_ms{0};
+    std::thread sweeper([&] {
+        const auto start = std::chrono::steady_clock::now();
+        RunStaleHandleSweepForTesting(service, [&](const Replica& r) {
+            sweep_started = true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            return r.is_completed();
+        });
+        sweep_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+        sweep_done = true;
+    });
+    while (!sweep_started.load()) {
+        std::this_thread::yield();
+    }
+    // Let the sweep get well into its first shard before writing.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    const auto start = std::chrono::steady_clock::now();
+    ASSERT_TRUE(service.PutStart(client, "writer_key", tenant, 128, config)
+                    .has_value());
+    const auto put_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start)
+                            .count();
+    sweeper.join();
+
+    // 600 candidates x 10ms per evaluation across scan chunks plus commits
+    // makes the sweep several seconds long; a write that lands far earlier
+    // proves it interleaved instead of waiting out the whole sweep.
+    EXPECT_LT(put_ms, sweep_ms / 3)
+        << "write took " << put_ms << "ms of a " << sweep_ms << "ms sweep";
+}
+
 // ===================== Hard Pin Tests =====================
 
 }  // namespace mooncake::test
