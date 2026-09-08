@@ -372,8 +372,7 @@ OffsetAllocator::OffsetAllocator(T& serializer) {
             throw std::runtime_error(
                 "Deserializing OffsetAllocator failed: corrupt header");
         }
-        m_allocator =
-            std::make_unique<__Allocator>(serializer, legacy_format);
+        m_allocator = std::make_unique<__Allocator>(serializer, legacy_format);
         const uint64_t largest_free_region =
             m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
         m_largest_free_region.store(largest_free_region,

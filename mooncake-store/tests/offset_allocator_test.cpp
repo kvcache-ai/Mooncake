@@ -722,9 +722,8 @@ TEST_F(OffsetAllocatorTest, RejectsLegacyLayoutWithAmbiguousNodeCount) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
     constexpr uint32 LEGACY_NODE_COUNT = 1501;
     constexpr uint32 CORRUPTED_NODE_COUNT = 1468;
-    auto allocator = OffsetAllocator::create(0, ALLOCATOR_SIZE,
-                                             LEGACY_NODE_COUNT,
-                                             LEGACY_NODE_COUNT);
+    auto allocator = OffsetAllocator::create(
+        0, ALLOCATOR_SIZE, LEGACY_NODE_COUNT, LEGACY_NODE_COUNT);
     const auto legacy_buffer = serializeLegacyAllocator(allocator);
     auto corrupted_buffer = legacy_buffer;
 
