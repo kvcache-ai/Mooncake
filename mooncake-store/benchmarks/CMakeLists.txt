@@ -3,6 +3,9 @@ add_executable(allocator_bench allocator_bench.cpp)
 target_link_libraries(allocator_bench PRIVATE cachelib_memory_allocator
                                               mooncake_store)
 
+add_executable(shm_helper_bench shm_helper_bench.cpp)
+target_link_libraries(shm_helper_bench PRIVATE mooncake_store glog::glog pthread)
+
 # Add focused OffsetAllocator concurrency benchmark
 add_executable(offset_allocator_concurrency_bench
                offset_allocator_concurrency_bench.cpp)

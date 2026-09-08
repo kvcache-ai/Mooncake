@@ -2,6 +2,26 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## Shared-Memory First-Touch Benchmark
+
+`shm_helper_bench` measures the allocation and initial page population time for
+memfd-backed shared memory. The default path uses the existing `MAP_POPULATE`
+behavior. Set `MC_STORE_SHM_POPULATE_THREADS` to opt in to native parallel
+first-touch and compare different thread counts on the target host:
+
+```bash
+cmake --build build --target shm_helper_bench -j$(nproc)
+./build/mooncake-store/benchmarks/shm_helper_bench 1024
+MC_STORE_SHM_POPULATE_THREADS=4 \
+  ./build/mooncake-store/benchmarks/shm_helper_bench 1024
+MC_STORE_SHM_POPULATE_THREADS=8 \
+  ./build/mooncake-store/benchmarks/shm_helper_bench 1024
+```
+
+Use the same allocation size and host configuration when comparing results.
+Large allocations can be limited by NUMA placement and memory bandwidth, so a
+higher thread count is not guaranteed to be faster.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment
