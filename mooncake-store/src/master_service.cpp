@@ -881,7 +881,7 @@ MasterService::DeleteTenantQuotaPolicy(const TenantId& tenant_id) {
                                        : ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+    auto tenant_handle = catalog_.Lookup(tenant_id);
     if (tenant_handle && tenant_handle->ObjectCount() > 0) {
         restore_policy();
         return tl::make_unexpected(ErrorCode::TENANT_NOT_EMPTY);
@@ -1145,8 +1145,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 return standby_accounted_memory_bytes_.contains(segment.name);
             });
         if (any_standby_kept_alive) {
-            tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                        const std::shared_ptr<TenantState>&
+            catalog_.Visit([&](const TenantId& tenant_id,
+                                        const std::shared_ptr<TenantCatalog>&
                                             handle) {
                 (void)tenant_id;
                 auto& tenant = *handle;
@@ -1503,14 +1503,14 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
 }
 
-std::shared_ptr<MasterService::TenantState>
-MasterService::GetOrCreateTenantStateHandle(const TenantId& tenant_id) {
+std::shared_ptr<mooncake::tenant::TenantCatalog>
+MasterService::GetOrCreateTenantCatalogHandle(const TenantId& tenant_id) {
     // Atomic get-or-create: two concurrent first writers for different keys in
-    // the same absent tenant must both land on the winning TenantState, or the
-    // loser's object would live in a TenantState the directory can never
+    // the same absent tenant must both land on the winning TenantCatalog, or the
+    // loser's object would live in a TenantCatalog the directory can never
     // reach again.
-    return tenant_directory_.GetOrCreate(tenant_id, [this, &tenant_id]() {
-        auto handle = std::make_shared<TenantState>();
+    return catalog_.GetOrCreateTenant(tenant_id, [this, &tenant_id]() {
+        auto handle = std::make_shared<TenantCatalog>();
         if (enable_multi_tenants_) {
             handle->quota_account =
                 tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
@@ -1520,7 +1520,7 @@ MasterService::GetOrCreateTenantStateHandle(const TenantId& tenant_id) {
 }
 
 TenantQuotaHandle MasterService::GetBoundTenantQuotaHandle(
-    const TenantState& tenant_state) const {
+    const TenantCatalog& tenant_state) const {
     if (!enable_multi_tenants_) {
         return nullptr;
     }
@@ -1578,8 +1578,8 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     }
 
     TenantQuotaUsageMap usage;
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         // Collect handles, then lock each per-object (there is no tenant
         auto objs = tenant_state.SnapshotObjects();
@@ -1597,8 +1597,8 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         }
     });
 
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         tenant_state.quota_account =
             tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
@@ -1641,13 +1641,13 @@ MasterService::ObjectOperationLock MasterService::AcquireObjectOperationLock(
     return {std::unique_lock<std::mutex>(object_operation_locks_[stripe_idx])};
 }
 
-void MasterService::UnregisterGroupMember(TenantState& tenant_state,
+void MasterService::UnregisterGroupMember(TenantCatalog& tenant_state,
                                           const std::string& key,
                                           const std::string& group_id) {
     if (group_id.empty()) {
         return;
     }
-    tenant_state.object_route.RemoveMember(group_id, key);
+    tenant_state.object_index.RemoveMember(group_id, key);
 }
 
 MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
@@ -1655,21 +1655,21 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     const std::string& group_id, bool allow_soft_pinned,
     std::chrono::system_clock::time_point now,
     const std::function<MasterService::EvictMemberOutcome(
-        const std::string&, ObjectMetadata&, TenantState&,
-        TenantStateAccessorRW&)>& evict_one_member) {
+        const std::string&, ObjectMetadata&, TenantCatalog&,
+        TenantCatalogAccessorRW&)>& evict_one_member) {
     GroupEvictionResult result;
 
     // All members of a tenant live in a single tenant container, so look up
     // that tenant and read its group membership from its own
-    // object_route.
-    auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+    // object_index.
+    auto tenant_handle = catalog_.Lookup(tenant_id);
     if (!tenant_handle) {
         return result;
     }
-    TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+    TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
 
-    std::vector<std::string> member_keys = tenant_state.object_route.Members(
+    std::vector<std::string> member_keys = tenant_state.object_index.Members(
         group_id);
     if (member_keys.empty()) {
         member_keys.push_back(key);
@@ -1728,7 +1728,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     // Empty()-check + Remove() here cannot be made atomic with a concurrent
     // first insert for the same tenant (Lookup happens outside every tenant
     // lock), so eager removal could strand a just-inserted object in a
-    // TenantState that is no longer reachable. Registered tenants are bounded,
+    // TenantCatalog that is no longer reachable. Registered tenants are bounded,
     // so the retention cost is a small empty container per tenant.
     return result;
 }
@@ -1784,8 +1784,8 @@ void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
 
 void MasterService::RebuildCacheTotalAccounting() {
     MasterMetricManager::instance().reset_cache_total_nums();
-    tenant_directory_.Visit([&](const TenantId&,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId&,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
@@ -1851,7 +1851,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
 }
 
 tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
-    TenantState& tenant_state, ObjectMetadata& metadata) {
+    TenantCatalog& tenant_state, ObjectMetadata& metadata) {
     if (!enable_multi_tenants_) {
         return {};
     }
@@ -1889,11 +1889,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+    auto tenant_handle = catalog_.Lookup(tenant_id);
     if (!tenant_handle) {
         return;
     }
-    TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+    TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Pin(durable_entry.object_key);
     if (!object_entry) {
@@ -1978,11 +1978,11 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     const OpLogEntry& durable_entry, QuotaEraseMode quota_mode) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
-    auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+    auto tenant_handle = catalog_.Lookup(tenant_id);
     if (!tenant_handle) {
         return;
     }
-    TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+    TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     EraseMetadata(tenant_state, durable_entry.object_key, tenant_id, quota_mode,
                   &tenant_accessor);
@@ -2017,7 +2017,7 @@ void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
         SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                           previous_media);
         auto settle_result =
-            SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
+            SettlePrimaryWriteQuotaIfReady(accessor.GetTenantCatalog(), metadata);
         if (settle_result && accessor.InProcessing()) {
             accessor.EraseFromProcessing();
         }
@@ -2077,7 +2077,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
     if (dynamic_task) {
-        ClearDynamicReplicationStateForKey(accessor.GetTenantState(),
+        ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(),
                                            durable_entry.object_key);
     }
     if (!metadata.IsValid()) {
@@ -2090,7 +2090,7 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
         if (accessor.HasReplicationTask()) {
             const auto& task = accessor.GetReplicationTask();
             ReleaseTenantQuota(
-                GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+                GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                 task.pending_quota_charge_bytes);
             accessor.EraseReplicationTask();
         }
@@ -2174,11 +2174,11 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
 
 // Key-based teardown: resolve the entry at call time, then run the shared
 // entry-based teardown below.
-void MasterService::EraseMetadata(TenantState& tenant_state,
+void MasterService::EraseMetadata(TenantCatalog& tenant_state,
                                   const std::string& key,
                                   const TenantId& tenant_id,
                                   QuotaEraseMode quota_mode,
-                                  TenantStateAccessorRW* tenant_accessor) {
+                                  TenantCatalogAccessorRW* tenant_accessor) {
     auto entry = tenant_state.Pin(key);
     if (!entry) {
         return;
@@ -2191,10 +2191,10 @@ void MasterService::EraseMetadata(TenantState& tenant_state,
 // processing_keys, replication_tasks, and promotion tasks.
 // Callers no longer need to clean these up manually before calling.
 void MasterService::EraseMetadata(
-    TenantState& tenant_state,
+    TenantCatalog& tenant_state,
     const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
     const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    TenantStateAccessorRW* tenant_accessor,
+    TenantCatalogAccessorRW* tenant_accessor,
     const std::vector<std::string>& previous_media_hint) {
     if (!entry) {
         return;
@@ -2336,17 +2336,17 @@ void MasterService::ReleaseLocalDiskUsage(
 }
 
 void MasterService::RebuildGroupState() {
-    // The group domain is single-sourced in each tenant's object_route: flat
+    // The group domain is single-sourced in each tenant's object_index: flat
     // group membership + one shared Lease live in the tenant's own
-    // TenantStore, so there is no global table to clear or rebuild. Rebuild the
+    // ObjectIndex, so there is no global table to clear or rebuild. Rebuild the
     // shared lease from object metadata after snapshot/standby restore.
     // Pass 1: aggregate the maximum restored lease deadline per group so a
     // grouped object is not left with a zero-deadline lease, which would make
     // it look expired and be dropped by post-restore cleanup.
     std::unordered_map<std::string, std::chrono::system_clock::time_point>
         max_deadline_by_group;
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         // Collect handles, then lock each per-object (there is no tenant
         auto objs = tenant_state.SnapshotObjects();
@@ -2369,8 +2369,8 @@ void MasterService::RebuildGroupState() {
     // group's maximum restored deadline. Singletons keep their per-object
     // lease (created at ObjectMetadata construction); only grouped members are
     // pointed at the group's shared Lease.
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
@@ -2379,8 +2379,8 @@ void MasterService::RebuildGroupState() {
             }
             std::unique_lock<std::shared_mutex> lk(entry->mutex);
             ObjectMetadata& metadata = entry->metadata();
-            auto lease = tenant_state.object_route.LeaseFor(metadata.group_id);
-            tenant_state.object_route.AddMember(metadata.group_id,
+            auto lease = tenant_state.object_index.LeaseFor(metadata.group_id);
+            tenant_state.object_index.AddMember(metadata.group_id,
                                                 entry->key());
             auto it = max_deadline_by_group.find(
                 tenant_id.MakeScopedKey(metadata.group_id));
@@ -2554,7 +2554,7 @@ void MasterService::CleanupExpiredSoftPins(
     for (const auto& entry : expired_entries) {
         const auto [tenant_id, key] =
             TenantId::ParseScopedKey(entry.scoped_key);
-        auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+        auto tenant_handle = catalog_.Lookup(tenant_id);
         if (!tenant_handle) {
             continue;
         }
@@ -2600,9 +2600,9 @@ void MasterService::ClearLocalDiskHandlesOwnedBy(const UUID& owner) {
 
 void MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
-        TenantStateAccessorRW tenant_accessor(handle.get());
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
+        TenantCatalogAccessorRW tenant_accessor(handle.get());
         auto& tenant_state = *handle;
         auto objs = handle->SnapshotObjects();
         std::vector<std::string> keys_to_erase;
@@ -2866,7 +2866,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
     }
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (!tenant_handle) {
         for (size_t i = 0; i < keys.size(); ++i) {
             VLOG(1) << "key=" << keys[i] << ", tenant_id=" << normalized_tenant
@@ -2903,7 +2903,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
     std::vector<std::string> all_keys;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
         auto objs = tenant_state.SnapshotObjects();
@@ -3181,7 +3181,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             {
-                auto existing_tenant = tenant_directory_.Lookup(tenant_id);
+                auto existing_tenant = catalog_.Lookup(tenant_id);
                 if (existing_tenant &&
                     existing_tenant->ContainsObject(user_key)) {
                     LOG(ERROR) << "RestoreFromStandbySnapshot: object already "
@@ -3347,7 +3347,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
         const auto now = std::chrono::system_clock::now();
         for (const auto& object : prepared_objects) {
-            auto tenant_handle = tenant_directory_.Lookup(object.tenant_id);
+            auto tenant_handle = catalog_.Lookup(object.tenant_id);
             if (tenant_handle &&
                 tenant_handle->ContainsObject(object.user_key)) {
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -3355,7 +3355,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
         for (auto& object : prepared_objects) {
             const auto& standby_meta = object.entry->metadata;
-            auto tenant_handle = GetOrCreateTenantStateHandle(object.tenant_id);
+            auto tenant_handle = GetOrCreateTenantCatalogHandle(object.tenant_id);
             auto& tenant_state = *tenant_handle;
             auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
                 std::make_unique<ObjectMetadata>(
@@ -3758,7 +3758,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
         auto objs = tenant_state.SnapshotObjects();
@@ -3947,7 +3947,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
     std::vector<ObjectIdentity> dynamic_replication_candidates;
     std::unordered_set<std::string> dynamic_replication_seen;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
         for (size_t original_idx = 0; original_idx < keys.size();
@@ -4071,7 +4071,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 
     const TenantId& normalized_tenant = tenant_id;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
         for (size_t original_idx = 0; original_idx < keys.size();
@@ -4119,7 +4119,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 }
 
 auto MasterService::AllocateAndInsertMetadata(
-    TenantStateAccessorRW& tenant_accessor, const UUID& client_id,
+    TenantCatalogAccessorRW& tenant_accessor, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& writer_host_id,
     const std::string& group_id, const TenantId& tenant_id,
@@ -4486,8 +4486,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 snapshot_arrive_hook_();
             }
             auto tenant_handle =
-                GetOrCreateTenantStateHandle(object_id.tenant_id);
-            TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+                GetOrCreateTenantCatalogHandle(object_id.tenant_id);
+            TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
@@ -4687,7 +4687,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
     }
 
     auto settle_result =
-        SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
+        SettlePrimaryWriteQuotaIfReady(accessor.GetTenantCatalog(), metadata);
     if (!settle_result) {
         return tl::make_unexpected(settle_result.error());
     }
@@ -4961,7 +4961,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
-            GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+            GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
             before_charge - after_charge);
         if (!release_result) {
             LogTenantQuotaLedgerError(release_result, "release_committed",
@@ -4977,7 +4977,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     SyncKvObjectState(key, metadata, object_id.tenant_id, previous_kv_media);
 
     auto settle_result =
-        SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
+        SettlePrimaryWriteQuotaIfReady(accessor.GetTenantCatalog(), metadata);
     if (!settle_result) {
         return tl::make_unexpected(settle_result.error());
     }
@@ -5142,8 +5142,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // Objects are always routed by hash(tenant, key); group_id does
             // not affect routing.
             auto tenant_handle =
-                GetOrCreateTenantStateHandle(object_id.tenant_id);
-            TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+                GetOrCreateTenantCatalogHandle(object_id.tenant_id);
+            TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
@@ -5725,7 +5725,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     }
 
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
 
     size_t new_replica_count = 0;
     for (const auto& tgt_segment : tgt_segments) {
@@ -5937,10 +5937,10 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                                  task.replica_ids.end(),
                                  replica.id()) != task.replica_ids.end();
             });
-        ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+        ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                            task.pending_quota_charge_bytes);
         accessor.EraseReplicationTask();
-        ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
+        ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(), key);
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
             accessor.Erase();
@@ -5999,7 +5999,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
             });
     }
 
-    ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
+    ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(), key);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
@@ -6033,7 +6033,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
 
     if (enable_multi_tenants_) {
         auto settle_result = metadata.quota_ledger.SettleAdditional(
-            GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+            GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
             task.pending_quota_charge_bytes, completed_quota_charge);
         if (!settle_result) {
             LogTenantQuotaLedgerError(settle_result, "settle_additional",
@@ -6110,10 +6110,10 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
             });
     }
 
-    ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+    ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
-    ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
+    ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(), key);
 
     if (!metadata.IsValid()) {
         // Remove the object if it does not have any replicas.
@@ -6162,7 +6162,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     }
 
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
     auto source = metadata.GetReplicaBySegmentName(src_segment);
     if (source == nullptr || !source->is_completed() ||
         source->has_invalid_mem_handle()) {
@@ -6303,7 +6303,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                                  task.replica_ids.end(),
                                  replica.id()) != task.replica_ids.end();
             });
-        ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+        ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                            task.pending_quota_charge_bytes);
         accessor.EraseReplicationTask();
         if (!metadata.IsValid()) {
@@ -6335,7 +6335,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                                      replica.id()) != task.replica_ids.end();
                 });
             ReleaseTenantQuota(
-                GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+                GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                 task.pending_quota_charge_bytes);
             accessor.EraseReplicationTask();
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
@@ -6398,7 +6398,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     }
     if (enable_multi_tenants_) {
         auto settle_result = metadata.quota_ledger.SettleAdditional(
-            GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+            GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
             task.pending_quota_charge_bytes,
             has_target ? static_cast<uint64_t>(metadata.size) : 0);
         if (!settle_result) {
@@ -6418,7 +6418,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             FreeDfsReplicas(key, source_replica);
             if (enable_multi_tenants_) {
                 auto release_result = metadata.quota_ledger.ReleaseCommitted(
-                    GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+                    GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                     static_cast<uint64_t>(metadata.size));
                 if (!release_result) {
                     LogTenantQuotaLedgerError(release_result,
@@ -6488,7 +6488,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
             });
     }
 
-    ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
+    ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
 
@@ -6580,9 +6580,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+        TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         for (const auto& entry : tenant_handle->SnapshotObjects()) {
@@ -6658,7 +6658,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
             }
         }
         if (tenant_state.Empty()) {
-            tenant_directory_.Remove(normalized_tenant);
+            catalog_.Remove(normalized_tenant);
         }
     }
 
@@ -6693,9 +6693,9 @@ long MasterService::RemoveAll(bool force) {
     local_ssd_manager_.RequestRemoveAll();
 
     // Delete metadata — runs concurrently with client SSD cleanup.
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
-        TenantStateAccessorRW tenant_accessor(handle.get());
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
+        TenantCatalogAccessorRW tenant_accessor(handle.get());
         auto& tenant_state = *handle;
         std::vector<std::string> keys;
         for (const auto& entry : handle->SnapshotObjects()) {
@@ -6821,9 +6821,9 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     // tenants' SSD data.
     std::unordered_set<UUID, boost::hash<UUID>> clients_with_disk_replicas;
 
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+        TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         for (const auto& entry : tenant_handle->SnapshotObjects()) {
@@ -6893,7 +6893,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             }
         }
         if (tenant_state.Empty()) {
-            tenant_directory_.Remove(normalized_tenant);
+            catalog_.Remove(normalized_tenant);
         }
     }
 
@@ -6923,9 +6923,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     auto alive_clients = ok_client_;
     client_lock.unlock();
 
-    auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+    auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+        TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
         auto& tenant_state = *tenant_handle;
         auto now = std::chrono::system_clock::now();
 
@@ -7038,7 +7038,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
             results[original_idx] = {};  // Success
         }
         if (tenant_state.Empty()) {
-            tenant_directory_.Remove(normalized_tenant);
+            catalog_.Remove(normalized_tenant);
         }
     } else {
         // No tenant handle: none of the requested keys can exist in it.
@@ -7053,7 +7053,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 }
 
 void MasterService::CancelPromotionTaskForRemovedReplicas(
-    TenantState& tenant_state, ObjectMetadata& metadata,
+    TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::vector<ReplicaID>& removed_replica_ids) {
     if (removed_replica_ids.empty()) {
         return;
@@ -7083,9 +7083,9 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
 
 bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
-    TenantState& tenant_state, ObjectMetadata& metadata,
+    TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
-    TenantStateAccessorRW* tenant_accessor) {
+    TenantCatalogAccessorRW* tenant_accessor) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
     // Kept as a thin wrapper over the predicate form so the owner-targeted
@@ -7104,9 +7104,9 @@ bool MasterService::CleanupStaleHandles(
 
 bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
-    TenantState& tenant_state, ObjectMetadata& metadata,
+    TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& is_stale,
-    TenantStateAccessorRW* tenant_accessor) {
+    TenantCatalogAccessorRW* tenant_accessor) {
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
@@ -7193,7 +7193,7 @@ void MasterService::RunDfsEviction() {
 
         auto now = std::chrono::system_clock::now();
         std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-        auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+        auto tenant_handle = catalog_.Lookup(tenant_id);
         if (!tenant_handle) {
             // No such tenant: accept every candidate (already evicted from the
             // master's point of view).
@@ -7257,7 +7257,7 @@ void MasterService::RunDfsEviction() {
             }
 
             if (tenant_state.Empty()) {
-                tenant_directory_.Remove(tenant_id);
+                catalog_.Remove(tenant_id);
             }
         }
 
@@ -7282,8 +7282,8 @@ void MasterService::RunDfsEviction() {
 
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
-    tenant_directory_.Visit(
-        [&](const TenantId&, const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit(
+        [&](const TenantId&, const std::shared_ptr<TenantCatalog>& handle) {
             total += handle->ObjectCount();
         });
     return total;
@@ -7726,7 +7726,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     return {};
 }
 
-bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
+bool MasterService::CancelQueuedOffloadTask(TenantCatalog& tenant_state,
                                             ObjectMetadata& metadata,
                                             const ObjectIdentity& object_id) {
     auto entry = tenant_state.Pin(object_id.user_key);
@@ -7793,7 +7793,7 @@ void MasterService::DecrementCandidateCount() {
     }
 }
 
-void MasterService::EraseCandidate(TenantState& tenant_state,
+void MasterService::EraseCandidate(TenantCatalog& tenant_state,
                                    const std::string& key) {
     auto entry = tenant_state.Pin(key);
     if (entry != nullptr && entry->promotion_candidate.has_value()) {
@@ -7803,17 +7803,17 @@ void MasterService::EraseCandidate(TenantState& tenant_state,
 }
 
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
-    auto tenant_handle = tenant_directory_.Lookup(object_id.tenant_id);
+    auto tenant_handle = catalog_.Lookup(object_id.tenant_id);
     if (!tenant_handle) return;
-    TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+    TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     EraseCandidate(tenant_state, object_id.user_key);
     if (tenant_state.Empty()) {
-        tenant_directory_.Remove(object_id.tenant_id);
+        catalog_.Remove(object_id.tenant_id);
     }
 }
 
-void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
+void MasterService::RecordOrUpdateCandidate(TenantCatalog& tenant_state,
                                             const std::string& key,
                                             uint8_t sketch_score,
                                             PromotionCandidateReason reason,
@@ -7893,9 +7893,9 @@ bool MasterService::IsTransientResult(PromotionQueueResult result) const {
 void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
                                      PromotionQueueResult result) {
     const auto now = std::chrono::steady_clock::now();
-    auto tenant_handle = tenant_directory_.Lookup(object_id.tenant_id);
+    auto tenant_handle = catalog_.Lookup(object_id.tenant_id);
     if (!tenant_handle) return;
-    TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+    TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Pin(object_id.user_key);
     if (!object_entry || !object_entry->promotion_candidate.has_value()) {
@@ -7926,13 +7926,13 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
     }
 
     if (tenant_state.Empty()) {
-        tenant_directory_.Remove(object_id.tenant_id);
+        catalog_.Remove(object_id.tenant_id);
     }
 }
 
 void MasterService::ClearCandidatesForReload() {
-    tenant_directory_.Visit([&](const TenantId&,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId&,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
@@ -7952,7 +7952,7 @@ size_t MasterService::RunPromotionCandidateRetryForTesting() {
 size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
     size_t count = 0;
     std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
-    auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+    auto tenant_handle = catalog_.Lookup(tenant_id);
     if (tenant_handle) {
         const auto& tenant_state = *tenant_handle;
         auto objs = tenant_state.SnapshotObjects();
@@ -7968,8 +7968,8 @@ size_t MasterService::CountCandidatesForTesting(const TenantId& tenant_id) {
 
 void MasterService::ResetCandidateBackoffsForTesting() {
     const auto epoch = std::chrono::steady_clock::time_point{};
-    tenant_directory_.Visit([&](const TenantId&,
-                                const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit([&](const TenantId&,
+                                const std::shared_ptr<TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
@@ -7996,8 +7996,8 @@ size_t MasterService::RunPromotionCandidateRetry() {
 
     {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
-        tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                    const std::shared_ptr<TenantState>&
+        catalog_.Visit([&](const TenantId& tenant_id,
+                                    const std::shared_ptr<TenantCatalog>&
                                         handle) {
             if (due_candidates.size() >= kPromotionRetryBatchSize) {
                 return;
@@ -8315,14 +8315,14 @@ int64_t MasterService::DynamicReplicationNowMs() {
 }
 
 void MasterService::ClearDynamicReplicationStateForKey(
-    TenantState& tenant_state, const std::string& key) {
+    TenantCatalog& tenant_state, const std::string& key) {
     auto entry = tenant_state.Pin(key);
     if (entry) {
         entry->dynamic_replication_pending.reset();
         entry->dynamic_replication_cooldown =
             std::chrono::steady_clock::time_point{};
     }
-    tenant_state.object_route.EraseDynamicReplicationLeasesForObject(key);
+    tenant_state.object_index.EraseDynamicReplicationLeasesForObject(key);
 }
 
 void MasterService::CleanupExpiredDynamicReplicationState() {
@@ -8330,9 +8330,9 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
         return;
     }
     const int64_t now_ms = DynamicReplicationNowMs();
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
-        TenantStateAccessorRW tenant_accessor(handle.get());
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
+        TenantCatalogAccessorRW tenant_accessor(handle.get());
         auto& tenant_state = *handle;
         auto objs = handle->SnapshotObjects();
         std::vector<std::string> expired_pending_keys;
@@ -8356,11 +8356,11 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
             }
             ClearDynamicReplicationStateForKey(tenant_state, key);
         }
-        tenant_state.object_route.EraseExpiredDynamicReplicationLeases(now_ms);
+        tenant_state.object_index.EraseExpiredDynamicReplicationLeases(now_ms);
     });
 }
 
-bool MasterService::HasDynamicReplicationPending(TenantState& tenant_state,
+bool MasterService::HasDynamicReplicationPending(TenantCatalog& tenant_state,
                                                  const std::string& key) {
     auto entry = tenant_state.Pin(key);
     if (!entry || !entry->dynamic_replication_pending.has_value()) {
@@ -8552,10 +8552,10 @@ MasterService::SubmitReplicaActionProposalLocked(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
     auto existing_lease =
-        tenant_state.object_route.FindDynamicReplicationLease(proposal_id);
+        tenant_state.object_index.FindDynamicReplicationLease(proposal_id);
     if (existing_lease.has_value()) {
         if (existing_lease->expire_at_ms_epoch >= now_ms) {
             const bool same_request =
@@ -8575,7 +8575,7 @@ MasterService::SubmitReplicaActionProposalLocked(
             }
             return *existing_lease;
         }
-        tenant_state.object_route.RemoveDynamicReplicationLease(proposal_id);
+        tenant_state.object_index.RemoveDynamicReplicationLease(proposal_id);
     }
 
     if (!DynamicReplicationHeatAdmitted(object_id)) {
@@ -8667,7 +8667,7 @@ MasterService::SubmitReplicaActionProposalLocked(
             std::chrono::steady_clock::now() +
             kDynamicReplicationActionCooldown;
     }
-    tenant_state.object_route.PutDynamicReplicationLease(proposal_id, lease);
+    tenant_state.object_index.PutDynamicReplicationLease(proposal_id, lease);
     return lease;
 }
 
@@ -8721,7 +8721,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         if (record_candidate) {
             MetadataAccessorRW accessor(this, object_id);
             if (accessor.Exists()) {
-                RecordOrUpdateCandidate(accessor.GetTenantState(), key, freq,
+                RecordOrUpdateCandidate(accessor.GetTenantCatalog(), key, freq,
                                         PromotionCandidateReason::kWatermark,
                                         ErrorCode::OK);
             }
@@ -8737,7 +8737,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         return PromotionQueueResult::kNotFound;
     }
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
 
     // A primary Put/Upsert owns all PROCESSING replicas while the key is in
@@ -8894,7 +8894,7 @@ auto MasterService::PromotionAllocStart(
     // nothing left to iterate, leaking the buffer until the object is
     // removed or evicted. The per-object lock is held for the rest of this
     // function, so the iterator stays valid across the allocation step.
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
     if (!object_entry || !object_entry->promotion_task.has_value()) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
@@ -8999,7 +8999,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
     }
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
 
     // Look up the in-flight task to find the exact replica we staged. A
@@ -9124,7 +9124,7 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantState();
+    auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
 
     if (!object_entry || !object_entry->promotion_task.has_value()) {
@@ -9240,10 +9240,10 @@ void MasterService::EvictionThreadFunc() {
             {
                 std::shared_lock<std::shared_mutex> shared_lock(
                     snapshot_mutex_);
-                tenant_directory_.Visit(
+                catalog_.Visit(
                     [&](const TenantId& tenant_id,
-                        const std::shared_ptr<TenantState>& handle) {
-                        TenantStateAccessorRW tenant_accessor(handle.get());
+                        const std::shared_ptr<TenantCatalog>& handle) {
+                        TenantCatalogAccessorRW tenant_accessor(handle.get());
                         DiscardExpiredProcessingReplicas(tenant_accessor, now);
                     });
                 ReleaseExpiredDiscardedReplicas(now);
@@ -9288,7 +9288,7 @@ void MasterService::EvictionThreadFunc() {
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    TenantStateAccessorRW& tenant_accessor,
+    TenantCatalogAccessorRW& tenant_accessor,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
@@ -9744,8 +9744,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
         if (!skip_cleanup) {
             auto cleanup_now = now;
-            tenant_directory_.Visit([&](const TenantId& tid,
-                                        const std::shared_ptr<TenantState>&
+            catalog_.Visit([&](const TenantId& tid,
+                                        const std::shared_ptr<TenantCatalog>&
                                             handle) {
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
@@ -9774,8 +9774,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        tenant_directory_.Visit(
-            [&](const TenantId&, const std::shared_ptr<TenantState>& handle) {
+        catalog_.Visit(
+            [&](const TenantId&, const std::shared_ptr<TenantCatalog>& handle) {
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
                 auto objs = tenant_state.SnapshotObjects();
@@ -9871,7 +9871,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
     auto evict_replicas =
-        [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
+        [&, this](TenantCatalog& tenant_state, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
@@ -9908,7 +9908,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
     auto try_evict_or_offload = [&, this](const std::string& key,
                                           ObjectMetadata& metadata,
-                                          TenantState& tenant_state,
+                                          TenantCatalog& tenant_state,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
         if (!offload_on_evict_) {
@@ -9969,11 +9969,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         std::string group_id;
         bool found = false;
         {
-            auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+            auto tenant_handle = catalog_.Lookup(normalized_tenant);
             if (!tenant_handle) {
                 return {};
             }
-            TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+            TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry) {
@@ -10008,7 +10008,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                   normalized_tenant);
                 }
                 if (tenant_state.Empty()) {
-                    tenant_directory_.Remove(normalized_tenant);
+                    catalog_.Remove(normalized_tenant);
                 }
                 return result;
             }
@@ -10027,11 +10027,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         // (lease/pin/evictable replica) happens inside EvictGroupOrObject under
         // the member's own tenant lock, so this callback only performs the
         // path-specific eviction. Object routing is decoupled from groups, so
-        // membership is read from the tenant's own object_route.
+        // membership is read from the tenant's own object_index.
         auto evict_one_member =
             [&, this](const std::string& member_key,
-                      ObjectMetadata& member_metadata, TenantState& state,
-                      TenantStateAccessorRW& accessor) -> EvictMemberOutcome {
+                      ObjectMetadata& member_metadata, TenantCatalog& state,
+                      TenantCatalogAccessorRW& accessor) -> EvictMemberOutcome {
             (void)accessor;
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, state, deferred_replicas);
@@ -10058,9 +10058,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         // trigger to erase it if it is now invalid and to drop an emptied
         // tenant.
         {
-            auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+            auto tenant_handle = catalog_.Lookup(normalized_tenant);
             if (tenant_handle) {
-                TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+                TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Pin(key);
                 if (object_entry) {
@@ -10077,7 +10077,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     }
                 }
                 if (tenant_state.Empty()) {
-                    tenant_directory_.Remove(normalized_tenant);
+                    catalog_.Remove(normalized_tenant);
                 }
             }
         }
@@ -10088,14 +10088,14 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         // All of the tenant's keys live in one container, so snapshot the
         // candidate keys under the tenant lock once, then evict
         // each outside it.
-        auto tenant_handle = tenant_directory_.Lookup(normalized_tenant);
+        auto tenant_handle = catalog_.Lookup(normalized_tenant);
         if (!tenant_handle) {
             return;
         }
         std::vector<std::vector<Replica>> deferred_replicas;
         std::vector<std::string> candidate_keys;
         {
-            TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+            TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             candidate_keys.reserve(tenant_state.ObjectCount());
             // Collect handles, then lock each per-object.
@@ -10181,7 +10181,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     auto evict_replicas =
-        [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
+        [&, this](TenantCatalog& tenant_state, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (enable_oplog_) {
                 return metadata.size *
@@ -10234,7 +10234,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto try_evict_or_offload =
         [&, this](
             const TenantId& tenant_id, const std::string& key,
-            ObjectMetadata& metadata, TenantState& tenant_state,
+            ObjectMetadata& metadata, TenantCatalog& tenant_state,
             std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
         if (enable_oplog_) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
@@ -10390,11 +10390,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::string group_id;
         bool found = false;
         {
-            auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+            auto tenant_handle = catalog_.Lookup(tenant_id);
             if (!tenant_handle) {
                 return {};
             }
-            TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+            TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Pin(key);
             if (!object_entry) {
@@ -10434,7 +10434,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                   QuotaEraseMode::kFull, &tenant_accessor);
                 }
                 if (tenant_state.Empty()) {
-                    tenant_directory_.Remove(tenant_id);
+                    catalog_.Remove(tenant_id);
                 }
                 return result;
             }
@@ -10453,11 +10453,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // (lease/pin/evictable replica) happens inside EvictGroupOrObject under
         // the member's own tenant lock, so this callback only performs the
         // path-specific eviction. Object routing is decoupled from groups, so
-        // membership is read from the tenant's own object_route.
+        // membership is read from the tenant's own object_index.
         auto evict_one_member =
             [&, this](const std::string& member_key,
-                      ObjectMetadata& member_metadata, TenantState& state,
-                      TenantStateAccessorRW& accessor) -> EvictMemberOutcome {
+                      ObjectMetadata& member_metadata, TenantCatalog& state,
+                      TenantCatalogAccessorRW& accessor) -> EvictMemberOutcome {
             (void)accessor;
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
                                                           member_metadata);
@@ -10488,9 +10488,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // trigger to erase it if it is now invalid and to drop an emptied
         // tenant.
         {
-            auto tenant_handle = tenant_directory_.Lookup(tenant_id);
+            auto tenant_handle = catalog_.Lookup(tenant_id);
             if (tenant_handle) {
-                TenantStateAccessorRW tenant_accessor(tenant_handle.get());
+                TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Pin(key);
                 if (!enable_oplog_ && object_entry) {
@@ -10507,7 +10507,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     }
                 }
                 if (tenant_state.Empty()) {
-                    tenant_directory_.Remove(tenant_id);
+                    catalog_.Remove(tenant_id);
                 }
             }
         }
@@ -10546,9 +10546,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     long local_object_count = 0;
     std::vector<std::chrono::system_clock::time_point> local_soft_pin;
 
-    tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                const std::shared_ptr<TenantState>& handle) {
-        TenantStateAccessorRW tenant_accessor(handle.get());
+    catalog_.Visit([&](const TenantId& tenant_id,
+                                const std::shared_ptr<TenantCatalog>& handle) {
+        TenantCatalogAccessorRW tenant_accessor(handle.get());
         DiscardExpiredProcessingReplicas(tenant_accessor, now);
 
         auto& tenant_state = *handle;
@@ -10609,10 +10609,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                   std::chrono::system_clock::time_point cutoff,
                                   bool collect_older_or_equal) {
         std::vector<Candidate> merged;
-        tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                    const std::shared_ptr<TenantState>&
+        catalog_.Visit([&](const TenantId& tenant_id,
+                                    const std::shared_ptr<TenantCatalog>&
                                         handle) {
-            TenantStateAccessorRW tenant_accessor(handle.get());
+            TenantCatalogAccessorRW tenant_accessor(handle.get());
             auto& tenant_state = *handle;
             // Collect handles, then lock each per-object.
             auto objs = tenant_state.SnapshotObjects();
@@ -10783,13 +10783,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Scan the directory once for keys within the target timeout.
             {
                 std::vector<std::pair<TenantId, std::string>> to_evict;
-                tenant_directory_.Visit(
+                catalog_.Visit(
                     [&](const TenantId& tenant_id,
-                        const std::shared_ptr<TenantState>& handle) {
+                        const std::shared_ptr<TenantCatalog>& handle) {
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
-                        TenantStateAccessorRW tenant_accessor(handle.get());
+                        TenantCatalogAccessorRW tenant_accessor(handle.get());
                         auto& tenant_state = *handle;
                         for (const auto& entry :
                              tenant_state.SnapshotObjects()) {
@@ -10835,13 +10835,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
             {
                 std::vector<std::pair<TenantId, std::string>> to_evict;
-                tenant_directory_.Visit(
+                catalog_.Visit(
                     [&](const TenantId& tenant_id,
-                        const std::shared_ptr<TenantState>& handle) {
+                        const std::shared_ptr<TenantCatalog>& handle) {
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
-                        TenantStateAccessorRW tenant_accessor(handle.get());
+                        TenantCatalogAccessorRW tenant_accessor(handle.get());
                         auto& tenant_state = *handle;
                         for (const auto& entry :
                              tenant_state.SnapshotObjects()) {
@@ -10890,9 +10890,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     // The per-tenant container now holds its object route in a
-    // mooncake::tenant::TenantStore, which does not expose bucket shrinking.
+    // mooncake::tenant::ObjectIndex, which does not expose bucket shrinking.
     // (erase() on the old `metadata` map never returned bucket memory; the
-    // TenantStore deliberately keeps this simple.)
+    // ObjectIndex deliberately keeps this simple.)
 
     const bool made_progress = evicted_count > 0 || released_discarded_cnt > 0;
     const bool success = made_progress || offload_deferred_count > 0;
@@ -10981,21 +10981,21 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
     // Count total objects first (a tenant's objects all live in one container),
     // then evict across tenants up to the target count.
-    tenant_directory_.Visit(
-        [&](const TenantId&, const std::shared_ptr<TenantState>& handle) {
+    catalog_.Visit(
+        [&](const TenantId&, const std::shared_ptr<TenantCatalog>& handle) {
             object_count += handle->ObjectCount();
         });
     const long ideal_evict_num =
         static_cast<long>(std::ceil(object_count * evict_ratio_target));
 
     if (ideal_evict_num > 0) {
-        tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                    const std::shared_ptr<TenantState>&
+        catalog_.Visit([&](const TenantId& tenant_id,
+                                    const std::shared_ptr<TenantCatalog>&
                                         handle) {
             if (evicted_count >= ideal_evict_num) {
                 return;
             }
-            TenantStateAccessorRW tenant_accessor(handle.get());
+            TenantCatalogAccessorRW tenant_accessor(handle.get());
             auto& tenant_state = *handle;
             auto objects = tenant_state.SnapshotObjects();
             for (auto& entry : objects) {
@@ -11523,11 +11523,11 @@ MasterService::MetadataSerializer::Serialize() {
     // directory slot on deserialize regardless of the entry key.
     packer.pack("shards");
 
-    std::vector<std::pair<TenantId, std::shared_ptr<TenantState>>>
+    std::vector<std::pair<TenantId, std::shared_ptr<TenantCatalog>>>
         tenants_with_metadata;
-    service_->tenant_directory_.Visit(
+    service_->catalog_.Visit(
         [&](const TenantId& tenant_id,
-            const std::shared_ptr<TenantState>& handle) {
+            const std::shared_ptr<TenantCatalog>& handle) {
             if (handle->ObjectCount() > 0) {
                 tenants_with_metadata.emplace_back(tenant_id, handle);
             }
@@ -11718,16 +11718,16 @@ void MasterService::MetadataSerializer::Reset() {
         // Drop every tenant from the TenantDirectory (collect
         // keys first — Visit holds an immutable snapshot and must not mutate).
         std::vector<TenantId> tenant_keys;
-        service_->tenant_directory_.Visit(
+        service_->catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<TenantState>&) {
+                const std::shared_ptr<TenantCatalog>&) {
                 tenant_keys.push_back(tenant_id);
             });
         for (const auto& tenant_id : tenant_keys) {
-            service_->tenant_directory_.Remove(tenant_id);
+            service_->catalog_.Remove(tenant_id);
         }
     }
-    // Group state is single-sourced in each tenant's object_route, so
+    // Group state is single-sourced in each tenant's object_index, so
     // the directory removal above already clears it; no global table to reset.
     {
         std::lock_guard lock(service_->discarded_replicas_mutex_);
@@ -11739,7 +11739,7 @@ void MasterService::MetadataSerializer::Reset() {
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeTenant(
-    const TenantId& tenant_id, const TenantState& tenant_state,
+    const TenantId& tenant_id, const TenantCatalog& tenant_state,
     MsgpackPacker& packer) const {
     // Tenant payload format: map with "metadata" field. Preserves the legacy
     // per-object layout [tenant_id, key, metadata_object].
@@ -11843,7 +11843,7 @@ MasterService::MetadataSerializer::DeserializeTenant(
         // TenantDirectory. There is no tenant-level lock; InsertObject takes
         // the route lock itself, and the object is brand-new so no per-object
         // lock is needed.
-        auto tenant_handle = service_->GetOrCreateTenantStateHandle(tenant_id);
+        auto tenant_handle = service_->GetOrCreateTenantCatalogHandle(tenant_id);
         auto& tenant_state = *tenant_handle;
         const std::string user_key = key;
         auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
@@ -12083,7 +12083,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
 tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(
-    TenantState& tenant_state, const std::string& key,
+    TenantCatalog& tenant_state, const std::string& key,
     const UUID& dynamic_replication_lease_id, const UUID& client_id,
     const std::string& source_segment, uint64_t current_version_epoch,
     uint64_t dynamic_replication_version_epoch,
@@ -12137,7 +12137,7 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
 }
 
 void MasterService::RegisterDynamicReplicaStart(
-    TenantState& tenant_state, ObjectMetadata& metadata, const std::string& key,
+    TenantCatalog& tenant_state, ObjectMetadata& metadata, const std::string& key,
     const std::string& source_segment, uint64_t version_epoch,
     const std::vector<std::string>& target_segments,
     const std::vector<ReplicaID>& replica_ids) {
@@ -12613,8 +12613,8 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
     std::unordered_set<std::string> blocked_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                    const std::shared_ptr<TenantState>&
+        catalog_.Visit([&](const TenantId& tenant_id,
+                                    const std::shared_ptr<TenantCatalog>&
                                         handle) {
             auto& tenant_state = *handle;
             auto objs = tenant_state.SnapshotObjects();
@@ -12706,8 +12706,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     std::unordered_set<std::string> remaining_unit_keys;
     {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        tenant_directory_.Visit([&](const TenantId& tenant_id,
-                                    const std::shared_ptr<TenantState>&
+        catalog_.Visit([&](const TenantId& tenant_id,
+                                    const std::shared_ptr<TenantCatalog>&
                                         handle) {
             auto objs = handle->SnapshotObjects();
             for (const auto& entry : objs) {

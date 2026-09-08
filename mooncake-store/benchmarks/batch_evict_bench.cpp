@@ -171,9 +171,9 @@ class BatchEvictBench {
 
         // Objects live in the default tenant's per-tenant route. Walk it via
         // the ownership registry; per-object access is under the metadata lock.
-        service.tenant_directory_.Visit(
+        service.catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<MasterService::TenantState>& handle) {
+                const std::shared_ptr<mooncake::tenant::TenantCatalog>& handle) {
                 if (tenant_id != TenantId::Default()) {
                     return;
                 }

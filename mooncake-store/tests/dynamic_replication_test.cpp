@@ -175,9 +175,9 @@ class DynamicReplicationTest : public ::testing::Test {
     bool HasDynamicState(MasterService& service, const std::string& key) const {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
-        auto& tenant_state = accessor.GetTenantState();
+        auto& tenant_state = accessor.GetTenantCatalog();
         const bool has_lease =
-            tenant_state.object_route.HasDynamicReplicationLeaseForKeyForTest(
+            tenant_state.object_index.HasDynamicReplicationLeaseForKeyForTest(
                 key);
         auto entry = tenant_state.Pin(key);
         if (!entry) {
@@ -210,7 +210,7 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        service.ClearDynamicReplicationStateForKey(accessor.GetTenantState(),
+        service.ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(),
                                                    key);
     }
 
@@ -218,11 +218,11 @@ class DynamicReplicationTest : public ::testing::Test {
                                           const std::string& key) const {
         (void)key;
         auto tenant_handle =
-            service.tenant_directory_.Lookup(TenantId::Default());
+            service.catalog_.Lookup(TenantId::Default());
         if (tenant_handle == nullptr) {
             return;
         }
-        MasterService::TenantStateAccessorRW shard(tenant_handle.get());
+        mooncake::tenant::TenantCatalogAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
     }
@@ -261,7 +261,7 @@ class DynamicReplicationTest : public ::testing::Test {
                               const std::string& key) const {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
-        auto& tenant_state = accessor.GetTenantState();
+        auto& tenant_state = accessor.GetTenantCatalog();
         auto entry = tenant_state.Pin(key);
         ASSERT_TRUE(entry != nullptr && entry->dynamic_replication_pending);
         entry->dynamic_replication_pending->expire_at_ms_epoch = 1;

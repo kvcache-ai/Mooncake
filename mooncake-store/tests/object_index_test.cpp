@@ -1,4 +1,4 @@
-#include "tenant/tenant_store.h"
+#include "tenant/object_index.h"
 
 #include <algorithm>
 #include <chrono>
@@ -26,13 +26,13 @@ std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
 
 // --- Group membership ---
 
-TEST(TenantStoreTest, StartsWithNoGroups) {
-    TenantStore store;
+TEST(ObjectIndexTest, StartsWithNoGroups) {
+    ObjectIndex store;
     EXPECT_TRUE(store.Members("g1").empty());
 }
 
-TEST(TenantStoreTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
-    TenantStore store;
+TEST(ObjectIndexTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
+    ObjectIndex store;
 
     auto a1 = store.LeaseFor("g1");
     auto a2 = store.LeaseFor("g1");
@@ -43,8 +43,8 @@ TEST(TenantStoreTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
     EXPECT_NE(a1.get(), b.get());   // different group -> distinct Lease
 }
 
-TEST(TenantStoreTest, AddRemoveGroupMembers) {
-    TenantStore store;
+TEST(ObjectIndexTest, AddRemoveGroupMembers) {
+    ObjectIndex store;
     store.LeaseFor("g1");
 
     EXPECT_TRUE(store.AddMember("g1", "k1"));
@@ -59,14 +59,14 @@ TEST(TenantStoreTest, AddRemoveGroupMembers) {
     EXPECT_EQ(after[0], "k2");
 }
 
-TEST(TenantStoreTest, AddingToUndefinedGroupIsRejected) {
-    TenantStore store;
+TEST(ObjectIndexTest, AddingToUndefinedGroupIsRejected) {
+    ObjectIndex store;
     // Group must be materialized via LeaseFor before members are registered.
     EXPECT_FALSE(store.AddMember("nope", "k1"));
 }
 
-TEST(TenantStoreTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
-    TenantStore store;
+TEST(ObjectIndexTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
+    ObjectIndex store;
     store.LeaseFor("g1");
     store.AddMember("g1", "k1");
 
@@ -76,8 +76,8 @@ TEST(TenantStoreTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
     EXPECT_TRUE(store.Members("g1").empty());
 }
 
-TEST(TenantStoreTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
-    TenantStore store;
+TEST(ObjectIndexTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
+    ObjectIndex store;
     store.LeaseFor("g1");
     store.AddMember("g1", "k1");
     store.AddMember("g1", "k2");
@@ -101,8 +101,8 @@ TEST(TenantStoreTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
 
 // --- Object route ---
 
-TEST(TenantStoreTest, InsertPinEraseContainsObjectCount) {
-    TenantStore store;
+TEST(ObjectIndexTest, InsertPinEraseContainsObjectCount) {
+    ObjectIndex store;
     EXPECT_EQ(store.ObjectCount(), 0u);
 
     auto e1 = MakeEntry("k1", "");
@@ -124,8 +124,8 @@ TEST(TenantStoreTest, InsertPinEraseContainsObjectCount) {
     EXPECT_EQ(store.ObjectCount(), 0u);
 }
 
-TEST(TenantStoreTest, DuplicateInsertIsRejected) {
-    TenantStore store;
+TEST(ObjectIndexTest, DuplicateInsertIsRejected) {
+    ObjectIndex store;
     store.Insert("k1", MakeEntry("k1", ""));
     // Second insert for the same key must not clobber the original.
     EXPECT_FALSE(store.Insert("k1", MakeEntry("k1", "")));
@@ -134,8 +134,8 @@ TEST(TenantStoreTest, DuplicateInsertIsRejected) {
     EXPECT_EQ(store.Pin("k1")->key(), "k1");
 }
 
-TEST(TenantStoreTest, SnapshotObjectsEnumeratesEveryEntry) {
-    TenantStore store;
+TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {
+    ObjectIndex store;
     store.Insert("k1", MakeEntry("k1", ""));
     store.Insert("k2", MakeEntry("k2", "g1"));
     store.Insert("k3", MakeEntry("k3", "g1"));
@@ -150,9 +150,9 @@ TEST(TenantStoreTest, SnapshotObjectsEnumeratesEveryEntry) {
     EXPECT_TRUE(std::find(keys.begin(), keys.end(), "k3") != keys.end());
 }
 
-TEST(TenantStoreTest,
+TEST(ObjectIndexTest,
      ObjectRouteAndGroupMembershipAreIndependentFlatStructures) {
-    TenantStore store;
+    ObjectIndex store;
     // A grouped member is just a flat route entry with a group_id annotation.
     auto member = MakeEntry("k2", "g1");
     store.Insert("k2", member);
@@ -173,8 +173,8 @@ TEST(TenantStoreTest,
 
 // --- InsertObject (route + group wiring) ---
 
-TEST(TenantStoreTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
-    TenantStore store;
+TEST(ObjectIndexTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
+    ObjectIndex store;
 
     // A grouped object: InsertObject should wire the group's shared Lease into
     // the entry's lease slot AND register it as a group member.
@@ -188,8 +188,8 @@ TEST(TenantStoreTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
               store.LeaseFor("g1").get());  // same single shared lease
 }
 
-TEST(TenantStoreTest, InsertObjectDoesNotJoinForSingleton) {
-    TenantStore store;
+TEST(ObjectIndexTest, InsertObjectDoesNotJoinForSingleton) {
+    ObjectIndex store;
 
     auto singleton = MakeEntry("k1", "");
     EXPECT_TRUE(store.InsertObject("k1", singleton));
@@ -202,8 +202,8 @@ TEST(TenantStoreTest, InsertObjectDoesNotJoinForSingleton) {
     EXPECT_TRUE(singleton->metadata().IsLeaseExpired());
 }
 
-TEST(TenantStoreTest, InsertObjectRejectsDuplicateKey) {
-    TenantStore store;
+TEST(ObjectIndexTest, InsertObjectRejectsDuplicateKey) {
+    ObjectIndex store;
     store.InsertObject("k1", MakeEntry("k1", "g1"));
     // Second insert for the same key is rejected; the original is intact.
     EXPECT_FALSE(
@@ -215,8 +215,8 @@ TEST(TenantStoreTest, InsertObjectRejectsDuplicateKey) {
 
 // --- Accessors ---
 
-TEST(TenantStoreTest, WithObjectScopeRespectsPresenceAndAbsence) {
-    TenantStore store;
+TEST(ObjectIndexTest, WithObjectScopeRespectsPresenceAndAbsence) {
+    ObjectIndex store;
     auto singleton = MakeEntry("k1", "");
     store.Insert("k1", singleton);
     auto& raw = singleton->metadata();
@@ -234,8 +234,8 @@ TEST(TenantStoreTest, WithObjectScopeRespectsPresenceAndAbsence) {
     EXPECT_TRUE(called);
 }
 
-TEST(TenantStoreTest, EmptyTracksRouteGroupsAndLeases) {
-    TenantStore store;
+TEST(ObjectIndexTest, EmptyTracksRouteGroupsAndLeases) {
+    ObjectIndex store;
     EXPECT_TRUE(store.Empty());
 
     // A routed object makes the container non-empty.

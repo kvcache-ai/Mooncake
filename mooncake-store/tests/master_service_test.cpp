@@ -944,9 +944,9 @@ TEST_F(MasterServiceTest,
        ConcurrentFirstWritesToDistinctKeysShareReachableTenant) {
     // Get-or-create must be atomic: 16 threads racing to write the first 16
     // distinct keys of the same absent tenant all run the tenant factory, but
-    // only the published TenantState is reachable through the directory. With
+    // only the published TenantCatalog is reachable through the directory. With
     // a non-atomic Lookup + Upsert the losers kept writing into a private
-    // TenantState, silently stranding their objects.
+    // TenantCatalog, silently stranding their objects.
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -989,7 +989,7 @@ TEST_F(MasterServiceTest,
     }
 
     // Every object must be reachable through the directory, not stranded in a
-    // losing TenantState.
+    // losing TenantCatalog.
     for (const auto& key : keys) {
         EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value())
             << "stranded key=" << key;

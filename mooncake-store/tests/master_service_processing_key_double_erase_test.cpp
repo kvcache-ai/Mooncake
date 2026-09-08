@@ -44,7 +44,7 @@
 //     Production had the same window: the expiry thread unmounts the ghost
 //     segment and only THEN slowly sweeps 23M keys in ClearInvalidHandles —
 //     any RPC landing in that window hits the buggy accessor cleanup first.
-//   * A second live key ON THE SAME METADATA SHARD must keep the TenantState
+//   * A second live key ON THE SAME METADATA SHARD must keep the TenantCatalog
 //     non-empty. Otherwise MaybeEraseEmptyTenant() erases the tenant and
 //     nulls tenant_state_, masking the bug (the buggy branch is guarded by
 //     tenant_state_ != nullptr). Production tenants hold millions of keys,
@@ -86,8 +86,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
     // Friend access: any second live key in the same tenant (Default) keeps
-    // the TenantState non-empty. All of a tenant's keys live in a single
-    // TenantState regardless of shard (there is no per-key shard to share), so
+    // the TenantCatalog non-empty. All of a tenant's keys live in a single
+    // TenantCatalog regardless of shard (there is no per-key shard to share), so
     // a simple suffix suffices instead of a shard-index probe.
     std::string FindKeyOnSameShard(MasterService& service,
                                    const std::string& key) {
@@ -114,7 +114,7 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         }
 
         // 2. PutStart a key onto the segment and never complete it — the key
-        //    stays in TenantState::processing_keys (client "died" mid-put).
+        //    stays in TenantCatalog::processing_keys (client "died" mid-put).
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segment = segment.name;
@@ -124,7 +124,7 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutStartFailed);
         }
 
-        // 2b. A second, completed key on the SAME shard keeps the TenantState
+        // 2b. A second, completed key on the SAME shard keeps the TenantCatalog
         //     non-empty in step 4 (see file header for why this is required).
         const std::string keepalive_key = FindKeyOnSameShard(service, key);
         if (!service

@@ -38,14 +38,18 @@ struct GroupState {
     bool Empty() const { return member_keys.empty(); }
 };
 
-// Tenant-scoped container holding that tenant's group membership. MasterService
-// owns this; the group TTL is single-source (one Lease per group, extended on
-// any member's read), so eviction can treat the whole group as all-or-none by
-// inspecting just the shared lease.
-class TenantStore {
+// The per-tenant ObjectIndex: the primary hash-map index
+// (object key -> strong ObjectEntry handle) plus the GroupIndex (group_id ->
+// shared Lease + member keys) and the in-flight dynamic-replication lease
+// table. MasterService owns this through the TenantCatalog aggregate; the
+// group TTL is single-source (one Lease per group, extended on any member's
+// read), so eviction can treat the whole group as all-or-none by inspecting
+// just the shared lease. Splitting the indexes into their own classes is a
+// documented follow-up.
+class ObjectIndex {
    public:
-    TenantStore() = default;
-    ~TenantStore() = default;
+    ObjectIndex() = default;
+    ~ObjectIndex() = default;
 
     // Return (creating on demand) the single shared Lease for a group_id.
     // Callers wire the returned lease into each member object's own lease slot,

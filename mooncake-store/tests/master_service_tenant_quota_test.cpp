@@ -226,11 +226,11 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             bytes);
     }
 
-    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
+    TenantQuotaHandle GetOrCreateTenantCatalogHandleForTest(
         MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
         (void)shard_idx;
         auto tenant_state_handle =
-            service.GetOrCreateTenantStateHandle(tenant_id);
+            service.GetOrCreateTenantCatalogHandle(tenant_id);
         return service.GetBoundTenantQuotaHandle(*tenant_state_handle);
     }
 
@@ -249,11 +249,11 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                                          const TenantId& tenant_id,
                                          const std::string& key) {
         (void)key;
-        auto tenant_handle = service.tenant_directory_.Lookup(tenant_id);
+        auto tenant_handle = service.catalog_.Lookup(tenant_id);
         if (tenant_handle == nullptr) {
             return;
         }
-        MasterService::TenantStateAccessorRW shard(tenant_handle.get());
+        mooncake::tenant::TenantCatalogAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());
     }
@@ -420,15 +420,15 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
+       SameTenantCatalogsAcrossMetadataShardsShareBoundHandle) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);
 
     auto* first_handle =
-        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
+        GetOrCreateTenantCatalogHandleForTest(service, 0, tenant_id);
     auto* second_handle =
-        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
+        GetOrCreateTenantCatalogHandleForTest(service, 1, tenant_id);
 
     ASSERT_NE(first_handle, nullptr);
     EXPECT_EQ(first_handle, second_handle);

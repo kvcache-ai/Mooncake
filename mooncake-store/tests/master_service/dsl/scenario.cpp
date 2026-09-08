@@ -1048,7 +1048,7 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
     const TenantId tenant(action.tenant);
     // All of a tenant's keys live in one tenant container, so a single
     // directory lookup finds the object (there is no per-shard probe).
-    auto tenant_handle = service_->tenant_directory_.Lookup(tenant);
+    auto tenant_handle = service_->catalog_.Lookup(tenant);
     if (!tenant_handle) {
         Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;

@@ -231,7 +231,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
-        auto handle = svc->tenant_directory_.Lookup(TenantId::Default());
+        auto handle = svc->catalog_.Lookup(TenantId::Default());
         if (handle == nullptr) {
             return false;
         }
@@ -244,7 +244,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService* svc, const std::string& key) {
-        auto handle = svc->tenant_directory_.Lookup(TenantId::Default());
+        auto handle = svc->catalog_.Lookup(TenantId::Default());
         if (handle == nullptr) {
             return std::nullopt;
         }
@@ -267,7 +267,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
 
     bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
         (void)shard_idx;
-        auto handle = service_->tenant_directory_.Lookup(TenantId::Default());
+        auto handle = service_->catalog_.Lookup(TenantId::Default());
         if (handle == nullptr) {
             return false;
         }

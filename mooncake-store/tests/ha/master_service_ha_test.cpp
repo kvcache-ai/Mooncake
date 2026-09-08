@@ -635,7 +635,7 @@ class MasterServiceHATest : public ::testing::Test {
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
         // The tenant container is resolved by tenant_id (there is no shard
         // routing); create it on demand.
-        auto tenant_handle = service->GetOrCreateTenantStateHandle(tenant);
+        auto tenant_handle = service->GetOrCreateTenantCatalogHandle(tenant);
         auto& tenant_state = *tenant_handle;
         auto entry = tenant_state.Pin(key);
         if (!entry) {
@@ -754,7 +754,7 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasMetadataEntryForTesting(MasterService& service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        auto tenant = service.tenant_directory_.Lookup(tenant_id);
+        auto tenant = service.catalog_.Lookup(tenant_id);
         return tenant && tenant->ContainsObject(key);
     }
 
@@ -824,12 +824,12 @@ class MasterServiceHATest : public ::testing::Test {
     static std::unique_lock<std::shared_mutex> LockMetadataShardForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        // TenantStore's route lock. Holding it EXCLUSIVE gates PutStart at its
+        // ObjectIndex's route lock. Holding it EXCLUSIVE gates PutStart at its
         // first Pin inside the snapshot barrier, letting the test observe the
         // barrier (snapshot held, client_mutex_ released) without racing the
         // async PutStart.
-        auto tenant_handle = service.GetOrCreateTenantStateHandle(tenant_id);
-        return tenant_handle->object_route.LockRouteForTesting();
+        auto tenant_handle = service.GetOrCreateTenantCatalogHandle(tenant_id);
+        return tenant_handle->object_index.LockRouteForTesting();
     }
 
     static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(

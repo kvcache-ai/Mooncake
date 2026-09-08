@@ -54,7 +54,7 @@ class TenantDirectory {
     // Atomic get-or-create. Two concurrent callers for an absent tenant each
     // run `factory` (racing), but both observe the SAME winning handle once
     // the winner is published, so a loser never keeps building on a private
-    // TenantState that the directory will never reach. `factory` must not
+    // TenantCatalog that the directory will never reach. `factory` must not
     // re-enter the directory.
     template <typename Factory>
     Handle GetOrCreate(const TenantId& tenant_id, Factory&& factory) {

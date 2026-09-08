@@ -4,7 +4,7 @@
 // the single source of identity (user_key, group_id) and group-lease wiring;
 // the entry adds only the per-key task state and the per-object mutation
 // boundary. Previously this state lived as N separate MasterService
-// TenantState maps keyed by the same string.
+// TenantCatalog maps keyed by the same string.
 
 #include <chrono>
 #include <memory>
