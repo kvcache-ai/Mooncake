@@ -118,6 +118,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     transfer_task.cpp
     config/fileread_worker_pool_config.cpp
     posix_file.cpp
+    dax_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp
