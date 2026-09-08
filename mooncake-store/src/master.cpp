@@ -16,6 +16,7 @@
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/snapshot/batch_oplog/config.h"
 
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
@@ -1482,20 +1483,9 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
         return 1;
     }
-    if (master_config.enable_oplog_snapshot) {
-        if (!master_config.enable_oplog) {
-            LOG(FATAL) << "enable_oplog_snapshot requires enable_oplog=true";
-            return 1;
-        }
-        if (master_config.snapshot_chunk_object_count == 0) {
-            LOG(FATAL) << "snapshot_chunk_object_count must be greater than 0";
-            return 1;
-        }
-        if (master_config.snapshot_object_store_type.empty()) {
-            LOG(FATAL) << "enable_oplog_snapshot requires "
-                       << "snapshot_object_store_type";
-            return 1;
-        }
+    if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
+        LOG(FATAL) << *error;
+        return 1;
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
