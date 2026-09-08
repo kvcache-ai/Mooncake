@@ -3,21 +3,74 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from collections.abc import Iterator
+from collections.abc import Generator
+from enum import Enum, auto
 from typing import Any, Sequence
 
 from .completion import (
     PendingTransferManager,
     TransferCompletionFailedError,
+    TransferCompletionInterrupted,
     TransferCompletionUnknownError,
     TransferEngineError,
     _CompletionUnknown,
     _CompletionWaitInterrupted,
-    _PendingCompletionWaitInterrupted,
     _batch_transfer_with_completion_fence,
 )
 from .contracts import TransferBatch, TransferBatchReceipt, TransferDirection
-from .lifetime import AllocationLifetimeToken
+from .lifetime import AllocationLifetimeToken, TerminalTransferState
+
+
+class _TransferSubmissionState(Enum):
+    ACTIVE = auto()
+    POISONED = auto()
+    CLOSED = auto()
+
+
+class TransferSubmission:
+    """Execute batches while one resource submission owns the native engine."""
+
+    _executor: MooncakeTransferEngineExecutor
+    _state: _TransferSubmissionState
+
+    def __init__(self, executor: MooncakeTransferEngineExecutor) -> None:
+        raise TransferEngineError(
+            "transfer submissions must be created by executor.submission()"
+        )
+
+    @classmethod
+    def _create(
+        cls,
+        executor: MooncakeTransferEngineExecutor,
+    ) -> TransferSubmission:
+        submission = object.__new__(cls)
+        submission._executor = executor
+        submission._state = _TransferSubmissionState.ACTIVE
+        return submission
+
+    def execute_batch(
+        self,
+        batch: TransferBatch,
+        direction: TransferDirection,
+    ) -> TransferBatchReceipt:
+        if self._state is _TransferSubmissionState.CLOSED:
+            raise TransferEngineError("transfer submission is no longer active")
+        if self._state is _TransferSubmissionState.POISONED:
+            raise TransferEngineError(
+                "transfer submission completion is unresolved and cannot accept "
+                "another batch"
+            )
+        try:
+            return self._executor._execute_batch(batch, direction)
+        except (
+            TransferCompletionInterrupted,
+            TransferCompletionUnknownError,
+        ):
+            self._state = _TransferSubmissionState.POISONED
+            raise
+
+    def _close(self) -> None:
+        self._state = _TransferSubmissionState.CLOSED
 
 
 class MooncakeTransferEngineExecutor:
@@ -43,17 +96,25 @@ class MooncakeTransferEngineExecutor:
         self.engine = engine
         self.max_completion_drain_attempts = max_completion_drain_attempts
         self.completion_drain_timeout_ms = completion_drain_timeout_ms
-        self.pending_manager = PendingTransferManager(engine)
+        self._pending_manager = PendingTransferManager(engine)
+
+    @property
+    def engine_identity(self) -> tuple[str, int]:
+        """Return the process-local identity used for submission fencing."""
+
+        return self._pending_manager.engine_identity
 
     @contextmanager
-    def submission(self) -> Iterator[None]:
+    def submission(self) -> Generator[TransferSubmission, None, None]:
         """Reserve the native engine across all batches of one resource plan."""
 
-        self.pending_manager._reserve_submission()
+        self._pending_manager._reserve_submission()
+        submission = TransferSubmission._create(self)
         try:
-            yield
+            yield submission
         finally:
-            self.pending_manager._release_submission()
+            submission._close()
+            self._pending_manager._release_submission()
 
     def execute_batch(
         self,
@@ -62,10 +123,10 @@ class MooncakeTransferEngineExecutor:
     ) -> TransferBatchReceipt:
         """Execute one standalone batch with engine-wide admission fencing."""
 
-        with self.submission():
-            return self._execute_reserved_batch(batch, direction)
+        with self.submission() as submission:
+            return submission.execute_batch(batch, direction)
 
-    def _execute_reserved_batch(
+    def _execute_batch(
         self,
         batch: TransferBatch,
         direction: TransferDirection,
@@ -158,9 +219,10 @@ class MooncakeTransferEngineExecutor:
                 drain_timeout_ms=self.completion_drain_timeout_ms,
             )
         except _CompletionUnknown as error:
-            pending_transfer_id = self.pending_manager._retain_pending_ticket(
+            pending_transfer_id = self._pending_manager._retain_pending_ticket(
                 error.ticket
             )
+            self._handoff_active_registration_frames(pending_transfer_id)
             restart_required = getattr(error.ticket, "restart_required", False)
             suffix = (
                 "; legacy API exposes no drainable ticket, so this engine is "
@@ -172,14 +234,17 @@ class MooncakeTransferEngineExecutor:
                 "batch transfer completion is unknown; registrations remain "
                 f"quarantined as {pending_transfer_id}{suffix}",
                 pending_transfer_id=pending_transfer_id,
+                engine_identity=self.engine_identity,
             ) from error
         except _CompletionWaitInterrupted as error:
-            pending_transfer_id = self.pending_manager._retain_pending_ticket(
+            pending_transfer_id = self._pending_manager._retain_pending_ticket(
                 error.ticket
             )
-            raise _PendingCompletionWaitInterrupted(
+            self._handoff_active_registration_frames(pending_transfer_id)
+            raise TransferCompletionInterrupted(
                 pending_transfer_id,
                 error.interruption,
+                engine_identity=self.engine_identity,
             ) from error
         except Exception as error:
             raise TransferEngineError(
@@ -196,6 +261,14 @@ class MooncakeTransferEngineExecutor:
             nbytes=batch.nbytes,
         )
 
+    def _handoff_active_registration_frames(self, pending_transfer_id: str) -> None:
+        from .registration import _handoff_active_registration_frames
+
+        _handoff_active_registration_frames(
+            pending_transfer_id,
+            engine_identity=self.engine_identity,
+        )
+
     def retain_pending_resources(
         self,
         pending_transfer_id: str,
@@ -204,14 +277,14 @@ class MooncakeTransferEngineExecutor:
         resources: Sequence[Any],
         allocation_tokens: Sequence[AllocationLifetimeToken] = (),
     ) -> None:
-        self.pending_manager._retain_pending_resources(
+        self._pending_manager._retain_pending_resources(
             pending_transfer_id,
             registrations=registrations,
             resources=resources,
             allocation_tokens=allocation_tokens,
         )
 
-    def _retain_pending_resources(
+    def _stage_pending_resources(
         self,
         pending_transfer_id: str,
         *,
@@ -219,8 +292,28 @@ class MooncakeTransferEngineExecutor:
         resources: Sequence[Any],
         allocation_tokens: Sequence[AllocationLifetimeToken] = (),
     ) -> None:
-        self.retain_pending_resources(
+        self._pending_manager._retain_pending_resources(
             pending_transfer_id,
+            registrations=registrations,
+            resources=resources,
+            allocation_tokens=allocation_tokens,
+            handoff_complete=False,
+        )
+
+    def _seal_pending_resource_handoff(self, pending_transfer_id: str) -> None:
+        self._pending_manager._seal_pending_resource_handoff(pending_transfer_id)
+
+    def retain_pending_registration_cleanup(
+        self,
+        *,
+        terminal_state: TerminalTransferState,
+        registrations: Sequence[int],
+        resources: Sequence[Any],
+        allocation_tokens: Sequence[AllocationLifetimeToken] = (),
+        restart_required: bool = False,
+    ) -> str:
+        return self._pending_manager._retain_pending_registration_cleanup(
+            terminal_state=terminal_state,
             registrations=registrations,
             resources=resources,
             allocation_tokens=allocation_tokens,
@@ -228,10 +321,10 @@ class MooncakeTransferEngineExecutor:
         )
 
     def pending_transfer_ids(self) -> tuple[str, ...]:
-        return self.pending_manager.pending_transfer_ids()
+        return self._pending_manager.pending_transfer_ids()
 
     def pending_transfer_status(self, pending_transfer_id: str) -> str:
-        return self.pending_manager.pending_transfer_status(pending_transfer_id)
+        return self._pending_manager.pending_transfer_status(pending_transfer_id)
 
     def drain_pending_transfer(
         self,
@@ -239,7 +332,7 @@ class MooncakeTransferEngineExecutor:
         *,
         timeout_ms: int = 1000,
     ) -> str:
-        return self.pending_manager.drain_pending_transfer(
+        return self._pending_manager.drain_pending_transfer(
             pending_transfer_id,
             timeout_ms=timeout_ms,
         )

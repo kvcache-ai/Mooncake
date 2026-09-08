@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Generator, NoReturn, Optional, Protocol, Sequence, Union
+from typing import Generator, NoReturn, Optional, Protocol, Sequence, TypeGuard, Union
 
 from ..contracts import LeaseId, RuntimeBindingFragment, RuntimeFragmentId
 from .completion import (
-    _PendingCompletionWaitInterrupted,
     TransferCompletionFailedError,
+    TransferCompletionInterrupted,
     TransferCompletionUnknownError,
     TransferEngineError,
     TransferRegistrationCleanupPendingError,
@@ -22,7 +23,10 @@ class _RegistrationEngine(Protocol):
 
 
 class _PendingResourceOwner(Protocol):
-    def _retain_pending_resources(
+    @property
+    def engine_identity(self) -> tuple[str, int]: ...
+
+    def retain_pending_resources(
         self,
         pending_transfer_id: str,
         *,
@@ -31,7 +35,18 @@ class _PendingResourceOwner(Protocol):
         allocation_tokens: Sequence[AllocationLifetimeToken] = (),
     ) -> None: ...
 
-    def _retain_pending_registration_cleanup(
+    def _stage_pending_resources(
+        self,
+        pending_transfer_id: str,
+        *,
+        registrations: Sequence[int],
+        resources: Sequence[object],
+        allocation_tokens: Sequence[AllocationLifetimeToken] = (),
+    ) -> None: ...
+
+    def _seal_pending_resource_handoff(self, pending_transfer_id: str) -> None: ...
+
+    def retain_pending_registration_cleanup(
         self,
         *,
         terminal_state: TerminalTransferState,
@@ -130,6 +145,44 @@ class BufferRegistrationLease:
         )
 
 
+@dataclass
+class _RegistrationFrame:
+    pending_owner: _PendingResourceOwner
+    engine_identity: tuple[str, int]
+    registrations: tuple[int, ...]
+    resources: tuple[object, ...]
+    lifetime_tokens: Optional[AllocationTokenSet]
+    handed_off: bool = False
+
+
+_registration_frames: ContextVar[tuple[_RegistrationFrame, ...]] = ContextVar(
+    "reshard_registration_frames",
+    default=(),
+)
+
+
+@contextmanager
+def _registration_frame(
+    pending_owner: _PendingResourceOwner,
+    *,
+    registrations: Sequence[int],
+    resources: Sequence[object],
+    lifetime_tokens: Optional[AllocationTokenSet],
+) -> Generator[_RegistrationFrame, None, None]:
+    frame = _RegistrationFrame(
+        pending_owner=pending_owner,
+        engine_identity=pending_owner.engine_identity,
+        registrations=tuple(registrations),
+        resources=tuple(resources),
+        lifetime_tokens=lifetime_tokens,
+    )
+    token = _registration_frames.set((*_registration_frames.get(), frame))
+    try:
+        yield frame
+    finally:
+        _registration_frames.reset(token)
+
+
 def same_runtime_snapshot(
     current: RuntimeBindingFragment,
     planned: RuntimeBindingFragment,
@@ -197,24 +250,60 @@ def validate_registration(
 
 def _handoff_pending_resources(
     pending_owner: _PendingResourceOwner,
-    error: Union[TransferCompletionUnknownError, _PendingCompletionWaitInterrupted],
-    *,
-    registrations: Sequence[int],
-    resources: Sequence[object],
-    lifetime_tokens: Optional[AllocationTokenSet] = None,
+    error: Union[TransferCompletionUnknownError, TransferCompletionInterrupted],
 ) -> BaseException:
-    allocation_tokens = lifetime_tokens.tokens if lifetime_tokens is not None else ()
-    pending_owner._retain_pending_resources(
+    _handoff_active_registration_frames(
         error.pending_transfer_id,
-        registrations=registrations,
-        resources=resources,
+        engine_identity=error.engine_identity,
+    )
+    return error
+
+
+def _handoff_active_registration_frames(
+    pending_transfer_id: str,
+    *,
+    engine_identity: tuple[str, int],
+) -> None:
+    frames = tuple(
+        frame
+        for frame in _registration_frames.get()
+        if frame.engine_identity == engine_identity and not frame.handed_off
+    )
+    if not frames:
+        return
+    pending_owner = frames[-1].pending_owner
+    allocation_tokens = tuple(
+        token
+        for frame in frames
+        if frame.lifetime_tokens is not None
+        for token in frame.lifetime_tokens.tokens
+    )
+    pending_owner._stage_pending_resources(
+        pending_transfer_id,
+        registrations=tuple(
+            address for frame in frames for address in frame.registrations
+        ),
+        resources=tuple(resource for frame in frames for resource in frame.resources),
         allocation_tokens=allocation_tokens,
     )
-    if lifetime_tokens is not None:
-        lifetime_tokens.handoff_to_pending()
-    if isinstance(error, _PendingCompletionWaitInterrupted):
-        return error.interruption
-    return error
+    for frame in frames:
+        frame.handed_off = True
+        if frame.lifetime_tokens is not None:
+            frame.lifetime_tokens.handoff_to_pending()
+    pending_owner._seal_pending_resource_handoff(pending_transfer_id)
+
+
+def _pending_error_belongs_to(
+    error: BaseException,
+    pending_owner: _PendingResourceOwner,
+) -> TypeGuard[Union[TransferCompletionUnknownError, TransferCompletionInterrupted]]:
+    return (
+        isinstance(
+            error,
+            (TransferCompletionUnknownError, TransferCompletionInterrupted),
+        )
+        and error.engine_identity == pending_owner.engine_identity
+    )
 
 
 def _cleanup_terminal_state(
@@ -245,7 +334,7 @@ def _raise_pending_registration_cleanup(
         primary_error,
         body_entered=body_entered,
     )
-    pending_transfer_id = pending_owner._retain_pending_registration_cleanup(
+    pending_transfer_id = pending_owner.retain_pending_registration_cleanup(
         terminal_state=terminal_state,
         registrations=tuple(address for address, _ in failures),
         resources=resources,
@@ -272,6 +361,7 @@ def _quarantine_unknown_registration_cleanup(
     pending_owner: _PendingResourceOwner,
     *,
     label: str,
+    operation: str,
     registrations: Sequence[int],
     error: BaseException,
     primary_error: Optional[BaseException],
@@ -295,7 +385,7 @@ def _quarantine_unknown_registration_cleanup(
     if lifetime_tokens is not None:
         lifetime_tokens.handoff_to_pending()
     detail = (
-        f"{label} unregister_memory outcome is unknown; cleanup is quarantined "
+        f"{label} {operation} outcome is unknown: {error}; cleanup is quarantined "
         f"as {pending_transfer_id} and engine restart is required"
     )
     if isinstance(error, Exception):
@@ -337,6 +427,7 @@ def _unregister_owned_allocations(
             _quarantine_unknown_registration_cleanup(
                 pending_owner,
                 label=label,
+                operation="unregister_memory",
                 registrations=unresolved,
                 error=error,
                 primary_error=primary_error,
@@ -375,6 +466,7 @@ def _register_allocations(
             _quarantine_unknown_registration_cleanup(
                 pending_owner,
                 label=label,
+                operation="register_memory",
                 registrations=(*owned, address),
                 error=error,
                 primary_error=error,
@@ -424,19 +516,21 @@ def registered_sources(
                 lease_generation=lease_generation,
                 runtime_lease_id=runtime_lease_id,
             )
-        try:
-            yield
-        except (
-            TransferCompletionUnknownError,
-            _PendingCompletionWaitInterrupted,
-        ) as error:
-            raise _handoff_pending_resources(
-                pending_owner,
-                error,
-                registrations=(),
-                resources=resources,
-                lifetime_tokens=lifetime_tokens,
-            )
+        with _registration_frame(
+            pending_owner,
+            registrations=(),
+            resources=resources,
+            lifetime_tokens=lifetime_tokens,
+        ):
+            try:
+                yield
+            except (
+                TransferCompletionUnknownError,
+                TransferCompletionInterrupted,
+            ) as error:
+                if _pending_error_belongs_to(error, pending_owner):
+                    raise _handoff_pending_resources(pending_owner, error)
+                raise
         return
     if registrations is not None:
         raise TransferEngineError(
@@ -452,43 +546,37 @@ def registered_sources(
         resources=resources,
         lifetime_tokens=lifetime_tokens,
     )
-    primary_error: Optional[BaseException] = None
-    try:
-        yield
-    except BaseException as error:
-        primary_error = error
-
-    if isinstance(
-        primary_error,
-        (
-            TransferCompletionUnknownError,
-            _PendingCompletionWaitInterrupted,
-        ),
-    ):
-        raise _handoff_pending_resources(
-            pending_owner,
-            primary_error,
-            registrations=owned,
-            resources=resources,
-            lifetime_tokens=lifetime_tokens,
-        )
-
-    _unregister_owned_allocations(
-        engine,
+    with _registration_frame(
         pending_owner,
-        owned,
-        label="source",
-        primary_error=primary_error,
-        body_entered=True,
+        registrations=owned,
         resources=resources,
         lifetime_tokens=lifetime_tokens,
-    )
-    if primary_error is not None:
-        raise primary_error
+    ) as frame:
+        primary_error: Optional[BaseException] = None
+        try:
+            yield
+        except BaseException as error:
+            primary_error = error
 
+        if primary_error is not None and _pending_error_belongs_to(
+            primary_error,
+            pending_owner,
+        ):
+            raise _handoff_pending_resources(pending_owner, primary_error)
 
-# Preserve the weight TE public name while exposing a resource-neutral name.
-MemoryRegistrationLease = BufferRegistrationLease
+        if not frame.handed_off:
+            _unregister_owned_allocations(
+                engine,
+                pending_owner,
+                owned,
+                label="source",
+                primary_error=primary_error,
+                body_entered=True,
+                resources=resources,
+                lifetime_tokens=lifetime_tokens,
+            )
+        if primary_error is not None:
+            raise primary_error
 
 
 @contextmanager
@@ -502,19 +590,21 @@ def registered_targets(
     lifetime_tokens: Optional[AllocationTokenSet] = None,
 ) -> Generator[None, None, None]:
     if pre_registered:
-        try:
-            yield
-        except (
-            TransferCompletionUnknownError,
-            _PendingCompletionWaitInterrupted,
-        ) as error:
-            raise _handoff_pending_resources(
-                pending_owner,
-                error,
-                registrations=(),
-                resources=resources,
-                lifetime_tokens=lifetime_tokens,
-            )
+        with _registration_frame(
+            pending_owner,
+            registrations=(),
+            resources=resources,
+            lifetime_tokens=lifetime_tokens,
+        ):
+            try:
+                yield
+            except (
+                TransferCompletionUnknownError,
+                TransferCompletionInterrupted,
+            ) as error:
+                if _pending_error_belongs_to(error, pending_owner):
+                    raise _handoff_pending_resources(pending_owner, error)
+                raise
         return
 
     sizes_by_address = _registered_allocations(fragments, "target")
@@ -526,39 +616,37 @@ def registered_targets(
         resources=resources,
         lifetime_tokens=lifetime_tokens,
     )
-    primary_error: Optional[BaseException] = None
-    try:
-        yield
-    except BaseException as error:
-        primary_error = error
-
-    if isinstance(
-        primary_error,
-        (
-            TransferCompletionUnknownError,
-            _PendingCompletionWaitInterrupted,
-        ),
-    ):
-        raise _handoff_pending_resources(
-            pending_owner,
-            primary_error,
-            registrations=owned,
-            resources=resources,
-            lifetime_tokens=lifetime_tokens,
-        )
-
-    _unregister_owned_allocations(
-        engine,
+    with _registration_frame(
         pending_owner,
-        owned,
-        label="target",
-        primary_error=primary_error,
-        body_entered=True,
+        registrations=owned,
         resources=resources,
         lifetime_tokens=lifetime_tokens,
-    )
-    if primary_error is not None:
-        raise primary_error
+    ) as frame:
+        primary_error: Optional[BaseException] = None
+        try:
+            yield
+        except BaseException as error:
+            primary_error = error
+
+        if primary_error is not None and _pending_error_belongs_to(
+            primary_error,
+            pending_owner,
+        ):
+            raise _handoff_pending_resources(pending_owner, primary_error)
+
+        if not frame.handed_off:
+            _unregister_owned_allocations(
+                engine,
+                pending_owner,
+                owned,
+                label="target",
+                primary_error=primary_error,
+                body_entered=True,
+                resources=resources,
+                lifetime_tokens=lifetime_tokens,
+            )
+        if primary_error is not None:
+            raise primary_error
 
 
 def _registered_allocations(

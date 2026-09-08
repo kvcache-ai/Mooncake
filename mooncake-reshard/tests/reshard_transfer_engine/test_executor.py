@@ -8,8 +8,10 @@ from mooncake.reshard.transfer_engine import (
     TransferBatch,
     TransferBatchRange,
     TransferDirection,
+    TransferCompletionInterrupted,
     TransferCompletionUnknownError,
     TransferEngineError,
+    TransferSubmission,
     TerminalTransferState,
 )
 
@@ -110,6 +112,36 @@ def test_resource_neutral_executor_supports_ticket_capable_binding() -> None:
     assert read.endpoint == write.endpoint == "worker-1:12345"
 
 
+def test_submission_executes_multiple_batches_and_closes_its_handle() -> None:
+    engine = TicketEngine()
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    with executor.submission() as submission:
+        read = submission.execute_batch(batch(), TransferDirection.READ)
+        write = submission.execute_batch(batch(), TransferDirection.WRITE)
+
+    assert read.operation_count == write.operation_count == 2
+    assert [call[0] for call in engine.calls] == ["read", "write"]
+    with pytest.raises(TransferEngineError, match="no longer active"):
+        submission.execute_batch(batch(), TransferDirection.READ)
+
+
+def test_transfer_submission_cannot_be_constructed_outside_executor_reservation() -> (
+    None
+):
+    engine = TicketEngine()
+    owner = MooncakeTransferEngineExecutor(engine)
+    peer = MooncakeTransferEngineExecutor(engine)
+
+    with owner.submission():
+        with pytest.raises(TransferEngineError, match="must be created"):
+            TransferSubmission(peer)
+        with pytest.raises(TypeError):
+            TransferSubmission(peer, object())
+
+    assert engine.calls == []
+
+
 def test_transfer_batch_rejects_mismatched_or_invalid_ranges() -> None:
     for values in (
         {"source_addresses": (0x1000,), "target_addresses": (), "sizes": (1,)},
@@ -124,6 +156,21 @@ def test_transfer_batch_rejects_mismatched_or_invalid_ranges() -> None:
         except ValueError:
             continue
         raise AssertionError("invalid transfer batch was accepted")
+
+
+@pytest.mark.parametrize("address_field", ["source_addresses", "target_addresses"])
+def test_transfer_batch_rejects_flat_address_range_overflow(
+    address_field: str,
+) -> None:
+    values = {
+        "source_addresses": (0x1000,),
+        "target_addresses": (0x2000,),
+        "sizes": (2,),
+    }
+    values[address_field] = ((1 << 64) - 1,)
+
+    with pytest.raises(ValueError, match="address range overflows"):
+        TransferBatch(endpoint="worker-1:12345", **values)
 
 
 def test_transfer_batch_ranges_preserve_allocation_bounds_and_flattening() -> None:
@@ -222,6 +269,107 @@ class UnknownTicket:
         return self.status
 
 
+def test_submission_rejects_reuse_after_completion_becomes_unknown() -> None:
+    ticket = UnknownTicket()
+    engine = TicketEngine()
+    calls = 0
+
+    def return_unknown_ticket(*arguments):
+        nonlocal calls
+        calls += 1
+        return ticket
+
+    engine.batch_transfer_sync_write_with_ticket = return_unknown_ticket
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    with executor.submission() as submission:
+        with pytest.raises(TransferCompletionUnknownError) as raised:
+            submission.execute_batch(batch(), TransferDirection.WRITE)
+        with pytest.raises(TransferEngineError, match="completion is unresolved"):
+            submission.execute_batch(batch(), TransferDirection.WRITE)
+
+    assert calls == 1
+    executor.retain_pending_resources(
+        raised.value.pending_transfer_id,
+        registrations=(),
+        resources=(ticket,),
+    )
+    ticket.status = "COMPLETED"
+    assert (
+        executor.drain_pending_transfer(raised.value.pending_transfer_id) == "COMPLETED"
+    )
+
+
+class InterruptedTicket:
+    status = "COMPLETION_UNKNOWN"
+
+    def __init__(self, interruption: BaseException) -> None:
+        self._interrupt = True
+        self._interruption = interruption
+
+    def drain(self, timeout_ms: int) -> str:
+        if self._interrupt:
+            self._interrupt = False
+            raise self._interruption
+        self.status = "COMPLETED"
+        return self.status
+
+
+@pytest.mark.parametrize(
+    "interruption",
+    (KeyboardInterrupt("completion wait interrupted"), SystemExit(2)),
+)
+def test_public_execute_batch_exposes_public_interruption(
+    interruption: BaseException,
+) -> None:
+    ticket = InterruptedTicket(interruption)
+    engine = TicketEngine()
+    engine.batch_transfer_sync_write_with_ticket = lambda *arguments: ticket
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    with pytest.raises(TransferCompletionInterrupted) as raised:
+        executor.execute_batch(batch(), TransferDirection.WRITE)
+
+    pending_transfer_id = raised.value.pending_transfer_id
+    executor.retain_pending_resources(
+        pending_transfer_id,
+        registrations=(),
+        resources=(ticket,),
+    )
+    assert executor.drain_pending_transfer(pending_transfer_id) == "COMPLETED"
+    assert raised.value.interruption is interruption
+
+
+def test_submission_rejects_reuse_after_completion_wait_is_interrupted() -> None:
+    ticket = InterruptedTicket(KeyboardInterrupt("completion wait interrupted"))
+    engine = TicketEngine()
+    calls = 0
+
+    def return_interrupted_ticket(*arguments):
+        nonlocal calls
+        calls += 1
+        return ticket
+
+    engine.batch_transfer_sync_write_with_ticket = return_interrupted_ticket
+    executor = MooncakeTransferEngineExecutor(engine)
+
+    with executor.submission() as submission:
+        with pytest.raises(TransferCompletionInterrupted) as raised:
+            submission.execute_batch(batch(), TransferDirection.WRITE)
+        with pytest.raises(TransferEngineError, match="completion is unresolved"):
+            submission.execute_batch(batch(), TransferDirection.WRITE)
+
+    assert calls == 1
+    executor.retain_pending_resources(
+        raised.value.pending_transfer_id,
+        registrations=(),
+        resources=(ticket,),
+    )
+    assert (
+        executor.drain_pending_transfer(raised.value.pending_transfer_id) == "COMPLETED"
+    )
+
+
 def test_scatter_unknown_ticket_is_retained_until_later_drain() -> None:
     ticket = UnknownTicket()
     engine = ScatterTicketEngine()
@@ -310,3 +458,66 @@ def test_pending_engine_fence_is_shared_across_resource_executors() -> None:
     )
     assert kv.execute_batch(batch(), TransferDirection.WRITE).operation_count == 2
 
+
+class ReleaseToken:
+    def __init__(
+        self,
+        token_id: str,
+        *,
+        fail_first: bool = False,
+        reject_second: bool = False,
+    ) -> None:
+        self.calls = 0
+        self.fail_first = fail_first
+        self.reject_second = reject_second
+        self._fence = AllocationFence(
+            resource_id="resource",
+            revision="revision",
+            placement_id="placement",
+            placement_digest="placement-digest",
+            instance_id="instance",
+            participant_id="participant",
+            runtime_lease_id="lease",
+            runtime_generation=1,
+            binding_digest="binding-digest",
+            fragment_ids=("runtime-0",),
+            token_id=token_id,
+        )
+
+    @property
+    def fence(self) -> AllocationFence:
+        return self._fence
+
+    def release_after_terminal(self, terminal_state: TerminalTransferState) -> None:
+        assert terminal_state is TerminalTransferState.COMPLETED
+        self.calls += 1
+        if self.fail_first and self.calls == 1:
+            raise RuntimeError("transient release failure")
+        if self.reject_second and self.calls > 1:
+            raise RuntimeError("token released twice")
+
+
+def test_partial_token_release_failure_never_replays_completed_token() -> None:
+    executor = MooncakeTransferEngineExecutor(TicketEngine())
+    transient = ReleaseToken("transient", fail_first=True)
+    completed = ReleaseToken("completed", reject_second=True)
+    pending_transfer_id = executor.retain_pending_registration_cleanup(
+        terminal_state=TerminalTransferState.COMPLETED,
+        registrations=(),
+        resources=(),
+        allocation_tokens=(transient, completed),
+    )
+
+    with pytest.raises(TransferEngineError, match="restart required"):
+        executor.drain_pending_transfer(pending_transfer_id)
+
+    assert transient.calls == 1
+    assert completed.calls == 1
+    assert executor.pending_transfer_status(pending_transfer_id) == (
+        "COMPLETION_UNKNOWN_RESTART_REQUIRED"
+    )
+    assert executor.drain_pending_transfer(pending_transfer_id) == (
+        "COMPLETION_UNKNOWN"
+    )
+    assert transient.calls == 1
+    assert completed.calls == 1
