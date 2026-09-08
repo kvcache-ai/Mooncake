@@ -26,7 +26,6 @@
 #include <cstdlib>
 #include <future>
 #include <limits>
-#include <set>
 #include <sstream>
 
 #include "tent/common/status.h"
@@ -35,6 +34,7 @@
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/workers.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 #include "tent/common/utils/random.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -52,6 +52,8 @@ namespace mooncake {
 namespace tent {
 
 namespace {
+
+constexpr uint64_t kDefaultRdmaQuiesceTimeoutNs = 10000000000ull;
 
 uint16_t getRdmaBindDefaultPort(const Config& config) {
     constexpr const char* kKey = "rpc_server_port";
@@ -377,12 +379,37 @@ Status RdmaTransport::install(std::string& local_segment_name,
     return Status::OK();
 }
 
+Status RdmaTransport::quiesce() {
+    uint64_t timeout_ns = kDefaultRdmaQuiesceTimeoutNs;
+    if (conf_) {
+        timeout_ns = conf_->get("transports/rdma/max_timeout_ns", timeout_ns);
+    }
+    Status drain = Status::OK();
+    if (workers_) {
+        drain = workers_->quiesce(timeout_ns);
+        if (!drain.ok()) {
+            LOG(ERROR) << "RDMA workers quiesce failed: " << drain.ToString();
+        }
+    }
+    const Status sync =
+        Platform::getLoader().synchronizeDevices(local_topology_.get());
+    if (!sync.ok()) {
+        LOG(WARNING) << "RDMA dest-GPU sync during quiesce failed: "
+                     << sync.ToString();
+    }
+    return drain;
+}
+
 Status RdmaTransport::uninstall() {
     // ControlService may still receive BootstrapRdma RPCs while uninstall is
     // running. Unregister and drain the callback before destroying workers,
     // contexts, and other state used by onSetupRdmaConnections(). Keep this
     // outside installed_ so partially-installed transports are covered too.
     if (metadata_) metadata_->setBootstrapRdmaCallback(nullptr);
+
+    // Drain CQ and dest-GPU visibility while MRs and QPs are still alive.
+    // Idempotent when deconstruct() already called quiesce().
+    (void)quiesce();
 
     if (installed_) {
         // Stop notification worker thread
@@ -493,7 +520,6 @@ Status RdmaTransport::submitTransferTasks(
             (request.length + num_slices - 1) / num_slices, default_block_size);
 
         std::vector<int> slice_dev_ids;
-        std::vector<uint64_t> slice_charged_bytes;
         // Only if a single request is enough, we perform aggregated allocation
         if (num_slices >= max_slice_count / 2) {
             std::string source_location = kWildcardLocation;
@@ -507,7 +533,7 @@ Status RdmaTransport::submitTransferTasks(
                 auto status = device_selector->allocate(
                     request.length, static_cast<uint32_t>(num_slices),
                     block_size, source_location, slice_dev_ids,
-                    request.priority, batch->device_mask, &slice_charged_bytes);
+                    request.priority, batch->device_mask);
                 if (!status.ok() || slice_dev_ids.empty()) {
                     LOG(WARNING) << "Device quota allocation failed: "
                                  << status.message();
@@ -526,7 +552,9 @@ Status RdmaTransport::submitTransferTasks(
             slice->task = task;
             slice->retry_count = 0;
             slice->last_fallback_idx = -1;
-            slice->quota_charged = false;
+            slice->charged_dev = -1;
+            slice->posted_dev = -1;
+            slice->counted_lane = -1;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
             slice->next = nullptr;
@@ -536,14 +564,7 @@ Status RdmaTransport::submitTransferTasks(
             task->ref();  // Each slice holds a reference to the task
             if (slice_idx < slice_dev_ids.size()) {
                 slice->source_dev_id = slice_dev_ids[slice_idx];
-                slice->quota_charged = true;
-                slice->charged_dev_id = slice->source_dev_id;
-                // Remember the exact bytes charged so release is symmetric even
-                // when this slice's real length differs from the allocator's
-                // per-slice estimate.
-                slice->charged_bytes = slice_idx < slice_charged_bytes.size()
-                                           ? slice_charged_bytes[slice_idx]
-                                           : slice->length;
+                slice->charged_dev = slice->source_dev_id;
             }
             offset += length;
             int part_id = next_worker_idx % num_workers;
@@ -954,7 +975,11 @@ double RdmaTransport::getEstimatedBandwidth() const {
     if (!workers_) return -1.0;
     auto* sel = workers_->getDeviceSelector();
     if (!sel) return -1.0;
-    return sel->getAggregateEwmaBandwidth();
+    // The transmit estimate, not the selection EWMA: the admission queue
+    // asks "how fast do bytes move once they are sent", and adds the wait
+    // behind earlier work itself (DeadlineMlu's bytes_ahead), so the rate
+    // must not fold that wait in the way the selection sample does.
+    return sel->getAggregateTransmitBandwidth();
 }
 
 }  // namespace tent

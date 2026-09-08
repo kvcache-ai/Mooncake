@@ -25,6 +25,26 @@ namespace mooncake {
 namespace tent {
 namespace {
 
+TEST(TargetMetricsTest, NonConstantPayloadOnlyForHpTcpConsistencyChecks) {
+    const auto saved_transport = XferBenchConfig::xport_type;
+    const bool saved_check = XferBenchConfig::check_consistency;
+    std::vector<uint8_t> data(4096);
+    for (const auto* transport : {"hp_tcp", "tcp"}) {
+        XferBenchConfig::xport_type = transport;
+        for (bool check : {false, true}) {
+            XferBenchConfig::check_consistency = check;
+            fillData(data.data(), data.size(), 37);
+            const bool constant = std::all_of(
+                data.begin(), data.end(), [](uint8_t b) { return b == 37; });
+            EXPECT_EQ(constant,
+                      !(check && XferBenchConfig::xport_type == "hp_tcp"));
+            verifyData(data.data(), data.size(), 37);
+        }
+    }
+    XferBenchConfig::xport_type = saved_transport;
+    XferBenchConfig::check_consistency = saved_check;
+}
+
 TEST(TargetMetricsTest, ReportsEachTargetAndWritesJsonl) {
     std::vector<TargetBenchStats> stats(2);
     stats[0].segment_name = "target-a";

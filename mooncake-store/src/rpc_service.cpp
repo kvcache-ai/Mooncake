@@ -93,6 +93,15 @@ WrappedMasterService::WrappedMasterService(
 
 WrappedMasterService::~WrappedMasterService() = default;
 
+void WrappedMasterService::SetBatchOpLogTerminalCallback(
+    OrderedOpLogWriter::TerminalCallback callback) {
+    master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
+}
+
+void WrappedMasterService::StopBatchOpLogWriter() {
+    master_service_.StopBatchOpLogWriter();
+}
+
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
     return MasterMetricManager::instance().calculate_cache_stats();
@@ -1727,6 +1736,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbySegmentInfo>& segments) {
     return master_service_.RestoreFromStandbySnapshot(
         objects, initial_oplog_sequence_id, segments);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::RestoreFromBatchOpLogPromotion(
+    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(std::move(handoff),
+                                                          chunk_object_count);
 }
 
 void RegisterRpcService(

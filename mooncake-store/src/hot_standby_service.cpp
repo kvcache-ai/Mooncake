@@ -83,9 +83,13 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     if (verification_thread_.joinable()) {
         verification_thread_.join();
     }
+    if (!metadata_store_) {
+        metadata_store_ = std::make_unique<StandbyMetadataStore>();
+    }
     batch_standby_reader_.reset();
     batch_standby_kv_backend_.reset();
     batch_snapshot_baseline_.reset();
+    batch_snapshot_producer_view_version_ = 0;
     {
         std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
         last_applied_batch_snapshot_prefix_.reset();
@@ -283,6 +287,7 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     batch_snapshot_baseline_ =
         DurablePrefix{.batch_id = restored->last_applied_batch_id,
                       .last_seq = restored->last_applied_seq};
+    batch_snapshot_producer_view_version_ = restored->producer_view_version;
     applied_seq_id_.store(baseline_seq_id, std::memory_order_release);
     primary_seq_id_.store(baseline_seq_id, std::memory_order_release);
     return ErrorCode::OK;
@@ -495,7 +500,7 @@ bool HotStandbyService::IsReadyForPromotion() const {
             << "will be synced after promotion.";
     }
 
-    // NOTE: unresolved-gap check is deferred to PromoteLockedInternal, which
+    // NOTE: unresolved-gap check is deferred to PreparePromotionLocked, which
     // runs gap resolution + final catch-up first and only rejects promotion
     // when gaps remain after both attempts. Checking here would return a
     // misleading UNAVAILABLE_IN_CURRENT_STATUS before gap resolution runs.
@@ -532,29 +537,38 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             cluster_id_, backend, *oplog_applier_);
         reader = local_reader.get();
     }
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     const auto initial_retry_delay =
         std::chrono::milliseconds(std::max(config_.oplog_poll_interval_ms, 1));
     const auto max_retry_delay =
         std::max(initial_retry_delay, std::chrono::milliseconds(1000));
+    const auto no_progress_timeout =
+        std::chrono::seconds(config_.batch_oplog_retry_timeout_sec);
+    auto last_progress = std::chrono::steady_clock::now();
     auto retry_delay = initial_retry_delay;
     auto wait_to_retry = [&] {
         const auto now = std::chrono::steady_clock::now();
-        if (now >= deadline) {
+        if (now - last_progress >= no_progress_timeout) {
             return false;
         }
         std::this_thread::sleep_for(std::min(
             retry_delay, std::chrono::duration_cast<std::chrono::milliseconds>(
-                             deadline - now)));
+                             no_progress_timeout - (now - last_progress))));
         retry_delay = std::min(retry_delay * 2, max_retry_delay);
         return true;
     };
     for (;;) {
-        if (std::chrono::steady_clock::now() >= deadline) {
-            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
-        }
+        const uint64_t expected_before =
+            oplog_applier_->GetExpectedSequenceId();
+        const auto cursor_before = reader->GetLastAppliedDurablePrefix();
         auto result = reader->PollOnce();
+        const uint64_t expected_after = oplog_applier_->GetExpectedSequenceId();
+        const auto cursor_after = reader->GetLastAppliedDurablePrefix();
+        const bool made_progress =
+            expected_after > expected_before || cursor_after != cursor_before;
+        if (made_progress) {
+            last_progress = std::chrono::steady_clock::now();
+            retry_delay = initial_retry_delay;
+        }
         if (result.error != ErrorCode::OK) {
             if (result.disposition !=
                     OpLogBatchStandbyPollDisposition::RETRYABLE ||
@@ -563,7 +577,6 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             }
             continue;
         }
-        retry_delay = initial_retry_delay;
         if (!result.durable_prefix_present) {
             return GetLocalLastAppliedSequenceIdLocked() == 0
                        ? ErrorCode::OK
@@ -572,6 +585,9 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         if (GetLocalLastAppliedSequenceIdLocked() >=
             result.durable_prefix.last_seq) {
             return ErrorCode::OK;
+        }
+        if (!made_progress && !wait_to_retry()) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
         }
     }
 }
@@ -600,7 +616,11 @@ ErrorCode HotStandbyService::Promote() {
               << " entries"
               << ", state: " << StandbyStateToString(GetState());
 
-    auto internal_err = PromoteLockedInternal(current_applied_seq_id);
+    auto internal_err = PreparePromotionLocked(current_applied_seq_id);
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
+    }
+    internal_err = CompletePromotionLocked();
     if (internal_err != ErrorCode::OK) {
         return internal_err;
     }
@@ -617,7 +637,7 @@ ErrorCode HotStandbyService::Promote() {
     return ErrorCode::OK;
 }
 
-ErrorCode HotStandbyService::PromoteLockedInternal(
+ErrorCode HotStandbyService::PreparePromotionLocked(
     uint64_t current_applied_seq_id) {
     NotifySnapshotPromotion();
     StopReplicationLoop();
@@ -632,10 +652,15 @@ ErrorCode HotStandbyService::PromoteLockedInternal(
     applied_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
     primary_seq_id_.store(latest_applied_seq_id, std::memory_order_release);
 
+    return ErrorCode::OK;
+}
+
+ErrorCode HotStandbyService::CompletePromotionLocked() {
     auto promotion_success =
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_SUCCESS);
     if (!promotion_success.allowed) {
         LOG(ERROR) << "Cannot finish promotion: " << promotion_success.reason;
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
@@ -665,7 +690,11 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
               << " entries"
               << ", state: " << StandbyStateToString(GetState());
 
-    auto internal_err = PromoteLockedInternal(current_applied_seq_id);
+    auto internal_err = PreparePromotionLocked(current_applied_seq_id);
+    if (internal_err != ErrorCode::OK) {
+        return internal_err;
+    }
+    internal_err = CompletePromotionLocked();
     if (internal_err != ErrorCode::OK) {
         return internal_err;
     }
@@ -694,6 +723,85 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
         LOG(INFO) << "Standby promoted to Primary from snapshot baseline.";
     }
     return ErrorCode::OK;
+}
+
+bool HotStandbyService::IsBatchOpLogSnapshotMode() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_.enable_oplog_following &&
+           batch_oplog_snapshot_provider_ != nullptr &&
+           batch_standby_reader_ != nullptr;
+}
+
+tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
+HotStandbyService::PromoteAndDetachBatchOpLogStore() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    if (!batch_oplog_snapshot_provider_ || !config_.enable_oplog_following ||
+        !batch_standby_reader_) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (!IsReadyForPromotion()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto transition = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
+    if (!transition.allowed) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    const uint64_t current_applied_seq_id = GetSyncStatus().applied_seq_id;
+    ErrorCode err = PreparePromotionLocked(current_applied_seq_id);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    const uint64_t latest_applied_seq_id =
+        GetLocalLastAppliedSequenceIdLocked();
+    auto applied_cursor =
+        batch_standby_reader_
+            ? batch_standby_reader_->GetLastAppliedDurablePrefix()
+            : std::nullopt;
+    if (!applied_cursor && latest_applied_seq_id == 0 && metadata_store_ &&
+        metadata_store_->GetKeyCount() == 0) {
+        applied_cursor = DurablePrefix{};
+    }
+    if (!metadata_store_ || !applied_cursor ||
+        applied_cursor->last_seq != latest_applied_seq_id) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+    }
+
+    ReplicaID max_replica_id = 0;
+    if (!metadata_store_->ValidateReplicaIds(max_replica_id)) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ViewVersionId producer_view_version = batch_snapshot_producer_view_version_;
+    ViewVersionId current_producer_view = 0;
+    if (batch_standby_reader_->ReadProducerView(current_producer_view) ==
+        ErrorCode::OK) {
+        producer_view_version = current_producer_view;
+    }
+
+    auto segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    err = CompletePromotionLocked();
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+
+    BatchOpLogPromotionHandoff handoff{
+        .metadata_store = std::move(metadata_store_),
+        .segments = std::move(segments),
+        .applied_cursor = *applied_cursor,
+        .producer_view_version = producer_view_version,
+        .max_replica_id = max_replica_id,
+    };
+    batch_standby_reader_.reset();
+    oplog_applier_.reset();
+
+    lock.unlock();
+    Stop();
+    return handoff;
 }
 
 size_t HotStandbyService::GetMetadataCount() const {
