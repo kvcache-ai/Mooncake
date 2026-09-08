@@ -1,9 +1,8 @@
 #pragma once
 
-// The object replica list: container logic for the set of replicas attached to
-// one object (add / pop / erase / visit / query), extracted from
-// ObjectMetadata so it lives in one focused, independently testable place.
-// ObjectMetadata owns one and forwards its replica API to it.
+// The object replica list: add / pop / erase / visit / query over the set of
+// replicas attached to one object. ObjectMetadata owns one and forwards its
+// replica API to it.
 
 #include <algorithm>
 #include <functional>

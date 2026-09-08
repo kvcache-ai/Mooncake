@@ -1,12 +1,8 @@
 #pragma once
 
-// Shared per-object runtime task types. These are tenant- and object-scoped
-// bookkeeping structs that both MasterService and the tenant module
-// (mooncake::tenant::ObjectEntry) need to reference. They are deliberately
-// lifted out of MasterService so the tenant module can stay independent of
-// MasterService internals.
-//
-// Each struct is a small per-key state record, not a container.
+// Shared per-object runtime task types: tenant/object-scoped bookkeeping
+// records referenced by both MasterService and mooncake::tenant::ObjectEntry.
+// Each is a small per-key state record, not a container.
 
 #include <chrono>
 #include <cstdint>

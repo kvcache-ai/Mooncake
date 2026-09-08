@@ -94,14 +94,11 @@ class GroupIndex {
     std::unordered_map<std::string, GroupState> groups_;
 };
 
-// The per-tenant ObjectIndex: the primary hash-map index
-// (object key -> strong ObjectEntry handle) plus the GroupIndex (group_id ->
-// shared Lease + member keys) and the in-flight dynamic-replication lease
-// table. MasterService owns this through the TenantCatalog aggregate; the
-// group TTL is single-source (one Lease per group, extended on any member's
-// read), so eviction can treat the whole group as all-or-none by inspecting
-// just the shared lease. Splitting the indexes into their own classes is a
-// documented follow-up.
+// The per-tenant ObjectIndex: the primary hash map (object key -> strong
+// ObjectEntry handle) plus the GroupIndex and the in-flight dynamic-
+// replication lease table. The group TTL is single-source (one Lease per
+// group, extended on any member's read), so eviction treats a whole group as
+// all-or-none by inspecting just the shared lease.
 class ObjectIndex {
    public:
     ObjectIndex() = default;

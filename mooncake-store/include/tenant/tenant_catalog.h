@@ -1,9 +1,7 @@
 #pragma once
 
-// TenantCatalog: the per-tenant aggregate inside the MetadataCatalog. It owns
-// the ObjectIndex for this tenant plus tenant-scoped bookkeeping (quota
-// handle, LOCAL_DISK replica census). Business policy stays in MasterService;
-// this type is pure state + thin pass-through views over the ObjectIndex.
+// TenantCatalog: the per-tenant aggregate inside the MetadataCatalog —
+// the tenant's ObjectIndex plus quota and eviction-census bookkeeping.
 
 #include <atomic>
 #include <memory>

@@ -1,13 +1,11 @@
 #pragma once
 
-// Shared object metadata envelope. This is the cache/data envelope that today
-// lives nested inside MasterService. It is lifted out so the tenant module
-// (mooncake::tenant::ObjectEntry) can hold real metadata without depending on
-// MasterService internals.
+// Shared object metadata envelope: identity, replica set, lease and soft-pin
+// state for one object. Owned through a pointer by the tenant module
+// (mooncake::tenant::ObjectEntry).
 //
-// ObjectMetadata is deliberately NON-copyable / NON-movable and self-locking
-// (holds a SpinLock). Callers must own it through a pointer
-// (e.g. unique_ptr<ObjectMetadata>), never by value in a resizing container.
+// NON-copyable / NON-movable and self-locking (holds a SpinLock); always own
+// it through a pointer (e.g. unique_ptr<ObjectMetadata>), never by value.
 
 #include <algorithm>
 #include <chrono>

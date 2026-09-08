@@ -2,9 +2,8 @@
 
 // ObjectEntry: the per-object runtime shell. The ObjectMetadata envelope is
 // the single source of identity (user_key, group_id) and group-lease wiring;
-// the entry adds only the per-key task state and the per-object mutation
-// boundary. Previously this state lived as N separate MasterService
-// TenantCatalog maps keyed by the same string.
+// the entry adds the per-key task state and the per-object mutation
+// boundary.
 
 #include <chrono>
 #include <memory>
@@ -44,12 +43,11 @@ class ObjectEntry {
     // later replacement of the same key; see ObjectIndex::IsCurrent.
     uint64_t generation() const { return generation_; }
 
-    // Per-key runtime task state. By convention at most one in-flight task
-    // (replication / offload / promotion / dynamic-replication pending) is
-    // wired per entry; the transitions are driven by MasterService.
+    // Per-key task state; at most one in-flight task per entry, driven by
+    // MasterService. Guarded by `mutex`.
     bool is_processing{false};
-    // Set under `mutex` by EraseMetadata so a second eraser that pinned the
-    // entry before the route erase bails out instead of double-releasing
+    // Teardown-once claim (set under `mutex` by EraseMetadata): a second
+    // eraser of the same entry bails out instead of double-releasing
     // refcounts, quota charges and KV removal events.
     bool is_torn_down{false};
     std::optional<ReplicationTask> replication_task;
@@ -59,13 +57,11 @@ class ObjectEntry {
     std::optional<DynamicReplicaPending> dynamic_replication_pending;
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
-    // Per-object mutation boundary: the narrowest lock a point operation may
-    // hold after pinning this entry. All locking goes through LockUnique/
-    // LockShared so the contract below has a single choke point. Compound
-    // operations may release the returned lock midway (this mutex and
-    // route_lock_ are never held together), which a closure API cannot
-    // express. Lock order: this mutex first, then ObjectMetadata's own
-    // SpinLock, never the reverse.
+    // Per-object mutation boundary; see the lock-order note below. The
+    // returned lock may be released and reacquired midway through a compound
+    // operation (this mutex and route_lock_ are never held together). Lock
+    // order: this mutex first, then ObjectMetadata's SpinLock, never the
+    // reverse.
     std::unique_lock<std::shared_mutex> LockUnique() const {
         return std::unique_lock<std::shared_mutex>(mutex);
     }
