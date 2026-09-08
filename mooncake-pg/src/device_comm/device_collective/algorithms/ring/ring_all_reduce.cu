@@ -78,9 +78,6 @@ struct DrainRingTransfers {
 
     __device__ __forceinline__ void operator()() const {
         if (plan->participant_count <= 1) return;
-        // Drain all transfer lanes for the two outgoing edges, including the
-        // lane used by startup. A two-rank Ring uses the same peer on both
-        // edges.
         const GlobalRank peers[] = {plan->predecessor.global_rank,
                                     plan->successor.global_rank};
         const uint32_t peer_count = peers[0] == peers[1] ? 1 : 2;
