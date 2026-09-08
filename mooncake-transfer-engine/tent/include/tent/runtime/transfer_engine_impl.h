@@ -64,8 +64,8 @@ void waitBeforeNextPoll(uint64_t poll_count);
 
 struct LogicalTransferRuntimePolicy {
     uint64_t config_generation{0};
-    int max_failover_attempts{3};
-    bool enable_auto_failover_on_poll{true};
+    int max_failover_attempts{kDefaultMaxFailoverAttempts};
+    bool enable_auto_failover_on_poll{kDefaultAutoFailoverOnPoll};
 };
 
 struct TaskInfo {
@@ -335,11 +335,16 @@ class TransferEngineImpl {
         }
     }
 
-    void publishRuntimeConfigForTest(
+    Status publishRuntimeConfigForTest(
         std::shared_ptr<const RuntimeConfigSnapshot> snapshot) {
+        if (!snapshot) {
+            return Status::InvalidArgument(
+                "Runtime config snapshot must not be null" LOC_MARK);
+        }
         std::atomic_store_explicit(&runtime_config_snapshot_,
                                    std::move(snapshot),
                                    std::memory_order_release);
+        return Status::OK();
     }
 
     // Test-only hook: how many batches are still alive. Lets a test assert

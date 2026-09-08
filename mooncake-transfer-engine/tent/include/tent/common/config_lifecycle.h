@@ -125,11 +125,14 @@ class RuntimeConfig final : public LifecycleConfigView {
                               ConfigLifecycle::kRuntimeCandidate) {}
 };
 
+inline constexpr int kDefaultMaxFailoverAttempts = 3;
+inline constexpr bool kDefaultAutoFailoverOnPoll = true;
+
 struct RuntimeConfigSnapshot {
     uint64_t generation{0};
     std::shared_ptr<const RuntimeConfig> config;
-    int max_failover_attempts{3};
-    bool enable_auto_failover_on_poll{true};
+    int max_failover_attempts{kDefaultMaxFailoverAttempts};
+    bool enable_auto_failover_on_poll{kDefaultAutoFailoverOnPoll};
 };
 
 struct TentConfigBundle {

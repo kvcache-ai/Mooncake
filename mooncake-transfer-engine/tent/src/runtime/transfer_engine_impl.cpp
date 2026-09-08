@@ -337,10 +337,11 @@ Status TransferEngineImpl::setupLocalSegment() {
 }
 
 Status TransferEngineImpl::construct() {
-    CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
+    // Publish the snapshot before any setup step can return an error.
     std::atomic_store_explicit(&runtime_config_snapshot_,
                                buildTentConfigBundle(*conf_).runtime,
                                std::memory_order_relaxed);
+    CHECK_STATUS(ParseHpTcpTransportConfig(*conf_, &hp_tcp_transport_config_));
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
 

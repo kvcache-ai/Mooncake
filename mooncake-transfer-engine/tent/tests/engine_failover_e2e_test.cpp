@@ -599,8 +599,13 @@ TEST_P(PinnedFailoverPolicyTest, PolicyIsPinnedAtSubmit) {
     // Change each field independently so one cannot mask the other.
     next_cfg->set("max_failover_attempts", GetParam() ? 1 : 0);
     next_cfg->set("enable_auto_failover_on_poll", !GetParam());
-    engine.publishRuntimeConfigForTest(
-        buildTentConfigBundle(*next_cfg, 1).runtime);
+    ASSERT_TRUE(engine
+                    .publishRuntimeConfigForTest(
+                        buildTentConfigBundle(*next_cfg, 1).runtime)
+                    .ok());
+    // Reject a null publication without replacing the active policy.
+    EXPECT_TRUE(
+        engine.publishRuntimeConfigForTest(nullptr).IsInvalidArgument());
 
     auto old_status = pollUntilDone(engine, old_generation.batch_id, 0);
     EXPECT_EQ(old_status.s, TransferStatusEnum::COMPLETED);
