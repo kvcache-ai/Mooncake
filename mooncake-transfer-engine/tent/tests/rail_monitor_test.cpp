@@ -389,6 +389,120 @@ TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
            "from the previous cycle.";
 }
 
+// ---------------------------------------------------------------------------
+// Defect A: a burst of failures within one error window must not escalate the
+// cooldown. Previously cooldown doubled on every markFailed call, so N error
+// WQEs in 10s pushed a 1s pause to the 300s cap, forcing a multi-minute
+// TCP fallback after the peer had already recovered. Now the cooldown is set
+// once when a fresh pause arms; errors arriving while already paused are
+// no-ops.
+//
+// error_threshold=1, cooldown=1s, probe_interval disabled (60s). 8 rapid
+// markFailed calls must arm resume_time at now+1s, not now+256s.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorBurstTest, BurstFailuresDoNotEscalateCooldown) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);  // disable probing
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    // A burst of 8 failures within the error window. With the old per-error
+    // doubling, cooldown would be 1->2->4->...->256s (capped 300). With the
+    // fix, only the first failure arms the pause at +1s; the rest are no-ops.
+    for (int i = 0; i < 8; ++i) rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+
+    // 1.5s > 1s initial cooldown, far below any escalated value. If the burst
+    // had escalated, the rail would still be paused here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    EXPECT_TRUE(rail.available(0, 0))
+        << "A single failure burst must not escalate the cooldown past the "
+           "initial 1s; staying paused past 1.5s indicates per-error doubling.";
+}
+
+// ---------------------------------------------------------------------------
+// Defect A (cross-cycle): cooldown-expiry RETAINS the cooldown so a rail that
+// fails again right after expiry backs off harder. (cooldown is reset to 0
+// only by markRecovered, a proven-healthy recovery.) This is the escalation
+// path that the old "reset cooldown on expiry" behavior collapsed.
+//
+// error_threshold=1, cooldown=1s, probe disabled. Cycle 1: pause 1s, expire.
+// Cycle 2: re-fail must escalate to 2s.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorEscalationTest, ExpiryRetainsCooldownForNextCycle) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);  // disable probing
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    // Cycle 1: single failure arms a 1s pause.
+    rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(rail.available(0, 0)) << "Cycle 1 cooldown (1s) must expire";
+
+    // Cycle 2: fail again. Expiry retained cooldown=1s (not proven healthy),
+    // so markFailed escalates 1->2s.
+    rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(rail.available(0, 0))
+        << "Cycle 2 must use the escalated 2s cooldown; 1.1s is not enough.";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1400));
+    EXPECT_TRUE(rail.available(0, 0))
+        << "Cycle 2 (2s) must expire by ~2.5s.";
+}
+
+// ---------------------------------------------------------------------------
+// Defect B: while a rail is paused, available() admits one transfer every
+// probe_interval as a recovery probe. A probe that succeeds (simulated via
+// markRecovered) un-pauses early, instead of waiting out the full cooldown.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorProbeTest, ProbeAdmitsTransferDuringCooldown) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 10);     // long cooldown
+    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 1);
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    rail.markFailed(0, 0);
+    // Immediately: probe throttled (last_probe_time armed to now on pause).
+    EXPECT_FALSE(rail.available(0, 0));
+
+    // After one probe_interval, available() admits a probe transfer.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_TRUE(rail.available(0, 0))
+        << "Probe must fire after probe_interval to test peer recovery.";
+
+    // The probe slice succeeds (simulated): markRecovered clears the pause
+    // well before the 10s cooldown would have elapsed.
+    rail.markRecovered(0, 0);
+    EXPECT_TRUE(rail.available(0, 0));
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

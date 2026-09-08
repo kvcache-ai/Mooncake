@@ -41,6 +41,8 @@ class RailMonitor {
         "transports/rdma/rail_error_window_secs";
     static constexpr const char *kCfgCooldownSecs =
         "transports/rdma/rail_cooldown_secs";
+    static constexpr const char *kCfgProbeIntervalSecs =
+        "transports/rdma/rail_probe_interval_secs";
 
    public:
     RailMonitor() = default;
@@ -103,6 +105,9 @@ class RailMonitor {
         std::chrono::seconds cooldown{0};
         std::chrono::steady_clock::time_point last_error{};
         std::chrono::steady_clock::time_point resume_time{};
+        // Last time available() let a transfer through as a recovery probe
+        // while the rail was paused. Throttles the probe rate.
+        std::chrono::steady_clock::time_point last_probe_time{};
 
         // Derived: a rail is paused iff a resume_time has been armed.
         bool paused() const {
@@ -117,6 +122,7 @@ class RailMonitor {
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};
     std::chrono::seconds cooldown_{30};
+    std::chrono::seconds probe_interval_{1};
 };
 
 }  // namespace tent

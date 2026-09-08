@@ -538,8 +538,11 @@ void Workers::asyncPostSend() {
             }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
-                LOG(ERROR) << "Failed to generate post path for slice " << slice
-                           << ": " << status.ToString();
+                VLOG(1) << "Failed to generate post path for slice " << slice
+                        << ": " << status.ToString();
+                LOG_EVERY_N(ERROR, 10000)
+                    << "Failed to generate post path for slice " << slice
+                    << ": " << status.ToString();
                 releaseSliceQuota(device_selector_.get(), slice);
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
