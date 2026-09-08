@@ -175,8 +175,7 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task);
 // inline AND the submit-loop epilogue did the same, leaving every
 // alternate task without a termination path.
 static inline void FinalizeSubmittedTask(mooncake::SpdkNofTask* task,
-                                         mooncake::SpdkNofQos* qos,
-                                         int op) {
+                                         mooncake::SpdkNofQos* qos, int op) {
     int rem = task->remaining_lba.load(std::memory_order_acquire);
     // remaining_lba > 0 means the worker has not submitted all blocks
     // yet — bail without touching chain state.
@@ -242,8 +241,7 @@ static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
 // in transfer_task.h's anonymous-ish inline space) because nof_connection.cpp
 // also calls Acquire/Release and shares the same SubTaskFreeList instance.
 // ----------------------------------------------------------------------------
-std::shared_ptr<mooncake::SpdkNofSubTask>
-mooncake::SubTaskFreeList::Acquire() {
+std::shared_ptr<mooncake::SpdkNofSubTask> mooncake::SubTaskFreeList::Acquire() {
     std::lock_guard<std::mutex> lock(mu);
     if (free_list.empty()) {
         EnsurePopulatedUnlocked(64);
@@ -289,7 +287,8 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
     // already exited and freed its local chunk array (the historical
     // UAF scenario at ~NofQpairPool CQ-drain).  After the local copy
     // is taken, the ctx allocation is freed.
-    auto* ctx_sp_ptr = reinterpret_cast<std::shared_ptr<mooncake::SpdkNofSubTask>*>(ctx);
+    auto* ctx_sp_ptr =
+        reinterpret_cast<std::shared_ptr<mooncake::SpdkNofSubTask>*>(ctx);
     if (!ctx_sp_ptr) {
         LOG(ERROR) << "nvmf_io_complete ctx_sp_ptr is null";
         return;
@@ -428,8 +427,7 @@ SpdkNofQos::~SpdkNofQos() {
     if (!active_tasks.empty()) {
         // One-line dump of every leaked pointer, capped at 16.
         std::ostringstream leaked;
-        leaked << "~SpdkNofQos: " << active_tasks.size()
-               << " task(s) leaked:";
+        leaked << "~SpdkNofQos: " << active_tasks.size() << " task(s) leaked:";
         size_t n = 0;
         for (SpdkNofTask* t : active_tasks) {
             leaked << " " << t;
@@ -528,11 +526,10 @@ void SpdkNofQos::FinalizeAfterDrain() {
         // io_count.  Therefore exchange(0) snapshots exactly the count
         // of CQEs that took the short-circuit, and fetch_sub(skipped)
         // is the matching pay-back.
-        int skipped = task->outstanding_sub_io.exchange(
-            0, std::memory_order_acq_rel);
+        int skipped =
+            task->outstanding_sub_io.exchange(0, std::memory_order_acq_rel);
         if (skipped > 0 && task->io_count) {
-            task->io_count->fetch_sub(skipped,
-                                      std::memory_order_acq_rel);
+            task->io_count->fetch_sub(skipped, std::memory_order_acq_rel);
         }
 
         task->on_chain = false;
@@ -854,16 +851,14 @@ static void DrainDrainingPoolsUntilQuiescent(
         if (conn == nullptr) continue;
         auto& pool = conn->GetQpairPool();
         if (!pool.IsDraining()) continue;
-        bool quiescent =
-            pool.WaitForInflightCompletion(kWorkerDrainTimeoutMs);
+        bool quiescent = pool.WaitForInflightCompletion(kWorkerDrainTimeoutMs);
         if (quiescent) continue;
 
-        LOG(ERROR)
-            << "[DrainDrainingPoolsUntilQuiescent] pool did not reach "
-            << "quiescence within " << kWorkerDrainTimeoutMs
-            << "ms — seg " << seg_handle
-            << " finalising in Phase 2 without retiring the connection "
-               "(see Phase 3 removal rationale).";
+        LOG(ERROR) << "[DrainDrainingPoolsUntilQuiescent] pool did not reach "
+                   << "quiescence within " << kWorkerDrainTimeoutMs
+                   << "ms — seg " << seg_handle
+                   << " finalising in Phase 2 without retiring the connection "
+                      "(see Phase 3 removal rationale).";
     }
 
     // Phase 2: FINALIZE — runs on every DRAINING pool.
@@ -1077,10 +1072,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                 submit_conn->GetQpairPool().IsDraining()
                                     ? "draining"
                                     : "spdk_reject";
-                            VLOG(1) << "work " << work_idx << ", seg "
-                                    << task->seg_handle
-                                    << " submit io fail (reason=" << reason
-                                    << ")";
+                            VLOG(1)
+                                << "work " << work_idx << ", seg "
+                                << task->seg_handle
+                                << " submit io fail (reason=" << reason << ")";
                             // No CQE will fire for a failed submission —
                             // roll back the increment, free the empty
                             // ctx, and return the sub_task to the free
