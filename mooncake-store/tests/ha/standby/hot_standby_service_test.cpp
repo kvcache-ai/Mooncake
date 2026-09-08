@@ -277,80 +277,6 @@ bool WaitForState(HotStandbyService& service, StandbyState state,
     return service.GetState() == state;
 }
 
-#ifdef STORE_USE_ETCD
-// Independent in-process integration fixture for live unreachable-endpoint
-// coverage.
-//
-// HotStandbyService's production path can only use the process-global store
-// etcd client (Go singleton via cgo), so a separate client instance is not
-// available. Fork/subprocess isolation is also unsafe once the Go runtime is
-// multi-threaded in this process.
-//
-// This fixture is therefore the strongest isolation the current API allows:
-// it takes exclusive ownership of the global store client for the test
-// duration (Reset onto unreachable endpoints), owns the HotStandbyService
-// under test, and on release always Stop()s that service before Reset-ing
-// back to a conventional endpoint. Reset itself cancels keepalives/watches,
-// waits for prefix-watch goroutines to exit, and closes the old client.
-class LiveUnreachableEtcdIntegrationFixture {
-   public:
-    static constexpr const char* kUnreachableEndpoints = "http://127.0.0.1:1";
-    static constexpr const char* kRestoreEndpoints = "http://127.0.0.1:2379";
-
-    // Returns nullopt on success, or a skip reason if the global client cannot
-    // be acquired onto the unreachable endpoints.
-    static std::optional<std::string> TryCreate(
-        std::unique_ptr<LiveUnreachableEtcdIntegrationFixture>* out) {
-        const ErrorCode err =
-            EtcdHelper::ResetEtcdStoreClient(kUnreachableEndpoints);
-        if (err != ErrorCode::OK) {
-            return std::string(
-                       "Unable to acquire "
-                       "LiveUnreachableEtcdIntegrationFixture: ") +
-                   toString(err);
-        }
-        out->reset(new LiveUnreachableEtcdIntegrationFixture());
-        return std::nullopt;
-    }
-
-    ~LiveUnreachableEtcdIntegrationFixture() { Release(); }
-
-    LiveUnreachableEtcdIntegrationFixture(
-        const LiveUnreachableEtcdIntegrationFixture&) = delete;
-    LiveUnreachableEtcdIntegrationFixture& operator=(
-        const LiveUnreachableEtcdIntegrationFixture&) = delete;
-
-    HotStandbyService& CreateService(HotStandbyConfig config) {
-        config.enable_oplog_following = true;
-        config.enable_verification = false;
-        config.oplog_poll_interval_ms = 1;
-        config.batch_oplog_retry_timeout_sec = 0;
-        service_ = std::make_unique<HotStandbyService>(std::move(config));
-        return *service_;
-    }
-
-    const char* unreachable_endpoints() const { return kUnreachableEndpoints; }
-
-    void Release() {
-        if (released_) {
-            return;
-        }
-        released_ = true;
-        if (service_) {
-            service_->Stop();
-            service_.reset();
-        }
-        (void)EtcdHelper::ResetEtcdStoreClient(kRestoreEndpoints);
-    }
-
-   private:
-    LiveUnreachableEtcdIntegrationFixture() = default;
-
-    std::unique_ptr<HotStandbyService> service_;
-    bool released_ = false;
-};
-#endif
-
 }  // namespace
 
 class HotStandbyServiceTest : public ::testing::Test {
@@ -493,37 +419,27 @@ TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
-#ifdef STORE_USE_ETCD
-    // Live dial failures are asynchronous: client construction succeeds, then
-    // replication Get() times out. Owned by a dedicated integration fixture so
-    // the global store client is exclusively claimed and restored.
-    std::unique_ptr<LiveUnreachableEtcdIntegrationFixture> fixture;
-    if (auto skip_reason =
-            LiveUnreachableEtcdIntegrationFixture::TryCreate(&fixture)) {
-        GTEST_SKIP() << *skip_reason;
-    }
+    // Deterministic connection-failure coverage: Start() succeeds with an
+    // injected backend, then a later Get error from the replication loop
+    // drives WATCHING -> FAILED. Prefer this over a live unreachable-etcd
+    // dial so we do not touch the process-global store client or network
+    // timeouts.
+    auto backend = MakeBackendWithBatch(cluster_id_, 1, 1, 1);
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = CreateOplogFollowingStandby(config_, cluster_id_, backend);
 
-    // Only the fixture owns HotStandbyService for this case.
-    service_.reset();
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("primary", oplog_endpoints_, cluster_id_));
+    ASSERT_TRUE(WaitForAppliedSequence(*service_, 1));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
 
-    HotStandbyService& service = fixture->CreateService(config_);
-    const ErrorCode err =
-        service.Start("primary", fixture->unreachable_endpoints(), cluster_id_);
-    ASSERT_EQ(ErrorCode::OK, err)
-        << "Start should succeed once the etcd client object exists; dial "
-           "failure is expected asynchronously from the replication loop";
-
-    // Store Get() uses a ~5s context timeout; allow headroom beyond that.
-    ASSERT_TRUE(WaitForState(service, StandbyState::FAILED,
-                             /*max_attempts=*/4000))
-        << "Expected FAILED after unreachable etcd Get/dial timeout";
-    EXPECT_EQ(StandbyState::FAILED, service.GetState());
-
-    fixture->Release();
-#else
-    GTEST_SKIP()
-        << "Live etcd connection-failure coverage requires STORE_USE_ETCD";
-#endif
+    backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
+    ASSERT_TRUE(WaitForState(*service_, StandbyState::FAILED));
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              service_->GetSyncStatus().last_error);
 }
 
 TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
