@@ -297,6 +297,9 @@ class TransferEngineImpl {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    Status submitCancellableTransfer(BatchID batch_id,
+                                     const std::vector<Request>& request_list);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
@@ -426,8 +429,8 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
-                          const Notification* notifi,
-                          QueueOwnerKind owner_kind);
+                          const Notification* notifi, QueueOwnerKind owner_kind,
+                          bool require_cancellation = false);
 
     Status submitStagingTransfer(BatchID batch_id,
                                  const std::vector<Request>& request_list);
@@ -439,7 +442,8 @@ class TransferEngineImpl {
                            QueueOwnerKind owner_kind) const;
 
     Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
-                         PreparedSubmit& prepared);
+                         PreparedSubmit& prepared,
+                         bool require_cancellation = false);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 

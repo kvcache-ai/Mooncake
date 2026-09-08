@@ -81,11 +81,13 @@ class FakeTransport : public Transport {
     explicit FakeTransport(TransportType self_type,
                            StatusFactory status_factory = {},
                            PollStatusFactory poll_status_factory = {},
-                           bool force_submit_fail = false)
+                           bool force_submit_fail = false,
+                           bool cancellation_supported = true)
         : self_type_(self_type),
           status_factory_(std::move(status_factory)),
           poll_status_factory_(std::move(poll_status_factory)),
-          force_submit_fail_(force_submit_fail) {
+          force_submit_fail_(force_submit_fail),
+          cancellation_supported_(cancellation_supported) {
         caps.dram_to_dram = true;  // so checkAvailability returns true
     }
 
@@ -158,7 +160,9 @@ class FakeTransport : public Transport {
         return Status::OK();
     }
 
-    bool supportsCancellation() const override { return true; }
+    bool supportsCancellation() const override {
+        return cancellation_supported_;
+    }
 
     Status cancelTransferTask(SubBatchRef batch, int task_id) override {
         auto* fb = static_cast<FakeSubBatch*>(batch);
@@ -216,6 +220,7 @@ class FakeTransport : public Transport {
     StatusFactory status_factory_;
     PollStatusFactory poll_status_factory_;
     bool force_submit_fail_;
+    bool cancellation_supported_;
 };
 
 class HpTcpRecoveryTransport : public FakeTransport {
@@ -471,6 +476,85 @@ TEST(EngineFailoverE2E, HpTcpStaleMetadataRetriesSameTransportOnce) {
     EXPECT_EQ(batch.fallback_tcp->submit_calls.load(), 0);
 
     releaseHpTcpRecoveryBatch(engine, batch);
+}
+
+TEST(EngineFailoverE2E,
+     CancellableSubmissionRejectsNonCancellableTransportBeforePublish) {
+    auto config = makeMinimalP2PConfig();
+    config->set("enable_runtime_queue", true);
+    config->set("runtime_queue/max_outstanding_owners", 16UL);
+    config->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    config->set("runtime_queue/max_dispatch_owners", 16UL);
+    config->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    config->set("runtime_queue/staging_owner_reserve", 0UL);
+    config->set("runtime_queue/staging_byte_reserve", 0UL);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    auto transport = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, FakeTransport::PollStatusFactory{},
+        false, false);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(transport->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, transport);
+
+    std::vector<uint8_t> buffer(4096, 0xA5);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const auto batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+
+    const auto status = engine.submitCancellableTransfer(batch_id, {request});
+    EXPECT_TRUE(status.IsNotImplemented()) << status.ToString();
+    EXPECT_EQ(transport->submit_calls.load(), 0);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, CancellableSubmissionPinsItsValidatedRoute) {
+    auto config = makeMinimalP2PConfig();
+    config->set("enable_runtime_queue", true);
+    config->set("runtime_queue/max_outstanding_owners", 16UL);
+    config->set("runtime_queue/max_outstanding_bytes", 1UL << 20);
+    config->set("runtime_queue/max_dispatch_owners", 1UL);
+    config->set("runtime_queue/max_dispatch_bytes", 1UL << 20);
+    config->set("runtime_queue/staging_owner_reserve", 0UL);
+    config->set("runtime_queue/staging_byte_reserve", 0UL);
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+
+    auto transport = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(transport->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, transport);
+
+    std::vector<uint8_t> buffer(4096, 0xA5);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const auto batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+
+    ASSERT_TRUE(engine.submitCancellableTransfer(batch_id, {request}).ok());
+    EXPECT_EQ(transport->submit_calls.load(), 1);
+    TransferStatus status;
+    ASSERT_TRUE(engine.getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(EngineFailoverE2E, HpTcpPermanentFailureDoesNotFailOver) {
