@@ -7,7 +7,12 @@
 
 #include <glog/logging.h>
 
+#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
+#include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/catalog_backed_snapshot_provider.h"
+#include "ha/snapshot/object/snapshot_object_store.h"
 #include "hot_standby_service.h"
 
 namespace mooncake {
@@ -29,7 +34,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
         .verification_interval_sec = 30,
         .max_replication_lag_entries = 1000,
         .enable_verification = false,
-        .enable_snapshot_bootstrap = config.enable_snapshot_restore,
+        .enable_snapshot_bootstrap =
+            config.enable_oplog_snapshot || config.enable_snapshot_restore,
         .enable_oplog_following = capabilities.has_oplog_following,
         .oplog_poll_interval_ms = config.oplog_poll_interval_ms,
         .batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec,
@@ -39,7 +45,8 @@ std::unique_ptr<HotStandbyService> CreateStandbyService(
 StandbyRuntimeCapabilities BuildStandbyRuntimeCapabilities(
     const HABackendSpec& spec, const MasterServiceSupervisorConfig& config) {
     StandbyRuntimeCapabilities capabilities;
-    capabilities.has_snapshot_bootstrap = config.enable_snapshot_restore;
+    capabilities.has_snapshot_bootstrap =
+        config.enable_oplog_snapshot || config.enable_snapshot_restore;
     capabilities.has_oplog_following =
         config.enable_oplog && spec.type == HABackendType::ETCD;
     return capabilities;
@@ -112,7 +119,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
           config_(config),
           capabilities_(BuildStandbyRuntimeCapabilities(spec, config)),
           standby_service_(CreateStandbyService(config, capabilities_)) {
-        if (capabilities_.has_snapshot_bootstrap) {
+        if (config_.enable_snapshot_restore && !config_.enable_oplog_snapshot) {
             auto snapshot_provider =
                 CreateCatalogBackedSnapshotProvider(config_);
             if (!snapshot_provider) {
@@ -123,6 +130,41 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             } else {
                 standby_service_->SetSnapshotProvider(
                     std::move(snapshot_provider.value()));
+            }
+        }
+
+        if (config_.enable_oplog_snapshot) {
+            try {
+                batch_backend_ = std::make_unique<EtcdHaKvBackend>();
+                auto type = ParseSnapshotObjectStoreType(
+                    config_.snapshot_object_store_type);
+                snapshot_object_store_ = SnapshotObjectStore::Create(type);
+                const std::string snapshot_root =
+                    BuildBatchOpLogSnapshotRoot(config_.cluster_id);
+                if (snapshot_root.empty()) {
+                    throw std::invalid_argument(
+                        "batch OpLog snapshot requires a valid cluster_id");
+                }
+                standby_service_->SetBatchOpLogSnapshotProvider(
+                    std::make_unique<BatchOpLogSnapshotProvider>(
+                        config_.cluster_id, *batch_backend_,
+                        *snapshot_object_store_, snapshot_root));
+                batch_oplog_snapshot_coordinator_ =
+                    std::make_unique<BatchOpLogSnapshotCoordinator>(
+                        *standby_service_, *batch_backend_,
+                        *snapshot_object_store_, config_.cluster_id,
+                        BatchOpLogSnapshotCoordinatorConfig{
+                            .snapshot_interval_seconds =
+                                config_.snapshot_interval_seconds,
+                            .chunk_object_count =
+                                config_.snapshot_chunk_object_count,
+                            .snapshot_root = snapshot_root,
+                            .clock = {},
+                        });
+            } catch (const std::exception& e) {
+                dependency_init_error_ = ErrorCode::INVALID_PARAMS;
+                LOG(ERROR) << "Failed to initialize batch OpLog snapshot: "
+                           << e.what();
             }
         }
 
@@ -145,6 +187,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     }
 
     ~CapabilityDrivenStandbyController() override {
+        batch_oplog_snapshot_coordinator_.reset();
         standby_service_->SetSyncStatusCallback({});
         standby_service_->Stop();
     }
@@ -187,12 +230,18 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             }
         }
         if (err == ErrorCode::OK) {
+            if (batch_oplog_snapshot_coordinator_) {
+                batch_oplog_snapshot_coordinator_->Start();
+            }
             NotifyRuntimeStateIfChanged();
         }
         return err;
     }
 
     void StopStandby() override {
+        if (batch_oplog_snapshot_coordinator_) {
+            batch_oplog_snapshot_coordinator_->Stop();
+        }
         standby_service_->Stop();
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
@@ -364,6 +413,10 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     MasterServiceSupervisorConfig config_;
     StandbyRuntimeCapabilities capabilities_;
     std::unique_ptr<HotStandbyService> standby_service_;
+    std::unique_ptr<HaKvBackend> batch_backend_;
+    std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
+    std::unique_ptr<BatchOpLogSnapshotCoordinator>
+        batch_oplog_snapshot_coordinator_;
     ErrorCode dependency_init_error_{ErrorCode::OK};
     std::string oplog_connstring_;
 
