@@ -2933,8 +2933,8 @@ bool Client::StageDfsWriteData(
                 if (!device->Copy(buffer.data, slice.ptr, slice.size,
                                   device::CopyDirection::kDeviceToHost)) {
                     pinned_buffer_pool_->Release(std::move(buffer));
-                    LOG(ERROR) << "DFS D2H staging failed for key "
-                               << context.keys[i];
+                    LOG(ERROR)
+                        << "DFS D2H staging failed for key " << context.keys[i];
                     return false;
                 }
                 context.slices[i].push_back(Slice{buffer.data, slice.size});
@@ -2951,17 +2951,15 @@ bool Client::StageDfsWriteData(
     return true;
 }
 
-void Client::RunAsyncDfsWrite(
-    std::shared_ptr<AsyncDfsWriteContext> context) {
+void Client::RunAsyncDfsWrite(std::shared_ptr<AsyncDfsWriteContext> context) {
     std::vector<DfsWriteRequest> requests;
     requests.reserve(context->keys.size());
     for (size_t i = 0; i < context->keys.size(); ++i) {
-        requests.push_back({context->keys[i], context->descriptors[i],
-                            context->slices[i]});
+        requests.push_back(
+            {context->keys[i], context->descriptors[i], context->slices[i]});
     }
 
-    std::vector<ErrorCode> outcomes(requests.size(),
-                                    ErrorCode::INTERNAL_ERROR);
+    std::vector<ErrorCode> outcomes(requests.size(), ErrorCode::INTERNAL_ERROR);
     try {
         auto results = context->backend->BatchWrite(requests);
         if (results.size() != requests.size()) {
@@ -2970,8 +2968,7 @@ void Client::RunAsyncDfsWrite(
                 << requests.size() << ", got " << results.size();
         } else {
             for (size_t i = 0; i < results.size(); ++i) {
-                outcomes[i] =
-                    results[i] ? ErrorCode::OK : results[i].error();
+                outcomes[i] = results[i] ? ErrorCode::OK : results[i].error();
             }
         }
     } catch (const std::exception& e) {
@@ -2993,19 +2990,17 @@ void Client::RunAsyncDfsWrite(
             tl::make_unexpected(ErrorCode::RPC_FAIL);
         for (int attempt = 0; attempt < kMaxCompletionAttempts; ++attempt) {
             if (succeeded) {
-                completion = context->is_upsert
-                                 ? master_client_.UpsertEnd(
-                                       ObjectMeta{key, std::nullopt},
-                                       ReplicaType::DFS)
-                                 : master_client_.PutEnd(
-                                       ObjectMeta{key, std::nullopt},
-                                       ReplicaType::DFS);
+                completion =
+                    context->is_upsert
+                        ? master_client_.UpsertEnd(
+                              ObjectMeta{key, std::nullopt}, ReplicaType::DFS)
+                        : master_client_.PutEnd(ObjectMeta{key, std::nullopt},
+                                                ReplicaType::DFS);
             } else {
-                completion = context->is_upsert
-                                 ? master_client_.UpsertRevoke(
-                                       key, ReplicaType::DFS)
-                                 : master_client_.PutRevoke(
-                                       key, ReplicaType::DFS);
+                completion =
+                    context->is_upsert
+                        ? master_client_.UpsertRevoke(key, ReplicaType::DFS)
+                        : master_client_.PutRevoke(key, ReplicaType::DFS);
             }
             if (completion) break;
             const auto error = completion.error();
@@ -3074,9 +3069,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
         std::any_of(op_indices.begin(), op_indices.end(), [&](size_t index) {
             return ops[index].transfer_summary.allocated_nof_replicas > 0;
         });
-    const bool async_write = allow_async && !has_nof &&
-                             backend->GetAllocatorType() ==
-                                 DfsAllocatorType::BUCKET;
+    const bool async_write =
+        allow_async && !has_nof &&
+        backend->GetAllocatorType() == DfsAllocatorType::BUCKET;
     if (!async_write) {
         auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
         for (size_t i = 0; i < results.size(); ++i) {
@@ -3084,8 +3079,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             if (results[i] == ErrorCode::OK) {
                 op.transfer_summary.RecordSuccess(ReplicaType::DFS);
             } else {
-                op.transfer_summary.RecordFailure(ReplicaType::DFS,
-                                                  results[i]);
+                op.transfer_summary.RecordFailure(ReplicaType::DFS, results[i]);
                 op.AppendFailureContext("Synchronous DFS write failed: " +
                                         toString(results[i]));
             }
@@ -3162,8 +3156,7 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
 void Client::DrainAsyncDfsWrites() {
     dfs_writes_shutting_down_.store(true, std::memory_order_release);
     std::unique_lock<std::mutex> lock(dfs_inflight_mutex_);
-    dfs_inflight_cv_.wait(lock,
-                          [this] { return dfs_inflight_writes_ == 0; });
+    dfs_inflight_cv_.wait(lock, [this] { return dfs_inflight_writes_ == 0; });
 }
 
 void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {

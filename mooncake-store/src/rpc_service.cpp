@@ -489,8 +489,7 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
         }
     } else {
         results = master_service_.BatchPutStart(
-            client_id, keys, resolved_tenant_id.value(), slice_lengths,
-            config);
+            client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
     }
 
     size_t failure_count = 0;
@@ -1530,8 +1529,8 @@ WrappedMasterService::GetTenantQuotaAllocatableCapacityBytes() {
     return master_service_.GetTenantQuotaAllocatableCapacityBytes();
 }
 
-tl::expected<int64_t, ErrorCode>
-WrappedMasterService::SetDfsMaxBucketCount(int64_t new_max_bucket_count) {
+tl::expected<int64_t, ErrorCode> WrappedMasterService::SetDfsMaxBucketCount(
+    int64_t new_max_bucket_count) {
     return master_service_.SetDfsMaxBucketCount(new_max_bucket_count);
 }
 

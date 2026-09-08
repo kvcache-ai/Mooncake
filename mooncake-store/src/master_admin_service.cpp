@@ -1254,18 +1254,16 @@ void MasterAdminServer::HandleSetDfsMaxBucketCount(
     }
 
     WithActiveService(resp, [&](auto service) {
-        auto result =
-            service->SetDfsMaxBucketCount(request->max_bucket_count);
+        auto result = service->SetDfsMaxBucketCount(request->max_bucket_count);
         if (!result) {
             WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
                                result.error());
             return;
         }
-        WriteJsonResponse(
-            resp, coro_http::status_type::ok,
-            HttpDfsMaxBucketCountResponse{.old_value = result.value(),
-                                          .new_value =
-                                              request->max_bucket_count});
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpDfsMaxBucketCountResponse{
+                              .old_value = result.value(),
+                              .new_value = request->max_bucket_count});
     });
 }
 

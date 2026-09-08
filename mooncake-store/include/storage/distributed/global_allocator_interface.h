@@ -75,9 +75,8 @@ class GlobalAllocatorInterface {
 
     virtual void Free(const std::string& key,
                       const DistributedFSDescriptor& descriptor) = 0;
-    virtual void UpdateAccess(
-        const std::string& key,
-        const DistributedFSDescriptor& descriptor) = 0;
+    virtual void UpdateAccess(const std::string& key,
+                              const DistributedFSDescriptor& descriptor) = 0;
 
     virtual bool IsEvictionEnabled() const = 0;
     virtual std::chrono::seconds GetEvictionCheckInterval() const = 0;

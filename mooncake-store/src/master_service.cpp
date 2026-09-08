@@ -3899,8 +3899,8 @@ auto MasterService::GetReplicaList(const std::string& key,
             [this, &key, &replica_list](const Replica& replica) {
                 replica_list.emplace_back(replica.get_descriptor());
                 if (replica.is_dfs_replica() && dfs_allocator_) {
-                    dfs_allocator_->UpdateAccess(
-                        key, replica.get_dfs_descriptor());
+                    dfs_allocator_->UpdateAccess(key,
+                                                 replica.get_dfs_descriptor());
                 }
             });
 
@@ -4438,8 +4438,7 @@ auto MasterService::AllocateAndInsertMetadata(
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
         if (preallocated_dfs.has_value()) {
-            replicas.emplace_back(*preallocated_dfs,
-                                  ReplicaStatus::PROCESSING);
+            replicas.emplace_back(*preallocated_dfs, ReplicaStatus::PROCESSING);
         } else {
             auto alloc = dfs_allocator_->Allocate(key, value_length);
             if (!alloc) {
@@ -4448,8 +4447,7 @@ auto MasterService::AllocateAndInsertMetadata(
                 refund_pending_quota();
                 return tl::make_unexpected(alloc.error());
             }
-            replicas.emplace_back(std::move(*alloc),
-                                  ReplicaStatus::PROCESSING);
+            replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
         }
     }
 
@@ -4738,8 +4736,7 @@ auto MasterService::PutStartInternal(
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
-std::vector<BatchAllocateResult>
-MasterService::ReserveDfsSpaceForBatch(
+std::vector<BatchAllocateResult> MasterService::ReserveDfsSpaceForBatch(
     const std::vector<std::string>& keys,
     const std::vector<uint64_t>& value_lengths,
     const std::vector<bool>& needs_dfs) {
@@ -4834,8 +4831,7 @@ MasterService::BatchPutStart(const UUID& client_id,
 
     std::vector<BatchAllocateResult> reservations;
     if (any_dfs) {
-        reservations =
-            ReserveDfsSpaceForBatch(keys, slice_lengths, needs_dfs);
+        reservations = ReserveDfsSpaceForBatch(keys, slice_lengths, needs_dfs);
     }
 
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -4844,16 +4840,15 @@ MasterService::BatchPutStart(const UUID& client_id,
         if (needs_dfs[i]) {
             auto& reservation = reservations[i];
             if (!reservation.success) {
-                results.emplace_back(
-                    tl::make_unexpected(reservation.error));
+                results.emplace_back(tl::make_unexpected(reservation.error));
                 continue;
             }
             preallocated = reservation.descriptor;
         }
 
-        auto result = PutStartInternal(client_id, keys[i], tenant_id,
-                                       slice_lengths[i], key_config,
-                                       preallocated);
+        auto result =
+            PutStartInternal(client_id, keys[i], tenant_id, slice_lengths[i],
+                             key_config, preallocated);
         if (!result && preallocated.has_value()) {
             dfs_allocator_->Free(keys[i], *preallocated);
         }
@@ -4925,9 +4920,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
-    if (bucket_allocator_ != nullptr &&
-        (replica_type == ReplicaType::ALL ||
-         replica_type == ReplicaType::DFS)) {
+    if (bucket_allocator_ != nullptr && (replica_type == ReplicaType::ALL ||
+                                         replica_type == ReplicaType::DFS)) {
         std::vector<DistributedFSDescriptor> pending_dfs;
         metadata.VisitReplicas(
             [](const Replica& replica) {
@@ -4960,8 +4954,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             }
             replica.mark_complete();
             if (replica.is_dfs_replica() && dfs_allocator_) {
-                dfs_allocator_->UpdateAccess(key,
-                                             replica.get_dfs_descriptor());
+                dfs_allocator_->UpdateAccess(key, replica.get_dfs_descriptor());
             }
         });
 
@@ -7491,11 +7484,11 @@ void MasterService::RestoreRecoveredDfsReplicas() {
         replicas.emplace_back(entry.descriptor, ReplicaStatus::COMPLETE);
         tenant_state.metadata.emplace(
             std::piecewise_construct, std::forward_as_tuple(entry.key),
-            std::forward_as_tuple(
-                UUID{0, 0}, std::chrono::system_clock::now(),
-                entry.descriptor.object_size, std::move(replicas),
-                std::nullopt, false, ObjectDataType::UNKNOWN, std::string(),
-                tenant_id, entry.key));
+            std::forward_as_tuple(UUID{0, 0}, std::chrono::system_clock::now(),
+                                  entry.descriptor.object_size,
+                                  std::move(replicas), std::nullopt, false,
+                                  ObjectDataType::UNKNOWN, std::string(),
+                                  tenant_id, entry.key));
         ++restored;
     }
 
@@ -7533,9 +7526,8 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
 
     while (true) {
         auto pending =
-            force_one
-                ? bucket_allocator_->PrepareEvictionForAllocationFailure()
-                : bucket_allocator_->PrepareEviction();
+            force_one ? bucket_allocator_->PrepareEvictionForAllocationFailure()
+                      : bucket_allocator_->PrepareEviction();
         if (pending.bucket_id() < 0) return evicted;
         if (!attempted.insert(pending.bucket_id()).second) {
             bucket_allocator_->AbortEviction(std::move(pending));
@@ -7641,18 +7633,17 @@ bool MasterService::RunBucketDfsEvictionInternal(bool force_one) {
                         }
 
                         auto& metadata = metadata_it->second;
-                        const size_t erased = metadata.EraseReplicas(
-                            [&](const Replica& replica) {
+                        const size_t erased =
+                            metadata.EraseReplicas([&](const Replica& replica) {
                                 return matches_candidate(replica, candidate);
                             });
                         if (erased > 0) {
-                            PublishKvRemovedAfterEvict(
-                                candidate.key, erased, "disk", metadata,
-                                tenant_id);
+                            PublishKvRemovedAfterEvict(candidate.key, erased,
+                                                       "disk", metadata,
+                                                       tenant_id);
                             if (!metadata.IsValid()) {
                                 EraseMetadata(tenant_state, metadata_it,
-                                              tenant_id,
-                                              QuotaEraseMode::kFull);
+                                              tenant_id, QuotaEraseMode::kFull);
                             }
                         }
                     }

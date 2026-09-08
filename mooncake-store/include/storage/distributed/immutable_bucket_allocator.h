@@ -132,7 +132,8 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
     ~ImmutableBucketAllocator() override;
 
     ImmutableBucketAllocator(const ImmutableBucketAllocator&) = delete;
-    ImmutableBucketAllocator& operator=(const ImmutableBucketAllocator&) = delete;
+    ImmutableBucketAllocator& operator=(const ImmutableBucketAllocator&) =
+        delete;
 
     DfsAllocatorType Type() const override { return DfsAllocatorType::BUCKET; }
 
@@ -251,7 +252,8 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
      *
      * Used only after allocation reports that the bucket-count limit has been
      * reached. It allows the master to reclaim one bucket and retry without
-     * turning low-utilization bucket tails into a permanent allocation deadlock.
+     * turning low-utilization bucket tails into a permanent allocation
+     * deadlock.
      */
     PendingEviction PrepareEvictionForAllocationFailure();
 
@@ -274,11 +276,12 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
      * @brief Write the `.meta` file of every bucket whose state is dirty.
      *
      * The hot paths - BatchAllocate, MarkCommitted, Free - only update memory
-     * and mark the bucket dirty, because the master calls `Free()` while holding
-     * a metadata shard lock and DFS I/O must never happen under that lock. This
-     * method performs the deferred writes, so it must be called with no master
-     * lock held: the master's DFS maintenance tick drives it, and the destructor
-     * runs it once more so a clean shutdown leaves no unwritten metadata.
+     * and mark the bucket dirty, because the master calls `Free()` while
+     * holding a metadata shard lock and DFS I/O must never happen under that
+     * lock. This method performs the deferred writes, so it must be called with
+     * no master lock held: the master's DFS maintenance tick drives it, and the
+     * destructor runs it once more so a clean shutdown leaves no unwritten
+     * metadata.
      *
      * @return the number of buckets whose metadata was made durable.
      */
@@ -336,9 +339,10 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
         // True once the bucket has been sealed (it is no longer the active
         // bucket), which is when its `.meta` file starts to exist.
         bool sealed = false;
-        // Set when the in-memory state differs from what the `.meta` file holds,
-        // cleared once the file has been rewritten. Only meaningful for a sealed
-        // bucket: an unsealed one is deliberately not persisted at all.
+        // Set when the in-memory state differs from what the `.meta` file
+        // holds, cleared once the file has been rewritten. Only meaningful for
+        // a sealed bucket: an unsealed one is deliberately not persisted at
+        // all.
         bool meta_dirty = false;
         // Tombstoned entries, kept for eviction bookkeeping.
         uint64_t tombstones = 0;
@@ -354,8 +358,7 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
 
     // Serializes `bucket` into a PersistedBucketMetadata snapshot. Taken under
     // `mutex_`; the file write happens outside it.
-    PersistedBucketMetadata SnapshotLocked(BucketState& bucket,
-                                           bool evicting);
+    PersistedBucketMetadata SnapshotLocked(BucketState& bucket, bool evicting);
 
     // Overwrites `bucket_id`'s single `.meta` file in place and syncs it.
     tl::expected<void, ErrorCode> PersistMetadata(

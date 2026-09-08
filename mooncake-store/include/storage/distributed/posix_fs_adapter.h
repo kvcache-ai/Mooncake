@@ -71,8 +71,8 @@ class PosixFsAdapter : public FileSystemAdapter {
         DirectStaging(const DirectStaging&) = delete;
         DirectStaging& operator=(const DirectStaging&) = delete;
 
-        void* ptr = nullptr;      // 4K-aligned, from posix_memalign
-        size_t capacity = 0;      // allocated bytes
+        void* ptr = nullptr;  // 4K-aligned, from posix_memalign
+        size_t capacity = 0;  // allocated bytes
         bool in_use = false;
     };
 

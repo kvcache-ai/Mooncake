@@ -53,9 +53,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
    protected:
     void SetUp() override {
         root_ = (std::filesystem::temp_directory_path() /
-                 ("dfs_immutable_bucket_client_" +
-                  std::to_string(::getpid()) + "_" +
-                  std::to_string(++next_root_)))
+                 ("dfs_immutable_bucket_client_" + std::to_string(::getpid()) +
+                  "_" + std::to_string(++next_root_)))
                     .string();
         std::filesystem::create_directories(root_);
 
@@ -79,8 +78,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         segment_size_ = 16 * 1024 * 1024;
         segment_ = allocate_buffer_allocator_memory(segment_size_);
         ASSERT_NE(segment_, nullptr);
-        ASSERT_TRUE(writer_->MountSegment(segment_, segment_size_, "tcp")
-                        .has_value());
+        ASSERT_TRUE(
+            writer_->MountSegment(segment_, segment_size_, "tcp").has_value());
 
         FileStorageConfig file_config;
         file_config.storage_backend_type = StorageBackendType::kDistributed;
@@ -172,11 +171,11 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
             if (!query.has_value()) {
                 if (query.error() == ErrorCode::OBJECT_NOT_FOUND) return true;
             } else {
-                const bool has_dfs = std::any_of(
-                    query->replicas.begin(), query->replicas.end(),
-                    [](const Replica::Descriptor& replica) {
-                        return replica.is_dfs_replica();
-                    });
+                const bool has_dfs =
+                    std::any_of(query->replicas.begin(), query->replicas.end(),
+                                [](const Replica::Descriptor& replica) {
+                                    return replica.is_dfs_replica();
+                                });
                 if (!has_dfs) return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -188,9 +187,10 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
         auto query = QueryDfsOnly(key);
         ASSERT_TRUE(query.has_value());
         std::vector<char> output(expected.size());
-        auto results = backend_->BatchRead(
-            {{key, query->replicas[0].get_dfs_descriptor(),
-              {{output.data(), output.size()}}}});
+        auto results =
+            backend_->BatchRead({{key,
+                                  query->replicas[0].get_dfs_descriptor(),
+                                  {{output.data(), output.size()}}}});
         ASSERT_EQ(results.size(), 1u);
         ASSERT_TRUE(results[0].has_value());
         EXPECT_EQ(std::memcmp(output.data(), expected.data(), expected.size()),
@@ -210,8 +210,8 @@ class DfsImmutableBucketClientTest : public ::testing::Test {
     void SetEnv(const std::string& key, const std::string& value) {
         const char* old_value = ::getenv(key.c_str());
         saved_env_.push_back({key, old_value
-                                      ? std::optional<std::string>(old_value)
-                                      : std::nullopt});
+                                       ? std::optional<std::string>(old_value)
+                                       : std::nullopt});
         ::setenv(key.c_str(), value.c_str(), 1);
     }
 
@@ -352,8 +352,7 @@ TEST_F(DfsImmutableBucketClientTest, ClientDestructionDrainsAsyncWrites) {
     ASSERT_NE(client, nullptr);
     client->SetDfsStorageBackend(backend_);
 
-    std::vector<std::vector<Slice>> slices{
-        {Slice{value.data(), value.size()}}};
+    std::vector<std::vector<Slice>> slices{{Slice{value.data(), value.size()}}};
     auto results = client->BatchPut({key}, slices, DfsConfig());
     ASSERT_EQ(results.size(), 1u);
     ASSERT_TRUE(results[0].has_value());
@@ -379,8 +378,8 @@ TEST_F(DfsImmutableBucketClientTest, ConcurrentBatchPutsRemainReadable) {
                 keys.push_back("concurrent_" + std::to_string(thread_index) +
                                "_" + std::to_string(i));
                 values.push_back(std::string(
-                    1024, static_cast<char>('a' + thread_index *
-                                                     kKeysPerThread + i)));
+                    1024, static_cast<char>(
+                              'a' + thread_index * kKeysPerThread + i)));
             }
             auto slices = MakeSlices(values);
             auto results = writer_->BatchPut(keys, slices, DfsConfig());

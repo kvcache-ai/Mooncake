@@ -91,8 +91,8 @@ DistributedStorageConfig MakeBucketConfig(const std::string& fsdir,
 }
 
 DistributedStorageConfig MakeShardConfig(const std::string& fsdir,
-                                        int shard_count,
-                                        uint64_t shard_capacity) {
+                                         int shard_count,
+                                         uint64_t shard_capacity) {
     DistributedStorageConfig config;
     config.fsdir = fsdir;
     config.fs_adapter_type = "posix";
@@ -107,20 +107,22 @@ DistributedStorageConfig MakeShardConfig(const std::string& fsdir,
     return config;
 }
 
-// Recomputes the entry start from a descriptor, mirroring what the backend does.
+// Recomputes the entry start from a descriptor, mirroring what the backend
+// does.
 uint64_t EntryStartOf(const DistributedFSDescriptor& desc,
                       const std::string& key) {
     return desc.offset - BucketEntryLayout::kHeaderSize - key.size();
 }
 
 std::string BucketMetaFile(const TempDir& tmp, int64_t bucket_id) {
-    return tmp.file("bucket_" + ImmutableBucketAllocator::FormatBucketId(bucket_id) +
+    return tmp.file("bucket_" +
+                    ImmutableBucketAllocator::FormatBucketId(bucket_id) +
                     ".meta");
 }
 
 // Seals the current active bucket, which is the only moment its `.meta` file is
-// written. The filler object is sized so that it only fits into an empty bucket,
-// forcing the allocator to roll over instead of appending.
+// written. The filler object is sized so that it only fits into an empty
+// bucket, forcing the allocator to roll over instead of appending.
 std::optional<DistributedFSDescriptor> RollOverActiveBucket(
     ImmutableBucketAllocator& alloc, const std::string& filler_key,
     uint64_t bucket_capacity) {
@@ -240,7 +242,8 @@ TEST(ImmutableBucketAllocatorTest, InitRejectsInvalidConfiguration) {
     }
 }
 
-TEST(ImmutableBucketAllocatorTest, MultipleObjectsShareBucketWithDistinctOffsets) {
+TEST(ImmutableBucketAllocatorTest,
+     MultipleObjectsShareBucketWithDistinctOffsets) {
     TempDir tmp("bucket_multi");
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
@@ -360,8 +363,7 @@ TEST(ImmutableBucketAllocatorTest, BatchAllocateIsContiguous) {
 TEST(ImmutableBucketAllocatorTest, ConcurrentBatchesDoNotInterleave) {
     TempDir tmp("bucket_batch_concurrent");
     ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(
-        alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 16)));
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 16)));
 
     constexpr int kThreads = 4;
     constexpr int kKeysPerBatch = 8;
@@ -371,9 +373,8 @@ TEST(ImmutableBucketAllocatorTest, ConcurrentBatchesDoNotInterleave) {
         threads.emplace_back([&alloc, &per_thread, t]() {
             std::vector<BatchAllocateRequest> requests;
             for (int i = 0; i < kKeysPerBatch; ++i) {
-                requests.push_back({"t" + std::to_string(t) + "_k" +
-                                        std::to_string(i),
-                                    1024});
+                requests.push_back(
+                    {"t" + std::to_string(t) + "_k" + std::to_string(i), 1024});
             }
             per_thread[t] = alloc.BatchAllocate(requests);
         });
@@ -417,9 +418,9 @@ TEST(ImmutableBucketAllocatorTest, ConcurrentBatchesDoNotInterleave) {
             if (spans[a].bucket_id != spans[b].bucket_id) continue;
             const bool disjoint = spans[a].end <= spans[b].begin ||
                                   spans[b].end <= spans[a].begin;
-            EXPECT_TRUE(disjoint) << "batches " << a << " and " << b
-                                  << " overlap in bucket "
-                                  << spans[a].bucket_id;
+            EXPECT_TRUE(disjoint)
+                << "batches " << a << " and " << b << " overlap in bucket "
+                << spans[a].bucket_id;
         }
     }
 }
@@ -466,7 +467,7 @@ TEST(ImmutableBucketAllocatorTest, BatchRollsOverToNewBucketWhenActiveIsFull) {
     ASSERT_TRUE(results[1].success);
     EXPECT_EQ(results[0].descriptor.shard_idx, 0);
     EXPECT_EQ(results[1].descriptor.shard_idx, 1);
-    EXPECT_EQ(EntryStartOf(results[0].descriptor, "x"),  kAlignment * 3);
+    EXPECT_EQ(EntryStartOf(results[0].descriptor, "x"), kAlignment * 3);
     EXPECT_EQ(EntryStartOf(results[1].descriptor, "y"), 0u);
 }
 
@@ -594,8 +595,8 @@ TEST(ImmutableBucketAllocatorTest, MetadataIsPersistedWhenBucketIsSealed) {
 
     // Rolling over to the next bucket seals bucket 0 and writes its one and
     // only metadata file.
-    ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                    .has_value());
+    ASSERT_TRUE(
+        RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
     ASSERT_TRUE(std::filesystem::exists(meta_path));
     EXPECT_GT(std::filesystem::file_size(meta_path), 0u);
     std::string payload(std::filesystem::file_size(meta_path), '\0');
@@ -634,8 +635,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
 
         // Seal bucket 0 so that its metadata reaches disk at all. The filler
         // lands in bucket 1, which stays active and is therefore discarded.
-        ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                        .has_value());
+        ASSERT_TRUE(
+            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
     }
 
     ImmutableBucketAllocator recovered;
@@ -647,8 +648,7 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRestoresOnlyCommittedEntries) {
     EXPECT_EQ(replicas[0].key, "committed");
     EXPECT_EQ(replicas[0].descriptor.offset, committed_desc.offset);
     EXPECT_EQ(replicas[0].descriptor.object_size, committed_desc.object_size);
-    EXPECT_EQ(replicas[0].descriptor.aligned_size,
-              committed_desc.aligned_size);
+    EXPECT_EQ(replicas[0].descriptor.aligned_size, committed_desc.aligned_size);
     EXPECT_EQ(replicas[0].descriptor.shard_idx, committed_desc.shard_idx);
     EXPECT_EQ(replicas[0].descriptor.file_path, committed_desc.file_path);
 
@@ -677,8 +677,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryDoesNotRevivedFreedKeys) {
         ASSERT_TRUE(alloc.MarkCommitted("gone", *desc));
         // Seal the bucket first, so that "gone" is actually on disk and the
         // tombstone has something to invalidate.
-        ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                        .has_value());
+        ASSERT_TRUE(
+            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
         ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
         alloc.Free("gone", *desc);
@@ -703,8 +703,8 @@ TEST(ImmutableBucketAllocatorTest, DestructorFlushesDeferredTombstones) {
         auto desc = alloc.Allocate("gone", 100);
         ASSERT_TRUE(desc.has_value());
         ASSERT_TRUE(alloc.MarkCommitted("gone", *desc));
-        ASSERT_TRUE(RollOverActiveBucket(alloc, "filler", kBucketCapacity)
-                        .has_value());
+        ASSERT_TRUE(
+            RollOverActiveBucket(alloc, "filler", kBucketCapacity).has_value());
         alloc.Free("gone", *desc);
         // No explicit flush: a clean shutdown must persist it anyway.
     }
@@ -726,7 +726,8 @@ TEST(ImmutableBucketAllocatorTest, FlushDirtyMetadataIsIdempotent) {
 
     auto desc = alloc.Allocate("k", 100);
     ASSERT_TRUE(desc.has_value());
-    // The active bucket is never written, so allocating leaves nothing to flush.
+    // The active bucket is never written, so allocating leaves nothing to
+    // flush.
     EXPECT_EQ(alloc.FlushDirtyMetadata(), 0u);
 
     // Sealing writes the metadata inline, which also leaves nothing pending.
@@ -781,9 +782,9 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
             recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
         EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
         EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
-        // Metadata that cannot be verified makes the data unusable: a cache miss
-        // is always cheaper than serving bytes nobody can validate, so both files
-        // go away.
+        // Metadata that cannot be verified makes the data unusable: a cache
+        // miss is always cheaper than serving bytes nobody can validate, so
+        // both files go away.
         EXPECT_FALSE(std::filesystem::exists(data_path));
         EXPECT_FALSE(std::filesystem::exists(meta_path));
     }
@@ -843,7 +844,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryRejectsCorruptAndTruncatedMetadata) {
     }
 }
 
-TEST(ImmutableBucketAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) {
+TEST(ImmutableBucketAllocatorTest,
+     NarrowedCapacityDiscardsIncompatibleBuckets) {
     TempDir tmp("bucket_recover_narrowed");
     std::string data_path;
     {
@@ -864,15 +866,15 @@ TEST(ImmutableBucketAllocatorTest, NarrowedCapacityDiscardsIncompatibleBuckets) 
     // incompatible, so the entries inside can no longer be located reliably.
     // Reclaim the bucket rather than keeping unusable bytes around forever.
     ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(recovered.Init(
-        MakeBucketConfig(tmp.path(), kBucketCapacity / 2, 8)));
+    ASSERT_TRUE(
+        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity / 2, 8)));
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
     EXPECT_FALSE(recovered.GetBucketIdForKey("k").has_value());
     EXPECT_FALSE(std::filesystem::exists(data_path));
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
-    // Discarded ids are still retired so stale descriptors from the previous run
-    // can never alias a freshly created bucket.
+    // Discarded ids are still retired so stale descriptors from the previous
+    // run can never alias a freshly created bucket.
     auto desc = recovered.Allocate("fresh", 100);
     ASSERT_TRUE(desc.has_value());
     EXPECT_GT(desc->shard_idx, 1);
@@ -974,9 +976,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
     EXPECT_EQ(recovered.GetBucketCount(), 2u);
     EXPECT_EQ(recovered.TakeRecoveredReplicas().size(), 2u);
     EXPECT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 2)));
-    EXPECT_FALSE(std::filesystem::exists(
-        tmp.file("bucket_" + ImmutableBucketAllocator::FormatBucketId(2) +
-                 ".data")));
+    EXPECT_FALSE(std::filesystem::exists(tmp.file(
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(2) + ".data")));
 
     // Ids of discarded buckets must not be reused either.
     auto desc = recovered.Allocate("after", 100);
@@ -991,8 +992,8 @@ TEST(ImmutableBucketAllocatorTest, RecoveryPreservesBucketIdSequence) {
 namespace {
 
 DistributedStorageConfig MakeEvictionConfig(const std::string& fsdir,
-                                           uint64_t bucket_capacity,
-                                           int64_t max_bucket_count) {
+                                            uint64_t bucket_capacity,
+                                            int64_t max_bucket_count) {
     auto config = MakeBucketConfig(fsdir, bucket_capacity, max_bucket_count);
     config.eviction_enabled = true;
     config.eviction_high_watermark = 0.5;
@@ -1136,7 +1137,8 @@ TEST(ImmutableBucketAllocatorTest, CommitAndAbortEvictionAreIdempotent) {
     EXPECT_EQ(alloc.GetBucketCount(), 2u);
 }
 
-TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark) {
+TEST(ImmutableBucketAllocatorTest,
+     AllocationFailureEvictionBypassesLowWatermark) {
     TempDir tmp("bucket_evict_allocation_failure");
     constexpr uint64_t capacity = 10 * kAlignment;
     ImmutableBucketAllocator alloc;
@@ -1150,9 +1152,9 @@ TEST(ImmutableBucketAllocatorTest, AllocationFailureEvictionBypassesLowWatermark
     for (int batch = 0; batch < 4; ++batch) {
         std::vector<BatchAllocateRequest> requests;
         for (int i = 0; i < 6; ++i) {
-            requests.push_back({"key_" + std::to_string(batch) + "_" +
-                                    std::to_string(i),
-                                100});
+            requests.push_back(
+                {"key_" + std::to_string(batch) + "_" + std::to_string(i),
+                 100});
         }
         auto results = alloc.BatchAllocate(requests);
         for (const auto& result : results) ASSERT_TRUE(result.success);
@@ -1256,7 +1258,8 @@ TEST(ImmutableBucketAllocatorTest, EvictionDisabledYieldsNoCandidates) {
     EXPECT_FALSE(alloc.IsEvictionEnabled());
 }
 
-TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction) {
+TEST(ImmutableBucketAllocatorTest,
+     ReadableDescriptorSurvivesConcurrentEviction) {
     TempDir tmp("bucket_evict_inflight");
     const uint64_t capacity = kAlignment;
     ImmutableBucketAllocator alloc;
@@ -1287,8 +1290,7 @@ TEST(ImmutableBucketAllocatorTest, ReadableDescriptorSurvivesConcurrentEviction)
 TEST(ImmutableBucketAllocatorTest, ConcurrentAllocateProducesDisjointRegions) {
     TempDir tmp("bucket_concurrent_alloc");
     ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(
-        alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 32)));
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 4 * 1024 * 1024, 32)));
 
     constexpr int kThreads = 8;
     constexpr int kPerThread = 32;
@@ -1344,8 +1346,7 @@ TEST(ImmutableBucketAllocatorTest, ConcurrentAllocateProducesDisjointRegions) {
 TEST(ImmutableBucketAllocatorTest, ConcurrentFreeAndUpdateAccessAreSafe) {
     TempDir tmp("bucket_concurrent_free");
     ImmutableBucketAllocator alloc;
-    ASSERT_TRUE(
-        alloc.Init(MakeBucketConfig(tmp.path(), 1024 * 1024, 16)));
+    ASSERT_TRUE(alloc.Init(MakeBucketConfig(tmp.path(), 1024 * 1024, 16)));
 
     constexpr int kKeys = 64;
     std::vector<std::pair<std::string, DistributedFSDescriptor>> allocations;
@@ -1399,16 +1400,15 @@ TEST(GlobalAllocatorInterfaceTest, BothImplementationsWorkPolymorphically) {
     }
     {
         auto shard = std::make_unique<DfsGlobalAllocator>();
-        ASSERT_TRUE(shard->Init(
-            MakeShardConfig(shard_dir.path(), 4, 1024 * 1024)));
+        ASSERT_TRUE(
+            shard->Init(MakeShardConfig(shard_dir.path(), 4, 1024 * 1024)));
         allocators.push_back(std::move(shard));
     }
 
     for (auto& allocator : allocators) {
         EXPECT_TRUE(allocator->IsInitialized());
         auto desc = allocator->Allocate("poly_key", 100);
-        ASSERT_TRUE(desc.has_value())
-            << "type=" << ToString(allocator->Type());
+        ASSERT_TRUE(desc.has_value()) << "type=" << ToString(allocator->Type());
         EXPECT_EQ(desc->object_size, 100u);
         EXPECT_GT(desc->aligned_size, 0u);
         EXPECT_GT(allocator->GetTotalCapacity(), 0u);
@@ -1563,8 +1563,8 @@ TEST(BucketEntryLayoutTest, RebuildMatchesComputeAndRejectsMisalignment) {
     auto computed = ComputeBucketEntryLayout(alignment, 6, 200, alignment);
     ASSERT_TRUE(computed.has_value());
 
-    auto rebuilt = RebuildBucketEntryLayout(computed->entry_start, 6, 200,
-                                            alignment);
+    auto rebuilt =
+        RebuildBucketEntryLayout(computed->entry_start, 6, 200, alignment);
     ASSERT_TRUE(rebuilt.has_value());
     EXPECT_EQ(rebuilt->entry_start, computed->entry_start);
     EXPECT_EQ(rebuilt->value_offset, computed->value_offset);
@@ -1580,7 +1580,8 @@ TEST(BucketEntryLayoutTest, DescriptorConstructionIsCentralized) {
     auto layout = ComputeBucketEntryLayout(0, key.size(), 100, alignment);
     ASSERT_TRUE(layout.has_value());
 
-    auto desc = MakeBucketDescriptor("/tmp/bucket_000001.data", *layout, 100, 1);
+    auto desc =
+        MakeBucketDescriptor("/tmp/bucket_000001.data", *layout, 100, 1);
     EXPECT_EQ(desc.file_path, "/tmp/bucket_000001.data");
     EXPECT_EQ(desc.offset, layout->value_offset);
     EXPECT_EQ(desc.object_size, 100u);
@@ -1589,7 +1590,6 @@ TEST(BucketEntryLayoutTest, DescriptorConstructionIsCentralized) {
     // The value offset is intentionally not alignment-aligned in bucket mode.
     EXPECT_NE(desc.offset % alignment, 0u);
 }
-
 
 // ---------------------------------------------------------------------------
 // Metadata durability boundary: what an abrupt restart keeps and what it drops
@@ -1625,7 +1625,8 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartDropsTheActiveBucket) {
     ASSERT_FALSE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
     ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    ASSERT_TRUE(
+        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     // Losing the single active bucket is the accepted trade-off for keeping the
     // put path free of metadata I/O. Its data file must not be left behind.
     EXPECT_TRUE(recovered.TakeRecoveredReplicas().empty());
@@ -1660,7 +1661,8 @@ TEST(BucketMetadataDurabilityTest, AbruptRestartKeepsSealedBuckets) {
     ASSERT_TRUE(std::filesystem::exists(BucketMetaFile(tmp, 0)));
 
     ImmutableBucketAllocator recovered;
-    ASSERT_TRUE(recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
+    ASSERT_TRUE(
+        recovered.Init(MakeBucketConfig(tmp.path(), kBucketCapacity, 8)));
     auto replicas = recovered.TakeRecoveredReplicas();
     ASSERT_EQ(replicas.size(), 1u);
     EXPECT_EQ(replicas[0].key, "sealed_key");
@@ -1710,7 +1712,8 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
     // A small capacity makes buckets roll over constantly, so sealing (which
     // writes metadata inline) runs while other threads keep allocating.
     constexpr uint64_t kEntriesPerBucket = 8;
-    auto config = MakeBucketConfig(tmp.path(), kEntriesPerBucket * kAlignment, 64);
+    auto config =
+        MakeBucketConfig(tmp.path(), kEntriesPerBucket * kAlignment, 64);
     ImmutableBucketAllocator alloc;
     ASSERT_TRUE(alloc.Init(config));
 
@@ -1724,8 +1727,8 @@ TEST(BucketMetadataDurabilityTest, FlushRacesWithConcurrentAllocateAndCommit) {
                 std::this_thread::yield();
             }
             for (int i = 0; i < kPerThread; ++i) {
-                const std::string key = "race_" + std::to_string(t) + "_" +
-                                        std::to_string(i);
+                const std::string key =
+                    "race_" + std::to_string(t) + "_" + std::to_string(i);
                 auto desc = alloc.Allocate(key, 100);
                 if (desc) {
                     EXPECT_TRUE(alloc.MarkCommitted(key, *desc));

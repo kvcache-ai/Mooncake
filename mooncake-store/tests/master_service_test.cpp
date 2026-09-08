@@ -992,8 +992,7 @@ class ScopedBucketDfsEnv {
           eviction_("MOONCAKE_DFS_EVICTION_ENABLED", eviction_enabled),
           high_watermark_("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK",
                           high_watermark),
-          low_watermark_("MOONCAKE_DFS_EVICTION_LOW_WATERMARK",
-                         low_watermark),
+          low_watermark_("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", low_watermark),
           deferred_free_("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0"),
           single_tenant_("MOONCAKE_DFS_SINGLE_TENANT", "true"),
           shard_count_("MOONCAKE_DFS_SHARD_COUNT", "1"),
@@ -1083,8 +1082,7 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutCommitsAndRollsBackPerKey) {
         EXPECT_EQ(mixed_results[1].error(), ErrorCode::OBJECT_ALREADY_EXISTS);
         EXPECT_TRUE(mixed_results[2].has_value());
 
-        auto original =
-            service.GetReplicaList("batch_a", TenantId::Default());
+        auto original = service.GetReplicaList("batch_a", TenantId::Default());
         ASSERT_TRUE(original.has_value());
         EXPECT_NE(FindDfsDescriptor(original->replicas), nullptr);
 
@@ -1098,15 +1096,14 @@ TEST_F(MasterServiceTest, DfsBucketBatchPutCommitsAndRollsBackPerKey) {
         ASSERT_FALSE(duplicate_results[0].has_value());
         EXPECT_EQ(duplicate_results[0].error(), ErrorCode::INVALID_PARAMS);
         EXPECT_EQ(duplicate_results[1].error(), ErrorCode::INVALID_PARAMS);
-        auto duplicate_retry = service.PutStart(
-            context.client_id, duplicates[0], TenantId::Default(), 4096,
-            config);
+        auto duplicate_retry =
+            service.PutStart(context.client_id, duplicates[0],
+                             TenantId::Default(), 4096, config);
         ASSERT_TRUE(duplicate_retry.has_value());
         ASSERT_TRUE(service
                         .PutEnd(context.client_id,
                                 ObjectMeta{duplicates[0], std::nullopt},
-                                TenantId::Default(),
-                                ReplicaType::ALL)
+                                TenantId::Default(), ReplicaType::ALL)
                         .has_value());
         auto duplicate =
             service.GetReplicaList(duplicates[0], TenantId::Default());
@@ -1197,7 +1194,8 @@ TEST_F(MasterServiceTest, DfsBucketEvictionRemovesWholeBucket) {
 
         service.RunDfsEvictionForTesting();
 
-        auto evicted = service.GetReplicaList(keys.front(), TenantId::Default());
+        auto evicted =
+            service.GetReplicaList(keys.front(), TenantId::Default());
         ASSERT_TRUE(evicted.has_value());
         EXPECT_EQ(FindDfsDescriptor(evicted->replicas), nullptr);
         auto newest = service.GetReplicaList(keys.back(), TenantId::Default());
@@ -1228,8 +1226,8 @@ TEST_F(MasterServiceTest, DfsBucketEvictionHonorsLeaseAndPins) {
                                       TenantId::Default(), 100, config)
                             .has_value());
             ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key,
-                                    TenantId::Default(), ReplicaType::ALL)
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
                             .has_value());
         };
 
@@ -1281,13 +1279,13 @@ TEST_F(MasterServiceTest, DfsBucketMaxCountCanChangeWithinDescriptorRange) {
         EXPECT_EQ(*changed, 4);
         EXPECT_EQ(service.SetDfsMaxBucketCount(0).error(),
                   ErrorCode::INVALID_PARAMS);
-        EXPECT_EQ(service
-                      .SetDfsMaxBucketCount(
-                          static_cast<int64_t>(
-                              std::numeric_limits<int32_t>::max()) +
-                          1)
-                      .error(),
-                  ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(
+            service
+                .SetDfsMaxBucketCount(
+                    static_cast<int64_t>(std::numeric_limits<int32_t>::max()) +
+                    1)
+                .error(),
+            ErrorCode::INVALID_PARAMS);
 
         ReplicateConfig config;
         config.replica_num = 1;

@@ -31,9 +31,9 @@ struct BucketEntryLayout {
     // Fixed-width header holding the key length.
     static constexpr uint64_t kHeaderSize = sizeof(int64_t);
 
-    uint64_t entry_start = 0;   // aligned start of the whole entry
-    uint64_t value_offset = 0;  // where the value bytes begin
-    uint64_t entry_size = 0;    // header + key + value, without padding
+    uint64_t entry_start = 0;    // aligned start of the whole entry
+    uint64_t value_offset = 0;   // where the value bytes begin
+    uint64_t entry_size = 0;     // header + key + value, without padding
     uint64_t reserved_size = 0;  // entry_size rounded up to `alignment`
 
     uint64_t entry_end() const { return entry_start + reserved_size; }
@@ -120,8 +120,8 @@ inline std::optional<BucketEntryLayout> RebuildBucketEntryLayout(
  * field.
  */
 inline DistributedFSDescriptor MakeBucketDescriptor(
-    std::string data_path, const BucketEntryLayout& layout,
-    uint64_t value_size, int64_t bucket_id) {
+    std::string data_path, const BucketEntryLayout& layout, uint64_t value_size,
+    int64_t bucket_id) {
     DistributedFSDescriptor descriptor;
     descriptor.file_path = std::move(data_path);
     descriptor.offset = layout.value_offset;

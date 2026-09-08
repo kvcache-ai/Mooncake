@@ -897,8 +897,8 @@ class Client {
                                             const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
-    void SubmitDfsWrites(std::vector<PutOperation>& ops,
-                         bool is_upsert = false, bool allow_async = true);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert = false,
+                         bool allow_async = true);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);

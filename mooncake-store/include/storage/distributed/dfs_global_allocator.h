@@ -87,9 +87,8 @@ class DfsGlobalAllocator final : public GlobalAllocatorInterface {
 
     void Free(const std::string& key,
               const DistributedFSDescriptor& descriptor) override;
-    void UpdateAccess(
-        const std::string& key,
-        const DistributedFSDescriptor& descriptor) override;
+    void UpdateAccess(const std::string& key,
+                      const DistributedFSDescriptor& descriptor) override;
 
     void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
               const std::string& key);

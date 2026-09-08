@@ -188,8 +188,8 @@ std::vector<BatchAllocateResult> DfsGlobalAllocator::BatchAllocate(
     return results;
 }
 
-void DfsGlobalAllocator::Free(
-    const std::string& key, const DistributedFSDescriptor& descriptor) {
+void DfsGlobalAllocator::Free(const std::string& key,
+                              const DistributedFSDescriptor& descriptor) {
     Free(descriptor.offset, descriptor.aligned_size, descriptor.shard_idx, key);
 }
 

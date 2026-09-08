@@ -146,8 +146,9 @@ class FileSystemAdapter {
      * caller's scatter buffers. The default is suitable for adapters whose
      * direct handles accept ordinary vectored I/O.
      */
-    virtual tl::expected<size_t, ErrorCode> DirectReadAt(
-        int fd, iovec* iov, int iovcnt, int64_t offset) {
+    virtual tl::expected<size_t, ErrorCode> DirectReadAt(int fd, iovec* iov,
+                                                         int iovcnt,
+                                                         int64_t offset) {
         return ReadAt(fd, iov, iovcnt, offset);
     }
 

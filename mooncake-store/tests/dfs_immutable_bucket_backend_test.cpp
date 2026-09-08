@@ -98,9 +98,8 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
                 remaining -= take;
             }
             if (trimmed.empty()) return size_t{0};
-            return PosixFsAdapter::WriteAt(fd, trimmed.data(),
-                                           static_cast<int>(trimmed.size()),
-                                           offset);
+            return PosixFsAdapter::WriteAt(
+                fd, trimmed.data(), static_cast<int>(trimmed.size()), offset);
         }
         return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
     }
@@ -114,8 +113,8 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
         return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
     }
 
-    tl::expected<size_t, ErrorCode> DirectReadAt(
-        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+    tl::expected<size_t, ErrorCode> DirectReadAt(int fd, iovec* iov, int iovcnt,
+                                                 int64_t offset) override {
         const int call = ++read_calls_;
         if (call == fail_read_call_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -252,20 +251,20 @@ TEST_F(DfsBucketBackendTest, WrittenEntryContainsHeaderKeyValueAndPadding) {
 
     uint64_t stored_key_size = 0;
     for (size_t i = 0; i < BucketEntryLayout::kHeaderSize; ++i) {
-        stored_key_size |= static_cast<uint64_t>(
-                               static_cast<unsigned char>(buffer[i]))
-                           << (8 * i);
+        stored_key_size |=
+            static_cast<uint64_t>(static_cast<unsigned char>(buffer[i]))
+            << (8 * i);
     }
     EXPECT_EQ(stored_key_size, key.size());
-    EXPECT_EQ(std::string(buffer.data() + BucketEntryLayout::kHeaderSize,
-                          key.size()),
-              key);
-    EXPECT_EQ(std::string(buffer.data() + BucketEntryLayout::kHeaderSize +
-                              key.size(),
-                          value.size()),
-              value);
-    const size_t entry_size = BucketEntryLayout::kHeaderSize + key.size() +
-                              value.size();
+    EXPECT_EQ(
+        std::string(buffer.data() + BucketEntryLayout::kHeaderSize, key.size()),
+        key);
+    EXPECT_EQ(
+        std::string(buffer.data() + BucketEntryLayout::kHeaderSize + key.size(),
+                    value.size()),
+        value);
+    const size_t entry_size =
+        BucketEntryLayout::kHeaderSize + key.size() + value.size();
     EXPECT_TRUE(std::all_of(buffer.begin() + entry_size, buffer.end(),
                             [](char byte) { return byte == 0; }));
 }
@@ -286,7 +285,7 @@ TEST_F(DfsBucketBackendTest, MultiSliceValueWriteAndRead) {
     // Read back into differently-sized slices.
     std::vector<char> out_a(300), out_b(900);
     std::vector<Slice> read_slices{{out_a.data(), out_a.size()},
-                                  {out_b.data(), out_b.size()}};
+                                   {out_b.data(), out_b.size()}};
     auto read_results = backend_->BatchRead({{key, *desc, read_slices}});
     ASSERT_EQ(read_results.size(), 1u);
     ASSERT_TRUE(read_results[0].has_value());
@@ -299,9 +298,8 @@ TEST_F(DfsBucketBackendTest, MultiSliceValueWriteAndRead) {
 
 TEST_F(DfsBucketBackendTest, BatchWriteAndBatchReadPreserveRequestOrder) {
     std::vector<std::string> keys{"batch_a", "batch_b", "batch_c"};
-    std::vector<std::string> values{std::string(100, 'a'),
-                                    std::string(200, 'b'),
-                                    std::string(300, 'c')};
+    std::vector<std::string> values{
+        std::string(100, 'a'), std::string(200, 'b'), std::string(300, 'c')};
 
     std::vector<BatchAllocateRequest> requests;
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -417,9 +415,8 @@ TEST_F(DfsBucketBackendTest, RejectsMismatchedBucketFileName) {
 
     // The path must name the bucket the descriptor claims.
     auto wrong_name = desc;
-    wrong_name.file_path =
-        tmp_->file("bucket_" + ImmutableBucketAllocator::FormatBucketId(99) +
-                   ".data");
+    wrong_name.file_path = tmp_->file(
+        "bucket_" + ImmutableBucketAllocator::FormatBucketId(99) + ".data");
     std::string out(value.size(), '\0');
     std::vector<Slice> slices{{out.data(), out.size()}};
     auto results = backend_->BatchRead({{key, wrong_name, slices}});
@@ -503,9 +500,9 @@ TEST_F(DfsBucketBackendTest, PerKeyErrorsDoNotAffectOtherKeys) {
     std::vector<DfsWriteRequest> writes;
     for (size_t i = 0; i < keys.size(); ++i) {
         slices[i] = {{values[i].data(), values[i].size()}};
-        writes.push_back({keys[i], i == 1 ? failed_descriptor
-                                           : allocations[i].descriptor,
-                          slices[i]});
+        writes.push_back(
+            {keys[i], i == 1 ? failed_descriptor : allocations[i].descriptor,
+             slices[i]});
     }
     auto results = backend_->BatchWrite(writes);
     ASSERT_EQ(results.size(), 2u);
@@ -527,8 +524,7 @@ TEST_F(DfsBucketBackendTest, ShortWriteIsResumedNotReportedAsFailure) {
     // from where it left off rather than declaring a short write.
     adapter_->ShortWriteCall(adapter_->WriteCalls() + 1, 16);
 
-    std::vector<Slice> slices{
-        {const_cast<char*>(value.data()), value.size()}};
+    std::vector<Slice> slices{{const_cast<char*>(value.data()), value.size()}};
     auto results = backend_->BatchWrite({{key, *desc, slices}});
     ASSERT_EQ(results.size(), 1u);
     ASSERT_TRUE(results[0].has_value());
@@ -641,8 +637,7 @@ TEST_F(DfsBucketBackendTest, ObjectsSurviveAcrossBucketRollover) {
         values.push_back(std::string(500, static_cast<char>('a' + i)));
         auto desc = allocator.Allocate(key, values.back().size());
         ASSERT_TRUE(desc.has_value()) << "allocation " << i;
-        std::vector<Slice> slices{
-            {values.back().data(), values.back().size()}};
+        std::vector<Slice> slices{{values.back().data(), values.back().size()}};
         auto results = backend->BatchWrite({{key, *desc, slices}});
         ASSERT_EQ(results.size(), 1u);
         ASSERT_TRUE(results[0].has_value()) << "write " << i;
@@ -680,8 +675,7 @@ TEST_F(DfsBucketBackendTest, ConcurrentReadsAndWritesOnSharedBucket) {
     std::vector<std::thread> writers;
     for (int i = 0; i < kKeys; ++i) {
         writers.emplace_back([this, i, &keys, &values, &descriptors]() {
-            std::vector<Slice> slices{
-                {values[i].data(), values[i].size()}};
+            std::vector<Slice> slices{{values[i].data(), values[i].size()}};
             auto results =
                 backend_->BatchWrite({{keys[i], descriptors[i], slices}});
             EXPECT_EQ(results.size(), 1u);
@@ -713,7 +707,8 @@ TEST_F(DfsBucketBackendTest, ConcurrentReadsAndWritesOnSharedBucket) {
 
 TEST_F(DfsBucketBackendTest, ReadAfterAllocatorRecoveryReturnsSameBytes) {
     // Write data, drop the allocator, recover it, and read via the recovered
-    // descriptors: recovery must restore usable descriptors, not just bookkeeping.
+    // descriptors: recovery must restore usable descriptors, not just
+    // bookkeeping.
     BucketTempDir dir("dfs_bucket_recover_io");
     auto config = MakeBucketConfig(dir.path());
     // Recovery intentionally restores sealed buckets only. Two aligned
@@ -779,16 +774,15 @@ TEST_F(DfsBucketBackendTest, ParallelBatchReadAcrossBuckets) {
     // Create multiple objects in each bucket
     for (size_t bucket = 0; bucket < kNumBuckets; ++bucket) {
         for (size_t i = 0; i < kEntriesPerBucket; ++i) {
-            std::string key =
-                "parallel_bucket_" + std::to_string(bucket) + "_key_" +
-                std::to_string(i);
+            std::string key = "parallel_bucket_" + std::to_string(bucket) +
+                              "_key_" + std::to_string(i);
             std::string value(100 + i * 10, static_cast<char>('A' + bucket));
 
             auto desc = allocator_->Allocate(key, value.size());
             ASSERT_TRUE(desc.has_value()) << "Allocate failed for " << key;
 
-            std::vector<Slice> slices{{const_cast<char*>(value.data()),
-                                       value.size()}};
+            std::vector<Slice> slices{
+                {const_cast<char*>(value.data()), value.size()}};
             auto results = backend_->BatchWrite({{key, *desc, slices}});
             ASSERT_EQ(results.size(), 1u);
             ASSERT_TRUE(results[0].has_value()) << "Write failed for " << key;
@@ -829,17 +823,15 @@ TEST_F(DfsBucketBackendTest, NonContiguousEntriesInSameBucket) {
     // Create multiple objects with gaps between them
     std::vector<std::string> keys{"key1", "key2", "key3"};
     std::vector<std::string> values{
-        std::string(100, '1'),
-        std::string(200, '2'),
-        std::string(300, '3')};
+        std::string(100, '1'), std::string(200, '2'), std::string(300, '3')};
 
     std::vector<DistributedFSDescriptor> descriptors;
     for (size_t i = 0; i < keys.size(); ++i) {
         auto desc = allocator_->Allocate(keys[i], values[i].size());
         ASSERT_TRUE(desc.has_value());
 
-        std::vector<Slice> slices{{const_cast<char*>(values[i].data()),
-                                   values[i].size()}};
+        std::vector<Slice> slices{
+            {const_cast<char*>(values[i].data()), values[i].size()}};
         auto results = backend_->BatchWrite({{keys[i], *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
         ASSERT_TRUE(allocator_->MarkCommitted(keys[i], *desc));
@@ -858,8 +850,8 @@ TEST_F(DfsBucketBackendTest, NonContiguousEntriesInSameBucket) {
     }
     size_t out_idx = 0;
     for (size_t i : indices) {
-        read_slices[out_idx] = {{outputs[out_idx].data(),
-                                 outputs[out_idx].size()}};
+        read_slices[out_idx] = {
+            {outputs[out_idx].data(), outputs[out_idx].size()}};
         reads.push_back({keys[i], descriptors[i], read_slices[out_idx]});
         ++out_idx;
     }
@@ -887,8 +879,8 @@ TEST_F(DfsBucketBackendTest, SingleBucketPathFallsBackToSequential) {
         auto desc = allocator_->Allocate(key, value.size());
         ASSERT_TRUE(desc.has_value());
 
-        std::vector<Slice> slices{{const_cast<char*>(value.data()),
-                                   value.size()}};
+        std::vector<Slice> slices{
+            {const_cast<char*>(value.data()), value.size()}};
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
         ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
@@ -936,8 +928,8 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
         auto desc = allocator_->Allocate(key, value.size());
         ASSERT_TRUE(desc.has_value());
 
-        std::vector<Slice> slices{{const_cast<char*>(value.data()),
-                                   value.size()}};
+        std::vector<Slice> slices{
+            {const_cast<char*>(value.data()), value.size()}};
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
         ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
@@ -986,8 +978,8 @@ TEST_F(DfsBucketBackendTest, BatchReadWithDifferentThreadCounts) {
         auto desc = allocator_->Allocate(key, value.size());
         ASSERT_TRUE(desc.has_value());
 
-        std::vector<Slice> slices{{const_cast<char*>(value.data()),
-                                   value.size()}};
+        std::vector<Slice> slices{
+            {const_cast<char*>(value.data()), value.size()}};
         auto results = backend_->BatchWrite({{key, *desc, slices}});
         ASSERT_TRUE(results[0].has_value());
         ASSERT_TRUE(allocator_->MarkCommitted(key, *desc));
@@ -1078,8 +1070,8 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
         auto desc = allocator_->Allocate(keys[i], values[i].size());
         ASSERT_TRUE(desc.has_value()) << "Allocate failed for " << keys[i];
 
-        std::vector<Slice> slices{{const_cast<char*>(values[i].data()),
-                                   values[i].size()}};
+        std::vector<Slice> slices{
+            {const_cast<char*>(values[i].data()), values[i].size()}};
         auto results = backend_->BatchWrite({{keys[i], *desc, slices}});
         ASSERT_TRUE(results[0].has_value()) << "Write failed for " << keys[i];
         ASSERT_TRUE(allocator_->MarkCommitted(keys[i], *desc));
@@ -1099,8 +1091,8 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
 
     size_t out_idx = 0;
     for (size_t i : indices) {
-        read_slices[out_idx] = {{outputs[out_idx].data(),
-                                 outputs[out_idx].size()}};
+        read_slices[out_idx] = {
+            {outputs[out_idx].data(), outputs[out_idx].size()}};
         reads.push_back({keys[i], descriptors[i], read_slices[out_idx]});
         ++out_idx;
     }
@@ -1134,10 +1126,9 @@ TEST(PosixFsAdapterDirectReadTest, HandlesUnalignedScatterBuffers) {
         data[i] = static_cast<char>(i % 251);
     }
     const std::string path = dir.file("direct.data");
-    ASSERT_TRUE(adapter
-                    .WriteFile(path, std::span<const char>(data.data(),
-                                                           data.size()))
-                    .has_value());
+    ASSERT_TRUE(
+        adapter.WriteFile(path, std::span<const char>(data.data(), data.size()))
+            .has_value());
 
     auto fd = adapter.OpenFileDirect(path);
     ASSERT_TRUE(fd.has_value());
@@ -1160,10 +1151,9 @@ TEST(PosixFsAdapterDirectReadTest, ReportsShortReadPastEndOfFile) {
 
     std::vector<char> data(5000, 's');
     const std::string path = dir.file("short.data");
-    ASSERT_TRUE(adapter
-                    .WriteFile(path, std::span<const char>(data.data(),
-                                                           data.size()))
-                    .has_value());
+    ASSERT_TRUE(
+        adapter.WriteFile(path, std::span<const char>(data.data(), data.size()))
+            .has_value());
     auto fd = adapter.OpenFileDirect(path);
     ASSERT_TRUE(fd.has_value());
 
@@ -1185,10 +1175,9 @@ TEST(PosixFsAdapterDirectReadTest, ReusesStagingUnderConcurrentReads) {
         data[i] = static_cast<char>(i % 127);
     }
     const std::string path = dir.file("pool.data");
-    ASSERT_TRUE(adapter
-                    .WriteFile(path, std::span<const char>(data.data(),
-                                                           data.size()))
-                    .has_value());
+    ASSERT_TRUE(
+        adapter.WriteFile(path, std::span<const char>(data.data(), data.size()))
+            .has_value());
     auto fd = adapter.OpenFileDirect(path);
     ASSERT_TRUE(fd.has_value());
 

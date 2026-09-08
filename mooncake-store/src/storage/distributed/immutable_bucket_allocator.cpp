@@ -326,8 +326,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::PersistMetadata(
         return tl::make_unexpected(sync_file.error());
     }
 
-    // Creating a directory entry needs one directory sync. Rewriting an existing
-    // file changes no namespace metadata and deliberately avoids that DFS lock.
+    // Creating a directory entry needs one directory sync. Rewriting an
+    // existing file changes no namespace metadata and deliberately avoids that
+    // DFS lock.
     if (!meta_existed) {
         auto sync_dir = fs_adapter_->SyncDirectory(fsdir_);
         if (!sync_dir) {
@@ -356,7 +357,8 @@ void ImmutableBucketAllocator::DeleteBucketFiles(int64_t bucket_id) {
 // === bucket lifecycle ===
 
 tl::expected<ImmutableBucketAllocator::BucketPtr, ErrorCode>
-ImmutableBucketAllocator::CreateBucketUnlocked(std::unique_lock<std::mutex>& lock) {
+ImmutableBucketAllocator::CreateBucketUnlocked(
+    std::unique_lock<std::mutex>& lock) {
     if (max_bucket_count_ > 0 &&
         static_cast<int64_t>(buckets_.size()) >= max_bucket_count_) {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -450,7 +452,7 @@ ImmutableBucketAllocator::CreateBucketUnlocked(std::unique_lock<std::mutex>& loc
 
 tl::expected<ImmutableBucketAllocator::BucketPtr, ErrorCode>
 ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
-                                          uint64_t required) {
+                                             uint64_t required) {
     if (required > bucket_capacity_) {
         // Refuse rather than spill across buckets: the caller asked for one
         // contiguous region and no bucket can ever satisfy it.
@@ -489,7 +491,8 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
-void ImmutableBucketAllocator::TouchLruLocked(int64_t bucket_id, int64_t now_ns) {
+void ImmutableBucketAllocator::TouchLruLocked(int64_t bucket_id,
+                                              int64_t now_ns) {
     auto index_it = lru_index_.find(bucket_id);
     if (index_it != lru_index_.end()) {
         lru_list_.splice(lru_list_.begin(), lru_list_, index_it->second);
@@ -512,8 +515,8 @@ void ImmutableBucketAllocator::RemoveFromLruLocked(int64_t bucket_id) {
 
 tl::expected<DistributedFSDescriptor, ErrorCode>
 ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
-                                             const std::string& key,
-                                             uint64_t size) {
+                                                const std::string& key,
+                                                uint64_t size) {
     auto layout = ComputeBucketEntryLayout(bucket.append_offset, key.size(),
                                            size, alignment_);
     if (!layout) {
@@ -597,8 +600,7 @@ ImmutableBucketAllocator::FindMatchingEntryLocked(
 
     auto index_it = key_index_.find(key);
     if (index_it == key_index_.end()) return fail("key_not_indexed");
-    if (index_it->second != bucket_id)
-        return fail("key_index_bucket_mismatch");
+    if (index_it->second != bucket_id) return fail("key_index_bucket_mismatch");
     auto bucket_it = buckets_.find(bucket_id);
     if (bucket_it == buckets_.end()) return fail("bucket_not_found");
 
@@ -739,14 +741,14 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     // occur only between two objects, never inside one object.
     for (const size_t index : allocatable) {
         const auto& request = requests[index];
-        auto object_layout = ComputeBucketEntryLayout(
-            0, request.key.size(), request.size, alignment_);
+        auto object_layout = ComputeBucketEntryLayout(0, request.key.size(),
+                                                      request.size, alignment_);
         if (!object_layout) {
             fail_allocatable();
             break;
         }
-        auto bucket_result = EnsureActiveBucket(lock,
-                                                object_layout->reserved_size);
+        auto bucket_result =
+            EnsureActiveBucket(lock, object_layout->reserved_size);
         if (!bucket_result) {
             fail_allocatable();
             results[index].error = bucket_result.error();
@@ -795,8 +797,7 @@ bool ImmutableBucketAllocator::MarkCommitted(
     const std::string& key, const DistributedFSDescriptor& descriptor) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "DFS commit rejected: reason=allocator_not_initialized"
-                   << ", key=" << key
-                   << ", bucket_id=" << descriptor.shard_idx;
+                   << ", key=" << key << ", bucket_id=" << descriptor.shard_idx;
         return false;
     }
 
@@ -810,8 +811,7 @@ bool ImmutableBucketAllocator::MarkCommitted(
     }
     if (entry->state != BucketEntryState::PENDING) {
         LOG(ERROR) << "DFS commit rejected: reason=invalid_entry_state"
-                   << ", key=" << key
-                   << ", bucket_id=" << descriptor.shard_idx
+                   << ", key=" << key << ", bucket_id=" << descriptor.shard_idx
                    << ", state=" << static_cast<int32_t>(entry->state);
         return false;
     }
@@ -825,7 +825,7 @@ bool ImmutableBucketAllocator::MarkCommitted(
 }
 
 void ImmutableBucketAllocator::Free(const std::string& key,
-                                 const DistributedFSDescriptor& descriptor) {
+                                    const DistributedFSDescriptor& descriptor) {
     if (!initialized_.load(std::memory_order_acquire)) return;
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -853,10 +853,11 @@ void ImmutableBucketAllocator::Free(const std::string& key,
         key_index_.erase(index_it);
     }
     // The committed entry must be removed from the persisted snapshot so the
-    // key cannot come back, but the master calls Free() while holding a metadata
-    // shard lock, so no I/O may happen here. Mark the bucket instead and let
-    // FlushDirtyMetadata() rewrite its `.meta` file. For the still-active bucket
-    // there is nothing to rewrite yet; tombstones are omitted when it is sealed.
+    // key cannot come back, but the master calls Free() while holding a
+    // metadata shard lock, so no I/O may happen here. Mark the bucket instead
+    // and let FlushDirtyMetadata() rewrite its `.meta` file. For the
+    // still-active bucket there is nothing to rewrite yet; tombstones are
+    // omitted when it is sealed.
     //
     // Losing a tombstone in a crash before the flush is safe: recovery only
     // revives COMMITTED entries, and the master's own metadata (which no longer
@@ -867,7 +868,8 @@ void ImmutableBucketAllocator::Free(const std::string& key,
 size_t ImmutableBucketAllocator::FlushDirtyMetadata() {
     if (!initialized_.load(std::memory_order_acquire)) return 0;
 
-    // Snapshot every dirty bucket under the lock, then do the writes without it.
+    // Snapshot every dirty bucket under the lock, then do the writes without
+    // it.
     struct PendingWrite {
         int64_t bucket_id = -1;
         uint64_t generation = 0;
@@ -959,8 +961,7 @@ uint64_t ImmutableBucketAllocator::GetUsedBytes() const {
     return UsedBytesLocked();
 }
 
-tl::expected<int64_t, ErrorCode>
-ImmutableBucketAllocator::SetMaxBucketCount(
+tl::expected<int64_t, ErrorCode> ImmutableBucketAllocator::SetMaxBucketCount(
     int64_t new_max_bucket_count) {
     if (new_max_bucket_count <= 0 || new_max_bucket_count > kMaxBucketId) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -968,8 +969,8 @@ ImmutableBucketAllocator::SetMaxBucketCount(
     std::lock_guard<std::mutex> lock(mutex_);
     const int64_t old = max_bucket_count_;
     max_bucket_count_ = new_max_bucket_count;
-    LOG(INFO) << "Dynamic max_bucket_count changed from "
-              << old << " to " << new_max_bucket_count;
+    LOG(INFO) << "Dynamic max_bucket_count changed from " << old << " to "
+              << new_max_bucket_count;
     return old;
 }
 
@@ -1050,9 +1051,9 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
             // Tombstoned entries are already gone from the master's view; only
             // live entries need validating.
             if (!IsLive(entry.state)) continue;
-            auto layout = RebuildBucketEntryLayout(
-                entry.entry_offset, entry.key_size, entry.value_size,
-                alignment_);
+            auto layout =
+                RebuildBucketEntryLayout(entry.entry_offset, entry.key_size,
+                                         entry.value_size, alignment_);
             if (!layout) {
                 LOG(ERROR) << "Skipping DFS eviction of bucket "
                            << victim->bucket_id << ": entry for key " << key
@@ -1065,9 +1066,9 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
             candidate.offset = layout->value_offset;
             // Byte-identical to what Allocate handed out, so the master can
             // match replica metadata field by field.
-            candidate.descriptor = MakeBucketDescriptor(
-                BucketDataPath(victim->bucket_id), *layout, entry.value_size,
-                victim->bucket_id);
+            candidate.descriptor =
+                MakeBucketDescriptor(BucketDataPath(victim->bucket_id), *layout,
+                                     entry.value_size, victim->bucket_id);
             candidates.push_back(std::move(candidate));
         }
 
@@ -1160,7 +1161,7 @@ void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending) {
 }
 
 void ImmutableBucketAllocator::AbortEviction(PendingEviction&& pending,
-                                          bool demote) {
+                                             bool demote) {
     auto* owner = std::exchange(pending.owner_, nullptr);
     if (owner != this) return;
 
@@ -1221,9 +1222,10 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
     uint64_t max_generation = 0;
     // Buckets already reclaimed by this pass: their metadata could not be
     // trusted, so both files were deleted. A cache entry that cannot be proven
-    // correct is worse than a miss - the reader would recompute it anyway, while
-    // serving unverifiable bytes would silently corrupt the result. Tracked only
-    // so the orphan sweep below does not report them a second time.
+    // correct is worse than a miss - the reader would recompute it anyway,
+    // while serving unverifiable bytes would silently corrupt the result.
+    // Tracked only so the orphan sweep below does not report them a second
+    // time.
     std::unordered_set<int64_t> discarded_ids;
     // key -> (generation, bucket_id): resolves the same key appearing in more
     // than one bucket by keeping the newest committed generation.
@@ -1247,18 +1249,19 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
             if (read_ok) {
                 try {
                     struct_pb::from_pb(snapshot, payload);
-                    valid = snapshot.version == kBucketMetadataVersion &&
-                            ComputeMetadataChecksum(snapshot) ==
-                                snapshot.checksum;
+                    valid =
+                        snapshot.version == kBucketMetadataVersion &&
+                        ComputeMetadataChecksum(snapshot) == snapshot.checksum;
                 } catch (...) {
                     valid = false;
                 }
             }
         }
         if (!valid || snapshot.bucket_id != bucket_id) {
-            LOG(ERROR) << "Discarding DFS bucket " << bucket_id
-                       << ": no valid metadata snapshot, so none of its data can"
-                          " be proven correct";
+            LOG(ERROR)
+                << "Discarding DFS bucket " << bucket_id
+                << ": no valid metadata snapshot, so none of its data can"
+                   " be proven correct";
             DeleteBucketFiles(bucket_id);
             discarded_ids.insert(bucket_id);
             continue;
@@ -1341,10 +1344,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
                 bucket_ok = false;
                 break;
             }
-            auto layout = RebuildBucketEntryLayout(persisted.entry_offset,
-                                                   persisted.key_size,
-                                                   persisted.value_size,
-                                                   alignment_);
+            auto layout = RebuildBucketEntryLayout(
+                persisted.entry_offset, persisted.key_size,
+                persisted.value_size, alignment_);
             if (!layout || layout->reserved_size != persisted.reserved_size ||
                 layout->entry_end() > snapshot.capacity) {
                 LOG(ERROR) << "Discarding DFS bucket " << bucket_id
@@ -1392,10 +1394,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
         // Validate committed entries restored from the snapshot against the
         // data file. Pending reservations and tombstones were not serialized.
         for (auto& [key, entry] : bucket->entries) {
-            auto layout = RebuildBucketEntryLayout(entry.entry_offset,
-                                                   entry.key_size,
-                                                   entry.value_size,
-                                                   alignment_);
+            auto layout =
+                RebuildBucketEntryLayout(entry.entry_offset, entry.key_size,
+                                         entry.value_size, alignment_);
             if (!layout ||
                 layout->entry_end() > static_cast<uint64_t>(*data_size)) {
                 LOG(ERROR) << "Dropping committed DFS entry for key " << key
@@ -1419,9 +1420,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
                              << "; keeping the newer generation";
                 winner_it->second = {entry.generation, bucket_id};
             } else {
-                LOG(WARNING) << "DFS key " << key << " in bucket " << bucket_id
-                             << " is superseded by bucket "
-                             << winner_it->second.second;
+                LOG(WARNING)
+                    << "DFS key " << key << " in bucket " << bucket_id
+                    << " is superseded by bucket " << winner_it->second.second;
             }
         }
 
@@ -1446,9 +1447,9 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
             }
             key_index_[key] = bucket_id;
 
-            auto layout = RebuildBucketEntryLayout(
-                entry.entry_offset, entry.key_size, entry.value_size,
-                alignment_);
+            auto layout =
+                RebuildBucketEntryLayout(entry.entry_offset, entry.key_size,
+                                         entry.value_size, alignment_);
             if (!layout) continue;
             recovered_replicas_.push_back(RecoveredReplica{
                 key, MakeBucketDescriptor(BucketDataPath(bucket_id), *layout,
@@ -1457,8 +1458,8 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::RecoverFromDisk() {
     }
 
     // A data file with no `.meta` at all is the signature of a crash while the
-    // bucket was still active: its metadata only lived in memory, so nothing can
-    // ever address the data again. Reclaim it. Buckets rejected above were
+    // bucket was still active: its metadata only lived in memory, so nothing
+    // can ever address the data again. Reclaim it. Buckets rejected above were
     // already deleted, so they are skipped here to avoid a duplicate log line.
     for (const int64_t data_id : data_ids) {
         max_seen_id = std::max(max_seen_id, data_id);

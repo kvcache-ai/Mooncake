@@ -128,9 +128,9 @@ class ScopedBucketDfsAdminEnv {
    private:
     void Set(const std::string& name, const std::string& value) {
         const char* previous = ::getenv(name.c_str());
-        saved_.emplace_back(
-            name, previous ? std::optional<std::string>(previous)
-                           : std::nullopt);
+        saved_.emplace_back(name, previous
+                                      ? std::optional<std::string>(previous)
+                                      : std::nullopt);
         ::setenv(name.c_str(), value.c_str(), 1);
     }
 
@@ -606,10 +606,9 @@ TEST_F(MasterAdminServerTest, DfsMaxBucketCountEndpointValidatesAndUpdates) {
     EXPECT_EQ(payload.old_value, 4);
     EXPECT_EQ(payload.new_value, 8);
 
-    for (const std::string body : {
-             "{}", "{\"max_bucket_count\":0}",
-             "{\"max_bucket_count\":-1}",
-             "{\"max_bucket_count\":2147483648}", "not-json"}) {
+    for (const std::string body :
+         {"{}", "{\"max_bucket_count\":0}", "{\"max_bucket_count\":-1}",
+          "{\"max_bucket_count\":2147483648}", "not-json"}) {
         auto invalid = HttpPutJson(port, "/api/v1/dfs/max_bucket_count", body);
         EXPECT_EQ(invalid.http_status, 400) << body << ": " << invalid.body;
         HttpErrorResponse error;

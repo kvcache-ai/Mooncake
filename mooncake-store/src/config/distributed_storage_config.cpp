@@ -114,8 +114,8 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
     if (max_bucket_count <= 0 || max_bucket_count > kMaxBucketId) {
         LOG(ERROR) << "DistributedStorageConfig: max_bucket_count must be in "
                       "[1, "
-                   << kMaxBucketId << "], max_bucket_count="
-                   << max_bucket_count;
+                   << kMaxBucketId
+                   << "], max_bucket_count=" << max_bucket_count;
         return false;
     }
     if (static_cast<uint64_t>(max_bucket_count) >
@@ -180,9 +180,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Variables::MOONCAKE_DFS_EVICTION_CHECK_INTERVAL,
         static_cast<int>(config.eviction_check_interval.count())));
 
-    const std::string allocator_type_name = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_ALLOCATOR_TYPE,
-        std::string(ToString(config.allocator_type)));
+    const std::string allocator_type_name =
+        Environ::ReadOr(Variables::MOONCAKE_DFS_ALLOCATOR_TYPE,
+                        std::string(ToString(config.allocator_type)));
     if (auto parsed = ParseDfsAllocatorType(allocator_type_name)) {
         config.allocator_type = *parsed;
     } else {
@@ -192,18 +192,17 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     }
     config.bucket_capacity = Environ::ReadOr(
         Variables::MOONCAKE_DFS_BUCKET_CAPACITY, config.bucket_capacity);
-    config.max_bucket_count = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT,
-        static_cast<int>(config.max_bucket_count));
+    config.max_bucket_count =
+        Environ::ReadOr(Variables::MOONCAKE_DFS_MAX_BUCKET_COUNT,
+                        static_cast<int>(config.max_bucket_count));
     config.batch_read_threads = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_BATCH_READ_THREADS,
-        config.batch_read_threads);
-    config.batch_read_merge_enabled = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED,
-        config.batch_read_merge_enabled);
-    config.direct_read_enabled = Environ::ReadOr(
-        Variables::MOONCAKE_DFS_DIRECT_READ_ENABLED,
-        config.direct_read_enabled);
+        Variables::MOONCAKE_DFS_BATCH_READ_THREADS, config.batch_read_threads);
+    config.batch_read_merge_enabled =
+        Environ::ReadOr(Variables::MOONCAKE_DFS_BATCH_READ_MERGE_ENABLED,
+                        config.batch_read_merge_enabled);
+    config.direct_read_enabled =
+        Environ::ReadOr(Variables::MOONCAKE_DFS_DIRECT_READ_ENABLED,
+                        config.direct_read_enabled);
     return config;
 }
 

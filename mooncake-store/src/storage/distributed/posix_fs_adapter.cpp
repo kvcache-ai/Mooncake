@@ -326,8 +326,9 @@ void PosixFsAdapter::ReleaseDirectStaging(DirectStaging* slot) {
     slot->in_use = false;
 }
 
-tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(
-    int fd, iovec* iov, int iovcnt, int64_t offset) {
+tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(int fd, iovec* iov,
+                                                             int iovcnt,
+                                                             int64_t offset) {
     if (fd < 0 || offset < 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -357,8 +358,8 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     const uint64_t need = skip + total_length;
-    if (need > std::numeric_limits<uint64_t>::max() -
-                   (kDirectIoAlignment - 1)) {
+    if (need >
+        std::numeric_limits<uint64_t>::max() - (kDirectIoAlignment - 1)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     const uint64_t window_size =
@@ -373,7 +374,8 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(
 
     // RAII over the staging memory: hands a pooled slot back, or frees a
     // transient allocation, whichever this read ended up using.
-    DirectStaging* pooled = AcquireDirectStaging(static_cast<size_t>(window_size));
+    DirectStaging* pooled =
+        AcquireDirectStaging(static_cast<size_t>(window_size));
     void* transient = nullptr;
     char* window = nullptr;
     if (pooled != nullptr) {
