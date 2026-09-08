@@ -5,6 +5,7 @@ import io
 import json
 import sys
 import uuid
+from collections.abc import MutableMapping
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -969,14 +970,14 @@ class MooncakeBundleTransfer:
                 )
         meta_info = _select_mapping(ref.meta_info, meta_info_keys)
         staged_matrices = {read.name: batch[read.name] for read in matrix_reads}
-        for read in matrix_reads:
-            if read.destination is not None:
-                batch[read.name] = read.destination
         result = _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
         )
         for read in matrix_reads:
-            batch[read.name] = read.finish(staged_matrices[read.name])
+            value = read.finish(staged_matrices[read.name])
+            if read.destination is not None:
+                batch[read.name] = value
+                _rebind_dataproto_batch_value(result, read.name, value)
         return result
 
     def _read_dataproto_matrices(
@@ -2092,6 +2093,19 @@ def _build_dataproto_like_result(
             f"{getattr(data_cls, '__name__', data_cls)!r} cannot be constructed from "
             "batch, non_tensor_batch, and meta_info"
         ) from error
+
+
+def _rebind_dataproto_batch_value(result: Any, name: str, value: Any) -> None:
+    """Update a constructed DataProto result after committing a destination."""
+    if isinstance(result, Mapping):
+        batch = result.get("batch")
+    else:
+        batch = getattr(result, "batch", None)
+    if not isinstance(batch, MutableMapping):
+        raise TypeError(
+            "DataProto result batch must be a mutable mapping when using destinations"
+        )
+    batch[name] = value
 
 
 def _split_dataproto_like(
@@ -3391,7 +3405,12 @@ class _StructuredObjectLayer:
 
     def _materialize_matrix_fallback(self, read: _MatrixRead) -> Any:
         value = self._read_structured_member(
-            read.name, read.payload_spec, read.field_spec, None, None
+            read.name,
+            read.payload_spec,
+            read.field_spec,
+            None,
+            None,
+            use_buffer_pool=False,
         )
         rows = (
             slice(read.rows.start, read.rows.stop, read.rows.step)
@@ -3434,6 +3453,8 @@ class _StructuredObjectLayer:
         field_spec: Mapping[str, Any],
         member_slice: StructuredMemberSlice | None,
         destination: Any,
+        *,
+        use_buffer_pool: bool = True,
     ) -> Any:
         encoding = field_spec.get("encoding", "bytes")
         if encoding == "bytes":
@@ -3442,12 +3463,21 @@ class _StructuredObjectLayer:
             )
         if encoding == "torch_tensor":
             return self._read_torch_tensor_member(
-                name, payload_spec, field_spec, member_slice, destination
+                name,
+                payload_spec,
+                field_spec,
+                member_slice,
+                destination,
             )
         if encoding != "ndarray":
             raise ValueError(f"unsupported structured field encoding: {encoding}")
         return self._read_ndarray_member(
-            name, payload_spec, field_spec, member_slice, destination
+            name,
+            payload_spec,
+            field_spec,
+            member_slice,
+            destination,
+            use_buffer_pool=use_buffer_pool,
         )
 
     def _read_torch_tensor_member(
@@ -3607,6 +3637,8 @@ class _StructuredObjectLayer:
         field_spec: Mapping[str, Any],
         member_slice: StructuredMemberSlice | None,
         destination: Any,
+        *,
+        use_buffer_pool: bool = True,
     ) -> np.ndarray:
         dtype = field_spec.get("dtype")
         shape = field_spec.get("shape")
@@ -3617,7 +3649,12 @@ class _StructuredObjectLayer:
         read_plan = _resolve_ndarray_read_plan(
             tuple(int(dim) for dim in shape), np.dtype(dtype), member_slice
         )
-        if destination is None and read_plan.byte_length > 0 and read_plan.step == 1:
+        if (
+            use_buffer_pool
+            and destination is None
+            and read_plan.byte_length > 0
+            and read_plan.step == 1
+        ):
             target = self._bundle_store.read_payload_range_into_pool_array(
                 payload_spec,
                 read_plan.dtype,

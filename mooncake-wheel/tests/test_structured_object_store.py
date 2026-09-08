@@ -266,6 +266,19 @@ class FakeBufferPool:
         return FakeLease(self, size)
 
 
+class NonBlockingOnlyBufferPool:
+    def __init__(self) -> None:
+        self.acquire_calls = 0
+        self.acquire_blocks: list[object] = []
+
+    def acquire(self, _size: int, block: object = None):
+        self.acquire_calls += 1
+        self.acquire_blocks.append(block)
+        if block is not False:
+            raise AssertionError("fallback attempted a blocking buffer-pool acquire")
+        return None
+
+
 class FailingRangeStore(InMemoryStore):
     def __init__(self) -> None:
         super().__init__()
@@ -1585,6 +1598,31 @@ def test_dataproto_matrix_range_cap_falls_back(monkeypatch) -> None:
     assert plain_store.get_into_ranges_calls == 0
 
 
+def test_dataproto_matrix_fallback_does_not_block_on_buffer_pool() -> None:
+    pool = NonBlockingOnlyBufferPool()
+    store, transfer = make_transfer()
+    matrix = np.arange(48, dtype=np.int16).reshape(6, 8)
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"matrix": matrix}), chunk_bytes=2
+    )
+    transfer._transport._buffer_pool = pool
+    destination = np.full((3, 4), -1, dtype=np.int16)
+
+    result = transfer.get_dataproto(
+        ref,
+        batch_fields=["matrix"],
+        rows=[4, 0, 2],
+        batch_slices={"matrix": slice(3, 7)},
+        destinations={"matrix": destination},
+    )
+
+    assert np.array_equal(destination, matrix[[4, 0, 2], 3:7])
+    assert result["batch"]["matrix"] is destination
+    assert pool.acquire_calls == 1
+    assert pool.acquire_blocks == [False]
+    assert store.get_into_ranges_calls == 1
+
+
 def test_dataproto_matrix_range_failure_does_not_modify_destination() -> None:
     store = FailingRangeStore()
     _store, transfer = make_transfer(store=store, buffer_pool=FakeBufferPool())
@@ -1661,7 +1699,10 @@ def test_dataproto_copied_result_keeps_matrix_destination() -> None:
         @classmethod
         def from_dict(cls, batch, non_tensor_batch=None, meta_info=None):
             return cls(
-                batch=dict(batch),
+                batch={
+                    name: value.copy() if isinstance(value, np.ndarray) else value
+                    for name, value in batch.items()
+                },
                 non_tensor_batch=dict(non_tensor_batch or {}),
                 meta_info=dict(meta_info or {}),
             )
