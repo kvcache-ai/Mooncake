@@ -229,6 +229,7 @@ struct TaskInfo {
 
 class TransferEngineImpl {
     friend class ProxyManager;
+    friend class TransferEngine;
     friend class ::mooncake::TransferEngineImplTestPeer;
 
    public:
@@ -433,10 +434,13 @@ class TransferEngineImpl {
 
     struct PreparedSubmit;
 
+    Status submitTransferRequiringPostSubmitCancellation(
+        BatchID batch_id, const std::vector<Request>& request_list);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
-                          const Notification* notifi,
-                          QueueOwnerKind owner_kind);
+                          const Notification* notifi, QueueOwnerKind owner_kind,
+                          bool require_post_submit_cancellation = false);
 
     Status submitStagingTransfer(BatchID batch_id,
                                  const std::vector<Request>& request_list);
@@ -448,7 +452,8 @@ class TransferEngineImpl {
                            QueueOwnerKind owner_kind) const;
 
     Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
-                         PreparedSubmit& prepared);
+                         PreparedSubmit& prepared,
+                         bool require_post_submit_cancellation = false);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
 

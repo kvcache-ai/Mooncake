@@ -295,6 +295,9 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    Status submitScatterTransfer(BatchID batch_id,
+                                 const std::vector<TransferRequest>& entries);
+
     std::shared_ptr<mooncake::tent::Config> buildTentConfig(
         const std::string& metadata_conn_string,
         const std::string& local_server_name) const;
