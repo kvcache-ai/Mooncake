@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from math import prod
 from typing import Literal, Optional, TypeVar, Union, cast
 
@@ -17,13 +17,14 @@ from ..contracts import RuntimeBindingFragment as _RuntimeBindingFragment
 RuntimeBindingFragment = _RuntimeBindingFragment
 
 _MAX_U64 = (1 << 64) - 1
-ParallelAxisKind = Literal["dp", "pp", "ep", "tp"]
-SplitAxisKind = Literal["ep", "tp"]
+ParallelAxisKind = Literal["dp", "pp", "ep", "tp", "cp"]
+SplitAxisKind = Literal["ep", "tp", "cp"]
 _PARALLEL_AXIS_ORDER: dict[ParallelAxisKind, int] = {
     "dp": 0,
     "pp": 1,
     "ep": 2,
     "tp": 3,
+    "cp": 4,
 }
 _T = TypeVar("_T")
 
@@ -41,10 +42,19 @@ class ParallelRank:
     tp: int = 0
     pp: int = 0
     ep: int = 0
+    cp: int = 0
 
     def __post_init__(self) -> None:
-        for name in ("dp", "tp", "pp", "ep"):
+        for name in ("dp", "tp", "pp", "ep", "cp"):
             _require_integer(getattr(self, name), f"parallel rank {name}", minimum=0)
+
+
+def _parallel_rank_identity(rank: ParallelRank) -> dict[str, int]:
+    # Preserve canonical IDs and wire payloads for existing CP-free placements.
+    result = {"dp": rank.dp, "tp": rank.tp, "pp": rank.pp, "ep": rank.ep}
+    if rank.cp != 0:
+        result["cp"] = rank.cp
+    return result
 
 
 @dataclass(frozen=True)
@@ -56,7 +66,7 @@ class SplitAxis:
 
     def __post_init__(self) -> None:
         _validate_parallel_axis_kind(self.kind)
-        if self.kind not in {"ep", "tp"}:
+        if self.kind not in {"ep", "tp", "cp"}:
             raise ValueError(f"{self.kind} cannot use split semantics")
         _require_integer(self.dim, "split axis dim", minimum=0)
         if self.kind == "ep" and self.dim != 0:
@@ -367,7 +377,7 @@ def _canonical_placement_fragment_id(
         "global_offset": global_offset,
         "local_shape": local_shape,
         "nbytes": nbytes,
-        "rank": asdict(rank),
+        "rank": _parallel_rank_identity(rank),
         "aliases": aliases,
     }
     if pipeline_stage_id is not None:

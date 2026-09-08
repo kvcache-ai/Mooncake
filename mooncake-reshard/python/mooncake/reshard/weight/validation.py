@@ -216,11 +216,11 @@ def _validate_undeclared_axis_dependencies(
         for kind in declared_axis_kinds
         if len({getattr(fragment.rank, kind) for fragment in fragments}) > 1
     )
-    for kind in ("dp", "pp", "ep", "tp"):
+    for kind in ("dp", "pp", "ep", "tp", "cp"):
         if kind in declared_axis_kinds or getattr(topology, f"{kind}_size") == 1:
             continue
         coordinates = {getattr(fragment.rank, kind) for fragment in fragments}
-        if kind in {"dp", "pp"} or len(coordinates) <= 1:
+        if kind in {"dp", "pp", "cp"} or len(coordinates) <= 1:
             raise ValueError(
                 "global placement tensor requires explicit parallel semantics "
                 f"for active undeclared {kind} axis: {tensor.tensor_id}"

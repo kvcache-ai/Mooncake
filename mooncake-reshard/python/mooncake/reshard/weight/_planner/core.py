@@ -138,7 +138,13 @@ def _build_placement_executor_plans(
                 )
             )
     result.sort(
-        key=lambda item: (item.rank.dp, item.rank.pp, item.rank.ep, item.rank.tp)
+        key=lambda item: (
+            item.rank.dp,
+            item.rank.pp,
+            item.rank.ep,
+            item.rank.tp,
+            item.rank.cp,
+        )
     )
     return tuple(result)
 

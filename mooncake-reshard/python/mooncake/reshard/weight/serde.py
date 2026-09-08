@@ -38,6 +38,7 @@ from .types import (
     SplitAxis,
     SplitAxisKind,
     TensorDescriptor,
+    _parallel_rank_identity,
 )
 
 JsonScalar: TypeAlias = Union[None, bool, int, float, str]
@@ -183,6 +184,7 @@ def _topology_to_wire(topology: ParallelTopology) -> dict[str, JsonValue]:
         "pp_size": topology.pp_size,
         "ep_size": topology.ep_size,
         "dp_size": topology.dp_size,
+        **({"cp_size": topology.cp_size} if topology.cp_size != 1 else {}),
         "topology_id": topology.topology_id,
         "participants": [
             {
@@ -199,6 +201,7 @@ def _topology_from_wire(value: object) -> ParallelTopology:
         value,
         {"tp_size", "pp_size", "ep_size", "dp_size", "topology_id", "participants"},
         "parallel topology",
+        optional={"cp_size"},
     )
     participants: list[TopologyParticipant] = []
     for index, item in enumerate(
@@ -226,6 +229,7 @@ def _topology_from_wire(value: object) -> ParallelTopology:
         pp_size=_require_integer(topology["pp_size"], "pp_size", minimum=1),
         ep_size=_require_integer(topology["ep_size"], "ep_size", minimum=1),
         dp_size=_require_integer(topology["dp_size"], "dp_size", minimum=1),
+        cp_size=_require_integer(topology.get("cp_size", 1), "cp_size", minimum=1),
         participants=tuple(participants),
         topology_id=TopologyId(
             _require_nonempty_string(topology["topology_id"], "topology_id")
@@ -384,16 +388,19 @@ def _fragment_from_wire(value: object, index: int) -> PlacementFragment:
 
 
 def _rank_to_wire(rank: ParallelRank) -> dict[str, JsonValue]:
-    return {"dp": rank.dp, "tp": rank.tp, "pp": rank.pp, "ep": rank.ep}
+    return {kind: value for kind, value in _parallel_rank_identity(rank).items()}
 
 
 def _rank_from_wire(value: object, label: str) -> ParallelRank:
-    rank = _require_exact_fields(value, {"dp", "tp", "pp", "ep"}, label)
+    rank = _require_exact_fields(
+        value, {"dp", "tp", "pp", "ep"}, label, optional={"cp"}
+    )
     return ParallelRank(
         dp=_require_integer(rank["dp"], "rank dp", minimum=0),
         tp=_require_integer(rank["tp"], "rank tp", minimum=0),
         pp=_require_integer(rank["pp"], "rank pp", minimum=0),
         ep=_require_integer(rank["ep"], "rank ep", minimum=0),
+        cp=_require_integer(rank.get("cp", 0), "rank cp", minimum=0),
     )
 
 
@@ -435,9 +442,11 @@ def _require_exact_fields(
     value: object,
     expected: AbstractSet[str],
     label: str,
+    *,
+    optional: AbstractSet[str] = frozenset(),
 ) -> JsonObject:
     mapping = _require_mapping(value, label)
-    if set(mapping) != set(expected):
+    if not expected <= set(mapping) <= expected | optional:
         raise ValueError(f"{label} schema fields do not match contract")
     return mapping
 
@@ -485,13 +494,13 @@ def _integer_tuple(
 
 def _parallel_axis_kind(value: object) -> ParallelAxisKind:
     kind = _require_nonempty_string(value, "parallel axis kind")
-    if kind not in {"dp", "pp", "ep", "tp"}:
+    if kind not in {"dp", "pp", "ep", "tp", "cp"}:
         raise ValueError(f"unsupported parallel axis kind: {kind}")
     return cast(ParallelAxisKind, kind)
 
 
 def _split_axis_kind(value: object) -> SplitAxisKind:
     kind = _parallel_axis_kind(value)
-    if kind not in {"ep", "tp"}:
+    if kind not in {"ep", "tp", "cp"}:
         raise ValueError(f"{kind} cannot use split semantics")
     return cast(SplitAxisKind, kind)
