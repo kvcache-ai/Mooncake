@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <optional>
 #include <regex>
@@ -174,6 +175,17 @@ class SnapshotChildProcessTest : public ::testing::Test {
             auto temp_manager = CreateTempSnapshotManager();
             temp_manager->HandleChildTimeout(pid, snapshot_id);
         }
+    }
+
+    void CallWaitForSnapshotChild(MasterSnapshotManager& manager, pid_t pid,
+                                  const std::string& snapshot_id,
+                                  int log_pipe_fd) {
+        manager.snapshot_running_ = true;
+        manager.WaitForSnapshotChild(pid, snapshot_id, log_pipe_fd);
+    }
+
+    std::unique_ptr<MasterSnapshotManager> CreateSnapshotManagerForTest() {
+        return CreateTempSnapshotManager();
     }
 
     void CallCleanupOldSnapshot(int keep_count,
@@ -411,6 +423,43 @@ TEST_F(SnapshotChildProcessTest, HandleChildTimeout_KillsSleepingChild) {
     // result should be -1 (already reaped) or pid (just reaped)
     // It should NOT be 0 (still running)
     EXPECT_NE(result, 0) << "Child process should have been terminated";
+}
+
+TEST_F(SnapshotChildProcessTest, StopInterruptsRunningSnapshotChild) {
+    CreateDefaultService();
+    auto manager = CreateSnapshotManagerForTest();
+
+    int log_pipe[2];
+    ASSERT_EQ(pipe(log_pipe), 0);
+    pid_t pid = fork();
+    ASSERT_NE(pid, -1) << "fork failed";
+    if (pid == 0) {
+        close(log_pipe[0]);
+        sleep(300);
+        _exit(0);
+    }
+    close(log_pipe[1]);
+
+    auto waiter = std::async(std::launch::async, [&] {
+        CallWaitForSnapshotChild(*manager, pid, "test_snapshot_stop",
+                                 log_pipe[0]);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    manager->Stop();
+
+    const auto wait_status = waiter.wait_for(std::chrono::seconds(2));
+    if (wait_status != std::future_status::ready) {
+        // Keep a regression from leaving this test blocked until the manager's
+        // configured 60-second snapshot timeout.
+        kill(pid, SIGTERM);
+    }
+    EXPECT_EQ(wait_status, std::future_status::ready);
+    waiter.get();
+    close(log_pipe[0]);
+
+    int status;
+    EXPECT_EQ(waitpid(pid, &status, WNOHANG), -1)
+        << "Snapshot child should already be reaped";
 }
 
 // ========== CleanupOldSnapshot ==========
