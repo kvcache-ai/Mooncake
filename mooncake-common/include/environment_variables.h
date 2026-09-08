@@ -123,6 +123,16 @@ struct TransferSubmitterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
 };
 
+struct NvmeKvConnectorEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_DEVICE_PATH);
+    // Keep numeric values as strings because the existing NVMe parser accepts
+    // base prefixes, a leading plus, and leading whitespace.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_NSID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_QUEUE_DEPTH);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_TRANSPORT);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
