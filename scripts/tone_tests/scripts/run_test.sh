@@ -34,26 +34,26 @@ RUN_DIR="$TONE_TESTS_DIR/run"
 
 get_test_type() {
     local test_name=$1
-    
+
     if [ ! -f "$TONE_TESTS_DIR/scripts/$test_name" ]; then
         echo "unknown"
         return 1
     fi
-    
+
     local test_type=$(grep "^TEST_TYPE=" "$TONE_TESTS_DIR/scripts/$test_name" | head -n 1 | cut -d'"' -f2)
-    
+
     if [ -z "$test_type" ]; then
         echo "unknown"
         return 1
     fi
-    
+
     echo "$test_type"
     return 0
 }
 
 get_framework_from_test_array() {
     local test_array_name=$1
-    
+
     case $test_array_name in
         "All_TEST_SCRIPTS_SGLANG")
             echo "SGLANG"
@@ -69,14 +69,14 @@ get_framework_from_test_array() {
 
 get_framework_from_test_name() {
     local test_name=$1
-    
+
     for vllm_test in "${All_TEST_SCRIPTS_VLLM[@]}"; do
         if [ "$test_name" = "$vllm_test" ]; then
             echo "VLLM"
             return 0
         fi
     done
-    
+
     # default SGLANG
     echo "SGLANG"
 }
@@ -120,7 +120,7 @@ is_base_env_prepared() {
 }
 
 prepare_single_env(){
-    local registry_addr=$1 
+    local registry_addr=$1
     local framework_type=$2
 
     if is_base_env_prepared; then
@@ -129,7 +129,7 @@ prepare_single_env(){
     fi
 
     echo "===== Preparing environment for $framework_type (registry: $registry_addr) ====="
-    
+
     setup_directory $RUN_DIR
     setup_directory $RUN_DIR/logs
 
@@ -183,17 +183,17 @@ prepare_double_env(){
 
     echo "Preparing remote machine $REMOTE_IP..."
     ${SSH_CMD} $REMOTE_IP "rm -rf ${REMOTE_TEST_DIR} && mkdir -p ${REMOTE_TEST_DIR}"
-    
+
     rsync -av ${TONE_TESTS_DIR}/ $REMOTE_IP:${REMOTE_TEST_DIR}/
     if [ $? -ne 0 ]; then
         echo "Failed to sync files to remote server"
         return 1
     fi
-    
+
     ${SSH_CMD} $REMOTE_IP "sed -i 's|^export BASE_DIR=.*$|export BASE_DIR=${REMOTE_TEST_DIR}|' ${REMOTE_TEST_DIR}/run/.shrc && \
                             sed -i 's|^export TEST_RUN_DIR=.*$|export TEST_RUN_DIR=${REMOTE_TEST_DIR}/run|' ${REMOTE_TEST_DIR}/run/.shrc && \
                             sed -i 's|^export TEST_RESULT_DIR=.*$|export TEST_RESULT_DIR=${REMOTE_TEST_DIR}/logs|' ${REMOTE_TEST_DIR}/run/.shrc"
-    
+
     echo "Remote preparation completed successfully"
 
     return 0
@@ -223,7 +223,7 @@ setup_env_for_test() {
             setup_node_env '${registry_addr}'
         " || { echo "ERROR: Remote setup failed"; return 1; }
     fi
-    
+
     echo "All environments are ready."
 }
 
@@ -234,9 +234,9 @@ run_single_test(){
 
     local framework_type=$(get_framework_from_test_name "$test_name")
     echo "Test $test_name will use framework: $framework_type"
-    
+
     setup_env_for_test "$test_name" "$framework_type" || return 1
-    
+
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
     source "./$test_name"
@@ -246,7 +246,7 @@ run_single_test(){
 
     local exit_code=0
     run_test "$@" || exit_code=1
-    
+
     if declare -f parse >/dev/null 2>&1; then
         parse "$exit_code" || exit_code=1
     fi
@@ -267,12 +267,12 @@ run_all_tests(){
 
     local framework_type=$(get_framework_from_test_array "$input_tests")
     echo "===== Running All Tests for $framework_type Framework (Double Machine Mode) ====="
-    
+
     setup_env_for_test "all" "$framework_type" || return 1
-    
+
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
-    
+
     local all_passed=true
     local test_index=0
     local test_count=${#tests[@]}
@@ -290,11 +290,11 @@ run_all_tests(){
         source "./$test_name"
         local exit_code=0
         run_test || exit_code=1
-        
+
         if declare -f parse >/dev/null 2>&1; then
             parse "$exit_code" || exit_code=1
         fi
-        
+
         [ $exit_code -ne 0 ] && all_passed=false
 
         # Container is shared across cases in run-all. Do not schedule another
@@ -307,7 +307,7 @@ run_all_tests(){
             break
         fi
     done
-    
+
     cleanup_test_env "double"
     $all_passed && return 0 || return 1
 }
@@ -335,7 +335,7 @@ case "$1" in
         # No parameter specified, run both SGLANG and VLLM tests
         echo "No framework specified, running all SGLANG tests..."
         run_all_tests "All_TEST_SCRIPTS_SGLANG"
-        
+
         echo "Running all VLLM tests..."
         run_all_tests "All_TEST_SCRIPTS_VLLM"
     else
