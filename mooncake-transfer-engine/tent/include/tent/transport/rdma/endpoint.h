@@ -16,6 +16,7 @@
 #define TENT_ENDPOINT_H
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <queue>
 #include <unordered_set>
@@ -160,11 +161,25 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
         bool failed;
     };
 
-    int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index);
+    // Post as many of `slice_list` as the queue pair's budget allows and
+    // return how many were taken (posted or marked `failed`). `on_post`,
+    // when given, runs for each of those before ibv_post_send: on a shared
+    // queue pair another lane can poll a completion before this call
+    // returns, so whatever the poller must find in place (the posted
+    // device, the set entry) has to be written first. Slices the hardware
+    // rejects come back with `failed` set; the caller undoes what it did for
+    // them.
+    int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
+                     const std::function<void(RdmaSlice*)>& on_post = {});
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
-    size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status);
+    // Pop `slice` and every slice queued before it on the same QP, giving
+    // them `status`. `on_each` is invoked for every popped slice so the
+    // caller can return per-slice accounting (the worker's selector charge)
+    // for slices it never sees otherwise.
+    size_t acknowledge(RdmaSlice* slice, TransferStatusEnum status,
+                       const std::function<void(RdmaSlice*)>& on_each = {});
 
     std::atomic<int>* getQuotaCounter(int qp_index) const {
         return &wr_depth_list_[qp_index].value;
@@ -204,6 +219,7 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
    private:
     friend class EndpointTestAccess;
+    friend class RdmaEndPointTestPeer;
 
     std::atomic<EndPointStatus> status_;
     RdmaContext* context_;
@@ -215,8 +231,15 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Empty = default single pool spanning all of qp_list_. Each segment's
     // [begin, begin+num_qp) indexes into qp_list_. Read-only after construct().
     std::vector<QpPoolSegment> qp_pool_segments_;
-    // Each data QP queue is owned by exactly one worker lane; reset/deconstruct
-    // are synchronized by the endpoint lifecycle lock.
+    // One queue per data QP. With the default lane layout a queue pair is
+    // posted and polled by a single worker lane. A qp_pools layout with
+    // fewer QPs than lanes folds several lanes onto one queue pair, and
+    // then two lanes can reach the same queue at once: submitSlices and
+    // acknowledge both hold only a read guard, which does not exclude them
+    // from each other, and the queue itself is unsynchronized. That is a
+    // data race in that layout, not a property this code relies on; it
+    // needs a per-QP lock. reset/deconstruct are synchronized by the
+    // endpoint lifecycle lock.
     std::vector<BoundedSliceQueue> slice_queue_;
     WrDepthBlock* wr_depth_list_;
     std::atomic<int> inflight_slices_;
