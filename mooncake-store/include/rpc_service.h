@@ -198,6 +198,8 @@ class WrappedMasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const std::string& tenant_id);
     tl::expected<uint64_t, ErrorCode> GetTenantQuotaAllocatableCapacityBytes();
+    tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
+        int64_t new_max_bucket_count);
 
     tl::expected<std::vector<std::string>, ErrorCode> GetAllKeysForAdmin();
 
