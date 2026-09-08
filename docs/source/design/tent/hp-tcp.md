@@ -203,11 +203,17 @@ as rail placement.
 ### Measured scope
 
 On two Xeon 8457C virtual machines, with four workers and four total lanes,
-three interleaved runs (1-second warmup, 3-second measurement) gave median
-single-task 64 MiB READ throughput of 3.22 GB/s on one rail and 6.46 GB/s on
-two. Four concurrent READs showed no additional gain (11.13 vs 10.96 GB/s).
-Small 4 KiB READs averaged 72 vs 78 microseconds. Both interfaces carried
-payload-direction traffic, but their underlying resource independence is not
-guaranteed. A same-pool 4 KiB/64 MiB closed-loop mix still delayed small tasks
-behind large ones: static slicing offers neither latency isolation nor
+three interleaved runs (1-second warmup, 3-second measurement) gave the
+following medians:
+
+| READ workload | Metric | One rail | Two rails |
+| --- | --- | ---: | ---: |
+| 64 MiB, one concurrent task | Throughput (GB/s) | 3.22 | 6.46 |
+| 64 MiB, four concurrent tasks | Throughput (GB/s) | 11.13 | 10.96 |
+| 4 KiB, one concurrent task | Mean latency (microseconds) | 72 | 78 |
+
+Both interfaces carried payload-direction traffic, but their underlying
+resource independence is not guaranteed. Four concurrent READs showed no
+additional gain. A same-pool 4 KiB/64 MiB closed-loop mix still delayed small
+tasks behind large ones: static slicing offers neither latency isolation nor
 universal bandwidth scaling.

@@ -39,6 +39,10 @@ class HighPerformanceTcpTransportTestPeer {
     static bool hasFailedWorker(const HighPerformanceTcpTransport& transport) {
         return transport.workers_->hasFailedWorker();
     }
+
+    static Status barrier(HighPerformanceTcpTransport& transport) {
+        return transport.workers_->barrier();
+    }
 };
 
 namespace {
@@ -325,13 +329,6 @@ class RailRelay {
     std::exception_ptr error_;
 };
 
-// As in the socket tests, the kernel orders the remote WRITE before its ACK,
-// but that ordering is not a C++ happens-before edge visible to TSan.
-__attribute__((no_sanitize("thread"))) bool SocketOrderedEqual(
-    const std::vector<uint8_t>& actual, const std::vector<uint8_t>& expected) {
-    return actual == expected;
-}
-
 void CheckRailPayloads(bool multi_rail) {
     constexpr size_t kLength = (4ULL << 20) + 97;
     constexpr size_t kOffset = 37;
@@ -488,7 +485,11 @@ void CheckRailPayloads(bool multi_rail) {
                                   expected.data() + kOffset, length),
                       0);
             if (opcode == Request::WRITE) {
-                EXPECT_TRUE(SocketOrderedEqual(remote, expected));
+                // After the ACK, synchronize with the server workers before
+                // inspecting their memory from this test thread.
+                ASSERT_TRUE(
+                    HighPerformanceTcpTransportTestPeer::barrier(server).ok());
+                EXPECT_EQ(remote, expected);
             }
             EXPECT_TRUE(std::all_of(local.begin(), local.begin() + kOffset,
                                     [](uint8_t b) { return b == 0xa5; }));
