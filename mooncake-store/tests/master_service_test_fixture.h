@@ -13,13 +13,18 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mooncake::test {
@@ -48,6 +53,30 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
+
+    // A key whose owning client was expired. That path erases the object
+    // outright rather than leaving it with replicas that are merely unready,
+    // which is what separates this from ExpectKeyHiddenFromReadApis.
+    void ExpectKeyGoneFromReadApis(MasterService& service,
+                                   const std::string& key) {
+        auto get = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get.has_value());
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get.error());
+
+        auto exists = service.ExistKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(*exists);
+
+        auto batch_exists = service.BatchExistKey({key}, TenantId::Default());
+        ASSERT_EQ(1u, batch_exists.size());
+        ASSERT_TRUE(batch_exists[0].has_value());
+        EXPECT_FALSE(*batch_exists[0]);
+
+        auto all_keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(all_keys.has_value());
+        EXPECT_EQ(all_keys->end(),
+                  std::find(all_keys->begin(), all_keys->end(), key));
+    }
 
     void PauseReplicaCleanup(MasterService& service) {
         service.replica_cleanup_worker_.Stop();
@@ -301,6 +330,100 @@ class MasterServiceTest : public ::testing::Test {
         auto mount_result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(mount_result.has_value());
         return {.segment_id = segment.id, .client_id = client_id};
+    }
+
+    struct RegisteredClientContext {
+        UUID segment_id;
+        UUID client_id;
+        std::string segment_name;
+    };
+
+    // Mount a segment and then drive the same client through ReMountSegment.
+    // ReMountSegment is the only insert into ok_client_, so a client that only
+    // mounts is never something ClientMonitorFunc can expire, and a test that
+    // skips this step measures nothing.
+    RegisteredClientContext RegisterClientWithSegment(
+        MasterService& service, const std::string& name, size_t base,
+        size_t size = kDefaultSegmentSize) const {
+        Segment segment = MakeSegment(name, base, size);
+        UUID client_id = generate_uuid();
+        auto mount_result = service.MountSegment(segment, client_id);
+        EXPECT_TRUE(mount_result.has_value());
+        std::vector<Segment> segments{segment};
+        auto remount_result = service.ReMountSegment(segments, client_id);
+        EXPECT_TRUE(remount_result.has_value());
+        auto ping_result = service.Ping(client_id);
+        EXPECT_TRUE(ping_result.has_value());
+        return {.segment_id = segment.id,
+                .client_id = client_id,
+                .segment_name = segment.name};
+    }
+
+    // ClientStatus as the master sees it now. Ping is the only read of it, and
+    // it also refreshes the client's TTL, so call this once per assertion and
+    // never inside a wait loop that is supposed to let a client go silent.
+    ClientStatus ObserveClientStatus(MasterService& service,
+                                     const UUID& client_id) const {
+        auto ping_result = service.Ping(client_id);
+        EXPECT_TRUE(ping_result.has_value());
+        if (!ping_result.has_value()) {
+            return ClientStatus::UNDEFINED;
+        }
+        return ping_result.value().client_status;
+    }
+
+    // Runs fn under a real exclusive client_mutex_ hold, recorded the way
+    // every production site records one. The breaker judges on the recorded
+    // window, so a test that only takes the mutex proves nothing about it.
+    template <typename Fn>
+    void WhileHoldingClientLockExclusively(MasterService& service, Fn&& fn) {
+        std::unique_lock<std::shared_mutex> lock(service.client_mutex_);
+        MasterService::ExclusiveClientLockWindow window(service);
+        fn();
+    }
+
+    // Keeps one client's heartbeat arriving on its own thread, the way a live
+    // store does, so the test thread can wait while the master stays
+    // demonstrably able to serve Ping.
+    class HeartbeatThread {
+       public:
+        HeartbeatThread(MasterService& service, UUID client_id)
+            : thread_([this, &service, client_id] {
+                  while (!stop_.load()) {
+                      (void)service.Ping(client_id);
+                      std::this_thread::sleep_for(
+                          std::chrono::milliseconds(100));
+                  }
+              }) {}
+        ~HeartbeatThread() {
+            stop_.store(true);
+            thread_.join();
+        }
+
+       private:
+        std::atomic<bool> stop_{false};
+        std::thread thread_;
+    };
+
+    // Polls instead of sleeping a fixed span, so a test costs what the master
+    // actually takes rather than the worst case. Returns whether the
+    // condition ever held.
+    static bool WaitFor(std::chrono::milliseconds timeout,
+                        const std::function<bool()>& condition) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (condition()) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return condition();
+    }
+
+    // Whether a key is still readable. Unlike Ping this touches no client
+    // state, so it is safe to poll while a client is meant to be going silent.
+    static bool KeyIsVisible(MasterService& service, const std::string& key) {
+        return service.GetReplicaList(key, TenantId::Default()).has_value();
     }
 
     std::string PutObjectOnSegment(MasterService& service,

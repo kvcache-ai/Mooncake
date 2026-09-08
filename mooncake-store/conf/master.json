@@ -24,6 +24,8 @@
   "cluster_id": "mooncake_cluster",
   "memory_allocator": "offset",
   "client_live_ttl_sec": 60,
+  "client_mass_expiry_guard": true,
+  "client_mass_expiry_grace_sec": 60,
   "enable_http_metadata_server": false,
   "http_metadata_server_host": "0.0.0.0",
   "http_metadata_server_port": 8080,

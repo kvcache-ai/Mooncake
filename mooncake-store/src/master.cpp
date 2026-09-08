@@ -286,6 +286,28 @@ DEFINE_int64(
     "Seconds a client stays considered alive after the last heartbeat. "
     "If this TTL elapses without a refresh, the master treats the "
     "client as disconnected and may unmount its segments");
+DEFINE_bool(
+    client_mass_expiry_guard, mooncake::DEFAULT_CLIENT_MASS_EXPIRY_GUARD,
+    "Arm the client mass-expiry circuit breaker: hold back an expiry the "
+    "master cannot rule out being its own stall, rather than unmounting the "
+    "clients' segments and erasing their keys. The rule and the cases it "
+    "covers are written out at MasterService::ClientMonitorFunc in "
+    "master_service.cpp. false leaves the master with no stall detection at "
+    "all");
+DEFINE_int64(
+    client_mass_expiry_grace_sec,
+    mooncake::DEFAULT_CLIENT_MASS_EXPIRY_GRACE_SEC,
+    "Upper bound, in seconds, on how long the client mass-expiry circuit "
+    "breaker may hold back one episode, after which the clients are expired. "
+    "0 leaves the master with no stall detection at all");
+DEFINE_validator(client_mass_expiry_grace_sec, [](const char* flagname,
+                                                  int64_t value) {
+    if (!mooncake::IsValidClientMassExpiryGraceSec(value)) {
+        LOG(ERROR) << flagname << " must be >= 0; got " << value;
+        return false;
+    }
+    return true;
+});
 DEFINE_int64(nof_heartbeat_interval_sec,
              mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
              "How often master probes each mounted NoF segment");
@@ -505,6 +527,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
+    default_config.GetBool("client_mass_expiry_guard",
+                           &master_config.client_mass_expiry_guard,
+                           FLAGS_client_mass_expiry_guard);
+    default_config.GetInt64("client_mass_expiry_grace_sec",
+                            &master_config.client_mass_expiry_grace_sec,
+                            FLAGS_client_mass_expiry_grace_sec);
     default_config.GetInt64("nof_heartbeat_interval_sec",
                             &master_config.nof_heartbeat_interval_sec,
                             FLAGS_nof_heartbeat_interval_sec);
@@ -1078,6 +1106,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
     }
+    if ((google::GetCommandLineFlagInfo("client_mass_expiry_guard", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.client_mass_expiry_guard = FLAGS_client_mass_expiry_guard;
+    }
+    if ((google::GetCommandLineFlagInfo("client_mass_expiry_grace_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.client_mass_expiry_grace_sec =
+            FLAGS_client_mass_expiry_grace_sec;
+    }
     if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1431,6 +1471,19 @@ int main(int argc, char* argv[]) {
         InitMasterConf(default_config, master_config);
     }
     LoadConfigFromCmdline(master_config, !conf_path.empty());
+    // The DEFINE_validators above only run for values that arrive as command
+    // line flags, so a config file reaches MasterService unvalidated. Apply
+    // the same predicate here, loudly: a negative grace is not a shorter one,
+    // it silently leaves the master with no stall detection.
+    if (!mooncake::IsValidClientMassExpiryGraceSec(
+            master_config.client_mass_expiry_grace_sec)) {
+        LOG(WARNING) << "action=config_clamped"
+                     << ", key=client_mass_expiry_grace_sec"
+                     << ", value=" << master_config.client_mass_expiry_grace_sec
+                     << ", clamped_to=0"
+                     << ", reason=must_be_non_negative";
+        master_config.client_mass_expiry_grace_sec = 0;
+    }
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
     // Fall back to environment variables for pod identity (K8s Downward API)
@@ -1551,6 +1604,10 @@ int main(int argc, char* argv[]) {
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
         << ", client_ttl=" << master_config.client_live_ttl_sec
+        << ", client_mass_expiry_guard="
+        << master_config.client_mass_expiry_guard
+        << ", client_mass_expiry_grace_sec="
+        << master_config.client_mass_expiry_grace_sec
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address

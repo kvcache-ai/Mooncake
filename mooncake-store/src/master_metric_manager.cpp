@@ -63,6 +63,14 @@ MasterMetricManager::MasterMetricManager()
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
+      client_expiry_deferred_(
+          "master_client_expiry_deferred_total",
+          "Total number of client-monitor ticks whose client mass expiry was "
+          "deferred because the master could not rule out its own stall"),
+      client_expiry_deferred_clients_(
+          "master_client_expiry_deferred_clients",
+          "Number of clients whose expiry is being deferred right now because "
+          "the master cannot rule out its own stall"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
@@ -508,12 +516,14 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
+    client_expiry_deferred_clients_.update(0);
     mem_cache_nums_.update(0);
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
     promotion_in_flight_metric_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
+    client_expiry_deferred_.inc(0);
     promotion_admitted_.inc(0);
     promotion_completed_.inc(0);
     promotion_completed_bytes_.inc(0);
@@ -892,6 +902,26 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+void MasterMetricManager::inc_client_expiry_deferred() {
+    client_expiry_deferred_.inc();
+}
+
+int64_t MasterMetricManager::get_client_expiry_deferred() {
+    return client_expiry_deferred_.value();
+}
+
+void MasterMetricManager::inc_client_expiry_deferred_clients(int64_t val) {
+    client_expiry_deferred_clients_.inc(val);
+}
+
+void MasterMetricManager::dec_client_expiry_deferred_clients(int64_t val) {
+    client_expiry_deferred_clients_.dec(val);
+}
+
+int64_t MasterMetricManager::get_client_expiry_deferred_clients() {
+    return client_expiry_deferred_clients_.value();
 }
 
 // Store-observed cache reuse metrics
@@ -1836,6 +1866,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
+    serialize_metric(client_expiry_deferred_);
+    serialize_metric(client_expiry_deferred_clients_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);

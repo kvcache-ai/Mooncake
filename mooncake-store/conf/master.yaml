@@ -35,6 +35,13 @@ root_fs_dir: ""
 cluster_id: "mooncake_cluster"
 memory_allocator: "offset"
 client_live_ttl_sec: 60
+# Client mass-expiry circuit breaker: hold back an expiry the master cannot
+# rule out being its own stall, bounded by the grace. The rule and the cases
+# it covers are written out at MasterService::ClientMonitorFunc in
+# src/master_service.cpp. Either a false guard or a zero grace leaves the
+# master with no stall detection at all.
+client_mass_expiry_guard: true
+client_mass_expiry_grace_sec: 60
 
 # OpLog store configuration for HA hot-standby replication
 enable_oplog: false

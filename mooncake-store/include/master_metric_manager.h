@@ -136,6 +136,20 @@ class MasterMetricManager {
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
+    // One increment per client-monitor tick whose client mass expiry the
+    // circuit breaker held back. Any increase means a master declined to erase
+    // its clients' keys because it could not rule out its own stall.
+    void inc_client_expiry_deferred();
+    int64_t get_client_expiry_deferred();
+    // How many clients are being held back right now. This is the one an
+    // alert watches: a non-zero value is a suspected stall in progress. Each
+    // client monitor adds and removes its own contribution, the way
+    // active_clients does, so two MasterService instances in one process
+    // compose instead of overwriting each other, and a monitor that stops
+    // while deferring takes its contribution back.
+    void inc_client_expiry_deferred_clients(int64_t val = 1);
+    void dec_client_expiry_deferred_clients(int64_t val = 1);
+    int64_t get_client_expiry_deferred_clients();
 
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);
@@ -578,6 +592,8 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+    ylt::metric::counter_t client_expiry_deferred_;
+    ylt::metric::gauge_t client_expiry_deferred_clients_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

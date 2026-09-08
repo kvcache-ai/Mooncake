@@ -3396,6 +3396,817 @@ TEST_F(MasterServiceTest, HardPinWithSoftPinEvictionOrder) {
     service_->RemoveAll();
 }
 
+// ---------------------------------------------------------------------------
+// Client mass-expiry circuit breaker (ClientMonitorFunc)
+//
+// Expiring a client unmounts its segments and erases its keys, and nothing in
+// the master undoes that: only a snapshot or a standby that still holds the
+// metadata can bring the index back. The breaker holds back an expiry the
+// master cannot rule out being its own stall, and it decides that from the
+// cause -- an exclusive client_mutex_ hold overlapping [last_ping_batch_at,
+// now], the stretch the master has no heartbeat of its own to show for --
+// rather than from the absence of heartbeats, which looks the same whether the
+// master failed to serve them or nobody sent any. A hold that released before
+// the last heartbeat was popped is refuted by that heartbeat and explains
+// nothing, which is what keeps a routine mount from deferring a genuine death.
+//
+// ClientMassExpiryDecisionTest covers the rule's boundary cases as a table
+// over the pure decision function, with no sleeping. The MasterServiceTest
+// cases below drive real monitor ticks, real locks and real keys, because the
+// wiring between the two -- which window is measured, when the episode latch
+// opens and closes, what the gauge holds -- is what a pure test cannot see.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr int64_t kBreakerClientTtlSec = 1;
+constexpr size_t kBreakerSegmentSize = 1024 * 1024 * 16;
+
+// One tick of a healthy master with one client just gone overdue, as the
+// starting point every table case varies one reading of.
+ClientMassExpiryInputs BaseBreakerInputs() {
+    using namespace std::chrono;
+    const auto now = steady_clock::time_point{} + hours(1);
+    ClientMassExpiryInputs inputs;
+    inputs.guard_enabled = true;
+    inputs.grace = seconds(60);
+    inputs.expired_count = 1;
+    inputs.tracked_clients = 1;
+    inputs.now = now;
+    inputs.newest_expired_deadline = now - seconds(1);
+    // The pop that stamped that deadline, one 10 s ttl before it, and nothing
+    // popped since. This is the value that makes master_silent unavoidably
+    // true for the newest candidate, and it is why silence on its own cannot
+    // decide anything. It is also the left edge of the hold window, so in this
+    // base tick the window is the whole ttl the heartbeat could have arrived
+    // in -- the single-client case, where the pinned edge and the moving one
+    // coincide.
+    inputs.last_ping_batch_at = now - seconds(11);
+    return inputs;
+}
+}  // namespace
+
+TEST(ClientMassExpiryDecisionTest, CaseTable) {
+    using namespace std::chrono;
+    const auto base = BaseBreakerInputs();
+    const auto now = base.now;
+
+    // A completed hold window, given as seconds before now.
+    auto hold = [&](int64_t start_ago, int64_t end_ago) {
+        ExclusiveClientLockHolds holds;
+        holds.last_completed =
+            std::make_pair(now - seconds(start_ago), now - seconds(end_ago));
+        return holds;
+    };
+    // The same, in milliseconds: the cases that separate a hold's release from
+    // the last heartbeat pop turn on sub-second ordering, because that is the
+    // scale a routine mount's hold and a 1 s monitor tick live on.
+    auto hold_ms = [&](int64_t start_ago_ms, int64_t end_ago_ms) {
+        ExclusiveClientLockHolds holds;
+        holds.last_completed = std::make_pair(now - milliseconds(start_ago_ms),
+                                              now - milliseconds(end_ago_ms));
+        return holds;
+    };
+    auto hold_in_progress = [&](int64_t start_ago) {
+        ExclusiveClientLockHolds holds;
+        holds.in_progress_start = now - seconds(start_ago);
+        return holds;
+    };
+
+    struct Case {
+        const char* name;
+        ClientMassExpiryInputs inputs;
+        bool want_is_mass_expiry;
+        // Pinned per case as well as the verdict, so a row says which
+        // condition carried it instead of leaving that to be inferred.
+        bool want_hold_overlap;
+        bool want_master_silent;
+        const char* why;
+    };
+
+    std::vector<Case> cases;
+    auto add = [&](const char* name, bool want, bool want_hold_overlap,
+                   bool want_master_silent, const char* why,
+                   const std::function<void(ClientMassExpiryInputs&)>& tweak) {
+        ClientMassExpiryInputs inputs = base;
+        tweak(inputs);
+        cases.push_back(
+            {name, inputs, want, want_hold_overlap, want_master_silent, why});
+    };
+
+    add("one client, it dies, master healthy", false, false, true,
+        "one tracked client is not evidence about the master, and nothing was "
+        "holding client_mutex_",
+        [](ClientMassExpiryInputs&) {});
+    add("one client, a stall that has already released", true, true, true,
+        "the hold released, but no heartbeat has been popped since, so "
+        "nothing refutes it as the explanation",
+        [&](ClientMassExpiryInputs& in) { in.holds = hold(9, 2); });
+    add("one client, a stall still in progress", true, true, true,
+        "a hold running now is stopping heartbeats now",
+        [&](ClientMassExpiryInputs& in) { in.holds = hold_in_progress(0); });
+    add("one client, a hold the last heartbeat outlived", false, false, true,
+        "a heartbeat was popped after that hold released, so the master was "
+        "serving again and the hold explains nothing",
+        [&](ClientMassExpiryInputs& in) { in.holds = hold(20, 12); });
+    add("13 clients, one dies, a short mount hold lands in its last ttl", false,
+        false, false,
+        "the hold released and heartbeats were popped after it, so it cannot "
+        "explain a client that is still overdue -- this is the case a pinned "
+        "left edge deferred for the whole grace",
+        [&](ClientMassExpiryInputs& in) {
+            in.tracked_clients = 13;
+            // 100 ms of somebody else's mount, 2 s ago, then the survivors'
+            // heartbeats.
+            in.holds = hold_ms(2000, 1900);
+            in.last_ping_batch_at = now;
+        });
+    add("13 clients, a stall that released after the last heartbeat", true,
+        true, false,
+        "no heartbeat has been popped since the hold released, so the recovery "
+        "gap is still the master's and the hold carries the verdict on its own",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 6;
+            in.tracked_clients = 13;
+            in.holds = hold_ms(9000, 400);
+            in.last_ping_batch_at = now - milliseconds(500);
+        });
+    add("13 clients, one stall, 6 of them overdue this tick", true, true, true,
+        "the hold decides it, so how the deadlines split across ticks does "
+        "not matter",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 6;
+            in.tracked_clients = 13;
+            in.holds = hold(9, 2);
+        });
+    add("13 clients, one stall, 1 of them overdue this tick", true, true, false,
+        "a lone candidate inside a real stall is still the master's fault",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 1;
+            in.tracked_clients = 13;
+            in.holds = hold_ms(9000, 400);
+            in.last_ping_batch_at = now - milliseconds(500);
+        });
+    add("13 clients, a hold still in progress, a heartbeat popped this tick",
+        true, true, false,
+        "a hold running now stops heartbeats now, whatever was popped before "
+        "it started",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 6;
+            in.tracked_clients = 13;
+            in.holds = hold_in_progress(0);
+            in.last_ping_batch_at = now;
+        });
+    add("13 clients, healthy master, a majority genuinely die", false, false,
+        false,
+        "the survivors' heartbeats land after the candidates' deadlines, so "
+        "the master can vouch for itself",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 7;
+            in.tracked_clients = 13;
+            in.last_ping_batch_at = now;
+        });
+    add("13 clients, healthy master, the whole fleet goes silent", true, false,
+        true,
+        "with nobody left to speak for the master, silence and a total stall "
+        "are the same reading",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 13;
+            in.tracked_clients = 13;
+        });
+    add("2 clients, one dies, the other keeps pinging", false, false, false,
+        "not silent and nothing holding", [&](ClientMassExpiryInputs& in) {
+            in.tracked_clients = 2;
+            in.last_ping_batch_at = now;
+        });
+    add("guard disarmed", false, false, false,
+        "the operator asked for no stall detection",
+        [&](ClientMassExpiryInputs& in) {
+            in.guard_enabled = false;
+            in.holds = hold_in_progress(0);
+        });
+    add("zero grace", false, false, false,
+        "a zero grace is also no stall detection",
+        [&](ClientMassExpiryInputs& in) {
+            in.grace = seconds(0);
+            in.holds = hold_in_progress(0);
+        });
+    add("no candidates", false, false, false, "nothing to decide about",
+        [&](ClientMassExpiryInputs& in) {
+            in.expired_count = 0;
+            in.holds = hold_in_progress(0);
+        });
+
+    for (const auto& c : cases) {
+        const auto decision = EvaluateClientMassExpiry(c.inputs);
+        EXPECT_EQ(c.want_is_mass_expiry, decision.is_mass_expiry)
+            << "case: " << c.name << " -- " << c.why;
+        EXPECT_EQ(c.want_hold_overlap, decision.exclusive_hold_overlap)
+            << "case: " << c.name << " -- " << c.why;
+        EXPECT_EQ(c.want_master_silent, decision.master_silent)
+            << "case: " << c.name << " -- " << c.why;
+        // Nothing is ever both deferred and expired.
+        EXPECT_FALSE(decision.defer && decision.grace_exceeded)
+            << "case: " << c.name;
+        if (!c.want_is_mass_expiry) {
+            EXPECT_FALSE(decision.defer) << "case: " << c.name;
+            EXPECT_FALSE(decision.grace_exceeded) << "case: " << c.name;
+        }
+    }
+
+    // kMinTrackedClientsForSilenceEvidence is the whole difference between
+    // "one client, it dies, master healthy" and "the whole fleet
+    // goes silent", so pin it rather than leaving it implied.
+    EXPECT_EQ(2u, kMinTrackedClientsForSilenceEvidence);
+}
+
+TEST(ClientMassExpiryDecisionTest, GraceBoundIsCheckedOnRawDurations) {
+    using namespace std::chrono;
+    auto inputs = BaseBreakerInputs();
+    inputs.grace = seconds(60);
+    inputs.holds.in_progress_start = inputs.now;
+
+    // Inside the bound, at a fraction of a second below it.
+    inputs.episode_since = inputs.now - milliseconds(59500);
+    auto decision = EvaluateClientMassExpiry(inputs);
+    EXPECT_TRUE(decision.defer);
+    EXPECT_FALSE(decision.grace_exceeded);
+
+    // Exactly at the bound: the deferral is over.
+    inputs.episode_since = inputs.now - seconds(60);
+    decision = EvaluateClientMassExpiry(inputs);
+    EXPECT_FALSE(decision.defer);
+    EXPECT_TRUE(decision.grace_exceeded);
+
+    // Just past it, by less than the second a rounded comparison would lose.
+    inputs.episode_since = inputs.now - milliseconds(60100);
+    decision = EvaluateClientMassExpiry(inputs);
+    EXPECT_FALSE(decision.defer);
+    EXPECT_TRUE(decision.grace_exceeded);
+
+    // A fresh episode is opened at now, so its clock starts at zero.
+    inputs.episode_since = std::nullopt;
+    decision = EvaluateClientMassExpiry(inputs);
+    EXPECT_TRUE(decision.defer);
+    EXPECT_EQ(steady_clock::duration::zero(), decision.deferred_for);
+}
+
+TEST(ClientMassExpiryDecisionTest, GraceClockRunsFromTheEpisodeStart) {
+    using namespace std::chrono;
+    auto inputs = BaseBreakerInputs();
+    inputs.grace = seconds(60);
+    inputs.holds.in_progress_start = inputs.now;
+    inputs.episode_since = inputs.now - seconds(40);
+
+    // The candidate set growing must not move the clock: a rule that restarted
+    // it on every change would defer without bound for as long as clients keep
+    // lapsing one at a time.
+    for (size_t expired : {size_t{1}, size_t{5}, size_t{13}}) {
+        inputs.expired_count = expired;
+        inputs.tracked_clients = 13;
+        const auto decision = EvaluateClientMassExpiry(inputs);
+        EXPECT_TRUE(decision.defer);
+        EXPECT_EQ(seconds(40), duration_cast<seconds>(decision.deferred_for))
+            << "expired_count=" << expired << " moved the episode clock";
+    }
+}
+
+TEST(ClientMassExpiryDecisionTest, HoldOverlapIsInclusiveAtBothEdges) {
+    using namespace std::chrono;
+    const auto now = steady_clock::time_point{} + hours(1);
+    const auto window_start = now - seconds(10);
+
+    ExclusiveClientLockHolds ends_at_window_start;
+    ends_at_window_start.last_completed =
+        std::make_pair(now - seconds(20), window_start);
+    EXPECT_TRUE(ends_at_window_start.Overlaps(window_start, now));
+
+    ExclusiveClientLockHolds ends_just_before;
+    ends_just_before.last_completed =
+        std::make_pair(now - seconds(20), window_start - milliseconds(1));
+    EXPECT_FALSE(ends_just_before.Overlaps(window_start, now));
+
+    ExclusiveClientLockHolds starts_at_window_end;
+    starts_at_window_end.in_progress_start = now;
+    EXPECT_TRUE(starts_at_window_end.Overlaps(window_start, now));
+
+    ExclusiveClientLockHolds nothing_recorded;
+    EXPECT_FALSE(nothing_recorded.Overlaps(window_start, now));
+}
+
+// A genuinely single-client fleet whose only client dies on a healthy master.
+// This is the case the rule has to get right for a single-store cluster to be
+// operable at all: nothing is holding client_mutex_, so the master has no
+// reason to suspect itself, and the expiry must happen at once. Deferring it
+// would hold every store restart in such a cluster for the whole grace.
+TEST_F(MasterServiceTest, SingleClientFleetExpiresAtOnce) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(kBreakerClientTtlSec)
+                              .set_client_mass_expiry_grace_sec(60)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    auto client =
+        RegisterClientWithSegment(*service, "breaker_lone_death",
+                                  kDefaultSegmentBase, kBreakerSegmentSize);
+    const std::string key =
+        PutObjectOnSegment(*service, client.client_id, client.segment_name);
+
+    // Let a monitor tick pop the registration heartbeat and put the
+    // registration's own ReMountSegment hold behind the window that tick
+    // stamps, so this measures a healthy master rather than the test's setup.
+    {
+        HeartbeatThread heartbeat(*service, client.client_id);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    }
+
+    const int64_t deferred_before =
+        MasterMetricManager::instance().get_client_expiry_deferred();
+
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(8),
+                        [&] { return !KeyIsVisible(*service, key); }))
+        << "a single-client cluster's only client was never expired, so its "
+           "store restarts wait out the whole grace";
+
+    ExpectKeyGoneFromReadApis(*service, key);
+    EXPECT_EQ(ClientStatus::NEED_REMOUNT,
+              ObserveClientStatus(*service, client.client_id));
+    EXPECT_EQ(deferred_before,
+              MasterMetricManager::instance().get_client_expiry_deferred())
+        << "silence with one tracked client was read as evidence about the "
+           "master";
+    EXPECT_EQ(
+        0,
+        MasterMetricManager::instance().get_client_expiry_deferred_clients());
+}
+
+// The same single-client fleet, but with an exclusive client_mutex_ hold
+// across the window its heartbeat could have arrived in -- a ReMountSegment
+// stall, in miniature. Together with the test above this is the pair that
+// pins the rule: the cluster's own client count decides nothing, the hold
+// does.
+TEST_F(MasterServiceTest, SingleClientFleetStallIsDeferred) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(kBreakerClientTtlSec)
+                              .set_client_mass_expiry_grace_sec(60)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    auto client =
+        RegisterClientWithSegment(*service, "breaker_lone_stall",
+                                  kDefaultSegmentBase, kBreakerSegmentSize);
+    const std::string key =
+        PutObjectOnSegment(*service, client.client_id, client.segment_name);
+
+    const int64_t deferred_before =
+        MasterMetricManager::instance().get_client_expiry_deferred();
+
+    // The breaker's gate runs ahead of the monitor's own locked section, so it
+    // reaches a verdict while the hold is still in place. Only metrics may be
+    // read inside the hold: anything touching client state would queue behind
+    // it.
+    bool deferred_during_stall = false;
+    int64_t gauge_during_stall = 0;
+    WhileHoldingClientLockExclusively(*service, [&] {
+        deferred_during_stall = WaitFor(std::chrono::seconds(8), [&] {
+            return MasterMetricManager::instance()
+                       .get_client_expiry_deferred() > deferred_before;
+        });
+        gauge_during_stall = MasterMetricManager::instance()
+                                 .get_client_expiry_deferred_clients();
+    });
+    ASSERT_TRUE(deferred_during_stall)
+        << "the stall was not recognised, so a single-client cluster loses its "
+           "cache to any long exclusive section";
+    EXPECT_GT(gauge_during_stall, 0)
+        << "the gauge does not report the clients being held back";
+
+    EXPECT_TRUE(KeyIsVisible(*service, key))
+        << "the deferred expiry still erased the client's keys";
+    EXPECT_EQ(ClientStatus::OK,
+              ObserveClientStatus(*service, client.client_id));
+}
+
+// Two or more tracked clients all going silent with nothing holding
+// client_mutex_ is the one place the weaker, silence-based evidence is used.
+// A total stall of the io threads looks exactly like this and records no hold,
+// which is why the reading is kept; the price is that a fleet that really did
+// all die is held for the grace bound before being expired.
+TEST_F(MasterServiceTest, WholeFleetSilenceIsDeferredWithoutAHold) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(kBreakerClientTtlSec)
+                              .set_client_mass_expiry_grace_sec(60)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    std::vector<RegisteredClientContext> clients;
+    std::vector<std::unique_ptr<HeartbeatThread>> heartbeats;
+    for (int i = 0; i < 4; ++i) {
+        clients.push_back(RegisterClientWithSegment(
+            *service, "breaker_silence_" + std::to_string(i),
+            kDefaultSegmentBase + static_cast<size_t>(i) * kBreakerSegmentSize,
+            kBreakerSegmentSize));
+    }
+    const std::string key = PutObjectOnSegment(*service, clients[0].client_id,
+                                               clients[0].segment_name);
+    for (const auto& client : clients) {
+        heartbeats.push_back(
+            std::make_unique<HeartbeatThread>(*service, client.client_id));
+    }
+    // Push every registration hold behind the window the next tick stamps, so
+    // the deferral below can only come from the silence.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+    const int64_t deferred_before =
+        MasterMetricManager::instance().get_client_expiry_deferred();
+    heartbeats.clear();
+
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(8),
+                        [&] {
+                            return MasterMetricManager::instance()
+                                       .get_client_expiry_deferred() >
+                                   deferred_before;
+                        }))
+        << "a whole fleet falling silent was expired without the master "
+           "checking whether it was serving anybody";
+
+    EXPECT_TRUE(KeyIsVisible(*service, key));
+    for (const auto& client : clients) {
+        EXPECT_EQ(ClientStatus::OK,
+                  ObserveClientStatus(*service, client.client_id));
+    }
+}
+
+// A majority of a healthy master's clients genuinely dying while the rest keep
+// pinging. The master has processed heartbeats after the casualties' deadlines
+// lapsed, so it can vouch for itself and the casualties really are gone: this
+// must expire at once. It is the regression test for a rule that deferred on
+// the share of clients expiring, which fired here precisely because the master
+// was demonstrably healthy.
+TEST_F(MasterServiceTest, MajorityGenuineDeathOnHealthyMasterExpiresAtOnce) {
+    constexpr int kCasualties = 3;
+    constexpr int kSurvivors = 2;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(kBreakerClientTtlSec)
+                              .set_client_mass_expiry_grace_sec(60)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    std::vector<RegisteredClientContext> clients;
+    for (int i = 0; i < kCasualties + kSurvivors; ++i) {
+        clients.push_back(RegisterClientWithSegment(
+            *service, "breaker_majority_" + std::to_string(i),
+            kDefaultSegmentBase + static_cast<size_t>(i) * kBreakerSegmentSize,
+            kBreakerSegmentSize));
+    }
+    std::vector<std::string> casualty_keys;
+    for (int i = 0; i < kCasualties; ++i) {
+        casualty_keys.push_back(PutObjectOnSegment(
+            *service, clients[i].client_id, clients[i].segment_name));
+    }
+
+    std::vector<std::unique_ptr<HeartbeatThread>> heartbeats;
+    for (const auto& client : clients) {
+        heartbeats.push_back(
+            std::make_unique<HeartbeatThread>(*service, client.client_id));
+    }
+    // Everybody alive for a tick, so the casualties' deadlines are stamped by
+    // a tick that has all the registration holds behind it.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+
+    const int64_t deferred_before =
+        MasterMetricManager::instance().get_client_expiry_deferred();
+    heartbeats.erase(heartbeats.begin(), heartbeats.begin() + kCasualties);
+
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(8),
+                        [&] {
+                            return std::none_of(
+                                casualty_keys.begin(), casualty_keys.end(),
+                                [&](const std::string& key) {
+                                    return KeyIsVisible(*service, key);
+                                });
+                        }))
+        << "a majority genuinely dying on a healthy master was deferred, "
+           "which is what losing a rack looks like";
+
+    EXPECT_EQ(deferred_before,
+              MasterMetricManager::instance().get_client_expiry_deferred())
+        << "the breaker fired although the master had served heartbeats after "
+           "the casualties' deadlines";
+    for (int i = kCasualties; i < kCasualties + kSurvivors; ++i) {
+        EXPECT_EQ(ClientStatus::OK,
+                  ObserveClientStatus(*service, clients[i].client_id));
+    }
+    heartbeats.clear();
+}
+
+// One stall whose expiries split across two monitor ticks. A client's deadline
+// is stamped by the tick that popped its heartbeat and clients ping on their
+// own timers, so the clients of one stalled master do not all fall due in the
+// same tick: 6 can fall due one tick and 7 the next. A rule that looked at the
+// share of clients expiring failed on the tick carrying 6, and unmounted their
+// segments and erased their keys -- the incident in miniature.
+//
+// The stall is a real exclusive client_mutex_ hold, held across the tick that
+// acts on the early group's deadlines. No witness client pings through it,
+// because a hold that stops Ping stops every client's heartbeat: whether the
+// master also reads itself as silent in the deferred tick depends on where the
+// last pop fell relative to the early deadlines, so this case asserts nothing
+// about that and the hold is what it is built on. The deterministic separation
+// of the two conditions is ClientMassExpiryDecisionTest.CaseTable, on the
+// sub-second ordering between a hold's release and the last heartbeat pop.
+// What this case adds is that the deferral covers a minority of the tracked
+// fleet -- the gauge names how many clients are held back, so the split is
+// read off the master itself -- and that the same split on an unguarded master
+// erases exactly those clients' keys.
+TEST_F(MasterServiceTest, ClientMassExpirySplitAcrossTicksIsDeferred) {
+    constexpr int kSplitEarlyClients = 6;
+    constexpr int kSplitLateClients = 7;
+    constexpr int64_t kSplitTtlSec = 4;
+    // The late group registers this much after the early group, so its
+    // deadlines lapse well after the early group's and the tick under test
+    // carries only the early group. The gap is the ttl, not a tick, because a
+    // deadline is stamped by the tick that popped the heartbeat and is acted
+    // on by the tick after it lapses: the two groups have to be further apart
+    // than that pair of roundings, or the hold below cannot sit between them.
+    const auto kSplitStagger = std::chrono::seconds(4);
+    // The hold spans the tick that acts on the early group's deadlines (arm +
+    // 5 s, acted on at arm + 5 s or 6 s) and releases before the late group's
+    // (arm + 9 s), so the episode the master sees is the minority one.
+    const auto kSplitHoldUntil = std::chrono::milliseconds(6600);
+
+    struct ArmResult {
+        std::vector<ClientStatus> early_status;
+        std::vector<ClientStatus> late_status;
+        std::vector<bool> early_keys_present;
+        int64_t deferred_delta = 0;
+        int64_t gauge_during_stall = 0;
+        bool deferred_during_stall = false;
+    };
+
+    auto run_arm = [&](bool guard, const std::string& tag) {
+        auto service_config = MasterServiceConfig::builder()
+                                  .set_client_live_ttl_sec(kSplitTtlSec)
+                                  .set_client_mass_expiry_guard(guard)
+                                  .set_client_mass_expiry_grace_sec(60)
+                                  .build();
+        auto service = std::make_unique<MasterService>(service_config);
+
+        const auto arm_started = std::chrono::steady_clock::now();
+        std::vector<RegisteredClientContext> early;
+        std::vector<std::string> early_keys;
+        for (int i = 0; i < kSplitEarlyClients; ++i) {
+            early.push_back(RegisterClientWithSegment(
+                *service, tag + "_early_" + std::to_string(i),
+                kDefaultSegmentBase +
+                    static_cast<size_t>(i) * kBreakerSegmentSize,
+                kBreakerSegmentSize));
+            early_keys.push_back(PutObjectOnSegment(
+                *service, early.back().client_id, early.back().segment_name));
+        }
+
+        const int64_t deferred_before =
+            MasterMetricManager::instance().get_client_expiry_deferred();
+
+        std::this_thread::sleep_for(kSplitStagger);
+
+        std::vector<RegisteredClientContext> late;
+        for (int i = 0; i < kSplitLateClients; ++i) {
+            late.push_back(RegisterClientWithSegment(
+                *service, tag + "_late_" + std::to_string(i),
+                kDefaultSegmentBase +
+                    static_cast<size_t>(kSplitEarlyClients + i) *
+                        kBreakerSegmentSize,
+                kBreakerSegmentSize));
+        }
+
+        ArmResult result;
+        // The stall. The breaker's gate runs ahead of the monitor's own locked
+        // section, so it reaches a verdict while the hold is still in place;
+        // an unguarded monitor instead blocks inside that section and does its
+        // expiry the moment the hold releases. Only metrics may be read in
+        // here -- anything touching client state would queue behind the hold.
+        const auto release_at = arm_started + kSplitHoldUntil;
+        WhileHoldingClientLockExclusively(*service, [&] {
+            const auto budget =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    release_at - std::chrono::steady_clock::now());
+            result.deferred_during_stall = WaitFor(budget, [&] {
+                return MasterMetricManager::instance()
+                           .get_client_expiry_deferred() > deferred_before;
+            });
+            result.gauge_during_stall =
+                MasterMetricManager::instance()
+                    .get_client_expiry_deferred_clients();
+            // Both arms hold for the same span, so both are sampled with the
+            // late group still inside its ttl.
+            std::this_thread::sleep_until(release_at);
+        });
+        result.deferred_delta =
+            MasterMetricManager::instance().get_client_expiry_deferred() -
+            deferred_before;
+
+        if (!guard) {
+            // The expiry the released hold lets through, and the sweep that
+            // erases the keys with it. Bounded well short of the late group's
+            // deadline, so a slow sweep cannot turn into a second episode.
+            WaitFor(std::chrono::milliseconds(800), [&] {
+                return !KeyIsVisible(*service, early_keys.front());
+            });
+        }
+        for (const auto& key : early_keys) {
+            result.early_keys_present.push_back(KeyIsVisible(*service, key));
+        }
+        for (const auto& client : early) {
+            result.early_status.push_back(
+                ObserveClientStatus(*service, client.client_id));
+        }
+        for (const auto& client : late) {
+            result.late_status.push_back(
+                ObserveClientStatus(*service, client.client_id));
+        }
+        return result;
+    };
+
+    // Sequentially, not concurrently: the deferral counter and the gauge are
+    // process-global, and this case reads both as exact numbers.
+    const ArmResult guarded = run_arm(true, "split_guarded");
+    const ArmResult unguarded = run_arm(false, "split_unguarded");
+
+    EXPECT_TRUE(guarded.deferred_during_stall)
+        << "the stall was not recognised, so a minority-sized tick inside it "
+           "was expired";
+    EXPECT_GT(guarded.gauge_during_stall, 0)
+        << "the gauge does not report the clients being held back";
+    EXPECT_LT(guarded.gauge_during_stall,
+              kSplitEarlyClients + kSplitLateClients)
+        << "the whole fleet was overdue in the deferred tick, so the episode "
+           "was not the minority one a share-of-clients rule misreads";
+    for (int i = 0; i < kSplitEarlyClients; ++i) {
+        EXPECT_EQ(ClientStatus::OK, guarded.early_status[i])
+            << "the early group was expired although an exclusive "
+               "client_mutex_ hold overlapped the window their heartbeats "
+               "could have arrived in";
+        EXPECT_TRUE(guarded.early_keys_present[i])
+            << "the deferred expiry still erased the early group's keys";
+    }
+    for (int i = 0; i < kSplitLateClients; ++i) {
+        EXPECT_EQ(ClientStatus::OK, guarded.late_status[i]);
+    }
+
+    EXPECT_EQ(0, unguarded.deferred_delta)
+        << "the guard was off, so nothing may be held back";
+    for (int i = 0; i < kSplitEarlyClients; ++i) {
+        EXPECT_EQ(ClientStatus::NEED_REMOUNT, unguarded.early_status[i])
+            << "the split did not happen, so this test proves nothing";
+        EXPECT_FALSE(unguarded.early_keys_present[i])
+            << "an expired client's keys survived, so key loss is not what "
+               "this test is measuring";
+    }
+    for (int i = 0; i < kSplitLateClients; ++i) {
+        EXPECT_EQ(ClientStatus::OK, unguarded.late_status[i])
+            << "the whole fleet expired at once, so the episode was not the "
+               "minority one a share-of-clients rule misreads";
+    }
+}
+
+// A deferral in progress that the clients themselves end. Recovery is the
+// monitor's own queue drain and nothing else: a heartbeat arriving refreshes
+// that client's ttl, which takes it out of the candidate set, which closes the
+// episode. Nothing is expired, the counter stops moving and the gauge returns
+// to 0.
+TEST_F(MasterServiceTest, HeartbeatsResumingEndTheDeferral) {
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(kBreakerClientTtlSec)
+                              .set_client_mass_expiry_grace_sec(60)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    auto client = RegisterClientWithSegment(
+        *service, "breaker_recovery", kDefaultSegmentBase, kBreakerSegmentSize);
+    const std::string key =
+        PutObjectOnSegment(*service, client.client_id, client.segment_name);
+
+    const int64_t deferred_before =
+        MasterMetricManager::instance().get_client_expiry_deferred();
+    bool deferred_during_stall = false;
+    WhileHoldingClientLockExclusively(*service, [&] {
+        deferred_during_stall = WaitFor(std::chrono::seconds(8), [&] {
+            return MasterMetricManager::instance()
+                       .get_client_expiry_deferred() > deferred_before;
+        });
+    });
+    ASSERT_TRUE(deferred_during_stall)
+        << "nothing was deferred, so there is no recovery to observe";
+
+    HeartbeatThread heartbeat(*service, client.client_id);
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(6), [&] {
+        return MasterMetricManager::instance()
+                   .get_client_expiry_deferred_clients() == 0;
+    })) << "the episode never closed although the client resumed pinging";
+
+    const int64_t deferred_at_recovery =
+        MasterMetricManager::instance().get_client_expiry_deferred();
+    std::this_thread::sleep_for(std::chrono::milliseconds(2500));
+    EXPECT_EQ(deferred_at_recovery,
+              MasterMetricManager::instance().get_client_expiry_deferred())
+        << "the breaker kept deferring a client that is pinging again";
+    EXPECT_TRUE(KeyIsVisible(*service, key));
+    EXPECT_EQ(ClientStatus::OK,
+              ObserveClientStatus(*service, client.client_id));
+}
+
+// The breaker must not be able to defer without bound. One episode whose
+// candidate set grows on several consecutive ticks -- clients registered in
+// three staggered groups, all of them then silent -- still has to end, and end
+// on the clock the episode started on rather than on the last change to its
+// candidate set. The exact arithmetic is pinned by
+// ClientMassExpiryDecisionTest.GraceClockRunsFromTheEpisodeStart; what this
+// case adds is that the monitor holds the latch across those changes.
+TEST_F(MasterServiceTest, GraceBoundEndsAnEpisodeWithAGrowingCandidateSet) {
+    constexpr int64_t kGraceSec = 3;
+    // The ttl has to outlast the whole stagger, because every group's
+    // registration heartbeat is proof that the master is serving: with a ttl
+    // shorter than the gap, each group's arrival expires the group before it
+    // instead of joining its episode. Five seconds against a 2.4 s stagger
+    // puts all six deadlines after the last heartbeat this master ever pops,
+    // which is the one episode with a growing candidate set.
+    constexpr int64_t kGrowingSetTtlSec = 5;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_client_live_ttl_sec(kGrowingSetTtlSec)
+                              .set_client_mass_expiry_grace_sec(kGraceSec)
+                              .build();
+    auto service = std::make_unique<MasterService>(service_config);
+
+    std::vector<RegisteredClientContext> clients;
+    std::vector<std::string> keys;
+    auto register_group = [&](int group) {
+        for (int i = 0; i < 2; ++i) {
+            const int index = group * 2 + i;
+            clients.push_back(RegisterClientWithSegment(
+                *service, "breaker_grace_" + std::to_string(index),
+                kDefaultSegmentBase +
+                    static_cast<size_t>(index) * kBreakerSegmentSize,
+                kBreakerSegmentSize));
+            keys.push_back(PutObjectOnSegment(*service,
+                                              clients.back().client_id,
+                                              clients.back().segment_name));
+        }
+    };
+    // Three groups a tick and a bit apart, so their deadlines lapse on
+    // different ticks and the candidate set grows inside one episode.
+    register_group(0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    register_group(1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    register_group(2);
+
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(8), [&] {
+        return MasterMetricManager::instance()
+                   .get_client_expiry_deferred_clients() > 0;
+    })) << "the episode never opened";
+    const auto episode_seen_at = std::chrono::steady_clock::now();
+    const int64_t deferred_clients_at_open =
+        MasterMetricManager::instance().get_client_expiry_deferred_clients();
+
+    // The first group is the one that opened the episode, so its expiry is
+    // what the episode's own grace clock has to produce. The later groups lapse
+    // inside the episode, which is the candidate-set change under test.
+    int64_t most_deferred_clients = deferred_clients_at_open;
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(8), [&] {
+        most_deferred_clients = std::max(
+            most_deferred_clients, MasterMetricManager::instance()
+                                       .get_client_expiry_deferred_clients());
+        return !KeyIsVisible(*service, keys[0]) &&
+               !KeyIsVisible(*service, keys[1]);
+    })) << "the episode never ended, so the breaker can defer without bound";
+    const auto expired_after =
+        std::chrono::steady_clock::now() - episode_seen_at;
+
+    EXPECT_GT(most_deferred_clients, deferred_clients_at_open)
+        << "the candidate set never grew, so this case does not exercise the "
+           "latch it is about";
+    EXPECT_LT(expired_after,
+              std::chrono::seconds(kGraceSec) + std::chrono::milliseconds(2000))
+        << "the episode outlived its grace bound by more than a monitor tick, "
+           "which is what a clock restarted on every candidate-set change "
+           "looks like";
+    ASSERT_TRUE(WaitFor(std::chrono::seconds(6), [&] {
+        return std::none_of(keys.begin(), keys.end(),
+                            [&](const std::string& key) {
+                                return KeyIsVisible(*service, key);
+                            });
+    })) << "some of the episode's clients were never expired";
+    // Every exit from the deferring state hands the gauge back, the
+    // grace-exceeded one included.
+    EXPECT_EQ(
+        0, MasterMetricManager::instance().get_client_expiry_deferred_clients())
+        << "the gauge still claims clients are being held back after the "
+           "episode expired";
+    for (const auto& key : keys) {
+        ExpectKeyGoneFromReadApis(*service, key);
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

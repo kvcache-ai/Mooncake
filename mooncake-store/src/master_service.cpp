@@ -198,6 +198,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_eviction_high_watermark_ratio),
       view_version_(config.view_version),
       client_live_ttl_sec_(config.client_live_ttl_sec),
+      client_mass_expiry_guard_(config.client_mass_expiry_guard),
+      client_mass_expiry_grace_(
+          std::chrono::seconds(config.client_mass_expiry_grace_sec)),
       nof_heartbeat_interval_sec_(
           std::chrono::seconds(config.nof_heartbeat_interval_sec)),
       nof_heartbeat_probe_timeout_ms_(
@@ -1028,6 +1031,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     -> tl::expected<void, ErrorCode> {
     {
         std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
+        ExclusiveClientLockWindow lock_window(*this);
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
         for (const auto& segment : segments) {
             if (!segment.host_id.empty()) {
@@ -1368,6 +1372,7 @@ void MasterService::UpdateClientHostId(const UUID& client_id,
     }
 
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
+    ExclusiveClientLockWindow lock_window(*this);
     auto it = client_host_id_.find(client_id);
     if (it == client_host_id_.end() || it->second != host_id) {
         client_host_id_[client_id] = host_id;
@@ -9981,6 +9986,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
 
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
+        ExclusiveClientLockWindow lock_window(*this);
         ok_client_.clear();
     }
     PodUUID pod_uuid;
@@ -11482,32 +11488,366 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
             << ", total_freed_size=" << total_freed_size;
 }
 
+ExclusiveClientLockHolds MasterService::ReadExclusiveClientLockHolds() const {
+    using Duration = std::chrono::steady_clock::duration;
+    using TimePoint = std::chrono::steady_clock::time_point;
+    ExclusiveClientLockHolds holds;
+    const int64_t in_progress =
+        client_lock_hold_start_ns_.load(std::memory_order_relaxed);
+    if (in_progress != kNoClientLockHold) {
+        holds.in_progress_start = TimePoint{Duration{in_progress}};
+    }
+    const int64_t last_start =
+        client_lock_last_hold_start_ns_.load(std::memory_order_relaxed);
+    const int64_t last_end =
+        client_lock_last_hold_end_ns_.load(std::memory_order_relaxed);
+    if (last_start != kNoClientLockHold && last_end != kNoClientLockHold) {
+        const TimePoint start{Duration{last_start}};
+        if (last_end < last_start) {
+            // A release wrote its start but not yet its end, so the hold it
+            // belongs to has no known end. Read it as still running, which is
+            // the reading that errs towards deferring.
+            if (!holds.in_progress_start.has_value() ||
+                start < *holds.in_progress_start) {
+                holds.in_progress_start = start;
+            }
+        } else {
+            holds.last_completed =
+                std::make_pair(start, TimePoint{Duration{last_end}});
+        }
+    }
+    return holds;
+}
+
+ClientMassExpiryDecision EvaluateClientMassExpiry(
+    const ClientMassExpiryInputs& inputs) {
+    ClientMassExpiryDecision decision;
+    decision.silent_for = inputs.now - inputs.last_ping_batch_at;
+    if (inputs.expired_count == 0 || !inputs.guard_enabled ||
+        inputs.grace <= std::chrono::seconds(0)) {
+        return decision;
+    }
+
+    // The window a hold has to overlap to be this tick's explanation:
+    // [last_ping_batch_at, now]. It opens at the last tick that popped a
+    // heartbeat, because a hold that released before that heartbeat is
+    // refuted by it -- the master demonstrably went back to serving pings
+    // afterwards, so it can no longer be what kept these candidates from
+    // being heard, and they are genuinely gone. It runs to now, because a
+    // hold in progress at this instant is stopping heartbeats at this
+    // instant whatever it did earlier (Overlaps takes any in_progress_start
+    // <= now).
+    decision.exclusive_hold_overlap =
+        inputs.holds.Overlaps(inputs.last_ping_batch_at, inputs.now);
+    decision.master_silent =
+        inputs.last_ping_batch_at < inputs.newest_expired_deadline;
+    decision.is_mass_expiry =
+        decision.exclusive_hold_overlap ||
+        (decision.master_silent &&
+         inputs.tracked_clients >= kMinTrackedClientsForSilenceEvidence);
+    if (!decision.is_mass_expiry) {
+        return decision;
+    }
+
+    decision.deferred_for =
+        inputs.now - inputs.episode_since.value_or(inputs.now);
+    // Compare the raw durations. Rounding to whole seconds first would make
+    // the effective bound [grace, grace + 1 s) instead of grace.
+    if (decision.deferred_for < inputs.grace) {
+        decision.defer = true;
+    } else {
+        decision.grace_exceeded = true;
+    }
+    return decision;
+}
+
+namespace {
+
+// This client monitor's contribution to master_client_expiry_deferred_clients.
+// The gauge is process-global while a monitor is per MasterService, so the
+// contribution is added and taken back as a delta rather than assigned: two
+// instances in one process then compose instead of overwriting each other. The
+// destructor takes the contribution back, so every exit from the monitor loop
+// -- including the one the destructor's join waits for -- leaves the gauge at
+// 0 rather than asserting a deferral that is no longer in progress.
+class DeferredClientsGaugeContribution {
+   public:
+    DeferredClientsGaugeContribution() = default;
+    ~DeferredClientsGaugeContribution() { Publish(0); }
+    DeferredClientsGaugeContribution(const DeferredClientsGaugeContribution&) =
+        delete;
+    DeferredClientsGaugeContribution& operator=(
+        const DeferredClientsGaugeContribution&) = delete;
+
+    void Publish(int64_t clients) {
+        if (clients == published_) {
+            return;
+        }
+        if (clients > published_) {
+            MasterMetricManager::instance().inc_client_expiry_deferred_clients(
+                clients - published_);
+        } else {
+            MasterMetricManager::instance().dec_client_expiry_deferred_clients(
+                published_ - clients);
+        }
+        published_ = clients;
+    }
+
+   private:
+    int64_t published_ = 0;
+};
+
+}  // namespace
+
 void MasterService::ClientMonitorFunc() {
+    // Both of these turn the circuit breaker off without saying so anywhere
+    // else, so say it once here: a master that will not hold back a suspected
+    // mass expiry is one bad tick away from erasing the whole cluster's cache
+    // index.
+    if (!client_mass_expiry_guard_ ||
+        client_mass_expiry_grace_ <= std::chrono::seconds(0)) {
+        LOG(WARNING) << "action=client_mass_expiry_guard_disabled"
+                     << ", client_mass_expiry_guard="
+                     << client_mass_expiry_guard_
+                     << ", client_mass_expiry_grace_sec="
+                     << client_mass_expiry_grace_.count()
+                     << ", effect=expiring_without_stall_detection";
+    }
+
     std::unordered_map<UUID, std::chrono::steady_clock::time_point,
                        boost::hash<UUID>>
         client_ttl;
+    // When the run of deferred expiries in progress began, or nullopt when no
+    // episode is in progress. Bounds one episode by
+    // client_mass_expiry_grace_.
+    std::optional<std::chrono::steady_clock::time_point> mass_expiry_since;
+    DeferredClientsGaugeContribution deferred_clients_gauge;
+    // The last tick that popped at least one ping, i.e. the last time the
+    // master is known to have processed a heartbeat. Seeded with the loop's
+    // first tick so a master that has only just started does not read its own
+    // empty queue as silence.
+    auto last_ping_batch_at = std::chrono::steady_clock::now();
     while (client_monitor_running_) {
         auto now = std::chrono::steady_clock::now();
 
-        // Update the client ttl
+        // Update the client ttl. A client's deadline is stamped by the tick
+        // that popped that client's ping, so it is that tick's time plus the
+        // ttl.
         PodUUID pod_client_id;
+        bool popped_ping = false;
         while (client_ping_queue_.pop(pod_client_id)) {
+            popped_ping = true;
             UUID client_id = {pod_client_id.first, pod_client_id.second};
             client_ttl[client_id] =
                 now + std::chrono::seconds(client_live_ttl_sec_);
         }
+        if (popped_ping) {
+            last_ping_batch_at = now;
+        }
 
-        // Find out expired clients
+        // Find out expired clients. Collect them without touching client_ttl,
+        // because the circuit breaker below may decide not to expire them.
         std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
+        auto newest_expired_deadline =
+            std::chrono::steady_clock::time_point::min();
+        for (const auto& [client_id, deadline] : client_ttl) {
+            if (deadline < now) {
+                expired_clients.push_back(client_id);
+                newest_expired_deadline =
+                    std::max(newest_expired_deadline, deadline);
             }
+        }
+
+        // Client mass-expiry circuit breaker.
+        //
+        // Expiring a client unmounts its segments and erases its keys, and
+        // nothing in the master undoes that: one bad tick costs the whole
+        // cluster its cache index, and only a snapshot or a standby that
+        // still holds the metadata can bring it back. So before acting, the
+        // monitor has to tell "my clients died" from "I failed to process
+        // their heartbeats" -- and it cannot do that from the absence of
+        // heartbeats, which looks identical either way. It measures the cause
+        // instead.
+        //
+        // Primary condition: an exclusive client_mutex_ hold overlapped
+        // [last_ping_batch_at, now], the stretch over which this master has
+        // no heartbeat of its own to show. A completed hold therefore counts
+        // only while no heartbeat has been popped since it released: once one
+        // has, the master is demonstrably serving pings again, that hold is
+        // refuted as an explanation, and candidates still overdue are
+        // genuinely gone. A hold in progress counts unconditionally, since it
+        // is stopping heartbeats at this instant. Ping's whole body is a
+        // shared-lock read of ok_client_ and a push onto a lock-free queue, so
+        // an exclusive holder of client_mutex_ is the one thing that stops the
+        // handler running at all -- and the master knows when it holds that
+        // lock, because every site that takes it exclusively records its
+        // window (see ExclusiveClientLockWindow). This is evidence about the
+        // master, not about the clients, so no tick boundary and no number of
+        // candidates can shake it. The monitor's own expiry branch below takes
+        // the same lock exclusively and is deliberately not instrumented: a
+        // previous tick's expiry work must not come back as evidence that the
+        // master was stalling.
+        //
+        // That left edge moves with the heartbeat stream, and it has to. A
+        // pinned edge -- the candidate's own last pop, newest_expired_deadline
+        // minus the ttl -- never advances while now does, so a routine
+        // few-millisecond hold that happens to land inside a dying client's
+        // last ttl window defers that client for the whole grace while every
+        // other client's heartbeats flow. Following the stream never widens
+        // the window either: the candidate's last pop is by definition at or
+        // before last_ping_batch_at, and the two coincide exactly when the
+        // newest candidate is the last client the master heard from, which is
+        // the single-client case and the whole-fleet case -- the two cases
+        // that need the protection most. Nor can the edge be a wall-clock
+        // recency bound on the hold: a hold can release and leave the master
+        // starved for many more ticks (the UnmountSegment ->
+        // ClearInvalidHandles sweep holds snapshot_mutex_ across all shards,
+        // observed at 8.5-9.6 s with 14M keys), and through that no heartbeat
+        // is popped, so last_ping_batch_at does not advance and the released
+        // hold stays evidence. A "holds within the last tick or two" rule ages
+        // that evidence out mid-stall and erases the keys.
+        //
+        // Secondary condition: the master has processed no ping at all since
+        // the newest candidate went overdue, and it tracks at least
+        // kMinTrackedClientsForSilenceEvidence clients. An exclusive hold is
+        // not the only way to starve heartbeats -- io threads all blocked on
+        // snapshot_mutex_ or on shard locks starve Ping too, and no hold is
+        // recorded for that -- so the silence is kept as weaker evidence. It
+        // needs the client count, because silence only says something about
+        // the master when there was somebody else who could have spoken for
+        // it: with one tracked client, "nobody pinged" and "that client died"
+        // are the same sentence, and reading it as a stall would hold back
+        // every store restart in a single-client cluster for the whole grace.
+        //
+        // The two are OR-ed, so the breaker errs towards deferring. That is
+        // the bounded direction: being wrong this way costs
+        // client_mass_expiry_grace_sec of stale segments, being wrong the
+        // other way costs the whole cluster its cache index.
+        //
+        // What the rule does, case by case:
+        //
+        //   one client, it dies, master healthy               expire now
+        //     -- no hold overlapped, and one tracked client is not evidence.
+        //   one client, a ReMountSegment stall                 defer
+        //     -- the remount's hold overlaps the window.
+        //   a client dies, then a short mount holds the lock   expire now
+        //     -- the hold released and heartbeats were popped after it, so it
+        //        does not explain a client still overdue. A left edge pinned
+        //        to the candidate's own last pop would defer the death for
+        //        the whole grace instead.
+        //   many clients, one stall, candidates split          defer
+        //     -- the hold overlaps every affected tick's window, because a
+        //        stall that blocks Ping pops no heartbeat and so cannot move
+        //        the window's left edge past itself. How the candidates split
+        //        across ticks is irrelevant, which is the whole point of
+        //        judging the cause, and it holds whether the tick carries a
+        //        majority of the clients or a single one.
+        //   many clients, healthy master, a majority die       expire now
+        //     -- the survivors' pings land after the candidates' deadlines,
+        //        so the master is not silent, and nothing was holding.
+        //   many clients, healthy master, all of them die      defer, then
+        //                                                      expire at the
+        //                                                      grace bound
+        //     -- silence with nobody left to speak for the master is exactly
+        //        what a total stall looks like, and no reading of the
+        //        heartbeat stream can separate the two. The cost is bounded
+        //        and it falls on segments whose owners are all gone.
+        //   one client, starvation with no client_mutex_ hold  keys erased
+        //     -- the residual gap. No hold is recorded and one tracked client
+        //        is not evidence, so the breaker has nothing to go on. Closing
+        //        it needs a liveness signal off the data path, which this
+        //        change does not build.
+        //
+        // Deferring is doing nothing at all: client_ttl keeps its entry, no
+        // unmount is prepared and no stale-handle sweep runs, and no deadline
+        // is refreshed by hand. Recovery needs no machinery either -- the loop
+        // above drains client_ping_queue_ every tick, so a client whose
+        // heartbeat arrives during the deferral has its TTL refreshed and
+        // stops being a candidate on its own, which is also what keeps the
+        // grace a bound on the whole episode rather than on the interval
+        // between refreshes.
+        const bool episode_was_open = mass_expiry_since.has_value();
+        const ClientMassExpiryDecision decision = EvaluateClientMassExpiry({
+            .guard_enabled = client_mass_expiry_guard_,
+            .grace = client_mass_expiry_grace_,
+            .expired_count = expired_clients.size(),
+            // client_ttl is this thread's own map, so reading its size needs
+            // no lock -- and the breaker must not take one, since it runs
+            // ahead of the locked section it exists to survive.
+            .tracked_clients = client_ttl.size(),
+            .holds = ReadExclusiveClientLockHolds(),
+            .now = now,
+            .last_ping_batch_at = last_ping_batch_at,
+            .newest_expired_deadline = newest_expired_deadline,
+            .episode_since = mass_expiry_since,
+        });
+
+        if (decision.is_mass_expiry) {
+            if (!mass_expiry_since.has_value()) {
+                mass_expiry_since = now;
+            }
+        } else {
+            mass_expiry_since.reset();
+        }
+        if (!decision.defer) {
+            deferred_clients_gauge.Publish(0);
+        }
+
+        if (decision.is_mass_expiry) {
+            const auto deferred_for_sec =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    decision.deferred_for);
+            const auto silent_for_sec =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    decision.silent_for);
+            if (decision.defer) {
+                MasterMetricManager::instance().inc_client_expiry_deferred();
+                deferred_clients_gauge.Publish(
+                    static_cast<int64_t>(expired_clients.size()));
+                // The first tick of an episode is news. The ticks after it are
+                // the same news once a second, so they go out at INFO and a
+                // 60 s episode does not bury the log in sixty warnings.
+                std::ostringstream line;
+                line << "action=client_mass_expiry_deferred"
+                     << ", expired_count=" << expired_clients.size()
+                     << ", tracked_clients=" << client_ttl.size()
+                     << ", exclusive_hold_overlap="
+                     << decision.exclusive_hold_overlap
+                     << ", master_silent=" << decision.master_silent
+                     << ", silent_for_sec=" << silent_for_sec.count()
+                     << ", deferred_for_sec=" << deferred_for_sec.count()
+                     << ", grace_sec=" << client_mass_expiry_grace_.count()
+                     << ", reason=master_stall_suspected";
+                if (episode_was_open) {
+                    LOG(INFO) << line.str();
+                } else {
+                    LOG(WARNING) << line.str();
+                }
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(kClientMonitorSleepMs));
+                continue;
+            }
+            // The grace bound is reached, so the breaker stops judging and the
+            // expiry goes ahead. mass_expiry_since stays set for as long as
+            // the conditions hold, which keeps the next tick from opening a
+            // fresh episode and deferring the same clients again. This is the
+            // master about to do the unrecoverable thing the breaker exists to
+            // avoid, so it is an error, not a warning.
+            LOG(ERROR) << "action=client_mass_expiry_grace_exceeded"
+                       << ", expired_count=" << expired_clients.size()
+                       << ", tracked_clients=" << client_ttl.size()
+                       << ", exclusive_hold_overlap="
+                       << decision.exclusive_hold_overlap
+                       << ", master_silent=" << decision.master_silent
+                       << ", silent_for_sec=" << silent_for_sec.count()
+                       << ", deferred_for_sec=" << deferred_for_sec.count()
+                       << ", grace_sec=" << client_mass_expiry_grace_.count()
+                       << ", reason=expiring_after_grace";
+        }
+
+        for (const auto& client_id : expired_clients) {
+            LOG(INFO) << "client_id=" << client_id << ", action=client_expired";
+            client_ttl.erase(client_id);
         }
 
         // Update the client status to NEED_REMOUNT
