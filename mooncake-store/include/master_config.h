@@ -59,6 +59,8 @@ struct MasterConfig {
 
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
@@ -201,6 +203,8 @@ class MasterServiceSupervisorConfig {
     std::string etcd_endpoints = "0.0.0.0:2379";
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
@@ -341,6 +345,8 @@ class MasterServiceSupervisorConfig {
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
@@ -525,6 +531,8 @@ class WrappedMasterServiceConfig {
     std::string ha_backend_connstring;
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -623,6 +631,8 @@ class WrappedMasterServiceConfig {
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -747,6 +757,8 @@ class WrappedMasterServiceConfig {
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -815,6 +827,8 @@ class MasterServiceConfigBuilder {
     std::string ha_backend_connstring_;
     // OpLog store configuration
     bool enable_oplog_ = false;
+    bool enable_oplog_snapshot_ = false;
+    uint64_t snapshot_chunk_object_count_ = 1000000;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
@@ -948,6 +962,17 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
         enable_oplog_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_oplog_snapshot(bool enable) {
+        enable_oplog_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_chunk_object_count(
+        uint64_t count) {
+        snapshot_chunk_object_count_ = count;
         return *this;
     }
 
@@ -1204,6 +1229,8 @@ class MasterServiceConfig {
     std::string ha_backend_connstring;
     // OpLog store configuration
     bool enable_oplog = false;
+    bool enable_oplog_snapshot = false;
+    uint64_t snapshot_chunk_object_count = 1000000;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -1296,6 +1323,8 @@ class MasterServiceConfig {
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
         enable_oplog = config.enable_oplog;
+        enable_oplog_snapshot = config.enable_oplog_snapshot;
+        snapshot_chunk_object_count = config.snapshot_chunk_object_count;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
@@ -1365,6 +1394,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
     config.enable_oplog = enable_oplog_;
+    config.enable_oplog_snapshot = enable_oplog_snapshot_;
+    config.snapshot_chunk_object_count = snapshot_chunk_object_count_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.cluster_id = cluster_id_;
