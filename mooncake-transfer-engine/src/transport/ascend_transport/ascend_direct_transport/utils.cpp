@@ -39,8 +39,6 @@ constexpr const char* kProtocolDescFlatKey =
     "comm_resource_config.protocol_desc";
 constexpr const char* kRocePrefix = "roce:";
 constexpr const char* kStoreConfigKey = "store";
-constexpr const char* kFabricMemoryKey = "fabric_memory";
-constexpr const char* kFabricMemoryFlatPrefix = "fabric_memory.";
 
 std::string SerializeCompactJson(const Json::Value& value) {
     Json::StreamWriterBuilder writer;
@@ -79,24 +77,6 @@ const Json::Value* FindProtocolDescValue(const Json::Value& root) {
     return nullptr;
 }
 
-bool RootHasFabricMemoryConfig(const Json::Value& root) {
-    if (!root.isObject()) {
-        return false;
-    }
-    if (root.isMember(kFabricMemoryKey)) {
-        return true;
-    }
-    const auto names = root.getMemberNames();
-    const size_t prefix_len = std::strlen(kFabricMemoryFlatPrefix);
-    for (const auto& name : names) {
-        if (name.size() > prefix_len &&
-            name.compare(0, prefix_len, kFabricMemoryFlatPrefix) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
 bool ParseGlobalResourceConfigObject(const char* config_str,
                                      Json::Value& root) {
     if (config_str == nullptr || config_str[0] == '\0') {
@@ -131,14 +111,6 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char* config_str) {
         return false;
     }
     return ProtocolDescValueContainsRoce(*protocol_desc);
-}
-
-bool HasFabricMemoryInGlobalResourceConfig(const char* config_str) {
-    Json::Value root;
-    if (!ParseGlobalResourceConfigObject(config_str, root)) {
-        return false;
-    }
-    return RootHasFabricMemoryConfig(root);
 }
 
 std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
