@@ -15,9 +15,12 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
-#include <numeric>
 #include <fstream>
+#include <limits>
+#include <mutex>
+#include <numeric>
 
 #include <pybind11/stl.h>
 #include "shared_segment_py.h"
@@ -56,6 +59,85 @@
 static void* (*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
+
+enum class ScatterTransferCompletionStatus : int {
+    COMPLETED = 0,
+    FAILED_DRAINED = -1,
+    COMPLETION_UNKNOWN = -2,
+};
+
+class ScatterTransferTicket {
+   public:
+    explicit ScatterTransferTicket(
+        std::shared_ptr<TransferEngine::ScatterTransferOperation> operation)
+        : operation_(std::move(operation)) {}
+
+    static std::shared_ptr<ScatterTransferTicket> terminal(
+        ScatterTransferCompletionStatus status) {
+        auto ticket = std::shared_ptr<ScatterTransferTicket>(
+            new ScatterTransferTicket(nullptr));
+        ticket->status_ = status;
+        ticket->drained_ = true;
+        return ticket;
+    }
+
+    ScatterTransferCompletionStatus status() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return status_;
+    }
+
+    bool drained() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return drained_;
+    }
+
+    ScatterTransferCompletionStatus drain(uint64_t timeout_ms) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (drained_) return status_;
+        if (!operation_) {
+            status_ = ScatterTransferCompletionStatus::FAILED_DRAINED;
+            drained_ = true;
+            return status_;
+        }
+
+        constexpr uint64_t kNanosPerMillis = 1000 * 1000;
+        const auto max_milliseconds =
+            static_cast<uint64_t>(std::chrono::nanoseconds::max().count()) /
+            kNanosPerMillis;
+        const auto bounded_timeout = std::chrono::milliseconds(
+            timeout_ms > max_milliseconds ? max_milliseconds : timeout_ms);
+        Status result = operation_->waitFor(bounded_timeout);
+        if (result.IsClock()) {
+            return ScatterTransferCompletionStatus::COMPLETION_UNKNOWN;
+        }
+
+        status_ = result.ok() ? ScatterTransferCompletionStatus::COMPLETED
+                              : ScatterTransferCompletionStatus::FAILED_DRAINED;
+        drained_ = true;
+        operation_.reset();
+        return status_;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::shared_ptr<TransferEngine::ScatterTransferOperation> operation_;
+    ScatterTransferCompletionStatus status_ =
+        ScatterTransferCompletionStatus::COMPLETION_UNKNOWN;
+    bool drained_ = false;
+};
+
+namespace {
+
+uint64_t nanosToCeilingMillis(uint64_t timeout_ns) {
+    constexpr uint64_t kNanosPerMillis = 1000 * 1000;
+    if (timeout_ns >
+        std::numeric_limits<uint64_t>::max() - (kNanosPerMillis - 1)) {
+        return std::numeric_limits<uint64_t>::max() / kNanosPerMillis;
+    }
+    return (timeout_ns + kNanosPerMillis - 1) / kNanosPerMillis;
+}
+
+}  // namespace
 
 //  Handle allocateMemory function pointer based on protocol
 void initMemoryAllocator(const char* protocol) {
@@ -458,6 +540,108 @@ int TransferEnginePy::batchTransferSyncRead(
     return batchTransferSync(target_hostname, buffers, peer_buffer_addresses,
                              lengths, TransferOpcode::READ, nullptr,
                              transport_hint);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncWriteWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths) {
+    return scatterTransferSyncWithTicket(
+        endpoint, local_base_addresses, local_capacities, remote_base_addresses,
+        remote_capacities, local_offsets, remote_offsets, lengths,
+        TransferOpcode::WRITE);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncReadWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths) {
+    return scatterTransferSyncWithTicket(
+        endpoint, local_base_addresses, local_capacities, remote_base_addresses,
+        remote_capacities, local_offsets, remote_offsets, lengths,
+        TransferOpcode::READ);
+}
+
+std::shared_ptr<ScatterTransferTicket>
+TransferEnginePy::scatterTransferSyncWithTicket(
+    const std::string& endpoint,
+    const std::vector<uintptr_t>& local_base_addresses,
+    const std::vector<size_t>& local_capacities,
+    const std::vector<uint64_t>& remote_base_addresses,
+    const std::vector<size_t>& remote_capacities,
+    const std::vector<std::vector<size_t>>& local_offsets,
+    const std::vector<std::vector<size_t>>& remote_offsets,
+    const std::vector<std::vector<size_t>>& lengths, TransferOpcode opcode) {
+    pybind11::gil_scoped_release release;
+    const size_t range_count = local_base_addresses.size();
+    if (local_capacities.size() != range_count ||
+        remote_base_addresses.size() != range_count ||
+        remote_capacities.size() != range_count ||
+        local_offsets.size() != range_count ||
+        remote_offsets.size() != range_count || lengths.size() != range_count) {
+        LOG(ERROR) << "Scatter transfer range arrays have different sizes";
+        return ScatterTransferTicket::terminal(
+            ScatterTransferCompletionStatus::FAILED_DRAINED);
+    }
+
+    std::vector<TransferEngine::ScatterTransferRange> ranges;
+    ranges.reserve(range_count);
+    uint64_t total_length = 0;
+    for (size_t i = 0; i < range_count; ++i) {
+        const size_t fragment_count = local_offsets[i].size();
+        if (remote_offsets[i].size() != fragment_count ||
+            lengths[i].size() != fragment_count) {
+            LOG(ERROR) << "Scatter transfer fragment arrays have different "
+                          "sizes at range "
+                       << i;
+            return ScatterTransferTicket::terminal(
+                ScatterTransferCompletionStatus::FAILED_DRAINED);
+        }
+
+        TransferEngine::ScatterTransferRange range;
+        range.opcode = opcode == TransferOpcode::WRITE ? TransferRequest::WRITE
+                                                       : TransferRequest::READ;
+        range.remote_segment = endpoint;
+        range.remote_base_offset = remote_base_addresses[i];
+        range.remote_size = remote_capacities[i];
+        range.local_buffer = reinterpret_cast<void*>(local_base_addresses[i]);
+        range.local_capacity = local_capacities[i];
+        range.local_offsets = local_offsets[i];
+        range.remote_offsets = remote_offsets[i];
+        range.lengths = lengths[i];
+        ranges.push_back(std::move(range));
+
+        for (size_t length : lengths[i]) {
+            if (length > std::numeric_limits<uint64_t>::max() - total_length) {
+                total_length = std::numeric_limits<uint64_t>::max();
+                break;
+            }
+            total_length += length;
+        }
+    }
+
+    auto operation = std::make_shared<TransferEngine::ScatterTransferOperation>(
+        engine_->submitScatter(ranges));
+    auto ticket = std::make_shared<ScatterTransferTicket>(operation);
+    const uint64_t timeout_ns =
+        total_length >
+                std::numeric_limits<uint64_t>::max() - transfer_timeout_nsec_
+            ? std::numeric_limits<uint64_t>::max()
+            : transfer_timeout_nsec_ + total_length;
+    ticket->drain(nanosToCeilingMillis(timeout_ns));
+    return ticket;
 }
 
 batch_id_t TransferEnginePy::batchTransferAsyncWrite(
@@ -1248,6 +1432,32 @@ PYBIND11_MODULE(engine, m) {
         .value("Write", TransferEnginePy::TransferOpcode::WRITE)
         .export_values();
 
+    py::enum_<ScatterTransferCompletionStatus>(
+        m, "ScatterTransferCompletionStatus")
+        .value("COMPLETED", ScatterTransferCompletionStatus::COMPLETED)
+        .value("FAILED_DRAINED",
+               ScatterTransferCompletionStatus::FAILED_DRAINED)
+        .value("COMPLETION_UNKNOWN",
+               ScatterTransferCompletionStatus::COMPLETION_UNKNOWN);
+
+    py::class_<ScatterTransferTicket, std::shared_ptr<ScatterTransferTicket>>(
+        m, "ScatterTransferTicket",
+        "Keeps a scatter operation alive until native DMA is drained.")
+        .def_property_readonly("status",
+                               [](const ScatterTransferTicket& ticket) {
+                                   py::gil_scoped_release release;
+                                   return ticket.status();
+                               })
+        .def_property_readonly("drained",
+                               [](const ScatterTransferTicket& ticket) {
+                                   py::gil_scoped_release release;
+                                   return ticket.drained();
+                               })
+        .def("drain", [](ScatterTransferTicket& ticket, uint64_t timeout_ms) {
+            py::gil_scoped_release release;
+            return ticket.drain(timeout_ms);
+        });
+
     py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
         .def(py::init<>())
         .def(py::init<const std::string&, const std::string&>(),
@@ -1282,6 +1492,20 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("transport_hint") = "")
+            .def("scatter_transfer_sync_write_with_ticket",
+                 &TransferEnginePy::scatterTransferSyncWriteWithTicket,
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
+            .def("scatter_transfer_sync_read_with_ticket",
+                 &TransferEnginePy::scatterTransferSyncReadWithTicket,
+                 py::arg("endpoint"), py::arg("local_base_addresses"),
+                 py::arg("local_capacities"), py::arg("remote_base_addresses"),
+                 py::arg("remote_capacities"), py::arg("local_offsets"),
+                 py::arg("remote_offsets"), py::arg("lengths"),
+                 py::keep_alive<0, 1>())
             .def("batch_transfer_async_write",
                  &TransferEnginePy::batchTransferAsyncWrite,
                  py::arg("target_hostname"), py::arg("buffers"),
