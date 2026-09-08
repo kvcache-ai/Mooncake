@@ -421,10 +421,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         wrapped_config.enable_snapshot_restore = false;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
+        // Keep the gate alive until after the service is destroyed because the
+        // OpLog writer owned by the service invokes a callback that uses it.
+        detail::ServingStateGate serving_state;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
-        detail::ServingStateGate serving_state;
         wrapped_master_service->SetBatchOpLogTerminalCallback(
             [&](const OrderedOpLogWriterTerminalState& state) {
                 serving_state.RequestShutdown([&]() {
