@@ -49,6 +49,15 @@ class Platform {
         void *start, size_t len, bool skip_prefault = false) = 0;
 
     virtual const std::string type() const = 0;
+
+    // Make GPUDirect / device DMA visible on devices named in `topology`.
+    // GPU platforms flush those devices; CPU and others no-op. Failures are
+    // logged and still return OK so teardown can continue.
+    virtual Status synchronizeDevices(const Topology *topology);
+
+   protected:
+    static std::vector<int> topologyDeviceIndices(const Topology *topology,
+                                                  Topology::MemType mem_type);
 };
 
 }  // namespace tent

@@ -13,6 +13,7 @@
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
+#include "config/rpc_timeout_config.h"
 #include "replica.h"
 #include "segment.h"
 #include "types.h"
@@ -48,17 +49,16 @@ inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
 
 // Applies the RPC timeout overrides to any mooncake-store RPC client config.
 // Shared by the client->master pool and the store->store offload pool so the
-// two cannot drift. Unset variables leave coro_rpc's built-in 30s defaults in
-// place. A negative request timeout disables the per-request timer.
+// two cannot drift. Absent overrides leave the caller's defaults in place.
+// A negative request timeout disables the per-request timer.
 template <typename ClientConfig>
-inline void ApplyRpcTimeoutEnvOverrides(ClientConfig& client_config) {
-    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
-        client_config.request_timeout_duration =
-            std::chrono::milliseconds(std::atoll(timeout_ms));
+inline void ApplyRpcTimeoutOverrides(ClientConfig& client_config,
+                                     const RpcTimeoutConfig& config) {
+    if (config.request_timeout.has_value()) {
+        client_config.request_timeout_duration = *config.request_timeout;
     }
-    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
-        client_config.connect_timeout_duration =
-            std::chrono::milliseconds(std::atoll(connect_ms));
+    if (config.connect_timeout.has_value()) {
+        client_config.connect_timeout_duration = *config.connect_timeout;
     }
 }
 
@@ -69,7 +69,8 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
-    ApplyRpcTimeoutEnvOverrides(config.client_config);
+    ApplyRpcTimeoutOverrides(config.client_config,
+                             RpcTimeoutConfig::FromEnvironment());
     return config;
 }
 
