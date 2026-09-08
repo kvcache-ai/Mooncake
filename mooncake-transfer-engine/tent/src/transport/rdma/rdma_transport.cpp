@@ -20,10 +20,16 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 #include <cassert>
 #include <cerrno>
 #include <cstddef>
 #include <cstdlib>
+#include <fstream>
 #include <future>
 #include <limits>
 #include <sstream>
@@ -81,6 +87,137 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
     }
 
     return 0;
+}
+
+#ifdef USE_CUDA
+// Driver-API probe: true iff this process already has a primary context on
+// `device`. Does not create one. Topology lists every visible GPU for NIC
+// affinity; cudaSetDevice on those names would allocate idle-card contexts
+// (Tone runs --gpus all without CUDA_VISIBLE_DEVICES).
+bool cudaPrimaryContextIsActive(int device) {
+    if (cuInit(0) != CUDA_SUCCESS) return false;
+    CUdevice cu_dev = 0;
+    if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+    unsigned int flags = 0;
+    int active = 0;
+    if (cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) != CUDA_SUCCESS) {
+        return false;
+    }
+    return active != 0;
+}
+
+bool cudaHasCurrentContext() {
+    if (cuInit(0) != CUDA_SUCCESS) return false;
+    CUcontext ctx = nullptr;
+    return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+}
+
+// Walk topology CUDA devices that already have a primary context. Restores
+// the caller's current device only when this thread already had one — a
+// bare cudaGetDevice() can implicitly create GPU 0. `op` is a log tag
+// (e.g. "quiesce", "gdr-flush").
+template <typename Fn>
+void forEachTopologyCudaDevice(const Topology* topology, const char* op,
+                               Fn&& on_device) {
+    if (!topology) return;
+
+    const size_t mem_count = topology->getMemCount();
+    bool any_cuda = false;
+    for (size_t i = 0; i < mem_count; ++i) {
+        const auto* mem =
+            topology->getMemEntry(static_cast<Topology::MemID>(i));
+        if (mem && mem->type == Topology::MEM_CUDA) {
+            any_cuda = true;
+            break;
+        }
+    }
+    if (!any_cuda) return;
+
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0) {
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA " << op << " cudaGetDeviceCount failed: "
+                         << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+        return;
+    }
+
+    int saved = 0;
+    const bool have_saved =
+        cudaHasCurrentContext() && cudaGetDevice(&saved) == cudaSuccess;
+    if (!have_saved) (void)cudaGetLastError();
+
+    for (size_t i = 0; i < mem_count; ++i) {
+        const auto* mem =
+            topology->getMemEntry(static_cast<Topology::MemID>(i));
+        if (!mem || mem->type != Topology::MEM_CUDA) continue;
+        LocationParser parser(mem->name);
+        const int device = parser.index();
+        if (device < 0 || device >= device_count) continue;
+        if (!cudaPrimaryContextIsActive(device)) continue;
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA " << op << " cudaSetDevice(" << device
+                         << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            continue;
+        }
+        on_device(device);
+    }
+    if (have_saved) {
+        err = cudaSetDevice(saved);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA " << op << " restore cudaSetDevice(" << saved
+                         << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
+}
+#endif
+
+// After a transfer-done notify, make GPUDirect RDMA writes visible to the dest
+// GPU owner before the caller consumes the buffer. Host-side flush, not a
+// full device synchronize. Empty topology / unsupported devices are no-ops.
+Status flushDestGpuDirectWrites(const Topology* topology) {
+#ifdef USE_CUDA
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11030
+    forEachTopologyCudaDevice(topology, "gdr-flush", [](int device) {
+        int options = 0;
+        cudaError_t err = cudaDeviceGetAttribute(
+            &options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA gdr-flush cudaDeviceGetAttribute device "
+                         << device << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            return;
+        }
+        if ((options & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) {
+            LOG_FIRST_N(WARNING, 8)
+                << "RDMA gdr-flush host option unsupported on device "
+                << device;
+            return;
+        }
+        err = cudaDeviceFlushGPUDirectRDMAWrites(
+            cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+            cudaFlushGPUDirectRDMAWritesToOwner);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA gdr-flush device " << device
+                         << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            return;
+        }
+        LOG_FIRST_N(INFO, 1)
+            << "RDMA dest GPUDirect write flush enabled on device " << device;
+    });
+#else
+    (void)topology;
+#endif
+#else
+    (void)topology;
+#endif
+    return Status::OK();
 }
 
 }  // namespace
@@ -238,16 +375,12 @@ static Status convertConfToRdmaParams(std::shared_ptr<Config> conf,
     params->verbose = conf->get("verbose", false);
     params->log_slice_affinity =
         conf->get("transports/rdma/log_slice_affinity", false);
+    params->with_nvidia_peermem =
+        conf->get("transports/rdma/with_nvidia_peermem", false);
     return Status::OK();
 }
 
-static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
-    auto disable_gpu_direct =
-        conf->get("transports/rdma/disable_gpu_direct_rdma", false);
-    if (disable_gpu_direct) {
-        return false;
-    }
-    // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
+static bool isPeermemModuleLoaded() {
     // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
     // ib_core), so the amdgpu module itself is the presence signal.
     std::ifstream modules("/proc/modules");
@@ -261,6 +394,25 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
         }
     }
     return false;
+}
+
+static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
+    auto disable_gpu_direct =
+        conf->get("transports/rdma/disable_gpu_direct_rdma", false);
+    if (disable_gpu_direct) {
+        return false;
+    }
+    const bool with_nvidia_peermem =
+        conf->get("transports/rdma/with_nvidia_peermem", false);
+    if (with_nvidia_peermem) {
+        return isPeermemModuleLoaded();
+    }
+    // Default: DMA-BUF first. Some GPUs/drivers advertise no DMA-BUF (H20
+    // here: CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED=0, export returns 801) and
+    // still do GDR through nvidia-peermem. Keep gpu_to_gpu on in that case so
+    // registration can fall back to ibv_reg_mr instead of host-bounce.
+    return RdmaContext::dmaBufRegistrationAvailable() ||
+           isPeermemModuleLoaded();
 }
 
 RdmaTransport::RdmaTransport()
@@ -375,6 +527,15 @@ Status RdmaTransport::install(std::string& local_segment_name,
         caps.dram_to_gpu = true;
         caps.gpu_to_dram = true;
         caps.gpu_to_gpu = true;
+        if (params_->with_nvidia_peermem) {
+            LOG(INFO) << "RdmaTransport(TENT): GPUDirect RDMA via "
+                         "nvidia-peermem/amdgpu (WITH_NVIDIA_PEERMEM)";
+        } else if (RdmaContext::dmaBufRegistrationAvailable()) {
+            LOG(INFO) << "RdmaTransport(TENT): GPUDirect RDMA via DMA-BUF";
+        } else {
+            LOG(INFO) << "RdmaTransport(TENT): GPUDirect RDMA via "
+                         "nvidia-peermem (DMA-BUF not available on this GPU)";
+        }
     }
     return Status::OK();
 }
@@ -828,12 +989,26 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
 
 Status RdmaTransport::receiveNotification(
     std::vector<Notification>& notify_list) {
-    std::lock_guard<std::mutex> lock(notify_mutex_);
-    if (notify_list_.empty()) {
-        return Status::OK();
+    {
+        std::lock_guard<std::mutex> lock(notify_mutex_);
+        if (notify_list_.empty()) {
+            return Status::OK();
+        }
+        notify_list = std::move(notify_list_);
+        notify_list_.clear();
     }
-    notify_list = std::move(notify_list_);
-    notify_list_.clear();
+    // Empty polls are the hot path. Flush only after a real transfer-done
+    // notify, and never while holding notify_mutex_ (this thread may enter
+    // CUDA; the notify worker is a different path).
+    bool flush = caps.gpu_to_gpu;
+    if (conf_) {
+        flush =
+            flush &&
+            conf_->get("transports/rdma/flush_gpu_direct_rdma_writes", true);
+    }
+    if (flush) {
+        (void)flushDestGpuDirectWrites(local_topology_.get());
+    }
     return Status::OK();
 }
 
