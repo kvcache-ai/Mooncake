@@ -203,7 +203,7 @@ static std::string NormalizeMooncakeHostId(std::string_view value) {
     return IsUsableMooncakeHostId(host_id) ? host_id : "";
 }
 
-std::string ResolveMooncakeHostId(const std::string& local_hostname) {
+std::string ResolveMooncakeHostId(const std::string &local_hostname) {
     const std::string configured_host_id(
         TrimAsciiWhitespace(Environ::GetString("MOONCAKE_HOST_ID", "")));
     if (!configured_host_id.empty()) {
