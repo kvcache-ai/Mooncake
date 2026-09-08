@@ -465,8 +465,7 @@ TEST(RailMonitorEscalationTest, ExpiryRetainsCooldownForNextCycle) {
     EXPECT_FALSE(rail.available(0, 0))
         << "Cycle 2 must use the escalated 2s cooldown; 1.1s is not enough.";
     std::this_thread::sleep_for(std::chrono::milliseconds(1400));
-    EXPECT_TRUE(rail.available(0, 0))
-        << "Cycle 2 (2s) must expire by ~2.5s.";
+    EXPECT_TRUE(rail.available(0, 0)) << "Cycle 2 (2s) must expire by ~2.5s.";
 }
 
 // ---------------------------------------------------------------------------
@@ -482,7 +481,7 @@ TEST(RailMonitorProbeTest, ProbeAdmitsTransferDuringCooldown) {
     Config cfg;
     cfg.set(RailMonitor::kCfgErrorThreshold, 1);
     cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
-    cfg.set(RailMonitor::kCfgCooldownSecs, 10);     // long cooldown
+    cfg.set(RailMonitor::kCfgCooldownSecs, 10);  // long cooldown
     cfg.set(RailMonitor::kCfgProbeIntervalSecs, 1);
 
     RailMonitor rail;

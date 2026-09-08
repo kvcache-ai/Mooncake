@@ -2526,12 +2526,13 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         return Status::InvalidEntry("All available transports are failed");
     }
 
-    LOG_EVERY_N(INFO, 1000) << "Transport failover: " << transportTypeName(prev_type)
-              << " -> " << transportTypeName(type) << " (attempt "
-              << task.failover_count << "/" << max_failover_attempts_ << ")";
-    VLOG(1) << "Transport failover: " << transportTypeName(prev_type)
-              << " -> " << transportTypeName(type) << " (attempt "
-              << task.failover_count << "/" << max_failover_attempts_ << ")";
+    LOG_EVERY_N(INFO, 1000)
+        << "Transport failover: " << transportTypeName(prev_type) << " -> "
+        << transportTypeName(type) << " (attempt " << task.failover_count << "/"
+        << max_failover_attempts_ << ")";
+    VLOG(1) << "Transport failover: " << transportTypeName(prev_type) << " -> "
+            << transportTypeName(type) << " (attempt " << task.failover_count
+            << "/" << max_failover_attempts_ << ")";
     TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     auto& transport = transport_list_[type];

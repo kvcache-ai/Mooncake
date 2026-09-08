@@ -133,8 +133,8 @@ bool RailMonitor::available(int local_nic, int remote_nic) {
     updateBestMapping();
     LOG(INFO) << "Rail recovered: local_nic=" << local_nic
               << " remote_nic=" << remote_nic
-              << " (cooldown expired, cooldown_retained="
-              << st.cooldown.count() << "s)";
+              << " (cooldown expired, cooldown_retained=" << st.cooldown.count()
+              << "s)";
     return true;
 }
 
