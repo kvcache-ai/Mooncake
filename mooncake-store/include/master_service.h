@@ -1549,8 +1549,7 @@ class MasterService {
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
-              lock_(entry_ != nullptr
-                        ? std::unique_lock<std::shared_mutex>(entry_->mutex)
+              lock_(entry_ != nullptr ? entry_->LockUnique()
                         : std::unique_lock<std::shared_mutex>()) {
             if (tenant_state_ != nullptr) {
                 service_->GetBoundTenantQuotaHandle(*tenant_state_);
@@ -1706,7 +1705,7 @@ class MasterService {
                         "Create(): winner entry disappeared after failed "
                         "insert");
                 }
-                lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
+                lock_ = entry_->LockUnique();
                 return;
             }
             // Create() is only used by the offload replica-registration path,
@@ -1714,7 +1713,7 @@ class MasterService {
             // write in flight), so it must not be marked processing. Primary
             // write processing is set by the PutStart/Upsert paths.
             entry_ = entry;
-            lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
+            lock_ = entry_->LockUnique();
         }
 
        private:
@@ -1733,7 +1732,7 @@ class MasterService {
             tenant_guard_ = TenantCatalogAccessorRW(tenant_state_);
             entry_ = tenant_state_->Pin(object_id_.user_key);
             if (entry_ != nullptr) {
-                lock_ = std::unique_lock<std::shared_mutex>(entry_->mutex);
+                lock_ = entry_->LockUnique();
             }
         }
 
@@ -1814,9 +1813,8 @@ class MasterService {
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
-              lock_(entry_ != nullptr
-                        ? std::shared_lock<std::shared_mutex>(entry_->mutex)
-                        : std::shared_lock<std::shared_mutex>()) {}
+              lock_(entry_ != nullptr ? entry_->LockShared()
+                                      : std::shared_lock<std::shared_mutex>()) {}
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {

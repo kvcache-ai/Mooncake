@@ -93,7 +93,7 @@ class MasterServiceTest : public ::testing::Test {
         if (!entry) {
             return std::nullopt;
         }
-        std::shared_lock<std::shared_mutex> entry_lock(entry->mutex);
+        auto entry_lock = entry->LockShared();
         return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
@@ -113,7 +113,7 @@ class MasterServiceTest : public ::testing::Test {
             service.GetOrCreateTenantCatalogHandle(normalized_tenant);
         auto entry = tenant_handle->Pin(key);
         ASSERT_TRUE(entry != nullptr);
-        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+        auto entry_lock = entry->LockUnique();
         entry->metadata().SetCommittedSoftPinTimeoutForTesting(deadline);
         service.soft_pin_deadline_index_.Upsert(
             normalized_tenant.MakeScopedKey(key), deadline);

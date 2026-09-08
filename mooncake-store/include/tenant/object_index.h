@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -27,15 +28,70 @@ namespace mooncake {
 class MasterService;  // friend: the service owns and operates the store
 namespace tenant {
 
-// A group is not a container of objects: it is a thin membership table plus a
-// single shared Lease. The lease is the all-or-none unit consulted by eviction
-// (the per-member ObjectMetadata entry points at it); the read path extends
-// that shared lease on a member hit without touching this table.
-struct GroupState {
-    std::unordered_set<std::string> member_keys;
-    std::shared_ptr<Lease> lease;
+// GroupIndex: group_id -> {shared Lease, member keys}. A group is not a
+// container of objects: it is a thin membership table plus a single shared
+// Lease. The lease is the all-or-none unit consulted by eviction (the
+// per-member ObjectMetadata entry points at it); the read path extends that
+// shared lease on a member hit without touching this index.
+class GroupIndex {
+   public:
+    // Return (creating on demand) the single shared Lease for a group_id.
+    std::shared_ptr<Lease> LeaseFor(const std::string& group_id) {
+        std::unique_lock<std::shared_mutex> lock(lock_);
+        auto [it, inserted] = groups_.try_emplace(group_id);
+        if (inserted) {
+            it->second.lease = std::make_shared<Lease>();
+        }
+        return it->second.lease;
+    }
 
-    bool Empty() const { return member_keys.empty(); }
+    bool AddMember(const std::string& group_id, const std::string& member_key) {
+        std::unique_lock<std::shared_mutex> lock(lock_);
+        auto it = groups_.find(group_id);
+        if (it == groups_.end()) {
+            return false;  // group must be materialized via LeaseFor first
+        }
+        return it->second.member_keys.insert(member_key).second;
+    }
+
+    bool RemoveMember(const std::string& group_id,
+                      const std::string& member_key) {
+        std::unique_lock<std::shared_mutex> lock(lock_);
+        auto it = groups_.find(group_id);
+        if (it == groups_.end()) {
+            return false;
+        }
+        const bool erased = it->second.member_keys.erase(member_key) > 0;
+        if (erased && it->second.Empty()) {
+            groups_.erase(it);
+        }
+        return erased;
+    }
+
+    std::vector<std::string> Members(const std::string& group_id) const {
+        std::shared_lock<std::shared_mutex> lock(lock_);
+        auto it = groups_.find(group_id);
+        if (it == groups_.end()) {
+            return {};
+        }
+        return {it->second.member_keys.begin(), it->second.member_keys.end()};
+    }
+
+    bool Empty() const {
+        std::shared_lock<std::shared_mutex> lock(lock_);
+        return groups_.empty();
+    }
+
+   private:
+    struct GroupState {
+        std::unordered_set<std::string> member_keys;
+        std::shared_ptr<Lease> lease;
+
+        bool Empty() const { return member_keys.empty(); }
+    };
+
+    mutable std::shared_mutex lock_;
+    std::unordered_map<std::string, GroupState> groups_;
 };
 
 // The per-tenant ObjectIndex: the primary hash-map index
@@ -51,48 +107,26 @@ class ObjectIndex {
     ObjectIndex() = default;
     ~ObjectIndex() = default;
 
+    // --- GroupIndex operations (delegated; the GroupIndex owns its lock) ---
+
     // Return (creating on demand) the single shared Lease for a group_id.
     // Callers wire the returned lease into each member object's own lease slot,
     // so the read path can extend the group TTL without touching this table.
     std::shared_ptr<Lease> LeaseFor(const std::string& group_id) {
-        std::unique_lock<std::shared_mutex> lock(groups_lock_);
-        auto [it, inserted] = groups_.try_emplace(group_id);
-        if (inserted) {
-            it->second.lease = std::make_shared<Lease>();
-        }
-        return it->second.lease;
+        return group_index.LeaseFor(group_id);
     }
 
     bool AddMember(const std::string& group_id, const std::string& member_key) {
-        std::unique_lock<std::shared_mutex> lock(groups_lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return false;  // group must be materialized via LeaseFor first
-        }
-        return it->second.member_keys.insert(member_key).second;
+        return group_index.AddMember(group_id, member_key);
     }
 
     bool RemoveMember(const std::string& group_id,
                       const std::string& member_key) {
-        std::unique_lock<std::shared_mutex> lock(groups_lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return false;
-        }
-        const bool erased = it->second.member_keys.erase(member_key) > 0;
-        if (erased && it->second.Empty()) {
-            groups_.erase(it);
-        }
-        return erased;
+        return group_index.RemoveMember(group_id, member_key);
     }
 
     std::vector<std::string> Members(const std::string& group_id) const {
-        std::shared_lock<std::shared_mutex> lock(groups_lock_);
-        auto it = groups_.find(group_id);
-        if (it == groups_.end()) {
-            return {};
-        }
-        return {it->second.member_keys.begin(), it->second.member_keys.end()};
+        return group_index.Members(group_id);
     }
 
     // The object route is a flat map key -> strong ObjectEntry handle. Read
@@ -107,9 +141,21 @@ class ObjectIndex {
 
     // Insert a NEW entry under this tenant. Returns false if a key already
     // exists (caller re-pins instead). The entry's key() must equal `key`.
+    // Assigns the entry's route generation (monotonic per index).
     bool Insert(std::string key, std::shared_ptr<ObjectEntry> entry) {
         std::unique_lock<std::shared_mutex> lock(route_lock_);
+        // Assign the publication generation before the handle is moved into
+        // the route (a failed duplicate insert simply wastes one value).
+        entry->generation_ = ++generation_counter_;
         return route_.emplace(std::move(key), std::move(entry)).second;
+    }
+
+    // True when `entry` is still the current published instance for `key`
+    // (identity + not torn down). Lets a pinned handle or a deferred eviction
+    // candidate revalidate itself against replacements of the same key.
+    bool IsCurrent(const std::string& key, const ObjectEntry* entry) const {
+        auto pinned = Pin(key);
+        return pinned && pinned.get() == entry && !entry->is_torn_down;
     }
 
     // Erase the route slot for `key` ONLY if it still resolves to `expected`.
@@ -169,9 +215,11 @@ class ObjectIndex {
     // True when the tenant holds no object route, no group membership, and no
     // in-flight dynamic-replication lease. Callers hold no locks when invoking.
     bool Empty() const {
-        std::shared_lock<std::shared_mutex> gl(groups_lock_);
+        if (!group_index.Empty()) {
+            return false;
+        }
         std::shared_lock<std::shared_mutex> ll(leases_lock_);
-        if (!groups_.empty() || !dynamic_replication_leases.empty()) {
+        if (!dynamic_replication_leases.empty()) {
             return false;
         }
         std::shared_lock<std::shared_mutex> rl(route_lock_);
@@ -291,9 +339,11 @@ class ObjectIndex {
     // (ObjectEntry::mutex).
     mutable std::shared_mutex route_lock_;
     std::unordered_map<std::string, std::shared_ptr<ObjectEntry>> route_;
+    // Monotonic publication counter backing ObjectEntry::generation().
+    std::atomic<uint64_t> generation_counter_{0};
 
-    mutable std::shared_mutex groups_lock_;
-    std::unordered_map<std::string, GroupState> groups_;
+    // GroupIndex sub-index (see the class comment above).
+    GroupIndex group_index;
 
     // In-flight dynamic-replication leases, keyed by proposal UUID (not by
     // object key), so they cannot fold into a per-object ObjectEntry. Guarded

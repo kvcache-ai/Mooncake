@@ -124,6 +124,26 @@ TEST(ObjectIndexTest, InsertPinEraseContainsObjectCount) {
     EXPECT_EQ(store.ObjectCount(), 0u);
 }
 
+TEST(ObjectIndexTest, InsertAssignsGenerationsAndIsCurrentTracksReplacement) {
+    ObjectIndex store;
+    auto e1 = MakeEntry("k1", "");
+    ASSERT_TRUE(store.Insert("k1", e1));
+    EXPECT_GT(e1->generation(), 0u);  // publication assigns a generation
+    EXPECT_TRUE(store.IsCurrent("k1", e1.get()));
+
+    EXPECT_TRUE(store.EraseIf("k1", e1.get()));
+    EXPECT_FALSE(store.IsCurrent("k1", e1.get()));
+
+    // A replacement of the same key gets a fresh, higher generation; the
+    // stale instance is never current again.
+    auto e2 = MakeEntry("k1", "");
+    EXPECT_EQ(e2->generation(), 0u);  // unpublished
+    ASSERT_TRUE(store.Insert("k1", e2));
+    EXPECT_GT(e2->generation(), e1->generation());
+    EXPECT_TRUE(store.IsCurrent("k1", e2.get()));
+    EXPECT_FALSE(store.IsCurrent("k1", e1.get()));
+}
+
 TEST(ObjectIndexTest, DuplicateInsertIsRejected) {
     ObjectIndex store;
     store.Insert("k1", MakeEntry("k1", ""));

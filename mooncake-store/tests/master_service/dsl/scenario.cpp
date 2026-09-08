@@ -1058,7 +1058,7 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;
     }
-    std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+    auto entry_lock = entry->LockUnique();
     entry->metadata().SetLeaseDeadlineForTesting(action.lease_timeout);
     entry->metadata().SetCommittedSoftPinTimeoutForTesting(
         action.soft_pin_timeout);

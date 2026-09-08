@@ -646,7 +646,7 @@ class MasterServiceHATest : public ::testing::Test {
                     ObjectDataType::UNKNOWN, "", tenant, key));
             tenant_state.InsertObject(key, entry);
         }
-        std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+        auto entry_lock = entry->LockUnique();
         entry->promotion_task = mooncake::PromotionTask{
             .source_id = 0,
             .alloc_id = alloc_id,

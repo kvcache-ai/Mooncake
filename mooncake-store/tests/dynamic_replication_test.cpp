@@ -222,7 +222,7 @@ class DynamicReplicationTest : public ::testing::Test {
         if (tenant_handle == nullptr) {
             return;
         }
-        mooncake::tenant::TenantCatalogAccessorRW shard(tenant_handle.get());
+        MasterService::TenantCatalogAccessorRW shard(tenant_handle.get());
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
     }

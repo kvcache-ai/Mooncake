@@ -39,6 +39,11 @@ class ObjectEntry {
     const std::string& key() const { return metadata_->user_key; }
     const std::string& group_id() const { return metadata_->group_id; }
 
+    // Monotonic generation assigned by ObjectIndex at route publication
+    // (0 = never published). Lets a pinned handle distinguish itself from a
+    // later replacement of the same key; see ObjectIndex::IsCurrent.
+    uint64_t generation() const { return generation_; }
+
     // Per-key runtime task state. By convention at most one in-flight task
     // (replication / offload / promotion / dynamic-replication pending) is
     // wired per entry; the transitions are driven by MasterService.
@@ -55,11 +60,18 @@ class ObjectEntry {
     std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
 
     // Per-object mutation boundary: the narrowest lock a point operation may
-    // hold after pinning this entry. Deliberately public: compound operations
-    // must release it midway (entry mutex and route_lock_ are never held
-    // together), which a closure API cannot express. Lock order: this mutex
-    // first, then ObjectMetadata's own SpinLock, never the reverse.
-    mutable std::shared_mutex mutex;
+    // hold after pinning this entry. All locking goes through LockUnique/
+    // LockShared so the contract below has a single choke point. Compound
+    // operations may release the returned lock midway (this mutex and
+    // route_lock_ are never held together), which a closure API cannot
+    // express. Lock order: this mutex first, then ObjectMetadata's own
+    // SpinLock, never the reverse.
+    std::unique_lock<std::shared_mutex> LockUnique() const {
+        return std::unique_lock<std::shared_mutex>(mutex);
+    }
+    std::shared_lock<std::shared_mutex> LockShared() const {
+        return std::shared_lock<std::shared_mutex>(mutex);
+    }
 
     // Owned envelope; never null (enforced by the constructor). Read under
     // `mutex` when the entry may be mid-mutation.
@@ -74,7 +86,11 @@ class ObjectEntry {
     }
 
    private:
+    friend class ObjectIndex;  // assigns generation_ at route publication
+
     std::unique_ptr<ObjectMetadata> metadata_;
+    uint64_t generation_{0};
+    mutable std::shared_mutex mutex;
 };
 
 }  // namespace tenant
