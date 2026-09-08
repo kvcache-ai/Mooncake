@@ -141,8 +141,17 @@ jobs:
           >"$RUNNER_TEMP/mooncake-master.log" 2>&1 &
         master_pid=$!
         rpc_server_pid=""
+        dummy_client_pid=""
 
         cleanup() {
+          status=$?
+          if [ -n "$dummy_client_pid" ]; then
+            kill "$dummy_client_pid" 2>/dev/null || true
+            wait "$dummy_client_pid" 2>/dev/null || true
+          fi
+          if [ "$status" -ne 0 ]; then
+            cat "$RUNNER_TEMP/mooncake-dummy-client.log" 2>/dev/null || true
+          fi
           if [ -n "$rpc_server_pid" ]; then
             kill "$rpc_server_pid" 2>/dev/null || true
             wait "$rpc_server_pid" 2>/dev/null || true
@@ -178,6 +187,33 @@ jobs:
         python scripts/test_copy_move_api.py
         python -m unittest mooncake-wheel.tests.test_safetensor_functions
         python scripts/test_drain_http_api.py --timeout-sec 90
+
+        mooncake_client --host=127.0.0.1 --global_segment_size="128 MB" \
+          --local_buffer_size="64 MB" \
+          >"$RUNNER_TEMP/mooncake-dummy-client.log" 2>&1 &
+        dummy_client_pid=$!
+        dummy_ready=false
+        for _ in {1..150}; do
+          if ! kill -0 "$dummy_client_pid" 2>/dev/null; then
+            echo "::error::mooncake_client exited before becoming ready"
+            exit 1
+          fi
+          if ss -H -ltn 'sport = :50052' | grep -q .; then
+            dummy_ready=true
+            break
+          fi
+          sleep 0.1
+        done
+        if [ "$dummy_ready" != true ]; then
+          echo "::error::mooncake_client did not become ready within 15 seconds"
+          exit 1
+        fi
+        DEFAULT_KV_LEASE_TTL=500 python -m unittest discover \
+          -s mooncake-wheel/tests -p test_dummy_client.py \
+          -k tensor_from -k test_external_host -v
+        kill "$dummy_client_pid"
+        wait "$dummy_client_pid" || true
+        dummy_client_pid=""
 
         python -u mooncake-transfer-engine/tests/rpc_communicator_test.py \
           server --url 127.0.0.1:9004 --data-size 1 \
