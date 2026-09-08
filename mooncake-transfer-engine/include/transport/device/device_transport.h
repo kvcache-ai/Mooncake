@@ -143,6 +143,11 @@ class RdmaTransport {
     // Destroy and recreate QPs (used when active_ranks changes).
     virtual int recreateQueuePairs(void* stream) = 0;
 
+    // After device submitters stop, wait for outstanding sends to complete.
+    // A non-zero result does not cancel work; reset or destroy QPs before
+    // releasing their registered memory. timeout_ms is shared across all QPs.
+    virtual int drainQueuePairs(void* stream, uint64_t timeout_ms) = 0;
+
     // Reset [qp_offset, qp_offset + num_qps) to INIT in place, preserving QPNs
     // and device pointers. Clears CQ/doorbell state and device-side counters.
     // The caller must stop using these QPs before reset and until reconnect.

@@ -21,11 +21,11 @@ uint32_t qpsPerRank(uint32_t max_world_size) {
 }
 
 struct RdmaEndpointMetadata {
-    uint32_t is_roce = 0;
+    bool is_roce = false;
     uint32_t qps_per_rank = 0;
-    uint32_t remote_key = 0;
-    uint64_t subnet_prefix = 0;
-    uint64_t interface_id = 0;
+    int32_t remote_key = 0;
+    int64_t subnet_prefix = 0;
+    int64_t interface_id = 0;
     std::vector<int32_t> qpns;
     std::vector<int32_t> lids;
 };
@@ -173,11 +173,11 @@ std::optional<RouteEndpoint> RdmaRoute::localEndpoint() {
         .route_key = std::string(kRouteKey),
         .version = routeVersion(),
         .metadata = encodeEndpointMetadata(RdmaEndpointMetadata{
-            .is_roce = static_cast<uint32_t>(state_->transport->isRoce()),
+            .is_roce = state_->transport->isRoce(),
             .qps_per_rank = state_->qps_per_rank,
-            .remote_key = static_cast<uint32_t>(metadata.rkey),
-            .subnet_prefix = static_cast<uint64_t>(metadata.subnet_prefix),
-            .interface_id = static_cast<uint64_t>(metadata.interface_id),
+            .remote_key = metadata.rkey,
+            .subnet_prefix = metadata.subnet_prefix,
+            .interface_id = metadata.interface_id,
             .qpns = metadata.qpns,
             .lids = metadata.lids,
         }),
@@ -212,8 +212,7 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
         const bool compatible =
             candidate.is_roce == state_->transport->isRoce() &&
             (candidate.is_roce ||
-             candidate.subnet_prefix ==
-                 static_cast<uint64_t>(local_metadata.subnet_prefix)) &&
+             candidate.subnet_prefix == local_metadata.subnet_prefix) &&
             candidate.qps_per_rank == state_->qps_per_rank &&
             candidate.qpns.size() == state_->num_qps &&
             candidate.lids.size() == state_->num_qps &&
@@ -226,10 +225,9 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
             route_endpoints[rank] = endpoint;
             remote_addrs[rank] =
                 static_cast<int64_t>(endpoints[rank]->region_address);
-            remote_keys[rank] = static_cast<int32_t>(candidate.remote_key);
-            subnet_prefixes[rank] =
-                static_cast<int64_t>(candidate.subnet_prefix);
-            interface_ids[rank] = static_cast<int64_t>(candidate.interface_id);
+            remote_keys[rank] = candidate.remote_key;
+            subnet_prefixes[rank] = candidate.subnet_prefix;
+            interface_ids[rank] = candidate.interface_id;
             active[rank] = 1;
             pending.push_back(rank);
 
@@ -252,7 +250,7 @@ PGResult<std::vector<DeviceTransferRoute>> RdmaRoute::resolveRoutes(
             .rdma =
                 {
                     .remote_region_address = endpoints[rank]->region_address,
-                    .remote_key = candidate.remote_key,
+                    .remote_key = static_cast<uint32_t>(candidate.remote_key),
                     .qp_offset =
                         static_cast<uint32_t>(rank) * state_->qps_per_rank,
                 },
@@ -295,24 +293,15 @@ PGResult<void> RdmaRoute::shutdown() {
     }
 
     PG_TRY(auto device_guard, GpuDeviceGuard::create(state_->device_index));
-    // Device callers drain before kernel exit; their streams must be idle
-    // before route resources are released.
-    if (state_->local_staging_region.addr) {
-        PG_TRY_TE(
-            state_->transport->unregisterMemory(state_->local_staging_region));
-        state_->local_staging_region = {};
+    // Kernel completion stops producers but may leave signal WQEs in flight.
+    // Deliver trailing acknowledgments before stopping QPs, since a peer may
+    // still need them to finish its last collective.
+    if (state_->transport->drainQueuePairs(state_->stream,
+                                           kTransferDrainTimeoutMs) != 0) {
+        LOG(WARNING) << "[PG] RDMA shutdown drain failed; destroying QPs";
     }
-    if (state_->peer_accessible_region.addr) {
-        PG_TRY_TE(state_->transport->unregisterMemory(
-            state_->peer_accessible_region));
-        state_->peer_accessible_region = {};
-    }
-    if (state_->atomic_sink_region.addr) {
-        PG_TRY_TE(
-            state_->transport->unregisterMemory(state_->atomic_sink_region));
-        state_->atomic_sink_region = {};
-    }
-
+    // State destroys the transport's QPs before unregistering memory and
+    // freeing the atomic sink. DTS can then release its backing allocations.
     state_.reset();
     shutdown_requested_ = true;
     return {};

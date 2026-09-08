@@ -98,7 +98,9 @@ PGResult<void> HostProxyRoute::registerRegion(DeviceRegionKind kind, void* addr,
 
 PGResult<void> HostProxyRoute::unregisterRegion(DeviceRegionKind kind,
                                                 void* addr, size_t size) {
-    PG_VALIDATE_STATE(initialized_, "HostProxyRoute is not initialized");
+    PG_VALIDATE_STATE(initialized_ || shutdown_requested_,
+                      "HostProxyRoute cannot unregister regions before "
+                      "initialization");
     PG_VALIDATE_ARG(addr && size != 0, "host-proxy region is empty");
     switch (kind) {
         case DeviceRegionKind::PeerAccessible:
