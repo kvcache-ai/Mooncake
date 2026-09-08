@@ -24,6 +24,8 @@ parse_up_options() {
   OPLOG_STORE_TYPE=etcd_batch_record
   BATCH_ENTRIES=1024
   RETRY_TIMEOUT_SEC=180
+  ENABLE_OPLOG_SNAPSHOT=false
+  SNAPSHOT_CHUNK_OBJECT_COUNT=1000000
   MASTER_CONFIG=""
   USE_ETCD_OBSERVER=true
   NON_HA_WORKERS=4
@@ -86,6 +88,15 @@ parse_up_options() {
       --retry-timeout-sec)
         (($# >= 2)) || die "--retry-timeout-sec requires a value"
         RETRY_TIMEOUT_SEC=$2
+        shift 2
+        ;;
+      --enable-oplog-snapshot)
+        ENABLE_OPLOG_SNAPSHOT=true
+        shift
+        ;;
+      --snapshot-chunk-object-count)
+        (($# >= 2)) || die "--snapshot-chunk-object-count requires a value"
+        SNAPSHOT_CHUNK_OBJECT_COUNT=$2
         shift 2
         ;;
       --master-config)
@@ -180,6 +191,8 @@ parse_up_options() {
   [[ "$CLIENT_COUNT" =~ ^[0-9]+$ ]] || die "clients must be non-negative"
   [[ "$BATCH_ENTRIES" =~ ^[1-9][0-9]*$ ]] ||
     die "batch-entries must be positive"
+  [[ "$SNAPSHOT_CHUNK_OBJECT_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+    die "snapshot-chunk-object-count must be positive"
   [[ "$START_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] ||
     die "timeout-sec must be positive"
   [[ "$FAILPOINT_TIMEOUT_SEC" =~ ^[1-9][0-9]*$ ]] ||
@@ -350,11 +363,17 @@ start_master() {
     environment=(env "MOONCAKE_TEST_FAILPOINT_DIR=$FAILPOINT_DIR"
       "MOONCAKE_TEST_FAILPOINT_TIMEOUT_SEC=$FAILPOINT_TIMEOUT_SEC")
   fi
+  if [[ "$ENABLE_OPLOG_SNAPSHOT" == true ]]; then
+    mkdir -p "$RUN_DIR/snapshots"
+    environment+=("MOONCAKE_SNAPSHOT_LOCAL_PATH=$RUN_DIR/snapshots")
+  fi
   local -a ha_args=(--enable_ha=false)
   local -a non_ha_args=()
   local -a config_args=()
   local -a allocator_args=()
   [[ -z "$MASTER_CONFIG" ]] || config_args=(--config_path="$MASTER_CONFIG")
+  [[ "$SNAPSHOT_CHUNK_OBJECT_COUNT" =~ ^[1-9][0-9]*$ ]] ||
+    die "snapshot-chunk-object-count must be positive"
   [[ -z "$MEMORY_ALLOCATOR" ]] ||
     allocator_args=(--memory_allocator="$MEMORY_ALLOCATOR")
   if [[ "$ENABLE_HA" == true ]]; then
@@ -362,6 +381,9 @@ start_master() {
       --ha_backend_connstring="$ETCD_ENDPOINTS"
       --etcd_endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID"
       --enable_oplog=true
+      --enable_oplog_snapshot="$ENABLE_OPLOG_SNAPSHOT"
+      --snapshot_chunk_object_count="$SNAPSHOT_CHUNK_OBJECT_COUNT"
+      --snapshot_object_store_type=local
       --oplog_batch_max_entries="$BATCH_ENTRIES"
       --batch_oplog_retry_timeout_sec="$RETRY_TIMEOUT_SEC")
   else
@@ -388,6 +410,8 @@ write_cluster_env() {
     printf 'OPLOG_STORE_TYPE=%q\n' "$OPLOG_STORE_TYPE"
     printf 'BATCH_ENTRIES=%q\n' "$BATCH_ENTRIES"
     printf 'RETRY_TIMEOUT_SEC=%q\n' "$RETRY_TIMEOUT_SEC"
+    printf 'ENABLE_OPLOG_SNAPSHOT=%q\n' "$ENABLE_OPLOG_SNAPSHOT"
+    printf 'SNAPSHOT_CHUNK_OBJECT_COUNT=%q\n' "$SNAPSHOT_CHUNK_OBJECT_COUNT"
     printf 'MASTER_CONFIG=%q\n' "$MASTER_CONFIG"
     printf 'USE_ETCD_OBSERVER=%q\n' "$USE_ETCD_OBSERVER"
     printf 'NON_HA_WORKERS=%q\n' "$NON_HA_WORKERS"

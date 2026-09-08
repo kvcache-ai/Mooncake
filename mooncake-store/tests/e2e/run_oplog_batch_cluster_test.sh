@@ -68,6 +68,8 @@ expect_failure 1 "ha-payload-bytes must be positive" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-payload-bytes 0
 expect_failure 1 "ha-pressure-sec must be positive" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-pressure-sec 0
+expect_failure 1 "snapshot-chunk-object-count must be positive" \
+  "$SCRIPT" up --build-dir "$TEST_ROOT" --snapshot-chunk-object-count 0
 expect_failure 1 "memory-allocator must be offset or cachelib" \
   "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
   --memory-allocator invalid
