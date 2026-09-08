@@ -683,8 +683,9 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
             kDefaultDrainTimeoutMs);
         if (!quiescent) {
             LOG(ERROR) << "ProbeNofSegment: qpair pool did not quiesce "
-                          "within " << kDefaultDrainTimeoutMs
-                          << "ms — deferring destruction to next probe";
+                          "within "
+                       << kDefaultDrainTimeoutMs
+                       << "ms — deferring destruction to next probe";
             ProbeCtxRecycler::Instance().PushWithConn(
                 std::move(probe_ctx), std::move(conn),
                 std::move(submit_wrapper_sp));

@@ -158,12 +158,10 @@ class NofQpairPool {
         // The release on the success-CAS path pairs with the acquire
         // load in WaitForInflightCompletion to publish every prior
         // release-store in the trampoline body.
-        int32_t cur =
-            inflight_count_.load(std::memory_order_acquire);
+        int32_t cur = inflight_count_.load(std::memory_order_acquire);
         while (cur > 0) {
             if (inflight_count_.compare_exchange_weak(
-                    cur, cur - 1,
-                    std::memory_order_release,
+                    cur, cur - 1, std::memory_order_release,
                     std::memory_order_relaxed)) {
                 return;
             }
@@ -260,11 +258,12 @@ class NofQpairPool {
     // test-injection path (TestInjectPollErrorOnce / pending_inject_error_idx_)
     // still runs before this gate so that an inject armed AFTER hold is
     // set will still fire and drive the pool into DRAINING — this is
-    // the regression-test contract for `Reproducer_DrainTimeout_FutureCompletesNotHangs`.
-    // Sibling qpair CQEs whose harvest is suppressed will be returned
-    // via the trampoline's DRAINING short-circuit once the worker
-    // observes the -1 return value and calls EnterDraining.
-    // Stays armed until released (pass false) or the pool is destroyed.
+    // the regression-test contract for
+    // `Reproducer_DrainTimeout_FutureCompletesNotHangs`. Sibling qpair CQEs
+    // whose harvest is suppressed will be returned via the trampoline's
+    // DRAINING short-circuit once the worker observes the -1 return value and
+    // calls EnterDraining. Stays armed until released (pass false) or the pool
+    // is destroyed.
     void TestHoldAllCompletions(bool hold) {
         hold_all_completions_.store(hold, std::memory_order_release);
     }

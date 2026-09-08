@@ -72,8 +72,7 @@ bool NofQpairPool::WaitForInflightCompletion(uint32_t timeout_ms) {
             // for the deadline.
             inflight_count_.exchange(0, std::memory_order_acq_rel);
             QpairPoolState expected = QpairPoolState::kActive;
-            state_.compare_exchange_strong(expected,
-                                           QpairPoolState::kDraining);
+            state_.compare_exchange_strong(expected, QpairPoolState::kDraining);
             return false;
         }
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -81,8 +80,7 @@ bool NofQpairPool::WaitForInflightCompletion(uint32_t timeout_ms) {
             // signal.  Same terminal actions as the fast-path.
             inflight_count_.exchange(0, std::memory_order_acq_rel);
             QpairPoolState expected = QpairPoolState::kActive;
-            state_.compare_exchange_strong(expected,
-                                           QpairPoolState::kDraining);
+            state_.compare_exchange_strong(expected, QpairPoolState::kDraining);
             return false;
         }
         // PollAll drove pending CQEs synchronously; each callback's
@@ -264,8 +262,7 @@ int32_t NofQpairPool::PollAll(uint32_t max_completions) {
         // EnterDraining even while CQEs are blocked.
         size_t expected = i;
         if (pending_inject_error_idx_.compare_exchange_strong(
-                expected, SIZE_MAX,
-                std::memory_order_acq_rel)) {
+                expected, SIZE_MAX, std::memory_order_acq_rel)) {
             if (first_error == 0) first_error = -1;
             continue;
         }
@@ -322,9 +319,8 @@ void NofQpairPool::TestRunDrainingShortCircuit() {
         DecrementInflight();
         return;
     }
-    LOG(ERROR)
-        << "TestRunDrainingShortCircuit invoked with pool not in "
-           "DRAINING state — test ordering bug";
+    LOG(ERROR) << "TestRunDrainingShortCircuit invoked with pool not in "
+                  "DRAINING state — test ordering bug";
 }
 #endif
 

@@ -90,10 +90,9 @@ class ScopedDrainInvariant {
           start_(std::chrono::steady_clock::now()) {}
 
     ~ScopedDrainInvariant() {
-        auto elapsed_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - start_)
-                .count();
+        auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now() - start_)
+                              .count();
         if (pool_ == nullptr) {
             LOG(INFO) << "[" << test_name_
                       << "] ScopedDrainInvariant: pool=nullptr, elapsed="
@@ -108,17 +107,15 @@ class ScopedDrainInvariant {
                   << ", IsDraining=" << draining;
 
         if (inflight != 0) {
-            ADD_FAILURE()
-                << "[" << test_name_
-                << "] pool->InflightCount=" << inflight
-                << " (expected 0) at test scope exit — task leak.";
+            ADD_FAILURE() << "[" << test_name_
+                          << "] pool->InflightCount=" << inflight
+                          << " (expected 0) at test scope exit — task leak.";
         }
 
         if (drove_draining_ && !draining) {
-            ADD_FAILURE()
-                << "[" << test_name_
-                << "] pool reverted from DRAINING to kActive after "
-                   "test scope exit.";
+            ADD_FAILURE() << "[" << test_name_
+                          << "] pool reverted from DRAINING to kActive after "
+                             "test scope exit.";
         }
     }
 
@@ -240,9 +237,8 @@ TEST_F(SiblingQpairFailure,
     if (primer_rc != mooncake::ErrorCode::OK) {
         spdk_free(buf);
         EXPECT_EQ(engine.freeEngine(), 0);
-        GTEST_SKIP()
-            << "Primer write returned " << static_cast<int>(primer_rc)
-            << " — target cannot service real I/O; skipping.";
+        GTEST_SKIP() << "Primer write returned " << static_cast<int>(primer_rc)
+                     << " — target cannot service real I/O; skipping.";
     }
 
     nof_seg_handle* handle = submitter.TestGetNofHandle(target_);
@@ -312,8 +308,8 @@ TEST_F(SiblingQpairFailure,
     // mid-drain and FinalizeAfterDrain marked the task failed).  The
     // invariant the test enforces is that EVERY future reaches a
     // terminal state within the deadline — i.e. no task is stranded.
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(10000);
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
     bool all_ready = true;
     for (auto& fut : futures) {
         if (!fut.has_value()) continue;
@@ -426,9 +422,8 @@ TEST_F(SiblingQpairFailure,
     if (primer_rc != mooncake::ErrorCode::OK) {
         spdk_free(buf);
         EXPECT_EQ(engine.freeEngine(), 0);
-        GTEST_SKIP()
-            << "Primer write returned " << static_cast<int>(primer_rc)
-            << " — target cannot service real I/O; skipping.";
+        GTEST_SKIP() << "Primer write returned " << static_cast<int>(primer_rc)
+                     << " — target cannot service real I/O; skipping.";
     }
 
     nof_seg_handle* handle = submitter.TestGetNofHandle(target_);
@@ -479,8 +474,8 @@ TEST_F(SiblingQpairFailure,
         invariant.MarkDroveDraining();
     }
 
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(10000);
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(10000);
     bool all_ready = true;
     for (auto& fut : futures) {
         if (!fut.has_value()) continue;
@@ -557,8 +552,7 @@ TEST_F(SiblingQpairFailure,
 //     short-circuits without dereferencing freed task memory.
 // ===========================================================================
 
-TEST_F(SiblingQpairFailure,
-       ReadPath_DeterministicDrain_AllCountersReachZero) {
+TEST_F(SiblingQpairFailure, ReadPath_DeterministicDrain_AllCountersReachZero) {
     auto& wrapper = mooncake::SpdkWrapper::GetInstance();
 
     mooncake::NofConfig cfg = mooncake::NofConfig::FromEnv();
@@ -661,8 +655,8 @@ TEST_F(SiblingQpairFailure,
     // ADD_FAILURE exit), so the regression is reported even if a
     // future refactor short-circuits the inline assertions below.
     ScopedDrainInvariant invariant(&pool,
-                                  "ReadPath_DeterministicDrain_"
-                                  "AllCountersReachZero");
+                                   "ReadPath_DeterministicDrain_"
+                                   "AllCountersReachZero");
 
     // Arm the synthesised error on qpair[0] BEFORE the next worker
     // poll.  The worker's next NvmePollProcessCompletion call sees
@@ -680,15 +674,14 @@ TEST_F(SiblingQpairFailure,
     // pool to DRAINING → walks DrainDrainingPoolsUntilQuiescent.
     auto real_desc = make_desc();
     auto real_future = submitter.submitSpdkNofOperation(
-        real_desc, buf, /*size=*/kBufBytes,
-        mooncake::TransferRequest::WRITE);
+        real_desc, buf, /*size=*/kBufBytes, mooncake::TransferRequest::WRITE);
     ASSERT_TRUE(real_future.has_value())
         << "submitSpdkNofOperation failed for the real submission";
 
     // Bounded wait.  TransferFuture::wait() blocks indefinitely on a
     // cv; poll isReady() with a 35 s deadline.
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(35000);
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(35000);
     while (!real_future->isReady() &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -772,8 +765,7 @@ TEST_F(SiblingQpairFailure,
 // the wall-clock assertion below observes how long
 // ~TransferSubmitter → spdk_nvmf_pool_.reset() → ~SpdkNofWorkerPool
 // → worker.join() takes.
-TEST_F(SiblingQpairFailure,
-       Reproducer_DrainTimeout_FutureCompletesNotHangs) {
+TEST_F(SiblingQpairFailure, Reproducer_DrainTimeout_FutureCompletesNotHangs) {
     auto& wrapper = mooncake::SpdkWrapper::GetInstance();
 
     mooncake::NofConfig cfg = mooncake::NofConfig::FromEnv();
@@ -861,8 +853,7 @@ TEST_F(SiblingQpairFailure,
     // to SPDK, then enters the drain path.
     auto real_desc = make_desc();
     auto real_future = submitter->submitSpdkNofOperation(
-        real_desc, buf, /*size=*/kBufBytes,
-        mooncake::TransferRequest::WRITE);
+        real_desc, buf, /*size=*/kBufBytes, mooncake::TransferRequest::WRITE);
     ASSERT_TRUE(real_future.has_value())
         << "submitSpdkNofOperation failed for the real submission";
 
@@ -870,8 +861,8 @@ TEST_F(SiblingQpairFailure,
     // (wait() blocks indefinitely on a cv).  5 s =
     // kWorkerDrainTimeoutMs (1 s) × 2 (Phase 1 + Phase 2) plus a
     // margin for trampoline bookkeeping and cv notification.
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(5000);
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
     while (!real_future->isReady() &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -975,8 +966,7 @@ TEST_F(SiblingQpairFailure,
 // destructor sequence (spdk_nvmf_pool_.reset() joins workers before
 // CloseNofSegment) is the only safe ordering, and it runs once at
 // end-of-submitter — not per iteration.
-TEST_F(SiblingQpairFailure,
-       Stress_DrainRecoveryCycles_NoLeakNoHang) {
+TEST_F(SiblingQpairFailure, Stress_DrainRecoveryCycles_NoLeakNoHang) {
     auto& wrapper = mooncake::SpdkWrapper::GetInstance();
 
     mooncake::NofConfig cfg = mooncake::NofConfig::FromEnv();
@@ -1020,9 +1010,8 @@ TEST_F(SiblingQpairFailure,
     if (primer_rc != mooncake::ErrorCode::OK) {
         spdk_free(buf);
         EXPECT_EQ(engine.freeEngine(), 0);
-        GTEST_SKIP()
-            << "Primer write returned " << static_cast<int>(primer_rc)
-            << " — target cannot service real I/O; skipping stress.";
+        GTEST_SKIP() << "Primer write returned " << static_cast<int>(primer_rc)
+                     << " — target cannot service real I/O; skipping stress.";
     }
 
     nof_seg_handle* handle = submitter.TestGetNofHandle(target_);
@@ -1056,8 +1045,7 @@ TEST_F(SiblingQpairFailure,
         for (int s = 0; s < kSubmitsPerIter; ++s) {
             auto desc = make_desc();
             desc.buffer_address_ =
-                static_cast<uint64_t>(iter * kSubmitsPerIter + s) *
-                kBufBytes;
+                static_cast<uint64_t>(iter * kSubmitsPerIter + s) * kBufBytes;
             auto fut = submitter.submitSpdkNofOperation(
                 desc, buf, /*size=*/kBufBytes,
                 mooncake::TransferRequest::WRITE);
@@ -1068,8 +1056,8 @@ TEST_F(SiblingQpairFailure,
         }
 
         // Bounded wait — every future must reach a terminal state.
-        auto deadline = std::chrono::steady_clock::now() +
-                        std::chrono::milliseconds(5000);
+        auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
         bool all_ready = true;
         for (auto& fut : futures) {
             if (!fut.has_value()) continue;
@@ -1097,21 +1085,22 @@ TEST_F(SiblingQpairFailure,
             << ": pool's InflightCount did not reach 0 within 2 s";
 
         if ((iter + 1) % 100 == 0) {
-            auto elapsed_ms = std::chrono::duration_cast<
-                                  std::chrono::milliseconds>(
-                                  std::chrono::steady_clock::now() -
-                                  stress_start).count();
-            LOG(INFO) << "Stress iter " << (iter + 1) << "/"
-                      << kIterations << " elapsed=" << elapsed_ms << "ms";
+            auto elapsed_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - stress_start)
+                    .count();
+            LOG(INFO) << "Stress iter " << (iter + 1) << "/" << kIterations
+                      << " elapsed=" << elapsed_ms << "ms";
         }
     }
 
     auto total_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - stress_start).count();
-    LOG(INFO) << "Stress completed: " << kIterations
-              << " iterations in " << total_elapsed_ms << "ms ("
-              << (total_elapsed_ms / kIterations) << "ms/iter avg)";
+            std::chrono::steady_clock::now() - stress_start)
+            .count();
+    LOG(INFO) << "Stress completed: " << kIterations << " iterations in "
+              << total_elapsed_ms << "ms (" << (total_elapsed_ms / kIterations)
+              << "ms/iter avg)";
 
     spdk_free(buf);
     EXPECT_EQ(engine.freeEngine(), 0);
@@ -1194,9 +1183,8 @@ TEST_F(SiblingQpairFailure, NoBusyLoopAfterDrain_ProcessExitsCleanly) {
     if (primer_rc != mooncake::ErrorCode::OK) {
         spdk_free(buf);
         EXPECT_EQ(engine.freeEngine(), 0);
-        GTEST_SKIP()
-            << "Primer write returned " << static_cast<int>(primer_rc)
-            << " — target cannot service real I/O; skipping.";
+        GTEST_SKIP() << "Primer write returned " << static_cast<int>(primer_rc)
+                     << " — target cannot service real I/O; skipping.";
     }
 
     nof_seg_handle* handle = submitter.TestGetNofHandle(target_);
@@ -1217,8 +1205,7 @@ TEST_F(SiblingQpairFailure, NoBusyLoopAfterDrain_ProcessExitsCleanly) {
     // Submit one transfer to wake the worker into the poll block.
     auto real_desc = make_desc();
     auto real_future = submitter.submitSpdkNofOperation(
-        real_desc, buf, /*size=*/kBufBytes,
-        mooncake::TransferRequest::WRITE);
+        real_desc, buf, /*size=*/kBufBytes, mooncake::TransferRequest::WRITE);
     ASSERT_TRUE(real_future.has_value());
 
     // Wait for DRAINING to be observed.
@@ -1235,8 +1222,8 @@ TEST_F(SiblingQpairFailure, NoBusyLoopAfterDrain_ProcessExitsCleanly) {
     }
 
     // Bounded wait for the first future to drain.
-    auto deadline = std::chrono::steady_clock::now() +
-                    std::chrono::milliseconds(5000);
+    auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
     while (!real_future->isReady() &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1278,8 +1265,8 @@ TEST_F(SiblingQpairFailure, NoBusyLoopAfterDrain_ProcessExitsCleanly) {
     // gate) and SpdkNofTaskCompletion (try_complete CAS) without
     // leaking or hanging.
     if (late_future.has_value()) {
-        auto late_deadline = std::chrono::steady_clock::now() +
-                             std::chrono::milliseconds(5000);
+        auto late_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(5000);
         while (!(*late_future).isReady() &&
                std::chrono::steady_clock::now() < late_deadline) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -1321,7 +1308,8 @@ TEST_F(SiblingQpairFailure, NoBusyLoopAfterDrain_ProcessExitsCleanly) {
     }
     auto join_elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - t0).count();
+            std::chrono::steady_clock::now() - t0)
+            .count();
     EXPECT_LT(join_elapsed_ms, 5000)
         << "Inner submitter destructor took " << join_elapsed_ms
         << "ms — worker join is hanging, the busy-loop regression has "

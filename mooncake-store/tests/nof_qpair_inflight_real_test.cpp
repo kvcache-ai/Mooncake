@@ -149,8 +149,7 @@ TEST_F(RealTarget, ProbeLateCallback) {
     // Phase 1b itself timed out after 30s).
     if (!ok) {
         EXPECT_NE(reason, "completion_timeout")
-            << "Phase 1b exceeded "
-            << mooncake::kDefaultDrainTimeoutMs
+            << "Phase 1b exceeded " << mooncake::kDefaultDrainTimeoutMs
             << "ms budget — quiescent proof failed: " << reason;
     }
 }

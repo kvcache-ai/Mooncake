@@ -538,8 +538,8 @@ TEST(NofQpairDrain, WaitForInflightCompletionFastPathOnPollError) {
     // Use the 30 s default deadline: a regression that drops the
     // fast-path would force this call to wait ~30 s.
     auto start = std::chrono::steady_clock::now();
-    bool quiescent = pool->WaitForInflightCompletion(
-        mooncake::kDefaultDrainTimeoutMs);
+    bool quiescent =
+        pool->WaitForInflightCompletion(mooncake::kDefaultDrainTimeoutMs);
     auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                           std::chrono::steady_clock::now() - start)
                           .count();
@@ -771,8 +771,8 @@ TEST(NofQpairDrainSibling, SiblingQpairFailure_LateCqeAfterDraining_NoUAF) {
     EXPECT_EQ(pool->InflightCount(), 0);
 
     // Step 5: WaitForInflightCompletion proves the pool is quiescent.
-    EXPECT_TRUE(pool->WaitForInflightCompletion(
-        mooncake::kDefaultDrainTimeoutMs));
+    EXPECT_TRUE(
+        pool->WaitForInflightCompletion(mooncake::kDefaultDrainTimeoutMs));
 
     // Step 6: Task-level counters must be UNCHANGED at this point —
     // the DRAINING short-circuit did NOT decrement outstanding_sub_io /
@@ -1033,8 +1033,7 @@ TEST(NofQpairDrainSibling, SyncFailurePath_DoesNotPopSiblingTask) {
     // remaining_lba == total_blocks.  Simulate the worker's sync
     // failure for each: set failed=true, zero remaining_lba.
     constexpr int kTaskCount = 4;
-    std::vector<std::shared_ptr<mooncake::SpdkNofOperationState>>
-        state_holders;
+    std::vector<std::shared_ptr<mooncake::SpdkNofOperationState>> state_holders;
     state_holders.reserve(kTaskCount);
     for (int i = 0; i < kTaskCount; ++i) {
         auto* task = MakeTask(/*total_blocks=*/4, /*op=*/kOp);
@@ -1104,8 +1103,7 @@ TEST(NofQpairDrainSibling,
     constexpr int kOp = mooncake::kSpdkNofOpRead;
     constexpr int kTaskCount = 8;
 
-    std::vector<std::shared_ptr<mooncake::SpdkNofOperationState>>
-        state_holders;
+    std::vector<std::shared_ptr<mooncake::SpdkNofOperationState>> state_holders;
     state_holders.reserve(kTaskCount);
     for (int i = 0; i < kTaskCount; ++i) {
         auto* task = MakeTask(/*total_blocks=*/4, /*op=*/kOp);

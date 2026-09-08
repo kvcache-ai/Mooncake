@@ -359,21 +359,44 @@ struct SpdkNofQos;
 // COUNTER LIVENESS TABLE
 // ===========================================================================
 //
-// | Counter                              | Owner           | Increment                                                  | Decrement / Pay-back                                  | Quiescence value | Owner of "must reach 0" invariant      |
-// | ------------------------------------ | --------------- | ---------------------------------------------------------- | ----------------------------------------------------- | ---------------- | -------------------------------------- |
-// | NofQpairPool::inflight_count_        | NofQpairPool    | worker, before spdk_nvme_ns_cmd_* (IncrementInflight)      | trampoline DecrementInflight (CAS-saturating)         | 0                | WaitForInflightCompletion             |
-// | NofQpairPool::was_ever_used_with_    | NofQpairPool    | first IncrementInflight (release store)                    | n/a (one-way flag)                                    | n/a              | ~NofQpairPool distinguish "truly" 0    |
-// |                                      |                 |                                                            |                                                       |                  |   from trivially-0                     |
-// | SpdkNofTask::outstanding_sub_io     | SpdkNofTask     | worker, on each successful SubmitRequest                   | trampoline nvmf_io_complete (normal path only)        | 0                | FinalizeAfterDrain's exchange(0)       |
-// | SpdkNofTask::io_count (shared_ptr)   | shared_ptr      | worker, on each successful SubmitRequest                   | trampoline (normal path) + FinalizeAfterDrain's       | 0                | workerThread break-condition           |
-// |                                      |   <atomic<int64_t>>  |                                                          |   fetch_sub(skipped) for DRAINING-short-circuited CQEs|                  |   ("total_outstanding_io == 0")        |
-// | SpdkNofTask::inflight_block_count   | SpdkNofTask     | worker, mirrored with nof_qos->inflight_blocks[op] on      | trampoline nvmf_io_complete (normal path only)        | 0                | not asserted (task-local, only         |
-// |                                      |                 |   submit                                                   |                                                       |                  |   consumed by submit-side budget)      |
-// | SpdkNofQos::inflight_blocks[op]      | SpdkNofQos      | worker, on each successful SubmitRequest                   | trampoline nvmf_io_complete (normal path only)        | 0                | FinalizeAfterDrain's exchange(0)       |
-// | SpdkNofQos::head[op]/tail[op]        | SpdkNofQos      | PushTask                                                   | PopTask (and FailQueuedTasks' drain)                  | nullptr          | FailQueuedTasks + FinalizeAfterDrain   |
-// | SpdkNofQos::active_tasks             | SpdkNofQos      | PushTask                                                   | SpdkNofTaskCompletion (erase by task ptr)             | empty            | ~SpdkNofQos DCHECK                     |
-// | SpdkNofTask::completion_token        | SpdkNofTask     | n/a (initialised to 0)                                     | try_complete() CAS, set to 1                          | exactly one set  | try_complete arbitrates set_completed  |
-// |                                      |                 |                                                            |                                                       |   to 1 per task  |   + delete                             |
+// | Counter                              | Owner           | Increment |
+// Decrement / Pay-back                                  | Quiescence value |
+// Owner of "must reach 0" invariant      | |
+// ------------------------------------ | --------------- |
+// ---------------------------------------------------------- |
+// ----------------------------------------------------- | ---------------- |
+// -------------------------------------- | | NofQpairPool::inflight_count_ |
+// NofQpairPool    | worker, before spdk_nvme_ns_cmd_* (IncrementInflight) |
+// trampoline DecrementInflight (CAS-saturating)         | 0                |
+// WaitForInflightCompletion             | | NofQpairPool::was_ever_used_with_
+// | NofQpairPool    | first IncrementInflight (release store) | n/a (one-way
+// flag)                                    | n/a              | ~NofQpairPool
+// distinguish "truly" 0    | |                                      | | | | |
+// from trivially-0                     | | SpdkNofTask::outstanding_sub_io |
+// SpdkNofTask     | worker, on each successful SubmitRequest | trampoline
+// nvmf_io_complete (normal path only)        | 0                |
+// FinalizeAfterDrain's exchange(0)       | | SpdkNofTask::io_count (shared_ptr)
+// | shared_ptr      | worker, on each successful SubmitRequest | trampoline
+// (normal path) + FinalizeAfterDrain's       | 0                | workerThread
+// break-condition           | |                                      |
+// <atomic<int64_t>>  | |   fetch_sub(skipped) for DRAINING-short-circuited
+// CQEs|                  |   ("total_outstanding_io == 0")        | |
+// SpdkNofTask::inflight_block_count   | SpdkNofTask     | worker, mirrored with
+// nof_qos->inflight_blocks[op] on      | trampoline nvmf_io_complete (normal
+// path only)        | 0                | not asserted (task-local, only | | |
+// |   submit                                                   | | |   consumed
+// by submit-side budget)      | | SpdkNofQos::inflight_blocks[op]      |
+// SpdkNofQos      | worker, on each successful SubmitRequest | trampoline
+// nvmf_io_complete (normal path only)        | 0                |
+// FinalizeAfterDrain's exchange(0)       | | SpdkNofQos::head[op]/tail[op] |
+// SpdkNofQos      | PushTask | PopTask (and FailQueuedTasks' drain) | nullptr
+// | FailQueuedTasks + FinalizeAfterDrain   | | SpdkNofQos::active_tasks |
+// SpdkNofQos      | PushTask | SpdkNofTaskCompletion (erase by task ptr) |
+// empty            | ~SpdkNofQos DCHECK                     | |
+// SpdkNofTask::completion_token        | SpdkNofTask     | n/a (initialised to
+// 0)                                     | try_complete() CAS, set to 1 |
+// exactly one set  | try_complete arbitrates set_completed  | | | | | |   to 1
+// per task  |   + delete                             |
 //
 // "DRAINING short-circuit" rules (nvmf_io_complete when pool->IsDraining()):
 //   - Skips: outstanding_sub_io fetch_sub, io_count fetch_sub,
