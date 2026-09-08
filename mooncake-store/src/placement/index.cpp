@@ -1,216 +1,213 @@
+#include "segment/catalog.h"
 #include "placement/index.h"
 
 #include <algorithm>
+#include <unordered_set>
+#include <memory_resource>
 #include <functional>
 #include <iterator>
 
 namespace mooncake {
-
-bool PlacementGroup::AddTarget(const PlacementTarget& target) {
-    if (target.Kind() != kind ||
-        std::find(targets.begin(), targets.end(), &target) != targets.end()) {
-        return false;
-    }
-    targets.push_back(&target);
-    return true;
+PlacementIndex::Entry* PlacementIndex::EntryMap::Find(std::string_view name) {
+    auto it = by_name_.find(name);
+    return it == by_name_.end() ? nullptr : it->second.get();
 }
 
-bool PlacementGroup::RemoveTarget(const PlacementTarget& target) {
-    auto it = std::find(targets.begin(), targets.end(), &target);
-    if (it == targets.end()) {
-        return false;
-    }
-    *it = targets.back();
-    targets.pop_back();
-    return true;
+const PlacementIndex::Entry* PlacementIndex::EntryMap::Find(
+    std::string_view name) const {
+    auto it = by_name_.find(name);
+    return it == by_name_.end() ? nullptr : it->second.get();
 }
 
-bool PlacementGroup::ReplaceTarget(const PlacementTarget& expected,
-                                   const PlacementTarget& replacement) {
-    if (expected.Kind() != kind || replacement.Kind() != kind) {
-        return false;
-    }
-    auto it = std::find(targets.begin(), targets.end(), &expected);
-    if (it == targets.end()) {
-        return false;
-    }
-    *it = &replacement;
-    return true;
+void PlacementIndex::EntryMap::Insert(std::unique_ptr<Entry> entry) noexcept {
+    auto [it, inserted] =
+        by_name_.emplace(entry->segment_name, std::move(entry));
+    DCHECK(inserted);
+    active_.push_back(it->second.get());
 }
 
-bool PlacementIndex::AddTarget(std::string_view name,
-                               const PlacementTarget* target) {
-    if (name.empty() || !target) {
-        return false;
-    }
-    const size_t kind_index = KindIndex(target->Kind());
-    if (kind_index >= kPlacementTargetKindCount) {
-        return false;
-    }
-    auto& groups = groups_by_kind_[kind_index];
-    auto it = groups.find(name);
-    if (it != groups.end()) {
-        return it->second->AddTarget(*target);
-    }
-
-    auto group = std::make_unique<PlacementGroup>(name, target->Kind());
-    if (!group->AddTarget(*target)) {
-        return false;
-    }
-    const auto* group_ptr = group.get();
-    groups.emplace(group->name, std::move(group));
-    active_groups_by_kind_[kind_index].push_back(group_ptr);
-    return true;
+void PlacementIndex::EntryMap::Erase(const Entry& entry) {
+    auto active_it = std::find(active_.begin(), active_.end(), &entry);
+    DCHECK(active_it != active_.end());
+    *active_it = active_.back();
+    active_.pop_back();
+    by_name_.erase(entry.segment_name);
 }
 
-bool PlacementIndex::RemoveTarget(std::string_view name,
-                                  const PlacementTarget* target) {
-    if (!target) {
+void PlacementIndex::EntryMap::Clear() {
+    active_.clear();
+    by_name_.clear();
+}
+
+bool PlacementIndex::AddCandidate(std::string_view segment_name,
+                                  const AllocationCandidate& candidate,
+                                  std::string_view host_id) {
+    if (segment_name.empty()) {
         return false;
     }
-    const size_t kind_index = KindIndex(target->Kind());
-    if (kind_index >= kPlacementTargetKindCount) {
+    const size_t kind_index = KindIndex(candidate.Kind());
+    if (kind_index >= kAllocationCandidateKindCount) {
         return false;
     }
-    auto& groups = groups_by_kind_[kind_index];
-    auto it = groups.find(name);
-    if (it == groups.end() || !it->second->RemoveTarget(*target)) {
-        return false;
-    }
-    if (!it->second->targets.empty()) {
+    auto& entries = entries_by_kind_[kind_index];
+    if (auto* entry = entries.Find(segment_name)) {
+        if (!entry->candidates.insert(&candidate).second) {
+            return false;
+        }
+        AddHostMember(host_id, segment_name);
         return true;
     }
 
-    const auto* group = it->second.get();
-    auto& active_groups = active_groups_by_kind_[kind_index];
-    auto active_it =
-        std::find(active_groups.begin(), active_groups.end(), group);
-    if (active_it != active_groups.end()) {
-        *active_it = active_groups.back();
-        active_groups.pop_back();
-    }
-    groups.erase(it);
+    auto entry = std::make_unique<Entry>(
+        Entry{std::string(segment_name), candidate.Kind(), {&candidate}});
+    entries.Insert(std::move(entry));
+    AddHostMember(host_id, segment_name);
     return true;
 }
 
-bool PlacementIndex::ReplaceTarget(std::string_view name,
-                                   const PlacementTarget* expected,
-                                   const PlacementTarget* replacement) {
-    if (!expected || !replacement) {
+bool PlacementIndex::RemoveCandidate(std::string_view segment_name,
+                                     const AllocationCandidate& candidate,
+                                     std::string_view host_id) {
+    const size_t kind_index = KindIndex(candidate.Kind());
+    if (kind_index >= kAllocationCandidateKindCount) {
         return false;
     }
-    if (expected->Kind() != replacement->Kind()) {
-        if (!AddTarget(name, replacement)) {
+    auto& entries = entries_by_kind_[kind_index];
+    auto* entry = entries.Find(segment_name);
+    if (!entry) {
+        return false;
+    }
+    auto& candidates = entry->candidates;
+    if (candidates.erase(&candidate) == 0) {
+        return false;
+    }
+    RemoveHostMember(host_id, segment_name);
+    if (!candidates.empty()) {
+        return true;
+    }
+
+    entries.Erase(*entry);
+    return true;
+}
+
+bool PlacementIndex::ReplaceCandidate(std::string_view segment_name,
+                                      const AllocationCandidate& expected,
+                                      const AllocationCandidate& replacement,
+                                      std::string_view host_id) {
+    if (expected.Kind() != replacement.Kind()) {
+        if (!AddCandidate(segment_name, replacement, host_id)) {
             return false;
         }
-        if (RemoveTarget(name, expected)) {
+        if (RemoveCandidate(segment_name, expected, host_id)) {
             return true;
         }
-        (void)RemoveTarget(name, replacement);
+        (void)RemoveCandidate(segment_name, replacement, host_id);
         return false;
     }
 
-    const size_t kind_index = KindIndex(expected->Kind());
-    if (kind_index >= kPlacementTargetKindCount) {
+    const size_t kind_index = KindIndex(expected.Kind());
+    if (kind_index >= kAllocationCandidateKindCount) {
         return false;
     }
-    auto& groups = groups_by_kind_[kind_index];
-    auto it = groups.find(name);
-    return it != groups.end() &&
-           it->second->ReplaceTarget(*expected, *replacement);
+    auto& entries = entries_by_kind_[kind_index];
+    auto* entry = entries.Find(segment_name);
+    if (!entry) {
+        return false;
+    }
+    auto& candidates = entry->candidates;
+    auto candidate_it = candidates.find(&expected);
+    if (candidate_it == candidates.end()) {
+        return false;
+    }
+    if (&expected == &replacement) {
+        return true;
+    }
+    if (candidates.find(&replacement) != candidates.end()) {
+        return false;
+    }
+    candidates.erase(candidate_it);
+    candidates.insert(&replacement);
+    return true;
 }
 
 void PlacementIndex::Clear() {
-    for (auto& groups : groups_by_kind_) {
-        groups.clear();
-    }
-    for (auto& active_groups : active_groups_by_kind_) {
-        active_groups.clear();
+    segments_by_host_.clear();
+    for (auto& entries : entries_by_kind_) {
+        entries.Clear();
     }
 }
 
-const PlacementGroup* PlacementIndex::Find(std::string_view name,
-                                           PlacementTargetKind kind) const {
+const PlacementIndex::Entry* PlacementIndex::Find(
+    std::string_view segment_name, AllocationCandidateKind kind) const {
     const size_t kind_index = KindIndex(kind);
-    if (kind_index >= kPlacementTargetKindCount) {
+    if (kind_index >= kAllocationCandidateKindCount) {
         return nullptr;
     }
-    const auto& groups = groups_by_kind_[kind_index];
-    auto it = groups.find(name);
-    return it == groups.end() ? nullptr : it->second.get();
+    const auto& entries = entries_by_kind_[kind_index];
+    return entries.Find(segment_name);
 }
 
-void PlacementIndex::GetActiveGroupNames(
-    PlacementTargetKind kind, std::vector<std::string>& names) const {
+void PlacementIndex::GetActiveSegmentNames(
+    AllocationCandidateKind kind, std::vector<std::string>& names) const {
     names.clear();
     const size_t kind_index = KindIndex(kind);
-    if (kind_index >= kPlacementTargetKindCount) {
+    if (kind_index >= kAllocationCandidateKindCount) {
         return;
     }
-    const auto& active_groups = active_groups_by_kind_[kind_index];
-    names.reserve(active_groups.size());
-    for (const auto* group : active_groups) {
-        names.push_back(group->name);
+    const auto active_entries = entries_by_kind_[kind_index].ActiveEntries();
+    names.reserve(active_entries.size());
+    for (const auto* entry : active_entries) {
+        names.push_back(entry->segment_name);
     }
 }
 
-void ScopedPlacementReadAccess::GetHostOrderedGroups(
+void PlacementIndex::AddHostMember(std::string_view host_id,
+                                   std::string_view segment_name) {
+    if (!host_id.empty()) {
+        ++segments_by_host_[std::string(host_id)][std::string(segment_name)];
+    }
+}
+
+void PlacementIndex::RemoveHostMember(std::string_view host_id,
+                                      std::string_view segment_name) {
+    if (host_id.empty()) return;
+    auto host = segments_by_host_.find(host_id);
+    DCHECK(host != segments_by_host_.end());
+    auto name = host->second.find(segment_name);
+    DCHECK(name != host->second.end());
+    auto& member_count = name->second;
+    if (--member_count == 0) {
+        host->second.erase(name);
+        if (host->second.empty()) segments_by_host_.erase(host);
+    }
+}
+
+void PlacementIndex::VisitHostOrderedSegmentNames(
     std::string_view writer_host_id, std::string_view key,
-    PlacementTargetKind target_kind,
-    std::vector<const PlacementGroup*>& output) const {
-    output.clear();
-    if (!regions_by_host_ || writer_host_id.empty() ||
-        regions_by_host_->empty()) {
-        return;
-    }
+    const std::function<bool(std::string_view)>& visit) const {
+    if (writer_host_id.empty() || segments_by_host_.empty()) return;
+    auto start = segments_by_host_.lower_bound(writer_host_id);
+    if (start == segments_by_host_.end()) start = segments_by_host_.begin();
 
-    auto host_it = regions_by_host_->find(writer_host_id);
-    if (host_it == regions_by_host_->end()) {
-        host_it = regions_by_host_->lower_bound(writer_host_id);
-        if (host_it == regions_by_host_->end()) {
-            host_it = regions_by_host_->begin();
+    const size_t key_hash = std::hash<std::string_view>{}(key);
+    // The same name can occur on multiple hosts. Batch per-visit dedup storage.
+    std::pmr::monotonic_buffer_resource scratch;
+    std::pmr::unordered_set<std::string_view> visited_names(&scratch);
+    auto host = start;
+    do {
+        const auto& names = host->second;
+        const size_t offset = key_hash % names.size();
+        for (size_t i = 0; i < names.size(); ++i) {
+            const auto& name = names.nth((offset + i) % names.size())->first;
+            if (visited_names.insert(name).second && visit(name)) return;
         }
-    }
-
-    for (size_t host_index = 0; host_index < regions_by_host_->size();
-         ++host_index) {
-        const auto& groups = host_it->second;
-        if (!groups.empty()) {
-            const size_t start =
-                std::hash<std::string_view>{}(key) % groups.size();
-            auto group_it = groups.begin();
-            std::advance(group_it, start);
-            for (size_t i = 0; i < groups.size(); ++i) {
-                if (!group_it->second.empty()) {
-                    const auto* group =
-                        placement_.Find(group_it->first, target_kind);
-                    if (group && std::find(output.begin(), output.end(),
-                                           group) == output.end()) {
-                        output.push_back(group);
-                    }
-                }
-                ++group_it;
-                if (group_it == groups.end()) {
-                    group_it = groups.begin();
-                }
-            }
-        }
-        ++host_it;
-        if (host_it == regions_by_host_->end()) {
-            host_it = regions_by_host_->begin();
-        }
-    }
+        if (++host == segments_by_host_.end()) host = segments_by_host_.begin();
+    } while (host != start);
 }
 
 std::optional<UUID> ScopedPlacementReadAccess::GetOwnerClientId(
-    std::string_view group_name) const {
-    if (!owner_client_by_group_name_) {
-        return std::nullopt;
-    }
-    auto it = owner_client_by_group_name_->find(group_name);
-    return it == owner_client_by_group_name_->end()
-               ? std::nullopt
-               : std::optional<UUID>(it->second);
+    std::string_view segment_name) const {
+    return catalog_.FindOwnerClientId(segment_name);
 }
 
 }  // namespace mooncake

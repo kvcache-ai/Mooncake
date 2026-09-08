@@ -1,7 +1,10 @@
 #pragma once
 
 #include <array>
+#include <boost/container/flat_set.hpp>
+#include <boost/container/flat_map.hpp>
 #include <cstddef>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -13,107 +16,114 @@
 #include <unordered_map>
 #include <vector>
 
-#include "placement/target.h"
+#include "placement/candidate.h"
 #include "types.h"
 #include "utils/transparent_string_hash.h"
 
 namespace mooncake {
 
-// A placement group contains allocation-equivalent targets. The index keys
-// groups by both logical name and target kind, so native and CXL targets may
-// share a name without being mixed during allocation.
-struct PlacementGroup final {
-    PlacementGroup(std::string_view group_name, PlacementTargetKind group_kind)
-        : name(group_name), kind(group_kind) {}
-
-    bool AddTarget(const PlacementTarget& target);
-    bool RemoveTarget(const PlacementTarget& target);
-    bool ReplaceTarget(const PlacementTarget& expected,
-                       const PlacementTarget& replacement);
-
-    std::string name;
-    const PlacementTargetKind kind;
-    std::vector<const PlacementTarget*> targets;
-};
-
 class PlacementIndex final {
    public:
+    // One (segment_name, kind) entry. Candidates are interchangeable for one
+    // allocation; multi-replica placement uses each entry at most once.
+    struct Entry final {
+        std::string segment_name;
+        const AllocationCandidateKind kind;
+        boost::container::flat_set<const AllocationCandidate*> candidates;
+    };
+
     PlacementIndex() = default;
     PlacementIndex(PlacementIndex&&) = default;
     PlacementIndex& operator=(PlacementIndex&&) = default;
     PlacementIndex(const PlacementIndex&) = delete;
     PlacementIndex& operator=(const PlacementIndex&) = delete;
 
-    bool AddTarget(std::string_view name, const PlacementTarget* target);
-    bool RemoveTarget(std::string_view name, const PlacementTarget* target);
-    bool ReplaceTarget(std::string_view name, const PlacementTarget* expected,
-                       const PlacementTarget* replacement);
+    // A candidate keeps the same segment name and host identity until removed.
+    bool AddCandidate(std::string_view segment_name,
+                      const AllocationCandidate& candidate,
+                      std::string_view host_id);
+    bool RemoveCandidate(std::string_view segment_name,
+                         const AllocationCandidate& candidate,
+                         std::string_view host_id);
+    bool ReplaceCandidate(std::string_view segment_name,
+                          const AllocationCandidate& expected,
+                          const AllocationCandidate& replacement,
+                          std::string_view host_id);
     void Clear();
 
-    const PlacementGroup* Find(std::string_view name,
-                               PlacementTargetKind kind) const;
-    bool Contains(std::string_view name, PlacementTargetKind kind) const {
-        return Find(name, kind) != nullptr;
+    // Visit unique names in host/key order under the read lock. Returning
+    // true stops traversal. Borrowed names remain valid only under this lock.
+    void VisitHostOrderedSegmentNames(
+        std::string_view writer_host_id, std::string_view key,
+        const std::function<bool(std::string_view)>& visit) const;
+    const Entry* Find(std::string_view segment_name,
+                      AllocationCandidateKind kind) const;
+    bool Contains(std::string_view segment_name,
+                  AllocationCandidateKind kind) const {
+        return Find(segment_name, kind) != nullptr;
     }
-    void GetActiveGroupNames(PlacementTargetKind kind,
-                             std::vector<std::string>& names) const;
-    std::span<const PlacementGroup* const> active_groups(
-        PlacementTargetKind kind) const {
-        return active_groups_by_kind_[KindIndex(kind)];
-    }
-    size_t size(PlacementTargetKind kind) const noexcept {
-        return active_groups_by_kind_[KindIndex(kind)].size();
-    }
-    bool empty(PlacementTargetKind kind) const noexcept {
-        return active_groups_by_kind_[KindIndex(kind)].empty();
+    void GetActiveSegmentNames(AllocationCandidateKind kind,
+                               std::vector<std::string>& names) const;
+    std::span<const Entry* const> active_entries(
+        AllocationCandidateKind kind) const {
+        return entries_by_kind_[KindIndex(kind)].ActiveEntries();
     }
 
    private:
-    static constexpr size_t KindIndex(PlacementTargetKind kind) noexcept {
+    static constexpr size_t KindIndex(AllocationCandidateKind kind) noexcept {
         return static_cast<size_t>(kind);
     }
 
-    using GroupMap =
-        std::unordered_map<std::string, std::unique_ptr<PlacementGroup>,
-                           TransparentStringHash, std::equal_to<>>;
-    std::array<GroupMap, kPlacementTargetKindCount> groups_by_kind_;
-    std::array<std::vector<const PlacementGroup*>, kPlacementTargetKindCount>
-        active_groups_by_kind_;
+    void AddHostMember(std::string_view host_id, std::string_view segment_name);
+    void RemoveHostMember(std::string_view host_id,
+                          std::string_view segment_name);
+
+    // Counts span kinds and regions. A name remains until its last active
+    // candidate on this host is removed. flat_map provides indexed name access.
+    using HostSegments =
+        boost::container::flat_map<std::string, size_t, std::less<>>;
+    std::map<std::string, HostSegments, std::less<>> segments_by_host_;
+
+    // Both views contain the same active entries; inactive regions live in
+    // RegionCatalog. EntryMap owns their lifetime and keeps the views in sync.
+    class EntryMap final {
+       public:
+        Entry* Find(std::string_view name);
+        const Entry* Find(std::string_view name) const;
+        void Insert(std::unique_ptr<Entry> entry) noexcept;
+        void Erase(const Entry& entry);
+        void Clear();
+        std::span<const Entry* const> ActiveEntries() const { return active_; }
+
+       private:
+        std::unordered_map<std::string, std::unique_ptr<Entry>,
+                           TransparentStringHash, std::equal_to<>>
+            by_name_;
+        std::vector<const Entry*> active_;
+    };
+    std::array<EntryMap, kAllocationCandidateKindCount> entries_by_kind_;
 };
 
-using HostRegionIndex =
-    std::map<std::string, std::map<std::string, std::set<UUID>>, std::less<>>;
-using OwnerClientByGroupName =
-    std::unordered_map<std::string, UUID, TransparentStringHash,
-                       std::equal_to<>>;
+class RegionCatalog;
 
+// Borrows the indexes and holds their shared lock. The owner of the indexes
+// and mutex must outlive this access object.
 class ScopedPlacementReadAccess final {
    public:
     ScopedPlacementReadAccess(const PlacementIndex& placement,
+                              const RegionCatalog& catalog,
                               std::shared_mutex& mutex)
-        : placement_(placement), lock_(mutex) {}
+        : placement_(placement), catalog_(catalog), lock_(mutex) {}
 
-    ScopedPlacementReadAccess(
-        const PlacementIndex& placement, const HostRegionIndex& regions_by_host,
-        const OwnerClientByGroupName& owner_client_by_group_name,
-        std::shared_mutex& mutex)
-        : placement_(placement),
-          regions_by_host_(&regions_by_host),
-          owner_client_by_group_name_(&owner_client_by_group_name),
-          lock_(mutex) {}
-
+    // The view and entries borrowed from it must only be used while this
+    // access object retains its lock.
     const PlacementIndex& GetView() const { return placement_; }
 
-    void GetHostOrderedGroups(std::string_view writer_host_id,
-                              std::string_view key,
-                              PlacementTargetKind target_kind,
-                              std::vector<const PlacementGroup*>& output) const;
-    std::optional<UUID> GetOwnerClientId(std::string_view group_name) const;
+    std::optional<UUID> GetOwnerClientId(std::string_view segment_name) const;
 
    private:
     const PlacementIndex& placement_;
-    const HostRegionIndex* regions_by_host_{nullptr};
-    const OwnerClientByGroupName* owner_client_by_group_name_{nullptr};
+    const RegionCatalog& catalog_;
     std::shared_lock<std::shared_mutex> lock_;
 };
 

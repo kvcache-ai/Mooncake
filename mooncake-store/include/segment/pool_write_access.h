@@ -9,62 +9,76 @@
 
 #include <ylt/util/tl/expected.hpp>
 
-#include "segment/transaction.h"
+#include "segment/catalog.h"
+#include "segment/pool.h"
 
 namespace mooncake {
 
-class SegmentPool;
+class SegmentPool::WriteAccess final {
+    struct TransactionKey {
+        explicit TransactionKey() = default;
+    };
 
-class ScopedSegmentPoolWriteAccess final {
    public:
+    class RegionMountTxn;
+    class RegionUnmountTxn;
+    class RegionGracefulUnmountTxn;
+
+    WriteAccess(AccessKey, SegmentPool& segment_pool);
+
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
     tl::expected<RegionMountTxn, ErrorCode> PrepareMount(const Segment& segment,
                                                          const UUID& client_id);
+    // Descriptors must use the canonical transport endpoint. The recovery
+    // caller resolves segment-name aliases before entering the Pool.
     tl::expected<RegionMountTxn, ErrorCode> PrepareRestore(
         const Segment& segment, const UUID& client_id,
         std::span<const AllocatedBuffer::Descriptor> descriptors);
     tl::expected<RegionMountTxn, ErrorCode> PrepareAdopt(
         MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator,
         bool account_capacity_metrics);
-    void CommitMount(RegionMountTxn& transaction) noexcept;
     void Clear() noexcept;
 
-    ErrorCode ValidateRemount(std::span<const Segment> segments,
-                              const UUID& client_id) const;
-    bool GetSegment(const UUID& segment_id, Segment& segment) const;
     tl::expected<RegionUnmountTxn, ErrorCode> PrepareUnmount(
         const UUID& segment_id, const UUID& client_id);
-    ErrorCode RollbackUnmount(RegionUnmountTxn& transaction);
-    ErrorCode CommitUnmount(RegionUnmountTxn& transaction);
-    ErrorCode PrepareGracefulUnmountSegment(const UUID& segment_id,
-                                            const UUID& client_id);
-    ErrorCode FinalizeGracefulUnmount(const UUID& segment_id,
-                                      const UUID& client_id);
+    tl::expected<RegionGracefulUnmountTxn, ErrorCode> PrepareGracefulUnmount(
+        const UUID& segment_id, const UUID& client_id);
 
-    ErrorCode GetClientSegments(const UUID& client_id,
-                                std::vector<Segment>& segments) const;
-    bool ExistsSegmentName(std::string_view segment_name) const;
-    bool IsSegmentAllocatable(std::string_view segment_name) const;
-    ErrorCode GetSegmentStatusByName(std::string_view segment_name,
-                                     SegmentStatus& status) const;
+    const RegionCatalog& Catalog() const;
     ErrorCode SetSegmentStatusByName(std::string_view segment_name,
                                      SegmentStatus status);
 
    private:
-    explicit ScopedSegmentPoolWriteAccess(SegmentPool* segment_pool);
-
-    tl::expected<RegionMountTxn, ErrorCode> PrepareWithInitialState(
+    ErrorCode PublishMount(
+        const MountedRegion& mounted, bool existed,
+        bool account_capacity_metrics, PreparedRegionResource& prepared,
+        const std::weak_ptr<BufferAllocatorBase>& previous_allocator) noexcept;
+    ErrorCode RestoreUnmountedRegion(const UUID& segment_id,
+                                     const UUID& client_id,
+                                     SegmentStatus previous_status,
+                                     uint64_t generation);
+    tl::expected<RegionMountTxn, ErrorCode> PrepareWithLiveAllocations(
         const Segment& segment, const UUID& client_id,
-        const RegionInitialState& initial_state,
+        const std::vector<LiveAllocation>& live_allocations,
         uint64_t imported_requested_bytes);
     ErrorCode EraseUnmountedRegion(const UUID& segment_id,
                                    const UUID& client_id,
-                                   SegmentStatus expected_status);
+                                   SegmentStatus expected_status,
+                                   uint64_t generation);
 
-    SegmentPool* segment_pool_;
+    ErrorCode TransitionRegion(const MountedRegion& mounted,
+                               RegionResource& resource, SegmentStatus status);
+
+    SegmentPool& segment_pool_;
     std::unique_lock<std::shared_mutex> lock_;
-
-    friend class SegmentPool;
+    RegionCatalog& catalog_;
 };
 
+using RegionMountTxn = SegmentPool::WriteAccess::RegionMountTxn;
+using RegionUnmountTxn = SegmentPool::WriteAccess::RegionUnmountTxn;
+using RegionGracefulUnmountTxn =
+    SegmentPool::WriteAccess::RegionGracefulUnmountTxn;
+
 }  // namespace mooncake
+
+#include "segment/transaction.h"

@@ -25,9 +25,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     placement/replica_allocator.cpp
     segment/catalog.cpp
     segment/pool.cpp
-    segment/pool_read_access.cpp
+    segment/pool_mount.cpp
     segment/pool_write_access.cpp
-    segment/resource_view.cpp
+    segment/pool_read_access.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
