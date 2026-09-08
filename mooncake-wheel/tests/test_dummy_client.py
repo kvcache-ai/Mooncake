@@ -448,91 +448,85 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.remove(key2), 0)
 
     def test_external_host_registered_tensor_roundtrip(self):
-        """Registered CPU tensors support bounded raw writes and read copy-back."""
+        """Registered pageable CPU tensors support bounded raw transfers."""
         if torch is None:
             self.skipTest("PyTorch is not available")
+        self._check_registered_cpu_tensor_roundtrip(pinned=False)
 
-        for pinned in (False, True):
-            with self.subTest(pin_memory=pinned):
-                if pinned and not torch.cuda.is_available():
-                    self.skipTest("Pinned host allocation requires CUDA")
-                source = torch.empty(64, dtype=torch.int32, pin_memory=pinned)
-                source.copy_(torch.arange(64, dtype=torch.int32))
-                destination = torch.empty(80, dtype=torch.int32, pin_memory=pinned)
+    def test_external_host_registered_pinned_tensor_roundtrip(self):
+        """Pinned CPU tensors preserve data and guards across Dummy RPC."""
+        if torch is None or not torch.cuda.is_available():
+            self.skipTest("Pinned host allocation requires CUDA")
+        self._check_registered_cpu_tensor_roundtrip(pinned=True)
+
+    def _check_registered_cpu_tensor_roundtrip(self, pinned):
+        source = torch.empty(64, dtype=torch.int32, pin_memory=pinned)
+        source.copy_(torch.arange(64, dtype=torch.int32))
+        destination = torch.empty(80, dtype=torch.int32, pin_memory=pinned)
+        destination.fill_(-1)
+        self.assertEqual(source.is_pinned(), pinned)
+        self.assertEqual(destination.is_pinned(), pinned)
+        source_ptr = source.data_ptr()
+        destination_ptr = destination.data_ptr()
+        size = source.numel() * source.element_size()
+        capacity = destination.numel() * destination.element_size()
+        offset = 8 * destination.element_size()
+        key = f"test_dummy_registered_tensor_{os.getpid()}_{pinned}"
+        self.assertEqual(self.store.register_buffer(source_ptr, size), 0)
+        try:
+            self.assertEqual(self.store.register_buffer(destination_ptr, capacity), 0)
+            try:
+                self.assertEqual(self.store.put_from(key, source_ptr, size), 0)
+                self.assertEqual(
+                    self.store.get_into(key, destination_ptr + offset, size),
+                    size,
+                )
+                expected = torch.full((80,), -1, dtype=torch.int32)
+                expected[8:72] = source
+                self.assertTrue(torch.equal(destination, expected))
+
+                source.add_(100)
+                self.assertEqual(
+                    list(self.store.batch_upsert_from([key], [source_ptr], [size])),
+                    [0],
+                )
+                self.assertEqual(
+                    list(
+                        self.store.batch_get_into(
+                            [key], [destination_ptr + offset], [size]
+                        )
+                    ),
+                    [size],
+                )
+                expected[8:72] = source
+                self.assertTrue(torch.equal(destination, expected))
+
                 destination.fill_(-1)
-                self.assertEqual(source.is_pinned(), pinned)
-                self.assertEqual(destination.is_pinned(), pinned)
-                source_ptr = source.data_ptr()
-                destination_ptr = destination.data_ptr()
-                size = source.numel() * source.element_size()
-                capacity = destination.numel() * destination.element_size()
-                offset = 8 * destination.element_size()
-                key = f"test_dummy_registered_tensor_{os.getpid()}_{pinned}"
-                self.assertEqual(self.store.register_buffer(source_ptr, size), 0)
-                try:
-                    self.assertEqual(
-                        self.store.register_buffer(destination_ptr, capacity), 0
-                    )
-                    try:
-                        self.assertEqual(self.store.put_from(key, source_ptr, size), 0)
-                        self.assertEqual(
-                            self.store.get_into(key, destination_ptr + offset, size),
-                            size,
-                        )
-                        expected = torch.full((80,), -1, dtype=torch.int32)
-                        expected[8:72] = source
-                        self.assertTrue(torch.equal(destination, expected))
-
-                        source.add_(100)
-                        self.assertEqual(
-                            list(
-                                self.store.batch_upsert_from(
-                                    [key], [source_ptr], [size]
-                                )
-                            ),
-                            [0],
-                        )
-                        self.assertEqual(
-                            list(
-                                self.store.batch_get_into(
-                                    [key], [destination_ptr + offset], [size]
-                                )
-                            ),
-                            [size],
-                        )
-                        expected[8:72] = source
-                        self.assertTrue(torch.equal(destination, expected))
-
-                        destination.fill_(-1)
-                        self.assertEqual(
-                            self.store.get_into_ranges(
-                                [destination_ptr],
-                                [[key]],
-                                [[[offset]]],
-                                [[[source.element_size()]]],
-                                [[[16]]],
-                            ),
-                            [[[16]]],
-                        )
-                        expected.fill_(-1)
-                        expected[8:12] = source[1:5]
-                        self.assertTrue(torch.equal(destination, expected))
-                        self.assertLess(
-                            self.store.get_into(
-                                key, destination_ptr + capacity - 4, size
-                            ),
-                            0,
-                        )
-                        self.assertTrue(torch.equal(destination, expected))
-                    finally:
-                        self.assertEqual(
-                            self.store.unregister_buffer(destination_ptr), 0
-                        )
-                    self.assertLess(self.store.get_into(key, destination_ptr, size), 0)
-                    self.assertTrue(torch.equal(destination, expected))
-                finally:
-                    self.assertEqual(self.store.unregister_buffer(source_ptr), 0)
-                    self.store.remove(key, force=True)
+                self.assertEqual(
+                    self.store.get_into_ranges(
+                        [destination_ptr],
+                        [[key]],
+                        [[[offset]]],
+                        [[[source.element_size()]]],
+                        [[[16]]],
+                    ),
+                    [[[16]]],
+                )
+                expected.fill_(-1)
+                expected[8:12] = source[1:5]
+                self.assertTrue(torch.equal(destination, expected))
+                self.assertLess(
+                    self.store.get_into(key, destination_ptr + capacity - 4, size),
+                    0,
+                )
+                self.assertTrue(torch.equal(destination, expected))
+            finally:
+                self.assertEqual(self.store.unregister_buffer(destination_ptr), 0)
+            self.assertLess(self.store.get_into(key, destination_ptr, size), 0)
+            self.assertTrue(torch.equal(destination, expected))
+        finally:
+            self.assertEqual(self.store.unregister_buffer(source_ptr), 0)
+            self.store.remove(key, force=True)
 
     def test_external_host_get_into_ranges_staging(self):
         """Range reads stage a registered process-local host destination."""
