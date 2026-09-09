@@ -47,6 +47,7 @@
 #endif
 #include "crc_checksum.h"
 #include "environ.h"
+#include "config/client_numa_config.h"
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
@@ -81,26 +82,6 @@ class ScopedObjectChecksumBuffer {
 };
 
 #ifdef USE_NOF
-std::optional<int> GetConfiguredNumaSocketId() {
-    const char* raw_value = std::getenv("MC_STORE_NUMA_SOCKET_ID");
-    if (!raw_value || raw_value[0] == '\0') {
-        return std::nullopt;
-    }
-
-    char* end_ptr = nullptr;
-    errno = 0;
-    long parsed = std::strtol(raw_value, &end_ptr, 10);
-    if (errno != 0 || end_ptr == raw_value ||
-        (end_ptr != nullptr && *end_ptr != '\0') || parsed < 0 ||
-        parsed > std::numeric_limits<int>::max()) {
-        LOG(WARNING) << "Invalid MC_STORE_NUMA_SOCKET_ID=" << raw_value
-                     << ", falling back to auto-detect";
-        return std::nullopt;
-    }
-
-    return static_cast<int>(parsed);
-}
-
 int GetCurrentNumaSocketId() {
     if (numa_available() < 0) {
         return 0;
@@ -1010,8 +991,9 @@ void Client::InitTransferSubmitter() {
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
 #ifdef USE_NOF
-    int numa_socket_id =
-        GetConfiguredNumaSocketId().value_or(GetCurrentNumaSocketId());
+    const int numa_socket_id =
+        ClientNumaConfig::FromEnvironment().socket_id.value_or(
+            GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
         metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);

@@ -23,6 +23,11 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
+    segment/catalog.cpp
+    segment/pool.cpp
+    segment/pool_mount.cpp
+    segment/pool_write_access.cpp
+    segment/pool_read_access.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
@@ -73,6 +78,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 set(MOONCAKE_STORE_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
+    config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
     client_metric.cpp
@@ -80,6 +86,8 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     storage_backend.cpp
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
+    config/nvme_kv_connector_config.cpp
+    config/nvme_kv_u32_parser.cpp
     nvme_kv_executor_io_uring.cpp
     nvme_kv_executor_ioctl.cpp
     nvme_kv_executor_util.cpp
@@ -101,7 +109,9 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
     config/cxl_segment_config.cpp
+    config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
+    config/nof_register_config.cpp
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp

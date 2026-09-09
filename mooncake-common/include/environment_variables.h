@@ -56,10 +56,23 @@ struct CxlSegmentEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_CXL_DEV_SIZE);
 };
 
+struct ClientNumaEnvironmentVariables {
+    // Keep the raw string to preserve the legacy strtol syntax and warning
+    // behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_NUMA_SOCKET_ID);
+};
+
 struct RegisteredPinnedMemoryEnvironmentVariables {
     // Keep the raw string because the legacy parser rejects a leading '+',
     // unlike the shared typed integer parser.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_PIN_MEMORY_MAX_BYTES);
+};
+
+struct MmapArenaEnvironmentVariables {
+    // Keep these values as strings to preserve the existing byte-size and
+    // canonical-bool parsing, opt-in, fallback, and logging behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_MMAP_ARENA_POOL_SIZE);
+    MC_DEFINE_ENV_VAR(std::string, MC_DISABLE_MMAP_ARENA);
 };
 
 struct LocalHotCacheEnvironmentVariables {
@@ -127,6 +140,21 @@ struct TransferSubmitterEnvironmentVariables {
     // Keep the raw string to preserve the legacy token set, whitespace,
     // invalid-value fallback, and warning behavior.
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
+};
+
+struct NoFRegisterEnvironmentVariables {
+    // Keep the raw string to preserve case normalization and warning behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_TRTYPE);
+};
+
+struct NvmeKvConnectorEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_DEVICE_PATH);
+    // Keep numeric values as strings because the existing NVMe parser accepts
+    // base prefixes, a leading plus, and leading whitespace.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_NSID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_QUEUE_DEPTH);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_TRANSPORT);
 };
 
 #undef MC_DEFINE_ENV_VAR
