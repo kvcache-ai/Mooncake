@@ -685,13 +685,14 @@ TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
 
 // ---- how a request is cut into slices ------------------------------------
 
-// Walk a plan the way submitTransferTasks() walks it: `count` slices, each
-// min(remaining, block_size). Returns the lengths handed out.
+// Walk a plan the way submitTransferTasks() walks it: a block each, and
+// whatever is left for the last. Returns the lengths handed out.
 std::vector<uint64_t> walkPlan(const RdmaSlicePlan& plan, uint64_t length) {
     std::vector<uint64_t> lengths;
     uint64_t offset = 0;
     for (uint64_t i = 0; i < plan.count; ++i) {
-        const uint64_t n = std::min<uint64_t>(length - offset, plan.block_size);
+        const uint64_t n =
+            (i + 1 == plan.count) ? length - offset : plan.block_size;
         lengths.push_back(n);
         offset += n;
     }
@@ -717,10 +718,15 @@ TEST(RdmaSlicePlanTest, EverySliceCarriesDataAndTheyCoverTheRequest) {
 
             const auto lengths = walkPlan(plan, length);
             uint64_t total = 0;
-            for (uint64_t n : lengths) {
-                EXPECT_GT(n, 0u) << "empty slice";
-                EXPECT_LE(n, plan.block_size);
-                total += n;
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                EXPECT_GT(lengths[i], 0u) << "empty slice";
+                if (i + 1 < lengths.size()) {
+                    EXPECT_EQ(lengths[i], plan.block_size);
+                } else {
+                    // The last one carries a folded tail at most.
+                    EXPECT_LE(lengths[i], 2 * plan.block_size);
+                }
+                total += lengths[i];
             }
             EXPECT_EQ(total, length);
         }
@@ -735,10 +741,64 @@ TEST(RdmaSlicePlanTest, BelowTheCapTheBlockIsTheConfiguredOne) {
         EXPECT_EQ(exact.block_size, kBase) << "blocks=" << blocks;
         EXPECT_EQ(exact.count, blocks) << "blocks=" << blocks;
 
+        // One byte over is a tail far too short to post on its own, so it
+        // joins the slice before it instead of adding one.
         const auto ragged = planRdmaSlices(blocks * kBase + 1, kBase, 64);
         EXPECT_EQ(ragged.block_size, kBase) << "blocks=" << blocks;
-        EXPECT_EQ(ragged.count, blocks + 1) << "blocks=" << blocks;
+        EXPECT_EQ(ragged.count, blocks) << "blocks=" << blocks;
     }
+}
+
+// A tail under a quarter block joins the slice before it: one work request
+// and one completion saved, and the request still spread over as many
+// slices as its size deserves. Reducing the count before choosing the block
+// -- what this used to do -- would round the block up to 128 KB instead,
+// which both halves the slices and leaves the 8 KB tail on its own anyway.
+TEST(RdmaSlicePlanTest, AShortTailJoinsTheSliceBeforeIt) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 8192;  // 520 KB
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);  // not widened
+    EXPECT_EQ(plan.count, 8u);          // not 9, and not 5
+
+    const auto lengths = walkPlan(plan, length);
+    ASSERT_EQ(lengths.size(), 8u);
+    EXPECT_EQ(lengths.back(), kBase + 8192);
+    for (size_t i = 0; i + 1 < lengths.size(); ++i)
+        EXPECT_EQ(lengths[i], kBase);
+}
+
+// A tail that is worth a slice of its own keeps one.
+TEST(RdmaSlicePlanTest, ALongTailKeepsItsOwnSlice) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + kBase / 2;  // half a block over
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);
+    EXPECT_EQ(plan.count, 9u);
+    EXPECT_EQ(walkPlan(plan, length).back(), kBase / 2);
+}
+
+// The ratio is the whole policy, so a caller can turn folding off.
+TEST(RdmaSlicePlanTest, AZeroRatioNeverFolds) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 1;
+
+    const auto folded = planRdmaSlices(length, kBase, 64);
+    const auto plain = planRdmaSlices(length, kBase, 64, /*merge_ratio=*/0.0);
+    EXPECT_EQ(folded.count, 8u);
+    EXPECT_EQ(plain.count, 9u);
+    EXPECT_EQ(walkPlan(plain, length).back(), 1u);
+}
+
+// Folding never empties the plan: two slices whose tail is short become one
+// slice holding everything, not zero.
+TEST(RdmaSlicePlanTest, FoldingNeverDropsTheLastSlice) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(kBase + 1, kBase, 64);
+    EXPECT_EQ(plan.count, 1u);
+    EXPECT_EQ(walkPlan(plan, kBase + 1).front(), kBase + 1);
 }
 
 // The regression: a 10 MB read asks for 64 slices of 160 KB, rounded up to

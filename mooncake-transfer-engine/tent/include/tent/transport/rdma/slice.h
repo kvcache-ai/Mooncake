@@ -41,7 +41,10 @@ struct RdmaSliceList {
     int num_slices = 0;
 };
 
-// `count` slices of `block_size` bytes, the last holding what remains.
+// `count` slices: the first count - 1 of `block_size` bytes and the last
+// holding what remains, which is a short tail folded in when one was worth
+// folding -- so up to `block_size` more than a block, never less than one
+// byte.
 struct RdmaSlicePlan {
     uint64_t block_size = 0;
     uint64_t count = 0;
@@ -51,11 +54,21 @@ struct RdmaSlicePlan {
 // `base_block` bytes. Rounding the block up covers the request in fewer
 // slices than were asked for, so the count comes from the block and not the
 // other way round: an empty slice would still cost a work request, a CQE, a
-// path selection and a completion. Zero length keeps one slice -- task
-// accounting counts slices, and a task with none never reaches a terminal
-// status.
+// path selection and a completion.
+//
+// A last slice shorter than `merge_ratio` of a block is given to the slice
+// before it instead of being posted on its own, trading a fraction of a
+// block of extra work on that one slice for a work request, a CQE and a
+// completion. This has to happen after the block is chosen: asking for one
+// slice fewer up front only makes the block round up to the next whole one,
+// which leaves the short tail as its own slice anyway and spreads the
+// request over half as many slices. A ratio of 0 never folds.
+//
+// Zero length keeps one slice -- task accounting counts slices, and a task
+// with none never reaches a terminal status.
 inline RdmaSlicePlan planRdmaSlices(uint64_t length, uint64_t base_block,
-                                    uint64_t max_slices) {
+                                    uint64_t max_slices,
+                                    double merge_ratio = 0.25) {
     if (base_block == 0) base_block = 1;
     if (max_slices == 0) max_slices = 1;
     if (length == 0) return {base_block, 1};
@@ -68,7 +81,12 @@ inline RdmaSlicePlan planRdmaSlices(uint64_t length, uint64_t base_block,
                                     ? per_slice
                                     : (per_slice / base_block + 1) * base_block;
 
-    return {block_size, (length + block_size - 1) / block_size};
+    count = (length + block_size - 1) / block_size;
+    if (count > 1) {
+        const uint64_t tail = length - (count - 1) * block_size;
+        if (static_cast<double>(tail) < merge_ratio * block_size) --count;
+    }
+    return {block_size, count};
 }
 
 // Forward declarations
