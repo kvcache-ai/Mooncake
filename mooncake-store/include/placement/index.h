@@ -3,6 +3,7 @@
 #include <array>
 #include <boost/container/flat_set.hpp>
 #include <boost/container/flat_map.hpp>
+#include <cassert>
 #include <cstddef>
 #include <functional>
 #include <map>
@@ -71,7 +72,9 @@ class PlacementIndex final {
 
    private:
     static constexpr size_t KindIndex(AllocationCandidateKind kind) noexcept {
-        return static_cast<size_t>(kind);
+        const auto index = static_cast<size_t>(kind);
+        assert(index < kAllocationCandidateKindCount);
+        return index;
     }
 
     void AddHostMember(std::string_view host_id, std::string_view segment_name);

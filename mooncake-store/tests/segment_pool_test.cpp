@@ -637,6 +637,62 @@ TEST(SegmentPoolTest, StaleGracefulUnmountCannotFinalizeNewMount) {
     EXPECT_EQ(std::move(*current).Finalize(access), ErrorCode::OK);
 }
 
+TEST(SegmentPoolTest, UnmountCannotEraseRegionOwnedByAnotherClient) {
+    for (bool graceful : {false, true}) {
+        SegmentPool pool(Drivers());
+        const UUID client = generate_uuid();
+        const UUID new_client = generate_uuid();
+        auto segment = MakeSegment(0, "unmount-new-owner");
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        auto remount = [&] {
+            access.Clear();
+            ASSERT_EQ(access.MountSegment(segment, new_client), ErrorCode::OK);
+        };
+        if (graceful) {
+            auto stale = access.PrepareGracefulUnmount(segment.id, client);
+            ASSERT_TRUE(stale.has_value());
+            remount();
+            EXPECT_EQ(std::move(*stale).Finalize(access),
+                      ErrorCode::INVALID_PARAMS);
+        } else {
+            auto stale = access.PrepareUnmount(segment.id, client);
+            ASSERT_TRUE(stale.has_value());
+            remount();
+            EXPECT_EQ(std::move(*stale).Commit(access),
+                      ErrorCode::INVALID_PARAMS);
+        }
+        const auto* mounted = access.Catalog().Find(segment.id);
+        ASSERT_NE(mounted, nullptr);
+        EXPECT_EQ(mounted->client_id, new_client);
+        EXPECT_EQ(mounted->status, SegmentStatus::OK);
+        auto current = access.PrepareUnmount(segment.id, new_client);
+        ASSERT_TRUE(current.has_value());
+        EXPECT_EQ(std::move(*current).Commit(access), ErrorCode::OK);
+    }
+}
+
+TEST(SegmentPoolTest, GracefulUnmountCannotFinalizeUnexpectedStatus) {
+    for (auto status : {SegmentStatus::OK, SegmentStatus::DRAINING}) {
+        SegmentPool pool(Drivers());
+        const UUID client = generate_uuid();
+        auto segment = MakeSegment(0, "graceful-status-changed");
+        auto access = pool.AcquireWriteAccess();
+        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        auto transaction = access.PrepareGracefulUnmount(segment.id, client);
+        ASSERT_TRUE(transaction.has_value());
+        ASSERT_EQ(access.SetSegmentStatusByName(segment.name, status),
+                  ErrorCode::OK);
+        EXPECT_EQ(std::move(*transaction).Finalize(access),
+                  ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
+        EXPECT_EQ(access.Catalog().Find(segment.id)->status, status);
+        auto current = access.PrepareUnmount(segment.id, client);
+        ASSERT_TRUE(current.has_value());
+        EXPECT_EQ(std::move(*current).Commit(access), ErrorCode::OK);
+    }
+}
+
 TEST(SegmentPoolTest, StaleGracefulUnmountCannotFinalizeNewDrain) {
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();

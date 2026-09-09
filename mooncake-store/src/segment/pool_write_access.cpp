@@ -157,13 +157,16 @@ ErrorCode SegmentPool::WriteAccess::EraseUnmountedRegion(
     if (mounted == nullptr) {
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
-    if (mounted->generation != generation) {
+    if (mounted->client_id != client_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (mounted->status != expected_status ||
+        mounted->generation != generation) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     const MountedRegion record = *mounted;
     RegionDriver* driver = segment_pool_.GetDriver(record.kind);
-    if (record.client_id != client_id || record.status != expected_status ||
-        !driver || !driver->GetResource(segment_id)) {
+    if (!driver || !driver->GetResource(segment_id)) {
         return ErrorCode::INTERNAL_ERROR;
     }
     // Resource existence was validated above. Erase is the commit point; all
