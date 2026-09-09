@@ -163,10 +163,13 @@ add_store_test(dfs_posix_test dfs_posix_test.cpp)
 add_store_test(distributed_storage_config_test
                distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
-add_test(NAME dfs_batch_read_checksum_test
-         COMMAND dfs_sync_client_test
-                 --gtest_filter=DfsSyncClientTest.BatchGetVerifiesDfsChecksum)
-set_tests_properties(dfs_batch_read_checksum_test
+add_test(
+  NAME dfs_read_checksum_test
+  COMMAND
+    dfs_sync_client_test
+    "--gtest_filter=DfsSyncClientTest.BatchGetVerifiesDfsChecksum:DfsSyncClientTest.GetVerifiesDfsChecksumAndRecordsError"
+)
+set_tests_properties(dfs_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)

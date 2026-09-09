@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "client_service.h"
+#include "environ.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -333,8 +334,7 @@ TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
 }
 
 TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
-    const char* checksum_enabled = std::getenv("MOONCAKE_STORE_CHECKSUM");
-    if (checksum_enabled == nullptr || std::string(checksum_enabled) != "1") {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 
@@ -362,8 +362,7 @@ TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
 }
 
 TEST_F(DfsSyncClientTest, GetVerifiesDfsChecksumAndRecordsError) {
-    const char* checksum_enabled = std::getenv("MOONCAKE_STORE_CHECKSUM");
-    if (checksum_enabled == nullptr || std::string(checksum_enabled) != "1") {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
     auto* metric = writer_->GetDfsMetricPtr();
