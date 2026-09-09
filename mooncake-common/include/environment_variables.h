@@ -50,6 +50,12 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct CxlSegmentEnvironmentVariables {
+    // Keep the raw string so an unset value remains distinguishable from a
+    // present but invalid value, which the legacy path resolves to zero.
+    MC_DEFINE_ENV_VAR(std::string, MC_CXL_DEV_SIZE);
+};
+
 struct ClientNumaEnvironmentVariables {
     // Keep the raw string to preserve the legacy strtol syntax and warning
     // behavior.

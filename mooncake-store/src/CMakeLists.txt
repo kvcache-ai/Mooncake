@@ -108,6 +108,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/file_storage_config.cpp
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
+    config/cxl_segment_config.cpp
     config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
     config/nof_register_config.cpp
