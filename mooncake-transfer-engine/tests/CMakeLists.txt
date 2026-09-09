@@ -23,6 +23,11 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CC)
     PRIVATE adaptive_congestion_control_core gtest gtest_main)
   add_test(NAME adaptive_congestion_control_config_test
            COMMAND adaptive_congestion_control_config_test)
+
+  add_executable(adaptive_congestion_control_benchmark
+                 ${WORKSPACE}/adaptive_congestion_control_benchmark.cpp)
+  target_link_libraries(adaptive_congestion_control_benchmark
+                        PRIVATE adaptive_congestion_control_core)
 endif()
 
 if(USE_HIP)
