@@ -135,6 +135,12 @@ class CapabilityDrivenStandbyController final : public StandbyController {
 
         if (config_.enable_oplog_snapshot) {
             try {
+                if (!capabilities_.has_oplog_following ||
+                    config_.snapshot_chunk_object_count == 0) {
+                    throw std::invalid_argument(
+                        "batch snapshot requires etcd OpLog and positive chunk "
+                        "count");
+                }
                 batch_backend_ = std::make_unique<EtcdHaKvBackend>();
                 auto type = ParseSnapshotObjectStoreType(
                     config_.snapshot_object_store_type);
@@ -162,9 +168,9 @@ class CapabilityDrivenStandbyController final : public StandbyController {
                             .clock = {},
                         });
             } catch (const std::exception& e) {
-                dependency_init_error_ = ErrorCode::INVALID_PARAMS;
-                LOG(ERROR) << "Failed to initialize batch OpLog snapshot: "
-                           << e.what();
+                throw std::runtime_error(
+                    std::string("Failed to initialize batch OpLog snapshot: ") +
+                    e.what());
             }
         }
 
@@ -187,9 +193,10 @@ class CapabilityDrivenStandbyController final : public StandbyController {
     }
 
     ~CapabilityDrivenStandbyController() override {
-        batch_oplog_snapshot_coordinator_.reset();
         standby_service_->SetSyncStatusCallback({});
         standby_service_->Stop();
+        batch_oplog_snapshot_coordinator_.reset();
+        standby_service_.reset();
     }
 
     ErrorCode StartStandby(
@@ -231,7 +238,14 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         if (err == ErrorCode::OK) {
             if (batch_oplog_snapshot_coordinator_) {
-                batch_oplog_snapshot_coordinator_->Start();
+                try {
+                    batch_oplog_snapshot_coordinator_->Start();
+                } catch (const std::exception& error) {
+                    LOG(ERROR)
+                        << "Snapshot worker start failed: " << error.what();
+                    StopStandby();
+                    return ErrorCode::INTERNAL_ERROR;
+                }
             }
             NotifyRuntimeStateIfChanged();
         }
