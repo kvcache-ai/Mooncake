@@ -165,6 +165,7 @@ def test_release_invokes_root_backend_and_restores_metadata(
         assert calls[-1][0] == "bash"
     assert calls[0][1:4] == ["-m", "pip", "install"]
     assert "auditwheel" in calls[0] and "patchelf" in calls[0]
+    assert "wheel>=0.45.1" in calls[0]
     assert calls[1][4:] == tomllib.loads(PROJECT_TEXT)["build-system"]["requires"]
     assert metadata.read_text() == PROJECT_TEXT
 
@@ -260,6 +261,9 @@ def test_repair_keeps_cuda_payload_out_of_auditwheel(tmp_path):
     payload = b"CUDA fatbin: must remain byte-identical"
     (package / "mooncake/libmooncake_ep_device.so").write_bytes(payload)
     (package / "mooncake/__init__.py").write_text("")
+    executable = package / "mooncake/mooncake_master"
+    executable.write_text("#!/bin/sh\necho smoke-test\n")
+    executable.chmod(0o755)
     metadata = package / "mooncake_transfer_engine-0.0.0.dist-info"
     metadata.mkdir()
     (metadata / "METADATA").write_text(
@@ -287,6 +291,7 @@ def test_repair_keeps_cuda_payload_out_of_auditwheel(tmp_path):
         "    with zipfile.ZipFile(wheel) as archive:\n"
         "        assert not any('device.so' in name for name in archive.namelist())\n"
         "    assert 'libmooncake_ep_device.so*' in sys.argv\n"
+        "    assert '/opt/conda/lib' in os.environ['LD_LIBRARY_PATH'].split(':')\n"
         "    shutil.copy(wheel, sys.argv[sys.argv.index('-w') + 1])\n"
         "else:\n"
         f"    os.execv({sys.executable!r}, [{sys.executable!r}, *sys.argv[1:]])\n"
@@ -309,6 +314,7 @@ def test_repair_keeps_cuda_payload_out_of_auditwheel(tmp_path):
     assert len(wheels) == 1
     with zipfile.ZipFile(wheels[0]) as archive:
         assert archive.read("mooncake/libmooncake_ep_device.so") == payload
+        assert archive.getinfo("mooncake/mooncake_master").external_attr >> 16 & 0o111
     subprocess.run(
         [
             sys.executable,
@@ -321,3 +327,33 @@ def test_repair_keeps_cuda_payload_out_of_auditwheel(tmp_path):
         ],
         check=True,
     )
+    installed = tmp_path / "installed"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(installed),
+            str(wheels[0]),
+            "--platform",
+            "linux_x86_64",
+            "--python-version",
+            "3.10",
+            "--implementation",
+            "cp",
+            "--abi",
+            "cp310",
+            "--only-binary=:all:",
+        ],
+        check=True,
+    )
+    result = subprocess.run(
+        [str(installed / "mooncake/mooncake_master")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert result.stdout == "smoke-test\n"

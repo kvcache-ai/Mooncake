@@ -178,7 +178,8 @@ def main() -> None:
             "pip",
             "install",
             "build",
-            "wheel",
+            # Older wheel unpack drops executable permissions (Ubuntu ships 0.37.1).
+            "wheel>=0.45.1",
             "auditwheel",
             "patchelf",
             'tomli; python_version < "3.11"',

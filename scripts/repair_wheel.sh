@@ -31,7 +31,10 @@ for staged in "$BUILD_DIR"/ep_pg_staging/*.so; do
     fi
     mv "$artifact" "$CUDA_EP_STAGING_DIR/"
 done
-export LD_LIBRARY_PATH="$CUDA_EP_STAGING_DIR:$BUILD_DIR/mooncake-common:$BUILD_DIR/mooncake-common/etcd:$BUILD_DIR/mooncake-common/k8s-lease:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+# CMake can link against Conda libraries in the PyTorch manylinux images (e.g.
+# yaml-cpp). Installation replaces the build RPATH with $ORIGIN, so auditwheel
+# needs that prefix explicitly to locate and vendor those dependencies.
+export LD_LIBRARY_PATH="$CUDA_EP_STAGING_DIR:$BUILD_DIR/mooncake-common:$BUILD_DIR/mooncake-common/etcd:$BUILD_DIR/mooncake-common/k8s-lease:/usr/local/lib:${LD_LIBRARY_PATH:-}:/opt/conda/lib"
 
 if [ "$NPU_BUILD" = "1" ]; then
     find "$PACKAGE_DIR/mooncake" -name '*.so' -exec strip --strip-unneeded {} \;
