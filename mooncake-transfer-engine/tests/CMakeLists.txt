@@ -8,6 +8,13 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CC)
                                 gtest_main)
   add_test(NAME adaptive_congestion_control_test
            COMMAND adaptive_congestion_control_test)
+
+  add_executable(rdma_error_classifier_test
+                 ${WORKSPACE}/rdma_error_classifier_test.cpp)
+  target_link_libraries(rdma_error_classifier_test
+                        PRIVATE adaptive_congestion_control_core gtest
+                                gtest_main)
+  add_test(NAME rdma_error_classifier_test COMMAND rdma_error_classifier_test)
 endif()
 
 if(USE_HIP)
