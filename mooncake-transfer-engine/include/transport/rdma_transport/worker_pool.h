@@ -116,6 +116,11 @@ class WorkerPool {
                             RdmaEndPoint *endpoint = nullptr);
 
     bool tryHandoffToAnotherLocalWorker(Transport::Slice *slice);
+    bool selectAvailablePeerRailAlternative(
+        RdmaTransport::SegmentDesc *peer_segment_desc, int buffer_id,
+        int selected_device_id, uint64_t selection_seed, int &device_id,
+        std::string &peer_nic_path);
+    static uint64_t peerRailSelectionSeed(const Transport::Slice *slice);
 
     // Only direct local completion errors charge the context breaker.
     // Submit-side all-rails-unavailable failures remain peer/rail scoped.

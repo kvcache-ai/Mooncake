@@ -399,32 +399,16 @@ int WorkerPool::submitPostSend(
 
         // If selected rail is paused, try alternative devices
         if (!isRailAvailable(peer_nic_path)) {
-            bool found = false;
-            for (size_t alt_dev_id = 0;
-                 alt_dev_id < peer_segment_desc->devices.size(); ++alt_dev_id) {
-                if (alt_dev_id == (size_t)device_id ||
-                    alt_dev_id >=
-                        peer_segment_desc->buffers[buffer_id].rkey.size()) {
-                    continue;
-                }
-                auto alt_path =
-                    MakeNicPath(peer_segment_desc->nicPathServerName(),
-                                peer_segment_desc->devices[alt_dev_id].name);
-                if (isRailAvailable(alt_path)) {
-                    device_id = alt_dev_id;
-                    slice->rdma.dest_rkey =
-                        peer_segment_desc->buffers[buffer_id].rkey[device_id];
-                    peer_nic_path = alt_path;
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
+            if (!selectAvailablePeerRailAlternative(
+                    peer_segment_desc.get(), buffer_id, device_id,
+                    peerRailSelectionSeed(slice), device_id, peer_nic_path)) {
                 slice->peer_nic_path = peer_nic_path;
                 delayRedispatch(slice, false, "all peer rails unavailable");
                 submitted_slice_count++;
                 continue;
             }
+            slice->rdma.dest_rkey =
+                peer_segment_desc->buffers[buffer_id].rkey[device_id];
         }
 
         slice->peer_nic_path = peer_nic_path;
@@ -1142,29 +1126,10 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                 MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             if (!isRailAvailable(peer_nic_path)) {
-                bool found = false;
-                for (size_t alt_dev_id = 0;
-                     alt_dev_id < peer_segment_desc->devices.size();
-                     ++alt_dev_id) {
-                    if (alt_dev_id == (size_t)device_id ||
-                        alt_dev_id >=
-                            peer_segment_desc->buffers[buffer_id].rkey.size()) {
-                        continue;
-                    }
-                    auto alt_path = MakeNicPath(
-                        peer_segment_desc->nicPathServerName(),
-                        peer_segment_desc->devices[alt_dev_id].name);
-                    if (isRailAvailable(alt_path)) {
-                        device_id = alt_dev_id;
-                        slice->rdma.dest_rkey =
-                            peer_segment_desc->buffers[buffer_id]
-                                .rkey[device_id];
-                        peer_nic_path = alt_path;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
+                if (!selectAvailablePeerRailAlternative(
+                        peer_segment_desc.get(), buffer_id, device_id,
+                        peerRailSelectionSeed(slice), device_id,
+                        peer_nic_path)) {
                     LOG(ERROR)
                         << "Worker: Delaying redispatch because all peer "
                            "rails are paused for target "
@@ -1175,6 +1140,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
                     delayRedispatch(slice, false, "all peer rails paused");
                     continue;
                 }
+                slice->rdma.dest_rkey =
+                    peer_segment_desc->buffers[buffer_id].rkey[device_id];
             }
             slice->peer_nic_path = peer_nic_path;
             if (globalConfig().log_rdma_slice_affinity) {
@@ -1520,6 +1487,8 @@ void WorkerPool::maybeActivateRecoveredContext() {
 
 bool WorkerPool::hasAvailablePeerRailAlternative(
     Transport::Slice *slice, const std::string &failed_peer_path) {
+    if (!slice) return false;
+
     auto peer_segment_desc =
         context_.engine().meta()->getSegmentDescByID(slice->target_id, false);
     if (!peer_segment_desc) return false;
@@ -1552,6 +1521,53 @@ bool WorkerPool::hasAvailablePeerRailAlternative(
     return false;
 }
 
+bool WorkerPool::selectAvailablePeerRailAlternative(
+    RdmaTransport::SegmentDesc *peer_segment_desc, int buffer_id,
+    int selected_device_id, uint64_t selection_seed, int &device_id,
+    std::string &peer_nic_path) {
+    if (!peer_segment_desc || buffer_id < 0 ||
+        buffer_id >= static_cast<int>(peer_segment_desc->buffers.size()) ||
+        peer_segment_desc->devices.empty()) {
+        return false;
+    }
+
+    const auto &rkeys = peer_segment_desc->buffers[buffer_id].rkey;
+    const size_t device_count = peer_segment_desc->devices.size();
+    const size_t start = selection_seed % device_count;
+    const auto server_name = peer_segment_desc->nicPathServerName();
+
+    for (size_t checked = 0; checked < device_count; ++checked) {
+        const size_t alt_dev_id = (start + checked) % device_count;
+        if (alt_dev_id == static_cast<size_t>(selected_device_id) ||
+            alt_dev_id >= rkeys.size()) {
+            continue;
+        }
+
+        auto alt_path = MakeNicPath(
+            server_name, peer_segment_desc->devices[alt_dev_id].name);
+        if (!isRailAvailable(alt_path)) continue;
+
+        device_id = static_cast<int>(alt_dev_id);
+        peer_nic_path = std::move(alt_path);
+        return true;
+    }
+
+    return false;
+}
+
+uint64_t WorkerPool::peerRailSelectionSeed(const Transport::Slice *slice) {
+    if (!slice) return 0;
+
+    uint64_t seed = static_cast<uint64_t>(slice->target_id);
+    seed ^= slice->rdma.dest_addr + 0x9e3779b97f4a7c15ull + (seed << 6) +
+            (seed >> 2);
+    seed ^= static_cast<uint64_t>(slice->length) + 0x9e3779b97f4a7c15ull +
+            (seed << 6) + (seed >> 2);
+    seed ^= static_cast<uint64_t>(slice->rdma.retry_cnt) +
+            0x9e3779b97f4a7c15ull + (seed << 6) + (seed >> 2);
+    return seed;
+}
+
 void WorkerPool::refreshPublishedLocalTopology() {
     std::lock_guard<std::mutex> guard(context_.engine().local_desc_lock_);
     auto desc =
@@ -1561,6 +1577,7 @@ void WorkerPool::refreshPublishedLocalTopology() {
     auto updated_desc = std::make_shared<RdmaTransport::SegmentDesc>(*desc);
     updated_desc->topology = *context_.engine().local_topology_;
     for (const auto &context : context_.engine().context_list_) {
+        if (!context) continue;
         if (context->active()) continue;
         updated_desc->topology.disableDevice(context->deviceName());
     }
