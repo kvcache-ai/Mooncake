@@ -29,11 +29,10 @@ from source, enable the EP/PG extensions with:
 cmake .. -DWITH_EP=ON
 ```
 
-The extensions are compiled against a specific PyTorch version. At import time,
-`mooncake.pg` and `mooncake.ep` load version-suffixed extension modules that
-match the active `torch.__version__`. If the current PyTorch version does not
-match a built extension, import will fail with a message such as
-`Mooncake PG was not built against torch==...`.
+`mooncake.pg` compiles its Torch-facing adapter at first import and caches the
+result locally. The wheel provides the native PG core/device libraries and the
+adapter source bundle; the runtime environment provides PyTorch, a CUDA toolkit
+with `nvcc`, and Ninja.
 
 ## Mooncake PG quick start
 
