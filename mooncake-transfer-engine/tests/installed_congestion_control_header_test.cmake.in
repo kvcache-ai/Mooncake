@@ -1,0 +1,32 @@
+set(prefix
+    "@CMAKE_CURRENT_BINARY_DIR@/installed_congestion_control_header_prefix")
+file(REMOVE_RECURSE "${prefix}")
+
+execute_process(
+  COMMAND "@CMAKE_COMMAND@" --install "@CMAKE_BINARY_DIR@" --prefix "${prefix}"
+          --component mooncake_transfer_engine_headers
+  RESULT_VARIABLE install_result
+  OUTPUT_VARIABLE install_output
+  ERROR_VARIABLE install_error)
+if(NOT install_result EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Installing the congestion-control build failed:\n${install_output}${install_error}"
+  )
+endif()
+
+execute_process(
+  COMMAND
+    "@CMAKE_CXX_COMPILER@" -std=c++20
+    -DMOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=1 -I${prefix}/include
+    -fsyntax-only
+    "@CMAKE_CURRENT_SOURCE_DIR@/installed_congestion_control_header_test.cpp"
+  RESULT_VARIABLE compile_result
+  OUTPUT_VARIABLE compile_output
+  ERROR_VARIABLE compile_error)
+if(NOT compile_result EQUAL 0)
+  message(
+    FATAL_ERROR
+      "Installed congestion-control headers are not self-contained:\n${compile_output}${compile_error}"
+  )
+endif()
