@@ -478,9 +478,10 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: "
                                    << result;
+                        // Teardown order: unmap, release, then free VA range.
                         cuMemUnmap((CUdeviceptr)shm_addr, entry.length);
-                        cuMemAddressFree((CUdeviceptr)shm_addr, entry.length);
                         cuMemRelease(handle);
+                        cuMemAddressFree((CUdeviceptr)shm_addr, entry.length);
                         return -1;
                     }
                     // Mapping holds a reference; release imported handle to
@@ -598,9 +599,10 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc, device_count);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemSetAccess failed: " << result;
+        // Teardown order: unmap, release, then free VA range.
         cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
         cuMemRelease(handle);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
         return nullptr;
     }
     // Mapping holds a reference; release the handle to avoid ref_count leak.
@@ -623,9 +625,12 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
     }
     result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
+        // Teardown order: unmap, release, then free VA range.
         cuMemUnmap((CUdeviceptr)ptr, size);
+        cuMemRelease(handle);
         cuMemAddressFree((CUdeviceptr)ptr, size);
+    } else {
+        cuMemRelease(handle);
     }
-    cuMemRelease(handle);
 }
 }  // namespace mooncake
