@@ -236,6 +236,7 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
     security_token_ =
         Environ::GetString("MOONCAKE_OSS_SECURITY_TOKEN",
                            Environ::GetString("OSS_SESSION_TOKEN", ""));
+    boost::algorithm::trim(security_token_);
     path_style_ = Environ::GetBool("MOONCAKE_OSS_PATH_STYLE", false);
     anonymous_ = Environ::GetBool("MOONCAKE_OSS_ANONYMOUS", false);
 

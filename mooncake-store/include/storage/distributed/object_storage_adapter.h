@@ -55,7 +55,12 @@ class ObjectStorageAdapter {
 
     // Performs an end-to-end service check after Init(). Implementations may
     // create a temporary object but must make a best effort to clean it up.
-    virtual tl::expected<void, ErrorCode> CheckHealth() = 0;
+    // Optional for source compatibility. Enabling health checks on an adapter
+    // without an override fails explicitly instead of reporting a false
+    // success.
+    virtual tl::expected<void, ErrorCode> CheckHealth() {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
     virtual const char* GetName() const = 0;
 };
 
