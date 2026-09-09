@@ -113,6 +113,11 @@ struct RpcTimeoutEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_RPC_CONNECT_TIMEOUT_MS);
 };
 
+struct RpcProtocolEnvironmentVariables {
+    // Preserve the legacy exact, case-sensitive "rdma" token check.
+    MC_DEFINE_ENV_VAR(std::string, MC_RPC_PROTOCOL);
+};
+
 struct LocalFileSnapshotEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
 };
