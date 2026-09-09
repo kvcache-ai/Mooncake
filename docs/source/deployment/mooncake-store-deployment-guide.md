@@ -612,6 +612,7 @@ mooncake_master \
 | `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
 | `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type: `file` or `etcd` when built with `STORE_USE_ETCD=ON` |
 | `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path; for `etcd`, the endpoints string |
+| `--tenant_eviction_high_watermark_ratio` | `0.90` | Usage ratio of a tenant's own effective quota that triggers background eviction for that tenant; `0` disables it |
 
 ### High Availability
 

@@ -135,6 +135,37 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         return builder.build();
     }
 
+    // Config for the tenant-scoped eviction watermark. Two settings here are
+    // load-bearing rather than incidental:
+    //   default_kv_lease_ttl(0) -- EvictTenantMemoryForQuota skips any object
+    //     whose lease is still live, so with the 10 s default the pass under
+    //     test would be a no-op and the assertions would pass for the wrong
+    //     reason.
+    //   eviction_high_watermark_ratio(1.0) -- keeps the POOL-wide evictor out
+    //     of the way. The whole point of the tenant watermark is that it fires
+    //     while the pool is nowhere near its own, so the test must not let the
+    //     pool-level path account for the bytes freed.
+    // A nullopt ratio leaves the builder default in place, which is how the
+    // "on out of the box" behaviour is exercised.
+    MasterServiceConfig MakeTenantWatermarkConfig(
+        const std::map<TenantId, uint64_t>& tenant_quotas,
+        std::optional<double> tenant_high_watermark_ratio,
+        double eviction_ratio = 0.05) {
+        auto builder =
+            MasterServiceConfig::builder()
+                .set_enable_multi_tenants(true)
+                .set_tenant_quota_connector_type("file")
+                .set_tenant_quota_connector_uri(WritePolicyFile(tenant_quotas))
+                .set_default_kv_lease_ttl(0)
+                .set_eviction_ratio(eviction_ratio)
+                .set_eviction_high_watermark_ratio(1.0);
+        if (tenant_high_watermark_ratio.has_value()) {
+            builder.set_tenant_eviction_high_watermark_ratio(
+                *tenant_high_watermark_ratio);
+        }
+        return builder.build();
+    }
+
     UUID MountSegment(MasterService& service, size_t size = 4096,
                       std::string name = "quota_segment") {
         Segment segment;
@@ -184,6 +215,13 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         auto end =
             service.PutEnd(client_id, key, tenant_id, ReplicaType::MEMORY);
         ASSERT_TRUE(end.has_value()) << toString(end.error());
+    }
+
+    // MasterService befriends this fixture, but TEST_F bodies are a derived
+    // class and friendship does not inherit -- so private access has to go
+    // through a fixture method, as it does for the helpers around this one.
+    void RunTenantEvictionPass(MasterService& service) {
+        service.EvictTenantsOverWatermark();
     }
 
     TenantQuotaSnapshot Snapshot(MasterService& service,
@@ -1217,6 +1255,126 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+// --- Tenant-scoped eviction watermark -------------------------------------
+//
+// This pass is the only thing that makes room for a tenant. A tenant whose
+// effective quota sits at or below the pool-wide eviction_high_watermark_ratio
+// reaches its own ceiling before the pool crosses the pool-wide watermark:
+// EvictionThreadFunc gates on a pool-global used_ratio (strictly greater), and
+// the quota path cannot arm it either -- need_mem_eviction_ is only set next to
+// inc_put_start_alloc_failures(), and a quota rejection returns before
+// allocation is attempted. Admission itself does not evict; it rejects with
+// TENANT_QUOTA_EXCEEDED and leaves the headroom to this pass.
+
+TEST_F(MasterServiceTenantQuotaTest, TenantEvictionWatermarkDefaultsToOn) {
+    const TenantId tenant("tenant-a");
+    // No explicit ratio: the tenant watermark must default to the same 0.90 as
+    // the pool-wide one, so a multi-tenant master gets the evict-to-make-room
+    // contract without having to opt in.
+    ASSERT_DOUBLE_EQ(DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
+                     DEFAULT_EVICTION_HIGH_WATERMARK_RATIO);
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/std::nullopt,
+                                                    /*eviction_ratio=*/0.05));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    240);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 960u);  // 0.96 > 0.90
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_LE(Snapshot(service, tenant).charged_bytes, 850u)
+        << "the pass must run without an explicit watermark setting";
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkOfZeroDisablesThePass) {
+    const TenantId tenant("tenant-a");
+    // Watermark 0.0 == the pre-existing behaviour, and remains available as an
+    // opt-out.
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/0.0));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    240);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 960u);
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_EQ(Snapshot(service, tenant).charged_bytes, 960u)
+        << "the pass must not run when the watermark is 0";
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkLeavesTenantsBelowItAlone) {
+    const TenantId tenant("tenant-a");
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/0.9));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    200);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 800u);  // 0.80
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_EQ(Snapshot(service, tenant).charged_bytes, 800u);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkEvictsDownToTargetRatio) {
+    const TenantId tenant("tenant-a");
+    // watermark 0.9, eviction_ratio 0.05 -> evict down to 0.85 of the quota.
+    MasterService service(MakeTenantWatermarkConfig({{tenant, 1000}},
+                                                    /*watermark=*/0.9,
+                                                    /*eviction_ratio=*/0.05));
+    UUID client_id = MountSegment(service, /*size=*/4096);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "key-" + std::to_string(i), tenant,
+                    240);
+    }
+    ASSERT_EQ(Snapshot(service, tenant).charged_bytes, 960u);  // 0.96 > 0.90
+
+    RunTenantEvictionPass(service);
+
+    const uint64_t charged = Snapshot(service, tenant).charged_bytes;
+    EXPECT_LT(charged, 960u) << "tenant was over its watermark and not evicted";
+    EXPECT_LE(charged, 850u) << "must reach (watermark - eviction_ratio)";
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       TenantEvictionWatermarkOnlyTouchesTenantsOverIt) {
+    const TenantId hot("tenant-hot");
+    const TenantId cold("tenant-cold");
+    // Sum of requested (2000) is below capacity, so each tenant gets its
+    // literal quota rather than a proportional share.
+    MasterService service(MakeTenantWatermarkConfig({{hot, 1000}, {cold, 1000}},
+                                                    /*watermark=*/0.9));
+    UUID client_id = MountSegment(service, /*size=*/8192);
+
+    for (int i = 0; i < 4; ++i) {
+        PutComplete(service, client_id, "hot-" + std::to_string(i), hot, 240);
+        PutComplete(service, client_id, "cold-" + std::to_string(i), cold, 100);
+    }
+    ASSERT_EQ(Snapshot(service, hot).charged_bytes, 960u);   // 0.96
+    ASSERT_EQ(Snapshot(service, cold).charged_bytes, 400u);  // 0.40
+
+    RunTenantEvictionPass(service);
+
+    EXPECT_LE(Snapshot(service, hot).charged_bytes, 850u);
+    EXPECT_EQ(Snapshot(service, cold).charged_bytes, 400u)
+        << "a tenant under its own watermark must not pay for a noisy one";
 }
 
 }  // namespace mooncake::test

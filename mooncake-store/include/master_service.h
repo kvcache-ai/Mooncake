@@ -223,6 +223,14 @@ class MasterService {
     void RunDfsEvictionForTesting();
 
     /**
+     * @brief Test-only wrapper around EvictTenantsOverWatermark, the background
+     *        pass that drains any tenant over its own quota watermark. Lets a
+     *        test drive one pass synchronously instead of racing the periodic
+     *        eviction thread's 1 Hz tick.
+     */
+    void RunTenantEvictForTesting();
+
+    /**
      * @brief Enables the tenant-epoch bookkeeping that decides whether
      *        RemoveAll may publish `cleared`. Production turns this on from the
      *        publisher config; tests need it without a live ZMQ socket.
@@ -1037,6 +1045,12 @@ class MasterService {
     };
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
+
+    // Background pass: evict any tenant that is over its own watermark down to
+    // (watermark - eviction_ratio) of its effective quota. Called from
+    // EvictionThreadFunc, and a no-op unless multi-tenancy and
+    // tenant_eviction_high_watermark_ratio are both enabled.
+    void EvictTenantsOverWatermark();
 
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
@@ -2052,9 +2066,8 @@ class MasterService {
                                         const TenantId& tenant_id);
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const;
-    tl::expected<void, ErrorCode> ChargeTenantQuota(
-        TenantQuotaHandle account, uint64_t bytes,
-        uint64_t* deficit_bytes = nullptr);
+    tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,
+                                                    uint64_t bytes);
     void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
@@ -2150,7 +2163,6 @@ class MasterService {
         const std::string& group_id, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
-        uint64_t& quota_deficit_bytes,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -2279,6 +2291,11 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
+    // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
+    // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
+    // sufficient once quotas partition the pool.
+    const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
@@ -2287,6 +2304,12 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // The eviction thread wakes every 10 ms, but the tenant pass has to walk
+    // every registered tenant and lock every quota shard, so it is throttled
+    // rather than run on each tick. Quota pressure builds over seconds, not
+    // milliseconds, and admission still has its own synchronous fallback in
+    // between.
+    static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
