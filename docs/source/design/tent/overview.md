@@ -133,6 +133,12 @@ deadline-scheduling
 failover
 :::
 
+## Adaptive RDMA Congestion Control
+
+TENT and classic TE share an optional, default-off RDMA admission controller.
+See [Adaptive RDMA Congestion Control](../transfer-engine/adaptive-rdma-control.md)
+for startup settings, recovery semantics, rollback, and performance validation.
+
 ## TENT Testing
 
 :::{toctree}
