@@ -232,8 +232,8 @@ class ObjectMetadata {
         lease_ = std::move(lease);
     }
 
-    // Snapshot of the wired lease (null only for a singleton before its first
-    // read). Takes the same lock as the other lease accessors.
+    // Snapshot of the wired lease; never null (initialized at construction).
+    // Takes the same lock as the other lease accessors.
     std::shared_ptr<Lease> lease() const {
         SpinLocker locker(&lock);
         return lease_;

@@ -14,9 +14,7 @@
 
 #include "lease.h"
 #include "object_metadata.h"
-#include "replica.h"
 #include "tenant/object_entry_types.h"
-#include "types.h"
 
 namespace mooncake {
 namespace tenant {
