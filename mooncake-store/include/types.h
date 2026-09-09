@@ -91,9 +91,11 @@ static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 // Per-tenant eviction watermark, as a fraction of a tenant's own effective
-// quota. 0.0 disables it, which is the pre-existing behaviour: only the
-// pool-wide watermark above triggers background eviction.
-static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.0;
+// quota. Mirrors the pool-wide default above so that a tenant gets the same
+// evict-to-make-room contract the pool has; 0.0 disables the pass and restores
+// the pre-existing behaviour, where only the pool-wide watermark can trigger
+// background eviction. Inert unless enable_multi_tenants is set.
+static constexpr double DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds

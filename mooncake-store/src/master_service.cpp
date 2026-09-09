@@ -68,8 +68,6 @@ namespace mooncake {
 
 namespace {
 
-constexpr int kMaxTenantQuotaEvictionRetries = 2;
-
 // Upper bound on the number of keys MasterService::ClearStaleHandles cleans
 // up while holding one metadata shard's write lock. A mass client expiry
 // marks handles stale all over the table, and without a cap the sweep held
@@ -324,11 +322,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
                    << tenant_eviction_high_watermark_ratio_;
         throw std::invalid_argument(
             "Invalid tenant eviction high watermark ratio");
-    }
-    if (tenant_eviction_high_watermark_ratio_ > 0.0 && !enable_multi_tenants_) {
-        LOG(WARNING) << "tenant_eviction_high_watermark_ratio="
-                     << tenant_eviction_high_watermark_ratio_
-                     << " has no effect without enable_multi_tenants";
     }
 
     // Validate offload tuning knobs here (not only via gflags validator),
@@ -797,6 +790,8 @@ void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
 }
 
 void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
+
+void MasterService::RunTenantEvictForTesting() { EvictTenantsOverWatermark(); }
 
 void MasterService::SetKvTenantEpochTrackingForTesting(bool enabled) {
     kv_track_tenant_epochs_ = enabled;
@@ -1638,7 +1633,7 @@ TenantQuotaHandle MasterService::GetBoundTenantQuotaHandle(
 }
 
 tl::expected<void, ErrorCode> MasterService::ChargeTenantQuota(
-    TenantQuotaHandle account, uint64_t bytes, uint64_t* deficit_bytes) {
+    TenantQuotaHandle account, uint64_t bytes) {
     if (!enable_multi_tenants_) {
         return {};
     }
@@ -1648,13 +1643,7 @@ tl::expected<void, ErrorCode> MasterService::ChargeTenantQuota(
     }
     auto result = account->TryCharge(bytes);
     if (result) {
-        if (deficit_bytes != nullptr) {
-            *deficit_bytes = 0;
-        }
         return {};
-    }
-    if (deficit_bytes != nullptr) {
-        *deficit_bytes = result.error().deficit_bytes;
     }
     return tl::make_unexpected(
         result.error().error == TenantQuotaError::kTenantNotRegistered
@@ -4959,7 +4948,6 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::string& group_id, const TenantId& tenant_id,
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
-    uint64_t& quota_deficit_bytes,
     std::optional<std::chrono::system_clock::time_point>
         committed_soft_pin_timeout)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -4971,9 +4959,8 @@ auto MasterService::AllocateAndInsertMetadata(
 
     const uint64_t pending_quota_charge =
         RequestedMemoryQuotaCharge(value_length, config);
-    auto quota_result =
-        ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
-                          pending_quota_charge, &quota_deficit_bytes);
+    auto quota_result = ChargeTenantQuota(
+        GetBoundTenantQuotaHandle(tenant_state), pending_quota_charge);
     if (!quota_result) {
         return tl::make_unexpected(quota_result.error());
     }
@@ -5080,11 +5067,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     [[maybe_unused]] auto object_operation_lock =
         AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
-    uint64_t quota_deficit_bytes = 0;
-
-    auto attempt_once =
+    auto admit =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-        quota_deficit_bytes = 0;
         auto now = std::chrono::system_clock::now();
         {
             std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
@@ -5165,8 +5149,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             if (it == tenant_state.metadata.end()) {
                 return AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, config, writer_host_id,
-                    group_id, object_id.tenant_id, now, *soft_pin_request,
-                    quota_deficit_bytes);
+                    group_id, object_id.tenant_id, now, *soft_pin_request);
             }
             // Logically unreachable: the object-exists paths above always
             // return or erase the entry. Kept for -Wreturn-type.
@@ -5174,21 +5157,19 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
     };
 
-    for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
-         ++attempt) {
-        auto result = attempt_once();
-        if (result.has_value() ||
-            result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
-            return result;
-        }
-        if (attempt == kMaxTenantQuotaEvictionRetries) {
-            MasterMetricManager::instance().inc_tenant_quota_reject(
-                object_id.tenant_id.value(), "quota_exceeded");
-            return result;
-        }
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+    // Over-quota is rejected outright. Making room is the background pass's
+    // job (EvictTenantsOverWatermark), not the write path's: the same contract
+    // the pool has when enable_multi_tenants is false -- this write fails, the
+    // evictor builds headroom, the next one succeeds. Evicting inline instead
+    // put a scan of up to kNumShards shard write locks on admission, which
+    // every concurrent writer at the ceiling repeated for the same freed
+    // extent.
+    auto result = admit();
+    if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
+        MasterMetricManager::instance().inc_tenant_quota_reject(
+            object_id.tenant_id.value(), "quota_exceeded");
     }
-    return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+    return result;
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
@@ -5740,11 +5721,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
     [[maybe_unused]] auto object_operation_lock =
         AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
-    uint64_t quota_deficit_bytes = 0;
-
-    auto attempt_once =
+    auto admit =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-        quota_deficit_bytes = 0;
         auto now = std::chrono::system_clock::now();
         std::optional<std::chrono::system_clock::time_point>
             case_a_committed_soft_pin_timeout;
@@ -5906,7 +5884,6 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 return AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, config, writer_host_id,
                     group_id, object_id.tenant_id, now, *soft_pin_request,
-                    quota_deficit_bytes,
                     std::move(case_a_committed_soft_pin_timeout));
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
@@ -6037,8 +6014,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     replacement_pending_quota_charge =
                         RequestedMemoryQuotaCharge(slice_length, merged_config);
                     auto quota_result = ChargeTenantQuota(
-                        quota_account, replacement_pending_quota_charge,
-                        &quota_deficit_bytes);
+                        quota_account, replacement_pending_quota_charge);
                     if (!quota_result) {
                         return tl::make_unexpected(quota_result.error());
                     }
@@ -6107,7 +6083,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   shard, client_id, key, slice_length,
                                   merged_config, writer_host_id,
                                   existing_group_id, object_id.tenant_id, now,
-                                  *soft_pin_request, quota_deficit_bytes,
+                                  *soft_pin_request,
                                   std::move(committed_soft_pin_timeout));
                 if (!allocate_result) {
                     if (replacement_replicas.has_value()) {
@@ -6160,21 +6136,19 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         }
     };
 
-    for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
-         ++attempt) {
-        auto result = attempt_once();
-        if (result.has_value() ||
-            result.error() != ErrorCode::TENANT_QUOTA_EXCEEDED) {
-            return result;
-        }
-        if (attempt == kMaxTenantQuotaEvictionRetries) {
-            MasterMetricManager::instance().inc_tenant_quota_reject(
-                object_id.tenant_id.value(), "quota_exceeded");
-            return result;
-        }
-        EvictTenantMemoryForQuota(object_id.tenant_id, quota_deficit_bytes);
+    // Over-quota is rejected outright. Making room is the background pass's
+    // job (EvictTenantsOverWatermark), not the write path's: the same contract
+    // the pool has when enable_multi_tenants is false -- this write fails, the
+    // evictor builds headroom, the next one succeeds. Evicting inline instead
+    // put a scan of up to kNumShards shard write locks on admission, which
+    // every concurrent writer at the ceiling repeated for the same freed
+    // extent.
+    auto result = admit();
+    if (!result && result.error() == ErrorCode::TENANT_QUOTA_EXCEEDED) {
+        MasterMetricManager::instance().inc_tenant_quota_reject(
+            object_id.tenant_id.value(), "quota_exceeded");
     }
-    return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
+    return result;
 }
 
 auto MasterService::UpsertEnd(const UUID& client_id,
