@@ -135,6 +135,19 @@ class RdmaTransportTestPeer {
         workers.applyContextEvent(dev_id, context, event);
     }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    static adaptive_congestion_control::DomainState& enableCongestionControl(Workers& workers,
+                                                             int dev_id) {
+        workers.congestion_control_config_.mode = adaptive_congestion_control::Mode::kEnforce;
+        workers.congestion_control_devices_.clear();
+        for (int i = 0; i <= dev_id; ++i) {
+            workers.congestion_control_devices_.push_back(
+                std::make_unique<adaptive_congestion_control::DomainState>(workers.congestion_control_config_));
+        }
+        return *workers.congestion_control_devices_[dev_id];
+    }
+#endif
+
     // Runs the monitorThread() 1 Hz safety net for contexts whose
     // IBV_EVENT_PORT_ACTIVE never arrived, without starting any threads.
     static void resumePausedContexts(Workers& workers) {
@@ -1248,6 +1261,27 @@ TEST_F(RdmaContextEventTest, DeviceFatalMarksUnavailableRegardlessOfPort) {
     fire(IBV_EVENT_DEVICE_FATAL, otherPort());  // device-scoped: no port
     EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
 }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(RdmaContextEventTest, OtherPortFailureDoesNotBlockCongestionAdmission) {
+    auto& domain =
+        RdmaTransportTestPeer::enableCongestionControl(*workers_, kDev);
+    fire(IBV_EVENT_PORT_ERR, otherPort());
+    adaptive_congestion_control::controlTick(domain, 1);
+    adaptive_congestion_control::Permit permit;
+    adaptive_congestion_control::PathHandle path{&domain, nullptr,
+                                 adaptive_congestion_control::generation(domain), 0};
+    EXPECT_EQ(adaptive_congestion_control::tryAcquire(path, 64, permit),
+              adaptive_congestion_control::Decision::kAllow);
+    adaptive_congestion_control::complete(permit, adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                          adaptive_congestion_control::FailureScope::kOperation);
+
+    fire(IBV_EVENT_PORT_ERR, ourPort());
+    adaptive_congestion_control::controlTick(domain, 2);
+    EXPECT_EQ(adaptive_congestion_control::tryAcquire(path, 64, permit),
+              adaptive_congestion_control::Decision::kAvoid);
+}
+#endif
 
 TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
     fire(IBV_EVENT_CQ_ERR, ourPort());
