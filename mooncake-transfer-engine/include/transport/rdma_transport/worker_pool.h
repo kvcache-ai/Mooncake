@@ -68,6 +68,11 @@ class WorkerPool {
     void redispatch(std::vector<Transport::Slice *> &slice_list, int thread_id,
                     bool handoff_to_local_worker = false,
                     bool defer_local_redispatch = false);
+    void delayRedispatch(Transport::Slice *slice, bool handoff_to_local_worker,
+                         const char *reason);
+    void releaseReadyDelayedSlices(int thread_id);
+    bool hasDelayedSlices() const;
+    uint64_t nextDelayedSliceDueNs() const;
 
     void transferWorker(int thread_id);
 
@@ -88,6 +93,8 @@ class WorkerPool {
     void markRailFailed(const std::string &peer_nic_path,
                         bool immediate_pause = false);
     bool isRailAvailable(const std::string &peer_nic_path);
+    uint64_t peerRailPauseRemainingNs(const std::string &peer_nic_path,
+                                      uint64_t now);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);
@@ -156,6 +163,14 @@ class WorkerPool {
     // Rail state management: peer_nic_path -> RailState
     std::unordered_map<std::string, RailState> rail_states_;
     std::mutex rail_state_lock_;
+
+    struct DelayedSlice {
+        Transport::Slice *slice = nullptr;
+        uint64_t due_ns = 0;
+        bool handoff_to_local_worker = false;
+    };
+    mutable std::mutex delayed_slices_lock_;
+    std::vector<DelayedSlice> delayed_slices_;
 
     // Rail monitor configuration
     const static int kRailErrorThreshold = 5;  // Errors before pause
