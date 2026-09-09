@@ -11,7 +11,6 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "process_handler.h"
 #include "types.h"
-#include "utils.h"
 
 USE_engine_flags;
 FLAG_etcd_endpoints;

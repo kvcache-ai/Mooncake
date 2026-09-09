@@ -2,7 +2,7 @@
 
 #include "placement/index.h"
 #include "segment/catalog.h"
-#include "segment/resource_view.h"
+#include "segment/region_driver.h"
 
 namespace mooncake {
 
@@ -15,8 +15,11 @@ class SegmentPool;
 class SegmentPoolSnapshotView final {
    public:
     const RegionCatalog& Catalog() const;
-    RegionResourceReadView Resources() const;
-    PlacementReadView Placement() const;
+    std::shared_ptr<BufferAllocatorBase> GetAllocator(
+        const UUID& region_id) const;
+    std::optional<BufferAllocatorType> GetMemoryAllocatorType() const;
+    bool HasKind(RegionKind kind) const;
+    const PlacementIndex& Placement() const;
 
    private:
     explicit SegmentPoolSnapshotView(const SegmentPool* segment_pool)

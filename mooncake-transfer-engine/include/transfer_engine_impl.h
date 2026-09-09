@@ -263,7 +263,12 @@ class TransferEngineImpl {
     }
 
     Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
+        return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
+            // BatchID is pointer-derived. Remove side-table state before the
+            // descriptor is deleted and its address can be reused.
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            notifies_to_send_.erase(batch_id);
+        });
     }
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
@@ -359,16 +364,19 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // send notify
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            if (!notifies_to_send_.count(batch_id)) return result;
-            auto value = notifies_to_send_[batch_id];
-            auto rc = sendNotifyByID(value.first, value.second);
+            std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
+            {
+                RWSpinlock::WriteGuard guard(send_notifies_lock_);
+                auto notify = notifies_to_send_.find(batch_id);
+                if (notify == notifies_to_send_.end()) return result;
+                value = std::move(notify->second);
+                notifies_to_send_.erase(notify);
+            }
+            auto rc = sendNotifyByID(value.first, std::move(value.second));
             if (rc) {
                 LOG(ERROR) << "Failed to send notify message, error code: "
                            << rc;
             }
-            notifies_to_send_.erase(batch_id);
         }
         return result;
     }

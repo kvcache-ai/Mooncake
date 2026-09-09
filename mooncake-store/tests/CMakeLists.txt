@@ -98,6 +98,22 @@ add_store_test(master_service_segment_scenario_test
                master_service_segment_scenario_test.cpp)
 target_link_libraries(master_service_segment_scenario_test
                       PRIVATE master_service_test_dsl)
+add_store_test(master_service_dfs_scenario_test
+               master_service_dfs_scenario_test.cpp)
+target_link_libraries(master_service_dfs_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_ssd_scenario_test
+               master_service_ssd_scenario_test.cpp)
+target_link_libraries(master_service_ssd_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_offload_scenario_test
+               master_service_offload_scenario_test.cpp)
+target_link_libraries(master_service_offload_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_concurrent_scenario_test
+               master_service_concurrent_scenario_test.cpp)
+target_link_libraries(master_service_concurrent_scenario_test
+                      PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
@@ -127,6 +143,7 @@ add_test(
 set_tests_properties(object_checksum_client_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
+add_store_test(rpc_timeout_config_test rpc_timeout_config_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
 endif()
@@ -135,6 +152,8 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+add_store_test(transfer_submitter_config_test
+               transfer_submitter_config_test.cpp)
 find_package(CUDAToolkit QUIET)
 if(CUDAToolkit_FOUND)
   target_compile_definitions(transfer_task_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
@@ -165,7 +184,10 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
-add_store_test(utils_test utils_test.cpp)
+add_store_test(byte_size_test byte_size_test.cpp)
+add_store_test(network_test network_test.cpp)
+add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
+add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
@@ -199,6 +221,8 @@ add_store_test(
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp
 )
 add_store_test(zstd_util_test zstd_util_test.cpp)
+add_store_test(local_file_snapshot_config_test
+               local_file_snapshot_config_test.cpp)
 add_store_test(
   local_file_snapshot_object_store_test
   ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
@@ -219,11 +243,14 @@ add_ha_test(batch_oplog_snapshot_publisher_test
             ha/snapshot/batch_oplog/publisher_test.cpp)
 add_ha_test(batch_oplog_snapshot_coordinator_test
             ha/snapshot/batch_oplog/coordinator_test.cpp)
+add_ha_test(batch_oplog_snapshot_promotion_test
+            ha/snapshot/batch_oplog/promotion_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)

@@ -39,7 +39,7 @@ from ..manifest import (
 from ..storage_manifest import (
     StoredFragmentSnapshot,
     StoredManifestIdentity,
-    WeightManifest,
+    StoredWeightManifest,
     validate_weight_manifest_snapshot,
 )
 from .geometry import (
@@ -471,7 +471,7 @@ class LogicalTransferPlan:
     source_tensors: tuple[TensorDescriptor, ...]
     target_tensors: tuple[TensorDescriptor, ...]
     operations: tuple[LogicalTransferOperation, ...]
-    source_manifest: Optional[WeightManifest] = None
+    source_manifest: Optional[StoredWeightManifest] = None
     planning_limits: PlanningLimits = field(default_factory=PlanningLimits)
     source_executors: tuple[PlacementExecutorPlan, ...] = ()
     target_executors: tuple[PlacementExecutorPlan, ...] = ()
@@ -497,7 +497,7 @@ class LogicalTransferPlan:
         ):
             raise ValueError("logical transfer plan source placement is invalid")
         if self.source_manifest is not None and not isinstance(
-            self.source_manifest, WeightManifest
+            self.source_manifest, StoredWeightManifest
         ):
             raise ValueError("logical transfer plan source manifest is invalid")
         if (self.source_placement is None) == (self.source_manifest is None):

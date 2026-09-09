@@ -1,8 +1,8 @@
 #include "segment/pool.h"
+#include "segment/snapshot_view.h"
 
 #include "segment/pool_write_access.h"
 #include "segment/pool_read_access.h"
-#include "segment/snapshot_view.h"
 
 #include "master_metric_manager.h"
 
@@ -13,18 +13,24 @@ namespace mooncake {
 
 SegmentPool::~SegmentPool() { ReleaseCapacityMetrics(); }
 
-ScopedSegmentPoolWriteAccess SegmentPool::AcquireWriteAccess() {
-    return ScopedSegmentPoolWriteAccess(this);
+SegmentPool::WriteAccess SegmentPool::AcquireWriteAccess() {
+    return WriteAccess(AccessKey{}, *this);
 }
 
-ScopedSegmentPoolReadAccess SegmentPool::AcquireReadAccess() const {
-    return ScopedSegmentPoolReadAccess(this);
+SegmentPool::ReadAccess SegmentPool::AcquireReadAccess() const {
+    return ReadAccess(AccessKey{}, *this);
 }
 
 ScopedPlacementReadAccess SegmentPool::AcquirePlacementAccess() const {
-    return ScopedPlacementReadAccess(
-        placement_index_, catalog_.regions_by_host_,
-        catalog_.owner_client_by_group_name_, pool_mutex_);
+    return ScopedPlacementReadAccess(placement_index_, catalog_, pool_mutex_);
+}
+
+tl::expected<Replica, ErrorCode> SegmentPool::AllocateInSegment(
+    std::string_view segment_name, AllocationCandidateKind kind, size_t size,
+    ReplicaType replica_type) const {
+    auto access = AcquirePlacementAccess();
+    return ReplicaAllocator(PreferredOnlyPlacementPolicy(kind))
+        .AllocateFrom(access, size, segment_name, replica_type);
 }
 
 SegmentPoolSnapshotView SegmentPool::GetSnapshotView() const noexcept {
@@ -35,17 +41,18 @@ StorageUsageSnapshot SegmentPool::GetMemoryUsageSnapshot() const {
     std::shared_lock lock(pool_mutex_);
     StorageUsageSnapshot snapshot;
     std::unordered_set<const BufferAllocatorBase*> counted;
-    for (const auto& [_, mounted] : catalog_.mounted_regions_) {
+    for (const auto& mounted : catalog_.Regions()) {
         const auto* resource = GetResource(mounted);
-        if (!resource || !resource->allocator ||
-            !counted.insert(resource->allocator.get()).second) {
+        if (!resource || !resource->allocator() ||
+            !counted.insert(resource->allocator().get()).second) {
             continue;
         }
-        const size_t used = resource->allocator->size();
-        const size_t capacity = resource->allocator->capacity();
+        const size_t used = resource->allocator()->size();
+        const size_t capacity = resource->allocator()->capacity();
         snapshot.used_bytes += used;
         snapshot.capacity_bytes += capacity;
-        auto& region = snapshot.segments[resource->allocator->getSegmentName()];
+        auto& region =
+            snapshot.segments[resource->allocator()->getSegmentName()];
         region.used_bytes += used;
         region.capacity_bytes += capacity;
     }
@@ -74,18 +81,18 @@ const RegionResource* SegmentPool::GetResource(
 
 void SegmentPool::ReleaseCapacityMetrics() {
     std::unordered_set<std::string> segment_names;
-    for (const auto& id : catalog_.capacity_accounted_region_ids_) {
-        auto mounted = catalog_.mounted_regions_.find(id);
-        if (mounted != catalog_.mounted_regions_.end()) {
+    for (const auto& id : capacity_accounted_region_ids_) {
+        auto mounted = catalog_.Find(id);
+        if (mounted != nullptr) {
             MasterMetricManager::instance().dec_total_mem_capacity(
-                mounted->second.segment.name, mounted->second.segment.size);
-            segment_names.insert(mounted->second.segment.name);
+                mounted->segment.name, mounted->segment.size);
+            segment_names.insert(mounted->segment.name);
         }
     }
     for (const auto& name : segment_names) {
         MasterMetricManager::instance().remove_segment_metrics(name);
     }
-    catalog_.capacity_accounted_region_ids_.clear();
+    capacity_accounted_region_ids_.clear();
 }
 
 }  // namespace mooncake

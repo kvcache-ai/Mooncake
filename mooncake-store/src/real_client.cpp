@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "common/client_buffer_allocation.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -28,7 +29,8 @@
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
-#include "utils.h"
+#include "common/network.h"
+#include "common/result.h"
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
@@ -1136,6 +1138,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                        << init_result.error();
             return init_result;
         }
+        // The dangling-replica heal in Client::Put needs an existence check
+        // against this process's offload files, which only the FileStorage
+        // owns. true: backing file is gone, false: present, nullopt: unknown.
+        std::weak_ptr<FileStorage> weak_storage = file_storage_;
+        client_->SetLocalDiskProbe(
+            [weak_storage](const std::string &key) -> std::optional<bool> {
+                auto storage = weak_storage.lock();
+                if (!storage) {
+                    return std::nullopt;
+                }
+                auto exists = storage->Exists(key);
+                if (!exists) {
+                    return std::nullopt;
+                }
+                return !*exists;
+            });
     }
     client_requester_ = std::make_shared<ClientRequester>();
     const bool should_start_http_server =
@@ -2757,8 +2775,10 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        // Per-buffer unregistration is idempotent so a DummyClient can safely
+        // retry after the RealClient completed an earlier request but its
+        // response was lost.
+        return {};
     }
     auto &context = it->second;
 
@@ -2773,11 +2793,7 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     }
 
     if (shm_it == context.mapped_shms.end()) {
-        std::stringstream addr_stream;
-        addr_stream << "0x" << std::hex << dummy_base_addr;
-        LOG(ERROR) << "Share memory not found for dummy address: "
-                   << addr_stream.str() << " (client_id: " << client_id << ")";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return {};
     }
 
     // Unmap and clean up the shm
@@ -5005,6 +5021,41 @@ RealClient::get_into_ranges_shm_helper(
     const std::map<std::string, CachedQueryResultResponse>
         &cached_query_results,
     int32_t device_id, const UUID &client_id) {
+    return get_into_ranges_shm_helper_impl(
+        dummy_buffers, std::vector<size_t>(dummy_buffers.size()), nullptr,
+        all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        cached_query_results, device_id, client_id);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_staged_shm_helper(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &dummy_buffer_sizes,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
+    int32_t device_id, const UUID &client_id) {
+    return get_into_ranges_shm_helper_impl(
+        dummy_buffers, dummy_buffer_sizes, &dummy_buffer_sizes, all_keys,
+        all_dst_offsets, all_src_offsets, all_sizes, cached_query_results,
+        device_id, client_id);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_shm_helper_impl(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &dummy_buffer_sizes,
+    const std::vector<size_t> *buffer_capacities,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
+    int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
@@ -5027,10 +5078,10 @@ RealClient::get_into_ranges_shm_helper(
             ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<size_t> capacities;
+    std::vector<size_t> mapped_capacities;
     auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
-        it->second, dummy_buffers, std::vector<size_t>(dummy_buffers.size()),
-        client_id, &capacities);
+        it->second, dummy_buffers, dummy_buffer_sizes, client_id,
+        buffer_capacities == nullptr ? &mapped_capacities : nullptr);
     if (!real_buffers_result) {
         return build_ranged_read_internal_error_results(
             dummy_buffers.size(), all_keys, all_dst_offsets,
@@ -5039,9 +5090,13 @@ RealClient::get_into_ranges_shm_helper(
 
     auto query_result_cache =
         build_query_result_cache_from_cached_results(cached_query_results);
+    const std::vector<size_t> *capacities = &mapped_capacities;
+    if (buffer_capacities != nullptr) {
+        capacities = buffer_capacities;
+    }
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
-        all_sizes, &capacities,
+        all_sizes, capacities,
         query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
@@ -5418,7 +5473,7 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
         return -1;
     }
 
-    if (size == 0) {
+    if (size == 0 && metadata_size == 0) {
         LOG(WARNING) << "Attempting to put empty data for key: " << key;
         return 0;
     }
@@ -6975,7 +7030,8 @@ ClientRequester::ClientRequester() {
     // peer which is gone blocks for connect_retry_count * 30s plus the waits
     // between retries -- 91s with the defaults above -- and no configuration
     // can shorten it. Defaults are unchanged when the variables are unset.
-    detail::ApplyRpcTimeoutEnvOverrides(pool_conf.client_config);
+    detail::ApplyRpcTimeoutOverrides(pool_conf.client_config,
+                                     RpcTimeoutConfig::FromEnvironment());
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(

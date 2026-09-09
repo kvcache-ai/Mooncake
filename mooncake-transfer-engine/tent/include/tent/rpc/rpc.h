@@ -47,6 +47,8 @@ enum RpcFuncID {
     Unpin,
     SubscribeSegmentUpdate,
     NotifySegmentUpdated,
+    // Appended to preserve the numeric values of the existing RPCs.
+    BootstrapUb,
 };
 
 class ClientPool;
