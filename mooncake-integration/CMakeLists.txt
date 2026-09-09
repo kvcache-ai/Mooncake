@@ -187,7 +187,7 @@ install(
 
 if(WITH_TE)
   install(
-    FILES "${CMAKE_CURRENT_SOURCE_DIR}/shared_segment.py"
+    FILES "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/shared_segment.py"
     DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}
     COMPONENT python)
 endif()
