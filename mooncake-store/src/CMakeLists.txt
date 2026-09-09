@@ -85,6 +85,8 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     storage_backend.cpp
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
+    config/nvme_kv_connector_config.cpp
+    config/nvme_kv_u32_parser.cpp
     nvme_kv_executor_io_uring.cpp
     nvme_kv_executor_ioctl.cpp
     nvme_kv_executor_util.cpp
