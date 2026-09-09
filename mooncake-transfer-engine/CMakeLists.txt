@@ -3,6 +3,12 @@ project(mooncake-transfer-engine)
 
 include(CheckCXXSourceCompiles)
 
+option(MOONCAKE_ENABLE_ADAPTIVE_CC
+       "Build adaptive congestion control for RDMA transports" OFF)
+if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+  add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CC=1)
+endif()
+
 if (NOT GLOBAL_CONFIG)
   if (USE_ETCD)
     message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
@@ -85,6 +91,9 @@ endif()
 
 include_directories(../mooncake-common/include)
 include_directories(include)
+if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+  include_directories(src/common/adaptive_congestion_control)
+endif()
 add_subdirectory(include)
 add_subdirectory(src)
 

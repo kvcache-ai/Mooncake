@@ -1,5 +1,15 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
+if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+  add_executable(adaptive_congestion_control_test
+                 ${WORKSPACE}/adaptive_congestion_control_test.cpp)
+  target_link_libraries(adaptive_congestion_control_test
+                        PRIVATE adaptive_congestion_control_core gtest
+                                gtest_main)
+  add_test(NAME adaptive_congestion_control_test
+           COMMAND adaptive_congestion_control_test)
+endif()
+
 if(USE_HIP)
   file(GLOB TEST_SOURCES "*.cpp")
   hipify_files(TEST_SOURCES)
