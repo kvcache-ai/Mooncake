@@ -10517,7 +10517,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::vector<Candidate> merged;
         catalog_.Visit([&](const TenantId& tenant_id,
                            const std::shared_ptr<TenantCatalog>& handle) {
-            TenantCatalogAccessorRW tenant_accessor(handle.get());
             auto& tenant_state = *handle;
             // Collect handles, then lock each per-object.
             auto objs = tenant_state.SnapshotObjects();
@@ -10694,7 +10693,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
-                        TenantCatalogAccessorRW tenant_accessor(handle.get());
                         auto& tenant_state = *handle;
                         for (const auto& entry :
                              tenant_state.SnapshotObjects()) {
@@ -10744,7 +10742,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
-                        TenantCatalogAccessorRW tenant_accessor(handle.get());
                         auto& tenant_state = *handle;
                         for (const auto& entry :
                              tenant_state.SnapshotObjects()) {
