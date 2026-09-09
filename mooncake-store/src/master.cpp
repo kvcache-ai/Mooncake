@@ -152,13 +152,14 @@ DEFINE_double(tenant_eviction_high_watermark_ratio,
               mooncake::DEFAULT_TENANT_EVICTION_HIGH_WATERMARK_RATIO,
               "Per-tenant high watermark, as a fraction of that tenant's own "
               "effective quota, at which background eviction starts for it. "
+              "Defaults to the same value as -eviction_high_watermark_ratio; "
               "0 disables it. Only meaningful with -enable_multi_tenants. "
-              "Set this when a tenant's effective quota can sit at or below "
-              "eviction_high_watermark_ratio: such a tenant reaches its own "
-              "ceiling before the pool crosses the pool-wide watermark, so "
-              "the bulk evictor never runs for it and admission falls back "
-              "to a synchronous per-object evict-and-retry that rejects "
-              "writes with TENANT_QUOTA_EXCEEDED");
+              "This is the only mechanism that frees space for a tenant: "
+              "admission itself never evicts, it rejects with "
+              "TENANT_QUOTA_EXCEEDED. Without it, a tenant whose effective "
+              "quota sits at or below eviction_high_watermark_ratio reaches "
+              "its own ceiling before the pool crosses the pool-wide "
+              "watermark, so nothing ever reclaims on its behalf");
 DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
               "Ratio of objects to evict when NoF SSD space is full");
 DEFINE_double(nof_eviction_high_watermark_ratio,

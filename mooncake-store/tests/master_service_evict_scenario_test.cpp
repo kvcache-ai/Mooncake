@@ -574,10 +574,12 @@ TEST_F(MasterServiceEvictScenarioTest,
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
 }
 
+// Admission does not evict. A tenant at its ceiling is rejected outright and
+// the background watermark pass is what makes room -- within that tenant only.
 TEST_F(MasterServiceEvictScenarioTest,
-       TenantAdmissionEvictsOnlyThatTenantsExpiredObject) {
+       TenantOverQuotaRejectsAdmissionAndBackgroundPassReclaims) {
     MasterScenario scenario(
-        "tenant admission evicts within tenant",
+        "over-quota admission rejects; the tenant pass makes room",
         TenantConfig({{"tenant-a", kObjectSize}, {"tenant-b", kObjectSize}}));
     scenario.Given(MemoryNode("memory"))
         .Given(Objects({"tenant-a-old"})
@@ -590,12 +592,25 @@ TEST_F(MasterServiceEvictScenarioTest,
                    .ForTenant("tenant-b")
                    .WithHardPin()
                    .CompleteOn("memory"))
+        // The write path no longer evicts inline, so the expired object
+        // survives the rejected admission.
+        .When(PutStart("tenant-a-new", kObjectSize)
+                  .ForTenant("tenant-a")
+                  .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED))
+        .Then(Object("tenant-a-old").ForTenant("tenant-a").IsReadable())
+        // The pass reclaims tenant-a's own expired object. tenant-b is over
+        // its watermark too, but its object is hard-pinned, so the pass frees
+        // nothing for it and never reaches across tenants to compensate.
+        .When(EvictTenants())
+        .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
+        .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
+        // With headroom built ahead of it, the retry is admitted.
         .When(PutStart("tenant-a-new", kObjectSize)
                   .ForTenant("tenant-a")
                   .ExpectReplicas(1))
-        .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
-        .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
+        // tenant-b has nothing evictable, so it keeps rejecting -- now
+        // without a shard scan per attempt.
         .When(PutStart("tenant-b-overflow", 1)
                   .ForTenant("tenant-b")
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
