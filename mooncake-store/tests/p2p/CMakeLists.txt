@@ -24,6 +24,10 @@ endfunction()
 # master side
 add_p2p_master_test(p2p_route_table_test p2p_route_table_test.cpp)
 add_p2p_master_test(p2p_rpc_types_test p2p_rpc_types_test.cpp)
+add_p2p_master_test(p2p_master_rpc_test
+    p2p_master_rpc_test.cpp
+    ../../src/p2p/master/p2p_master_client.cpp)
+set_tests_properties(p2p_master_rpc_test PROPERTIES TIMEOUT 60)
 add_p2p_master_test(p2p_master_service_test p2p_master_service_test.cpp)
 add_p2p_master_test(p2p_master_http_endpoints_test p2p_master_http_endpoints_test.cpp)
 add_p2p_master_test(p2p_master_metrics_test p2p_master_metrics_test.cpp)
