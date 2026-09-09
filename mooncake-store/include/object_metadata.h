@@ -92,9 +92,11 @@ class ObjectMetadata {
     ObjectMetadata(ObjectMetadata&&) = delete;
     ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
-    // Updated by UpsertStart (Case B) to reflect the new writer.
+    // The current writer; rewritten when an in-place same-size upsert
+    // reuses this object's buffers.
     UUID client_id;
-    // Updated by UpsertStart (Case B) to reset the discard timeout.
+    // Start of the current write; reset on the same in-place update so the
+    // discard timeout restarts.
     std::chrono::system_clock::time_point put_start_time;
     const size_t size;
     std::optional<uint64_t> object_checksum;
