@@ -283,6 +283,9 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         if (err != ErrorCode::OK) {
             standby_service_->Stop();
         }
+        if (err == ErrorCode::OK && batch_oplog_snapshot_coordinator_) {
+            batch_oplog_snapshot_coordinator_->Stop();
+        }
 
         {
             std::lock_guard<std::mutex> lock(state_mutex_);
