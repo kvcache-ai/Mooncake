@@ -349,10 +349,12 @@ class Client {
         ReplicaType replica_type);
 
     /**
-     * @brief Registers a memory segment to master for allocation
+     * @brief Registers local memory and the segment with the Master.
      * @param buffer Memory buffer to register
      * @param size Size of the buffer in bytes
-     * @return ErrorCode indicating success/failure
+     * @return Success after incremental Master registration. If the Master
+     * requests a full reconciliation, the control-plane flusher completes it
+     * asynchronously.
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
@@ -368,8 +370,8 @@ class Client {
                                                  size_t size);
 
     /**
-     * @brief Mounts a memory segment and returns its generated Segment UUID.
-     *        Logic is identical to MountSegment, but returns the segment id.
+     * @brief Registers local memory and the segment with the Master, then
+     * returns the generated Segment UUID.
      */
     tl::expected<UUID, ErrorCode> MountSegmentAndGetId(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
@@ -678,8 +680,8 @@ class Client {
     std::unordered_set<std::string> GetLocalEndpoints() const {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         std::unordered_set<std::string> endpoints;
-        for (const auto& [segment_id, segment] : mounted_segments_) {
-            endpoints.insert(segment.te_endpoint);
+        for (const auto& [segment_id, entry] : mounted_segments_) {
+            endpoints.insert(entry.segment.te_endpoint);
         }
         return endpoints;
     }
@@ -929,9 +931,26 @@ class Client {
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
+    enum class SegmentSyncState : uint8_t {
+        NEW_PENDING = 0,
+        REMOUNT_PENDING,
+        ACTIVE,
+    };
+
+    struct MountedSegmentEntry {
+        Segment segment;
+        SegmentSyncState sync_state{SegmentSyncState::NEW_PENDING};
+    };
+
+    using MountedSegmentMap =
+        std::unordered_map<UUID, MountedSegmentEntry, boost::hash<UUID>>;
+
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;
-    std::unordered_map<UUID, Segment, boost::hash<UUID>> mounted_segments_;
+    // Serializes synchronous registration, background reconciliation, and
+    // unmount operations so their snapshots cannot race with each other.
+    std::mutex segment_update_mutex_;
+    MountedSegmentMap mounted_segments_;
 
     // Segments in graceful unmount: readable by remote peers, not allocatable
     // locally. TE MR remains registered until master confirms removal.
@@ -946,7 +965,7 @@ class Client {
      *        Caller must hold mounted_segments_mutex_.
      */
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
-        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+        MountedSegmentMap::iterator it);
 
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);
@@ -988,6 +1007,9 @@ class Client {
     std::atomic<bool> leader_monitor_running_{false};
     std::thread storage_heartbeat_thread_;
     std::atomic<bool> storage_heartbeat_running_{false};
+    std::mutex storage_control_mutex_;
+    std::condition_variable storage_control_cv_;
+    std::atomic<bool> segment_flush_requested_{false};
     std::thread task_poll_thread_;
     std::atomic<bool> task_poll_running_{false};
     std::atomic<bool> last_ping_success_{false};

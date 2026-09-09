@@ -15,6 +15,7 @@
 #include "master_service.h"
 #include "segment.h"
 #include "rpc_service.h"
+#include "segment_update_test_utils.h"
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
@@ -161,8 +162,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // Test MountSegment request
-    auto mount_result = service_.MountSegment(segment, client_id);
+    // Test UpdateSegments(REGISTER) request
+    auto mount_result = RegisterNewSegmentForTest(service_, segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
@@ -295,7 +296,8 @@ TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
         service_config.default_kv_lease_ttl = 100;
         service_config.enable_metric_reporting = false;
         WrappedMasterService service(service_config);
-        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        ASSERT_TRUE(
+            RegisterNewSegmentForTest(service, segment, client_id).has_value());
         ASSERT_EQ(metrics.get_total_mem_capacity(),
                   capacity_before + static_cast<int64_t>(segment.size));
         ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
@@ -469,7 +471,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const double base_valid_get_rate =
         base_stats.at(CacheHitStat::VALID_GET_RATE);
 
-    auto mount_result = service_.MountSegment(segment, client_id);
+    auto mount_result = RegisterNewSegmentForTest(service_, segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto put_start_result1 =
         service_.PutStart(client_id, key, value_length, config);
@@ -616,7 +618,8 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     segment.base = 0x300000000;
     segment.size = 8 * 1024 * 1024;
     UUID client_id = generate_uuid();
-    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(*service, segment, client_id).has_value());
     ReplicateConfig config;
     config.replica_num = 1;
     constexpr size_t kAllocationSize = 4096;
@@ -735,7 +738,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     config.replica_num = 1;
 
     // Mount segment
-    auto mount_result = service_.MountSegment(segment, client_id);
+    auto mount_result = RegisterNewSegmentForTest(service_, segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
     // Test BatchExistKey request (should all return false initially)
@@ -1062,7 +1065,7 @@ TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
     const int64_t base_file_cache_nums = metrics.get_file_cache_nums();
 
     // Step 1: Mount segment and create a completed MEMORY replica.
-    auto mount_result = service_.MountSegment(segment, client_id);
+    auto mount_result = RegisterNewSegmentForTest(service_, segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
     auto put_start_result =
         service_.PutStart(client_id, key, value_length, config);

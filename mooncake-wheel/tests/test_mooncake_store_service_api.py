@@ -319,11 +319,13 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         # subsequent same-path detection keeps working.
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/old")
 
-    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(self):
+    async def test_reconfigure_decode_same_path_remount_failure_keeps_previous_segments(
+        self,
+    ):
         # A remount to the SAME path that fails to mount must not destroy the
         # still-healthy previous segments: the node keeps serving from them and
         # stays in decode mode (make-before-break). Same-path MBB is safe here
-        # because /api/reconfigure binds through MasterClient::MountSegment,
+        # because /api/reconfigure binds through MasterClient::UpdateSegments,
         # which mints a fresh UUID per mount and does not enter the NoF
         # te_endpoint-dedup path, so old and new cannot collide on the same path.
         old_id = "00000000-0000-0000-0000-000000000001"
@@ -397,7 +399,9 @@ class StoreServiceApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.service.current_mode, "decode")
         self.assertEqual(self.service.last_mount_info["path"], "/dev/shm/new")
 
-    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(self):
+    async def test_reconfigure_decode_partial_unmount_failure_keeps_only_failed_ids(
+        self,
+    ):
         # New mount succeeds, but retiring the previous segments only PARTIALLY
         # fails. unmount_segment reports the first error for a batch, so the old
         # ids must be unmounted individually; mounted_segment_ids must then hold
@@ -1077,9 +1081,7 @@ class StoreServiceShutdownTest(unittest.IsolatedAsyncioTestCase):
             await self.service.stop()
 
         self.assertIsNone(self.service.store)
-        self.assertTrue(
-            any("close returned 7" in message for message in logs.output)
-        )
+        self.assertTrue(any("close returned 7" in message for message in logs.output))
         await self.service.stop()
         store.close.assert_called_once_with()
 

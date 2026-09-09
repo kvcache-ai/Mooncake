@@ -24,6 +24,7 @@
 
 #include <unistd.h>
 
+#include "segment_update_test_utils.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "common/network.h"
@@ -1942,7 +1943,8 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
 
     Segment segment = MakeSegment("wrapped_batch_exist_segment");
     const UUID client_id = generate_uuid();
-    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(service_, segment, client_id).has_value());
 
     ReplicateConfig config;
     config.replica_num = 1;

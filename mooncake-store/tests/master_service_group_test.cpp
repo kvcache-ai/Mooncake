@@ -1,5 +1,6 @@
 #include "master_service_test_fixture.h"
 #include "rpc_service.h"
+#include "segment_update_test_utils.h"
 
 #include <glog/logging.h>
 
@@ -100,7 +101,8 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
 
     Segment segment = MakeSegment("wrapped_batch_group_segment");
     const UUID client_id = generate_uuid();
-    ASSERT_TRUE(service_.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(
+        RegisterNewSegmentForTest(service_, segment, client_id).has_value());
 
     const std::vector<std::string> keys = {
         "wrapped_batch_grouped_a",
