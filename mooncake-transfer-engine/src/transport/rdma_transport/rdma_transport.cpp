@@ -994,11 +994,14 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
     status.resize(task_count);
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto &task = batch_desc.task_list[task_id];
-        status[task_id].transferred_bytes = task.transferred_bytes;
         uint64_t success_slice_count =
             __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
         uint64_t failed_slice_count =
             __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+        // Completion counters publish the preceding byte updates. Read bytes
+        // afterwards so a terminal status cannot carry a stale byte count.
+        status[task_id].transferred_bytes =
+            __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
         if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
@@ -1022,11 +1025,13 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
-    status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
         __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Pair with Slice::markSuccess(): observe completion before reading bytes.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;
