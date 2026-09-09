@@ -11,9 +11,10 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_service.h"
+#include "common/network.h"
+#include "default_config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
-#include "default_config.h"
 #include "version.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");

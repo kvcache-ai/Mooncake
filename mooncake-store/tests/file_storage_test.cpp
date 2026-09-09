@@ -10,11 +10,12 @@
 
 #include "allocator.h"
 #include "client_metric.h"
+#include "common/network.h"
 #include "file_storage.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "utils/common.h"
 
 namespace mooncake {

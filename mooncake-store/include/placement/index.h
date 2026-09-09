@@ -18,7 +18,7 @@
 
 #include "placement/candidate.h"
 #include "types.h"
-#include "utils/transparent_string_hash.h"
+#include "common/transparent_string_hash.h"
 
 namespace mooncake {
 

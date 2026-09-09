@@ -36,6 +36,22 @@ MasterServiceConfig SsdAwareOffloadConfig() {
     return config;
 }
 
+// Allocation-pressure variant: no leases, the high watermark disabled, and a
+// small eviction ratio so every armed cycle handles exactly one expired
+// one-megabyte object.
+MasterServiceConfig PressureOffloadConfig() {
+    MasterServiceConfig config = OffloadConfig(/*lease_ttl_ms=*/0);
+    config.eviction_ratio = 0.05;
+    config.eviction_high_watermark_ratio = 1.0;
+    return config;
+}
+
+MasterServiceConfig PressureOffloadOnEvictConfig() {
+    MasterServiceConfig config = PressureOffloadConfig();
+    config.offload_on_evict = true;
+    return config;
+}
+
 std::string HeartbeatKey(size_t index) {
     return "offload_hb_" + std::to_string(index);
 }
@@ -472,6 +488,133 @@ TEST(MasterServiceOffloadScenarioTest, CompleteOffloadAfterUnmountIsRefused) {
                   .OfSize(1024)
                   .ExpectError(ErrorCode::SEGMENT_NOT_FOUND))
         .Then(Object("ssd_gate_orphan_key").DoesNotExist());
+}
+
+// The four offload/eviction config combos, driven through the client-visible
+// pressure path: a failed allocation arms the background eviction thread, and
+// the observable outcomes are which writes eventually succeed, which objects
+// stay readable, and what the offload heartbeat hands back.
+
+TEST(MasterServiceOffloadScenarioTest, DefaultModeEvictsUnderPressure) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_a_" + std::to_string(index);
+    };
+    MasterScenario scenario("the default mode reclaims memory under pressure",
+                            PressureOffloadConfig());
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(key(14)))
+        .Then(Objects(0, 3).NamedBy(key).DoNotExist())
+        .Then(Objects(3, 15).NamedBy(key).AreReadable());
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     ForceEvictAloneStillEvictsUnderPressure) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_d_" + std::to_string(index);
+    };
+    MasterServiceConfig config = PressureOffloadConfig();
+    config.offload_force_evict = true;  // on_evict is false, so it is ignored
+    MasterScenario scenario(
+        "offload_force_evict alone leaves pressure eviction unchanged", config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(key(14)))
+        .Then(Objects(0, 3).NamedBy(key).DoNotExist())
+        .Then(Objects(3, 15).NamedBy(key).AreReadable());
+}
+
+TEST(MasterServiceOffloadScenarioTest, OffloadOnEvictQueuesInsteadOfFreeing) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_b_" + std::to_string(index);
+    };
+    MasterScenario scenario(
+        "offload_on_evict queues eviction candidates without freeing memory",
+        PressureOffloadOnEvictConfig());
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .When(MountLocalDisk("node"))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .By("node")
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .By("node")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(WaitFor(std::chrono::milliseconds(100)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .By("node")
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(OffloadHeartbeat("node").ExpectSomeTasks())
+        .Then(Objects(0, 14).NamedBy(key).AreReadable());
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     OffloadOnEvictWithoutLocalDiskPreservesMemory) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_b2_" + std::to_string(index);
+    };
+    MasterScenario scenario(
+        "offload_on_evict without a local disk cannot free memory",
+        PressureOffloadOnEvictConfig());
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .When(WaitFor(std::chrono::milliseconds(100)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
+        .Then(Objects(0, 14).NamedBy(key).AreReadable());
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     ForceEvictReclaimsMemoryWhenOffloadPushFails) {
+    constexpr uint64_t kLargeObject = 1024 * 1024;
+    const auto key = [](size_t index) {
+        return "combo_c_" + std::to_string(index);
+    };
+    MasterServiceConfig config = PressureOffloadOnEvictConfig();
+    config.offload_force_evict = true;
+    MasterScenario scenario(
+        "offload_force_evict reclaims memory when the queue push fails",
+        config);
+    scenario.Given(MemoryNode("node").Capacity(16 * 1024 * 1024))
+        .Given(Objects(0, 14)
+                   .NamedBy(key)
+                   .Size(kLargeObject)
+                   .CompleteOn("node")
+                   .ExpiredFrom(std::chrono::system_clock::now() -
+                                std::chrono::hours(1)))
+        .When(PutStart(key(14), 3 * kLargeObject)
+                  .Eventually(std::chrono::seconds(10)))
+        .When(PutEnd(key(14)))
+        .Then(Objects(0, 3).NamedBy(key).DoNotExist())
+        .Then(Objects(3, 15).NamedBy(key).AreReadable());
 }
 
 }  // namespace mooncake::test

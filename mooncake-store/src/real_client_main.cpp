@@ -5,6 +5,7 @@
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
+#include "common/byte_size.h"
 #include "real_client.h"
 #include "version.h"
 
@@ -74,6 +75,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::get_into_range_shm_helper>(
         &real_client);
     server.register_handler<&RealClient::get_into_ranges_shm_helper>(
+        &real_client);
+    server.register_handler<&RealClient::get_into_ranges_staged_shm_helper>(
         &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::ascend_shm_internal>(&real_client);
