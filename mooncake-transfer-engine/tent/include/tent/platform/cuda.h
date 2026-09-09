@@ -20,6 +20,7 @@
 #include "tent/common/concurrent/rw_spinlock.h"
 
 #include <cuda_runtime.h>
+#include <functional>
 
 namespace mooncake {
 namespace tent {
@@ -123,6 +124,14 @@ class CudaPlatform : public Platform {
     virtual const std::string type() const { return "cuda"; }
 
     Status synchronizeDevices(const Topology* topology) override;
+
+    // Visit topology CUDA devices that already have a primary context. Restores
+    // the caller's current device only when this thread already had one — a
+    // bare cudaGetDevice() can implicitly create GPU 0. `log_tag` prefixes
+    // warning logs (e.g. "CudaPlatform::synchronizeDevices").
+    static void forEachActiveDevice(
+        const Topology* topology, const char* log_tag,
+        const std::function<void(int device)>& on_device);
 
     Status getStreamFromPool(CUDAStreamHandle& outHandle,
                              int deviceId = CUDAStreamPool::kCurrentDevice);

@@ -20,6 +20,11 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include "tent/platform/cuda.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -82,6 +87,49 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
     }
 
     return 0;
+}
+
+// After a transfer-done notify, make GPUDirect RDMA writes visible to the dest
+// GPU owner before the caller consumes the buffer. Host-side flush, not a
+// full device synchronize. Empty topology / unsupported devices are no-ops.
+Status flushDestGpuDirectWrites(const Topology* topology) {
+#ifdef USE_CUDA
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11030
+    CudaPlatform::forEachActiveDevice(topology, "RDMA gdr-flush", [](int device) {
+        int options = 0;
+        cudaError_t err = cudaDeviceGetAttribute(
+            &options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA gdr-flush cudaDeviceGetAttribute device "
+                         << device << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            return;
+        }
+        if ((options & cudaFlushGPUDirectRDMAWritesOptionHost) == 0) {
+            LOG_FIRST_N(WARNING, 8)
+                << "RDMA gdr-flush host option unsupported on device "
+                << device;
+            return;
+        }
+        err = cudaDeviceFlushGPUDirectRDMAWrites(
+            cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+            cudaFlushGPUDirectRDMAWritesToOwner);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "RDMA gdr-flush device " << device
+                         << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            return;
+        }
+        LOG_FIRST_N(INFO, 1)
+            << "RDMA dest GPUDirect write flush enabled on device " << device;
+    });
+#else
+    (void)topology;
+#endif
+#else
+    (void)topology;
+#endif
+    return Status::OK();
 }
 
 }  // namespace
@@ -890,12 +938,26 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
 
 Status RdmaTransport::receiveNotification(
     std::vector<Notification>& notify_list) {
-    std::lock_guard<std::mutex> lock(notify_mutex_);
-    if (notify_list_.empty()) {
-        return Status::OK();
+    {
+        std::lock_guard<std::mutex> lock(notify_mutex_);
+        if (notify_list_.empty()) {
+            return Status::OK();
+        }
+        notify_list = std::move(notify_list_);
+        notify_list_.clear();
     }
-    notify_list = std::move(notify_list_);
-    notify_list_.clear();
+    // Empty polls are the hot path. Flush only after a real transfer-done
+    // notify, and never while holding notify_mutex_ (this thread may enter
+    // CUDA; the notify worker is a different path).
+    bool flush = caps.gpu_to_gpu;
+    if (conf_) {
+        flush =
+            flush &&
+            conf_->get("transports/rdma/flush_gpu_direct_rdma_writes", true);
+    }
+    if (flush) {
+        (void)flushDestGpuDirectWrites(local_topology_.get());
+    }
     return Status::OK();
 }
 
