@@ -337,7 +337,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // the RAII guard below.
     DmabufExport dmabuf_exp;
     if (!context_list_.empty()) {
-        int eret = RdmaContext::exportDmabuf(addr, dmabuf_exp);
+        int eret = RdmaContext::exportDmabuf(addr, length, dmabuf_exp);
         if (eret != 0) {
             LOG(ERROR) << "Failed to export dma_buf for addr=" << addr;
             return eret;

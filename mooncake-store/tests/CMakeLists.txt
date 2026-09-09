@@ -38,6 +38,7 @@ endfunction()
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
+add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
@@ -108,6 +109,10 @@ target_link_libraries(master_service_ssd_scenario_test
 add_store_test(master_service_offload_scenario_test
                master_service_offload_scenario_test.cpp)
 target_link_libraries(master_service_offload_scenario_test
+                      PRIVATE master_service_test_dsl)
+add_store_test(master_service_concurrent_scenario_test
+               master_service_concurrent_scenario_test.cpp)
+target_link_libraries(master_service_concurrent_scenario_test
                       PRIVATE master_service_test_dsl)
 add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
@@ -180,7 +185,10 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
-add_store_test(utils_test utils_test.cpp)
+add_store_test(byte_size_test byte_size_test.cpp)
+add_store_test(network_test network_test.cpp)
+add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
+add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
@@ -241,6 +249,7 @@ add_ha_test(batch_oplog_snapshot_promotion_test
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
+add_store_test(nvme_kv_connector_config_test nvme_kv_connector_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)

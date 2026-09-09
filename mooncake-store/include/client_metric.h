@@ -16,7 +16,7 @@
 #include <ylt/metric/summary.hpp>
 #include "environ.h"
 #include "hybrid_metric.h"
-#include "utils.h"
+#include "common/byte_size.h"
 
 namespace mooncake {
 

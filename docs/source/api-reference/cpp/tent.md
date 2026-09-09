@@ -542,7 +542,7 @@ Status receiveNotification(std::vector<Notification>& notifi_list);
 
 Receives pending notifications from peers.
 
-- `notifi_list`: Output vector of received notifications.
+- `notifi_list`: Output vector of received notifications. The vector is cleared on entry, so each call reports only what that call delivered; a caller reusing one buffer across polls does not see the previous batch again. (Note that the classic Transfer Engine's `getNotifies()` appends instead of replacing.)
 - Return value: `Status::OK()` on success; otherwise a non-OK status.
 - Typical use: Polling loop to trigger follow-up actions on received data.
 

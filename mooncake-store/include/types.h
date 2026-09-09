@@ -440,6 +440,7 @@ struct Segment {
     std::string protocol;
     std::string host_id{};
     Segment() = default;
+    bool operator==(const Segment&) const = default;
 };
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
