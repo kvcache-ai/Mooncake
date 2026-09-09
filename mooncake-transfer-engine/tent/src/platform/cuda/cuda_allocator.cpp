@@ -168,6 +168,14 @@ void CudaPlatform::forEachActiveDevice(
                          << ") failed: " << cudaGetErrorString(err);
             (void)cudaGetLastError();
         }
+    } else if (ensureCudaDriverInit()) {
+        // cudaSetDevice binds a current context on this thread. Drop it so a
+        // notify poller that entered with none is not stuck on the last GPU.
+        const CUresult ctx_err = cuCtxSetCurrent(nullptr);
+        if (ctx_err != CUDA_SUCCESS) {
+            LOG(WARNING) << log_tag << " cuCtxSetCurrent(nullptr) failed: "
+                         << static_cast<int>(ctx_err);
+        }
     }
 }
 

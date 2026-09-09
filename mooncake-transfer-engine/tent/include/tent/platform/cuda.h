@@ -125,10 +125,11 @@ class CudaPlatform : public Platform {
 
     Status synchronizeDevices(const Topology* topology) override;
 
-    // Visit topology CUDA devices that already have a primary context. Restores
-    // the caller's current device only when this thread already had one — a
-    // bare cudaGetDevice() can implicitly create GPU 0. `log_tag` prefixes
-    // warning logs (e.g. "CudaPlatform::synchronizeDevices").
+    // Visit topology CUDA devices that already have a primary context. If this
+    // thread already had a current device, restore it. Otherwise unbind the
+    // current context so a poller is not left on the last visited GPU. A bare
+    // cudaGetDevice() can implicitly create GPU 0. `log_tag` prefixes warning
+    // logs (e.g. "CudaPlatform::synchronizeDevices").
     static void forEachActiveDevice(
         const Topology* topology, const char* log_tag,
         const std::function<void(int device)>& on_device);

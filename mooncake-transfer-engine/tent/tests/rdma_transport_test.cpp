@@ -2873,6 +2873,39 @@ TEST(RdmaNotifyFlushGpuTest, DestFlushDoesNotCreateIdlePrimaryContexts) {
     EXPECT_TRUE(primary_active(0));
     EXPECT_FALSE(primary_active(idle));
 }
+
+TEST(RdmaNotifyFlushGpuTest, DestFlushDoesNotLeaveCurrentContext) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 1) {
+        GTEST_SKIP() << "need a CUDA device";
+    }
+    ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+
+    // Create a process-level primary context, then unbind this thread so the
+    // flush path must cudaSetDevice and must not leave a current context.
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_EQ(cuCtxSetCurrent(nullptr), CUDA_SUCCESS);
+    CUcontext ctx = reinterpret_cast<CUcontext>(1);
+    ASSERT_EQ(cuCtxGetCurrent(&ctx), CUDA_SUCCESS);
+    ASSERT_EQ(ctx, nullptr);
+
+    auto topology = std::make_shared<Topology>();
+    Topology::MemEntry memory;
+    memory.name = "cuda:0";
+    memory.type = Topology::MEM_CUDA;
+    memory.numa_node = 0;
+    topology->mem_list_.push_back(std::move(memory));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    RdmaTransportTestPeer::setGpuToGpu(transport, true);
+    transport.addNotificationToQueue("peer", "done");
+
+    std::vector<Notification> list;
+    EXPECT_TRUE(transport.receiveNotification(list).ok());
+    ASSERT_EQ(cuCtxGetCurrent(&ctx), CUDA_SUCCESS);
+    EXPECT_EQ(ctx, nullptr);
+}
 #endif
 
 }  // namespace
