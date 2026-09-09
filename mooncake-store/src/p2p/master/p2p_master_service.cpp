@@ -80,7 +80,6 @@ std::vector<std::string> P2PMasterService::ListRouteKeys() const {
     for (const auto& shard : route_shards_) {
         SharedMutexLocker lock(&shard.mutex, shared_lock);
         auto shard_keys = shard.table.ListRouteKeys();
-        keys.reserve(keys.size() + shard_keys.size());
         std::move(shard_keys.begin(), shard_keys.end(),
                   std::back_inserter(keys));
     }
@@ -562,17 +561,20 @@ std::vector<P2PRouteDescriptor> P2PMasterService::FilterRoutes(
         }
 
         // 1.3 client-granularity: keep the highest-priority client.
-        auto descriptor = BuildRouteDescriptor(location, route.object_size);
-        if (!descriptor.has_value()) {
-            continue;
-        }
+        P2PRouteDescriptor descriptor{
+            .client_id = location.client_id,
+            .segment_id = location.segment_id,
+            .ip_address = client->get_ip_address(),
+            .rpc_port = client->get_rpc_port(),
+            .object_size = route.object_size,
+        };
         auto it = best_by_client.find(location.client_id);
         if (it == best_by_client.end()) {
             best_by_client[location.client_id] = candidates.size();
-            candidates.emplace_back(segment.priority, std::move(*descriptor));
+            candidates.emplace_back(segment.priority, std::move(descriptor));
         } else if (segment.priority > candidates[it->second].first) {
             candidates[it->second] =
-                std::make_pair(segment.priority, std::move(*descriptor));
+                std::make_pair(segment.priority, std::move(descriptor));
         }
     }  // for over
 
