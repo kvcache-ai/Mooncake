@@ -50,6 +50,19 @@ def test_dependency_boundaries_are_declared() -> None:
     assert metadata["optional-dependencies"]["administration"] == ["paramiko"]
 
 
+def test_legacy_wheel_administration_extra_matches_root_project() -> None:
+    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    legacy = tomllib.loads(
+        (REPOSITORY_ROOT / "mooncake-wheel" / "pyproject.toml").read_text()
+    )
+
+    assert (
+        legacy["project"]["optional-dependencies"]["administration"]
+        == project["project"]["optional-dependencies"]["administration"]
+    )
+    assert not any("paramiko" in dep for dep in legacy["project"]["dependencies"])
+
+
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
     package_root = REPOSITORY_ROOT / "python" / "mooncake"
 
@@ -98,6 +111,7 @@ def test_ssd_administration_modules_have_one_authoritative_source() -> None:
     ).read_text()
     legacy_builder = (REPOSITORY_ROOT / "scripts" / "build_wheel.sh").read_text()
     modules = (
+        "_administration.py",
         "mooncake_ssd_register.py",
         "mooncake_ssd_unregister.py",
         "spdk_tgt_create.py",

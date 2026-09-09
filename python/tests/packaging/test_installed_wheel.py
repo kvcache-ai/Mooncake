@@ -11,20 +11,30 @@ import pytest
 REPOSITORY_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _project_version() -> str:
+def _project_version(project_file: str) -> str:
     try:
         import tomllib
     except ModuleNotFoundError:  # pragma: no cover - Python 3.10
         import tomli as tomllib
 
-    project = tomllib.loads((REPOSITORY_ROOT / "pyproject.toml").read_text())
+    project = tomllib.loads((REPOSITORY_ROOT / project_file).read_text())
     return project["project"]["version"]
 
 
-def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
-    wheel_value = os.environ.get("MOONCAKE_TEST_WHEEL")
+@pytest.mark.parametrize(
+    ("wheel_variable", "project_file"),
+    [
+        ("MOONCAKE_TEST_WHEEL", "pyproject.toml"),
+        ("MOONCAKE_TEST_LEGACY_WHEEL", "mooncake-wheel/pyproject.toml"),
+    ],
+    ids=["unified", "legacy"],
+)
+def test_wheel_imports_outside_the_repository(
+    tmp_path: Path, wheel_variable: str, project_file: str
+) -> None:
+    wheel_value = os.environ.get(wheel_variable)
     if not wheel_value:
-        pytest.skip("set MOONCAKE_TEST_WHEEL to run the installed-wheel smoke test")
+        pytest.skip(f"set {wheel_variable} to run the installed-wheel smoke test")
 
     wheel = Path(wheel_value).resolve()
     assert wheel.is_file(), f"wheel does not exist: {wheel}"
@@ -52,7 +62,8 @@ import mooncake.store
 package_path = Path(mooncake.__file__).resolve()
 repository_path = Path({str(REPOSITORY_ROOT)!r}).resolve()
 assert not package_path.is_relative_to(repository_path), (package_path, repository_path)
-assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
+assert metadata.version("mooncake-transfer-engine") == {_project_version(project_file)!r}
+assert "administration" in metadata.metadata("mooncake-transfer-engine").get_all("Provides-Extra", [])
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
 for ep_module in (
@@ -72,6 +83,7 @@ assert "paramiko" not in sys.modules
 
 installed_files = {{str(path) for path in metadata.files("mooncake-transfer-engine") or []}}
 assert {{
+    "mooncake/_administration.py",
     "mooncake/mooncake_ssd_register.py",
     "mooncake/mooncake_ssd_unregister.py",
     "mooncake/spdk_tgt_create.py",
