@@ -1375,6 +1375,13 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
+    if (!client_op_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "RealClient teardown: client ops still in flight after "
+                      "30s drain; continuing teardown (UAF risk)";
+    }
+    // Finish Get/Put (incl. TransferEngine) before unregister / client_.reset
+    // (#3909). MasterClient drain alone does not cover TransferRead.
+    (void)client_->DrainInflightOperations();
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(
@@ -2945,15 +2952,25 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 
 // Implementation of get_buffer method
 std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
+    RpcDrainGuard::ScopedCall inflight(client_op_drain_);
+    if (!inflight.ok()) {
+        return nullptr;
+    }
+    auto client = client_;
+    if (!client) {
+        LOG(ERROR) << "Client is not initialized";
+        return nullptr;
+    }
     return execute_timed_operation<std::shared_ptr<BufferHandle>>(
         [&]() { return get_buffer_internal(key, client_buffer_allocator_); },
         [](const auto &buffer) { return buffer != nullptr; },
         [&](uint64_t latency_us, const auto &buffer) {
-            client_->ObserveTransferOperation(TransferOperationKind::kRead,
-                                              "get_buffer", buffer->size(),
-                                              latency_us);
+            client->ObserveTransferOperation(TransferOperationKind::kRead,
+                                             "get_buffer", buffer->size(),
+                                             latency_us);
         });
 }
+
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
 RealClient::acquire_hot_cache(const std::string &key) {

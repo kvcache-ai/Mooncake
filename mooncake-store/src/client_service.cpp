@@ -443,7 +443,20 @@ Client::Client(const std::string& local_hostname,
     }
 }
 
+bool Client::DrainInflightOperations(std::chrono::seconds timeout) {
+    if (!api_drain_.drain_for(timeout)) {
+        LOG(ERROR) << "Client teardown: API calls still in flight after "
+                   << timeout.count()
+                   << "s drain; continuing teardown (UAF risk)";
+        return false;
+    }
+    return true;
+}
+
 Client::~Client() {
+    // Never free TransferEngine / master pool under an in-flight Get/Put.
+    (void)DrainInflightOperations();
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -1352,6 +1365,11 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -1424,6 +1442,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
@@ -1853,6 +1876,11 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
