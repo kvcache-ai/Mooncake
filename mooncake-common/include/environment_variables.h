@@ -50,6 +50,12 @@ struct ClientAutoPortEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MC_STORE_CLIENT_MAX_PORT);
 };
 
+struct ClientNumaEnvironmentVariables {
+    // Keep the raw string to preserve the legacy strtol syntax and warning
+    // behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_NUMA_SOCKET_ID);
+};
+
 struct RegisteredPinnedMemoryEnvironmentVariables {
     // Keep the raw string because the legacy parser rejects a leading '+',
     // unlike the shared typed integer parser.
