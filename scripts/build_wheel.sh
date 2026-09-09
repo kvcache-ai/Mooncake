@@ -185,6 +185,7 @@ echo "Building wheel package..."
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
+    _launcher.py
     cli.py
     cli_bench.py
     cli_client.py

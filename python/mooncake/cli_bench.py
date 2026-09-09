@@ -3,10 +3,10 @@
 Minimal CLI module for transfer_engine_bench.
 """
 
-import os
-import stat
 import subprocess
 import sys
+
+from mooncake._launcher import locate
 
 
 def main():
@@ -14,14 +14,7 @@ def main():
     Main entry point for the transfer_engine_bench command.
     Simply runs the transfer_engine_bench binary with all arguments passed through.
     """
-    # Get the path to the transfer_engine_bench binary
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    bin_path = os.path.join(package_dir, "transfer_engine_bench")
-
-    # Make sure the binary is executable
-    if not os.access(bin_path, os.X_OK):
-        st = os.stat(bin_path)
-        os.chmod(bin_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    bin_path = locate("transfer_engine_bench")
 
     # Run the binary with all arguments passed through
     return subprocess.call([bin_path] + sys.argv[1:])
