@@ -137,11 +137,9 @@ void flushGpuDirectWritesOrSynchronize(int device) {
 
 Status flushDestGpuDirectWrites(const Topology* topology) {
 #ifdef USE_CUDA
-    CudaPlatform::forEachActiveDevice(topology, "RDMA gdr-flush",
-                                      [](int device) {
-                                          flushGpuDirectWritesOrSynchronize(
-                                              device);
-                                      });
+    CudaPlatform::forEachActiveDevice(
+        topology, "RDMA gdr-flush",
+        [](int device) { flushGpuDirectWritesOrSynchronize(device); });
 #else
     (void)topology;
 #endif

@@ -180,18 +180,17 @@ void CudaPlatform::forEachActiveDevice(
 }
 
 Status CudaPlatform::synchronizeDevices(const Topology* topology) {
-    forEachActiveDevice(topology, "CudaPlatform::synchronizeDevices",
-                        [](int device) {
-                            cudaError_t err = cudaDeviceSynchronize();
-                            if (err != cudaSuccess) {
-                                LOG(WARNING)
-                                    << "CudaPlatform::synchronizeDevices "
-                                       "cudaDeviceSynchronize device "
-                                    << device
-                                    << " failed: " << cudaGetErrorString(err);
-                                (void)cudaGetLastError();
-                            }
-                        });
+    forEachActiveDevice(
+        topology, "CudaPlatform::synchronizeDevices", [](int device) {
+            cudaError_t err = cudaDeviceSynchronize();
+            if (err != cudaSuccess) {
+                LOG(WARNING)
+                    << "CudaPlatform::synchronizeDevices "
+                       "cudaDeviceSynchronize device "
+                    << device << " failed: " << cudaGetErrorString(err);
+                (void)cudaGetLastError();
+            }
+        });
     return Status::OK();
 }
 }  // namespace tent
