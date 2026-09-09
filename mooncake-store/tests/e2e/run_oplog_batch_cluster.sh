@@ -365,6 +365,9 @@ start_master() {
   fi
   if [[ "$ENABLE_OPLOG_SNAPSHOT" == true ]]; then
     mkdir -p "$RUN_DIR/snapshots"
+    if ((${#environment[@]} == 0)); then
+      environment=(env)
+    fi
     environment+=("MOONCAKE_SNAPSHOT_LOCAL_PATH=$RUN_DIR/snapshots")
   fi
   local -a ha_args=(--enable_ha=false)
