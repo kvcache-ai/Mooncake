@@ -41,6 +41,36 @@ struct RdmaSliceList {
     int num_slices = 0;
 };
 
+// `count` slices of `block_size` bytes, the last holding what remains.
+struct RdmaSlicePlan {
+    uint64_t block_size = 0;
+    uint64_t count = 0;
+};
+
+// Cut `length` into at most `max_slices` slices, each a whole number of
+// `base_block` bytes. Rounding the block up covers the request in fewer
+// slices than were asked for, so the count comes from the block and not the
+// other way round: an empty slice would still cost a work request, a CQE, a
+// path selection and a completion. Zero length keeps one slice -- task
+// accounting counts slices, and a task with none never reaches a terminal
+// status.
+inline RdmaSlicePlan planRdmaSlices(uint64_t length, uint64_t base_block,
+                                    uint64_t max_slices) {
+    if (base_block == 0) base_block = 1;
+    if (max_slices == 0) max_slices = 1;
+    if (length == 0) return {base_block, 1};
+
+    uint64_t count = (length + base_block - 1) / base_block;
+    if (count > max_slices) count = max_slices;
+
+    const uint64_t per_slice = (length + count - 1) / count;
+    const uint64_t block_size = (per_slice % base_block == 0)
+                                    ? per_slice
+                                    : (per_slice / base_block + 1) * base_block;
+
+    return {block_size, (length + block_size - 1) / block_size};
+}
+
 // Forward declarations
 class RdmaEndPoint;
 struct RdmaTask;

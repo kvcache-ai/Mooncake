@@ -460,10 +460,6 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
     return Status::OK();
 }
 
-static inline uint64_t roundup(uint64_t a, uint64_t b) {
-    return (a % b == 0) ? a : (a / b + 1) * b;
-}
-
 Status RdmaTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
@@ -503,26 +499,35 @@ Status RdmaTransport::submitTransferTasks(
         task->cancel_requested.store(false, std::memory_order_relaxed);
         task->ref();  // Batch holds a reference to the task
 
+        // Ask for one slice fewer when the tail is under a quarter block.
+        // Once the cap has widened the block, `tail` is not the real
+        // remainder and this is a guess -- worth revisiting, but it only
+        // moves what is asked for, never what is planned.
         const double merge_ratio = 0.25;
         uint64_t base_block = default_block_size;
-        uint64_t num_slices = (request.length + base_block - 1) / base_block;
-        num_slices = std::max<uint64_t>(
-            1, std::min<uint64_t>(num_slices, max_slice_count));
-
-        if (num_slices > 1) {
+        uint64_t requested_slices =
+            (request.length + base_block - 1) / base_block;
+        requested_slices = std::max<uint64_t>(
+            1, std::min<uint64_t>(requested_slices, max_slice_count));
+        if (requested_slices > 1) {
             uint64_t tail = request.length % base_block;
             if (tail > 0 &&
                 tail < static_cast<uint64_t>(base_block * merge_ratio)) {
-                num_slices = std::max<uint64_t>(1, num_slices - 1);
+                --requested_slices;
             }
         }
 
-        uint64_t block_size = roundup(
-            (request.length + num_slices - 1) / num_slices, default_block_size);
+        const auto plan =
+            planRdmaSlices(request.length, base_block, requested_slices);
+        const uint64_t block_size = plan.block_size;
+        const uint64_t num_slices = plan.count;
 
         std::vector<int> slice_dev_ids;
-        // Only if a single request is enough, we perform aggregated allocation
-        if (num_slices >= max_slice_count / 2) {
+        // Only if a single request is enough, we perform aggregated
+        // allocation. Gated on what was asked for, so which requests take
+        // this path did not change when the plan stopped counting empty
+        // slices; the allocation itself is sized from the plan.
+        if (requested_slices >= max_slice_count / 2) {
             std::string source_location = kWildcardLocation;
             auto source_locations =
                 Platform::getLoader().getLocation(request.source, 1, true);
