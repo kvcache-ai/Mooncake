@@ -19,9 +19,9 @@
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
-/python/mooncake/mooncake_ssd_*.py @ykwd @stmatengss @XucSh @YiXR
-/python/mooncake/spdk_tgt_create.py @ykwd @stmatengss @XucSh @YiXR
-/python/tests/ssd/ @ykwd @stmatengss @XucSh @YiXR
+/python/mooncake/mooncake_ssd_*.py @ykwd @stmatengss
+/python/mooncake/spdk_tgt_create.py @ykwd @stmatengss
+/python/tests/ssd/ @ykwd @stmatengss
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov

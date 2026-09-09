@@ -41,7 +41,7 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     clean_environment.pop("PYTHONPATH", None)
     clean_environment["PYTHONNOUSERSITE"] = "1"
     smoke_script = f"""
-from importlib import metadata, util
+from importlib import import_module, metadata, util
 from pathlib import Path
 import sys
 import mooncake
@@ -66,7 +66,8 @@ for module in (
     "mooncake.mooncake_ssd_unregister",
     "mooncake.spdk_tgt_create",
 ):
-    assert util.find_spec(module) is not None, module
+    import_module(module)
+assert util.find_spec("paramiko") is None
 assert "paramiko" not in sys.modules
 
 installed_files = {{str(path) for path in metadata.files("mooncake-transfer-engine") or []}}
@@ -82,3 +83,32 @@ assert {{
         env=clean_environment,
         check=True,
     )
+
+    def check_help():
+        for module in (
+            "mooncake.mooncake_ssd_register",
+            "mooncake.mooncake_ssd_unregister",
+            "mooncake.spdk_tgt_create",
+        ):
+            result = subprocess.run(
+                [str(python), "-I", "-m", module, "--help"],
+                cwd=tmp_path,
+                env=clean_environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            assert "usage:" in result.stdout
+
+    check_help()
+    subprocess.run(
+        [str(python), "-m", "pip", "install", f"{wheel}[administration]"],
+        check=True,
+    )
+    subprocess.run(
+        [str(python), "-I", "-c", "import paramiko; assert paramiko.SSHClient"],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
+    check_help()

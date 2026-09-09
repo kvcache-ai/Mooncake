@@ -2,13 +2,19 @@
 # Tool to remotely create SPDK targets on multiple nodes
 # Usage: python3 -m mooncake.spdk_tgt_create --spdk_target_info="ip:192.168.65.56 path:/home/spdk pci:0000:01:00.0,0000:02:00.0" --spdk_target_info="ip:192.168.65.57 path:/home/spdk"
 
+from __future__ import annotations
+
 import argparse
 import logging
-import paramiko
 import re
 import shlex
 import time
-from typing import List, Dict, Any, Optional
+from typing import TYPE_CHECKING, List, Dict, Any, Optional
+
+from mooncake._administration import require_paramiko
+
+if TYPE_CHECKING:
+    import paramiko
 
 
 class SPDKTgtCreator:
@@ -144,6 +150,7 @@ class SPDKTgtCreator:
         """
         Establish an SSH connection to the target host.
         """
+        paramiko = require_paramiko()
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 

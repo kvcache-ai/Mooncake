@@ -7,7 +7,7 @@ import json
 import shlex
 from typing import List, Dict, Any
 
-import paramiko
+from mooncake._administration import require_paramiko
 
 from mooncake.store import MooncakeDistributedNoFRegister
 
@@ -85,6 +85,7 @@ class MooncakeNoFUnregister:
         """
         Execute command on remote server via SSH
         """
+        paramiko = require_paramiko()
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:

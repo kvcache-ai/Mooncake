@@ -1,10 +1,5 @@
-from importlib.util import find_spec
 import sys
-import unittest
 from unittest.mock import patch
-
-if find_spec("paramiko") is None:
-    raise unittest.SkipTest("paramiko is required for SPDK target tests")
 
 from mooncake.spdk_tgt_create import SPDKTgtCreator, parse_arguments
 
@@ -29,7 +24,8 @@ def test_parse_arguments_accepts_ssh_port():
 def test_ssh_connect_uses_requested_port():
     creator = SPDKTgtCreator(["ip:127.0.0.1 path:/home/spdk"])
 
-    with patch("mooncake.spdk_tgt_create.paramiko.SSHClient") as ssh_client:
+    with patch("mooncake.spdk_tgt_create.require_paramiko") as require_paramiko:
+        ssh_client = require_paramiko.return_value.SSHClient
         creator._ssh_connect("127.0.0.1", port=2222)
 
     ssh_client.return_value.connect.assert_called_once_with(
