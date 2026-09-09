@@ -97,10 +97,10 @@ class TenantCatalog {
             max_deadline_by_group;
         auto objs = object_index.SnapshotObjects();
         for (const auto& entry : objs) {
+            auto lk = entry->LockShared();
             if (!entry->metadata().IsGrouped()) {
                 continue;
             }
-            auto lk = entry->LockShared();
             ObjectMetadata& metadata = entry->metadata();
             const auto deadline = metadata.EvictionDeadline();
             auto [it, inserted] = max_deadline_by_group.try_emplace(
@@ -110,10 +110,10 @@ class TenantCatalog {
             }
         }
         for (const auto& entry : objs) {
+            auto lk = entry->LockUnique();
             if (!entry->metadata().IsGrouped()) {
                 continue;
             }
-            auto lk = entry->LockUnique();
             ObjectMetadata& metadata = entry->metadata();
             auto lease = group_index.LeaseFor(metadata.group_id);
             group_index.AddMember(metadata.group_id, entry->key());
@@ -132,7 +132,6 @@ class TenantCatalog {
     std::shared_ptr<ObjectEntry> Pin(const std::string& key) const {
         return object_index.Pin(key);
     }
-    // Insert a NEW ObjectEntry; returns false if `key` already present.
     // Only erase when the route still resolves to `expected`; see
     // ObjectIndex::EraseIf.
     bool EraseObjectIf(const std::string& key,
@@ -146,8 +145,6 @@ class TenantCatalog {
     std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects() const {
         return object_index.SnapshotObjects();
     }
-    // True when this tenant holds no object route, no group membership, and
-    // no in-flight dynamic-replication lease.
 };
 
 }  // namespace tenant

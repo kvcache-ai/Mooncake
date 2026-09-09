@@ -179,7 +179,7 @@ class BatchEvictBench {
                 }
                 auto& tenant_state = *handle;
                 for (const auto& entry : tenant_state.SnapshotObjects()) {
-
+                    auto lock = entry->LockUnique();
                     auto& metadata = entry->metadata();
                     metadata.SetLeaseDeadlineForTesting(
                         base_expiration + std::chrono::nanoseconds(ordinal++));

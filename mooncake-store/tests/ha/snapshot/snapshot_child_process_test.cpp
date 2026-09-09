@@ -252,6 +252,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (!entry) {
             return std::nullopt;
         }
+        auto lock = entry->LockShared();
         return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
@@ -273,7 +274,11 @@ class SnapshotChildProcessTest : public ::testing::Test {
             return false;
         }
         auto entry = handle->Pin(key);
-        return entry != nullptr && entry->metadata().IsGrouped();
+        if (entry == nullptr) {
+            return false;
+        }
+        auto lock = entry->LockShared();
+        return entry->metadata().IsGrouped();
     }
 
    private:
