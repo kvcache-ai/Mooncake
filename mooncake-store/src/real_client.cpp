@@ -452,8 +452,9 @@ inline const Replica::Descriptor *SelectSessionReplica(
         }
         return nullptr;
     };
-    if (const auto *local_disk = find_complete(
-            [](const auto &replica) { return replica.is_local_disk_replica(); })) {
+    if (const auto *local_disk = find_complete([](const auto &replica) {
+            return replica.is_local_disk_replica();
+        })) {
         return local_disk;
     }
     if (const auto *dfs = find_complete(
@@ -484,8 +485,8 @@ std::shared_ptr<BufferHandle> AcquireSessionStaging(
         if (!backing->buffer.data || backing->buffer.capacity < size) {
             return nullptr;
         }
-        return std::make_shared<BufferHandle>(
-            backing->buffer.data, size, [backing]() { (void)backing; });
+        return std::make_shared<BufferHandle>(backing->buffer.data, size,
+                                              [backing]() { (void)backing; });
     } catch (const std::bad_alloc &) {
         return nullptr;
     }
@@ -5568,8 +5569,8 @@ std::vector<int> RealClient::batch_get_session_start(
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "Session query result size mismatch: expected="
                    << keys.size() << ", got=" << query_results.size();
-        return std::vector<int>(
-            keys.size(), static_cast<int>(toInt(ErrorCode::RPC_FAIL)));
+        return std::vector<int>(keys.size(),
+                                static_cast<int>(toInt(ErrorCode::RPC_FAIL)));
     }
     auto local_endpoints = client_->GetLocalEndpoints();
 
@@ -5661,13 +5662,15 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 continue;
             }
             if (it->second.replicas.size() != 1) {
-                results[i] = static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
+                results[i] =
+                    static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
                 continue;
             }
             const auto &replica = it->second.replicas.front();
             const uint64_t replica_size = calculate_total_size(replica);
             if (replica_size > std::numeric_limits<size_t>::max()) {
-                results[i] = static_cast<int>(toInt(ErrorCode::BUFFER_OVERFLOW));
+                results[i] =
+                    static_cast<int>(toInt(ErrorCode::BUFFER_OVERFLOW));
                 continue;
             }
             const size_t replica_limit = static_cast<size_t>(replica_size);
@@ -5681,8 +5684,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 if ((buffers[j] == nullptr && sizes[j] != 0) ||
                     is_object_range_overflow(offsets[j], sizes[j],
                                              replica_limit) ||
-                    sizes[j] > std::numeric_limits<size_t>::max() -
-                                   transferred) {
+                    sizes[j] >
+                        std::numeric_limits<size_t>::max() - transferred) {
                     overflow = true;
                     break;
                 }
@@ -5708,19 +5711,12 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 idx_map.push_back(i);
                 lease_deadlines.push_back(it->second.lease_timeout);
             } else {
-                non_memory_entries.push_back(
-                    NonMemoryReadEntry{keys[i],
-                                       i,
-                                       replica,
-                                       it->second,
-                                       std::vector<void *>(buffers.begin(),
-                                                           buffers.end()),
-                                       std::vector<size_t>(sizes.begin(),
-                                                           sizes.end()),
-                                       std::vector<size_t>(offsets.begin(),
-                                                           offsets.end()),
-                                       transferred,
-                                       it->second.lease_timeout});
+                non_memory_entries.push_back(NonMemoryReadEntry{
+                    keys[i], i, replica, it->second,
+                    std::vector<void *>(buffers.begin(), buffers.end()),
+                    std::vector<size_t>(sizes.begin(), sizes.end()),
+                    std::vector<size_t>(offsets.begin(), offsets.end()),
+                    transferred, it->second.lease_timeout});
             }
         }
     }
@@ -5755,8 +5751,7 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     auto fail_entries_for_key = [&](const std::string &key, ErrorCode error) {
         for (auto &entry : non_memory_entries) {
             if (entry.key == key) {
-                results[entry.original_index] =
-                    static_cast<int>(toInt(error));
+                results[entry.original_index] = static_cast<int>(toInt(error));
             }
         }
     };
@@ -5770,8 +5765,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             return;
         }
         for (size_t j = 0; j < entry.buffers.size(); ++j) {
-            const void *source = static_cast<const char *>(staging) +
-                                 entry.src_offsets[j];
+            const void *source =
+                static_cast<const char *>(staging) + entry.src_offsets[j];
             if (auto copy = scatter_host_to_maybe_device(
                     entry.buffers[j], source, entry.sizes[j],
                     "session file-backed range read, key: " + entry.key);
@@ -5834,7 +5829,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
             staging.emplace(entry->key, std::move(handle));
         }
         if (!objects.empty()) {
-            auto read = batch_get_into_offload_object_internal(endpoint, objects);
+            auto read =
+                batch_get_into_offload_object_internal(endpoint, objects);
             if (!read) {
                 for (const auto &[key, unused] : objects) {
                     fail_entries_for_key(key, read.error());
@@ -5844,7 +5840,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                     auto it = staging.find(entry->key);
                     if (it != staging.end() &&
                         results[entry->original_index] ==
-                            static_cast<int>(toInt(ErrorCode::INVALID_PARAMS))) {
+                            static_cast<int>(
+                                toInt(ErrorCode::INVALID_PARAMS))) {
                         scatter_entry(*entry, it->second->ptr());
                     }
                 }
@@ -5852,7 +5849,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         }
     }
 
-    auto read_disk_entries = [&](const std::vector<NonMemoryReadEntry *> &entries) {
+    auto read_disk_entries = [&](const std::vector<NonMemoryReadEntry *>
+                                     &entries) {
         std::vector<std::string> batch_keys;
         std::vector<QueryResult> batch_queries;
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
@@ -5885,8 +5883,9 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         auto read_results =
             client_->BatchGet(batch_keys, batch_queries, batch_slices);
         if (read_results.size() != batch_keys.size()) {
-            LOG(ERROR) << "Session DISK BatchGet result size mismatch: expected="
-                       << batch_keys.size() << ", got=" << read_results.size();
+            LOG(ERROR)
+                << "Session DISK BatchGet result size mismatch: expected="
+                << batch_keys.size() << ", got=" << read_results.size();
             for (const auto &key : batch_keys) {
                 fail_entries_for_key(key, ErrorCode::INTERNAL_ERROR);
             }
@@ -5920,8 +5919,8 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
                 (kObjectAlignment - arena_size % kObjectAlignment) %
                 kObjectAlignment;
             if (padding > std::numeric_limits<size_t>::max() - arena_size ||
-                object_size > std::numeric_limits<size_t>::max() - arena_size -
-                                  padding) {
+                object_size >
+                    std::numeric_limits<size_t>::max() - arena_size - padding) {
                 fail_entries_for_key(entry->key, ErrorCode::BUFFER_OVERFLOW);
                 continue;
             }
