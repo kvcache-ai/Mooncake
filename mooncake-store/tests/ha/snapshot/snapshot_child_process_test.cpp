@@ -255,9 +255,9 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
-    // Legacy metadata-bucket placement (std::hash % 1024); carries no
-    // behavioral meaning under per-tenant routing.
-    uint32_t GetShardIndexForTest(const std::string& key) {
+    // Shard index a legacy snapshot writer would have used for this key
+    // (std::hash % 1024); the legacy wire format stores per-shard maps.
+    uint32_t LegacyShardIndex(const std::string& key) {
         return static_cast<uint32_t>(std::hash<std::string>{}(key) % 1024);
     }
 
@@ -267,8 +267,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return serializer.Deserialize(data);
     }
 
-    bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
-        (void)shard_idx;
+    bool ObjectIsGroupedInMetadata(const std::string& key) {
         auto handle = service_->catalog_.Lookup(TenantId::Default());
         if (handle == nullptr) {
             return false;
@@ -278,7 +277,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                entry->metadata().IsGrouped();
     }
 
-    std::string FindGroupIdOnDifferentShard(MasterService* svc,
+    std::string FindGroupIdOnDifferentBucket(MasterService* svc,
                                             const std::string& key) {
         const size_t key_shard =
             std::hash<std::string>{}(key) % 1024;
@@ -626,7 +625,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
     replicate_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard(service_.get(), key)};
+        FindGroupIdOnDifferentBucket(service_.get(), key)};
 
     auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
                                         1024, replicate_config);
@@ -706,7 +705,7 @@ TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();
     const std::string key = "legacy_snapshot_no_group_id_key";
-    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const uint32_t shard_idx = LegacyShardIndex(key);
     const UUID client_id = generate_uuid();
 
     msgpack::sbuffer shard_buffer;
@@ -752,13 +751,13 @@ TEST_F(SnapshotChildProcessTest,
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
-    EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+    EXPECT_FALSE(ObjectIsGroupedInMetadata(key));
 }
 
 TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {
     CreateDefaultService();
     const std::string key = "invalid_client_id_snapshot_key";
-    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const uint32_t shard_idx = LegacyShardIndex(key);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);

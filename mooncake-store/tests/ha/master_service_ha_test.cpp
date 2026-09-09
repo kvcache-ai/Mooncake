@@ -599,32 +599,34 @@ class MasterServiceHATest : public ::testing::Test {
     // Legacy metadata-bucket placement (std::hash % 1024). Routing is now
     // per-tenant, so the bucket carries no behavioral meaning; the helpers
     // only pick names the old formula placed apart.
-    static size_t LegacyShardOf(std::string_view value) {
-        return std::hash<std::string_view>{}(value) % 1024;
+    static constexpr size_t kLegacyBucketCount = 1024;
+
+    static size_t LegacyBucketOf(std::string_view value) {
+        return std::hash<std::string_view>{}(value) % kLegacyBucketCount;
     }
 
-    static std::string FindGroupIdOnDifferentShard(size_t source_shard,
-                                                   const std::string& prefix) {
-        for (size_t index = 0; index < 2048; ++index) {
+    static std::string FindGroupIdOnDifferentBucket(size_t source_bucket,
+                                                    const std::string& prefix) {
+        for (size_t index = 0; index < kLegacyBucketCount * 2; ++index) {
             std::string group_id = prefix + std::to_string(index);
-            if (LegacyShardOf(group_id) != source_shard) {
+            if (LegacyBucketOf(group_id) != source_bucket) {
                 return group_id;
             }
         }
         return {};
     }
 
-    static std::string FindGroupIdOnDifferentShardFromObject(
+    static std::string FindGroupIdOnDifferentBucketFromObject(
         const TenantId& tenant_id, const std::string& key,
         const std::string& prefix) {
         const std::string scope =
             tenant_id.IsDefault() ? key : tenant_id.value();
-        return FindGroupIdOnDifferentShard(LegacyShardOf(scope), prefix);
+        return FindGroupIdOnDifferentBucket(LegacyBucketOf(scope), prefix);
     }
 
-    static std::string FindGroupIdOnDifferentShardFromGroup(
+    static std::string FindGroupIdOnDifferentBucketFromGroup(
         const std::string& group_id, const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(LegacyShardOf(group_id), prefix);
+        return FindGroupIdOnDifferentBucket(LegacyBucketOf(group_id), prefix);
     }
     // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
     // hence this static funnel. Seeds an in-flight PromotionTask for a
@@ -823,7 +825,7 @@ class MasterServiceHATest : public ::testing::Test {
 
     SnapshotBarrierGate snapshot_gate_;
 
-    static std::unique_lock<std::shared_mutex> LockMetadataShardForTesting(
+    static std::unique_lock<std::shared_mutex> LockRouteForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
         // ObjectIndex's route lock. Holding it EXCLUSIVE gates PutStart at its
@@ -1303,12 +1305,12 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherShard) {
+       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherGroup) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
-    const std::string key = "standby_cross_shard_duplicate";
-    const std::string endpoint = "standby_cross_shard_segment";
+    const std::string key = "standby_cross_group_duplicate";
+    const std::string endpoint = "standby_cross_group_segment";
     auto existing = MakeStandbyObject(key, endpoint);
     ASSERT_TRUE(service
                     .RestoreFromStandbySnapshot(
@@ -1316,7 +1318,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(kDefaultTenant, key, "group-");
+    duplicate.metadata.group_id = FindGroupIdOnDifferentBucketFromObject(kDefaultTenant, key, "group-");
     ASSERT_FALSE(duplicate.metadata.group_id.empty());
 
     auto result = service.RestoreFromStandbySnapshot(
@@ -1341,7 +1343,8 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(existing.metadata.group_id, "replacement-group-");
+    duplicate.metadata.group_id = FindGroupIdOnDifferentBucketFromGroup(existing.metadata.group_id,
+                                         "replacement-group-");
     ASSERT_FALSE(duplicate.metadata.group_id.empty());
 
     auto result = service.RestoreFromStandbySnapshot(
@@ -1551,10 +1554,10 @@ TEST_F(MasterServiceHATest,
     ReplicateConfig config;
     config.replica_num = 1;
     // Deterministically gate PutStart inside the snapshot barrier: holding the
-    // owning route shard EXCLUSIVE parks it at its first Pin, after it released
+    // owning route lock EXCLUSIVE parks it at its first Pin, after it released
     // client_mutex_ and while it holds snapshot_mutex_ (shared).
     snapshot_gate_.Arm();
-    auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
+    auto route_lock = LockRouteForTesting(service, kDefaultTenant, key);
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
@@ -1562,7 +1565,7 @@ TEST_F(MasterServiceHATest,
     if (!snapshot_gate_.WaitForArrive(std::chrono::seconds(5))) {
         // PutStart never entered the barrier within the deadline. Unblock it
         // and drain the future so the service destructs cleanly, then fail.
-        shard_lock.unlock();
+        route_lock.unlock();
         EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         if (put.wait_for(std::chrono::seconds(0)) ==
@@ -1576,7 +1579,7 @@ TEST_F(MasterServiceHATest,
     // ReMountSegment holds client_mutex_ exclusively while waiting for the
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
-    shard_lock.unlock();
+    route_lock.unlock();
     // A real re-acquire would block PutStart forever on client_mutex_ (held by
     // the test), so a generous window still catches it; a slow-but-legal
     // LOCAL_FIRST allocation completes far within it.

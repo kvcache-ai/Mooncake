@@ -857,14 +857,14 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
 }
 
 TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
-    auto find_group_id_on_different_shard = [](const std::string& key) {
-        static constexpr size_t kMetadataShardCountForTest = 1024;
+    auto find_group_id_on_different_bucket = [](const std::string& key) {
+        static constexpr size_t kLegacyBucketCount = 1024;
         const size_t key_shard =
-            std::hash<std::string>{}(key) % kMetadataShardCountForTest;
+            std::hash<std::string>{}(key) % kLegacyBucketCount;
         for (int i = 0; i < 10000; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
             if (std::hash<std::string>{}(group_id) %
-                    kMetadataShardCountForTest !=
+                    kLegacyBucketCount !=
                 key_shard) {
                 return group_id;
             }
@@ -897,8 +897,8 @@ TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids =
-        std::vector<std::string>{find_group_id_on_different_shard(keys[0]), "",
-                                 find_group_id_on_different_shard(keys[2])};
+        std::vector<std::string>{find_group_id_on_different_bucket(keys[0]), "",
+                                 find_group_id_on_different_bucket(keys[2])};
 
     auto put_results = test_client_->BatchPut(keys, batched_slices, config);
     ASSERT_EQ(put_results.size(), keys.size());

@@ -1545,7 +1545,7 @@ TEST_F(MasterServiceTest, SoftPinDeadlineIndexExpiresOnlyDueEntries) {
 
     ReplicateConfig grouped_config = config;
     grouped_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard("grouped_deadline_key")};
+        FindGroupIdOnDifferentBucket("grouped_deadline_key")};
     PutCompletedObject(*service, client_id, "grouped_deadline_key",
                        grouped_config);
 

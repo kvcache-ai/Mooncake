@@ -19,7 +19,7 @@ TEST_F(MasterServiceTest, GroupedLeaseRefreshNearExpiryProtectsCurrentMembers) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = FindGroupIdOnDifferentBucket(key_a);
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -60,7 +60,7 @@ TEST_F(MasterServiceTest, GroupedEvictionSkipsUnsafeMembersAndEvictsSafePeers) {
 
     const std::string safe_key = "grouped_mixed_safe_key";
     const std::string hard_pinned_key = "grouped_mixed_hard_pinned_key";
-    const std::string group_id = FindGroupIdOnDifferentShard(safe_key);
+    const std::string group_id = FindGroupIdOnDifferentBucket(safe_key);
 
     ReplicateConfig safe_config;
     safe_config.replica_num = 1;
@@ -112,8 +112,8 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.group_ids =
-        std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), "",
-                                 FindGroupIdOnDifferentShard(keys[2])};
+        std::vector<std::string>{FindGroupIdOnDifferentBucket(keys[0]), "",
+                                 FindGroupIdOnDifferentBucket(keys[2])};
 
     auto results = service_.BatchPutStart(client_id, keys, sizes, config);
     ASSERT_EQ(results.size(), keys.size());
@@ -254,20 +254,20 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
-    // Two member keys that hash to different metadata shards, sharing one
-    // group whose id hashes to yet another shard. The default-tenant route is
-    // hash(key) % 1024 (the legacy metadata-bucket placement).
-    constexpr size_t kMetadataShardCountForTest = 1024;
+    // Two member keys that hash to different metadata buckets, sharing one
+    // group whose id hashes to yet another bucket
+    // (std::hash<std::string>{}(x) % kLegacyBucketCount).
+    constexpr size_t kLegacyBucketCount = 1024;
     const std::string key_a = "route_decouple_key_a";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = FindGroupIdOnDifferentBucket(key_a);
     std::string key_b = "route_decouple_key_b";
     const size_t shard_a =
-        std::hash<std::string>{}(key_a) % kMetadataShardCountForTest;
+        std::hash<std::string>{}(key_a) % kLegacyBucketCount;
     size_t shard_b =
-        std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
+        std::hash<std::string>{}(key_b) % kLegacyBucketCount;
     for (int i = 0; i < 10000 && shard_b == shard_a; ++i) {
         key_b = "route_decouple_key_b_" + std::to_string(i);
-        shard_b = std::hash<std::string>{}(key_b) % kMetadataShardCountForTest;
+        shard_b = std::hash<std::string>{}(key_b) % kLegacyBucketCount;
     }
     ASSERT_NE(shard_a, shard_b);  // members span metadata shards
 
@@ -296,9 +296,9 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     // objects existed), so a later ungrouped put of the same key would land on
     // the same shard.
     EXPECT_EQ(shard_a,
-              std::hash<std::string>{}(key_a) % kMetadataShardCountForTest);
+              std::hash<std::string>{}(key_a) % kLegacyBucketCount);
     EXPECT_EQ(shard_b,
-              std::hash<std::string>{}(key_b) % kMetadataShardCountForTest);
+              std::hash<std::string>{}(key_b) % kLegacyBucketCount);
 }
 
 TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
@@ -310,7 +310,7 @@ TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {
 
     const std::string key_a = "lease_group_key_a";
     const std::string key_b = "lease_group_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = FindGroupIdOnDifferentBucket(key_a);
 
     ReplicateConfig config_a;
     config_a.replica_num = 1;
@@ -359,7 +359,7 @@ TEST_F(MasterServiceTest, GroupedMembershipChangeStillSharesGroupLeaseOnRead) {
 
     const std::string key_a = "lease_group_dirty_key_a";
     const std::string key_b = "lease_group_dirty_key_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = FindGroupIdOnDifferentBucket(key_a);
 
     ReplicateConfig config;
     config.replica_num = 1;
@@ -463,7 +463,7 @@ TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
 
     const std::string key_a = "group_lease_member_a";
     const std::string key_b = "group_lease_member_b";
-    const std::string group_id = FindGroupIdOnDifferentShard(key_a);
+    const std::string group_id = FindGroupIdOnDifferentBucket(key_a);
 
     ReplicateConfig config;
     config.replica_num = 1;

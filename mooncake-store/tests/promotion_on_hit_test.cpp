@@ -1001,9 +1001,9 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
 
     // Find two keys that hash to the same metadata bucket
     // (std::hash<std::string>{}(key) % 1024).
-    constexpr size_t kNumShardsLocal = 1024;
+    constexpr size_t kLegacyBucketCount = 1024;
     auto shard_of = [](const std::string& k) {
-        return std::hash<std::string>{}(k) % kNumShardsLocal;
+        return std::hash<std::string>{}(k) % kLegacyBucketCount;
     };
     const std::string k1 = "qlim_first";
     std::string k2;
@@ -1240,9 +1240,9 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsCrossShard) {
     // Find two keys hashing to *different* shards. With the old per-shard
     // heuristic this would let both through (each shard's count is 0
     // independently). With the global counter, only the first goes in.
-    constexpr size_t kNumShardsLocal = 1024;
+    constexpr size_t kLegacyBucketCount = 1024;
     auto shard_of = [](const std::string& k) {
-        return std::hash<std::string>{}(k) % kNumShardsLocal;
+        return std::hash<std::string>{}(k) % kLegacyBucketCount;
     };
     const std::string k1 = "xshard_first";
     std::string k2;
