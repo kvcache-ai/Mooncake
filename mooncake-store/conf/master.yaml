@@ -38,6 +38,9 @@ client_live_ttl_sec: 60
 
 # OpLog store configuration for HA hot-standby replication
 enable_oplog: false
+enable_oplog_snapshot: false
+# Maximum objects per standby batch OpLog snapshot chunk
+snapshot_chunk_object_count: 1000000
 # Batch standby base polling/retry delay in milliseconds
 oplog_poll_interval_ms: 1000
 # Maximum consecutive retryable batch-standby failure window in seconds

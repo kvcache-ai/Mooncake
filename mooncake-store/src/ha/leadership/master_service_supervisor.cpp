@@ -236,11 +236,11 @@ void EnterStandbyMode(MasterAdminServer& admin_server,
 
 int RunSupervisorLoop(const HABackendSpec& spec,
                       const MasterServiceSupervisorConfig& config,
-                      MasterAdminServer& admin_server) {
+                      MasterAdminServer& admin_server,
+                      std::unique_ptr<StandbyController> standby_controller) {
     auto label_reconciler = MakeLeaderLabelReconciler(config);
     label_reconciler.SetLeader(false);
     SetRuntimeState(admin_server, MasterRuntimeState::kStarting);
-    auto standby_controller = CreateStandbyController(spec, config);
     std::atomic<bool> accept_standby_runtime_updates{false};
     standby_controller->SetStandbyRuntimeStateCallback(
         [&](MasterRuntimeState state) {
@@ -597,6 +597,15 @@ int MasterServiceSupervisor::Start() {
         return -1;
     }
 
+    std::unique_ptr<StandbyController> standby_controller;
+    try {
+        standby_controller = CreateStandbyController(*spec, config_);
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "Standby dependency initialization failed: "
+                   << error.what();
+        return -1;
+    }
+
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
         config_.enable_metric_reporting, config_.metrics_host);
@@ -605,7 +614,8 @@ int MasterServiceSupervisor::Start() {
                    << config_.metrics_port;
         return -1;
     }
-    return RunSupervisorLoop(*spec, config_, admin_server);
+    return RunSupervisorLoop(*spec, config_, admin_server,
+                             std::move(standby_controller));
 }
 
 }  // namespace ha

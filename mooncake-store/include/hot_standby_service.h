@@ -226,14 +226,21 @@ class HotStandbyService {
     }
 
    private:
+    enum class PromotionCatchUpPolicy {
+        kLegacyTotalDeadline,
+        kBoundedNoProgress,
+    };
+
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
-    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
-    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id,
+                                             PromotionCatchUpPolicy policy);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
+                                             PromotionCatchUpPolicy policy);
     void StopReplicationLoop();
     void HandleSnapshotCaptureRequest(
         const OpLogBatchStandbyPollResult& result);
@@ -241,7 +248,8 @@ class HotStandbyService {
     void NotifySnapshotPromotion();
     void NotifySnapshotStop();
 
-    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id);
+    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id,
+                                     PromotionCatchUpPolicy policy);
     ErrorCode CompletePromotionLocked();
 
     void NotifySyncStatus();

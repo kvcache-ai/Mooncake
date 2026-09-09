@@ -16,6 +16,7 @@
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+#include "ha/snapshot/batch_oplog/config.h"
 
 #include "http_metadata_server.h"
 #include "master_admin_service.h"
@@ -310,6 +311,10 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 // OpLog store configuration
 DEFINE_bool(enable_oplog, false,
             "Enable HA metadata replication through batch-record OpLog");
+DEFINE_bool(enable_oplog_snapshot, false,
+            "Enable standby batch OpLog snapshot production");
+DEFINE_uint64(snapshot_chunk_object_count, 1000000,
+              "Maximum objects per standby batch OpLog snapshot chunk");
 DEFINE_int32(oplog_poll_interval_ms, 1000,
              "Batch-record standby poll interval.");
 DEFINE_uint32(oplog_batch_max_entries, 1024,
@@ -612,6 +617,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetBool("enable_oplog", &master_config.enable_oplog,
                            FLAGS_enable_oplog);
+    default_config.GetBool("enable_oplog_snapshot",
+                           &master_config.enable_oplog_snapshot,
+                           FLAGS_enable_oplog_snapshot);
+    default_config.GetUInt64("snapshot_chunk_object_count",
+                             &master_config.snapshot_chunk_object_count,
+                             FLAGS_snapshot_chunk_object_count);
     default_config.GetInt32("oplog_poll_interval_ms",
                             &master_config.oplog_poll_interval_ms,
                             FLAGS_oplog_poll_interval_ms);
@@ -1108,6 +1119,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_oplog = FLAGS_enable_oplog;
     }
+    if ((google::GetCommandLineFlagInfo("enable_oplog_snapshot", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_oplog_snapshot = FLAGS_enable_oplog_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_chunk_object_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_chunk_object_count =
+            FLAGS_snapshot_chunk_object_count;
+    }
     if ((google::GetCommandLineFlagInfo("oplog_poll_interval_ms", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -1461,6 +1483,10 @@ int main(int argc, char* argv[]) {
         LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
         return 1;
     }
+    if (auto error = ValidateBatchOpLogSnapshotConfig(master_config)) {
+        LOG(FATAL) << *error;
+        return 1;
+    }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
@@ -1539,6 +1565,9 @@ int main(int argc, char* argv[]) {
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
         << ", enable_oplog=" << master_config.enable_oplog
+        << ", enable_oplog_snapshot=" << master_config.enable_oplog_snapshot
+        << ", snapshot_chunk_object_count="
+        << master_config.snapshot_chunk_object_count
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_kv_events=" << master_config.enable_kv_events
         << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint

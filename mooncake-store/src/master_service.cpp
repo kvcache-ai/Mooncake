@@ -254,7 +254,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 
     const bool use_snapshot_backup_dir = !config.snapshot_backup_dir.empty();
-    if (config.enable_snapshot || config.enable_snapshot_restore) {
+    if (!config.enable_oplog_snapshot &&
+        (config.enable_snapshot || config.enable_snapshot_restore)) {
         try {
             auto object_store_type =
                 ParseSnapshotObjectStoreType(config.snapshot_object_store_type);
@@ -283,7 +284,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
         tenant_quota_policy_store_ = std::move(store.value());
     }
 
-    if (config.enable_snapshot_restore) {
+    if (config.enable_snapshot_restore && !config.enable_oplog_snapshot) {
         RestoreState();
     }
     if (enable_multi_tenants_) {
