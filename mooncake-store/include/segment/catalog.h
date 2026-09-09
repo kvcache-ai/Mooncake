@@ -8,7 +8,7 @@
 #include <string_view>
 
 #include "segment/mounted_region.h"
-#include "utils/transparent_string_hash.h"
+#include "common/transparent_string_hash.h"
 
 namespace mooncake {
 
