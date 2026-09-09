@@ -1246,9 +1246,25 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                 // flows.
                 device_selector_->setDeviceAvailable(dev_id, false);
                 LOG(WARNING) << "Action: " << context.name() << " down";
-            } else {
-                activateContext(dev_id, context);
+            } else if (activateContext(dev_id, context)) {
                 LOG(WARNING) << "Action: " << context.name() << " up";
+            }
+            break;
+        }
+        case IBV_EVENT_GID_CHANGE:
+        case IBV_EVENT_LID_CHANGE: {
+            if (event.element.port_num != context.portNum()) {
+                LOG(INFO) << context.name() << ": ignoring "
+                          << ibv_event_type_str(event.event_type)
+                          << " for port " << event.element.port_num
+                          << " (this context uses port "
+                          << static_cast<int>(context.portNum()) << ")";
+                break;
+            }
+            if (activateContext(dev_id, context)) {
+                LOG(WARNING)
+                    << "Action: " << context.name() << " refreshed after "
+                    << ibv_event_type_str(event.event_type);
             }
             break;
         }
@@ -1266,12 +1282,52 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
     }
 }
 
-void Workers::activateContext(int dev_id, RdmaContext& context) {
-    context.resume();
+RdmaAddressRefreshResult Workers::refreshAddress(RdmaContext& context) {
+    RdmaAddressSnapshot previous;
+    RdmaAddressSnapshot current;
+    auto result = context.refreshAddress(&previous, &current);
+    if (result == RdmaAddressRefreshResult::CHANGED) {
+        LOG(WARNING) << "Refreshed RDMA address for " << context.name()
+                     << ": LID " << previous.lid << " -> " << current.lid
+                     << ", GID[" << previous.gid_index << "] " << previous.gid
+                     << " -> GID[" << current.gid_index << "] " << current.gid;
+    } else if (result == RdmaAddressRefreshResult::UNCHANGED) {
+        VLOG(1) << "RDMA address for " << context.name() << " is unchanged";
+    }
+    return result;
+}
+
+bool Workers::activateContext(int dev_id, RdmaContext& context) {
+    // Stop new work from selecting this NIC while its address generation is
+    // being replaced. Incoming bootstrap also rejects paused contexts.
+    if (context.pause() != 0 ||
+        context.status() != RdmaContext::DEVICE_PAUSED) {
+        if (device_selector_)
+            device_selector_->setDeviceAvailable(dev_id, false);
+        LOG(WARNING) << "Action: " << context.name()
+                     << " cannot refresh RDMA address from context state "
+                     << context.status();
+        return false;
+    }
+    if (device_selector_) device_selector_->setDeviceAvailable(dev_id, false);
+
+    auto result = refreshAddress(context);
+    if (result == RdmaAddressRefreshResult::FAILED) {
+        LOG(WARNING) << "Action: " << context.name()
+                     << " remains down because its RDMA address could not be "
+                        "refreshed";
+        return false;
+    }
+
+    // resume() evicts every endpoint built with the previous address before
+    // the NIC becomes selectable again. This is deliberately conservative for
+    // a spurious change event whose queried value is unchanged.
+    if (context.resume() != 0) return false;
     // The link may have renegotiated while down: re-seed before the device
     // becomes selectable so no worker scores it on the old rate.
     refreshLinkSpeed(dev_id, context);
     if (device_selector_) device_selector_->setDeviceAvailable(dev_id, true);
+    return true;
 }
 
 void Workers::refreshLinkSpeed(int dev_id, RdmaContext& context) {
