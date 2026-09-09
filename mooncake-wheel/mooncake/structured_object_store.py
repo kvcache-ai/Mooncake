@@ -6251,8 +6251,9 @@ _WRITE_CONFIG_COPY_FIELDS = (
     "preferred_segment",
     "preferred_segments",
     "replica_num",
+    "soft_pin_action",
+    "soft_pin_ttl_ms",
     "with_hard_pin",
-    "with_soft_pin",
 )
 
 
