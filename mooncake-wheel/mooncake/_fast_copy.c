@@ -8,6 +8,233 @@
 #define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
 #include <numpy/arrayobject.h>
 
+#ifndef ARROW_C_DATA_INTERFACE
+#define ARROW_C_DATA_INTERFACE
+struct ArrowArray {
+    int64_t length, null_count, offset, n_buffers, n_children;
+    const void **buffers;
+    struct ArrowArray **children;
+    struct ArrowArray *dictionary;
+    void (*release)(struct ArrowArray *);
+    void *private_data;
+};
+struct ArrowSchema {
+    const char *format, *name, *metadata;
+    int64_t flags, n_children;
+    struct ArrowSchema **children;
+    struct ArrowSchema *dictionary;
+    void (*release)(struct ArrowSchema *);
+    void *private_data;
+};
+#endif
+
+typedef struct {
+    struct ArrowArray array;
+    const void *data;
+} PillowArrowOwner;
+
+typedef struct {
+    const void *buffers[2];
+    Py_buffer view;
+} BufferArrowOwner;
+
+static void release_moved_pillow_array(PyObject *capsule) {
+    PillowArrowOwner *owner =
+        PyCapsule_GetPointer(capsule, "mooncake_pillow_arrow");
+    if (!owner) {
+        PyErr_Clear();
+        return;
+    }
+    if (owner->array.release) owner->array.release(&owner->array);
+    free(owner);
+}
+
+static int parse_pillow_arrow(PyObject *image, PillowArrowOwner **out,
+                              unsigned long long *data_size) {
+    PyObject *capsules = PyObject_CallMethod(image, "__arrow_c_array__", NULL);
+    if (!capsules) return -1;
+    if (!PyTuple_Check(capsules) || PyTuple_GET_SIZE(capsules) != 2) {
+        Py_DECREF(capsules);
+        PyErr_SetString(PyExc_ValueError,
+                        "Pillow returned invalid Arrow capsules");
+        return -1;
+    }
+    struct ArrowSchema *schema =
+        PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 0), "arrow_schema");
+    struct ArrowArray *array =
+        PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 1), "arrow_array");
+    if (!schema || !array) {
+        Py_DECREF(capsules);
+        return -1;
+    }
+    if (!schema->release || !array->release) goto invalid;
+    if (!schema->format || strcmp(schema->format, "+w:4") != 0 ||
+        schema->n_children != 1 || array->n_children != 1 ||
+        array->n_buffers != 1 || !array->buffers || array->buffers[0] ||
+        schema->dictionary || !schema->children || !array->children)
+        goto invalid;
+    const struct ArrowSchema *data_schema = schema->children[0];
+    const struct ArrowArray *data_array = array->children[0];
+    if (!data_schema || !data_array || !data_schema->release ||
+        !data_array->release || !data_schema->format ||
+        strcmp(data_schema->format, "C") != 0 || data_schema->n_children != 0 ||
+        data_schema->dictionary || data_schema->children ||
+        data_array->offset != 0 || data_array->null_count != 0 ||
+        data_array->n_buffers != 2 || data_array->n_children != 0 ||
+        data_array->dictionary || data_array->children ||
+        !data_array->buffers || data_array->buffers[0] ||
+        !data_array->buffers[1] || array->offset != 0 ||
+        array->null_count != 0 || array->dictionary || array->length < 0 ||
+        array->length > INT64_MAX / 4 ||
+        data_array->length != array->length * 4)
+        goto invalid;
+    PillowArrowOwner *owner = calloc(1, sizeof(*owner));
+    if (!owner) {
+        Py_DECREF(capsules);
+        PyErr_NoMemory();
+        return -1;
+    }
+    owner->array = *array;
+    array->release = NULL;
+    *data_size = (unsigned long long)data_array->length;
+    owner->data = data_array->buffers[1];
+    Py_DECREF(capsules);
+    *out = owner;
+    return 0;
+invalid:
+    Py_DECREF(capsules);
+    PyErr_SetString(PyExc_ValueError, "unsupported Pillow Arrow layout");
+    return -1;
+}
+
+static PyObject *pillow_arrow_view(PyObject *self, PyObject *image) {
+    PillowArrowOwner *owner = NULL;
+    unsigned long long size = 0;
+    if (parse_pillow_arrow(image, &owner, &size) < 0) return NULL;
+    if (size > NPY_MAX_INTP) {
+        if (owner->array.release) owner->array.release(&owner->array);
+        free(owner);
+        return PyErr_Format(PyExc_OverflowError,
+                            "Pillow Arrow buffer is too large: %llu", size);
+    }
+    npy_intp dims[1] = {(npy_intp)size};
+    PyObject *array =
+        PyArray_SimpleNewFromData(1, dims, NPY_UINT8, (void *)owner->data);
+    if (!array) {
+        if (owner->array.release) owner->array.release(&owner->array);
+        free(owner);
+        return NULL;
+    }
+    PyObject *capsule = PyCapsule_New(owner, "mooncake_pillow_arrow",
+                                      release_moved_pillow_array);
+    if (!capsule) {
+        Py_DECREF(array);
+        if (owner->array.release) owner->array.release(&owner->array);
+        free(owner);
+        return NULL;
+    }
+    if (PyArray_SetBaseObject((PyArrayObject *)array, capsule) < 0) {
+        Py_DECREF(array);
+        return NULL;
+    }
+    PyArray_CLEARFLAGS((PyArrayObject *)array, NPY_ARRAY_WRITEABLE);
+    return array;
+}
+
+static void release_buffer_arrow(struct ArrowArray *array) {
+    if (!array || !array->release) return;
+    BufferArrowOwner *owner = array->private_data;
+    array->release = NULL;
+    PyGILState_STATE state = PyGILState_Ensure();
+    PyBuffer_Release(&owner->view);
+    PyGILState_Release(state);
+    free(owner);
+}
+
+static void release_arrow_schema(struct ArrowSchema *schema) {
+    if (!schema || !schema->release) return;
+    schema->release = NULL;
+}
+
+static void destroy_arrow_array_capsule(PyObject *capsule) {
+    struct ArrowArray *array = PyCapsule_GetPointer(capsule, "arrow_array");
+    if (!array) {
+        PyErr_Clear();
+        return;
+    }
+    if (array->release) array->release(array);
+    free(array);
+}
+
+static void destroy_arrow_schema_capsule(PyObject *capsule) {
+    struct ArrowSchema *schema = PyCapsule_GetPointer(capsule, "arrow_schema");
+    if (!schema) {
+        PyErr_Clear();
+        return;
+    }
+    if (schema->release) schema->release(schema);
+    free(schema);
+}
+
+static PyObject *export_arrow_u8(PyObject *self, PyObject *args) {
+    PyObject *buffer;
+    PyObject *requested = Py_None;
+    if (!PyArg_ParseTuple(args, "O|O", &buffer, &requested)) return NULL;
+    (void)requested;
+    BufferArrowOwner *owner = calloc(1, sizeof(*owner));
+    struct ArrowArray *array = calloc(1, sizeof(*array));
+    struct ArrowSchema *schema = calloc(1, sizeof(*schema));
+    if (!owner || !array || !schema) {
+        free(owner);
+        free(array);
+        free(schema);
+        return PyErr_NoMemory();
+    }
+    if (PyObject_GetBuffer(buffer, &owner->view, PyBUF_CONTIG_RO) < 0) {
+        free(owner);
+        free(array);
+        free(schema);
+        return NULL;
+    }
+    if (owner->view.len < 0 || (owner->view.len > 0 && !owner->view.buf)) {
+        PyBuffer_Release(&owner->view);
+        free(owner);
+        free(array);
+        free(schema);
+        PyErr_SetString(PyExc_ValueError, "invalid Arrow buffer");
+        return NULL;
+    }
+    owner->buffers[1] = owner->view.buf;
+    array->length = owner->view.len;
+    array->null_count = 0;
+    array->n_buffers = 2;
+    array->buffers = owner->buffers;
+    array->release = release_buffer_arrow;
+    array->private_data = owner;
+    schema->format = "C";
+    schema->release = release_arrow_schema;
+    PyObject *schema_capsule =
+        PyCapsule_New(schema, "arrow_schema", destroy_arrow_schema_capsule);
+    if (!schema_capsule) {
+        array->release(array);
+        free(array);
+        free(schema);
+        return NULL;
+    }
+    PyObject *array_capsule =
+        PyCapsule_New(array, "arrow_array", destroy_arrow_array_capsule);
+    if (!array_capsule) {
+        Py_DECREF(schema_capsule);
+        array->release(array);
+        free(array);
+        return NULL;
+    }
+    PyObject *result = PyTuple_Pack(2, schema_capsule, array_capsule);
+    Py_DECREF(schema_capsule);
+    Py_DECREF(array_capsule);
+    return result;
+}
+
 typedef struct {
     void **src_ptrs;
     size_t *src_sizes;
@@ -179,6 +406,10 @@ fail:
 static PyMethodDef module_methods[] = {
     {"concat_arrays_into", concat_arrays_into, METH_VARARGS,
      "Scatter-copy arrays[start:start+count] into dest_ptr (GIL released)."},
+    {"pillow_arrow_view", pillow_arrow_view, METH_O,
+     "Return a read-only uint8 view over Pillow Arrow pixel storage."},
+    {"export_arrow_u8", export_arrow_u8, METH_VARARGS,
+     "Export a contiguous buffer through the Arrow PyCapsule interface."},
     {NULL, NULL, 0, NULL}};
 
 static struct PyModuleDef moduledef = {
