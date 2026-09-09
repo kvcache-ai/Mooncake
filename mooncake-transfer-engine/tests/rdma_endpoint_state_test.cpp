@@ -367,6 +367,22 @@ TEST_F(RdmaEndPointStateTest, ConnectedIsReadyToSend) {
     EXPECT_TRUE(endpoint_->readyToSend());
 }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+TEST_F(RdmaEndPointStateTest, LimitedSubmitLeavesDeferredSuffixQueued) {
+    Transport::Slice first{};
+    Transport::Slice deferred{};
+    std::vector<Transport::Slice *> queued{&first, &deferred};
+    std::vector<Transport::Slice *> failed;
+
+    endpoint_->submitPostSendLimited(queued, failed, 1);
+
+    ASSERT_EQ(failed.size(), 1u);
+    EXPECT_EQ(failed.front(), &first);
+    ASSERT_EQ(queued.size(), 1u);
+    EXPECT_EQ(queued.front(), &deferred);
+}
+#endif
+
 TEST_F(RdmaEndPointStateTest, ReadyAckTimeoutOnlyAppliesToWaitingState) {
     RdmaEndPointTestPeer::setReadyWaitStartTs(*endpoint_, 1);
 
