@@ -77,8 +77,8 @@ class ObjectMetadata {
           group_id(std::move(group_id_)),
           tenant_id(std::move(tenant_id_)),
           user_key(std::move(user_key_)),
-          soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           hard_pinned(enable_hard_pin),
+          soft_pin_timeout(std::move(committed_soft_pin_timeout)),
           replicas_(std::move(reps)) {
         MasterMetricManager::instance().inc_key_count(1);
         if (soft_pin_timeout) {

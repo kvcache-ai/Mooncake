@@ -63,7 +63,11 @@ class ObjectIndex {
     // candidate revalidate itself against replacements of the same key.
     bool IsCurrent(const std::string& key, const ObjectEntry* entry) const {
         auto pinned = Pin(key);
-        return pinned && pinned.get() == entry && !entry->is_torn_down;
+        if (!pinned || pinned.get() != entry) {
+            return false;
+        }
+        auto lk = entry->LockShared();
+        return !entry->is_torn_down;
     }
 
     // Erase the route slot for `key` ONLY if it still resolves to `expected`.

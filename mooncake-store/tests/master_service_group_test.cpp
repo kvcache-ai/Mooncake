@@ -261,10 +261,8 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     const std::string key_a = "route_decouple_key_a";
     const std::string group_id = FindGroupIdOnDifferentBucket(key_a);
     std::string key_b = "route_decouple_key_b";
-    const size_t shard_a =
-        std::hash<std::string>{}(key_a) % kLegacyBucketCount;
-    size_t shard_b =
-        std::hash<std::string>{}(key_b) % kLegacyBucketCount;
+    const size_t shard_a = std::hash<std::string>{}(key_a) % kLegacyBucketCount;
+    size_t shard_b = std::hash<std::string>{}(key_b) % kLegacyBucketCount;
     for (int i = 0; i < 10000 && shard_b == shard_a; ++i) {
         key_b = "route_decouple_key_b_" + std::to_string(i);
         shard_b = std::hash<std::string>{}(key_b) % kLegacyBucketCount;
@@ -295,10 +293,8 @@ TEST_F(MasterServiceTest, GroupedRoutingUsesHashOfTenantAndKeyOnly) {
     // does not change it (identical to the ungrouped route computed before the
     // objects existed), so a later ungrouped put of the same key would land on
     // the same shard.
-    EXPECT_EQ(shard_a,
-              std::hash<std::string>{}(key_a) % kLegacyBucketCount);
-    EXPECT_EQ(shard_b,
-              std::hash<std::string>{}(key_b) % kLegacyBucketCount);
+    EXPECT_EQ(shard_a, std::hash<std::string>{}(key_a) % kLegacyBucketCount);
+    EXPECT_EQ(shard_b, std::hash<std::string>{}(key_b) % kLegacyBucketCount);
 }
 
 TEST_F(MasterServiceTest, GroupedReadRefreshesSharedGroupLease) {

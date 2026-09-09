@@ -863,8 +863,7 @@ TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
             std::hash<std::string>{}(key) % kLegacyBucketCount;
         for (int i = 0; i < 10000; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) %
-                    kLegacyBucketCount !=
+            if (std::hash<std::string>{}(group_id) % kLegacyBucketCount !=
                 key_shard) {
                 return group_id;
             }

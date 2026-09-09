@@ -273,14 +273,12 @@ class SnapshotChildProcessTest : public ::testing::Test {
             return false;
         }
         auto entry = handle->Pin(key);
-        return entry != nullptr &&
-               entry->metadata().IsGrouped();
+        return entry != nullptr && entry->metadata().IsGrouped();
     }
 
     std::string FindGroupIdOnDifferentBucket(MasterService* svc,
-                                            const std::string& key) {
-        const size_t key_shard =
-            std::hash<std::string>{}(key) % 1024;
+                                             const std::string& key) {
+        const size_t key_shard = std::hash<std::string>{}(key) % 1024;
         for (int i = 0; i < 1024; ++i) {
             std::string group_id = key + "_group_" + std::to_string(i);
             if (std::hash<std::string>{}(group_id) % 1024 != key_shard) {

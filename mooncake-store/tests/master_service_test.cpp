@@ -767,13 +767,14 @@ TEST_F(MasterServiceTest,
             while (!start.load(std::memory_order_acquire)) {
                 std::this_thread::yield();
             }
-            auto put_start = service_->PutStart(
-                client_id, keys[i], tenant_id, 1024, config);
+            auto put_start =
+                service_->PutStart(client_id, keys[i], tenant_id, 1024, config);
             ASSERT_TRUE(put_start.has_value())
                 << "key=" << keys[i] << ", error=" << put_start.error();
-            ASSERT_TRUE(service_->PutEnd(client_id, keys[i], tenant_id,
-                                         ReplicaType::MEMORY)
-                            .has_value());
+            ASSERT_TRUE(
+                service_
+                    ->PutEnd(client_id, keys[i], tenant_id, ReplicaType::MEMORY)
+                    .has_value());
         });
     }
     while (ready.load(std::memory_order_acquire) < kThreadCount) {
@@ -1392,7 +1393,6 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Creation time: " << total_create_duration.count() << "ms\n"
               << "Unmount time: " << unmount_duration.count() << "ms\n";
 }
-
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     const uint64_t kv_lease_ttl = 200;

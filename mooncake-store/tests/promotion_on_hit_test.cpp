@@ -70,11 +70,10 @@ class PromotionOnHitTest : public ::testing::Test {
     }
 
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
-        service->catalog_.Visit([](const TenantId&,
-                                   const std::shared_ptr<TenantCatalog>&
-                                       handle) {
-            handle->ResetPromotionCandidateBackoffsForTesting();
-        });
+        service->catalog_.Visit(
+            [](const TenantId&, const std::shared_ptr<TenantCatalog>& handle) {
+                handle->ResetPromotionCandidateBackoffsForTesting();
+            });
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {

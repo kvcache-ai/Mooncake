@@ -1318,7 +1318,8 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentBucketFromObject(kDefaultTenant, key, "group-");
+    duplicate.metadata.group_id =
+        FindGroupIdOnDifferentBucketFromObject(kDefaultTenant, key, "group-");
     ASSERT_FALSE(duplicate.metadata.group_id.empty());
 
     auto result = service.RestoreFromStandbySnapshot(
@@ -1343,8 +1344,8 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentBucketFromGroup(existing.metadata.group_id,
-                                         "replacement-group-");
+    duplicate.metadata.group_id = FindGroupIdOnDifferentBucketFromGroup(
+        existing.metadata.group_id, "replacement-group-");
     ASSERT_FALSE(duplicate.metadata.group_id.empty());
 
     auto result = service.RestoreFromStandbySnapshot(
