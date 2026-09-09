@@ -123,6 +123,11 @@ struct TransferSubmitterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_MEMCPY);
 };
 
+struct NoFRegisterEnvironmentVariables {
+    // Keep the raw string to preserve case normalization and warning behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_NOF_TRTYPE);
+};
+
 struct NvmeKvConnectorEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_DEVICE_PATH);
     // Keep numeric values as strings because the existing NVMe parser accepts
