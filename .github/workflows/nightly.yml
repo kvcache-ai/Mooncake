@@ -42,7 +42,7 @@ jobs:
       - name: Compute nightly version
         id: version
         run: |
-          BASE_VERSION=$(grep -Po '(?<=^version = ")[^"]+' mooncake-wheel/pyproject.toml)
+          BASE_VERSION=$(grep -Po '(?<=^version = ")[^"]+' pyproject.toml)
           # Strip .postN suffix if present, then bump patch for forward-looking version
           CLEAN_VERSION=$(echo "$BASE_VERSION" | sed 's/\.post[0-9]*$//')
           MAJOR=$(echo "$CLEAN_VERSION" | cut -d. -f1)
@@ -360,7 +360,7 @@ jobs:
           source "${RUNNER_TEMP}/mooncake-nightly-venv/bin/activate"
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           export CUDA_HOME=/usr/local/cuda
-          PYTHON_VERSION=3.12 OUTPUT_DIR=dist ./scripts/build_wheel.sh
+          OUTPUT_DIR=dist python3.12 scripts/build_release_wheel.py
           python -m pip install mooncake-wheel/dist/*.whl
 
       - name: Run Python integration tests (full suite)

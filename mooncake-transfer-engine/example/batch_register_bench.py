@@ -18,7 +18,7 @@ Usage:
       --target_server_name <target_ip>:12345 \
       --num_blocks 40 --block_size_gb 4 --protocol efa
 
-Requires: mooncake Python package (pip install -e mooncake-wheel)
+Requires: mooncake Python package (pip install -e . from the repository root)
 """
 
 import argparse

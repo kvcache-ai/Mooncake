@@ -19,7 +19,7 @@ Usage:
       --pool_size_gb 100 --protocol efa \
       --prefix_tokens 4096,8192,16384,32768
 
-Requires: mooncake Python package (pip install -e mooncake-wheel)
+Requires: mooncake Python package (pip install -e . from the repository root)
 Branch: feat/efa-auto-split-mr (per-NIC partition auto-split)
 """
 

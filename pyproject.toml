@@ -12,7 +12,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.12.post1"
+version = "0.3.13"
 description = "A KVCache-centric disaggregated architecture for large-scale LLM inference and training."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -7,11 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        # Only tags whose tree already contains ROCm support (the HIP_BUILD
-        # variant in scripts/build_wheel.sh, i.e. this PR onward) can be built.
-        # Tags predating ROCm support are rejected by the guard below, since
-        # they would produce a mislabeled default-named wheel.
-        description: 'Release tag to (re)build the ROCm wheel for (must contain HIP_BUILD support)'
+        # Only tags containing the scikit-build release entry point and its
+        # HIP_BUILD variant can be built by this workflow.
+        description: 'Release tag to (re)build (requires scikit-build ROCm release support)'
         required: true
         type: string
 
@@ -83,13 +81,11 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
-          # Guard against backfilling a tag that predates ROCm support: its
-          # scripts/build_wheel.sh would ignore HIP_BUILD and emit the default
-          # "mooncake-transfer-engine" package, which the publish steps would
-          # then upload over the CUDA package on PyPI. Refuse such tags.
-          if ! grep -q 'HIP_BUILD' scripts/build_wheel.sh; then
-            echo "::error::Checked-out tree has no HIP_BUILD support in scripts/build_wheel.sh;"
-            echo "::error::refusing to build a mislabeled ROCm wheel. Use a tag at or after ROCm support landed."
+          # Refuse older trees without the entry point invoked below or without
+          # HIP_BUILD support, which could produce a mislabeled CUDA package.
+          if ! grep -q 'HIP_BUILD' scripts/build_release_wheel.py; then
+            echo "::error::Checked-out tree has no scikit-build ROCm release support;"
+            echo "::error::use a tag containing scripts/build_release_wheel.py with HIP_BUILD support."
             exit 1
           fi
 
@@ -123,49 +119,22 @@ jobs:
           bash -x dependencies.sh -y
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
 
-      - name: Configure project
-        shell: bash
-        run: |
-          set -eo pipefail
-          export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
-          rm -rf build && mkdir build && cd build
-          cmake -G Ninja .. \
-            -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
-            -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
-            -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DPython3_EXECUTABLE="${PYTHON_BIN}"
-
-      - name: Build project
-        shell: bash
-        run: |
-          set -eo pipefail
-          export PATH="/opt/rocm/bin:$PATH"
-          cd build
-          # Retry to ride out transient Go module (proxy.golang.org) fetch errors
-          # during the etcd-wrapper build; Go caches modules, so retries resume.
-          n=0
-          until cmake --build . -j"$(nproc)"; do
-            n=$((n+1))
-            if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
-            echo "Build attempt $n failed; retrying in 15s..."; sleep 15
-          done
-          cmake --install .
-
       - name: Generate Python version tag
         id: generate_tag_release
         shell: bash
         run: echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
 
       - name: Build Python wheel
+        env:
+          CMAKE_ARGS: >-
+            -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_DEBUG_SYMBOLS=OFF
         shell: bash
         run: |
           set -eo pipefail
           export PATH="/opt/rocm/bin:$PATH"
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
-          HIP_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
-            OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
-            ./scripts/build_wheel.sh
+          HIP_BUILD=1 OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
+            python${{ matrix.python-version }} scripts/build_release_wheel.py --build-attempts 3
 
       - name: Assert ROCm package name
         shell: bash

@@ -29,6 +29,58 @@ make -j
 sudo make install
 ```
 
+### Python Packaging Migration
+
+Python source installs and release wheels now use the repository-root
+`pyproject.toml` and scikit-build-core. Published distribution names and console
+commands are unchanged, but local build commands have changed:
+
+- `pip install -e mooncake-wheel` and `mooncake-wheel/setup.py` are removed.
+  From the repository root, use `python -m pip install -e .` instead. This builds
+  native extensions; manually copying `.so` files into the source package is no
+  longer necessary. A fresh source install defaults to CPU-only; enable CUDA
+  with `-Ccmake.define.USE_CUDA=ON` and pass other hardware options explicitly.
+- `scripts/build_wheel.sh [python_version] [output_dir]` is removed. Invoke
+  `scripts/build_release_wheel.py` with the target Python interpreter instead of
+  setting `PYTHON_VERSION`. The script requires that interpreter's `pip` and
+  installs its build tools automatically.
+- The release entry point configures and builds through the root backend before
+  repairing the wheel; it is **not** a packaging-only operation on existing
+  binaries. `BUILD_DIR` (default `build`) can adopt an existing native CMake tree,
+  retaining its configured profile, while an explicit variant can override
+  hardware settings. Use `CMAKE_ARGS` for additional CMake options.
+- `OUTPUT_DIR=dist` still means `mooncake-wheel/dist`. Alternatively,
+  `--output-dir dist` means `dist` relative to the repository root. Both build
+  and output paths are resolved from the repository root, not the shell's
+  current directory.
+- Existing wheels are protected by default. For a repeat build, including a
+  retry after repair failed, use `--overwrite` to delete only existing `*.whl`
+  files in the output directory, or choose a different output directory.
+- Release metadata now comes from the root project. Variant environment flags
+  still select the distribution name and hardware profile; descriptions and
+  keywords are shared rather than variant-specific. Use
+  `MOONCAKE_WHEEL_VERSION` for an explicit version override (`VERSION` does not
+  override package metadata).
+
+For example, after installing the native dependencies above, build a CPU wheel
+from the repository root:
+
+```bash
+NON_CUDA_BUILD=1 OUTPUT_DIR=dist python3.12 scripts/build_release_wheel.py
+python3.12 -m pip install mooncake-wheel/dist/*.whl
+
+# Rebuild into the same directory (removes its previous wheels first):
+NON_CUDA_BUILD=1 OUTPUT_DIR=dist python3.12 scripts/build_release_wheel.py --overwrite
+```
+
+The other naming flags are `CU13_BUILD`, `NPU_BUILD`, `MUSA_BUILD`, `HIP_BUILD`,
+`EFA_BUILD`, `EFA_CU13_BUILD`, and `EFA_NON_CUDA_BUILD`; set only one to `1`.
+For the standard CUDA distribution on a fresh build, omit naming flags and use
+`CMAKE_ARGS="-DUSE_CUDA=ON"`. CUDA 13 also requires the corresponding CUDA toolkit;
+selecting a variant does not install a hardware SDK. Native extension filenames
+may now carry the Python ABI suffix; use Python imports rather than assuming a
+literal `engine.so` or `store.so` path.
+
 ### Build with VRAM Segment
 
 To enable VRAM Segment, install CUDA toolkit and build Mooncake with

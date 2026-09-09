@@ -392,8 +392,13 @@ jobs:
     - name: Run focused release gate tests
       run: |
         python -m pip install --disable-pip-version-check \
-          packaging pytest==8.3.5
-        python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+          packaging pytest==8.3.5 wheel pyyaml
+        python -m pytest -q \
+          mooncake-wheel/tests/test_testpypi_wheel_gate.py \
+          mooncake-wheel/tests/test_release_wheel_tags.py \
+          python/tests/packaging/test_project.py \
+          python/tests/packaging/test_release_build.py \
+          python/tests/packaging/test_release_workflows.py
       shell: bash
 
     - name: Test CI service and smoke scripts

@@ -89,6 +89,42 @@ def test_ep_modules_have_one_authoritative_source() -> None:
         assert not legacy_test.exists()
 
 
+@pytest.mark.parametrize(
+    "artifact,defines,expected",
+    [
+        ("libetcd_wrapper.so", {"STORE_USE_ETCD": "ON"}, True),
+        ("libetcd_wrapper.so", {"USE_ETCD": "ON"}, True),
+        ("libetcd_wrapper.so", {"USE_ETCD": "ON", "USE_ETCD_LEGACY": "ON"}, False),
+        ("libetcd_wrapper.so", {"STORE_USE_ETCD": "ON", "USE_ETCD_LEGACY": "ON"}, True),
+        ("libetcd_wrapper.so", {}, False),
+        ("allocator.py", {"WITH_TE": "ON"}, True),
+        ("fabric_allocator_utils.py", {"WITH_TE": "ON"}, True),
+    ],
+)
+def test_release_runtime_install_conditions(tmp_path, artifact, defines, expected):
+    cmake = shutil.which("cmake")
+    if cmake is None:
+        pytest.skip("CMake is required to evaluate install conditions")
+    source = (REPOSITORY_ROOT / "mooncake-integration/CMakeLists.txt").read_text()
+    # Execute the actual, self-contained conditional install rule without
+    # configuring native dependencies. Capture install() arguments in script mode.
+    marker = source.index(f'/{artifact}"')
+    start = source.rfind("if(", 0, marker)
+    end = source.index("endif()", marker) + len("endif()")
+    result = tmp_path / "installed.txt"
+    script = tmp_path / "check.cmake"
+    script.write_text(
+        "\n".join(f"set({key} {value})" for key, value in defines.items())
+        + f'\nmacro(install)\nfile(APPEND "{result}" "${{ARGV}}\\n")\nendmacro()\n'
+        + source[start:end]
+    )
+    subprocess.run([cmake, "-P", str(script)], check=True)
+    assert result.exists() is expected
+    if expected:
+        assert artifact in result.read_text()
+        assert "COMPONENT;python" in result.read_text()
+
+
 def test_pg_extension_build_stages_outside_the_source_tree(
     tmp_path: Path,
 ) -> None:
