@@ -135,6 +135,62 @@ def test_group_transport_selection_uses_every_rank_capability(monkeypatch) -> No
     )
 
 
+@pytest.mark.parametrize("rank_world_sizes", [[2, 2, 8, 8, 8, 8, 8, 8], [8, 8]])
+def test_nccl_consensus_rejects_changed_world_size_on_every_rank(
+    monkeypatch, rank_world_sizes: list[int]
+) -> None:
+    class Group:
+        @staticmethod
+        def size() -> int:
+            return len(rank_world_sizes)
+
+    test_group = Group()
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def fake_all_gather(gathered_states, local_state, group=None) -> None:
+        assert group is test_group
+        assert len(gathered_states) == test_group.size()
+        assert local_state.numel() == 4
+        for state, world_size in zip(gathered_states, rank_world_sizes):
+            # Survivors require NCCL; newly constructed buffers request auto.
+            required_code = 2 if world_size != test_group.size() else 0
+            state.copy_(
+                torch.tensor([0, 1, required_code, world_size], dtype=torch.int32)
+            )
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    for world_size in rank_world_sizes:
+        with pytest.raises(RuntimeError, match="fixed logical world size"):
+            _select_transport_for_group(
+                test_group,
+                "auto",
+                True,
+                world_size,
+                1,
+                world_size,
+                True,
+                required_transport="nccl" if world_size != test_group.size() else None,
+            )
+
+
+def test_nccl_consensus_rejects_missing_rank_state(monkeypatch) -> None:
+    class Group:
+        @staticmethod
+        def size() -> int:
+            return 2
+
+    test_group = Group()
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def fake_all_gather(gathered_states, local_state, group=None) -> None:
+        # Mooncake PG can leave inactive ranks' output slots untouched.
+        gathered_states[0].copy_(local_state)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    with pytest.raises(RuntimeError, match="requirements are not met on ranks: 1"):
+        _select_transport_for_group(test_group, "nccl", True, 2, 1, 2, True)
+
+
 def test_transport_consensus_selects_nccl_when_every_rank_is_ready() -> None:
     assert (
         _resolve_transport_consensus([("auto", True, None), ("auto", True, None)])
@@ -201,6 +257,60 @@ def test_nccl_reconfiguration_rejects_incomplete_membership(
 ) -> None:
     with pytest.raises(RuntimeError, match="complete fixed logical rank set"):
         _resolve_nccl_membership_masks(rank_masks)
+
+
+@pytest.mark.parametrize("active_mask", [[1, 1], [1, 1, 0, 0]])
+def test_nccl_membership_accepts_reserved_capacity(monkeypatch, active_mask) -> None:
+    buffer = object.__new__(ElasticBuffer)
+    buffer.num_ranks = 2
+    buffer.group = object()
+    monkeypatch.setattr(buffer, "_active_ranks_mask", lambda: active_mask)
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def fake_all_gather(gathered_masks, local_mask, group=None) -> None:
+        assert group is buffer.group
+        assert local_mask.tolist() == [1, 1]
+        assert len(gathered_masks) == buffer.num_ranks
+        for mask in gathered_masks:
+            mask.copy_(local_mask)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    buffer._require_full_nccl_membership()
+
+
+@pytest.mark.parametrize("active_mask", [[1, 0, 0, 0], [1], []])
+def test_nccl_membership_rejects_missing_logical_ranks(
+    monkeypatch, active_mask
+) -> None:
+    buffer = object.__new__(ElasticBuffer)
+    buffer.num_ranks = 2
+    buffer.group = object()
+    monkeypatch.setattr(buffer, "_active_ranks_mask", lambda: active_mask)
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def fake_all_gather(gathered_masks, local_mask, group=None) -> None:
+        for mask in gathered_masks:
+            mask.copy_(local_mask)
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    with pytest.raises(RuntimeError, match="complete fixed logical rank set"):
+        buffer._require_full_nccl_membership()
+
+
+def test_nccl_membership_rejects_incomplete_remote_view(monkeypatch) -> None:
+    buffer = object.__new__(ElasticBuffer)
+    buffer.num_ranks = 2
+    buffer.group = object()
+    monkeypatch.setattr(buffer, "_active_ranks_mask", lambda: [1, 1, 0, 0])
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def fake_all_gather(gathered_masks, local_mask, group=None) -> None:
+        gathered_masks[0].copy_(local_mask)
+        gathered_masks[1].copy_(torch.tensor([1, 0], dtype=torch.int32))
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    with pytest.raises(RuntimeError, match=r"logical slots: \[1\]"):
+        buffer._require_full_nccl_membership()
 
 
 def test_nccl_generation_rejects_stale_handle() -> None:

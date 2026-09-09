@@ -184,25 +184,30 @@ def _select_transport_for_group(
     collective_device = (
         "cpu" if str(dist.get_backend(group)).lower() == "gloo" else "cuda"
     )
+    group_size = group.size()
     local_state = torch.tensor(
         [
             _TRANSPORT_TO_CODE[requested],
             int(local_auto_choice == "nccl"),
             _TRANSPORT_TO_CODE[required_transport or "auto"],
+            num_ranks,
         ],
         dtype=torch.int32,
         device=collective_device,
     )
-    gathered_states = [torch.full_like(local_state, -1) for _ in range(group.size())]
+    gathered_states = [torch.full_like(local_state, -1) for _ in range(group_size)]
     dist.all_gather(gathered_states, local_state, group=group)
 
     rank_states = []
-    for state in gathered_states:
+    mismatched_world_sizes = []
+    for rank, state in enumerate(gathered_states):
         values = [int(value) for value in state.cpu().tolist()]
-        if values == [-1, -1, -1]:
+        if values == [-1, -1, -1, -1]:
             rank_states.append((requested, False, None))
             continue
-        requested_code, rank_nccl_ready, required_code = values
+        requested_code, rank_nccl_ready, required_code, rank_world_size = values
+        if rank_world_size != group_size:
+            mismatched_world_sizes.append(f"rank {rank}={rank_world_size}")
         if (
             requested_code not in _CODE_TO_TRANSPORT
             or required_code not in _CODE_TO_TRANSPORT
@@ -218,6 +223,18 @@ def _select_transport_for_group(
                 bool(rank_nccl_ready),
                 None if required_name == "auto" else required_name,
             )
+        )
+    # Exchange the expected world size in this fixed-width collective, before
+    # the membership exchange uses num_ranks-sized tensors. Survivors retain
+    # their original size while a new buffer sees the current PG size; a local
+    # check alone could leave replacements entering a different collective.
+    if mismatched_world_sizes:
+        raise RuntimeError(
+            "ElasticBuffer requires a fixed logical world size during bootstrap; "
+            f"the process group has {group_size} ranks, but buffers expect "
+            + ", ".join(mismatched_world_sizes)
+            + ". Restore the original logical rank set or recreate all buffers "
+            "for the new group size."
         )
     return _resolve_transport_consensus(rank_states)
 
@@ -479,9 +496,15 @@ class ElasticBuffer:
         local_mask = torch.full(
             (self.num_ranks,), -1, dtype=torch.int32, device=collective_device
         )
-        if len(active_mask) == self.num_ranks:
+        # Mooncake PG masks cover max_group_size (or a larger user-provided
+        # tensor), not just the logical ranks used by this fixed-world buffer.
+        if len(active_mask) >= self.num_ranks:
             local_mask.copy_(
-                torch.tensor(active_mask, dtype=torch.int32, device=collective_device)
+                torch.tensor(
+                    active_mask[: self.num_ranks],
+                    dtype=torch.int32,
+                    device=collective_device,
+                )
             )
         gathered_masks = [
             torch.full_like(local_mask, -1) for _ in range(self.num_ranks)

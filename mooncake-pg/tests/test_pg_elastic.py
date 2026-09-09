@@ -986,12 +986,15 @@ def _nccl_elastic_buffer_recovery_worker(
     broken_exited: mp.Event,
     start_recovery: mp.Event,
     membership_restored: mp.Event,
+    max_group_size: int | None = None,
 ) -> None:
     """Replace rank 1 and rebuild the NCCL ElasticBuffer generation."""
     logical_rank = ctx.rank if ctx.proc_rank < ctx.world_size else BROKEN_RANK
+    capacity = ctx.world_size if max_group_size is None else max_group_size
+    reserved_slots = [0] * (capacity - ctx.world_size)
 
     if ctx.proc_rank < ctx.world_size:
-        device = ctx.init_group(rank=logical_rank)
+        device = ctx.init_group(rank=logical_rank, max_group_size=max_group_size)
         backend = ctx.get_backend()
         buffer = _make_nccl_elastic_buffer()
         stale_handle, stale_x = _run_nccl_elastic_data_round(
@@ -1017,7 +1020,7 @@ def _nccl_elastic_buffer_recovery_worker(
         if pg.get_local_success(work):
             raise AssertionError("P2P probe to departed rank unexpectedly succeeded")
         active_ranks = pg.get_active_ranks(backend).cpu().tolist()
-        if active_ranks != [1, 0]:
+        if active_ranks != [1, 0] + reserved_slots:
             raise AssertionError(
                 "expected rank 1 to be inactive, " f"got active_ranks={active_ranks}"
             )
@@ -1041,7 +1044,9 @@ def _nccl_elastic_buffer_recovery_worker(
     else:
         if not start_recovery.wait(timeout=60.0):
             raise TimeoutError("timed out waiting to start NCCL EP replacement")
-        device = ctx.init_group(rank=logical_rank, is_extension=True)
+        device = ctx.init_group(
+            rank=logical_rank, max_group_size=max_group_size, is_extension=True
+        )
         backend = ctx.get_backend()
         pg.join_group(backend)
         if not membership_restored.wait(timeout=60.0):
@@ -1052,7 +1057,7 @@ def _nccl_elastic_buffer_recovery_worker(
     # process has applied the fully restored logical-rank view before either
     # survivors or replacements enter it.
     wait_until(
-        lambda: pg.get_active_ranks(backend).cpu().tolist() == [1, 1],
+        lambda: pg.get_active_ranks(backend).cpu().tolist() == [1, 1] + reserved_slots,
         timeout_s=60.0,
         poll_interval_s=0.05,
         description=f"rank {logical_rank} waiting for restored active-rank view",
@@ -1729,6 +1734,15 @@ class TestMooncakePGElasticCUDA(_ElasticMixin, MooncakePGCUDABackendTestCase):
 
     def test_nccl_elastic_buffer_recovery(self) -> None:
         """NCCL EP rebuilds after Mooncake PG replaces a logical rank."""
+        self._run_nccl_elastic_buffer_recovery()
+
+    def test_nccl_elastic_buffer_recovery_with_reserved_capacity(self) -> None:
+        """Unused PG slots do not prevent NCCL construction or recovery."""
+        self._run_nccl_elastic_buffer_recovery(max_group_size=4)
+
+    def _run_nccl_elastic_buffer_recovery(
+        self, max_group_size: int | None = None
+    ) -> None:
         if torch.cuda.device_count() < 2:
             self.skipTest("NCCL ElasticBuffer recovery requires two CUDA devices")
         try:
@@ -1751,6 +1765,7 @@ class TestMooncakePGElasticCUDA(_ElasticMixin, MooncakePGCUDABackendTestCase):
             broken_exited,
             start_recovery,
             membership_restored,
+            max_group_size,
             world_size=2,
             nprocs=3,
             timeout_s=180.0,
