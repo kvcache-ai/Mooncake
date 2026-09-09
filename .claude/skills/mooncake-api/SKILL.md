@@ -500,7 +500,7 @@ curl http://localhost:8080/metadata
 2. **Register buffers for zero-copy**: Required for RDMA operations
 3. **Use batch operations**: Better throughput for multiple operations
 4. **Configure replication**: Use `ReplicateConfig` for important data
-5. **Use soft pinning**: Give objects a fixed retention window via `SoftPinAction.ENABLE` (reads do not extend it)
+5. **Use soft pinning**: Give objects a fixed retention window via `SoftPinAction.ENABLE` + `soft_pin_ttl_ms` (omit the TTL to use the master default; reads do not extend it)
 6. **Choose protocol wisely**: TCP for dev/test, RDMA for production
 7. **Monitor leases**: Objects have TTL, renew if needed
 8. **Handle errors**: Check return codes and handle failures

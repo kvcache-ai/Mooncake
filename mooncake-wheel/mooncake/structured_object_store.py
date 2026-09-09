@@ -6242,6 +6242,8 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
     return fn(*args, config=config)
 
 
+# Keep in sync with the pybind ReplicateConfig fields: the fallback copy in
+# _copy_write_config silently drops fields missing from this list.
 _WRITE_CONFIG_COPY_FIELDS = (
     "data_type",
     "group_ids",
