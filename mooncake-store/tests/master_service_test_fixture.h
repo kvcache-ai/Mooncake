@@ -343,18 +343,9 @@ class MasterServiceTest : public ::testing::Test {
         return key;
     }
 
-    std::string FindGroupIdOnDifferentBucket(const std::string& key) const {
-        static constexpr size_t kLegacyBucketCount = 1024;
-        const size_t key_bucket =
-            std::hash<std::string>{}(key) % kLegacyBucketCount;
-        for (int i = 0; i < 10000; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) % kLegacyBucketCount !=
-                key_bucket) {
-                return group_id;
-            }
-        }
-        return key + "_fallback_group";
+    // A group id that is distinct from the object key.
+    std::string UnrelatedGroupId(const std::string& key) const {
+        return key + "_group";
     }
 
     void PutCompletedObject(MasterService& service, const UUID& client_id,
@@ -532,7 +523,7 @@ class MasterServiceTest : public ::testing::Test {
         const UUID client_id = generate_uuid();
         const std::string grouped_key = "reroute_grouped_key";
         const std::string ungrouped_key = "reroute_ungrouped_key";
-        const std::string group_id = FindGroupIdOnDifferentBucket(grouped_key);
+        const std::string group_id = UnrelatedGroupId(grouped_key);
 
         ReplicateConfig grouped_config;
         grouped_config.replica_num = 1;

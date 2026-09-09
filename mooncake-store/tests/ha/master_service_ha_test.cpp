@@ -596,38 +596,6 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
-    // Legacy metadata-bucket placement (std::hash % 1024). Routing is now
-    // per-tenant, so the bucket carries no behavioral meaning; the helpers
-    // only pick names the old formula placed apart.
-    static constexpr size_t kLegacyBucketCount = 1024;
-
-    static size_t LegacyBucketOf(std::string_view value) {
-        return std::hash<std::string_view>{}(value) % kLegacyBucketCount;
-    }
-
-    static std::string FindGroupIdOnDifferentBucket(size_t source_bucket,
-                                                    const std::string& prefix) {
-        for (size_t index = 0; index < kLegacyBucketCount * 2; ++index) {
-            std::string group_id = prefix + std::to_string(index);
-            if (LegacyBucketOf(group_id) != source_bucket) {
-                return group_id;
-            }
-        }
-        return {};
-    }
-
-    static std::string FindGroupIdOnDifferentBucketFromObject(
-        const TenantId& tenant_id, const std::string& key,
-        const std::string& prefix) {
-        const std::string scope =
-            tenant_id.IsDefault() ? key : tenant_id.value();
-        return FindGroupIdOnDifferentBucket(LegacyBucketOf(scope), prefix);
-    }
-
-    static std::string FindGroupIdOnDifferentBucketFromGroup(
-        const std::string& group_id, const std::string& prefix) {
-        return FindGroupIdOnDifferentBucket(LegacyBucketOf(group_id), prefix);
-    }
     // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
     // hence this static funnel. Seeds an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
@@ -1318,9 +1286,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id =
-        FindGroupIdOnDifferentBucketFromObject(kDefaultTenant, key, "group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "group-" + key;
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -1344,9 +1310,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentBucketFromGroup(
-        existing.metadata.group_id, "replacement-group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "replacement-group";
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});

@@ -276,18 +276,6 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return entry != nullptr && entry->metadata().IsGrouped();
     }
 
-    std::string FindGroupIdOnDifferentBucket(MasterService* svc,
-                                             const std::string& key) {
-        const size_t key_shard = std::hash<std::string>{}(key) % 1024;
-        for (int i = 0; i < 1024; ++i) {
-            std::string group_id = key + "_group_" + std::to_string(i);
-            if (std::hash<std::string>{}(group_id) % 1024 != key_shard) {
-                return group_id;
-            }
-        }
-        return key + "_group";
-    }
-
    private:
     // Helper to create a temporary snapshot manager for tests
     std::unique_ptr<MasterSnapshotManager> CreateTempSnapshotManager() {
@@ -622,8 +610,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     const std::string key = "snapshot_grouped_route_key";
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
-    replicate_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentBucket(service_.get(), key)};
+    replicate_config.group_ids = std::vector<std::string>{key + "_group"};
 
     auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
                                         1024, replicate_config);
