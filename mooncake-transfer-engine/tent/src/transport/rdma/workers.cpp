@@ -1230,7 +1230,10 @@ int Workers::handleContextEvents(int dev_id,
 
 void Workers::applyContextEvent(int dev_id, RdmaContext& context,
                                 const ibv_async_event& event) {
-    switch (event.event_type) {
+    // Switched as an int, not as the enum: kIbvEventDeviceSpeedChange is not
+    // an enumerator on older headers, and the default below already covers
+    // every event this does not act on.
+    switch (static_cast<int>(event.event_type)) {
         case IBV_EVENT_QP_FATAL:
         case IBV_EVENT_WQ_FATAL: {
             auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
@@ -1287,15 +1290,14 @@ void Workers::applyContextEvent(int dev_id, RdmaContext& context,
             }
             break;
         }
-#ifdef HAVE_IBV_EVENT_DEVICE_SPEED_CHANGE
-        case IBV_EVENT_DEVICE_SPEED_CHANGE:
-            // rdma-core >= 62: a port speed changed without a link flap
-            // (e.g. a VF over LAG losing a PF). Device-level, so the event
-            // names no port; each context opens exactly one, so re-query
-            // that one.
+        case kIbvEventDeviceSpeedChange:
+            // A port speed changed without a link flap (e.g. a VF over LAG
+            // losing a PF). Device-level, so the event names no port; each
+            // context opens exactly one, so re-query that one. See
+            // kIbvEventDeviceSpeedChange for why this is not behind an
+            // #ifdef on the header's enumerator.
             refreshLinkSpeed(dev_id, context);
             break;
-#endif
         default:
             break;
     }
