@@ -58,6 +58,9 @@ P2PMasterService::P2PMasterService(const P2PMasterConfig& config,
         config.client_lifecycle.live_ttl_seconds,
         config.client_lifecycle.crashed_ttl_seconds, view_version);
     InitializeClientManager();
+    // TODO(P2P heartbeat/HA redesign): The monitor starts before promotion
+    // restore and RPC readiness, so a slow restore can expire restored clients.
+    // Coordinate heartbeat monitoring and timeout baselines with HA readiness.
     client_manager_->Start();
 }
 
@@ -360,6 +363,10 @@ auto P2PMasterService::RegisterClient(const P2PRegisterClientRequest& req)
         return view_version_;
     };
 
+    // TODO(P2P heartbeat/HA redesign): Registration mutates memory before
+    // recording OpLog. If persistence fails, this retry path reports success
+    // without retrying the missing registration log. Coordinate registration
+    // completion and retry semantics in the heartbeat/HA redesign.
     if (client_manager_->GetClient(req.client_id)) {
         return make_idempotent_response();
     }
