@@ -35,8 +35,25 @@ type P2PStore struct {
 	localServerName    string
 	catalog            *Catalog
 	memory             *RegisteredMemory
-	metadata           *Metadata
-	transfer           *TransferEngine
+	metadata           metadataStore
+	transfer           transferEngine
+}
+
+type metadataStore interface {
+	Close() error
+	Create(context.Context, string, *Payload) error
+	Put(context.Context, string, *Payload) error
+	Update(context.Context, string, *Payload, int64) (bool, error)
+	Get(context.Context, string) (*Payload, int64, error)
+	List(context.Context, string) ([]*Payload, error)
+}
+
+type transferEngine interface {
+	batchTransport
+	Close()
+	GetLocalIpAndPort() (string, error)
+	registerLocalMemory(uintptr, uint64, string) error
+	unregisterLocalMemory(uintptr) error
 }
 
 const DEFAULT_PORT int = 12345
