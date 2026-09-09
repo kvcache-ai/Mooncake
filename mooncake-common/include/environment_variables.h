@@ -56,6 +56,13 @@ struct RegisteredPinnedMemoryEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_STORE_PIN_MEMORY_MAX_BYTES);
 };
 
+struct MmapArenaEnvironmentVariables {
+    // Keep these values as strings to preserve the existing byte-size and
+    // canonical-bool parsing, opt-in, fallback, and logging behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_MMAP_ARENA_POOL_SIZE);
+    MC_DEFINE_ENV_VAR(std::string, MC_DISABLE_MMAP_ARENA);
+};
+
 struct LocalHotCacheEnvironmentVariables {
     // Keep these values as strings to preserve their existing per-setting
     // parsing, fallback, and logging behavior.
