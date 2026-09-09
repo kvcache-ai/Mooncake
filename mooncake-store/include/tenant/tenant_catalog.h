@@ -129,6 +129,34 @@ class TenantCatalog {
     // base is ObjectCount() - disk_object_count.
     std::atomic<long> disk_object_count{0};
 
+    // Called after adding a LOCAL_DISK replica. Increments
+    // disk_object_count if this is the first completed LOCAL_DISK
+    // replica for the object (i.e., exactly 1 completed disk replica now).
+    void OnDiskReplicaAdded(const ObjectMetadata& metadata) {
+        size_t disk_count = metadata.CountReplicas([](const Replica& r) {
+            return r.is_local_disk_replica() && r.is_completed();
+        });
+        if (disk_count == 1) disk_object_count.fetch_add(1);
+    }
+
+    // Called after removing a LOCAL_DISK replica, or when erasing an
+    // object that had one. Pass had_completed_disk=true if the object
+    // had at least one completed LOCAL_DISK replica before the removal.
+    // When the entire object is being erased, call the one-arg overload.
+    void OnDiskReplicaRemoved(bool had_completed_disk,
+                              const ObjectMetadata& metadata) {
+        if (!had_completed_disk) return;
+        bool still_has_disk = metadata.HasReplica([](const Replica& r) {
+            return r.is_local_disk_replica() && r.is_completed();
+        });
+        if (!still_has_disk) disk_object_count.fetch_sub(1);
+    }
+
+    // Overload for full object erasure — no metadata needed.
+    void OnDiskReplicaRemoved(bool had_completed_disk) {
+        if (had_completed_disk) disk_object_count.fetch_sub(1);
+    }
+
     std::shared_ptr<ObjectEntry> Pin(const std::string& key) const {
         return object_index.Pin(key);
     }
