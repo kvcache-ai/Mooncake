@@ -814,7 +814,7 @@ is required.
 | `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
 | `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
 | `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
-| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
+| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Initial shard count. The master also discovers existing contiguous shard files at startup; running clients open added shards on demand. |
 | `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
 | `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
 | `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
@@ -823,6 +823,51 @@ is required.
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
 | `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+
+#### Growing DFS capacity online
+
+The default shard allocator supports adding shard files while the master and
+clients remain running. Use the master's existing HTTP admin listener:
+
+```bash
+curl http://127.0.0.1:9003/api/v1/dfs/shard_count
+curl -X PUT http://127.0.0.1:9003/api/v1/dfs/shard_count \
+  -H 'Content-Type: application/json' -d '{"shard_count": 128}'
+```
+
+Both requests return the current count, for example
+`{"success":true,"shard_count":128}`. A PUT sets the desired **total** count,
+not the number to add. Repeating the current count succeeds without changing
+anything; shrinking, non-integer values, and non-positive counts return HTTP
+400. DFS-disabled masters and concurrent expansion requests return HTTP 409;
+unavailable or standby services return HTTP 503. Filesystem preparation runs
+off the HTTP I/O threads, so health checks and other administration remain
+available while an expansion is pending.
+
+Upgrade the master and every DFS client to a version supporting online shard
+expansion before increasing capacity. An already running upgraded client can
+open a new shard from its descriptor even when its initial
+`MOONCAKE_DFS_SHARD_COUNT` is smaller. Older binaries reject those descriptors.
+Every process must still use the same shared root, adapter, shard capacity, and
+alignment. Provision sufficient backing filesystem space before expanding;
+changing the root or per-shard capacity online is unsupported.
+
+Only one active master may manage a DFS root. Do not create, rename, truncate,
+or remove its shard files outside that master. Clients do not create shard
+files during initialization; they open them only from published descriptors.
+
+The allocator prepares new files and allocation state before publishing the
+expanded shard set. Existing paths and allocated ranges remain unchanged,
+including when the shard index gains another decimal digit. Allocation, reads,
+writes, deferred frees, and eviction continue to use ready shards. A failed
+expansion leaves the published shard count unchanged.
+
+On startup, the master discovers the contiguous existing shard layout and uses
+at least the configured count. Duplicate indices, missing intermediate shards,
+and unexpected file sizes are rejected rather than silently changing the
+layout. This preserves **capacity**, not cached key metadata or allocation
+ownership: DFS allocator recovery, snapshots, and HA remain subject to the
+limitations below. Do not treat online expansion as a data durability guarantee.
 
 #### Requesting and accessing DFS replicas
 
@@ -841,10 +886,11 @@ store.put("key", b"value", config)
 with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
 not supported.
 
-Each key hashes to exactly one DFS shard. Allocation does not fall back to a
-different shard, so a request may return `NO_AVAILABLE_HANDLE` when its selected
-shard is full even if other shards have free space. A DFS object is never
-striped across shards. The selected shard must have room for the object rounded
+Allocation first tries the key's hash-selected DFS shard, then tries other
+ready shards if that shard has no suitable extent. This lets new shards accept
+writes even when older shards are full. `NO_AVAILABLE_HANDLE` means no ready
+shard could satisfy the allocation. A DFS object is never striped across shards.
+The selected shard must have room for the object rounded
 up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
 padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
 therefore lower than the shard file's
@@ -876,9 +922,8 @@ reads for that descriptor.
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
-- A DFS object must fit in its key-selected shard after alignment and allocator
-  padding; objects are not striped and allocation does not fall back to another
-  shard.
+- A DFS object must fit in a single shard after alignment and allocator
+  padding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.

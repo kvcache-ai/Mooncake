@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "config/distributed_storage_config.h"
@@ -97,11 +98,18 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::mutex mutex;
     };
 
+    tl::expected<ShardFile*, ErrorCode> GetOrOpenShard(
+        const DistributedFSDescriptor& descriptor);
+
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
-    std::vector<std::unique_ptr<ShardFile>> shard_files_;
+    // Cache only shards opened from descriptors published by the master.
+    // Entries are never erased while the backend is running, so callers can
+    // retain a ShardFile pointer after releasing the cache lock.
+    std::mutex shard_files_mutex_;
+    std::unordered_map<int, std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
 };

@@ -759,10 +759,22 @@ finalized. Removal, revocation, replacement, and allocator eviction release
 the range, with a configurable deferred-free interval preventing immediate
 offset reuse.
 
+The shard set can grow online through the master admin API. Expansion prepares
+new shard files and allocator state, then atomically publishes the complete
+ready set; existing shard paths and ranges remain unchanged. Allocation tries
+the hash-selected shard first and falls back to other ready shards, so added
+capacity can relieve full shards. Startup discovers the existing contiguous
+layout to retain the expanded capacity; it does not recover allocation or key
+metadata.
+
 The client owns the DFS data plane. `DistributedStorageBackend` validates the
 descriptor and delegates positional I/O to either `PosixFsAdapter` or
 `Hf3fsAdapter`. The master and clients must use the same DFS root and shard
 layout so that a descriptor identifies the same physical file everywhere.
+Clients do not open or create shard files during initialization. They open a
+shard only when first using its published descriptor, validating the path,
+shard index, and file capacity before caching the file handle. This prevents
+clients from retaining files that an unsuccessful expansion rolls back.
 
 For a write, the client first completes the requested memory and NoF transfers,
 then writes the DFS replica. `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`

@@ -572,6 +572,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 }
 
+tl::expected<int, ErrorCode> MasterService::GetDfsShardCount() const {
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return dfs_allocator_->GetShardCount();
+}
+
+tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return dfs_allocator_->ExpandShards(shard_count);
+}
+
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
     enable_dfs_ = Environ::GetBool(
@@ -606,7 +620,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     }
 
     LOG(INFO) << "DFS allocator initialized, config={" << dfs_config.FormatStr()
-              << "}";
+              << "}, ready_shard_count=" << dfs_allocator_->GetShardCount();
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>

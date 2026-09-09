@@ -913,6 +913,11 @@ class MasterService {
                                                  const std::string& source,
                                                  const std::string& target);
 
+    // Admin-only, grow-only DFS capacity management. Existing placements remain
+    // valid.
+    tl::expected<int, ErrorCode> GetDfsShardCount() const;
+    tl::expected<int, ErrorCode> ExpandDfsShards(int shard_count);
+
     /**
      * @brief Create a drain job to gracefully evacuate one or more segments.
      */
