@@ -35,6 +35,9 @@ class KVCacheTransferEngineExecutor:
     do NOT prove that DMA stopped: failed receipts conservatively mark the
     writer non-quiescent and this executor refuses unregister/retry afterwards.
     The runtime must drain or destroy the transport before reclaiming memory.
+    Registration errors also leave the native registration state uncertain.
+    This executor stays blocked after such errors; the runtime must rebuild the
+    transport before replacing the executor. No in-place recovery is provided.
     """
 
     def __init__(
@@ -52,14 +55,20 @@ class KVCacheTransferEngineExecutor:
         self._uncertain = False
         self._lock = threading.RLock()
 
+    def _require_ready(self) -> None:
+        if self._uncertain:
+            raise RuntimeError(
+                "executor requires transport recovery: native work may still be "
+                "in flight or registration state is uncertain"
+            )
+
     def register_region(self, region: KVCacheRegisteredRegion) -> None:
         if not isinstance(region, KVCacheRegisteredRegion):
             raise TypeError("region must be a KVCacheRegisteredRegion")
         if region.endpoint != self.endpoint:
             raise ValueError("region endpoint differs from local executor")
         with self._lock:
-            if self._uncertain:
-                raise RuntimeError("native work may still be in flight")
+            self._require_ready()
             if region.region_id in self._regions:
                 if self._regions[region.region_id] == region:
                     return
@@ -70,28 +79,32 @@ class KVCacheTransferEngineExecutor:
                 for r in self._regions.values()
             ):
                 raise ValueError("registered regions overlap")
+            # Enter quarantine before crossing the native boundary. Errors or
+            # interruptions may occur after partial registration side effects.
+            self._uncertain = True
             code = self.engine.register_memory(region.address, region.nbytes)
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"TE register_memory failed: {code}")
             self._regions[region.region_id] = region
+            self._uncertain = False
 
     def unregister_region(self, region_id: str) -> None:
         with self._lock:
-            if self._uncertain:
-                raise RuntimeError(
-                    "cannot unregister while native work may still be in flight"
-                )
+            self._require_ready()
             region = self._regions[region_id]
+            self._uncertain = True
             code = self.engine.unregister_memory(region.address)
             if type(code) is not int or code != 0:
                 raise RuntimeError(f"TE unregister_memory failed: {code}")
             del self._regions[region_id]
+            self._uncertain = False
 
     def validate_local_binding(self, binding: KVCacheResolvedRuntimeBinding) -> None:
         """Check local owner registration before publishing a source/target binding."""
         if not isinstance(binding, KVCacheResolvedRuntimeBinding):
             raise TypeError("binding must be a KVCacheResolvedRuntimeBinding")
         with self._lock:
+            self._require_ready()
             if binding.instance_id != self.instance_id:
                 raise ValueError("binding instance differs from local executor")
             if any(self._regions.get(r.region_id) != r for r in binding.regions):
@@ -106,6 +119,7 @@ class KVCacheTransferEngineExecutor:
         if type(warmup) is not bool:
             raise ValueError("warmup must be a boolean")
         with self._lock:
+            self._require_ready()
             if any(
                 op == plan.operation_id and digest != plan.digest
                 for (op, _), (digest, _) in self._results.items()
@@ -121,10 +135,6 @@ class KVCacheTransferEngineExecutor:
                         "operation_id was already used with a different transfer"
                     )
                 return receipts
-            if self._uncertain:
-                raise RuntimeError(
-                    "executor requires transport recovery before another operation"
-                )
             bindings = [
                 b for b in plan.source_bindings if b.participant_id == writer_id
             ]

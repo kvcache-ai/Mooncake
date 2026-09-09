@@ -520,6 +520,99 @@ def test_local_registration_and_operation_reuse(small_operation):
         executor.execute(changed, b.participant_id)
 
 
+@pytest.mark.parametrize("operation", ["register", "unregister"])
+@pytest.mark.parametrize("failure", [-7, False, RuntimeError, KeyboardInterrupt])
+def test_registration_failure_blocks_further_operations(
+    small_operation, monkeypatch, operation, failure
+):
+    plan, _keepalive = small_operation
+    binding = plan.source_bindings[0]
+    engine = MemoryEngine()
+    executor = KVCacheTransferEngineExecutor(
+        engine, instance_id=binding.instance_id, endpoint=binding.regions[0].endpoint
+    )
+    for region in binding.regions:
+        executor.register_region(region)
+    # Also exercise the cached-success path after a later registration error.
+    assert all(r.success for r in executor.execute(plan, binding.participant_id))
+    submissions = len(engine.calls)
+    additional = KVCacheRegisteredRegion(
+        "additional",
+        binding.regions[0].endpoint,
+        max(r.address + r.nbytes for r in binding.regions) + 4096,
+        64,
+    )
+    method = "register_memory" if operation == "register" else "unregister_memory"
+    original = getattr(engine, method)
+    registration_calls = []
+
+    def fail(*args):
+        registration_calls.append(args)
+        if isinstance(failure, type):
+            raise failure("ambiguous registration state")
+        return failure
+
+    monkeypatch.setattr(engine, method, fail)
+    with pytest.raises(failure if isinstance(failure, type) else RuntimeError):
+        if operation == "register":
+            executor.register_region(additional)
+        else:
+            executor.unregister_region(binding.regions[0].region_id)
+    fresh = replace(
+        plan,
+        operation_id="retry",
+        source_bindings=tuple(
+            replace(b, operation_id="retry") for b in plan.source_bindings
+        ),
+        target_bindings=tuple(
+            replace(b, operation_id="retry") for b in plan.target_bindings
+        ),
+    )
+    for action in (
+        lambda: executor.execute(plan, binding.participant_id),
+        lambda: executor.execute(fresh, binding.participant_id),
+        lambda: executor.register_region(additional),
+        lambda: executor.register_region(binding.regions[0]),
+        lambda: executor.unregister_region(binding.regions[0].region_id),
+        lambda: executor.validate_local_binding(binding),
+    ):
+        with pytest.raises(RuntimeError, match="recovery"):
+            action()
+    assert len(registration_calls) == 1
+    assert len(engine.calls) == submissions
+    # A transient error disappearing does not prove that partial side effects
+    # have been recovered; the original executor must stay quarantined.
+    monkeypatch.setattr(engine, method, original)
+    with pytest.raises(RuntimeError, match="recovery"):
+        executor.execute(plan, binding.participant_id)
+
+
+def test_registration_preflight_errors_leave_executor_usable(small_operation):
+    plan, _keepalive = small_operation
+    binding = plan.source_bindings[0]
+    executor = KVCacheTransferEngineExecutor(
+        MemoryEngine(),
+        instance_id=binding.instance_id,
+        endpoint=binding.regions[0].endpoint,
+    )
+    for region in binding.regions:
+        executor.register_region(region)
+    region = binding.regions[0]
+    for invalid in (
+        replace(region, endpoint="other"),
+        replace(region, nbytes=region.nbytes + 1),
+        replace(region, region_id="overlap"),
+    ):
+        with pytest.raises(ValueError):
+            executor.register_region(invalid)
+    with pytest.raises(KeyError):
+        executor.unregister_region("unknown")
+    executor.unregister_region(region.region_id)
+    executor.register_region(region)
+    executor.validate_local_binding(binding)
+    assert all(r.success for r in executor.execute(plan, binding.participant_id))
+
+
 def test_disjoint_bytes_do_not_hide_duplicate_logical_ranges(small_operation):
     plan, _ = small_operation
     b = plan.target_bindings[0]
