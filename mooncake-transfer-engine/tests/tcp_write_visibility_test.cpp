@@ -3771,6 +3771,8 @@ TEST(TcpWriteVisibilityTest, SameEndpointNewTcpInstanceRetiresOldGroup) {
     ASSERT_TRUE(endpoint.ok());
 
     const std::string logical_peer = "127.0.0.2:18051";
+    const std::string first_id = "0123456789abcdef0123456789abcdef";
+    const std::string second_id = "fedcba9876543210fedcba9876543210";
 
     EngineHandle target;
     target.init(metadata_server.uri(), logical_peer, 64 * 1024);
@@ -3782,7 +3784,7 @@ TEST(TcpWriteVisibilityTest, SameEndpointNewTcpInstanceRetiresOldGroup) {
 
     // G1 uses endpoint A.
     ASSERT_EQ(publishAndRefreshTcpIncarnation(h, h.segment_id, endpoint.port(),
-                                              "tcp-instance-g1"),
+                                              first_id),
               logical_peer);
 
     ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
@@ -3794,13 +3796,13 @@ TEST(TcpWriteVisibilityTest, SameEndpointNewTcpInstanceRetiresOldGroup) {
     // Simulate a process restart. The TCP endpoint is deliberately unchanged;
     // only the incarnation identity changes from G1 to G2.
     ASSERT_EQ(publishAndRefreshTcpIncarnation(h, h.segment_id, endpoint.port(),
-                                              "tcp-instance-g2"),
+                                              second_id),
               logical_peer);
 
     auto refreshed = h.engine->getMetadata()->getSegmentDescByID(h.segment_id);
     ASSERT_NE(refreshed, nullptr);
     ASSERT_EQ(refreshed->tcp_data_port, endpoint.port());
-    ASSERT_EQ(refreshed->tcp_instance_id, "tcp-instance-g2");
+    ASSERT_EQ(refreshed->tcp_instance_id, second_id);
 
     ASSERT_EQ(runOne(h.engine.get(), makeWriteRequest(h, 1)),
               TransferStatusEnum::COMPLETED);

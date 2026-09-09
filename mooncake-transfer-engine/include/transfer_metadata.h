@@ -134,8 +134,9 @@ class TransferMetadata {
 
         // Opaque identity for one TCP server incarnation. It stays stable
         // for the lifetime of a TCP transport instance and changes after a
-        // restart. Missing/empty means a legacy peer with no incarnation
-        // identity support.
+        // restart. A nonempty ID is 32 lowercase hexadecimal characters.
+        // Missing/empty means a legacy peer with no incarnation identity
+        // support.
         std::string tcp_instance_id;
 
         // In dual-NIC setups (MC_RDMA_BIND_ADDRESS), the RDMA-reachable

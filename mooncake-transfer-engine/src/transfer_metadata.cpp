@@ -650,8 +650,7 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
                                   ? segmentJSON["tcp_proto_version"].asInt()
                                   : 1;
-    if (segmentJSON.isMember("tcp_instance_id") &&
-        segmentJSON["tcp_instance_id"].isString()) {
+    if (segmentJSON.isMember("tcp_instance_id")) {
         desc->tcp_instance_id = segmentJSON["tcp_instance_id"].asString();
     }
     if (segmentJSON.isMember("timestamp"))
@@ -778,6 +777,20 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                                     const std::string &segment_name) {
+    if (segmentJSON.isMember("tcp_instance_id")) {
+        const char *begin = nullptr;
+        const char *end = nullptr;
+        if (!segmentJSON["tcp_instance_id"].getString(&begin, &end) ||
+            (begin != end &&
+             (end - begin != 32 || !std::all_of(begin, end, [](char c) {
+                  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+              })))) {
+            LOG(WARNING) << "Invalid TCP instance ID in segment "
+                         << segment_name;
+            return nullptr;
+        }
+    }
+
 #ifdef ENABLE_MULTI_PROTOCOL
     // Check if this is a multi-protocol scenario (CXL+TCP or CXL+RDMA)
     bool is_multi_protocol = false;
@@ -823,8 +836,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
                                   ? segmentJSON["tcp_proto_version"].asInt()
                                   : 1;
-    if (segmentJSON.isMember("tcp_instance_id") &&
-        segmentJSON["tcp_instance_id"].isString()) {
+    if (segmentJSON.isMember("tcp_instance_id")) {
         desc->tcp_instance_id = segmentJSON["tcp_instance_id"].asString();
     }
     if (segmentJSON.isMember("timestamp"))
