@@ -137,6 +137,9 @@ class BufferAllocatorBase {
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
 
+    [[nodiscard]] int32_t getNumaNode() const noexcept { return numa_node_; }
+    void SetNumaNode(int32_t numa_node) noexcept { numa_node_ = numa_node; }
+
     /**
      * Returns the largest free region available in this allocator.
      * For CacheLib allocators, this returns kAllocatorUnknownFreeSpace as an
@@ -168,6 +171,7 @@ class BufferAllocatorBase {
 
    private:
     std::atomic_size_t cur_size_{0};
+    int32_t numa_node_{-1};
     std::unique_ptr<StorageUsageRegistration> usage_registration_;
 };
 

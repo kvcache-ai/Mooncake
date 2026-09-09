@@ -10,9 +10,10 @@ tl::expected<std::vector<Replica>, ErrorCode> AllocationStrategy::Allocate(
     const size_t replica_num,
     const std::vector<std::string>& preferred_segments,
     const std::set<std::string>& excluded_segments,
-    const ReplicaType replica_type) {
+    const ReplicaType replica_type, const int32_t preferred_numa_node) {
     return Allocate(placement.getAllocatorManager(), slice_length, replica_num,
-                    preferred_segments, excluded_segments, replica_type);
+                    preferred_segments, excluded_segments, replica_type,
+                    preferred_numa_node);
 }
 
 tl::expected<std::vector<Replica>, ErrorCode>
@@ -21,11 +22,12 @@ SsdFreeRatioFirstAllocationStrategy::Allocate(
     const size_t replica_num,
     const std::vector<std::string>& preferred_segments,
     const std::set<std::string>& excluded_segments,
-    const ReplicaType replica_type) {
+    const ReplicaType replica_type, const int32_t preferred_numa_node) {
     const auto& allocator_manager = placement.getAllocatorManager();
     return AllocateRanked(
         allocator_manager, slice_length, replica_num, preferred_segments,
-        excluded_segments, replica_type, [&](const std::string& name) {
+        excluded_segments, replica_type, preferred_numa_node,
+        [&](const std::string& name) {
             auto client_id = placement.GetOwnerClientId(name);
             if (!client_id) {
                 return 1.0;

@@ -244,6 +244,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     }
     auto allocator = std::move(*created);
 
+    allocator->SetNumaNode(segment.numa_node.value_or(-1));
     allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
@@ -263,6 +264,16 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
         auto validation = ValidateRemountSegment(segment, client_id);
         if (validation != ErrorCode::OK) {
             return validation;
+        }
+        auto mounted = segment_manager_->mounted_segments_.find(segment.id);
+        if (mounted != segment_manager_->mounted_segments_.end() &&
+            !mounted->second.segment.numa_node.has_value() &&
+            segment.numa_node.has_value()) {
+            mounted->second.segment.numa_node = segment.numa_node;
+            if (mounted->second.buf_allocator) {
+                mounted->second.buf_allocator->SetNumaNode(
+                    segment.numa_node.value());
+            }
         }
         ErrorCode err = MountSegment(segment, client_id);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
@@ -307,7 +318,9 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
         authoritative.size != segment.size ||
         authoritative.te_endpoint != segment.te_endpoint ||
         authoritative.protocol != segment.protocol ||
-        authoritative.host_id != segment.host_id) {
+        authoritative.host_id != segment.host_id ||
+        (authoritative.numa_node.has_value() && segment.numa_node.has_value() &&
+         authoritative.numa_node.value() != segment.numa_node.value())) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;

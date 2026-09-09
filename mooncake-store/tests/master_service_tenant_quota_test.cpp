@@ -71,11 +71,12 @@ class BlockingAllocationStrategy final : public AllocationStrategy {
         const size_t replica_num,
         const std::vector<std::string>& preferred_segments,
         const std::set<std::string>& excluded_segments,
-        const ReplicaType replica_type) override {
+        const ReplicaType replica_type,
+        const int32_t preferred_numa_node = -1) override {
         BlockOnce();
         return delegate_.Allocate(allocator_manager, slice_length, replica_num,
                                   preferred_segments, excluded_segments,
-                                  replica_type);
+                                  replica_type, preferred_numa_node);
     }
 
     tl::expected<Replica, ErrorCode> AllocateFrom(
