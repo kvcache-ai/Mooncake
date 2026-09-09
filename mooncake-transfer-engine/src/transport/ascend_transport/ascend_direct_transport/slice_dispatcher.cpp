@@ -64,12 +64,14 @@ DefaultSliceDispatcher::DefaultSliceDispatcher(
 
 void DefaultSliceDispatcher::enqueue(
     std::vector<Transport::Slice *> slice_list) {
-    std::map<
-        std::pair<Transport::SegmentID, Transport::TransferRequest::OpCode>,
-        std::vector<Transport::Slice *>>
+    std::map<std::tuple<int32_t, Transport::SegmentID,
+                        Transport::TransferRequest::OpCode>,
+             std::vector<Transport::Slice *>>
         seg_to_slices;
     for (auto slice : slice_list) {
-        seg_to_slices[{slice->target_id, slice->opcode}].push_back(slice);
+        seg_to_slices[{slice->ascend_direct.engine_id, slice->target_id,
+                       slice->opcode}]
+            .push_back(slice);
     }
     auto *executor = transfer_executor_;
     auto contexts = local_engine_contexts_;

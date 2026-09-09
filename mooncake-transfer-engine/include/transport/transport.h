@@ -67,6 +67,10 @@ class Transport {
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
+        // Explicit local accelerator identity for asynchronous submissions.
+        // Ascend standalone clients pass a physical device id here so the
+        // transport need not consult thread-local ACL state.
+        int32_t device_id = -1;
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;

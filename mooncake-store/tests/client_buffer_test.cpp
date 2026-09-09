@@ -279,6 +279,37 @@ TEST_F(ClientBufferTest, SplitIntoSlicesPtrLength) {
     EXPECT_EQ(total_slice_size, alloc_size);
 }
 
+TEST_F(ClientBufferTest, SplitIntoSlicesPreservesDeviceId) {
+    constexpr size_t kLength = 1024;
+    constexpr int32_t kPhysicalDeviceId = 3;
+    std::vector<uint8_t> buffer(kLength);
+
+    auto slices =
+        split_into_slices(buffer.data(), buffer.size(), kPhysicalDeviceId);
+
+    ASSERT_FALSE(slices.empty());
+    for (const auto& slice : slices) {
+        EXPECT_EQ(slice.device_id, kPhysicalDeviceId);
+    }
+}
+
+TEST_F(ClientBufferTest, SplitBufferHandlePreservesDeviceId) {
+    constexpr size_t kBufferSize = 1024 * 1024;
+    constexpr size_t kAllocationSize = 1024;
+    constexpr int32_t kPhysicalDeviceId = 3;
+    auto allocator = ClientBufferAllocator::create(kBufferSize);
+    ASSERT_NE(allocator, nullptr);
+    auto handle = allocator->allocate(kAllocationSize);
+    ASSERT_TRUE(handle.has_value());
+
+    auto slices = split_into_slices(*handle, kPhysicalDeviceId);
+
+    ASSERT_FALSE(slices.empty());
+    for (const auto& slice : slices) {
+        EXPECT_EQ(slice.device_id, kPhysicalDeviceId);
+    }
+}
+
 // Test memory exhaustion scenario
 TEST_F(ClientBufferTest, MemoryExhaustion) {
     const size_t buffer_size =
@@ -367,6 +398,7 @@ TEST_F(ClientBufferTest, CalculateTotalSizeZeroSizeMemoryReplica) {
 TEST_F(ClientBufferTest, AllocateSlicesMemoryReplica) {
     const size_t buffer_size = 1024 * 1024;  // 1MB
     const size_t alloc_size = 4096;          // 4KB
+    constexpr int32_t kPhysicalDeviceId = 3;
 
     auto allocator = ClientBufferAllocator::create(buffer_size);
     ASSERT_NE(allocator, nullptr);
@@ -386,7 +418,8 @@ TEST_F(ClientBufferTest, AllocateSlicesMemoryReplica) {
     replica.status = ReplicaStatus::COMPLETE;
 
     std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle.ptr());
+    int result =
+        allocateSlices(slices, replica, handle.ptr(), kPhysicalDeviceId);
 
     EXPECT_EQ(result, 0);
     EXPECT_EQ(slices.size(), 1);
@@ -396,6 +429,7 @@ TEST_F(ClientBufferTest, AllocateSlicesMemoryReplica) {
 
     // Verify slice pointer matches buffer pointer
     EXPECT_EQ(slices[0].ptr, handle.ptr());
+    EXPECT_EQ(slices[0].device_id, kPhysicalDeviceId);
 }
 
 // Test allocateSlices function with disk replica
