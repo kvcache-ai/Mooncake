@@ -279,6 +279,9 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
         return restored.error();
     }
 
+    LOG(INFO) << "Batch snapshot bootstrap complete: snapshot_seq="
+              << restored->last_included_seq
+              << " applied_seq=" << restored->last_applied_seq;
     // The provider has already replayed the suffix in temporary state. The
     // running reader/applier starts from that proven final sequence.
     metadata_store_ = std::move(temporary_metadata);
