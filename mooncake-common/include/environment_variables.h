@@ -75,6 +75,13 @@ struct MmapArenaEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_DISABLE_MMAP_ARENA);
 };
 
+struct HugepageEnvironmentVariables {
+    // Keep these values as strings to preserve presence-based enablement and
+    // the existing byte-size parser, fallback, and logging behavior.
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_USE_HUGEPAGE);
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_HUGEPAGE_SIZE);
+};
+
 struct LocalHotCacheEnvironmentVariables {
     // Keep these values as strings to preserve their existing per-setting
     // parsing, fallback, and logging behavior.
