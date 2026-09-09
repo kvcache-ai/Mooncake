@@ -13,6 +13,16 @@ endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+option(MOONCAKE_ENABLE_ADAPTIVE_CC
+       "Build adaptive congestion control for RDMA transports" OFF)
+if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+  add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CC=1)
+  if(NOT TARGET adaptive_congestion_control_core)
+    add_subdirectory(../src/common/adaptive_congestion_control
+                     ${CMAKE_CURRENT_BINARY_DIR}/adaptive_congestion_control)
+  endif()
+endif()
+
 # Compile-time metrics switch (default OFF for zero overhead on the transfer hot
 # path). Declared at the top level so it is discoverable; the actual compile
 # definition is applied in tent/src/metrics/CMakeLists.txt.

@@ -3,18 +3,26 @@ set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 if(MOONCAKE_ENABLE_ADAPTIVE_CC)
   add_executable(adaptive_congestion_control_test
                  ${WORKSPACE}/adaptive_congestion_control_test.cpp)
-  target_link_libraries(adaptive_congestion_control_test
-                        PRIVATE adaptive_congestion_control_core gtest
-                                gtest_main)
+  target_link_libraries(
+    adaptive_congestion_control_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
   add_test(NAME adaptive_congestion_control_test
            COMMAND adaptive_congestion_control_test)
 
   add_executable(rdma_error_classifier_test
                  ${WORKSPACE}/rdma_error_classifier_test.cpp)
-  target_link_libraries(rdma_error_classifier_test
-                        PRIVATE adaptive_congestion_control_core gtest
-                                gtest_main)
+  target_link_libraries(
+    rdma_error_classifier_test PRIVATE adaptive_congestion_control_core gtest
+                                       gtest_main)
   add_test(NAME rdma_error_classifier_test COMMAND rdma_error_classifier_test)
+
+  add_executable(adaptive_congestion_control_config_test
+                 ${WORKSPACE}/adaptive_congestion_control_config_test.cpp)
+  target_link_libraries(
+    adaptive_congestion_control_config_test
+    PRIVATE adaptive_congestion_control_core gtest gtest_main)
+  add_test(NAME adaptive_congestion_control_config_test
+           COMMAND adaptive_congestion_control_config_test)
 endif()
 
 if(USE_HIP)
