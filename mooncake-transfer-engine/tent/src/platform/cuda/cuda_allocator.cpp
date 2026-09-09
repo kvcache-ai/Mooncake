@@ -18,20 +18,30 @@
 #include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <numa.h>
 #include <glog/logging.h>
+#include <mutex>
+#include <numa.h>
 #include <vector>
 
 namespace mooncake {
 namespace tent {
 namespace {
 
+// cuInit is process-global and idempotent; still call it once so the driver
+// probe is not re-entered on every topology device.
+bool ensureCudaDriverInit() {
+    static std::once_flag flag;
+    static CUresult result = CUDA_ERROR_NOT_INITIALIZED;
+    std::call_once(flag, []() { result = cuInit(0); });
+    return result == CUDA_SUCCESS;
+}
+
 // Driver-API probe: true iff this process already has a primary context on
 // `device`. Does not create one. Topology lists every visible GPU for NIC
 // affinity; cudaSetDevice on those names would allocate idle-card contexts
-// (Tone runs --gpus all without CUDA_VISIBLE_DEVICES).
+// when the process can see more GPUs than this rank uses.
 bool cudaPrimaryContextIsActive(int device) {
-    if (cuInit(0) != CUDA_SUCCESS) return false;
+    if (!ensureCudaDriverInit()) return false;
     CUdevice cu_dev = 0;
     if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
     unsigned int flags = 0;
@@ -45,7 +55,7 @@ bool cudaPrimaryContextIsActive(int device) {
 // Bare cudaGetDevice() can implicitly create GPU 0 when this thread has no
 // current context. Only save/restore the caller's device when one exists.
 bool cudaHasCurrentContext() {
-    if (cuInit(0) != CUDA_SUCCESS) return false;
+    if (!ensureCudaDriverInit()) return false;
     CUcontext ctx = nullptr;
     return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
 }

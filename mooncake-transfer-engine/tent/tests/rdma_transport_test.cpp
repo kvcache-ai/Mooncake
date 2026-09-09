@@ -2324,8 +2324,7 @@ TEST(RdmaQuiesceTest, SynchronizeDevicesDoesNotCreateIdlePrimaryContexts) {
         GTEST_SKIP() << "need an idle GPU besides cuda:0";
     }
 
-    // Rank-like: only cuda:0 is in use. Topology still lists every visible GPU
-    // (Tone --gpus all / no CUDA_VISIBLE_DEVICES on the real box).
+    // Only cuda:0 is in use. Topology still lists every visible GPU.
     ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
     ASSERT_TRUE(primary_active(0));
 
