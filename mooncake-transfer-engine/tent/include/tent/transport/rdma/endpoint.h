@@ -27,6 +27,9 @@
 
 namespace mooncake {
 namespace tent {
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+struct TentRdmaCongestionControlRoute;
+#endif
 class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     struct WrDepthBlock {
         std::atomic<int> value;
@@ -131,6 +134,20 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     std::string name() const { return endpoint_name_; }
 
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    uint32_t generation() const { return generation_; }
+    TentRdmaCongestionControlRoute* bindCongestionRoute(TentRdmaCongestionControlRoute* route) {
+        TentRdmaCongestionControlRoute* expected = nullptr;
+        congestion_route_.compare_exchange_strong(expected, route,
+                                                  std::memory_order_release,
+                                                  std::memory_order_relaxed);
+        return congestion_route_.load(std::memory_order_acquire);
+    }
+    TentRdmaCongestionControlRoute* congestionRoute() const {
+        return congestion_route_.load(std::memory_order_acquire);
+    }
+#endif
+
     // Notification QP operations
     uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
 
@@ -209,6 +226,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // them.
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
                      const std::function<void(RdmaSlice*)>& on_post = {});
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    int submitSlicesLimited(std::vector<RdmaSlice*>& slice_list, int qp_index,
+                            const std::function<void(RdmaSlice*)>& on_post,
+                            size_t max_count);
+#endif
 
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
@@ -270,6 +292,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     // Immutable address generation used to create this endpoint's QPs and
     // bootstrap descriptors. A context refresh evicts the whole endpoint.
     RdmaAddressSnapshot local_address_;
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    uint32_t generation_ = 0;
+    std::atomic<TentRdmaCongestionControlRoute*> congestion_route_{nullptr};
+#endif
 
     std::vector<ibv_qp*> qp_list_;
     // Per-pool QP layout, resolved once in construct() from params_->qp_pools.
