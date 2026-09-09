@@ -210,15 +210,14 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
-        service.ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(),
-                                                   key);
+        service.ClearDynamicReplicationStateLocked(accessor.GetTenantCatalog(),
+                                                   *accessor.GetEntry());
     }
 
     void DiscardExpiredProcessingReplicas(MasterService& service,
                                           const std::string& key) const {
         (void)key;
-        auto tenant_handle =
-            service.catalog_.Lookup(TenantId::Default());
+        auto tenant_handle = service.catalog_.Lookup(TenantId::Default());
         if (tenant_handle == nullptr) {
             return;
         }

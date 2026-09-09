@@ -2077,8 +2077,8 @@ void MasterService::FinalizeExpiredReplicationTaskAfterDurable(
         discarded_replicas_.emplace_back(std::move(replicas), ttl);
     }
     if (dynamic_task) {
-        ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(),
-                                           durable_entry.object_key);
+        ClearDynamicReplicationStateLocked(accessor.GetTenantCatalog(),
+                                           *accessor.GetEntry());
     }
     if (!metadata.IsValid()) {
         accessor.Erase(previous_media);
@@ -2174,6 +2174,20 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
 
 // Key-based teardown: resolve the entry at call time, then run the shared
 // entry-based teardown below.
+void MasterService::ErasePromotionTaskLocked(
+    TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry) {
+    if (!entry.promotion_task.has_value()) {
+        return;
+    }
+    ReleaseTenantQuota(
+        GetBoundTenantQuotaHandle(tenant_state),
+        std::exchange(entry.promotion_task->pending_quota_charge_bytes, 0));
+    entry.promotion_task.reset();
+    promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
+    MasterMetricManager::instance().dec_promotion_in_flight();
+    MasterMetricManager::instance().inc_promotion_cancelled();
+}
+
 void MasterService::EraseMetadata(TenantCatalog& tenant_state,
                                   const std::string& key,
                                   const TenantId& tenant_id,
@@ -2262,8 +2276,12 @@ void MasterService::EraseMetadata(
                            entry->replication_task->pending_quota_charge_bytes);
         entry->replication_task.reset();
     }
-    ErasePromotionTaskIfPresent(tenant_state, key);
-    ClearDynamicReplicationStateForKey(tenant_state, key);
+    ErasePromotionTaskLocked(tenant_state, *entry);
+    // The global candidate count must be settled here: an erased entry can
+    // no longer reach the retry loop's expiry path, so its candidate would
+    // permanently leak a slot toward the admission limit.
+    EraseCandidateLocked(*entry);
+    ClearDynamicReplicationStateLocked(tenant_state, *entry);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     FreeDfsReplicas(key, metadata.GetAllReplicas());
@@ -5690,7 +5708,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         if (!pending_validation) {
             return tl::make_unexpected(pending_validation.error());
         }
-        ClearDynamicReplicationStateForKey(tenant_state, key);
+        ClearDynamicReplicationStateLocked(tenant_state, *accessor.GetEntry());
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     if (!pending_validation) {
@@ -5701,13 +5719,15 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
             segment_manager_.getSegmentAccess();
         for (const auto& tgt_segment : tgt_segments) {
             if (!segment_access.ExistsSegmentName(tgt_segment)) {
-                ClearDynamicReplicationStateForKey(tenant_state, key);
+                ClearDynamicReplicationStateLocked(tenant_state,
+                                                   *accessor.GetEntry());
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_found";
                 return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
             }
             if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
-                ClearDynamicReplicationStateForKey(tenant_state, key);
+                ClearDynamicReplicationStateLocked(tenant_state,
+                                                   *accessor.GetEntry());
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_allocatable";
                 return tl::make_unexpected(
@@ -5722,7 +5742,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         LOG(ERROR) << "key=" << key << ", src_segment=" << src_segment
                    << ", replica not found or not valid";
         if (dynamic_copy) {
-            ClearDynamicReplicationStateForKey(tenant_state, key);
+            ClearDynamicReplicationStateLocked(tenant_state,
+                                               *accessor.GetEntry());
         }
         return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
     }
@@ -5738,7 +5759,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
                 object_id.tenant_id.value(), "quota_exceeded");
         }
         if (dynamic_copy) {
-            ClearDynamicReplicationStateForKey(tenant_state, key);
+            ClearDynamicReplicationStateLocked(tenant_state,
+                                               *accessor.GetEntry());
         }
         return tl::make_unexpected(quota_result.error());
     }
@@ -5769,7 +5791,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
                            << ", failed to allocate replica";
                 refund_pending_quota();
                 if (dynamic_copy) {
-                    ClearDynamicReplicationStateForKey(tenant_state, key);
+                    ClearDynamicReplicationStateLocked(tenant_state,
+                                                       *accessor.GetEntry());
                 }
                 return tl::make_unexpected(replica.error());
             }
@@ -5794,7 +5817,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     if (object_entry == nullptr || object_entry->replication_task.has_value()) {
         refund_pending_quota();
         if (dynamic_copy) {
-            ClearDynamicReplicationStateForKey(tenant_state, key);
+            ClearDynamicReplicationStateLocked(tenant_state,
+                                               *accessor.GetEntry());
         }
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
@@ -5889,7 +5913,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
             GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
             task.pending_quota_charge_bytes);
         accessor.EraseReplicationTask();
-        ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(), key);
+        ClearDynamicReplicationStateLocked(accessor.GetTenantCatalog(),
+                                           *accessor.GetEntry());
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
             accessor.Erase();
@@ -5948,7 +5973,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
             });
     }
 
-    ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(), key);
+    ClearDynamicReplicationStateLocked(accessor.GetTenantCatalog(),
+                                       *accessor.GetEntry());
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
@@ -6062,7 +6088,8 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantCatalog()),
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
-    ClearDynamicReplicationStateForKey(accessor.GetTenantCatalog(), key);
+    ClearDynamicReplicationStateLocked(accessor.GetTenantCatalog(),
+                                       *accessor.GetEntry());
 
     if (!metadata.IsValid()) {
         // Remove the object if it does not have any replicas.
@@ -7015,7 +7042,7 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
         source->dec_refcnt();
     }
     const UUID holder_id = entry->promotion_task->holder_id;
-    ErasePromotionTaskIfPresent(tenant_state, metadata.user_key);
+    ErasePromotionTaskLocked(tenant_state, *entry);
 
     // Best-effort cleanup of a task that may still be queued on the holder.
     local_ssd_manager_.RemovePromotion(holder_id, metadata.tenant_id,
@@ -7729,11 +7756,9 @@ void MasterService::DecrementCandidateCount() {
     }
 }
 
-void MasterService::EraseCandidate(TenantCatalog& tenant_state,
-                                   const std::string& key) {
-    auto entry = tenant_state.Pin(key);
-    if (entry != nullptr && entry->promotion_candidate.has_value()) {
-        entry->promotion_candidate.reset();
+void MasterService::EraseCandidateLocked(mooncake::tenant::ObjectEntry& entry) {
+    if (entry.promotion_candidate.has_value()) {
+        entry.promotion_candidate.reset();
         DecrementCandidateCount();
     }
 }
@@ -7741,31 +7766,25 @@ void MasterService::EraseCandidate(TenantCatalog& tenant_state,
 void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
     auto tenant_handle = catalog_.Lookup(object_id.tenant_id);
     if (!tenant_handle) return;
-    TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
-    auto& tenant_state = *tenant_handle;
-    EraseCandidate(tenant_state, object_id.user_key);
+    auto entry = tenant_handle->Pin(object_id.user_key);
+    if (entry == nullptr) return;
+    auto lock = entry->LockUnique();
+    EraseCandidateLocked(*entry);
 }
 
-void MasterService::RecordOrUpdateCandidate(TenantCatalog& tenant_state,
-                                            const std::string& key,
-                                            uint8_t sketch_score,
-                                            PromotionCandidateReason reason,
-                                            ErrorCode last_error,
-                                            uint32_t execution_failures) {
+void MasterService::RecordOrUpdateCandidateLocked(
+    mooncake::tenant::ObjectEntry& entry, uint8_t sketch_score,
+    PromotionCandidateReason reason, ErrorCode last_error,
+    uint32_t execution_failures) {
     const auto now = std::chrono::steady_clock::now();
-    auto entry = tenant_state.Pin(key);
-    if (entry == nullptr) {
-        // A promotion candidate lives in the object's entry; without an entry
-        // there is nowhere to record it.
-        return;
-    }
-    if (entry->promotion_candidate.has_value()) {
+    const std::string& key = entry.key();
+    if (entry.promotion_candidate.has_value()) {
         // Update existing entry: refresh last_seen, reset
         // retry_after/retry_count. execution_failures is intentionally NOT
         // updated here: a read refresh is new demand signal and may extend
         // the budget, but it must not erase the failure history of this
         // admission chain.
-        PromotionCandidate& candidate = *entry->promotion_candidate;
+        PromotionCandidate& candidate = *entry.promotion_candidate;
         candidate.last_seen = now;
         candidate.last_reason = reason;
         candidate.last_error = last_error;
@@ -7792,7 +7811,7 @@ void MasterService::RecordOrUpdateCandidate(TenantCatalog& tenant_state,
         return;
     }
 
-    entry->promotion_candidate =
+    entry.promotion_candidate =
         PromotionCandidate{.sketch_score = sketch_score,
                            .first_seen = now,
                            .last_seen = now,
@@ -7831,7 +7850,9 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
     TenantCatalogAccessorRW tenant_accessor(tenant_handle.get());
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Pin(object_id.user_key);
-    if (!object_entry || !object_entry->promotion_candidate.has_value()) {
+    if (!object_entry) return;
+    auto lock = object_entry->LockUnique();
+    if (!object_entry->promotion_candidate.has_value()) {
         return;
     }
 
@@ -7851,7 +7872,7 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
     if (ttl_expired || c.retry_count >= kPromotionCandidateMaxRetries) {
         VLOG(1) << "promotion_candidate_gave_up key=" << object_id.user_key
                 << " retries=" << c.retry_count;
-        EraseCandidate(tenant_state, object_id.user_key);
+        EraseCandidateLocked(*object_entry);
         MasterMetricManager::instance()
             .inc_promotion_candidate_expired_evaluated();
     } else {
@@ -7866,7 +7887,7 @@ void MasterService::ClearCandidatesForReload() {
             auto objs = tenant_state.SnapshotObjects();
             for (const auto& entry : objs) {
                 auto lk = entry->LockUnique();
-                entry->promotion_candidate.reset();
+                EraseCandidateLocked(*entry);
             }
         });
     promotion_candidate_count_.store(0, std::memory_order_relaxed);
@@ -7954,15 +7975,10 @@ size_t MasterService::RunPromotionCandidateRetry() {
                     ObjectIdentity{.tenant_id = tenant_id, .user_key = key});
             }
             for (const auto& key : keys_to_drop) {
-                // Reset under the object lock (EraseCandidate does not
-                // acquire a lock; callers may already hold it).
                 auto e = tenant_state.Pin(key);
                 if (e) {
                     auto lk = e->LockUnique();
-                    if (e->promotion_candidate.has_value()) {
-                        e->promotion_candidate.reset();
-                        DecrementCandidateCount();
-                    }
+                    EraseCandidateLocked(*e);
                 }
             }
         });
@@ -8210,15 +8226,14 @@ int64_t MasterService::DynamicReplicationNowMs() {
             .count());
 }
 
-void MasterService::ClearDynamicReplicationStateForKey(
-    TenantCatalog& tenant_state, const std::string& key) {
-    auto entry = tenant_state.Pin(key);
-    if (entry) {
-        entry->dynamic_replication_pending.reset();
-        entry->dynamic_replication_cooldown =
-            std::chrono::steady_clock::time_point{};
-    }
-    tenant_state.object_index.EraseDynamicReplicationLeasesForObject(key);
+// Locked kernel — see the declaration for the lock requirement.
+void MasterService::ClearDynamicReplicationStateLocked(
+    TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry) {
+    entry.dynamic_replication_pending.reset();
+    entry.dynamic_replication_cooldown =
+        std::chrono::steady_clock::time_point{};
+    tenant_state.object_index.EraseDynamicReplicationLeasesForObject(
+        entry.key());
 }
 
 void MasterService::CleanupExpiredDynamicReplicationState() {
@@ -8246,21 +8261,22 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
         }
         for (const auto& [key, generation] : expired_pending_keys) {
             auto object_entry = tenant_state.Pin(key);
-            if (!object_entry || object_entry->generation() != generation ||
-                object_entry->is_torn_down) {
+            if (!object_entry || object_entry->generation() != generation) {
                 // The entry was erased (and possibly replaced) after
-                // detection; its expired task died with it.
-                ClearDynamicReplicationStateForKey(tenant_state, key);
+                // detection: the expired task died with the old entry, and
+                // a replacement owns its own pending state, which must not
+                // be touched here. Stale lease records expire via the
+                // time-based sweep below.
                 continue;
             }
             auto lk = object_entry->LockUnique();
-            if (object_entry->dynamic_replication_pending) {
+            if (!object_entry->is_torn_down &&
+                object_entry->dynamic_replication_pending) {
                 task_manager_.get_write_access().fail_task_if_pending(
                     object_entry->dynamic_replication_pending->task_id,
                     "dynamic replica lease expired");
             }
-            lk.unlock();
-            ClearDynamicReplicationStateForKey(tenant_state, key);
+            ClearDynamicReplicationStateLocked(tenant_state, *object_entry);
         }
         tenant_state.object_index.EraseExpiredDynamicReplicationLeases(now_ms);
     });
@@ -8276,7 +8292,7 @@ bool MasterService::HasDynamicReplicationPending(TenantCatalog& tenant_state,
         DynamicReplicationNowMs()) {
         return true;
     }
-    ClearDynamicReplicationStateForKey(tenant_state, key);
+    ClearDynamicReplicationStateLocked(tenant_state, *entry);
     return false;
 }
 
@@ -8562,7 +8578,7 @@ MasterService::SubmitReplicaActionProposalLocked(
     auto task =
         SubmitDynamicReplicaCopyTask(object_id, *plan, lease_id, version_epoch);
     if (!task.has_value()) {
-        ClearDynamicReplicationStateForKey(tenant_state, object_id.user_key);
+        ClearDynamicReplicationStateLocked(tenant_state, *object_entry);
         return tl::make_unexpected(task.error());
     }
 
@@ -8627,9 +8643,9 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         if (record_candidate) {
             MetadataAccessorRW accessor(this, object_id);
             if (accessor.Exists()) {
-                RecordOrUpdateCandidate(accessor.GetTenantCatalog(), key, freq,
-                                        PromotionCandidateReason::kWatermark,
-                                        ErrorCode::OK);
+                RecordOrUpdateCandidateLocked(
+                    *accessor.GetEntry(), freq,
+                    PromotionCandidateReason::kWatermark, ErrorCode::OK);
             }
         }
         return PromotionQueueResult::kWatermarkRejected;
@@ -8643,13 +8659,12 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         return PromotionQueueResult::kNotFound;
     }
     auto& metadata = accessor.Get();
-    auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
 
     // A primary Put/Upsert owns all PROCESSING replicas while the key is in
     // processing_keys. Promotion must not establish a second owner.
     if (accessor.InProcessing()) {
-        EraseCandidate(tenant_state, key);
+        EraseCandidateLocked(*object_entry);
         return PromotionQueueResult::kAlreadyInFlight;
     }
 
@@ -8662,11 +8677,11 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         // promotion is executing) or the holder's mailbox is gone.
         local_ssd_manager_.TouchPromotion(
             object_entry->promotion_task->holder_id, object_id.tenant_id, key);
-        EraseCandidate(tenant_state, key);
+        EraseCandidateLocked(*object_entry);
         return PromotionQueueResult::kAlreadyInFlight;
     }
     if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
-        EraseCandidate(tenant_state, key);
+        EraseCandidateLocked(*object_entry);
         return PromotionQueueResult::kMemoryReplicaPresent;
     }
 
@@ -8677,7 +8692,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
                                if (source == nullptr) source = &r;
                            });
     if (source == nullptr) {
-        EraseCandidate(tenant_state, key);
+        EraseCandidateLocked(*object_entry);
         return PromotionQueueResult::kNoLocalDiskSource;
     }
 
@@ -8691,9 +8706,9 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         promotion_queue_limit_) {
         MasterMetricManager::instance().inc_promotion_rejected_cap();
         if (record_candidate) {
-            RecordOrUpdateCandidate(tenant_state, key, freq,
-                                    PromotionCandidateReason::kQueueCap,
-                                    ErrorCode::OK);
+            RecordOrUpdateCandidateLocked(*object_entry, freq,
+                                          PromotionCandidateReason::kQueueCap,
+                                          ErrorCode::OK);
         }
         return PromotionQueueResult::kQueueCapRejected;
     }
@@ -8710,18 +8725,18 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         VLOG(1) << "promotion_push_failed key=" << key
                 << " error=" << push_result.error();
         if (push_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            EraseCandidate(tenant_state, key);
+            EraseCandidateLocked(*object_entry);
             return PromotionQueueResult::kAlreadyInFlight;
         }
         if (push_result.error() == ErrorCode::SEGMENT_NOT_FOUND ||
             push_result.error() == ErrorCode::INVALID_PARAMS) {
-            EraseCandidate(tenant_state, key);
+            EraseCandidateLocked(*object_entry);
             return PromotionQueueResult::kNoLocalDiskSource;
         }
         if (record_candidate) {
-            RecordOrUpdateCandidate(tenant_state, key, freq,
-                                    PromotionCandidateReason::kPushFailed,
-                                    push_result.error());
+            RecordOrUpdateCandidateLocked(*object_entry, freq,
+                                          PromotionCandidateReason::kPushFailed,
+                                          push_result.error());
         }
         return PromotionQueueResult::kPushFailed;
     }
@@ -8742,7 +8757,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         execution_failures =
             object_entry->promotion_candidate->execution_failures;
     }
-    EraseCandidate(tenant_state, key);
+    EraseCandidateLocked(*object_entry);
     if (object_entry != nullptr) {
         object_entry->promotion_task =
             PromotionTask{.source_id = source->id(),
@@ -9102,9 +9117,9 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
                 object_id.tenant_id.MakeScopedKey(object_id.user_key);
             const uint8_t freq =
                 promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
-            RecordOrUpdateCandidate(tenant_state, object_id.user_key, freq,
-                                    PromotionCandidateReason::kExecutionFailed,
-                                    ErrorCode::OK, prior_failures + 1);
+            RecordOrUpdateCandidateLocked(
+                *object_entry, freq, PromotionCandidateReason::kExecutionFailed,
+                ErrorCode::OK, prior_failures + 1);
         }
     }
 
@@ -9419,7 +9434,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             discarded_replicas.emplace_back(std::move(replicas), ttl);
         }
         if (dynamic_task) {
-            ClearDynamicReplicationStateForKey(tenant_state, key);
+            ClearDynamicReplicationStateLocked(tenant_state, *entry);
         }
         if (!metadata.IsValid()) {
             replication_erase_keys.push_back(key);
@@ -11966,6 +11981,8 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     return metadata;
 }
 
+// Caller must hold the entry's mutex (CopyStart runs inside a
+// MetadataAccessorRW scope).
 tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(
     TenantCatalog& tenant_state, const std::string& key,
@@ -11985,7 +12002,7 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
     }
     auto& pending = *pending_entry->dynamic_replication_pending;
     if (pending.expire_at_ms_epoch < DynamicReplicationNowMs()) {
-        ClearDynamicReplicationStateForKey(tenant_state, key);
+        ClearDynamicReplicationStateLocked(tenant_state, *pending_entry);
         if (dynamic_copy) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -11996,7 +12013,7 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
     if (pending.version_epoch != current_version_epoch) {
-        ClearDynamicReplicationStateForKey(tenant_state, key);
+        ClearDynamicReplicationStateLocked(tenant_state, *pending_entry);
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
     }
     if (pending.lease_id != dynamic_replication_lease_id ||

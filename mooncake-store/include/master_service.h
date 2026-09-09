@@ -1443,12 +1443,17 @@ class MasterService {
      */
     PromotionQueueResult TryPushPromotionQueue(const ObjectIdentity& object_id,
                                                bool record_candidate = true);
-    void RecordOrUpdateCandidate(TenantCatalog& tenant_state,
-                                 const std::string& key, uint8_t sketch_score,
-                                 PromotionCandidateReason reason,
-                                 ErrorCode last_error,
-                                 uint32_t execution_failures = 0);
-    void EraseCandidate(TenantCatalog& tenant_state, const std::string& key);
+    // Candidate state lives in ObjectEntry::promotion_candidate and is
+    // guarded by the entry mutex. The *Locked kernels require the caller to
+    // hold it (e.g. a MetadataAccessorRW scope); the plain entry points Pin
+    // the entry and take the lock themselves. A helper must never serve
+    // locked and unlocked callers at once.
+    void RecordOrUpdateCandidateLocked(mooncake::tenant::ObjectEntry& entry,
+                                       uint8_t sketch_score,
+                                       PromotionCandidateReason reason,
+                                       ErrorCode last_error,
+                                       uint32_t execution_failures = 0);
+    void EraseCandidateLocked(mooncake::tenant::ObjectEntry& entry);
     void EraseCandidate(const ObjectIdentity& object_id);
     void DecrementCandidateCount();
     void BackoffCandidate(const ObjectIdentity& object_id,
@@ -1461,23 +1466,21 @@ class MasterService {
 
     // Erase any in-flight PromotionTask for `key`, refund its pending charge,
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task
-    // exists.
+    // exists. Pins the entry and takes its lock; callers already holding the
+    // entry mutex must use ErasePromotionTaskLocked instead.
     void ErasePromotionTaskIfPresent(TenantCatalog& tenant_state,
                                      const std::string& key)
         NO_THREAD_SAFETY_ANALYSIS {
         auto entry = tenant_state.Pin(key);
-        if (entry == nullptr || !entry->promotion_task.has_value()) {
+        if (entry == nullptr) {
             return;
         }
-        ReleaseTenantQuota(
-            GetBoundTenantQuotaHandle(tenant_state),
-            std::exchange(entry->promotion_task->pending_quota_charge_bytes,
-                          0));
-        entry->promotion_task.reset();
-        promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
-        MasterMetricManager::instance().dec_promotion_in_flight();
-        MasterMetricManager::instance().inc_promotion_cancelled();
+        auto lock = entry->LockUnique();
+        ErasePromotionTaskLocked(tenant_state, *entry);
     }
+    // Locked kernel — caller must hold the entry's mutex.
+    void ErasePromotionTaskLocked(TenantCatalog& tenant_state,
+                                  mooncake::tenant::ObjectEntry& entry);
     void CancelPromotionTaskForRemovedReplicas(
         TenantCatalog& tenant_state, ObjectMetadata& metadata,
         const std::vector<ReplicaID>& removed_replica_ids)
@@ -1995,9 +1998,12 @@ class MasterService {
     SubmitReplicaActionProposalLocked(const ReplicaActionProposal& proposal);
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const;
-    void ClearDynamicReplicationStateForKey(TenantCatalog& tenant_state,
-                                            const std::string& key);
+    // Locked kernel — caller must hold the entry's mutex. Drops the pending
+    // DR task state and erases the key's lease-table records.
+    void ClearDynamicReplicationStateLocked(
+        TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry);
     void CleanupExpiredDynamicReplicationState();
+    // Caller must hold the entry's mutex.
     bool HasDynamicReplicationPending(TenantCatalog& tenant_state,
                                       const std::string& key);
     std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
