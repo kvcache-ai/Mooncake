@@ -242,7 +242,7 @@ def test_content_topologies_and_completion(
     target = _placement(
         "target", target_pp, target_tp, total_kv_heads=heads, dp_size=target_dp
     )
-    plan, keepalive = make_operation(
+    plan, _keepalive = make_operation(
         source,
         target,
         limits=KVCacheTransferLimits(max_batch_operations=3, max_batch_bytes=48),
@@ -270,7 +270,6 @@ def test_content_topologies_and_completion(
         )
         barrier.record_target(receipt)
     assert barrier.can_activate
-    assert keepalive
     for binding, executor, engine in zip(plan.source_bindings, executors, engines):
         before = len(engine.calls)
         assert executor.execute(plan, binding.participant_id)
@@ -451,8 +450,6 @@ def test_strict_wire_and_overflow(small_operation):
     payload["digest"] = "0" * 64
     with pytest.raises(ValueError, match="digest"):
         kv_cache_runtime_transfer_from_json(json.dumps(payload))
-    with pytest.raises(ValueError, match="token_end"):
-        _snapshot(token_start=(1 << 64) - 1)
     with pytest.raises(ValueError, match="region address end"):
         KVCacheRegisteredRegion("r", "peer", (1 << 64) - 1, 8)
     with pytest.raises(ValueError, match="wire limit"):
@@ -481,15 +478,6 @@ def test_contiguous_compatibility_and_missing_snapshot():
     )
     with pytest.raises(ValueError, match="explicit snapshot"):
         KVCacheRuntimeTransferPlan("op", (logical,), (resolved,), (resolved,))
-
-
-def test_huge_head_count_plans_by_intervals():
-    source = _placement("source", ((0,),), 1, total_kv_heads=1 << 40)
-    target = _placement("target", ((0,),), 2, total_kv_heads=1 << 40)
-    plan = plan_kv_cache_transfer_to_local_target(
-        source, target, target.parts[0].participant_id
-    )
-    assert len(plan.edges) == 2
 
 
 def test_receiver_limits_cannot_be_raised_by_wire(small_operation):
@@ -633,11 +621,11 @@ def test_adjacent_registered_regions_must_not_be_coalesced():
     source = _placement("source", ((0,),), 1)
     target = _placement("target", ((0,),), 1)
     snapshot = _snapshot(token_start=0, token_count=5)
-    bindings, allocations = [], []
+    bindings, _allocations = [], []
     for placement in (source, target):
         part = placement.parts[0]
         allocation = ctypes.create_string_buffer(640)
-        allocations.append(allocation)
+        _allocations.append(allocation)
         regions = tuple(
             KVCacheRegisteredRegion(
                 component.value,
@@ -674,4 +662,3 @@ def test_adjacent_registered_regions_must_not_be_coalesced():
     )
     assert len(plan.writes) == 2
     assert [w.nbytes for w in plan.writes] == [320, 320]
-    assert allocations

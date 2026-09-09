@@ -28,6 +28,7 @@ from mooncake.reshard.kv_cache import (
     KVCacheSnapshotDescriptor,
     KVCacheTopology,
     KVCacheTopologyParticipant,
+    KVCacheTransferEdge,
     assemble_kv_cache_placement,
     kv_cache_logical_plan_from_json,
     kv_cache_logical_plan_to_json,
@@ -45,6 +46,9 @@ from mooncake.reshard.kv_cache import (
     validate_runtime_binding,
     validate_runtime_bindings,
 )
+
+
+_MAX_U64 = (1 << 64) - 1
 
 
 def _placement(
@@ -217,6 +221,34 @@ def _binding(
     )
 
 
+def _binding_with_address_space(
+    binding, *, instance="shared", worker="worker", device="cuda:0"
+):
+    return replace(
+        binding,
+        instance_id=RuntimeInstanceId(instance),
+        buffers=tuple(
+            replace(
+                item, fragment=replace(item.fragment, worker_id=worker, device=device)
+            )
+            for item in binding.buffers
+        ),
+    )
+
+
+def _buffer_with_storage(item, address, storage_address, storage_nbytes):
+    return replace(
+        item,
+        fragment=replace(
+            item.fragment,
+            address=address,
+            storage_address=storage_address,
+            storage_nbytes=storage_nbytes,
+            storage_offset_bytes=address - storage_address,
+        ),
+    )
+
+
 def _plan(
     source: KVCachePlacementManifest,
     target: KVCachePlacementManifest,
@@ -254,6 +286,56 @@ def test_placement_part_and_binding_round_trip_are_canonical() -> None:
 
 
 @pytest.mark.parametrize(
+    "heads,dim,itemsize,accepted",
+    [
+        (1, 1 << 63, 2, False),
+        (2, 1 << 62, 2, False),
+        (_MAX_U64, 1, 1, True),
+        (1, _MAX_U64, 1, True),
+        (1, (1 << 63) - 1, 2, True),
+    ],
+)
+def test_transfer_edge_byte_size_boundary(heads, dim, itemsize, accepted):
+    args = dict(
+        source_participant_id="s",
+        target_participant_id="t",
+        global_layer_id=0,
+        component=KVCacheComponent.KEY,
+        global_head_start=0,
+        head_count=heads,
+        source_head_offset=0,
+        target_head_offset=0,
+        head_dim=dim,
+        itemsize=itemsize,
+    )
+    if accepted:
+        assert KVCacheTransferEdge(**args).inner_bytes == heads * dim * itemsize
+    else:
+        with pytest.raises(ValueError, match="inner_bytes"):
+            KVCacheTransferEdge(**args)
+
+
+@pytest.mark.parametrize("component", ["key_head_dim", "value_head_dim"])
+def test_descriptor_rejects_overflowing_head_bytes(component):
+    descriptor = _placement("source", ((0,),), 1).descriptor
+    with pytest.raises(ValueError, match="byte size"):
+        replace(descriptor, **{component: 1 << 63})
+
+
+def test_descriptor_keeps_distributed_global_size_separate_from_local_size():
+    descriptor = KVCacheDescriptor(
+        global_layer_ids=(0,),
+        dtype="uint8",
+        itemsize=1,
+        page_size=1,
+        total_kv_heads=2,
+        key_head_dim=_MAX_U64,
+        value_head_dim=1,
+    )
+    assert descriptor.total_kv_heads * descriptor.key_head_dim > _MAX_U64
+
+
+@pytest.mark.parametrize(
     ("source_tp", "target_tp", "target_rank", "expected_intervals"),
     [
         (1, 2, 1, ((2, 2),)),
@@ -278,6 +360,15 @@ def test_tp_scatter_and_gather(
         if edge.component is KVCacheComponent.KEY
     )
     assert key_intervals == expected_intervals
+
+
+def test_huge_head_count_plans_by_intervals():
+    source = _placement("source", ((0,),), 1, total_kv_heads=1 << 40)
+    target = _placement("target", ((0,),), 2, total_kv_heads=1 << 40)
+    plan = plan_kv_cache_transfer_to_local_target(
+        source, target, target.parts[0].participant_id
+    )
+    assert len(plan.edges) == 2
 
 
 def test_gqa_replica_ordinal_selects_one_source_writer() -> None:
@@ -424,6 +515,148 @@ def test_binding_requires_exact_participant_membership_and_global_digest() -> No
         )
 
 
+@pytest.mark.parametrize("different", ["worker", "device", "instance", None])
+def test_identical_virtual_addresses_respect_address_space(different):
+    placement = _placement("source", ((0,),), 2)
+    first = _binding_with_address_space(
+        _binding(
+            placement,
+            placement.parts[0].participant_id,
+            base_address=1_000_000,
+            capacity_tokens=1,
+        )
+    )
+    second = _binding_with_address_space(
+        _binding(
+            placement,
+            placement.parts[1].participant_id,
+            base_address=1_000_000,
+            capacity_tokens=1,
+        ),
+        **({different: "other"} if different else {}),
+    )
+    if different:
+        validate_runtime_bindings(placement, (first, second))
+    else:
+        with pytest.raises(ValueError, match="overlap"):
+            validate_runtime_bindings(placement, (first, second))
+
+
+def test_per_participant_views_also_respect_device_address_space():
+    placement = _placement("source", ((0,),), 1)
+    binding = _binding(
+        placement,
+        placement.parts[0].participant_id,
+        base_address=1_000_000,
+        capacity_tokens=1,
+    )
+    first, second = binding.buffers
+    second = replace(
+        second,
+        fragment=replace(
+            second.fragment,
+            address=first.fragment.address,
+            storage_address=first.fragment.storage_address,
+            device="cuda:1",
+        ),
+    )
+    validate_runtime_binding(placement, replace(binding, buffers=(first, second)))
+
+
+@pytest.mark.parametrize(
+    "allocations,accepted",
+    [
+        (((1024, 256), (1152, 256)), False),
+        (((1024, 512), (1024, 512)), True),
+        (((1024, 256), (1280, 256)), True),
+        (((1024, 256), (1024, 512)), False),
+    ],
+)
+def test_backing_allocations_with_disjoint_views(allocations, accepted):
+    placement = _placement("source", ((0,),), 1)
+    binding = _binding(
+        placement,
+        placement.parts[0].participant_id,
+        base_address=1_000_000,
+        capacity_tokens=1,
+    )
+    buffers = tuple(
+        _buffer_with_storage(item, address, *allocation)
+        for item, address, allocation in zip(binding.buffers, (1024, 1280), allocations)
+    )
+    binding = replace(binding, buffers=buffers)
+    if accepted:
+        validate_runtime_binding(placement, binding)
+    else:
+        with pytest.raises(ValueError, match="backing allocation.*overlap"):
+            validate_runtime_binding(placement, binding)
+
+
+@pytest.mark.parametrize("same_allocation", [True, False])
+def test_backing_allocations_across_participants(same_allocation):
+    placement = _placement("source", ((0,),), 2)
+    first = _binding_with_address_space(
+        _binding(
+            placement,
+            placement.parts[0].participant_id,
+            base_address=1_000_000,
+            capacity_tokens=1,
+        )
+    )
+    second = _binding_with_address_space(
+        _binding(
+            placement,
+            placement.parts[1].participant_id,
+            base_address=3_000_000,
+            capacity_tokens=1,
+        )
+    )
+    first = replace(
+        first,
+        buffers=(
+            _buffer_with_storage(
+                first.buffers[0], 1024, 1024, 512 if same_allocation else 256
+            ),
+            first.buffers[1],
+        ),
+    )
+    second = replace(
+        second,
+        buffers=(
+            _buffer_with_storage(
+                second.buffers[0],
+                1280,
+                1024 if same_allocation else 1152,
+                512 if same_allocation else 256,
+            ),
+            second.buffers[1],
+        ),
+    )
+    if same_allocation:
+        validate_runtime_bindings(placement, (first, second))
+    else:
+        with pytest.raises(ValueError, match="backing allocation.*overlap"):
+            validate_runtime_bindings(placement, (first, second))
+
+
+def test_shared_backing_allocation_does_not_allow_overlapping_views():
+    placement = _placement("source", ((0,),), 1)
+    binding = _binding(
+        placement,
+        placement.parts[0].participant_id,
+        base_address=1_000_000,
+        capacity_tokens=1,
+    )
+    binding = replace(
+        binding,
+        buffers=tuple(
+            _buffer_with_storage(item, 1024, 1024, 512) for item in binding.buffers
+        ),
+    )
+    with pytest.raises(ValueError, match="buffers overlap"):
+        validate_runtime_binding(placement, binding)
+
+
 def test_singleton_stride_is_normalized_before_binding_validation() -> None:
     placement = _placement("source", ((0,),), 4)
     binding = _binding(placement, "source-p0-t0", base_address=1_000_000_000)
@@ -499,6 +732,20 @@ def test_snapshot_contract_is_canonical_and_optional_for_pd() -> None:
         _plan(source, target, "target-p0-t0", snapshot=snapshot)
 
 
+@pytest.mark.parametrize(
+    "start,count,accepted",
+    [(_MAX_U64, 1, False), (_MAX_U64 - 1, 1, True), (0, _MAX_U64, True)],
+)
+def test_snapshot_token_end_boundary(start, count, accepted):
+    if accepted:
+        assert (
+            _snapshot(token_start=start, token_count=count).token_end == start + count
+        )
+    else:
+        with pytest.raises(ValueError, match="token_end"):
+            _snapshot(token_start=start, token_count=count)
+
+
 def test_page_size_repacking_is_rejected_explicitly() -> None:
     source = _placement("source", ((0,),), 1, page_size=16)
     target = _placement("target", ((0,),), 1, page_size=32)
@@ -558,3 +805,56 @@ def test_snapshot_bound_runtime_bindings_are_checked_at_prepare() -> None:
     stale = replace(target_binding, snapshot_digest="0" * 64)
     with pytest.raises(ValueError, match="snapshot digest"):
         prepare_kv_cache_transfer(plan, source_binding, stale)
+
+
+@pytest.mark.parametrize(
+    "source_snapshot,target_snapshot,explicit_plan,mismatched_digest,accepted",
+    [
+        (None, None, False, False, True),
+        (0, 0, False, False, True),
+        (0, 8, False, False, False),
+        (0, None, False, False, False),
+        (None, 0, False, False, False),
+        (0, 0, True, False, True),
+        (0, 8, True, False, False),
+        (None, None, True, False, False),
+        (0, 0, False, True, False),
+    ],
+)
+def test_prepare_snapshot_identity(
+    source_snapshot, target_snapshot, explicit_plan, mismatched_digest, accepted
+):
+    source = _placement("source", ((0,),), 1)
+    target = _placement("target", ((0,),), 1)
+    snapshot = _snapshot()
+    sb = _binding(
+        source,
+        source.parts[0].participant_id,
+        base_address=1_000_000,
+        snapshot=_snapshot(token_start=source_snapshot)
+        if source_snapshot is not None
+        else None,
+    )
+    tb = _binding(
+        target,
+        target.parts[0].participant_id,
+        base_address=3_000_000,
+        snapshot=_snapshot(token_start=target_snapshot)
+        if target_snapshot is not None
+        else None,
+    )
+    if mismatched_digest:
+        tb = replace(tb, snapshot_digest="0" * 64)
+    plan = _plan(
+        source,
+        target,
+        target.parts[0].participant_id,
+        snapshot=snapshot if explicit_plan else None,
+    )
+    if not accepted:
+        with pytest.raises(ValueError, match="snapshot"):
+            prepare_kv_cache_transfer(plan, sb, tb)
+    else:
+        prepared = prepare_kv_cache_transfer(plan, sb, tb)
+        assert prepared.snapshot_id == sb.snapshot_id
+        assert prepared.snapshot_digest == sb.snapshot_digest

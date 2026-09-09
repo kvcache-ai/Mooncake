@@ -47,6 +47,7 @@ class KVCacheTransferEdge:
             require_integer(getattr(self, name), name, minimum=1)
         if not isinstance(self.component, KVCacheComponent):
             raise ValueError("component must be a KVCacheComponent")  # noqa: TRY004
+        require_integer(self.inner_bytes, "inner_bytes", minimum=1)
 
     @property
     def inner_bytes(self) -> int:
@@ -424,6 +425,11 @@ def prepare_kv_cache_transfer(
         snapshot=logical_plan.snapshot,
     )
 
+    source_snapshot = (source_binding.snapshot_id, source_binding.snapshot_digest)
+    target_snapshot = (target_binding.snapshot_id, target_binding.snapshot_digest)
+    if source_snapshot != target_snapshot:
+        raise ValueError("source and target runtime binding snapshot identities differ")
+
     source_buffers = {
         (item.global_layer_id, item.component): item.fragment
         for item in source_binding.buffers
@@ -467,14 +473,8 @@ def prepare_kv_cache_transfer(
         source_placement_digest=logical_plan.source_placement.digest,
         target_placement_id=logical_plan.target_placement.placement_id,
         target_placement_digest=logical_plan.target_placement.digest,
-        snapshot_id=(
-            logical_plan.snapshot.snapshot_id
-            if logical_plan.snapshot is not None
-            else None
-        ),
-        snapshot_digest=(
-            logical_plan.snapshot.digest if logical_plan.snapshot is not None else None
-        ),
+        snapshot_id=source_binding.snapshot_id,
+        snapshot_digest=source_binding.snapshot_digest,
         page_size=logical_plan.source_placement.descriptor.page_size,
         edges=tuple(prepared_edges),
     )

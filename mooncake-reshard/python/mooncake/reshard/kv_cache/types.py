@@ -74,6 +74,10 @@ class KVCacheDescriptor:
             "value_head_dim",
         ):
             require_integer(getattr(self, name), name, minimum=1)
+        for name in ("key_head_dim", "value_head_dim"):
+            require_integer(
+                getattr(self, name) * self.itemsize, f"{name} byte size", minimum=1
+            )
         if not isinstance(self.layout, KVCacheLayout):
             raise ValueError("layout must be a KVCacheLayout")  # noqa: TRY004
         if self.layout is not KVCacheLayout.NHD:

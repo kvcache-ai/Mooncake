@@ -10,6 +10,7 @@ from .runtime import KVCacheRuntimeBindingManifest
 from .snapshot import KVCacheSnapshotDescriptor
 from .types import (
     KVCacheComponent,
+    KVCacheRuntimeBuffer,
     canonical_strides_bytes,
     placement_fragment_id,
     require_manifest_items,
@@ -123,48 +124,47 @@ def validate_runtime_bindings(
     unknown = sorted(actual - expected)
     if unknown:
         raise ValueError(f"unknown runtime binding participant: {unknown[0]}")
-    by_instance: dict[RuntimeInstanceId, list[KVCacheRuntimeBindingManifest]] = {}
-    for binding in items:
-        by_instance.setdefault(binding.instance_id, []).append(binding)
-    for instance_bindings in by_instance.values():
-        _validate_shared_instance_ranges(tuple(instance_bindings))
+    _validate_shared_instance_ranges(items)
 
 
 def _validate_address_ranges(binding: KVCacheRuntimeBindingManifest) -> None:
-    ranges = sorted(
-        (
-            item.fragment.address,
-            item.fragment.address + item.fragment.nbytes,
-            item.fragment.fragment_id,
-        )
-        for item in binding.buffers
-    )
-    for previous, current in pairwise(ranges):
-        if current[0] < previous[1]:
-            raise ValueError(
-                "runtime KV buffers overlap within one participant: "
-                f"{previous[2]} and {current[2]}"
-            )
+    _validate_shared_instance_ranges((binding,))
 
 
 def _validate_shared_instance_ranges(
     bindings: tuple[KVCacheRuntimeBindingManifest, ...],
 ) -> None:
-    ranges = sorted(
-        (
-            item.fragment.address,
-            item.fragment.address + item.fragment.nbytes,
-            item.fragment.fragment_id,
+    # Virtual addresses are comparable only within the declared address space.
+    by_space: dict[tuple[RuntimeInstanceId, str, str], list[KVCacheRuntimeBuffer]] = {}
+    for binding in bindings:
+        for item in binding.buffers:
+            fragment = item.fragment
+            key = (binding.instance_id, fragment.worker_id, fragment.device)
+            by_space.setdefault(key, []).append(fragment)
+    for fragments in by_space.values():
+        views = sorted(
+            (fragment.address, fragment.address + fragment.nbytes)
+            for fragment in fragments
         )
-        for binding in bindings
-        for item in binding.buffers
-    )
-    for previous, current in pairwise(ranges):
-        if current[0] < previous[1]:
-            raise ValueError(
-                "runtime KV buffers overlap in one runtime instance: "
-                f"{previous[2]} and {current[2]}"
-            )
+        for previous, current in pairwise(views):
+            if current[0] < previous[1]:
+                raise ValueError("runtime KV buffers overlap in one address space")
+        # Several disjoint views may share the same complete allocation. Distinct
+        # allocation claims may not overlap, including unequal nested claims.
+        allocations = sorted(
+            {
+                (
+                    fragment.storage_address,
+                    fragment.storage_address + fragment.storage_nbytes,
+                )
+                for fragment in fragments
+            }
+        )
+        for previous, current in pairwise(allocations):
+            if current[0] < previous[1]:
+                raise ValueError(
+                    "runtime KV backing allocations overlap in one address space"
+                )
 
 
 __all__ = ["validate_runtime_binding", "validate_runtime_bindings"]
