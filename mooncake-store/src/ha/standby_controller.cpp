@@ -336,6 +336,9 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             ctx.applied_cursor = handoff->applied_cursor;
             ctx.producer_view_version = handoff->producer_view_version;
             ctx.max_replica_id = handoff->max_replica_id;
+            if (batch_oplog_snapshot_coordinator_) {
+                batch_oplog_snapshot_coordinator_->Stop();
+            }
             return ctx;
         }
 
