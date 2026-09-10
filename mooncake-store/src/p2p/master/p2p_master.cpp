@@ -120,11 +120,12 @@ std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     return service;
 }
 
-int RunActiveRpcServers(const P2PMasterConfig& config,
-                        coro_rpc::coro_rpc_server& server,
-                        P2PMasterRpcService& p2p_service,
-                        std::function<void()> before_start = {}) {
-    const bool dedicated_heartbeat = config.rpc.heartbeat_port > 0;
+}  // namespace
+
+int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
+                                  P2PMasterRpcService& p2p_service,
+                                  std::function<void()> before_start) {
+    const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
     RegisterP2PRpcService(server, p2p_service,
                           /*include_heartbeat=*/!dedicated_heartbeat);
     if (before_start) {
@@ -134,10 +135,10 @@ int RunActiveRpcServers(const P2PMasterConfig& config,
     std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
     if (dedicated_heartbeat) {
         heartbeat_server.emplace(
-            std::max<uint32_t>(1u, config.rpc.heartbeat_thread_num),
-            config.rpc.heartbeat_port, config.rpc.address,
-            std::chrono::seconds(config.rpc.connection_timeout_seconds),
-            config.rpc.enable_tcp_no_delay);
+            std::max<uint32_t>(1u, config_.rpc.heartbeat_thread_num),
+            config_.rpc.heartbeat_port, config_.rpc.address,
+            std::chrono::seconds(config_.rpc.connection_timeout_seconds),
+            config_.rpc.enable_tcp_no_delay);
         RegisterP2PHeartbeatRpcService(*heartbeat_server, p2p_service);
         auto heartbeat_result = heartbeat_server->async_start();
         if (heartbeat_result.hasResult()) {
@@ -151,21 +152,25 @@ int RunActiveRpcServers(const P2PMasterConfig& config,
     if (server_result.hasResult()) {
         LOG(ERROR) << "Failed to start P2P master RPC server: "
                    << server_result.result().value();
+        // A concurrent stop can also complete the future during startup.
+        server.stop();
         heartbeat_server.reset();
         return -1;
     }
     auto error = std::move(server_result).get();
     LOG(ERROR) << "P2P master RPC server stopped: " << error;
+    // The start future only waits for the accept loop. Drain in-flight RPCs
+    // before callers can destroy the service, including when another thread
+    // is already stopping the server after losing the leader lease.
+    server.stop();
     heartbeat_server.reset();
     return 0;
 }
 
-}  // namespace
-
 int P2PMaster::RunStandalone() {
     auto server = CreateRpcServer(config_);
     auto active_service = CreateActiveService(config_, /*view_version=*/0);
-    return RunActiveRpcServers(config_, *server, *active_service);
+    return RunActiveRpcServers(*server, *active_service);
 }
 
 int P2PMaster::RunWithHA() {
@@ -331,10 +336,10 @@ int P2PMaster::RunWithHA() {
             }
         };
         const int run_result = RunActiveRpcServers(
-            config_, *server, *active_service, std::move(mark_primary));
+            *server, *active_service, std::move(mark_primary));
 #else
         const int run_result =
-            RunActiveRpcServers(config_, *server, *active_service);
+            RunActiveRpcServers(*server, *active_service);
 #endif
         active_service.reset();
         master_view->CancelKeepAlive(lease_id);

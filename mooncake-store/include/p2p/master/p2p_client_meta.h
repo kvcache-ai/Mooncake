@@ -43,6 +43,8 @@ class P2PClientMeta final {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
     auto QuerySegment(const UUID& segment_id)
         -> tl::expected<P2PSegment, ErrorCode>;
+    auto CheckSegmentAvailable(const UUID& segment_id) const
+        -> tl::expected<void, ErrorCode>;
     auto QueryIp() -> tl::expected<std::vector<std::string>, ErrorCode>;
 
     using SegmentRemovalCallback = std::function<void(const UUID& segment_id)>;
@@ -80,19 +82,17 @@ class P2PClientMeta final {
     void MarkRegistered() { registered_ = true; }
 
     /**
-     * @brief Evaluate this client as a write-route candidate.
+     * @brief Compute a write candidate from config-eligible segments.
      *
-     * Performs health check and capacity filtering (tag_filters /
-     * priority_limit / top_tier_only) internally and, on success, returns a
-     * P2PWriteCandidate whose `score` is the raw free ratio (free/total over
-     * eligible tiers).
+     * Applies tag_filters, priority_limit and top_tier_only. The score is the
+     * raw free ratio over eligible tiers. Callers check current health and
+     * object size for each key, allowing recovery during a batch.
      *
-     * @return A populated P2PWriteCandidate when this client is routable;
-     *         std::nullopt when it is not a candidate (unhealthy, no eligible
-     *         tier, or insufficient free capacity).
+     * @return std::nullopt for recycled metadata or no eligible capacity.
+     *         A full tier still produces a candidate with zero free capacity.
      */
     std::optional<P2PWriteCandidate> GetWriteRouteCandidate(
-        const P2PGetWriteRouteRequest& req);
+        const P2PWriteRouteConfig& config) const;
 
     void SetSyncing(bool syncing) {
         is_syncing_.store(syncing, std::memory_order_release);
@@ -113,15 +113,7 @@ class P2PClientMeta final {
         size_t free = 0;
         size_t total = 0;
     };
-
-    /**
-     * @brief Aggregate free/total over the eligible segments for write-route
-     *        scoring. A segment is eligible when it carries no tag in
-     *        `tag_filters` and its priority is >= `priority_limit`. When
-     *        `top_tier_only` is true, only the highest-priority eligible
-     *        segment(s) contribute (a client may not spill to lower tiers under
-     *        memory pressure). Returns {0,0} when no segment is eligible.
-     */
+    // Aggregates eligible free/total capacity under one segment read lock.
     CapacityStat GetWriteScoreCapacity(
         const std::vector<std::string>& tag_filters, int priority_limit,
         bool top_tier_only) const;
@@ -133,7 +125,7 @@ class P2PClientMeta final {
     mutable SharedMutex client_mutex_;
     UUID client_id_;
     P2PClientHealthState health_state_ GUARDED_BY(client_mutex_);
-    std::atomic<bool> recycled_{false};
+    bool recycled_ GUARDED_BY(client_mutex_){false};
     // A temporary meta may be destroyed after losing a registration race. It
     // must not remove metric series owned by the registered meta with the same
     // client ID.

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <iterator>
+#include <random>
 #include <regex>
 #include <stdexcept>
 #include <tuple>
@@ -231,8 +232,8 @@ auto P2PMasterService::GetReadRoute(
     -> tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode> {
     auto route = GetRouteSnapshot(key);
     if (!route.has_value()) {
-        LOG(WARNING) << "GetReadRoute failed: key not found"
-                     << ", key=" << key;
+        VLOG(1) << "GetReadRoute failed: key not found"
+                << ", key=" << key;
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
@@ -322,7 +323,7 @@ void P2PMasterService::OnSegmentRemoved(const P2PRouteLocation& location) {
     for (auto& shard : route_shards_) {
         SharedMutexLocker lock(&shard.mutex);
         auto cleanup = shard.table.RemoveLocation(location);
-        removed_key_count += cleanup.removed_keys.size();
+        removed_key_count += cleanup.removed_key_count;
     }
     if (removed_key_count > 0) {
         P2PMasterMetricManager::instance().dec_key_count(removed_key_count);
@@ -509,7 +510,7 @@ auto P2PMasterService::BuildRouteDescriptor(const P2PRouteLocation& location,
                      << ", segment_id=" << location.segment_id;
         return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
     }
-    auto segment = client->QuerySegment(location.segment_id);
+    auto segment = client->CheckSegmentAvailable(location.segment_id);
     if (!segment.has_value()) {
         LOG(WARNING) << "Route references an unavailable segment"
                      << ", client_id=" << location.client_id
@@ -611,13 +612,104 @@ std::vector<P2PRouteDescriptor> P2PMasterService::FilterRoutes(
 
 auto P2PMasterService::GetWriteRoute(const P2PGetWriteRouteRequest& req)
     -> tl::expected<std::vector<P2PWriteCandidate>, ErrorCode> {
-    if (!req.config.IsValid()) {
-        LOG(ERROR) << "invalid write route config: " << req.config
-                   << ", client_id: " << req.client_id;
+    auto clients = GetWriteRouteClients(req.client_id, req.config);
+    if (!clients) {
+        LOG(ERROR) << "fail to get write route clients"
+                   << ", ret=" << toString(clients.error());
+        return tl::make_unexpected(clients.error());
+    }
+    return InnerGetWriteRoute(req, *clients);
+}
+
+auto P2PMasterService::BatchGetWriteRoute(
+    const P2PBatchGetWriteRouteRequest& req) -> P2PBatchGetWriteRouteResponse {
+    P2PBatchGetWriteRouteResponse response;
+    response.responses.resize(req.keys.size());
+    response.error_codes.resize(req.keys.size(), ErrorCode::OK);
+
+    if (req.keys.size() != req.object_sizes.size()) {
+        LOG(ERROR) << "BatchGetWriteRoute rejected inconsistent request arrays"
+                   << ", keys=" << req.keys.size()
+                   << ", sizes=" << req.object_sizes.size();
+        std::fill(response.error_codes.begin(), response.error_codes.end(),
+                  ErrorCode::INVALID_PARAMS);
+        return response;
+    }
+    if (req.keys.empty()) {
+        return response;
+    }
+    auto clients = GetWriteRouteClients(req.client_id, req.config);
+    if (!clients) {
+        LOG(ERROR) << "fail to get write route clients"
+                   << ", ret=" << toString(clients.error());
+        std::fill(response.error_codes.begin(), response.error_codes.end(),
+                  clients.error());
+        return response;
+    }
+
+    P2PGetWriteRouteRequest single_req;
+    single_req.client_id = req.client_id;
+    single_req.config = req.config;
+    for (size_t i = 0; i < req.keys.size(); ++i) {
+        single_req.key = req.keys[i];
+        single_req.object_size = req.object_sizes[i];
+        auto result = InnerGetWriteRoute(single_req, *clients);
+        if (result) {
+            response.responses[i] = std::move(*result);
+        } else {
+            LOG(ERROR) << "BatchGetWriteRoute failed to get write route"
+                        << ", key=" << req.keys[i]
+                        << ", client_id=" << req.client_id
+                        << ", ret=" << result.error();
+            response.error_codes[i] = result.error();
+        }
+    }
+    return response;
+}
+
+auto P2PMasterService::GetWriteRouteClients(
+    const UUID& requester_id, const P2PWriteRouteConfig& config) const
+    -> tl::expected<std::vector<WriteRouteClient>, ErrorCode> {
+    if (!config.IsValid()) {
+        LOG(ERROR) << "invalid write route config: " << config;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // 1. Collect existing route owners and enforce the client limit.
+    std::vector<WriteRouteClient> candidates;
+    const double remote_weight = std::clamp(config.remote_weight, 0.0, 1.0);
+
+    auto visited = client_manager_->ForEachClient(
+        config.strategy,
+        [&](const std::shared_ptr<P2PClientMeta>& client)
+            -> tl::expected<bool, ErrorCode> {
+            const double weight = client->get_client_id() == requester_id
+                                      ? 1.0 - remote_weight
+                                      : remote_weight;
+            if (weight <= 0.0) {
+                return false;
+            }
+            auto candidate = client->GetWriteRouteCandidate(config);
+            if (!candidate) {
+                return false;
+            }
+            candidate->score *= weight;
+            candidates.push_back({client, std::move(*candidate)});
+            return false;
+        });
+    if (!visited) {
+        LOG(ERROR) << "fail to enumerate write route clients"
+                   << ", client_id=" << requester_id
+                   << ", ret=" << toString(visited.error());
+        return tl::make_unexpected(visited.error());
+    }
+
+    return candidates;
+}
+
+auto P2PMasterService::InnerGetWriteRoute(
+    const P2PGetWriteRouteRequest& req,
+    const std::vector<WriteRouteClient>& clients) const
+    -> tl::expected<std::vector<P2PWriteCandidate>, ErrorCode> {
     OwnerClientSet owners;
     if (!req.key.empty()) {
         auto route = GetRouteSnapshot(req.key);
@@ -634,48 +726,31 @@ auto P2PMasterService::GetWriteRoute(const P2PGetWriteRouteRequest& req)
             }
         }
     }
-
-    // 2. Single pass: collect and score all candidates.
-    //    score = free_ratio * (is_local ? (1 - remote_weight) : remote_weight)
-    const double remote_weight = std::clamp(req.config.remote_weight, 0.0, 1.0);
-    std::vector<P2PWriteCandidate> candidates;
     const bool can_early_stop =
         req.config.early_return &&
-        req.config.max_candidates !=
-            P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
-
-    client_manager_->ForEachClient(
-        req.config.strategy,
-        [&](const std::shared_ptr<P2PClientMeta>& client)
-            -> tl::expected<bool, ErrorCode> {
-            const UUID client_id = client->get_client_id();
-            if (owners.contains(client_id)) {
-                return false;
-            }
-            const bool is_local = client_id == req.client_id;
-            const double weight =
-                is_local ? (1.0 - remote_weight) : remote_weight;
-            if (weight <= 0.0) {
-                return false;
-            }
-
-            if (auto candidate = client->GetWriteRouteCandidate(req)) {
-                candidate->score *= weight;
-                candidates.push_back(std::move(*candidate));
-                return can_early_stop &&
-                       candidates.size() >= req.config.max_candidates;
-            }
-            return false;
-        });
-
+        req.config.max_candidates != P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
+    std::vector<P2PWriteCandidate> candidates;
+    for (const auto& entry : clients) {
+        const auto& candidate = entry.candidate;
+        if (owners.contains(candidate.client_id) ||
+            candidate.available_capacity < req.object_size) {
+            continue;
+        }
+        if (!entry.client->is_health()) {
+            continue;
+        }
+        candidates.push_back(candidate);
+        if (can_early_stop && candidates.size() >= req.config.max_candidates) {
+            break;
+        }
+    }
     if (candidates.empty()) {
         LOG(ERROR) << "no candidate found for key: " << req.key
                    << ", client_id: " << req.client_id
                    << ", size: " << req.object_size;
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_CANDIDATE);
     }
-    // 3. Sort by score descending, using capacity as the tiebreaker, then
-    // truncate the result.
+
     std::sort(candidates.begin(), candidates.end(),
               [](const auto& a, const auto& b) {
                   return std::tie(b.score, b.available_capacity) <
@@ -687,37 +762,6 @@ auto P2PMasterService::GetWriteRoute(const P2PGetWriteRouteRequest& req)
         candidates.resize(req.config.max_candidates);
     }
     return candidates;
-}
-
-auto P2PMasterService::BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req)
-    -> P2PBatchGetWriteRouteResponse {
-    P2PBatchGetWriteRouteResponse response;
-    response.responses.resize(req.keys.size());
-    response.error_codes.resize(req.keys.size(), ErrorCode::OK);
-
-    if (req.keys.size() != req.object_sizes.size()) {
-        LOG(ERROR) << "BatchGetWriteRoute rejected inconsistent request arrays"
-                   << ", keys=" << req.keys.size()
-                   << ", sizes=" << req.object_sizes.size();
-        std::fill(response.error_codes.begin(), response.error_codes.end(),
-                  ErrorCode::INVALID_PARAMS);
-        return response;
-    }
-
-    P2PGetWriteRouteRequest single_req;
-    single_req.client_id = req.client_id;
-    single_req.config = req.config;
-    for (size_t i = 0; i < req.keys.size(); ++i) {
-        single_req.key = req.keys[i];
-        single_req.object_size = req.object_sizes[i];
-        auto result = GetWriteRoute(single_req);
-        if (result.has_value()) {
-            response.responses[i] = std::move(*result);
-        } else {
-            response.error_codes[i] = result.error();
-        }
-    }
-    return response;
 }
 
 auto P2PMasterService::PublishRoute(const P2PPublishRouteRequest& req)
@@ -747,7 +791,7 @@ auto P2PMasterService::ApplyPublishLocked(
     const UUID& segment_id, size_t size,
     const std::shared_ptr<P2PClientMeta>& client)
     -> tl::expected<void, ErrorCode> {
-    auto segment = client->QuerySegment(segment_id);
+    auto segment = client->CheckSegmentAvailable(segment_id);
     if (!segment.has_value()) {
         LOG(ERROR) << "fail to query segment"
                    << ", client_id: " << client_id

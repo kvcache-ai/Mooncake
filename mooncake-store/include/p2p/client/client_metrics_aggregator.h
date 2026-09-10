@@ -50,9 +50,10 @@ class ClientMetricsAggregator {
                               const DataMetricSnapshot& new_v,
                               CounterGroup& group);
 
-    // Recomputes retention aggregates from client_snapshots_.
-    // Callers must hold mutex_.
-    void RefreshRetentionAggregates();
+    // Updates retention aggregates using this client's stored baseline.
+    // Callers must hold mutex_ and replace or erase the stored snapshot afterwards.
+    void UpdateRetention(const UUID& client_id,
+                         const KeyRetentionSnapshot& current);
 
     mutable std::mutex mutex_;
     // Per-client baseline for signed deltas; subtracted on client removal.

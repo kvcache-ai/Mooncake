@@ -35,7 +35,7 @@ class P2PRouteTable final {
 
     struct CleanupResult {
         size_t removed_routes{0};
-        std::vector<std::string> removed_keys;
+        size_t removed_key_count{0};
     };
 
     using Mutation = tl::expected<MutationResult, ErrorCode>;

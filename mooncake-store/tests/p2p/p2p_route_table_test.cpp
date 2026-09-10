@@ -128,8 +128,8 @@ TEST(P2PRouteTableTest, CleanupUsesClientAndSegmentIdentity) {
 
     auto cleanup = table.RemoveLocation(location_a);
     EXPECT_EQ(cleanup.removed_routes, 2);
-    ASSERT_EQ(cleanup.removed_keys.size(), 1);
-    EXPECT_EQ(cleanup.removed_keys.front(), "only-a");
+    EXPECT_EQ(cleanup.removed_key_count, 1);
+    EXPECT_FALSE(table.RouteExists("only-a"));
 
     auto shared = table.GetRoute("shared");
     ASSERT_TRUE(shared.has_value());
@@ -149,12 +149,12 @@ TEST(P2PRouteTableTest, RepeatedCleanupLeavesNoDanglingReverseKeys) {
 
     auto cleanup = table.RemoveLocation(location);
     EXPECT_EQ(cleanup.removed_routes, 2000);
-    EXPECT_EQ(cleanup.removed_keys.size(), 2000);
+    EXPECT_EQ(cleanup.removed_key_count, 2000);
     EXPECT_EQ(table.GetRouteKeyCount(), 0);
 
     auto second_cleanup = table.RemoveLocation(location);
     EXPECT_EQ(second_cleanup.removed_routes, 0);
-    EXPECT_TRUE(second_cleanup.removed_keys.empty());
+    EXPECT_EQ(second_cleanup.removed_key_count, 0);
 }
 
 }  // namespace

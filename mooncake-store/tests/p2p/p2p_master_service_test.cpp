@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <functional>
 #include <memory>
 #include <string>
@@ -377,9 +378,9 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteWeightedRemoteCanWin) {
     EXPECT_EQ(remote_id, res.value()[0].client_id);
 }
 
-// With early_return=true and max_candidates=1, ForEachClient stops after the
-// first eligible candidate. Under CAPACITY_PRIORITY the high-capacity remote
-// is visited first, so it is returned without visiting the local client.
+// Strategy traversal precedes early stop; only the selected candidates are
+// ranked by weighted score. Moving score ranking before early stop changes
+// which client wins this request.
 TEST_F(P2PMasterServiceTest, GetWriteRouteEarlyReturnStopsAtFirstCandidate) {
     auto service = CreateService();
     auto local_seg = MakeP2PSegment("local", 1000, {}, 1);
@@ -398,13 +399,21 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteEarlyReturnStopsAtFirstCandidate) {
     req.object_size = 50;
     req.config.max_candidates = 1;
     req.config.early_return = true;
-    req.config.remote_weight = 0.4;
+    req.config.remote_weight = 0.02;
 
     auto res = service->GetWriteRoute(req);
     ASSERT_TRUE(res.has_value()) << res.error();
     ASSERT_EQ(1u, res.value().size());
     // CAPACITY_PRIORITY visits the 100 000-capacity remote first; early stop.
     EXPECT_EQ(remote_id, res.value()[0].client_id);
+
+    // Without early stop, the local score (0.1 * 0.98) beats the remote
+    // score (1.0 * 0.02), despite having less absolute available capacity.
+    req.config.early_return = false;
+    auto all_candidates = service->GetWriteRoute(req);
+    ASSERT_TRUE(all_candidates.has_value());
+    ASSERT_EQ(all_candidates->size(), 1);
+    EXPECT_EQ(local_id, all_candidates->front().client_id);
 }
 
 // Problem 3: top_tier_only changes which client wins by scoring only the
@@ -610,6 +619,355 @@ TEST_F(P2PMasterServiceTest, GetWriteRouteInvalidConfigSecondContradiction) {
     auto res = service->GetWriteRoute(req);
     EXPECT_FALSE(res.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, res.error());
+}
+
+TEST_F(P2PMasterServiceTest, BatchWriteRoutesMatchSingleRequests) {
+    auto service = CreateService(/*max_client_per_key=*/2);
+    service->GetClientManager().Stop();
+    const UUID local_id{1, 1};
+    const UUID remote_id{2, 2};
+    auto local_top = MakeP2PSegment("local-top", 1000, {}, 10);
+    local_top.usage = 100;
+    auto local_disk = MakeP2PSegment("local-disk", 10000, {}, 1);
+    local_disk.usage = 8000;
+    auto remote = MakeP2PSegment("remote", 4000, {}, 5);
+    remote.usage = 1000;
+    auto excluded = MakeP2PSegment("excluded", 20000, {"excluded"}, 2);
+    RegisterP2PClient(*service, local_id, {local_top, local_disk});
+    RegisterP2PClient(*service, remote_id, {remote});
+    RegisterP2PClient(*service, UUID{3, 3}, {excluded});
+    AddReplicaHelper(*service, "owned", 64, local_id, local_top.id);
+    AddReplicaHelper(*service, "capped", 64, local_id, local_top.id);
+    AddReplicaHelper(*service, "capped", 64, remote_id, remote.id);
+
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = local_id;
+    request.keys = {"new", "owned", "large", "capped", "", "new"};
+    request.object_sizes = {64, 64, 100000, 64, 64, 64};
+    for (auto strategy : {P2PClientSelectionStrategy::ORDERED,
+                          P2PClientSelectionStrategy::CAPACITY_PRIORITY,
+                          P2PClientSelectionStrategy::RANDOM}) {
+        for (bool early_return : {false, true}) {
+            for (double weight : {0.0, 0.2, 1.0}) {
+                request.config.strategy = strategy;
+                request.config.early_return = early_return;
+                // Random early selection has no deterministic single-request
+                // oracle. Its limited-candidate behavior is tested separately.
+                request.config.max_candidates =
+                    strategy == P2PClientSelectionStrategy::RANDOM ? 0 : 1;
+                request.config.remote_weight = weight;
+                request.config.top_tier_only = early_return;
+                request.config.tag_filters =
+                    early_return ? std::vector<std::string>{"excluded"}
+                                 : std::vector<std::string>{};
+                request.config.priority_limit = early_return ? 4 : 0;
+
+                auto batch = service->BatchGetWriteRoute(request);
+                ASSERT_EQ(batch.responses.size(), request.keys.size());
+                ASSERT_EQ(batch.error_codes.size(), request.keys.size());
+                EXPECT_EQ(batch.error_codes[2], ErrorCode::NO_AVAILABLE_CANDIDATE);
+                EXPECT_EQ(batch.error_codes[3], ErrorCode::REPLICA_NUM_EXCEEDED);
+                for (size_t i = 0; i < request.keys.size(); ++i) {
+                    auto single = service->GetWriteRoute(
+                        {.key = request.keys[i],
+                         .client_id = request.client_id,
+                         .object_size = request.object_sizes[i],
+                         .config = request.config});
+                    EXPECT_EQ(batch.error_codes[i],
+                              single ? ErrorCode::OK : single.error());
+                    if (!single) {
+                        EXPECT_TRUE(batch.responses[i].empty());
+                        continue;
+                    }
+                    ASSERT_EQ(batch.responses[i].size(), single->size());
+                    for (size_t j = 0; j < single->size(); ++j) {
+                        const auto& actual = batch.responses[i][j];
+                        const auto& expected = (*single)[j];
+                        EXPECT_EQ(actual.client_id, expected.client_id);
+                        EXPECT_EQ(actual.ip_address, expected.ip_address);
+                        EXPECT_EQ(actual.rpc_port, expected.rpc_port);
+                        EXPECT_EQ(actual.available_capacity,
+                                  expected.available_capacity);
+                        EXPECT_DOUBLE_EQ(actual.score, expected.score);
+                    }
+                }
+            }
+        }
+    }
+}
+
+TEST_F(P2PMasterServiceTest, BatchWriteRouteHandlesEmptyInvalidAndSingleInput) {
+    auto service = CreateService(/*max_client_per_key=*/1);
+    service->GetClientManager().Stop();
+    const UUID client_id{1, 1};
+    auto segment = MakeP2PSegment("segment", 4096);
+    RegisterP2PClient(*service, client_id, {segment});
+    AddReplicaHelper(*service, "capped", 64, client_id, segment.id);
+
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = client_id;
+    EXPECT_TRUE(service->BatchGetWriteRoute(request).responses.empty());
+    request.keys = {"new", "capped"};
+    request.object_sizes = {64};
+    auto result = service->BatchGetWriteRoute(request);
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>(2, ErrorCode::INVALID_PARAMS)));
+
+    request.object_sizes.push_back(64);
+    request.config.remote_weight = 0;
+    request.config.local_write_waterline = 0;
+    result = service->BatchGetWriteRoute(request);
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>(2, ErrorCode::INVALID_PARAMS)));
+
+    request.config = P2PWriteRouteConfig{};
+    request.config.strategy = static_cast<P2PClientSelectionStrategy>(99);
+    result = service->BatchGetWriteRoute(request);
+    // The manager rejects the strategy while preparing clients, before any
+    // per-key selection or owner-limit check can run.
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>(2, ErrorCode::INTERNAL_ERROR)));
+
+    request.config = P2PWriteRouteConfig{};
+    request.keys = {"new"};
+    request.object_sizes = {64};
+    result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.error_codes, (std::vector<ErrorCode>{ErrorCode::OK}));
+    ASSERT_EQ(result.responses.front().size(), 1);
+    EXPECT_EQ(result.responses.front().front().client_id, client_id);
+    request.keys = {"capped", "capped"};
+    request.object_sizes = {64, 64};
+    EXPECT_EQ(service->BatchGetWriteRoute(request).error_codes,
+              (std::vector<ErrorCode>(2, ErrorCode::REPLICA_NUM_EXCEEDED)));
+}
+
+TEST_F(P2PMasterServiceTest, BatchWriteRouteChecksEachObjectSize) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID client_id{1, 1};
+    auto segment = MakeP2PSegment("segment", 1000);
+    segment.usage = 900;
+    RegisterP2PClient(*service, client_id, {segment});
+
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = client_id;
+    request.keys = {"too-large", "fits", "zero"};
+    request.object_sizes = {101, 100, 0};
+    auto result = service->BatchGetWriteRoute(request);
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::NO_AVAILABLE_CANDIDATE,
+                                      ErrorCode::OK, ErrorCode::OK}));
+    ASSERT_EQ(result.responses.size(), 3);
+    EXPECT_TRUE(result.responses[0].empty());
+    for (size_t i : {size_t{1}, size_t{2}}) {
+        ASSERT_EQ(result.responses[i].size(), 1);
+        EXPECT_EQ(result.responses[i].front().client_id, client_id);
+        EXPECT_EQ(result.responses[i].front().available_capacity, 100);
+    }
+
+    auto client = service->GetClientManager().GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto update = client->UpdateSegmentUsages({{segment.id, 1000}});
+    ASSERT_EQ(update.sub_results.size(), 1);
+    ASSERT_EQ(update.sub_results.front().error, ErrorCode::OK);
+    request.keys = {"positive", "zero"};
+    request.object_sizes = {1, 0};
+    result = service->BatchGetWriteRoute(request);
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::NO_AVAILABLE_CANDIDATE,
+                                      ErrorCode::OK}));
+    ASSERT_EQ(result.responses.size(), 2);
+    EXPECT_TRUE(result.responses[0].empty());
+    ASSERT_EQ(result.responses[1].size(), 1);
+    EXPECT_EQ(result.responses[1].front().available_capacity, 0);
+    EXPECT_DOUBLE_EQ(result.responses[1].front().score, 0);
+}
+
+TEST_F(P2PMasterServiceTest, RandomBatchWriteRouteReusesPreparedOrder) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID owner{1, 1};
+    auto owner_segment = MakeP2PSegment("owner", 4096);
+    RegisterP2PClient(*service, owner, {owner_segment});
+    AddReplicaHelper(*service, "owned", 64, owner, owner_segment.id);
+    for (uint64_t i = 2; i <= 4; ++i) {
+        RegisterP2PClient(*service, UUID{i, i},
+                         {MakeP2PSegment("remote-" + std::to_string(i),
+                                         i * 4096)});
+    }
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = owner;
+    request.keys = {"owned", "owned", "owned", "owned"};
+    request.object_sizes.assign(request.keys.size(), 64);
+    request.config.strategy = P2PClientSelectionStrategy::RANDOM;
+    request.config.early_return = true;
+    request.config.max_candidates = 2;
+    auto result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.responses.size(), request.keys.size());
+    for (size_t i = 0; i < result.responses.size(); ++i) {
+        ASSERT_EQ(result.error_codes[i], ErrorCode::OK);
+        const auto& candidates = result.responses[i];
+        ASSERT_EQ(candidates.size(), 2);
+        EXPECT_NE(candidates[0].client_id, candidates[1].client_id);
+        EXPECT_EQ(candidates[0].client_id,
+                  result.responses.front()[0].client_id);
+        EXPECT_EQ(candidates[1].client_id,
+                  result.responses.front()[1].client_id);
+        for (const auto& candidate : candidates) {
+            EXPECT_NE(candidate.client_id, owner);
+            EXPECT_GE(candidate.available_capacity, 64);
+        }
+    }
+}
+
+TEST_F(P2PMasterServiceTest, PreparedWriteClientsFreezeCapacityButRecheckHealth) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID client_id{1, 1};
+    auto segment = MakeP2PSegment("segment", 1000);
+    segment.usage = 100;
+    RegisterP2PClient(*service, client_id, {segment});
+    auto client = service->GetClientManager().GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    client->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
+        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
+    ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
+
+    P2PGetWriteRouteRequest request{
+        .key = "new", .client_id = client_id, .object_size = 100};
+    request.config.remote_weight = 0.2;
+    const auto clients =
+        service->GetWriteRouteClients(request.client_id, request.config);
+    ASSERT_TRUE(clients.has_value());
+    ASSERT_EQ(clients->size(), 1);
+    auto select = [&] {
+        return service->InnerGetWriteRoute(request, *clients);
+    };
+    auto result = select();
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
+
+    ASSERT_EQ(client->Heartbeat().second, P2PClientStatus::HEALTH);
+    auto usage = client->UpdateSegmentUsages({{segment.id, 1000}});
+    ASSERT_EQ(usage.sub_results.front().error, ErrorCode::OK);
+    for (int i = 0; i < 2; ++i) {
+        result = select();
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 1);
+        EXPECT_EQ(result->front().available_capacity, 900);
+        EXPECT_DOUBLE_EQ(result->front().score, 0.9 * 0.8);
+    }
+    auto fresh = service->GetWriteRoute(request);
+    ASSERT_FALSE(fresh.has_value());
+    EXPECT_EQ(fresh.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
+
+    AddReplicaHelper(*service, "new", 100, client_id, segment.id);
+    result = select();
+    EXPECT_FALSE(result.has_value());
+
+    request.key = "unowned";
+    client->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
+        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
+    ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
+    EXPECT_FALSE(select().has_value());
+    ASSERT_EQ(client->Heartbeat().second, P2PClientStatus::HEALTH);
+    EXPECT_TRUE(select().has_value());
+    ASSERT_TRUE(service->UnregisterClient(client_id).has_value());
+    EXPECT_FALSE(select().has_value());
+}
+
+TEST_F(P2PMasterServiceTest, WriteRouteClientsFilterConfigBeforeKeySelection) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID first_id{1, 1};
+    const UUID second_id{2, 2};
+    auto first = MakeP2PSegment("first", 1000, {}, 10);
+    first.usage = 100;
+    auto second_top = MakeP2PSegment("second-top", 100, {}, 10);
+    auto second_low = MakeP2PSegment("second-low", 10000, {}, 1);
+    auto excluded = MakeP2PSegment("excluded", 50000, {"skip"}, 10);
+    RegisterP2PClient(*service, first_id, {first});
+    RegisterP2PClient(*service, second_id, {second_top, second_low});
+    RegisterP2PClient(*service, UUID{3, 3}, {excluded});
+    auto second = service->GetClientManager().GetClient(second_id);
+    ASSERT_NE(second, nullptr);
+    second->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
+        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
+    ASSERT_EQ(second->CheckHealth().second, P2PClientStatus::DISCONNECTION);
+
+    P2PGetWriteRouteRequest request{
+        .key = "new", .client_id = UUID{99, 99}, .object_size = 64};
+    request.config.tag_filters = {"skip"};
+    request.config.priority_limit = 5;
+    request.config.max_candidates = 1;
+    request.config.early_return = true;
+    const auto clients =
+        service->GetWriteRouteClients(request.client_id, request.config);
+    ASSERT_TRUE(clients.has_value());
+    ASSERT_EQ(clients->size(), 2);
+    // Total capacity determines traversal order, while config selects the
+    // eligible tiers. Disconnected clients remain available for later recovery.
+    EXPECT_EQ((*clients)[0].client->get_client_id(), second_id);
+    EXPECT_EQ((*clients)[1].client->get_client_id(), first_id);
+
+    auto result = service->InnerGetWriteRoute(request, *clients);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front().client_id, first_id);
+
+    ASSERT_EQ(second->Heartbeat().second, P2PClientStatus::HEALTH);
+    result = service->InnerGetWriteRoute(request, *clients);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front().client_id, second_id);
+
+    request.object_size = 128;
+    result = service->InnerGetWriteRoute(request, *clients);
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(result->front().client_id, first_id);
+}
+
+TEST_F(P2PMasterServiceTest, WriteRouteClientsApplyLocalRemoteConfig) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID local_id{1, 1};
+    const UUID remote_id{2, 2};
+    auto local = MakeP2PSegment("local", 1000);
+    local.usage = 200;
+    auto remote = MakeP2PSegment("remote", 2000);
+    remote.usage = 1000;
+    auto excluded = MakeP2PSegment("excluded", 10000, {"skip"});
+    RegisterP2PClient(*service, local_id, {local});
+    RegisterP2PClient(*service, remote_id, {remote});
+    RegisterP2PClient(*service, UUID{3, 3}, {excluded});
+
+    P2PWriteRouteConfig config;
+    config.tag_filters = {"skip"};
+    config.remote_weight = 0;
+    auto clients = service->GetWriteRouteClients(local_id, config);
+    ASSERT_TRUE(clients.has_value());
+    ASSERT_EQ(clients->size(), 1);
+    EXPECT_EQ(clients->front().client->get_client_id(), local_id);
+    EXPECT_DOUBLE_EQ(clients->front().candidate.score, 0.8);
+
+    config.remote_weight = 1;
+    clients = service->GetWriteRouteClients(local_id, config);
+    ASSERT_TRUE(clients.has_value());
+    ASSERT_EQ(clients->size(), 1);
+    EXPECT_EQ(clients->front().client->get_client_id(), remote_id);
+    EXPECT_DOUBLE_EQ(clients->front().candidate.score, 0.5);
+
+    config.remote_weight = 0.25;
+    clients = service->GetWriteRouteClients(local_id, config);
+    ASSERT_TRUE(clients.has_value());
+    ASSERT_EQ(clients->size(), 2);
+    for (const auto& entry : *clients) {
+        EXPECT_DOUBLE_EQ(entry.candidate.score,
+                         entry.client->get_client_id() == local_id
+                             ? 0.8 * 0.75
+                             : 0.5 * 0.25);
+    }
 }
 
 // ============================================================
@@ -1016,6 +1374,32 @@ TEST_F(P2PMasterServiceTest, UnregisterClientIdempotent) {
     ASSERT_TRUE(service->UnregisterClient(client_id).has_value());
     // Second call: client already gone -> still OK (idempotent).
     EXPECT_TRUE(service->UnregisterClient(client_id).has_value());
+}
+
+TEST_F(P2PMasterServiceTest, CapturedClientCannotPublishAfterUnregister) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    auto segment = MakeP2PSegment("segment");
+    const UUID client_id{1, 1};
+    RegisterP2PClient(*service, client_id, {segment});
+    auto old_client = service->GetClientManager().GetClient(client_id);
+    ASSERT_NE(old_client, nullptr);
+    AddReplicaHelper(*service, "existing", 64, client_id, segment.id);
+    ASSERT_TRUE(service->UnregisterClient(client_id).has_value());
+
+    // Model requests that captured the old shared_ptr before unregister and
+    // resume after its cleanup has completed.
+    auto mount = old_client->MountSegment(segment);
+    ASSERT_FALSE(mount.has_value());
+    EXPECT_EQ(mount.error(), ErrorCode::CLIENT_UNHEALTHY);
+    auto publish = service->InnerPublishRoute("late", client_id, segment.id,
+                                               64, old_client);
+    ASSERT_FALSE(publish.has_value());
+    EXPECT_EQ(publish.error(), ErrorCode::CLIENT_UNHEALTHY);
+    EXPECT_EQ(old_client->GetAvailableCapacity(), 0);
+    EXPECT_EQ(service->GetKeyCount(), 0);
+    EXPECT_FALSE(*service->ExistKey("late"));
+    EXPECT_FALSE(*service->ExistKey("existing"));
 }
 
 // ============================================================

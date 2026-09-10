@@ -33,7 +33,8 @@ namespace mooncake {
  * Lock order:
  * 1. P2PMasterService route shard mutex
  * 2. P2PClientManager::clients_mutex_
- * 3. P2PSegmentManager::segments_mutex_
+ * 3. P2PClientMeta::client_mutex_
+ * 4. P2PSegmentManager::segment_mutex_
  */
 class P2PMasterService final {
    public:
@@ -95,7 +96,7 @@ class P2PMasterService final {
 
     /**
      * @brief Batch get write routes for multiple keys.
-     *        Reuses GetWriteRoute logic per key.
+     *        Reuses capacity snapshots while checking owners and health per key.
      */
     auto BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req)
         -> P2PBatchGetWriteRouteResponse;
@@ -150,6 +151,20 @@ class P2PMasterService final {
     void InitializeClientManager();
     void OnSegmentRemoved(const P2PRouteLocation& location);
     static OwnerClientSet CollectRouteOwnerClients(const P2PRouteEntry& route);
+
+    struct WriteRouteClient {
+        std::shared_ptr<P2PClientMeta> client;
+        P2PWriteCandidate candidate;
+    };
+    // Collect config-eligible candidates in the manager's strategy order.
+    // InnerGetWriteRoute rechecks health/key constraints and ranks the result.
+    auto GetWriteRouteClients(const UUID& requester_id,
+                              const P2PWriteRouteConfig& config) const
+        -> tl::expected<std::vector<WriteRouteClient>, ErrorCode>;
+    auto InnerGetWriteRoute(
+        const P2PGetWriteRouteRequest& req,
+        const std::vector<WriteRouteClient>& clients) const
+        -> tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>;
 
     auto BuildRouteDescriptor(const P2PRouteLocation& location,
                               uint64_t object_size) const

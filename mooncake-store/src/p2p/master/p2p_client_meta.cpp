@@ -136,6 +136,19 @@ tl::expected<P2PSegment, ErrorCode> P2PClientMeta::QuerySegment(
     return segment_manager_.QuerySegment(segment_id);
 }
 
+tl::expected<void, ErrorCode> P2PClientMeta::CheckSegmentAvailable(
+    const UUID& segment_id) const {
+    SharedMutexLocker lock(&client_mutex_, shared_lock);
+    auto check_ret = InnerStatusCheck();
+    if (!check_ret.has_value()) {
+        LOG(ERROR) << "fail to inner check client status"
+                   << ", client_id=" << client_id_
+                   << ", ret=" << check_ret.error();
+        return check_ret;
+    }
+    return segment_manager_.CheckSegmentExists(segment_id);
+}
+
 void P2PClientMeta::SetSegmentRemovalCallback(SegmentRemovalCallback cb) {
     segment_removal_cb_ = std::move(cb);
 }
@@ -153,7 +166,7 @@ P2PClientHealthState P2PClientMeta::get_health_state() const {
 
 bool P2PClientMeta::is_health() const {
     SharedMutexLocker lock(&client_mutex_, shared_lock);
-    return health_state_.status == P2PClientStatus::HEALTH;
+    return !recycled_ && health_state_.status == P2PClientStatus::HEALTH;
 }
 
 std::pair<P2PClientStatus, P2PClientStatus> P2PClientMeta::Heartbeat() {
@@ -260,6 +273,11 @@ void P2PClientMeta::ApplyHealthTransition(P2PClientStatus old_status,
 }
 
 tl::expected<void, ErrorCode> P2PClientMeta::InnerStatusCheck() const {
+    if (recycled_) {
+        LOG(WARNING) << "Client metadata has been recycled"
+                     << ", client_id=" << client_id_;
+        return tl::make_unexpected(ErrorCode::CLIENT_UNHEALTHY);
+    }
     if (health_state_.status != P2PClientStatus::HEALTH) {
         LOG(WARNING) << "Client is not HEALTH"
                      << ", client_id=" << client_id_
@@ -270,15 +288,17 @@ tl::expected<void, ErrorCode> P2PClientMeta::InnerStatusCheck() const {
 }
 
 void P2PClientMeta::RecycleMeta() {
-    if (recycled_.exchange(true, std::memory_order_acq_rel)) {
-        return;
-    }
-    LOG(INFO) << "start to recycle client meta"
-              << ", client_id=" << client_id_;
-
     std::vector<UUID> removed_segments;
     {
-        SharedMutexLocker lock(&client_mutex_, shared_lock);
+        SharedMutexLocker lock(&client_mutex_);
+        if (recycled_) {
+            return;
+        }
+        // Fence captured client pointers before taking the segment snapshot.
+        // A mount either finishes before this lock or observes recycled_.
+        recycled_ = true;
+        LOG(INFO) << "start to recycle client meta"
+                  << ", client_id=" << client_id_;
         auto segments_res = segment_manager_.GetSegments();
         if (segments_res) {
             removed_segments.reserve(segments_res->size());
@@ -293,6 +313,10 @@ void P2PClientMeta::RecycleMeta() {
                 }
                 removed_segments.push_back(segment.id);
             }
+        } else {
+            LOG(ERROR) << "Failed to list segments during client recycling"
+                       << ", client_id=" << client_id_
+                       << ", error=" << segments_res.error();
         }
     }
     if (segment_removal_cb_) {
@@ -395,39 +419,24 @@ P2PClientMeta::CapacityStat P2PClientMeta::GetWriteScoreCapacity(
     return top_tier_only ? top : all;
 }
 
-// Returns std::nullopt when this client is not a write-route candidate
 std::optional<P2PWriteCandidate> P2PClientMeta::GetWriteRouteCandidate(
-    const P2PGetWriteRouteRequest& req) {
+    const P2PWriteRouteConfig& config) const {
     SharedMutexLocker lock(&client_mutex_, shared_lock);
-
-    // Check health status under lock protection.
-    auto check_ret = InnerStatusCheck();
-    if (!check_ret.has_value()) {
-        LOG(WARNING) << "client could not route"
-                     << ", client_id: " << client_id_;
-        // Unhealthy is not an error: the client is simply not a candidate.
+    if (recycled_) {
         return std::nullopt;
     }
-
-    // Client-granular routing: the master routes to a client; the client picks
-    // the concrete segment/tier. The score is the raw free ratio; the master
-    // multiplies it by (1-w) for local or w for remote.
-    const CapacityStat cap =
-        GetWriteScoreCapacity(req.config.tag_filters, req.config.priority_limit,
-                              req.config.top_tier_only);
-    if (cap.total == 0) return std::nullopt;  // no eligible tier
-    if (cap.free < req.object_size)
-        return std::nullopt;  // cannot hold (master's view)
-
-    const double free_ratio = static_cast<double>(cap.free) / cap.total;
-
-    P2PWriteCandidate candidate;
-    candidate.client_id = client_id_;
-    candidate.ip_address = ip_address_;
-    candidate.rpc_port = rpc_port_;
-    candidate.available_capacity = cap.free;
-    candidate.score = free_ratio;
-    return candidate;
+    const CapacityStat capacity = GetWriteScoreCapacity(
+        config.tag_filters, config.priority_limit, config.top_tier_only);
+    if (capacity.total == 0) {
+        return std::nullopt;
+    }
+    return P2PWriteCandidate{
+        .client_id = client_id_,
+        .ip_address = ip_address_,
+        .rpc_port = rpc_port_,
+        .available_capacity = capacity.free,
+        .score = static_cast<double>(capacity.free) / capacity.total,
+    };
 }
 
 }  // namespace mooncake

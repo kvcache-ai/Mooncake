@@ -113,6 +113,17 @@ tl::expected<P2PSegment, ErrorCode> P2PSegmentManager::QuerySegment(
     return it->second;
 }
 
+tl::expected<void, ErrorCode> P2PSegmentManager::CheckSegmentExists(
+    const UUID& segment_id) const {
+    SharedMutexLocker lock(&segment_mutex_, shared_lock);
+    if (!mounted_segments_.contains(segment_id)) {
+        LOG(WARNING) << "CheckSegmentExists: segment not found"
+                     << ", segment_id=" << segment_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    return {};
+}
+
 tl::expected<std::vector<P2PSegment>, ErrorCode>
 P2PSegmentManager::GetSegments() {
     SharedMutexLocker lock(&segment_mutex_, shared_lock);

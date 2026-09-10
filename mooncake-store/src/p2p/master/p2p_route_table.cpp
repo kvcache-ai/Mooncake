@@ -206,7 +206,7 @@ P2PRouteTable::CleanupResult P2PRouteTable::RemoveLocation(
         std::erase(locations, location);
         result.removed_routes += old_size - locations.size();
         if (locations.empty()) {
-            result.removed_keys.push_back(route_it->first);
+            ++result.removed_key_count;
             routes_.erase(route_it);
         }
     }

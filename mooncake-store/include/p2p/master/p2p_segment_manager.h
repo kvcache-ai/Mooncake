@@ -29,6 +29,8 @@ class P2PSegmentManager {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
     auto QuerySegment(const UUID& segment_id)
         -> tl::expected<P2PSegment, ErrorCode>;
+    auto CheckSegmentExists(const UUID& segment_id) const
+        -> tl::expected<void, ErrorCode>;
     auto GetSegments() -> tl::expected<std::vector<P2PSegment>, ErrorCode>;
 
     /**

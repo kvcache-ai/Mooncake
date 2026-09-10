@@ -1,18 +1,29 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include "p2p/master/p2p_master_client.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "utils.h"
+
+// Standard-library and YLT dependencies are included before exposing only the
+// master's private runner, following the existing master test convention.
+#define private public
+#include "p2p/master/p2p_master.h"
+#undef private
 
 namespace mooncake::testing {
 namespace {
@@ -234,6 +245,183 @@ TEST_F(P2PMasterRpcTest, BatchWriteReturnsAlignedCandidateAndValidationErrors) {
         EXPECT_TRUE(response.empty());
     }
 }
+
+class GatedRpcHandler {
+   public:
+    GatedRpcHandler()
+        : release_(release_promise_.get_future().share()),
+          entered_(entered_promise_.get_future()) {}
+
+    bool WaitForRelease() {
+        entered_promise_.set_value();
+        release_.wait();
+        exited_ = true;
+        return true;
+    }
+
+    void Release() {
+        std::call_once(release_once_, [this] { release_promise_.set_value(); });
+    }
+
+    std::future_status WaitForEntry(std::chrono::seconds timeout) {
+        return entered_.wait_for(timeout);
+    }
+
+    bool HasExited() const { return exited_.load(); }
+
+   private:
+    std::promise<void> entered_promise_;
+    std::promise<void> release_promise_;
+    std::shared_future<void> release_;
+    std::future<void> entered_;
+    std::once_flag release_once_;
+    std::atomic<bool> exited_{false};
+};
+
+class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
+   public:
+    static void SetUpTestSuite() {
+        google::InitGoogleLogging("p2p_master_rpc_shutdown_test");
+        FLAGS_logtostderr = true;
+    }
+
+    static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
+
+   protected:
+    void SetUp() override {
+        P2PMasterConfig config;
+        config.rpc.address = "127.0.0.1";
+        config.rpc.port = 0;
+        config.rpc.thread_num = 2;
+        config.metrics.enable_reporting = false;
+        config.metrics.http_port = 0;
+        if (GetParam()) {
+            const int port = getFreeTcpPort();
+            ASSERT_GT(port, 0);
+            config.rpc.heartbeat_port = port;
+        }
+        heartbeat_port_ = config.rpc.heartbeat_port;
+        master_ = std::make_unique<P2PMaster>(config);
+        service_ = std::make_unique<P2PMasterRpcService>(config);
+        server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            config.rpc.thread_num, config.rpc.port, config.rpc.address);
+        server_->register_handler<&GatedRpcHandler::WaitForRelease>(&handler_);
+
+        std::packaged_task<int()> run([this] {
+            return master_->RunActiveRpcServers(*server_, *service_);
+        });
+        run_result_ = run.get_future();
+        run_thread_ = std::thread(std::move(run));
+
+        // An ephemeral port is published only after the listener is bound.
+        const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+        while (server_->port() == 0 &&
+               std::chrono::steady_clock::now() < deadline &&
+               run_result_.wait_for(std::chrono::milliseconds(1)) ==
+                   std::future_status::timeout) {
+        }
+        ASSERT_NE(server_->port(), 0);
+        client_ = std::make_unique<coro_rpc::coro_rpc_client>();
+        auto connected = async_simple::coro::syncAwait(client_->connect(
+            "127.0.0.1", std::to_string(server_->port()), kTimeout));
+        ASSERT_FALSE(connected) << connected.message();
+    }
+
+    void TearDown() override {
+        // Always unblock the handler before joining stop(), including after
+        // ASSERT failures. Keep the service alive until every RPC is drained.
+        handler_.Release();
+        if (server_) {
+            server_->stop();
+        }
+        for (auto* thread : {&request_thread_, &stop_thread_, &run_thread_}) {
+            if (thread->joinable()) {
+                thread->join();
+            }
+        }
+        client_.reset();
+        server_.reset();
+        service_.reset();
+        master_.reset();
+    }
+
+    bool WaitForListenerClosed(uint16_t port) {
+        asio::io_context context;
+        const asio::ip::tcp::endpoint endpoint(
+            asio::ip::make_address("127.0.0.1"), port);
+        const auto deadline = std::chrono::steady_clock::now() + kTimeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            asio::ip::tcp::socket socket(context);
+            asio::error_code error;
+            socket.connect(endpoint, error);
+            if (error == asio::error::connection_refused) {
+                return true;
+            }
+            if (error) {
+                LOG(ERROR) << "Unexpected listener probe failure: " << error;
+                return false;
+            }
+            // Poll listener state; request/stop ordering is controlled by gates.
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return false;
+    }
+
+    static constexpr auto kTimeout = std::chrono::seconds(5);
+    uint16_t heartbeat_port_{0};
+    GatedRpcHandler handler_;
+    std::unique_ptr<P2PMaster> master_;
+    std::unique_ptr<P2PMasterRpcService> service_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> server_;
+    std::unique_ptr<coro_rpc::coro_rpc_client> client_;
+    std::thread run_thread_;
+    std::thread request_thread_;
+    std::thread stop_thread_;
+    std::future<int> run_result_;
+    std::future<void> request_result_;
+    std::future<void> stop_result_;
+};
+
+TEST_P(P2PMasterRpcShutdownTest, RunnerWaitsForInFlightRpcAfterListenerCloses) {
+    std::packaged_task<void()> request([this] {
+        // Closing the connection may fail the client call; the server handler
+        // must still finish before the production runner returns.
+        (void)async_simple::coro::syncAwait(
+            client_->call_for<&GatedRpcHandler::WaitForRelease>(kTimeout));
+    });
+    request_result_ = request.get_future();
+    request_thread_ = std::thread(std::move(request));
+    ASSERT_EQ(handler_.WaitForEntry(kTimeout), std::future_status::ready);
+
+    std::packaged_task<void()> stop([this] { server_->stop(); });
+    stop_result_ = stop.get_future();
+    stop_thread_ = std::thread(std::move(stop));
+    ASSERT_TRUE(WaitForListenerClosed(server_->port()));
+
+    EXPECT_EQ(run_result_.wait_for(std::chrono::milliseconds(200)),
+              std::future_status::timeout);
+    EXPECT_EQ(stop_result_.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+    EXPECT_FALSE(handler_.HasExited());
+
+    handler_.Release();
+    ASSERT_EQ(run_result_.wait_for(kTimeout), std::future_status::ready);
+    // An immediate stop can complete the start future before the runner's
+    // startup check. Both existing exit classifications must drain the RPCs.
+    const int run_result = run_result_.get();
+    EXPECT_TRUE(run_result == 0 || run_result == -1);
+    EXPECT_TRUE(handler_.HasExited());
+    ASSERT_EQ(stop_result_.wait_for(kTimeout), std::future_status::ready);
+    stop_result_.get();
+    ASSERT_EQ(request_result_.wait_for(kTimeout), std::future_status::ready);
+    request_result_.get();
+    if (heartbeat_port_ > 0) {
+        EXPECT_TRUE(WaitForListenerClosed(heartbeat_port_));
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(HeartbeatModes, P2PMasterRpcShutdownTest,
+                         ::testing::Bool());
 
 }  // namespace
 }  // namespace mooncake::testing

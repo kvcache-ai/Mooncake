@@ -47,6 +47,16 @@ TEST(P2PSegmentManagerTest, RejectsDuplicateAndMissingSegments) {
     auto missing = manager.QuerySegment({9, 9});
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::SEGMENT_NOT_FOUND);
+
+    const auto& read_only_manager = manager;
+    EXPECT_TRUE(read_only_manager.CheckSegmentExists({1, 1}).has_value());
+    auto absent = read_only_manager.CheckSegmentExists({9, 9});
+    ASSERT_FALSE(absent.has_value());
+    EXPECT_EQ(absent.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_TRUE(manager.UnmountSegment({1, 1}).has_value());
+    auto removed = read_only_manager.CheckSegmentExists({1, 1});
+    ASSERT_FALSE(removed.has_value());
+    EXPECT_EQ(removed.error(), ErrorCode::SEGMENT_NOT_FOUND);
 }
 
 TEST(P2PSegmentManagerTest, MaintainsCapacityAndUsageAggregate) {
