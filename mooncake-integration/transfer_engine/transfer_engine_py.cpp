@@ -137,12 +137,25 @@ TransferEnginePy::TransferEnginePy() {
 }
 
 TransferEnginePy::~TransferEnginePy() {
-    for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
-    handle_map_.clear();
-    engine_.reset();
-    for (auto& buffer : buffer_list_) freeMemory(buffer);
+    if (engine_) {
+        for (auto& handle : handle_map_) engine_->closeSegment(handle.second);
+        handle_map_.clear();
+        if (use_shm_alloc_) {
+            for (auto& buffer : buffer_list_) engine_->freeSharedMemory(buffer);
+            for (auto& buffer : large_buffer_list_)
+                engine_->freeSharedMemory(buffer);
+            buffer_list_.clear();
+            large_buffer_list_.clear();
+        }
+        engine_.reset();
+    }
+    for (auto& buffer : buffer_list_) {
+        if (freeMemory) freeMemory(buffer);
+    }
     buffer_list_.clear();
-    for (auto& buffer : large_buffer_list_) freeMemory(buffer);
+    for (auto& buffer : large_buffer_list_) {
+        if (freeMemory) freeMemory(buffer);
+    }
     large_buffer_list_.clear();
 }
 
@@ -190,6 +203,20 @@ std::string buildConnString(const std::string& metadata_type,
     return conn_string;
 }
 
+static int maybeInstallShmFromProtocol(TransferEngine& engine) {
+    if (engine.getTransport("shm") != nullptr) {
+        LOG(INFO) << "SHM transport already installed";
+        return 0;
+    }
+    LOG(INFO) << "Installing SHM transport as requested by protocol parameter";
+    if (!engine.installTransport("shm", nullptr)) {
+        LOG(ERROR) << "Failed to install SHM transport";
+        return -1;
+    }
+    LOG(INFO) << "SHM transport installed successfully";
+    return 0;
+}
+
 int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
@@ -217,6 +244,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
     bool use_flagcx = (proto == "flagcx");
+    bool use_shm = (proto == "shm");
 
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
@@ -243,7 +271,8 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
+    engine_ = std::make_unique<TransferEngine>(!use_flagcx && !use_shm,
+                                               device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -259,8 +288,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     }
 
 #ifdef USE_EFA
-    // Install EFA transport when protocol is "efa"
-    if (use_efa) {
+    if (use_shm) {
+        if (maybeInstallShmFromProtocol(*engine_)) return -1;
+    } else if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
         auto transport = engine_->installTransport("efa", nullptr);
@@ -292,7 +322,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         LOG(INFO) << "TCP transport installed successfully";
     }
 #elif defined(USE_CXI)
-    if (use_cxi) {
+    if (use_shm) {
+        if (maybeInstallShmFromProtocol(*engine_)) return -1;
+    } else if (use_cxi) {
         LOG(INFO)
             << "Installing CXI transport as requested by protocol parameter";
         auto transport = engine_->installTransport("cxi", nullptr);
@@ -324,7 +356,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         LOG(INFO) << "TCP transport installed successfully";
     }
 #else
-    if (use_flagcx) {
+    if (use_shm) {
+        if (maybeInstallShmFromProtocol(*engine_)) return -1;
+    } else if (use_flagcx) {
         LOG(INFO)
             << "Installing FlagCX transport as requested by protocol parameter";
         auto transport = engine_->installTransport("flagcx", nullptr);
@@ -336,6 +370,14 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
     }
 #endif
 
+    const bool gpu_pinned = proto == "nvlink" || proto == "musa" ||
+                            proto == "hip" || proto == "nvlink_intra";
+    use_shm_alloc_ =
+        !gpu_pinned && engine_ && engine_->getTransport("shm") != nullptr;
+    if (use_shm_alloc_) {
+        LOG(INFO) << "allocate_managed_buffer will use POSIX shm";
+    }
+
     free_list_.resize(kSlabSizeKBTabLen);
     return 0;
 }
@@ -343,18 +385,37 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
-    if (allocateMemory == nullptr || freeMemory == nullptr) {
-        LOG(ERROR) << "Memory allocator is not initialized";
-        return nullptr;
+    void* buffer = nullptr;
+    if (use_shm_alloc_) {
+        buffer = engine_->allocateSharedMemory(capacity);
+    } else {
+        if (allocateMemory == nullptr || freeMemory == nullptr) {
+            LOG(ERROR) << "Memory allocator is not initialized";
+            return nullptr;
+        }
+        buffer = allocateMemory(capacity);
     }
-    auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
     if (ret) {
-        freeMemory(buffer);
+        releaseRawBuffer(buffer);
         return nullptr;
     }
     return (char*)buffer;
+}
+
+void TransferEnginePy::releaseRawBuffer(void* buffer) {
+    if (!buffer) return;
+    if (use_shm_alloc_ && engine_) {
+        engine_->freeSharedMemory(buffer);
+        return;
+    }
+    if (freeMemory) freeMemory(buffer);
+}
+
+size_t TransferEnginePy::buddySlabCapacity() const {
+    return use_shm_alloc_ ? (1024ull * kSlabSizeKB[kMaxClassId])
+                          : kDefaultBufferCapacity;
 }
 
 int TransferEnginePy::findClassId(size_t size) {
@@ -366,10 +427,11 @@ int TransferEnginePy::findClassId(size_t size) {
 
 int TransferEnginePy::doBuddyAllocate(int class_id) {
     if (class_id == kMaxClassId) {
-        auto buffer = allocateRawBuffer(kDefaultBufferCapacity);
+        const size_t cap = buddySlabCapacity();
+        auto buffer = allocateRawBuffer(cap);
         if (!buffer) return -1;
         buffer_list_.push_back(buffer);
-        for (size_t offset = 0; offset < kDefaultBufferCapacity;
+        for (size_t offset = 0; offset < cap;
              offset += 1024ull * kSlabSizeKB[kMaxClassId])
             free_list_[kMaxClassId].push(buffer + offset);
         return 0;
@@ -408,8 +470,12 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
     int class_id = findClassId(length);
     if (class_id < 0) {
         large_buffer_list_.erase(buffer);
-        engine_->unregisterLocalMemory(buffer);
-        freeMemory(buffer);
+        if (use_shm_alloc_) {
+            releaseRawBuffer(buffer);
+        } else {
+            engine_->unregisterLocalMemory(buffer);
+            if (freeMemory) freeMemory(buffer);
+        }
         return 0;
     }
     free_list_[class_id].push(buffer);
