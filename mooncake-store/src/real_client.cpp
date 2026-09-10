@@ -2003,7 +2003,13 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
     const std::string &key, std::span<const char> value,
-    const ReplicateConfig &config, const UUID &client_id) {
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_if_needed(protocol, device_id, "put");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2105,7 +2111,14 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
-    const ReplicateConfig &config, const UUID &client_id) {
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_if_needed(protocol, device_id, "put_batch");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2201,7 +2214,14 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     const std::string &key, std::vector<std::span<const char>> values,
-    const ReplicateConfig &config, const UUID &client_id) {
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_if_needed(protocol, device_id, "put_parts");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2983,8 +3003,15 @@ tl::expected<void, ErrorCode> RealClient::release_hot_cache(
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::acquire_buffer_dummy(const std::string &key,
+RealClient::acquire_buffer_dummy(const std::string &key, int32_t device_id,
                                  const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_if_needed(protocol, device_id, "get_buffer");
+    if (!context_result) {
+        return tl::unexpected(context_result.error());
+    }
+#endif
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -3105,9 +3132,21 @@ tl::expected<void, ErrorCode> RealClient::batch_release_hot_cache(
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
 RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
+                                       int32_t device_id,
                                        const UUID &client_id) {
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_if_needed(protocol, device_id, "batch_get_buffer");
+    if (!context_result) {
+        for (auto &r : results) {
+            r = tl::unexpected(context_result.error());
+        }
+        return results;
+    }
+#endif
 
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto ctx_it = shm_contexts_.find(client_id);
