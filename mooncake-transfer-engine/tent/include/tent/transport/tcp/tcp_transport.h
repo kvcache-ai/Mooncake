@@ -88,6 +88,8 @@ class TcpTransport : public Transport {
 
     virtual Status uninstall();
 
+    virtual Status quiesce() override;
+
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef &batch);
