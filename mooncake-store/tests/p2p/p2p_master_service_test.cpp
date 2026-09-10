@@ -17,6 +17,7 @@
 #undef private
 
 #include "p2p/master/p2p_client_meta.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 #include "p2p/common/p2p_rpc_types.h"
 #include "types.h"
 
@@ -1441,6 +1442,90 @@ TEST_F(P2PMasterServiceTest, GetReadRouteByRegexReturnsMatchingRoutes) {
     EXPECT_TRUE(result->contains("prefix-a"));
     EXPECT_TRUE(result->contains("prefix-b"));
     EXPECT_FALSE(result->contains("other"));
+}
+
+TEST_F(P2PMasterServiceTest, RegexHandlesEmptyInvalidAndUnmatchedPatterns) {
+    auto service = CreateService();
+    auto empty = service->GetReadRouteByRegex(".*");
+    ASSERT_TRUE(empty.has_value());
+    EXPECT_TRUE(empty->empty());
+    auto removed = service->RemoveByRegex(".*");
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(*removed, 0);
+
+    const auto client = generate_uuid();
+    const auto segment = MakeP2PSegment();
+    RegisterP2PClient(*service, client, {segment});
+    AddReplicaHelper(*service, "retained", 64, client, segment.id);
+    auto invalid_read = service->GetReadRouteByRegex("[");
+    ASSERT_FALSE(invalid_read.has_value());
+    EXPECT_EQ(invalid_read.error(), ErrorCode::INVALID_PARAMS);
+    auto invalid_remove = service->RemoveByRegex("[");
+    ASSERT_FALSE(invalid_remove.has_value());
+    EXPECT_EQ(invalid_remove.error(), ErrorCode::INVALID_PARAMS);
+    auto unmatched = service->GetReadRouteByRegex("^absent$");
+    ASSERT_TRUE(unmatched.has_value());
+    EXPECT_TRUE(unmatched->empty());
+    removed = service->RemoveByRegex("^absent$");
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(*removed, 0);
+    EXPECT_EQ(service->GetKeyCount(), 1);
+    EXPECT_EQ(service->RemoveAll(), 1);
+}
+
+TEST_F(P2PMasterServiceTest, RegexPreservesLongKeysAndAllLocationsAcrossShards) {
+    auto service = CreateService();
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto initial_key_count = metrics.get_key_count();
+    const auto client = generate_uuid();
+    const auto first = MakeP2PSegment("first");
+    const auto second = MakeP2PSegment("second");
+    RegisterP2PClient(*service, client, {first, second});
+    std::vector<std::string> keys;
+    std::unordered_set<size_t> shards;
+    for (size_t i = 0; i < 128; ++i) {
+        keys.push_back("match-" + std::string(256, 'x') + std::to_string(i));
+        shards.insert(service->GetRouteShardIndex(keys.back()));
+        AddReplicaHelper(*service, keys.back(), 64, client, first.id);
+        AddReplicaHelper(*service, keys.back(), 64, client, second.id);
+    }
+    ASSERT_GT(shards.size(), 1u);
+    AddReplicaHelper(*service, "retained", 64, client, first.id);
+
+    auto routes = service->GetReadRouteByRegex("^match-");
+    ASSERT_TRUE(routes.has_value());
+    ASSERT_EQ(routes->size(), keys.size());
+    for (const auto& key : keys) {
+        ASSERT_TRUE(routes->contains(key));
+        const auto& locations = routes->at(key);
+        ASSERT_EQ(locations.size(), 2u);
+        std::unordered_set<UUID, boost::hash<UUID>> segments;
+        for (const auto& route : locations) {
+            EXPECT_EQ(route.client_id, client);
+            EXPECT_EQ(route.object_size, 64u);
+            EXPECT_EQ(route.ip_address, "127.0.0.1");
+            EXPECT_EQ(route.rpc_port, 50051);
+            segments.insert(route.segment_id);
+        }
+        EXPECT_TRUE(segments.contains(first.id));
+        EXPECT_TRUE(segments.contains(second.id));
+    }
+    auto removed = service->RemoveByRegex("^match-");
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(*removed, static_cast<long>(keys.size()));
+    EXPECT_EQ(service->GetKeyCount(), 1u);
+    EXPECT_EQ(metrics.get_key_count(), initial_key_count + 1);
+    removed = service->RemoveByRegex("^match-");
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(*removed, 0);
+    removed = service->RemoveByRegex("");
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(*removed, 1);
+    EXPECT_EQ(service->GetKeyCount(), 0u);
+    EXPECT_EQ(metrics.get_key_count(), initial_key_count);
+    auto all = service->GetReadRouteByRegex("");
+    ASSERT_TRUE(all.has_value());
+    EXPECT_TRUE(all->empty());
 }
 
 TEST_F(P2PMasterServiceTest, FilterReplicasWithTagAndPriority) {

@@ -198,31 +198,39 @@ auto P2PMasterService::GetReadRouteByRegex(std::string_view regex_pattern)
     }
 
     std::unordered_map<std::string, std::vector<P2PRouteDescriptor>> results;
-    for (const auto& key : ListRouteKeys()) {
-        if (!std::regex_search(key, pattern)) {
-            continue;
+    for (const auto& shard : route_shards_) {
+        std::vector<std::string> keys;
+        {
+            SharedMutexLocker lock(&shard.mutex, shared_lock);
+            keys = shard.table.ListRouteKeys();
         }
-        auto route = GetRouteSnapshot(key);
-        if (!route.has_value()) {
-            VLOG(1) << "Route was removed during regex query"
-                    << ", key=" << key;
-            continue;
-        }
-        std::vector<P2PRouteDescriptor> descriptors;
-        descriptors.reserve(route->locations.size());
-        for (const auto& location : route->locations) {
-            auto descriptor =
-                BuildRouteDescriptor(location, route->object_size);
-            if (descriptor.has_value()) {
-                descriptors.push_back(std::move(*descriptor));
+        // Keep owning keys only for this shard; regex evaluation stays unlocked.
+        for (const auto& key : keys) {
+            if (!std::regex_search(key, pattern)) {
+                continue;
             }
+            auto route = GetRouteSnapshot(key);
+            if (!route.has_value()) {
+                VLOG(1) << "Route was removed during regex query"
+                        << ", key=" << key;
+                continue;
+            }
+            std::vector<P2PRouteDescriptor> descriptors;
+            descriptors.reserve(route->locations.size());
+            for (const auto& location : route->locations) {
+                auto descriptor =
+                    BuildRouteDescriptor(location, route->object_size);
+                if (descriptor.has_value()) {
+                    descriptors.push_back(std::move(*descriptor));
+                }
+            }
+            if (descriptors.empty()) {
+                LOG(WARNING) << "key=" << key
+                             << " matched by regex, but has no available routes.";
+                continue;
+            }
+            results.emplace(key, std::move(descriptors));
         }
-        if (descriptors.empty()) {
-            LOG(WARNING) << "key=" << key
-                         << " matched by regex, but has no available routes.";
-            continue;
-        }
-        results.emplace(key, std::move(descriptors));
     }
     return results;
 }
@@ -274,17 +282,25 @@ auto P2PMasterService::RemoveByRegex(std::string_view regex_pattern)
     }
 
     long removed_count = 0;
-    for (const auto& key : ListRouteKeys()) {
-        if (!std::regex_search(key, pattern)) {
-            continue;
+    for (auto& shard : route_shards_) {
+        std::vector<std::string> keys;
+        {
+            SharedMutexLocker lock(&shard.mutex, shared_lock);
+            keys = shard.table.ListRouteKeys();
         }
-        auto& shard = route_shards_[GetRouteShardIndex(key)];
-        SharedMutexLocker lock(&shard.mutex);
-        if (!shard.table.RemoveKey(key)) {
-            continue;
+        for (const auto& key : keys) {
+            if (!std::regex_search(key, pattern)) {
+                continue;
+            }
+            SharedMutexLocker lock(&shard.mutex);
+            if (!shard.table.RemoveKey(key)) {
+                VLOG(1) << "Route was removed during regex deletion"
+                        << ", key=" << key;
+                continue;
+            }
+            VLOG(1) << "key=" << key << " matched by regex. Removing.";
+            ++removed_count;
         }
-        VLOG(1) << "key=" << key << " matched by regex. Removing.";
-        ++removed_count;
     }
 
     if (removed_count > 0) {
