@@ -9,6 +9,7 @@ use mooncake_store_core::{Result, StoreError};
 mod backend;
 mod backing;
 mod object;
+mod managed;
 mod physical;
 pub(in crate::client) mod physical_backend;
 mod runtime;
@@ -21,6 +22,10 @@ pub(in crate::client) use super::owner::{
 };
 pub use backend::NofBackend;
 pub use backing::NofBacking;
+pub use managed::{
+    NofManagedAllocationRequest, NofManagedAllocator, NofManagedLimits, NofManagedLocator,
+    NofManagedRead, NofManagedReadRequest, NofManagedWrite, NofManagedWriteRequest,
+};
 pub use object::{
     NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectShardWrite,
     NofObjectState, NofObjectWrite,

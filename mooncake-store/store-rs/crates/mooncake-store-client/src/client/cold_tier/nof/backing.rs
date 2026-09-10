@@ -5,6 +5,7 @@ use mooncake_store_core::{ColdBackingRoute, Result, StoreError};
 use super::object::{
     NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectWrite,
 };
+use super::managed::{NofManagedAllocator, NofManagedLimits, NofManagedRead, NofManagedWrite};
 use super::physical::{
     NofHealth, NofPhysicalDelete, NofPhysicalQuery, NofPhysicalRead, NofPhysicalWrite,
 };
@@ -16,6 +17,22 @@ use super::physical::{
 /// a provider mode or emulate them through provider CLIs. The advertised capability set and limits
 /// must remain stable for the lifetime of the backing.
 pub trait NofBacking: Send + Sync {
+    fn managed_limits(&self) -> Option<NofManagedLimits> {
+        None
+    }
+
+    fn managed_allocator(&self) -> Option<&dyn NofManagedAllocator> {
+        None
+    }
+
+    fn managed_write(&self) -> Option<&dyn NofManagedWrite> {
+        None
+    }
+
+    fn managed_read(&self) -> Option<&dyn NofManagedRead> {
+        None
+    }
+
     fn object_limits(&self) -> Option<NofObjectLimits> {
         None
     }
