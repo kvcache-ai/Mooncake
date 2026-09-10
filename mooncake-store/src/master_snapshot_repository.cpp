@@ -9,7 +9,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "ha/snapshot/snapshot_constants.h"
 #include "ha/snapshot/snapshot_logger.h"
-#include "utils/file_util.h"
+#include "common/file_util.h"
 
 namespace mooncake {
 

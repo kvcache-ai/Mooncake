@@ -14,13 +14,13 @@
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 
+#include "common/network.h"
 #include "ha/ha_types.h"
 #include "master_admin_service.h"
 #include "master_config.h"
 #include "rpc_service.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
-#include "utils.h"
 #include "version.h"
 
 #include <ylt/reflection/user_reflect_macro.hpp>
@@ -698,7 +698,7 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         WrappedMasterServiceConfig svc_config;
         svc_config.default_kv_lease_ttl = 5000;
         svc_config.enable_metric_reporting = false;
-        svc_config.client_live_ttl_sec =
+        svc_config.client_active_ttl_sec =
             3600;  // prevent client expiry in slow CI
         service_ = std::make_shared<WrappedMasterService>(svc_config);
 

@@ -9,7 +9,7 @@
 #include <unistd.h>
 #include <glog/logging.h>
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "config.h"
 #if defined(USE_ASCEND_DIRECT)
 #include "ascend_allocator.h"

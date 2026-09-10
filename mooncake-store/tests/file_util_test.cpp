@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "utils/file_util.h"
+#include "common/file_util.h"
 
 namespace mooncake::test {
 

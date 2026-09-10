@@ -12,7 +12,7 @@
 #include "segment.h"
 #include "task_manager.h"
 #include "tenant_id.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake::ha {
 
