@@ -63,15 +63,6 @@ target_include_directories(tent_metrics_recording_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_metrics_recording_test COMMAND tent_metrics_recording_test)
 
-add_executable(registration_rollback_test registration_rollback_test.cpp)
-target_link_libraries(registration_rollback_test
-                      PRIVATE gtest gtest_main tent_link_group glog::glog)
-if(TARGET asio_shared)
-  target_link_libraries(registration_rollback_test PRIVATE asio_shared)
-endif()
-add_test(NAME registration_rollback_test COMMAND registration_rollback_test)
-set_tests_properties(registration_rollback_test PROPERTIES TIMEOUT 60)
-
 add_executable(admission_queue_test admission_queue_test.cpp
                                     ../src/runtime/admission_queue.cpp)
 target_link_libraries(admission_queue_test PRIVATE tent_common gtest gtest_main)

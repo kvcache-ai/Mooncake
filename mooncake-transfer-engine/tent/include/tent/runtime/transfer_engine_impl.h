@@ -374,7 +374,6 @@ class TransferEngineImpl {
 
    private:
     friend class ProgressWorker;
-    friend class RegistrationRollbackTestPeer;
 
     Status construct();
 

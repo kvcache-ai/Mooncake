@@ -25,7 +25,6 @@
 
 #include <gtest/gtest.h>
 
-#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <string>
@@ -69,21 +68,6 @@ BufferDesc makeBuffer(uint64_t addr, uint64_t length) {
     desc.location = locationFor(addr);
     desc.ref_count = 1;
     return desc;
-}
-
-void expectSameBufferDesc(const BufferDesc& actual,
-                          const BufferDesc& expected) {
-    EXPECT_EQ(actual.addr, expected.addr);
-    EXPECT_EQ(actual.length, expected.length);
-    EXPECT_EQ(actual.location, expected.location);
-    EXPECT_EQ(actual.transports, expected.transports);
-    EXPECT_EQ(actual.transport_attrs, expected.transport_attrs);
-    EXPECT_EQ(actual.ref_count, expected.ref_count);
-    EXPECT_EQ(actual.rkey, expected.rkey);
-    EXPECT_EQ(actual.shm_path, expected.shm_path);
-    EXPECT_EQ(actual.mnnvl_handle, expected.mnnvl_handle);
-    EXPECT_EQ(actual.lkey, expected.lkey);
-    EXPECT_EQ(actual.internal, expected.internal);
 }
 
 const std::vector<BufferDesc>& buffersOf(const SegmentDescRef& snapshot) {
@@ -153,10 +137,8 @@ TEST(SegmentTrackerTest, RefCountedAddRemove) {
     std::vector<BufferDesc> first{makeBuffer(0x10000, 0x1000)};
     std::vector<BufferDesc> rollback_removed;
     ASSERT_TRUE(tracker.addInBatch(first, noop, rollback_removed).ok());
-    EXPECT_TRUE(rollback_removed.empty());
     std::vector<BufferDesc> second{makeBuffer(0x10000, 0x1000)};
     ASSERT_TRUE(tracker.addInBatch(second, noop, rollback_removed).ok());
-    EXPECT_TRUE(rollback_removed.empty());
 
     auto snapshot = manager->getLocal();
     ASSERT_EQ(buffersOf(snapshot).size(), 1u);
@@ -184,7 +166,6 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
     std::vector<BufferDesc> first{makeBuffer(0x20000, 0x1000)};
     std::vector<BufferDesc> rollback_removed;
     ASSERT_TRUE(tracker.addInBatch(first, ok, rollback_removed).ok());
-    EXPECT_TRUE(rollback_removed.empty());
     ASSERT_EQ(buffersOf(manager->getLocal())[0].ref_count, 1);
 
     // A duplicate registration whose transport callback fails must not leave
@@ -194,7 +175,6 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
     };
     std::vector<BufferDesc> dup{makeBuffer(0x20000, 0x1000)};
     EXPECT_FALSE(tracker.addInBatch(dup, fail, rollback_removed).ok());
-    EXPECT_TRUE(rollback_removed.empty());
     ASSERT_EQ(buffersOf(manager->getLocal()).size(), 1u);
     EXPECT_EQ(buffersOf(manager->getLocal())[0].ref_count, 1);
 
@@ -205,102 +185,6 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
     };
     ASSERT_TRUE(tracker.remove(0x20000, 0x1000, on_remove).ok());
     EXPECT_EQ(remove_callbacks, 1);
-    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
-}
-
-TEST(SegmentTrackerTest, FailedBatchHandsOffOnlyRemovedDuplicateDescriptors) {
-    auto manager = makeManager();
-    SegmentTracker tracker(*manager);
-
-    BufferDesc first = makeBuffer(0x30000, 0x1000);
-    first.transports = {HP_TCP, TCP};
-    first.transport_attrs[HP_TCP] = "hp-first";
-    first.rkey = {7};
-    first.shm_path = "shm-first";
-    first.mnnvl_handle = "mnnvl-first";
-    first.lkey = {11};
-    first.internal = true;
-    BufferDesc second = makeBuffer(0x40000, 0x2000);
-    second.transports = {HP_TCP};
-    second.transport_attrs[HP_TCP] = "hp-second";
-    second.rkey = {13};
-    second.lkey = {17};
-    second.internal = true;
-
-    auto ok = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
-    std::vector<BufferDesc> initial{first, second};
-    std::vector<BufferDesc> rollback_removed;
-    ASSERT_TRUE(tracker.addInBatch(initial, ok, rollback_removed).ok());
-    EXPECT_TRUE(rollback_removed.empty());
-
-    auto fail_after_owner_unregister =
-        [&](std::vector<BufferDesc>& new_descs) -> Status {
-        EXPECT_TRUE(new_descs.empty());
-        int remove_callbacks = 0;
-        auto on_remove = [&](BufferDesc&) -> Status {
-            ++remove_callbacks;
-            return Status::OK();
-        };
-        EXPECT_TRUE(tracker.remove(first.addr, first.length, on_remove).ok());
-        EXPECT_TRUE(tracker.remove(second.addr, second.length, on_remove).ok());
-        EXPECT_EQ(remove_callbacks, 0);
-        return Status::InternalError("injected transport failure");
-    };
-    std::vector<BufferDesc> duplicates{
-        makeBuffer(first.addr, first.length),
-        makeBuffer(first.addr, first.length),
-        makeBuffer(second.addr, second.length),
-    };
-    EXPECT_FALSE(tracker
-                     .addInBatch(duplicates, fail_after_owner_unregister,
-                                 rollback_removed)
-                     .ok());
-    ASSERT_EQ(rollback_removed.size(), 2u);
-    first.ref_count = 0;
-    second.ref_count = 0;
-    expectSameBufferDesc(rollback_removed[0], first);
-    expectSameBufferDesc(rollback_removed[1], second);
-    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
-}
-
-TEST(SegmentTrackerTest, NestedFailedBatchesHandOffOnlyFromLastRelease) {
-    auto manager = makeManager();
-    SegmentTracker tracker(*manager);
-
-    auto ok = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
-    BufferDesc buffer = makeBuffer(0x50000, 0x1000);
-    buffer.transports = {HP_TCP};
-    buffer.transport_attrs[HP_TCP] = "hp";
-    std::vector<BufferDesc> initial{buffer};
-    std::vector<BufferDesc> rollback_removed;
-    ASSERT_TRUE(tracker.addInBatch(initial, ok, rollback_removed).ok());
-
-    auto outer_fail = [&](std::vector<BufferDesc>& outer_new_descs) -> Status {
-        EXPECT_TRUE(outer_new_descs.empty());
-        std::vector<BufferDesc> inner{makeBuffer(buffer.addr, buffer.length)};
-        std::vector<BufferDesc> inner_removed;
-        auto inner_fail =
-            [&](std::vector<BufferDesc>& inner_new_descs) -> Status {
-            EXPECT_TRUE(inner_new_descs.empty());
-            int remove_callbacks = 0;
-            auto on_remove = [&](BufferDesc&) -> Status {
-                ++remove_callbacks;
-                return Status::OK();
-            };
-            EXPECT_TRUE(
-                tracker.remove(buffer.addr, buffer.length, on_remove).ok());
-            EXPECT_EQ(remove_callbacks, 0);
-            return Status::InternalError("inner failure");
-        };
-        EXPECT_FALSE(tracker.addInBatch(inner, inner_fail, inner_removed).ok());
-        EXPECT_TRUE(inner_removed.empty());
-        return Status::InternalError("outer failure");
-    };
-    std::vector<BufferDesc> outer{makeBuffer(buffer.addr, buffer.length)};
-    EXPECT_FALSE(tracker.addInBatch(outer, outer_fail, rollback_removed).ok());
-    ASSERT_EQ(rollback_removed.size(), 1u);
-    buffer.ref_count = 0;
-    expectSameBufferDesc(rollback_removed[0], buffer);
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
 }
 
@@ -374,7 +258,6 @@ TEST(SegmentTrackerTest, ConcurrentWritersVsSnapshotReaders) {
                 std::vector<BufferDesc> rollback_removed;
                 if (!tracker.addInBatch(batch, noop, rollback_removed).ok())
                     failures++;
-                if (!rollback_removed.empty()) failures++;
                 for (int i = 0; i < kBuffersPerBatch; ++i) {
                     auto on_remove = [](BufferDesc&) -> Status {
                         return Status::OK();

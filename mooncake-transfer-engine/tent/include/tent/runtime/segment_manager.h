@@ -244,8 +244,6 @@ class SegmentManager {
 
     std::unique_ptr<SegmentRegistry> registry_;
 
-    friend class RegistrationRollbackTestPeer;
-
     std::string file_desc_basepath_;
 
     // shared_ptr to prevent UAF in async callbacks
