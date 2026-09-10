@@ -1,4 +1,4 @@
-#include "p2p/client/data_manager.h"
+#include "p2p/client/v1/data_manager_v1.h"
 
 #include <algorithm>
 #include <cstring>
@@ -183,11 +183,11 @@ ErrorCode ExecuteLocalCopyPlan(const LocalCopyPlan& plan) {
 // Constructor
 // ================================================================
 
-DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
-                         std::shared_ptr<TransferEngine> transfer_engine,
-                         size_t lock_shard_count,
-                         const LocalTransferConfig& local_transfer_config,
-                         const KeyLeaseConfig& key_lease_config)
+DataManagerV1::DataManagerV1(std::unique_ptr<TieredBackend> tiered_backend,
+                             std::shared_ptr<TransferEngine> transfer_engine,
+                             size_t lock_shard_count,
+                             const LocalTransferConfig& local_transfer_config,
+                             const KeyLeaseConfig& key_lease_config)
     : tiered_backend_(std::move(tiered_backend)),
       transfer_engine_(transfer_engine),
       lock_shard_count_(lock_shard_count > 0 ? lock_shard_count : 1024),
@@ -250,12 +250,12 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
               << lease_scan_interval_.count();
 
     // Start background work only after synchronous initialization completes.
-    lease_scanner_thread_ = std::thread(&DataManager::LeaseScannerMain, this);
+    lease_scanner_thread_ = std::thread(&DataManagerV1::LeaseScannerMain, this);
 }
 
-DataManager::~DataManager() { Stop(); }
+DataManagerV1::~DataManagerV1() { Stop(); }
 
-void DataManager::Stop() {
+void DataManagerV1::Stop() {
     ShutdownLeaseScanner();
     ClearLeaseRecords();
     if (async_memcpy_executor_) {
@@ -280,7 +280,7 @@ void DataManager::Stop() {
     }
 }
 
-void DataManager::ClearLeaseRecords() {
+void DataManagerV1::ClearLeaseRecords() {
     for (auto& shard : pending_write_shards_) {
         std::unique_lock lock(shard.mutex);
         shard.existed_operation_key_map.clear();
@@ -293,7 +293,7 @@ void DataManager::ClearLeaseRecords() {
     }
 }
 
-DataManager::KeyCtx DataManager::BuildKeyCtx(std::string_view key) const {
+DataManagerV1::KeyCtx DataManagerV1::BuildKeyCtx(std::string_view key) const {
     KeyCtx ctx;
     ctx.key = key;
     ctx.hash = StringHash{}(key);
@@ -306,16 +306,28 @@ DataManager::KeyCtx DataManager::BuildKeyCtx(std::string_view key) const {
     return ctx;
 }
 
-DataManager::PendingWriteShard& DataManager::GetPendingWriteShard(
+DataManagerV1::OwnedKeyCtx DataManagerV1::BuildOwnedKeyCtx(
+    std::string_view key) const {
+    const KeyCtx view = BuildKeyCtx(key);
+    OwnedKeyCtx owned;
+    owned.key.assign(key.data(), key.size());
+    owned.hash = view.hash;
+    owned.pending_write_shard_idx = view.pending_write_shard_idx;
+    owned.pinned_key_shard_idx = view.pinned_key_shard_idx;
+    return owned;
+}
+
+DataManagerV1::PendingWriteShard& DataManagerV1::GetPendingWriteShard(
     const KeyCtx& ctx) {
     return pending_write_shards_[ctx.pending_write_shard_idx];
 }
 
-DataManager::PinnedKeyShard& DataManager::GetPinnedKeyShard(const KeyCtx& ctx) {
+DataManagerV1::PinnedKeyShard& DataManagerV1::GetPinnedKeyShard(
+    const KeyCtx& ctx) {
     return pinned_key_shards_[ctx.pinned_key_shard_idx];
 }
 
-tl::expected<RemoteBufferDesc, ErrorCode> DataManager::BuildRemoteBufferDesc(
+tl::expected<RemoteBufferDesc, ErrorCode> DataManagerV1::BuildRemoteBufferDesc(
     const AllocationHandle& handle) const {
     const auto& loc_data = handle->loc.data;
     if (!loc_data.buffer) {
@@ -326,12 +338,23 @@ tl::expected<RemoteBufferDesc, ErrorCode> DataManager::BuildRemoteBufferDesc(
     remote_buffer.segment_endpoint = local_transfer_config_.te_endpoint;
     remote_buffer.addr = reinterpret_cast<uintptr_t>(loc_data.buffer->data());
     remote_buffer.size = loc_data.buffer->size();
+    // A buffer object can exist while exposing no directly addressable memory
+    // (e.g. a StorageBuffer whose payload has been flushed to disk returns
+    // data() == nullptr). Handing such a descriptor to a peer produces an
+    // address that never passes TE registration, so reject it here instead of
+    // failing later inside ValidateRemoteBuffers on the requester side.
+    if (remote_buffer.addr == 0) {
+        LOG(ERROR) << "BuildRemoteBufferDesc: buffer exposes no directly "
+                      "addressable memory, type="
+                   << static_cast<int>(loc_data.type);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     return remote_buffer;
 }
 
 template <typename Record>
-size_t DataManager::ScanExpiredRecordShard(RecordShard<Record>& shard,
-                                           TimePoint now) {
+size_t DataManagerV1::ScanExpiredRecordShard(RecordShard<Record>& shard,
+                                             TimePoint now) {
     size_t removed = 0;
     while (!shard.ordered_list.empty()) {
         auto list_it = shard.ordered_list.begin();
@@ -362,13 +385,13 @@ size_t DataManager::ScanExpiredRecordShard(RecordShard<Record>& shard,
 }
 
 template size_t
-DataManager::ScanExpiredRecordShard<DataManager::PendingWriteRecord>(
-    RecordShard<DataManager::PendingWriteRecord>&, TimePoint);
+DataManagerV1::ScanExpiredRecordShard<DataManagerV1::PendingWriteRecord>(
+    RecordShard<DataManagerV1::PendingWriteRecord>&, TimePoint);
 template size_t
-DataManager::ScanExpiredRecordShard<DataManager::PinnedKeyRecord>(
-    RecordShard<DataManager::PinnedKeyRecord>&, TimePoint);
+DataManagerV1::ScanExpiredRecordShard<DataManagerV1::PinnedKeyRecord>(
+    RecordShard<DataManagerV1::PinnedKeyRecord>&, TimePoint);
 
-DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
+DataManagerV1::PendingWriteEraseResult DataManagerV1::ErasePendingWriteRecord(
     PendingWriteShard& shard, std::string_view key,
     const UUID& write_operation_id) {
     const auto now = std::chrono::steady_clock::now();
@@ -390,7 +413,7 @@ DataManager::PendingWriteEraseResult DataManager::ErasePendingWriteRecord(
     return PendingWriteEraseResult::Erased;
 }
 
-tl::expected<void, ErrorCode> DataManager::ReservePendingWriteSlot(
+tl::expected<void, ErrorCode> DataManagerV1::ReservePendingWriteSlot(
     PendingWriteShard& shard, std::string_view key, TimePoint now,
     TimePoint deadline, const UUID& write_operation_id) {
     std::unique_lock lock(shard.mutex);
@@ -417,7 +440,7 @@ tl::expected<void, ErrorCode> DataManager::ReservePendingWriteSlot(
     return {};
 }
 
-tl::expected<void, ErrorCode> DataManager::AttachPendingWriteHandle(
+tl::expected<void, ErrorCode> DataManagerV1::AttachPendingWriteHandle(
     PendingWriteShard& shard, std::string_view key,
     const UUID& write_operation_id, const AllocationHandle& handle) {
     // Shard shared_lock only: validates map lookup against concurrent shard
@@ -447,9 +470,10 @@ tl::expected<void, ErrorCode> DataManager::AttachPendingWriteHandle(
 }
 
 tl::expected<AllocationHandle, ErrorCode>
-DataManager::ValidatePendingWriteForCommit(PendingWriteShard& shard,
-                                           std::string_view key, TimePoint now,
-                                           const UUID& write_operation_id) {
+DataManagerV1::ValidatePendingWriteForCommit(PendingWriteShard& shard,
+                                             std::string_view key,
+                                             TimePoint now,
+                                             const UUID& write_operation_id) {
     // Hold the pending record through Commit so a new PreWrite cannot reserve
     // the same key in the race window before tiered_backend_->Commit finishes.
     std::shared_lock shard_lock(shard.mutex);
@@ -479,14 +503,14 @@ DataManager::ValidatePendingWriteForCommit(PendingWriteShard& shard,
     return record_it->second.handle;
 }
 
-tl::expected<void, ErrorCode> DataManager::WriteRevoke(
+tl::expected<void, ErrorCode> DataManagerV1::WriteRevoke(
     std::string_view key, const UUID& write_operation_id) {
     return WriteRevokeInternal(BuildKeyCtx(key), write_operation_id);
 }
 
-tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
+tl::expected<void, ErrorCode> DataManagerV1::WriteRevokeInternal(
     const KeyCtx& ctx, const UUID& write_operation_id) {
-    ScopedVLogTimer timer(1, "DataManager::WriteRevoke");
+    ScopedVLogTimer timer(1, "DataManagerV1::WriteRevoke");
     timer.LogRequest("key=", ctx.key);
 
     if (ctx.key.empty() || IsZeroUUID(write_operation_id)) {
@@ -515,7 +539,7 @@ tl::expected<void, ErrorCode> DataManager::WriteRevokeInternal(
     return {};
 }
 
-void DataManager::ShutdownLeaseScanner() {
+void DataManagerV1::ShutdownLeaseScanner() {
     lease_scanner_stop_requested_.store(true);
     lease_scanner_cv_.notify_all();
     if (lease_scanner_thread_.joinable()) {
@@ -523,7 +547,7 @@ void DataManager::ShutdownLeaseScanner() {
     }
 }
 
-void DataManager::LeaseScannerMain() {
+void DataManagerV1::LeaseScannerMain() {
     while (!lease_scanner_stop_requested_.load()) {
         {
             std::unique_lock<std::mutex> wait_lock(lease_scanner_mutex_);
@@ -559,7 +583,7 @@ void DataManager::LeaseScannerMain() {
 // in a waste of resources.
 // In future, we will add a pre-occupation mechanism in the Allocation stage
 // to optimize this issue.
-tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
+tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManagerV1::Put(
     std::string_view key, std::vector<Slice>& slices) {
     switch (local_transfer_config_.mode) {
         case LocalTransferMode::TE:
@@ -572,10 +596,10 @@ tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode> DataManager::Put(
 
 // TE wait may offload to te_wait_pool_; copy/commit always run after wait
 // on the Wait() caller or WaitAsync resume executor (not on wait workers).
-tl::expected<void, ErrorCode> DataManager::FinishPutViaTeAfterWait(
+tl::expected<void, ErrorCode> DataManagerV1::FinishPutViaTeAfterWait(
     const KeyCtx& ctx, const UUID& write_operation_id, TeSubmitResult& te_ctx,
     tl::expected<void, ErrorCode> wait_result) {
-    ScopedVLogTimer timer(1, "DataManager::PutViaTe");
+    ScopedVLogTimer timer(1, "DataManagerV1::PutViaTe");
     timer.LogRequest("key=", ctx.key);
     if (!wait_result) {
         LOG(ERROR) << "WaitAllTransferBatches failed"
@@ -614,9 +638,11 @@ tl::expected<void, ErrorCode> DataManager::FinishPutViaTeAfterWait(
 }
 
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
+DataManagerV1::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
     // using Te, treat local memory as remote memory
-    const KeyCtx kctx = BuildKeyCtx(key);
+    // Owning ctx: the finish step below runs at TaskHandle::Wait() time, after
+    // this function returned and possibly after the caller's key storage died.
+    const OwnedKeyCtx okey = BuildOwnedKeyCtx(key);
     size_t total_size = 0;
     for (const auto& s : slices) total_size += s.size;
     auto src_buffers = SlicesToRemoteBufferDescs(slices);
@@ -629,8 +655,8 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
 
     // Local Put: pin the local replica to DRAM (strict; evict+retry on a full
     // DRAM, never spill to a slower tier).
-    auto prewrite_result =
-        PreWriteInternal(kctx, total_size, std::nullopt, /*dram_only=*/true);
+    auto prewrite_result = PreWriteInternal(okey.View(), total_size,
+                                            std::nullopt, /*dram_only=*/true);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaTe: PreWrite failed"
                    << ", key=" << key
@@ -646,7 +672,7 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
         LOG(ERROR) << "SubmitTeTransferInternal failed"
                    << ", key=" << key
                    << ", error_code=" << toString(submit_result.error());
-        (void)WriteRevokeInternal(kctx, write_operation_id);
+        (void)WriteRevokeInternal(okey.View(), write_operation_id);
         return tl::unexpected(submit_result.error());
     }
 
@@ -655,34 +681,36 @@ DataManager::PutViaTe(std::string_view key, std::vector<Slice>& slices) {
             std::move(submit_result->transfer_batches));
         return MakeFutureThenHandle<void>(
             std::move(wait_future),
-            [this, kctx, write_operation_id, ctx = std::move(*submit_result)](
+            [this, okey, write_operation_id, ctx = std::move(*submit_result)](
                 tl::expected<void, ErrorCode> wait_result) mutable {
-                return FinishPutViaTeAfterWait(kctx, write_operation_id, ctx,
-                                               std::move(wait_result));
+                return FinishPutViaTeAfterWait(okey.View(), write_operation_id,
+                                               ctx, std::move(wait_result));
             });
     }
 
     return CallableTaskHandle<void>::Create(
-        [this, ctx = std::move(*submit_result), kctx,
+        [this, ctx = std::move(*submit_result), okey,
          write_operation_id]() mutable -> tl::expected<void, ErrorCode> {
             return FinishPutViaTeAfterWait(
-                kctx, write_operation_id, ctx,
+                okey.View(), write_operation_id, ctx,
                 WaitAllTransferBatches(ctx.transfer_batches));
         });
 }
 
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
-DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
+DataManagerV1::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     if (slices.size() != 1) {
         LOG(ERROR) << "PutLocal in memcpy mode only supports a single slice";
         return tl::unexpected(ErrorCode::NOT_IMPLEMENTED);
     }
-    const KeyCtx kctx = BuildKeyCtx(key);
+    // Owning ctx: write_fn / commit_fn below run at TaskHandle::Wait() time or
+    // on an async memcpy worker, both of which outlive `key`.
+    const OwnedKeyCtx okey = BuildOwnedKeyCtx(key);
     Slice slice = slices[0];
 
     // Same allocation policy as PutViaTe: DRAM-only local replica.
-    auto prewrite_result =
-        PreWriteInternal(kctx, slice.size, std::nullopt, /*dram_only=*/true);
+    auto prewrite_result = PreWriteInternal(okey.View(), slice.size,
+                                            std::nullopt, /*dram_only=*/true);
     if (!prewrite_result) {
         LOG(ERROR) << "PutViaMemcpy: PreWrite failed"
                    << ", key=" << key
@@ -692,7 +720,7 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
     const UUID write_operation_id = prewrite_result->write_operation_id;
     AllocationHandle alloc_handle = prewrite_result->handle;
 
-    auto write_fn = [this, kctx, slice, alloc_handle,
+    auto write_fn = [this, okey, slice, alloc_handle,
                      write_operation_id]() -> tl::expected<void, ErrorCode> {
         DataSource source;
         source.buffer = std::make_unique<RefBuffer>(slice.ptr, slice.size);
@@ -700,19 +728,20 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
 
         auto write_result = tiered_backend_->Write(source, alloc_handle);
         if (!write_result.has_value()) {
-            LOG(ERROR) << "Failed to write data for key: " << kctx.key
+            LOG(ERROR) << "Failed to write data for key: " << okey.key
                        << ", error: " << write_result.error();
-            (void)WriteRevokeInternal(kctx, write_operation_id);
+            (void)WriteRevokeInternal(okey.View(), write_operation_id);
             return tl::make_unexpected(write_result.error());
         }
         return {};
     };
 
-    auto commit_fn = [this, kctx,
+    auto commit_fn = [this, okey,
                       write_operation_id]() -> tl::expected<void, ErrorCode> {
-        auto commit_result = WriteCommitInternal(kctx, write_operation_id);
+        auto commit_result =
+            WriteCommitInternal(okey.View(), write_operation_id);
         if (!commit_result) {
-            LOG(ERROR) << "Failed to commit data for key: " << kctx.key
+            LOG(ERROR) << "Failed to commit data for key: " << okey.key
                        << ", error: " << commit_result.error();
             return tl::make_unexpected(commit_result.error());
         }
@@ -721,9 +750,9 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
 
     auto write_and_commit = [write_fn = std::move(write_fn),
                              commit_fn = std::move(commit_fn),
-                             kctx]() mutable -> tl::expected<void, ErrorCode> {
-        ScopedVLogTimer timer(1, "DataManager::PutViaMemcpy");
-        timer.LogRequest("key=", kctx.key);
+                             okey]() mutable -> tl::expected<void, ErrorCode> {
+        ScopedVLogTimer timer(1, "DataManagerV1::PutViaMemcpy");
+        timer.LogRequest("key=", okey.key);
         auto write_result = write_fn();
         if (!write_result) {
             LOG(ERROR) << "Failed to write data, error: "
@@ -755,7 +784,7 @@ DataManager::PutViaMemcpy(std::string_view key, std::vector<Slice>& slices) {
 // Get
 // ================================================================
 
-tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
+tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::Get(
     std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
@@ -788,7 +817,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     return result;
 }
 
-tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
+tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::Get(
     std::string_view key, const std::vector<Slice>& slices) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
@@ -806,7 +835,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::Get(
     return result;
 }
 
-tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopier(
+tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::BuildDataCopier(
     const AllocationHandle& handle, std::string_view key,
     const std::vector<Slice>& slices) {
     if (!handle || !handle->loc.data.buffer) {
@@ -823,7 +852,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopier(
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
-tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
+tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::BuildDataCopierViaTe(
     const AllocationHandle& handle, const std::vector<Slice>& slices) {
     // using Te, treat local memory as remote memory
     const size_t source_size = handle->loc.data.buffer->size();
@@ -857,7 +886,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
     } else {
         auto te_wait = [this, ctx = std::move(submit_result.value()),
                         h = handle]() mutable -> tl::expected<void, ErrorCode> {
-            ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaTe");
+            ScopedVLogTimer timer(1, "DataManagerV1::BuildDataCopierViaTe");
             auto wait_result = WaitAllTransferBatches(ctx.transfer_batches);
             if (!wait_result) {
                 LOG(ERROR) << "Failed to wait TE read transfer, error_code="
@@ -872,7 +901,7 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaTe(
     return res;
 }
 
-tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
+tl::expected<ReadTaskHandle, ErrorCode> DataManagerV1::BuildDataCopierViaMemcpy(
     const AllocationHandle& handle, std::string_view key,
     const std::vector<Slice>& slices) {
     auto plan_result = BuildLocalCopyPlan(key, handle, slices);
@@ -885,9 +914,13 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
     ReadTaskHandle res;
     res.data_size = static_cast<int64_t>(plan_result.value().source_size);
 
-    auto read_fn = [plan = std::move(plan_result.value()),
-                    key]() mutable -> tl::expected<void, ErrorCode> {
-        ScopedVLogTimer timer(1, "DataManager::BuildDataCopierViaMemcpy");
+    // Own the key: read_fn runs at TaskHandle::Wait() time or on an async
+    // memcpy worker, after Get() returned and possibly after the caller's key
+    // storage died.
+    auto read_fn =
+        [plan = std::move(plan_result.value()),
+         key = std::string(key)]() mutable -> tl::expected<void, ErrorCode> {
+        ScopedVLogTimer timer(1, "DataManagerV1::BuildDataCopierViaMemcpy");
         timer.LogRequest("key=", key);
         ErrorCode ec = ExecuteLocalCopyPlan(plan);
         if (ec != ErrorCode::OK) {
@@ -916,16 +949,16 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
 // Remote data transfer — called by RPC service layer
 // ================================================================
 
-tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
+tl::expected<void, ErrorCode> DataManagerV1::ReadRemoteData(
     std::string_view key, const std::vector<RemoteBufferDesc>& dest_buffers) {
     return async_simple::coro::syncAwait(
         ReadRemoteDataAsync(key, dest_buffers));
 }
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-DataManager::ReadRemoteDataAsync(
+DataManagerV1::ReadRemoteDataAsync(
     std::string_view key, const std::vector<RemoteBufferDesc>& dest_buffers) {
-    ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
+    ScopedVLogTimer timer(1, "DataManagerV1::ReadRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
     auto validate_result = ValidateRemoteBuffers(dest_buffers);
@@ -978,7 +1011,7 @@ DataManager::ReadRemoteDataAsync(
     co_return tl::expected<void, ErrorCode>{};
 }
 
-tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
+tl::expected<void, ErrorCode> DataManagerV1::TransferDataToRemote(
     AllocationHandle handle,
     const std::vector<RemoteBufferDesc>& dest_buffers) {
     auto submit_result = SubmitTeTransferInternal(
@@ -994,7 +1027,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     return {};
 }
 
-tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
+tl::expected<UUID, ErrorCode> DataManagerV1::WriteRemoteData(
     std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
     return async_simple::coro::syncAwait(
@@ -1002,10 +1035,10 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
 }
 
 async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
-DataManager::WriteRemoteDataAsync(
+DataManagerV1::WriteRemoteDataAsync(
     std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
-    ScopedVLogTimer timer(1, "DataManager::WriteRemoteData");
+    ScopedVLogTimer timer(1, "DataManagerV1::WriteRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", src_buffers.size());
     const KeyCtx kctx = BuildKeyCtx(key);
 
@@ -1078,7 +1111,7 @@ DataManager::WriteRemoteDataAsync(
     co_return result_tier_id;
 }
 
-tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
+tl::expected<PreWriteResponse, ErrorCode> DataManagerV1::PreWrite(
     std::string_view key, size_t size_bytes, std::optional<UUID> tier_id) {
     // Public PreWrite backs the cross-node forward TE path, which requires a
     // DRAM handle. Pin to DRAM strictly (evict+retry on a full DRAM) rather
@@ -1097,10 +1130,10 @@ tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(
     return out;
 }
 
-tl::expected<DataManager::PreWriteResult, ErrorCode>
-DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
-                              std::optional<UUID> tier_id, bool dram_only) {
-    ScopedVLogTimer timer(1, "DataManager::PreWrite");
+tl::expected<DataManagerV1::PreWriteResult, ErrorCode>
+DataManagerV1::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
+                                std::optional<UUID> tier_id, bool dram_only) {
+    ScopedVLogTimer timer(1, "DataManagerV1::PreWrite");
     timer.LogRequest("key=", ctx.key, "size_bytes=", size_bytes);
 
     if (ctx.key.empty() || size_bytes == 0) {
@@ -1190,14 +1223,14 @@ DataManager::PreWriteInternal(const KeyCtx& ctx, size_t size_bytes,
     return result;
 }
 
-tl::expected<void, ErrorCode> DataManager::WriteCommit(
+tl::expected<void, ErrorCode> DataManagerV1::WriteCommit(
     std::string_view key, const UUID& write_operation_id) {
     return WriteCommitInternal(BuildKeyCtx(key), write_operation_id);
 }
 
-tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
+tl::expected<void, ErrorCode> DataManagerV1::WriteCommitInternal(
     const KeyCtx& ctx, const UUID& write_operation_id) {
-    ScopedVLogTimer timer(1, "DataManager::WriteCommit");
+    ScopedVLogTimer timer(1, "DataManagerV1::WriteCommit");
     timer.LogRequest("key=", ctx.key);
 
     if (ctx.key.empty() || IsZeroUUID(write_operation_id)) {
@@ -1262,7 +1295,7 @@ tl::expected<void, ErrorCode> DataManager::WriteCommitInternal(
     return {};
 }
 
-tl::expected<PinKeyResponse, ErrorCode> DataManager::PinKey(
+tl::expected<PinKeyResponse, ErrorCode> DataManagerV1::PinKey(
     std::string_view key, std::optional<UUID> tier_id) {
     auto internal_result = PinKeyInternal(BuildKeyCtx(key), tier_id);
     if (!internal_result) {
@@ -1274,9 +1307,9 @@ tl::expected<PinKeyResponse, ErrorCode> DataManager::PinKey(
     return out;
 }
 
-tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
-    const KeyCtx& ctx, std::optional<UUID> tier_id) {
-    ScopedVLogTimer timer(1, "DataManager::PinKey");
+tl::expected<DataManagerV1::PinKeyResult, ErrorCode>
+DataManagerV1::PinKeyInternal(const KeyCtx& ctx, std::optional<UUID> tier_id) {
+    ScopedVLogTimer timer(1, "DataManagerV1::PinKey");
     timer.LogRequest("key=", ctx.key);
 
     if (ctx.key.empty()) {
@@ -1351,6 +1384,19 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     }
 
     auto handle = std::move(handle_result.value());
+    // PinKey forward path: DRAM-only. This check must happen on the first-pin
+    // path too, not only when bumping an existing pin: otherwise a replica
+    // that lives on a slower tier would either hand out an addr==0 descriptor
+    // or, inside the not-yet-flushed window, a staging address that was never
+    // registered with the TransferEngine. No lease is created on this path.
+    if (handle->loc.data.type != MemoryType::DRAM) {
+        LOG(ERROR) << "PinKey: DRAM-only forward path, non-DRAM replica"
+                   << ", key=" << ctx.key << ", error="
+                   << toString(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        timer.LogResponse("error_code=",
+                          ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
     auto remote_buffer_result = BuildRemoteBufferDesc(handle);
     if (!remote_buffer_result) {
         timer.LogResponse("error_code=", remote_buffer_result.error());
@@ -1389,14 +1435,14 @@ tl::expected<DataManager::PinKeyResult, ErrorCode> DataManager::PinKeyInternal(
     return result;
 }
 
-tl::expected<void, ErrorCode> DataManager::UnPinKey(
+tl::expected<void, ErrorCode> DataManagerV1::UnPinKey(
     std::string_view key, const UUID& read_operation_id) {
     return UnPinKeyInternal(BuildKeyCtx(key), read_operation_id);
 }
 
-tl::expected<void, ErrorCode> DataManager::UnPinKeyInternal(
+tl::expected<void, ErrorCode> DataManagerV1::UnPinKeyInternal(
     const KeyCtx& ctx, const UUID& read_operation_id) {
-    ScopedVLogTimer timer(1, "DataManager::UnPinKey");
+    ScopedVLogTimer timer(1, "DataManagerV1::UnPinKey");
     timer.LogRequest("key=", ctx.key);
 
     if (ctx.key.empty() || IsZeroUUID(read_operation_id)) {
@@ -1439,7 +1485,7 @@ tl::expected<void, ErrorCode> DataManager::UnPinKeyInternal(
     return {};
 }
 
-tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
+tl::expected<void, ErrorCode> DataManagerV1::TransferDataFromRemote(
     AllocationHandle handle, const std::vector<RemoteBufferDesc>& src_buffers) {
     auto submit_result = SubmitTeTransferInternal(
         handle, src_buffers, Transport::TransferRequest::READ);
@@ -1477,8 +1523,8 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 // TE transfer internals
 // ================================================================
 
-tl::expected<DataManager::TeSubmitResult, ErrorCode>
-DataManager::SubmitTeTransferInternal(
+tl::expected<DataManagerV1::TeSubmitResult, ErrorCode>
+DataManagerV1::SubmitTeTransferInternal(
     const AllocationHandle& handle,
     const std::vector<RemoteBufferDesc>& remote_buffers,
     Transport::TransferRequest::OpCode opcode) {
@@ -1557,7 +1603,7 @@ DataManager::SubmitTeTransferInternal(
 
 tl::expected<std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
              ErrorCode>
-DataManager::SubmitTeTransferBatches(
+DataManagerV1::SubmitTeTransferBatches(
     void* transfer_ptr, size_t total_data_size,
     const std::vector<RemoteBufferDesc>& remote_buffers,
     Transport::TransferRequest::OpCode opcode) {
@@ -1643,7 +1689,7 @@ DataManager::SubmitTeTransferBatches(
 
 tl::expected<std::vector<std::tuple<Transport::BatchID, size_t, std::string>>,
              ErrorCode>
-DataManager::SubmitTransferData(
+DataManagerV1::SubmitTransferData(
     void* local_transfer_base, size_t total_size,
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
@@ -1674,7 +1720,7 @@ DataManager::SubmitTransferData(
     return batches;
 }
 
-tl::expected<void, ErrorCode> DataManager::TransferData(
+tl::expected<void, ErrorCode> DataManagerV1::TransferData(
     void* local_transfer_base, size_t total_size,
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
@@ -1694,7 +1740,7 @@ tl::expected<void, ErrorCode> DataManager::TransferData(
 }
 
 async_simple::Future<tl::expected<void, ErrorCode>>
-DataManager::TransferDataAsync(
+DataManagerV1::TransferDataAsync(
     void* local_transfer_base, size_t total_size,
     const std::vector<RemoteBufferDesc>& peer_buffers,
     Transport::TransferRequest::OpCode opcode) {
@@ -1710,14 +1756,14 @@ DataManager::TransferDataAsync(
     return WaitAllTransferBatchesAsync(std::move(batches.value()));
 }
 
-async_simple::Executor* DataManager::GetCoroExecutor() const {
+async_simple::Executor* DataManagerV1::GetCoroExecutor() const {
     if (coro_executor_pool_) {
         return coro_executor_pool_->get_executor();
     }
     return coro_io::get_global_executor();
 }
 
-tl::expected<void, ErrorCode> DataManager::ValidateRemoteBuffers(
+tl::expected<void, ErrorCode> DataManagerV1::ValidateRemoteBuffers(
     const std::vector<RemoteBufferDesc>& buffers) {
     if (buffers.empty()) {
         LOG(ERROR) << "Empty buffers";
@@ -1758,9 +1804,10 @@ AllocateTempDRAMBuffer(size_t total_size) {
 
 tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
              ErrorCode>
-DataManager::PrepareDRAMTransferBuffer(void* source_ptr, MemoryType source_type,
-                                       size_t total_size,
-                                       TieredBackend* backend) {
+DataManagerV1::PrepareDRAMTransferBuffer(void* source_ptr,
+                                         MemoryType source_type,
+                                         size_t total_size,
+                                         TieredBackend* backend) {
     if (source_type == MemoryType::DRAM) {
         return std::make_pair(
             source_ptr,
@@ -1804,8 +1851,8 @@ DataManager::PrepareDRAMTransferBuffer(void* source_ptr, MemoryType source_type,
 
 tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
              ErrorCode>
-DataManager::PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
-                                      size_t total_size) {
+DataManagerV1::PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
+                                        size_t total_size) {
     if (dest_type == MemoryType::DRAM) {
         return std::make_pair(dest_ptr, std::unique_ptr<void, void (*)(void*)>(
                                             nullptr, [](void*) {}));
@@ -1825,7 +1872,8 @@ DataManager::PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
     return std::make_pair(transfer_ptr, std::move(temp_buffer));
 }
 
-tl::expected<Transport::BatchID, ErrorCode> DataManager::SubmitTransferRequests(
+tl::expected<Transport::BatchID, ErrorCode>
+DataManagerV1::SubmitTransferRequests(
     const std::string& segment_endpoint, Transport::SegmentHandle seg,
     const std::vector<Transport::TransferRequest>& requests) {
     Transport::BatchID batch_id =
@@ -1852,7 +1900,7 @@ tl::expected<Transport::BatchID, ErrorCode> DataManager::SubmitTransferRequests(
     return batch_id;
 }
 
-tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
+tl::expected<void, ErrorCode> DataManagerV1::WaitAllTransferBatches(
     const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
         batches) {
     for (size_t i = 0; i < batches.size(); ++i) {
@@ -1884,7 +1932,7 @@ tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
 }
 
 async_simple::Future<tl::expected<void, ErrorCode>>
-DataManager::WaitAllTransferBatchesAsync(
+DataManagerV1::WaitAllTransferBatchesAsync(
     std::vector<std::tuple<Transport::BatchID, size_t, std::string>> batches) {
     async_simple::Executor* wait_ex = nullptr;
     {
@@ -1904,7 +1952,7 @@ DataManager::WaitAllTransferBatchesAsync(
                               wait_ex, [this]() { ReleaseTeWaitInflight(); });
 }
 
-void DataManager::ReleaseTeWaitInflight() {
+void DataManagerV1::ReleaseTeWaitInflight() {
     std::lock_guard lock(te_wait_mutex_);
     --te_wait_inflight_;
     if (te_wait_inflight_ == 0) {
@@ -1912,8 +1960,8 @@ void DataManager::ReleaseTeWaitInflight() {
     }
 }
 
-bool DataManager::IsTeBatchFullyDrained(Transport::BatchID batch_id,
-                                        size_t num_tasks) {
+bool DataManagerV1::IsTeBatchFullyDrained(Transport::BatchID batch_id,
+                                          size_t num_tasks) {
     for (size_t i = 0; i < num_tasks; ++i) {
         TransferStatus status;
         Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
@@ -1925,7 +1973,7 @@ bool DataManager::IsTeBatchFullyDrained(Transport::BatchID batch_id,
     return true;
 }
 
-DataManager::TeBatchPollResult DataManager::PollTransferBatchOnce(
+DataManagerV1::TeBatchPollResult DataManagerV1::PollTransferBatchOnce(
     Transport::BatchID batch_id, size_t num_tasks,
     const std::string& segment_endpoint,
     std::chrono::steady_clock::time_point start_time) {
@@ -1974,7 +2022,7 @@ DataManager::TeBatchPollResult DataManager::PollTransferBatchOnce(
     return TeBatchPollResult::kPending;
 }
 
-tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
+tl::expected<void, ErrorCode> DataManagerV1::WaitTransferBatch(
     Transport::BatchID batch_id, size_t num_tasks,
     const std::string& segment_endpoint) {
     auto start_time = std::chrono::steady_clock::now();
@@ -1995,9 +2043,9 @@ tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
 }
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-DataManager::WaitTransferBatchCoro(Transport::BatchID batch_id,
-                                   size_t num_tasks,
-                                   std::string segment_endpoint) {
+DataManagerV1::WaitTransferBatchCoro(Transport::BatchID batch_id,
+                                     size_t num_tasks,
+                                     std::string segment_endpoint) {
     auto start_time = std::chrono::steady_clock::now();
     while (true) {
         if (te_wait_stopped_.load(std::memory_order_acquire)) {
@@ -2022,7 +2070,7 @@ DataManager::WaitTransferBatchCoro(Transport::BatchID batch_id,
 }
 
 async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
-DataManager::WaitAllTransferBatchesCoro(
+DataManagerV1::WaitAllTransferBatchesCoro(
     std::vector<std::tuple<Transport::BatchID, size_t, std::string>> batches) {
     for (size_t i = 0; i < batches.size(); ++i) {
         Transport::BatchID batch_id = std::get<0>(batches[i]);
@@ -2047,8 +2095,8 @@ DataManager::WaitAllTransferBatchesCoro(
 // Then, only COMPLETED and FAILED status of task will trigger to set
 // is_finished=true. And there is no cancel API in TransferEngine. Thus, we must
 // poll until all tasks reach a terminal state before calling freeBatchID.
-void DataManager::CancelBatchTETask(Transport::BatchID batch_id,
-                                    size_t num_tasks) {
+void DataManagerV1::CancelBatchTETask(Transport::BatchID batch_id,
+                                      size_t num_tasks) {
     auto start = std::chrono::steady_clock::now();
     while (true) {
         if (IsTeBatchFullyDrained(batch_id, num_tasks)) {
@@ -2068,7 +2116,7 @@ void DataManager::CancelBatchTETask(Transport::BatchID batch_id,
     transfer_engine_->freeBatchID(batch_id);
 }
 
-async_simple::coro::Lazy<void> DataManager::CancelBatchTETaskCoro(
+async_simple::coro::Lazy<void> DataManagerV1::CancelBatchTETaskCoro(
     Transport::BatchID batch_id, size_t num_tasks) {
     auto start = std::chrono::steady_clock::now();
     while (true) {
@@ -2089,7 +2137,7 @@ async_simple::coro::Lazy<void> DataManager::CancelBatchTETaskCoro(
     transfer_engine_->freeBatchID(batch_id);
 }
 
-async_simple::coro::Lazy<void> DataManager::CancelTeWaitBatchesCoro(
+async_simple::coro::Lazy<void> DataManagerV1::CancelTeWaitBatchesCoro(
     const std::vector<std::tuple<Transport::BatchID, size_t, std::string>>&
         batches,
     size_t from_index) {
@@ -2099,7 +2147,7 @@ async_simple::coro::Lazy<void> DataManager::CancelTeWaitBatchesCoro(
     }
 }
 
-tl::expected<void, ErrorCode> DataManager::CopyFromDRAMBuffer(
+tl::expected<void, ErrorCode> DataManagerV1::CopyFromDRAMBuffer(
     void* temp_buffer, void* dest_ptr, MemoryType dest_type, size_t total_size,
     TieredBackend* backend) {
     VLOG(1) << "Copying from temp DRAM to non-DRAM tier";
@@ -2127,7 +2175,7 @@ tl::expected<void, ErrorCode> DataManager::CopyFromDRAMBuffer(
 // ================================================================
 // Buffer helpers
 // ================================================================
-std::vector<RemoteBufferDesc> DataManager::SlicesToRemoteBufferDescs(
+std::vector<RemoteBufferDesc> DataManagerV1::SlicesToRemoteBufferDescs(
     const std::vector<Slice>& slices) const {
     std::vector<RemoteBufferDesc> buffers;
     buffers.reserve(slices.size());
@@ -2145,7 +2193,7 @@ std::vector<RemoteBufferDesc> DataManager::SlicesToRemoteBufferDescs(
 // Delete / Exist
 // ================================================================
 
-tl::expected<std::pair<UUID, uint64_t>, ErrorCode> DataManager::Query(
+tl::expected<std::pair<UUID, uint64_t>, ErrorCode> DataManagerV1::Query(
     std::string_view key) {
     auto handle = tiered_backend_->Get(key);
     if (!handle) {
@@ -2161,7 +2209,7 @@ tl::expected<std::pair<UUID, uint64_t>, ErrorCode> DataManager::Query(
     return std::make_pair(segment_id, object_size);
 }
 
-tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
+tl::expected<size_t, ErrorCode> DataManagerV1::QueryObjectSize(
     std::string_view key) {
     auto info = Query(key);
     if (!info) {
@@ -2172,10 +2220,10 @@ tl::expected<size_t, ErrorCode> DataManager::QueryObjectSize(
     return info.value().second;
 }
 
-tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
-                                                  std::optional<UUID> tier_id,
-                                                  bool notify_master) {
-    ScopedVLogTimer timer(1, "DataManager::Delete");
+tl::expected<void, ErrorCode> DataManagerV1::Delete(std::string_view key,
+                                                    std::optional<UUID> tier_id,
+                                                    bool notify_master) {
+    ScopedVLogTimer timer(1, "DataManagerV1::Delete");
     timer.LogRequest("key=", key);
 
     // NOTE (weak delete semantics):
@@ -2194,13 +2242,13 @@ tl::expected<void, ErrorCode> DataManager::Delete(std::string_view key,
     return {};
 }
 
-bool DataManager::Exist(std::string_view key,
-                        std::optional<UUID> tier_id) const {
+bool DataManagerV1::Exist(std::string_view key,
+                          std::optional<UUID> tier_id) const {
     return tiered_backend_->Exist(key, tier_id);
 }
 
-tl::expected<long, ErrorCode> DataManager::RemoveAll() {
-    ScopedVLogTimer timer(1, "DataManager::RemoveAll");
+tl::expected<long, ErrorCode> DataManagerV1::RemoveAll() {
+    ScopedVLogTimer timer(1, "DataManagerV1::RemoveAll");
 
     if (!tiered_backend_) {
         LOG(ERROR) << "RemoveAll: tiered_backend_ is null";
@@ -2221,20 +2269,20 @@ tl::expected<long, ErrorCode> DataManager::RemoveAll() {
     return result.value();
 }
 
-void DataManager::ForEachKeyBatch(
+void DataManagerV1::ForEachKeyBatch(
     const std::function<bool(std::vector<ReplicaLocation>&&)>& callback) const {
     if (tiered_backend_) {
         tiered_backend_->ForEachKeyBatch(callback);
     }
 }
 
-AccessStats DataManager::GetHotKeyStats(
+AccessStats DataManagerV1::GetHotKeyStats(
     std::optional<size_t> hot_key_num) const {
     if (!tiered_backend_) return {};
     return tiered_backend_->GetHotKeyStats(hot_key_num);
 }
 
-std::vector<UUID> DataManager::GetReplicaTierIds(std::string_view key) const {
+std::vector<UUID> DataManagerV1::GetReplicaTierIds(std::string_view key) const {
     if (!tiered_backend_) return {};
     return tiered_backend_->GetReplicaTierIds(key);
 }
@@ -2245,8 +2293,8 @@ std::vector<UUID> DataManager::GetReplicaTierIds(std::string_view key) const {
 
 // If a client attempts to access data via a read route and the data is not
 // found locally, it calls this function to rectify the stale route in master.
-void DataManager::RectifyReadRoute(std::string_view key,
-                                   std::optional<UUID> tier_id) {
+void DataManagerV1::RectifyReadRoute(std::string_view key,
+                                     std::optional<UUID> tier_id) {
     if (!rectify_wrong_route_fn_) return;
 
     tiered_backend_->conditionalExecute(
@@ -2264,12 +2312,11 @@ void DataManager::RectifyReadRoute(std::string_view key,
         });
 }
 
-void DataManager::SetRectifyCallback(
-    std::function<void(std::string_view, std::optional<UUID>)> fn) {
+void DataManagerV1::SetRectifyCallback(RectifyRouteCallback fn) {
     rectify_wrong_route_fn_ = std::move(fn);
 }
 
-std::vector<TierView> DataManager::GetTierViews() const {
+std::vector<TierView> DataManagerV1::GetTierViews() const {
     return tiered_backend_->GetTierViews();
 }
 

@@ -9,6 +9,7 @@
 #include "p2p/client/client_rpc_service.h"
 #include "p2p/client/client_rpc_types.h"
 #include "p2p/client/data_manager.h"
+#include "p2p/client/v1/data_manager_v1.h"
 #include "p2p/client/tiered_cache/tiered_backend.h"
 #include "../utils/common.h"
 #include "transfer_engine.h"
@@ -72,7 +73,7 @@ class ClientRpcServiceTest : public ::testing::Test {
         LocalTransferConfig transfer_config;
         transfer_config.mode = LocalTransferMode::MEMCPY;
         transfer_config.local_memcpy_async_worker_num = 32;
-        data_manager_ = std::make_unique<DataManager>(
+        data_manager_ = std::make_unique<DataManagerV1>(
             std::move(tiered_backend_), transfer_engine_,
             /*lock_shard_count=*/1024, transfer_config);
 

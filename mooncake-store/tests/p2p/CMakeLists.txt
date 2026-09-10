@@ -63,7 +63,7 @@ add_p2p_store_test(peer_client_test peer_client_test.cpp)
 # Explicit benchmark binary: never count it as a default functional CTest.
 add_p2p_store_executable(peer_client_perf_test peer_client_perf_test.cpp)
 add_p2p_store_test(client_rpc_service_test client_rpc_service_test.cpp)
-add_p2p_store_test(data_manager_test data_manager_test.cpp)
+add_p2p_store_test(data_manager_v1_test data_manager_v1_test.cpp)
 add_p2p_store_test(route_cache_test route_cache_test.cpp)
 add_p2p_store_test(inflight_tracker_test inflight_tracker_test.cpp)
 add_p2p_store_test(async_metadata_notifier_test async_metadata_notifier_test.cpp)

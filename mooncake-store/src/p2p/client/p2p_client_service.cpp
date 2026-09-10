@@ -18,6 +18,7 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
 
+#include "p2p/client/v1/data_manager_v1.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -462,7 +463,7 @@ void P2PClientService::Stop() {
     }
 
     // 6. Stop tier scheduler of tiered_backend.
-    if (data_manager_.has_value()) {
+    if (data_manager_ != nullptr) {
         data_manager_->Stop();
     }
 
@@ -495,7 +496,7 @@ void P2PClientService::Destroy() {
     client_rpc_service_.reset();
     ha_manager_.reset();
     async_route_notifier_.reset();
-    if (data_manager_.has_value()) {
+    if (data_manager_ != nullptr) {
         data_manager_->Destroy();
     }
     data_manager_.reset();
@@ -604,7 +605,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                                                 ErrorCode error) {
             LOG(WARNING) << "Async ADD rejected by Master, deleting local"
                          << ", key=" << key << ", error=" << error;
-            if (data_manager_.has_value()) {
+            if (data_manager_ != nullptr) {
                 auto r = data_manager_->Delete(key, segment_id,
                                                /*notify_master=*/false);
                 if (!r) {
@@ -710,9 +711,9 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     key_lease_config.duration_ms = config.p2p_key_lease_duration_ms;
     key_lease_config.scan_interval_ms = config.p2p_key_lease_scan_interval_ms;
 
-    data_manager_.emplace(std::move(tiered_backend), transfer_engine_,
-                          config.lock_shard_count, local_transfer_config,
-                          key_lease_config);
+    data_manager_ = std::make_unique<DataManagerV1>(
+        std::move(tiered_backend), transfer_engine_, config.lock_shard_count,
+        local_transfer_config, key_lease_config);
     // Set rectify callback on DataManager to remove stale replicas from master
     data_manager_->SetRectifyCallback([this](std::string_view key,
                                              std::optional<UUID> tier_id) {
@@ -896,7 +897,7 @@ P2PHeartbeatRequest P2PClientService::build_heartbeat_request() {
     P2PHeartbeatRequest req;
     req.client_id = client_id_;
 
-    if (data_manager_.has_value()) {
+    if (data_manager_ != nullptr) {
         SyncSegmentMetaParam param;
         auto tier_views = data_manager_->GetTierViews();
         for (const auto& view : tier_views) {
@@ -922,7 +923,7 @@ P2PHeartbeatRequest P2PClientService::build_heartbeat_request() {
 
 std::vector<P2PSegment> P2PClientService::CollectTierSegments() const {
     std::vector<P2PSegment> segments;
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         return segments;
     }
 
@@ -1187,7 +1188,7 @@ P2PClientService::InnerBatchPutLocalOnly(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const std::vector<size_t>& sizes) {
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "Data manager not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
@@ -1208,7 +1209,7 @@ P2PClientService::InnerBatchPutLocalOnly(
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
 P2PClientService::CreatePutHandleFromLocal(std::string_view key,
                                            std::vector<Slice>& slices) {
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "Data manager not initialized";
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -1429,22 +1430,22 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                 LOG(WARNING) << "Master returned local candidate but "
                                 "remote_weight>=1 (force remote), skipping";
                 continue;
-            } else if (!data_manager_.has_value()) {
+            } else if (data_manager_ == nullptr) {
                 LOG(ERROR) << "Data manager not initialized";
                 continue;
             }
-            write_ops.push_back(
-                std::make_unique<LocalWriteOp>(&*data_manager_, key, &slices));
+            write_ops.push_back(std::make_unique<LocalWriteOp>(
+                data_manager_.get(), key, &slices));
         } else {
             std::string endpoint =
                 candidate.ip_address + ":" + std::to_string(candidate.rpc_port);
             auto* peer = &GetOrCreatePeerClient(endpoint);
             if (transfer_direction_mode_ == TransferDirectionMode::FORWARD) {
-                if (!data_manager_.has_value()) {
+                if (data_manager_ == nullptr) {
                     LOG(ERROR) << "Data manager not initialized";
                     continue;
                 }
-                DataManager* dm = &*data_manager_;
+                DataManager* dm = data_manager_.get();
                 RemoteForwardWriteOp::TeTransferFn te_transfer =
                     [dm](void* local_base, size_t size,
                          const std::vector<RemoteBufferDesc>& dest_buffers) {
@@ -1829,7 +1830,7 @@ P2PClientService::BatchCreateGetHandles(
     const ReadRouteConfig& config) {
     auto local_get = [&](std::string_view key,
                          size_t) -> tl::expected<ReadTaskHandle, ErrorCode> {
-        if (!data_manager_.has_value()) {
+        if (data_manager_ == nullptr) {
             LOG(ERROR) << "Data manager is not initialized";
             return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -1849,7 +1850,7 @@ P2PClientService::BatchCreateGetHandles(
     const ReadRouteConfig& config) {
     auto local_get = [&](std::string_view key,
                          size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
-        if (!data_manager_.has_value()) {
+        if (data_manager_ == nullptr) {
             LOG(ERROR) << "Data manager is not initialized";
             return tl::unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
@@ -2152,7 +2153,7 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     const ResolvedRoute& route, std::shared_ptr<RemoteReadRequest> req,
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
         promise) {
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "Forward transfer read requires DataManager";
         co_return ErrorCode::INTERNAL_ERROR;
     }
@@ -2492,7 +2493,7 @@ tl::expected<bool, ErrorCode> P2PClientService::IsExist(
     }
 
     // Check local first
-    if (data_manager_.has_value() && data_manager_->Exist(key)) {
+    if (data_manager_ != nullptr && data_manager_->Exist(key)) {
         return true;
     }
 
@@ -2521,7 +2522,7 @@ std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
     // Batch local check
     for (size_t i = 0; i < keys.size(); ++i) {
         const bool local_hit =
-            data_manager_.has_value() && data_manager_->Exist(keys[i]);
+            data_manager_ != nullptr && data_manager_->Exist(keys[i]);
         if (local_hit) {
             results[i] = true;
         } else {
@@ -2563,7 +2564,7 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // 1) Local first
-    if (data_manager_.has_value()) {
+    if (data_manager_ != nullptr) {
         auto local = data_manager_->Query(object_key);
         if (local.has_value()) {
             P2PProxyDescriptor proxy;
@@ -2700,7 +2701,7 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAllLocal() {
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "data_manager_ is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -2722,7 +2723,7 @@ tl::expected<void, ErrorCode> P2PClientService::RemoveLocal(
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "data_manager_ is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -2743,7 +2744,7 @@ tl::expected<size_t, ErrorCode> P2PClientService::GetLocalKeyCount() {
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "data_manager_ is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -2764,7 +2765,7 @@ P2PClientService::GetLocalKeys(size_t limit) {
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    if (!data_manager_.has_value()) {
+    if (data_manager_ == nullptr) {
         LOG(ERROR) << "data_manager_ is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -2824,7 +2825,7 @@ tl::expected<void, ErrorCode> P2PClientService::UnmountSegment(
 // ============================================================================
 
 async_simple::Executor* P2PClientService::GetCoroExecutor() const {
-    if (data_manager_.has_value()) {
+    if (data_manager_ != nullptr) {
         if (async_simple::Executor* ex = data_manager_->GetCoroExecutor()) {
             return ex;
         }
