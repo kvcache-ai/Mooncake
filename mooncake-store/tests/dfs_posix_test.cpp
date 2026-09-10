@@ -4,11 +4,13 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -976,6 +978,16 @@ class DfsBackendTest : public ::testing::Test {
 
 class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
+    void FailOpenCall(int call) { fail_open_call_ = call; }
+    int OpenCallCount() const { return open_calls_.load(); }
+
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        if (++open_calls_ == fail_open_call_) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        return PosixFsAdapter::OpenFile(path);
+    }
+
     void FailWriteCall(int call) { fail_write_call_ = call; }
     void ShortWriteCall(int call) { short_write_call_ = call; }
     void FailReadCall(int call) { fail_read_call_ = call; }
@@ -1017,6 +1029,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     }
 
    private:
+    std::atomic<int> open_calls_{0};
+    int fail_open_call_ = -1;
     std::atomic<int> write_calls_{0};
     std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
@@ -1024,6 +1038,116 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     int fail_read_call_ = -1;
     int short_read_call_ = -1;
 };
+
+class BlockingShardFsAdapter : public PosixFsAdapter {
+   public:
+    BlockingShardFsAdapter(std::string path, bool block_file_size)
+        : path_(std::move(path)), block_file_size_(block_file_size) {}
+
+    bool WaitUntilBlocked() {
+        return blocked_.wait_for(std::chrono::seconds(5)) ==
+               std::future_status::ready;
+    }
+
+    void Release() {
+        if (!released_once_.exchange(true)) release_signal_.set_value();
+    }
+
+    int OpenCallCount() const { return open_calls_.load(); }
+
+    tl::expected<size_t, ErrorCode> GetFileSize(
+        const std::string& path) override {
+        if (path == path_ && block_file_size_) Block();
+        return PosixFsAdapter::GetFileSize(path);
+    }
+
+    tl::expected<int, ErrorCode> OpenFile(const std::string& path) override {
+        if (path == path_) {
+            ++open_calls_;
+            if (!block_file_size_) Block();
+        }
+        return PosixFsAdapter::OpenFile(path);
+    }
+
+   private:
+    void Block() {
+        if (!blocked_once_.exchange(true)) blocked_signal_.set_value();
+        released_.wait();
+    }
+
+    std::string path_;
+    bool block_file_size_;
+    std::atomic<int> open_calls_{0};
+    std::atomic<bool> blocked_once_{false};
+    std::atomic<bool> released_once_{false};
+    std::promise<void> blocked_signal_;
+    std::future<void> blocked_{blocked_signal_.get_future()};
+    std::promise<void> release_signal_;
+    std::shared_future<void> released_{release_signal_.get_future().share()};
+};
+
+TEST_F(DfsBackendTest, SlowShardInitializationDoesNotBlockOtherShards) {
+    for (bool block_file_size : {false, true}) {
+        SCOPED_TRACE(block_file_size ? "GetFileSize" : "OpenFile");
+        FileStorageConfig file_config;
+        file_config.storage_backend_type = StorageBackendType::kDistributed;
+        file_config.storage_filepath = tmp_->path();
+        auto config =
+            MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+        config.fs_adapter_type = "posix";
+        auto adapter = std::make_unique<BlockingShardFsAdapter>(
+            ShardPath(1), block_file_size);
+        auto* controlled = adapter.get();
+        backend_ = std::make_unique<DistributedStorageBackend>(
+            file_config, config, std::move(adapter));
+        ASSERT_TRUE(backend_->Init());
+
+        auto write_and_read = [&](int index, uint64_t offset) {
+            std::string input(4096, 'V'), output(4096, '\0');
+            const DistributedFSDescriptor descriptor{ShardPath(index), offset,
+                                                     4096, 4096, index};
+            auto writes = backend_->BatchWrite(
+                {{"value", descriptor, {{input.data(), input.size()}}}});
+            auto reads = backend_->BatchRead(
+                {{"value", descriptor, {{output.data(), output.size()}}}});
+            return writes.size() == 1 && writes[0] && reads.size() == 1 &&
+                   reads[0] && output == input;
+        };
+        ASSERT_TRUE(write_and_read(0, 0));
+
+        // Release the adapter before waiting on any async future's destructor,
+        // including when an assertion fails while initialization is blocked.
+        std::future<bool> first, same_shard, other_shards;
+        struct ReleaseOnExit {
+            BlockingShardFsAdapter* adapter;
+            ~ReleaseOnExit() { adapter->Release(); }
+        } release{controlled};
+        first = std::async(std::launch::async,
+                           [&] { return write_and_read(1, 0); });
+        ASSERT_TRUE(controlled->WaitUntilBlocked());
+        same_shard = std::async(std::launch::async,
+                                [&] { return write_and_read(1, 4096); });
+        other_shards = std::async(std::launch::async, [&] {
+            std::string output(4096, '\0');
+            auto reads =
+                backend_->BatchRead({{"cached",
+                                      {ShardPath(0), 0, 4096, 4096, 0},
+                                      {{output.data(), output.size()}}}});
+            return reads.size() == 1 && reads[0] &&
+                   output == std::string(4096, 'V') &&
+                   write_and_read(0, 4096) && write_and_read(2, 0);
+        });
+        EXPECT_EQ(other_shards.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        EXPECT_EQ(same_shard.wait_for(std::chrono::seconds(0)),
+                  std::future_status::timeout);
+        controlled->Release();
+        EXPECT_TRUE(first.get());
+        EXPECT_TRUE(same_shard.get());
+        EXPECT_TRUE(other_shards.get());
+        EXPECT_EQ(controlled->OpenCallCount(), 1);
+    }
+}
 
 TEST(DfsBackendInitializationTest, ClientBeforeMasterDoesNotCreateShards) {
     EnvGuard env;
@@ -1170,6 +1294,38 @@ TEST_F(DfsBackendTest, OpensNewShardDescriptorAfterClientInitialization) {
     ASSERT_EQ(reads.size(), 1);
     ASSERT_TRUE(reads[0].has_value());
     EXPECT_EQ(std::memcmp(expected.data(), actual.data(), expected.size()), 0);
+}
+
+TEST_F(DfsBackendTest, LazyOpenRetriesAfterOpenFailure) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    auto config = MakeAllocatorConfig(tmp_->path(), 4, 64 * 1024 * 1024, 4096);
+    config.fs_adapter_type = "posix";
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled = adapter.get();
+    controlled->FailOpenCall(1);
+    backend_ = std::make_unique<DistributedStorageBackend>(file_config, config,
+                                                           std::move(adapter));
+    ASSERT_TRUE(backend_->Init());
+
+    std::string input(4096, 'R'), output(4096, '\0');
+    const DistributedFSDescriptor descriptor{ShardPath(1), 0, 4096, 4096, 1};
+    const std::vector<DfsWriteRequest> request{
+        {"retry", descriptor, {{input.data(), input.size()}}}};
+    auto failed = backend_->BatchWrite(request);
+    ASSERT_EQ(failed.size(), 1);
+    ASSERT_FALSE(failed[0]);
+    EXPECT_EQ(failed[0].error(), ErrorCode::FILE_OPEN_FAIL);
+    auto retried = backend_->BatchWrite(request);
+    ASSERT_EQ(retried.size(), 1);
+    ASSERT_TRUE(retried[0]);
+    auto reads = backend_->BatchRead(
+        {{"retry", descriptor, {{output.data(), output.size()}}}});
+    ASSERT_EQ(reads.size(), 1);
+    ASSERT_TRUE(reads[0]);
+    EXPECT_EQ(output, input);
+    EXPECT_EQ(controlled->OpenCallCount(), 2);
 }
 
 TEST_F(DfsBackendTest, LazyOpenRejectsMissingAndMalformedShardFiles) {

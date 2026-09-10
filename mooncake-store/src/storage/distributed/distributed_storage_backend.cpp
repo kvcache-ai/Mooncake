@@ -79,7 +79,7 @@ DistributedStorageBackend::DistributedStorageBackend(
 }
 
 DistributedStorageBackend::~DistributedStorageBackend() {
-    for (auto& [index, shard] : shard_files_) {
+    for (auto& [_, shard] : shard_files_) {
         if (shard && shard->fd >= 0 && fs_adapter_) {
             fs_adapter_->CloseFile(shard->fd);
             shard->fd = -1;
@@ -136,18 +136,33 @@ DistributedStorageBackend::GetOrOpenShard(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::lock_guard cache_lock(shard_files_mutex_);
-    auto existing = shard_files_.find(descriptor.shard_idx);
-    if (existing != shard_files_.end()) {
-        if (existing->second->path != path.string()) {
+    ShardFile* shard;
+    {
+        std::lock_guard cache_lock(shard_files_mutex_);
+        auto existing = shard_files_.find(descriptor.shard_idx);
+        if (existing == shard_files_.end()) {
+            existing = shard_files_
+                           .emplace(descriptor.shard_idx,
+                                    std::make_unique<ShardFile>())
+                           .first;
+        }
+        shard = existing->second.get();
+    }
+
+    // File validation and opening may block. Serialize them only with this
+    // shard's initialization and I/O, leaving other cached shards available.
+    std::lock_guard shard_lock(shard->mutex);
+    auto file_path = path.string();
+    if (shard->fd >= 0) {
+        if (shard->path != file_path) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        return existing->second.get();
+        return shard;
     }
 
     // The master prepares new shards before publishing their descriptors.
     // OpenFile may create a file, so reject missing/unprepared shards first.
-    auto file_size = fs_adapter_->GetFileSize(path.string());
+    auto file_size = fs_adapter_->GetFileSize(file_path);
     if (!file_size) return tl::make_unexpected(file_size.error());
     if (*file_size != distributed_config_.shard_capacity) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -161,14 +176,13 @@ DistributedStorageBackend::GetOrOpenShard(
         canonical_path.filename() != path.filename()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto fd = fs_adapter_->OpenFile(path.string());
+    auto fd = fs_adapter_->OpenFile(file_path);
     if (!fd) return tl::make_unexpected(fd.error());
-    auto shard = std::make_unique<ShardFile>();
-    shard->path = path.string();
+    // Failed attempts keep fd == -1 so a later request can retry
+    // initialization.
+    shard->path = std::move(file_path);
     shard->fd = *fd;
-    auto* result = shard.get();
-    shard_files_.emplace(descriptor.shard_idx, std::move(shard));
-    return result;
+    return shard;
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(

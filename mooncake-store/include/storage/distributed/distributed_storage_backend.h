@@ -105,7 +105,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
-    // Cache only shards opened from descriptors published by the master.
+    // Create shard entries only from descriptors published by the master.
+    // The cache lock protects lookup/insertion; each shard's mutex protects
+    // initialization (fd stays -1 until opening succeeds) and positional I/O.
     // Entries are never erased while the backend is running, so callers can
     // retain a ShardFile pointer after releasing the cache lock.
     std::mutex shard_files_mutex_;
