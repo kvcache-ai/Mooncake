@@ -247,6 +247,12 @@ TEST_F(P2PMasterRpcTest, LifecycleRemovesRoutesAndUpdatesClientStatus) {
 }
 
 TEST_F(P2PMasterRpcTest, BatchWriteReturnsAlignedCandidateAndValidationErrors) {
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto requests = metrics.get_batch_get_write_route_requests();
+    const auto items = metrics.get_batch_get_write_route_items();
+    const auto failures = metrics.get_batch_get_write_route_failures();
+    const auto partial = metrics.get_batch_get_write_route_partial_successes();
+    const auto failed_items = metrics.get_batch_get_write_route_failed_items();
     P2PBatchGetWriteRouteRequest request;
     request.client_id = client_id_;
     request.keys = {"fits", "too-large"};
@@ -272,6 +278,11 @@ TEST_F(P2PMasterRpcTest, BatchWriteReturnsAlignedCandidateAndValidationErrors) {
     for (const auto& response : invalid->responses) {
         EXPECT_TRUE(response.empty());
     }
+    EXPECT_EQ(metrics.get_batch_get_write_route_requests(), requests + 2);
+    EXPECT_EQ(metrics.get_batch_get_write_route_items(), items + 4);
+    EXPECT_EQ(metrics.get_batch_get_write_route_failures(), failures + 1);
+    EXPECT_EQ(metrics.get_batch_get_write_route_partial_successes(), partial + 1);
+    EXPECT_EQ(metrics.get_batch_get_write_route_failed_items(), failed_items + 3);
 }
 
 class GatedRpcHandler {

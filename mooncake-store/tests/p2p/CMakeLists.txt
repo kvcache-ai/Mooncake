@@ -95,6 +95,8 @@ set_tests_properties(p2p_client_integration_test p2p_client_http_endpoints_test
     heartbeat_dedicated_port_test scheduler_integration_test
     PROPERTIES LABELS "p2p;client;integration")
 set_tests_properties(p2p_register_concurrency_test heartbeat_dedicated_port_test
+    p2p_master_service_test p2p_client_manager_test p2p_client_meta_test
+    p2p_segment_manager_test
     PROPERTIES TIMEOUT 180)
 if(USE_ASCEND_CACHE_TIER)
     set_tests_properties(ascend_tier_test PROPERTIES LABELS "p2p;client;hardware")
