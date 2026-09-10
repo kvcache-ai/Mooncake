@@ -244,22 +244,22 @@ Low-Level `nof_replica_count` is clamped to `1..=8` and defaults to 1. The share
 `ReplicaLoadBalanceStrategy` selects write targets using provider score, accumulated writes, and
 target ID.
 
-Each NoF target has one current runtime owner for its control plane. The owner record is target
-scoped and coordinated through the existing shared route metadata authority:
+Each NoF target has one current runtime owner for its control plane. The owner is a derived
+control-plane view: every client computes it from the configured target-set fingerprint and the
+current active client leases using stable rendezvous assignment. No separate owner database is
+read on the data path.
 
 ```text
 target_id
 owner_runtime
-owner_generation
-state: Active | Draining | Recovering
-record_version
-handoff_id
+assignment = rendezvous(target-set, active-client-leases)
 ```
 
-`record_version` is used by the existing metadata CAS. `owner_generation` fences stale owner
-requests after a handoff; it is not an object version, route version, or client epoch.
+The current owner publishes only its cached health result through the existing client lease
+label. A client joining or leaving changes the computed assignment on the next lease refresh;
+there is no second owner metadata store.
 
-This shared route authority is distinct from provider-owned external metadata. External metadata
+This lease-derived owner view is distinct from provider-owned external metadata. External metadata
 is the provider's own object/manifest state (for example KVCS shard manifests) and is not used to
 store NoF owner assignments or Mooncake-managed handoff snapshots.
 
