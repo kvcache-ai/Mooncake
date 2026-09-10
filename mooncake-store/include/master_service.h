@@ -116,6 +116,7 @@ class MasterServiceSSDTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
+class MetadataScanBench;
 }  // namespace benchmarks
 
 /*
@@ -147,6 +148,7 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class test::DynamicReplicationTest;
     friend class benchmarks::BatchEvictBench;
+    friend class benchmarks::MetadataScanBench;
     friend class test::MasterServiceTenantQuotaTest;
     // The scenario DSL controls lease timestamps so eviction tests do not
     // depend on sleeps or the background eviction thread.
