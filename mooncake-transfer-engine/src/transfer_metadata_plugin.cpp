@@ -498,6 +498,29 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
+    // etcd v3 answers a range request for a missing key with an OK response
+    // carrying no value, so an empty payload is an authoritative absence;
+    // everything else that fails (RPC error, timeout, malformed payload) is
+    // reported as unavailability, never as absence.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        auto resp = client_.get(key);
+        if (!resp.is_ok()) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
+                       << metadata_uri_ << ": " << resp.error_message();
+            return GetResult::kUnavailable;
+        }
+        auto json_file = resp.value().as_string();
+        if (json_file.empty()) return GetResult::kNotFound;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
+    }
+
     virtual bool set(const std::string &key, const Json::Value &value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
@@ -564,6 +587,36 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         return true;
+    }
+
+    // EtcdGetWrapper reports a missing key as ret == 0 with no payload, so
+    // that combination is an authoritative absence; a non-zero return (RPC
+    // error, timeout) is unavailability, never absence.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        char *json_data = nullptr;
+        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
+        if (ret) {
+            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
+                       << metadata_uri_ << ": " << err_msg_;
+            // free the memory for storing error message
+            free(err_msg_);
+            err_msg_ = nullptr;
+            return GetResult::kUnavailable;
+        }
+        if (!json_data) {
+            return GetResult::kNotFound;
+        }
+        auto json_file = std::string(json_data);
+        // free the memory allocated by EtcdGetWrapper
+        free(json_data);
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return GetResult::kUnavailable;
+        }
+        return GetResult::kFound;
     }
 
     virtual bool set(const std::string &key, const Json::Value &value) {

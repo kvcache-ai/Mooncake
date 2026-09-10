@@ -1115,6 +1115,37 @@ class FakeMetadataStoragePlugin : public MetadataStoragePlugin {
     std::map<std::string, int> forced_failures_;
 };
 
+// A backend that only implements the legacy bool get() and cannot tell a
+// missing key from a backend failure, so it inherits the default
+// getWithStatus() mapping instead of overriding it.
+class OpaqueMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return false;
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return false;
+        value = it->second;
+        return true;
+    }
+    bool set(const std::string &key, const Json::Value &value) override {
+        store_[key] = value;
+        return true;
+    }
+    bool remove(const std::string &key) override {
+        store_.erase(key);
+        return true;
+    }
+    void failNext(const std::string &key, int n) { forced_failures_[key] = n; }
+
+   private:
+    std::map<std::string, Json::Value> store_;
+    std::map<std::string, int> forced_failures_;
+};
+
 // Exposes the protected storage-plugin injection seam to hardware-free tests.
 class TestableTransferMetadata : public TransferMetadata {
    public:
@@ -1235,6 +1266,33 @@ TEST_F(TransferMetadataStaleSegmentInvalidationTest,
     // Outage clears: get() succeeds again, the entry was never invalidated.
     ASSERT_EQ(client.syncSegmentCache(""), 0);
     EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+}
+
+// Default-mapping guard: a backend that only implements the legacy bool
+// get() (no getWithStatus() override) inherits the default mapping, which
+// must fail closed -- an ambiguous false is kUnavailable, never kNotFound --
+// so a sustained failure cannot purge the cached entry. Guards against the
+// default treating an opaque backend failure as an authoritative removal.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       DefaultPluginMappingFailsClosed) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<OpaqueMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "E";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Sustained failures through the inherited default path: 5 sync cycles
+    // of get() == false with no way to prove the key is gone.
+    plugin->failNext("mooncake/ram/E", 5);
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(client.syncSegmentCache(""), 0);
+        EXPECT_NE(client.getSegmentDescByName(name), nullptr)
+            << "default mapping invalidated after " << (i + 1)
+            << " opaque failures";
+    }
 }
 
 }  // namespace mooncake
