@@ -35,7 +35,7 @@ struct StandbyObjectMetadata {
     // state; promoted objects resume as ordinary cache.
     std::string group_id;  // Tenant group identifier
     ObjectDataType data_type{
-        ObjectDataType::UNKNOWN};  // Data type classification
+        ObjectDataType::UNKNOWN};                  // Data type classification
     struct_pack::compatible<bool, 1> hard_pinned;  // Eviction protection
 
     StandbyObjectMetadata() = default;

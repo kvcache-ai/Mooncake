@@ -235,7 +235,7 @@ bool SharedSegment::Supported(bool mmap, bool host_register) {
         return false;
 #endif
     }
-    // mmap without HostRegister only needs POSIX shm.
+    // mmap without HostRegister only needs an anonymous memfd.
     return true;
 }
 

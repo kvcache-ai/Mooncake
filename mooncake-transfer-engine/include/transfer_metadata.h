@@ -69,10 +69,10 @@ class TransferMetadata {
 #else
         using mr_key_t = uint32_t;
 #endif
-        std::vector<mr_key_t> lkey;         // for rdma/efa
-        std::vector<mr_key_t> rkey;         // for rdma/efa
-        std::string shm_name;               // for nvlink and hip
-        uint64_t offset;                    // for cxl
+        std::vector<mr_key_t> lkey;  // for rdma/efa
+        std::vector<mr_key_t> rkey;  // for rdma/efa
+        std::string shm_name;  // nvlink/hip IPC blob, or POSIX shm object name
+        uint64_t offset;       // for cxl
         std::vector<std::string> tseg;      // for ub/urma
         std::vector<uint32_t> l_seg_index;  // for ub/urma
 

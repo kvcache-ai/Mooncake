@@ -361,6 +361,14 @@ std::string BuildBatchOpLogSnapshotId(uint64_t last_included_batch_id,
            std::to_string(maintenance_lease_id);
 }
 
+std::string BuildBatchOpLogSnapshotRoot(const std::string& cluster_id) {
+    std::string normalized = cluster_id;
+    if (!NormalizeAndValidateClusterId(normalized) || normalized.empty()) {
+        return {};
+    }
+    return "mooncake_master_snapshot/" + normalized;
+}
+
 std::string BuildBatchOpLogSnapshotMaintenanceKey(
     const std::string& cluster_id) {
     return BuildControlKey(cluster_id, "maintenance");

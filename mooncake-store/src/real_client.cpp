@@ -26,6 +26,7 @@
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
+#include "config/cxl_segment_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -904,17 +905,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // registration limit split it into balanced chunks; other transports use
     // one segment.
     if (protocol == "cxl") {
-        size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
-            cxl_dev_size =
-                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
-                                              .allow_leading_plus = true})
-                    .value_or(0);
-        } else {
+        const auto cxl_config = CxlSegmentConfig::FromEnvironment();
+        if (!cxl_config.device_size.has_value()) {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+        const size_t cxl_dev_size = *cxl_config.device_size;
 
         void *ptr = client_->GetBaseAddr();
         LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
