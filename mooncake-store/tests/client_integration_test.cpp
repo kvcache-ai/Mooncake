@@ -856,6 +856,111 @@ TEST_F(ClientIntegrationTest, BatchPutGetOperations) {
     }
 }
 
+TEST_F(ClientIntegrationTest, BatchGetChecksLeasesWithPreferredNode) {
+    const std::vector<std::string> keys = {"batch_lease_expired",
+                                           "batch_lease_live",
+                                           "batch_lease_missing_slices"};
+    const std::string value = "batch read lease regression";
+    const size_t buffer_size = value.size() * 3;
+    void* buffer = client_buffer_allocator_->allocate(buffer_size);
+    ASSERT_NE(buffer, nullptr);
+    auto release_buffer = [buffer_size](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, buffer_size);
+    };
+    std::unique_ptr<void, decltype(release_buffer)> buffer_owner(
+        buffer, release_buffer);
+    memcpy(buffer, value.data(), value.size());
+    std::vector<Slice> source{{buffer, value.size()}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    // Keep both readable keys in the same transfer batch.
+    config.preferred_segment = "localhost:17812";
+    for (const auto& key : keys) {
+        ASSERT_TRUE(test_client_->Put(key, source, config).has_value());
+    }
+
+    const auto queries = test_client_->BatchQuery(keys);
+    ASSERT_EQ(queries.size(), keys.size());
+    std::vector<QueryResult> query_results;
+    const auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < queries.size(); ++i) {
+        ASSERT_TRUE(queries[i].has_value());
+        ASSERT_EQ(queries[i]->replicas.size(), 1);
+        ASSERT_TRUE(queries[i]->replicas[0].is_memory_replica());
+        auto replicas = queries[i]->replicas;
+        // Use an explicit expired deadline instead of relying on a slow
+        // transfer or sleeping until the master's lease expires.
+        query_results.emplace_back(std::move(replicas),
+                                   i == 1 ? now + std::chrono::minutes(1)
+                                          : now - std::chrono::seconds(1),
+                                   queries[i]->object_checksum);
+    }
+    EXPECT_EQ(queries[0]
+                  ->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              queries[1]
+                  ->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_);
+    auto* expired_dst = static_cast<char*>(buffer) + value.size();
+    auto* live_dst = expired_dst + value.size();
+    std::unordered_map<std::string, std::vector<Slice>> destinations{
+        {keys[0], {{expired_dst, value.size()}}},
+        {keys[1], {{live_dst, value.size()}}}};
+
+    // Both public BatchGet modes must apply the same per-key lease contract.
+    for (bool prefer_same_node : {false, true}) {
+        SCOPED_TRACE(prefer_same_node);
+        memset(expired_dst, 0, value.size() * 2);
+        const auto results = test_client_->BatchGet(
+            keys, query_results, destinations, prefer_same_node);
+        ASSERT_EQ(results.size(), keys.size());
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::LEASE_EXPIRED);
+        EXPECT_TRUE(results[1].has_value());
+        ASSERT_FALSE(results[2].has_value());
+        EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+        // The expired item completed its transfer too; it must still not be
+        // reported as a successful read once its lease has expired.
+        EXPECT_EQ(memcmp(expired_dst, value.data(), value.size()), 0);
+        EXPECT_EQ(memcmp(live_dst, value.data(), value.size()), 0);
+    }
+}
+
+TEST_F(ClientIntegrationTest, BatchGetPreservesTransferErrorWithExpiredLease) {
+    const std::string key = "batch_lease_transfer_failure";
+    const std::string value = "batch read transfer error";
+    void* buffer = client_buffer_allocator_->allocate(value.size());
+    ASSERT_NE(buffer, nullptr);
+    auto release_buffer = [&value](void* ptr) {
+        client_buffer_allocator_->deallocate(ptr, value.size());
+    };
+    std::unique_ptr<void, decltype(release_buffer)> buffer_owner(
+        buffer, release_buffer);
+    memcpy(buffer, value.data(), value.size());
+    std::vector<Slice> source{{buffer, value.size()}};
+    ASSERT_TRUE(test_client_->Put(key, source, ReplicateConfig{}).has_value());
+    const auto query = test_client_->Query(key);
+    ASSERT_TRUE(query.has_value());
+    auto replicas = query->replicas;
+    const std::vector<QueryResult> query_results{
+        QueryResult(std::move(replicas),
+                    std::chrono::steady_clock::now() - std::chrono::seconds(1),
+                    query->object_checksum)};
+    // Invalid transfer length fails submission before any bytes are copied.
+    std::unordered_map<std::string, std::vector<Slice>> destinations{
+        {key, {{buffer, value.size() - 1}}}};
+    for (bool prefer_same_node : {false, true}) {
+        SCOPED_TRACE(prefer_same_node);
+        const auto results = test_client_->BatchGet(
+            {key}, query_results, destinations, prefer_same_node);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::TRANSFER_FAIL);
+    }
+}
+
 TEST_F(ClientIntegrationTest, BatchPutMixedGroupIdsThroughClient) {
     auto find_group_id_on_different_shard = [](const std::string& key) {
         static constexpr size_t kMetadataShardCountForTest = 1024;

@@ -1582,6 +1582,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             }
         }
     }
+    // A successful transfer is only valid while its read lease is live.
+    // Check once all segment batches have completed, as in the regular
+    // BatchGet path, and preserve errors from validation or transfer.
+    auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << object_keys[i];
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
     return results;
 }
 
