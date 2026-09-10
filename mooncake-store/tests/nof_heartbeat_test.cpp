@@ -24,6 +24,7 @@ NoFSegment MakeNoFSegment(std::string name, std::string endpoint,
     segment.base = base;
     segment.size = size;
     segment.te_endpoint = std::move(endpoint);
+    segment.block_size = 512;
     return segment;
 }
 

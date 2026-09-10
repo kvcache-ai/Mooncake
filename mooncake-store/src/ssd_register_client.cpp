@@ -12,11 +12,17 @@ NoFRegisterClient::~NoFRegisterClient() = default;
 int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
                                     const std::string &traddr, size_t trsvcid,
                                     uintptr_t base, size_t size,
-                                    const std::string &master_server_addr) {
+                                    const std::string &master_server_addr,
+                                    uint32_t block_size) {
+    if (block_size < 512 || (block_size & (block_size - 1)) != 0) {
+        LOG(ERROR) << "Invalid NoF namespace block_size=" << block_size;
+        return OPERATION_FAILED;
+    }
+
     LOG(INFO) << "Registering SSD: nqn=" << nqn << ",nsid=" << nsid
               << ",traddr=" << traddr << ",trsvcid=" << trsvcid
               << ",master=" << master_server_addr << ",base=" << base
-              << ",size=" << size;
+              << ",size=" << size << ",block_size=" << block_size;
 
     auto err = master_client_.Connect(master_server_addr);
     if (err != ErrorCode::OK) {
@@ -37,6 +43,7 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
     segment.id = generate_uuid();
     segment.name = te_endpoint;
     segment.te_endpoint = te_endpoint;
+    segment.block_size = block_size;
     auto mount_result = master_client_.MountNoFSegment(segment);
     if (!mount_result) {
         LOG(ERROR) << "mount_segment_to_master_failed ";

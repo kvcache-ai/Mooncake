@@ -1270,6 +1270,12 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
                                                const UUID& client_id) {
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
+    const uint32_t block_size = segment.block_size;
+
+    if (block_size < 512 || (block_size & (block_size - 1)) != 0) {
+        LOG(ERROR) << "NoF segment mount: invalid block_size=" << block_size;
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     // NoF segment base is an NVMe namespace offset, so 0 is valid.
     if (size == 0) {

@@ -160,6 +160,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.base = kSegmentBase + next_segment_offset_;
         segment.size = size;
         segment.te_endpoint = segment.name;
+        segment.block_size = 512;
         next_segment_offset_ += size + 4096;
 
         UUID client_id = generate_uuid();
