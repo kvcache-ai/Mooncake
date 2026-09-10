@@ -175,6 +175,8 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = task.status_word.load(std::memory_order_acquire);
     status.transferred_bytes =
         task.transferred_bytes.load(std::memory_order_acquire);
+    if (status.s == TransferStatusEnum::FAILED && task.non_replayable_failure)
+        return Status::RpcServiceError("TCP WRITE outcome is unknown" LOC_MARK);
     return Status::OK();
 }
 
@@ -260,13 +262,22 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         LOG(WARNING) << "TCP transfer attempt " << attempt
                      << " failed: " << status.ToString();
 
+        if (task->request.opcode == Request::WRITE &&
+            status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
+            task->non_replayable_failure = true;
+            return status;
+        }
+
         if (!status.IsRpcServiceError() && !status.IsInternalError()) {
             return status;
         }
 
-        // Peer may have restarted with a new address; re-resolve before retry
-        if (status.IsRpcServiceError()) {
-            rpc_server_addr.clear();
+        // Only a pre-send connection failure permits an endpoint refresh
+        // followed by automatic WRITE replay.
+        if (status.IsRpcConnectionError()) {
+            CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
+                task->request.target_id));
+            if (attempt == params_.max_retry_count) break;
             auto resolve = findRemoteSegment(
                 task->request.target_offset, task->request.length,
                 task->request.target_id, rpc_server_addr);
