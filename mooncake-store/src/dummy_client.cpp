@@ -658,10 +658,10 @@ int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         buffer_addr, client_id_);
     // Same contract as unregister_buffer: the receiver removes the mapping on
-    // INTERNAL_ERROR too (unmapped, or quarantined when the SPDK unregister
-    // fails), and INVALID_PARAMS means the server has no such mapping, so drop
-    // the local bookkeeping then; keep it on RPC_FAIL / RPC_TIMEOUT where the
-    // server may not have run.
+    // INTERNAL_ERROR too (unmapped, or quarantined when the SPDK or transfer
+    // engine unregister fails), and INVALID_PARAMS means the server has no such
+    // mapping, so drop the local bookkeeping then; keep it on RPC_FAIL /
+    // RPC_TIMEOUT where the server may not have run.
     if (ret.has_value() ||
         (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
                               ret.error() == ErrorCode::INVALID_PARAMS))) {
@@ -787,12 +787,12 @@ int DummyClient::unregister_buffer(void* buffer) {
         reinterpret_cast<uint64_t>(buffer), client_id_);
     // INTERNAL_ERROR means the receiver still executed the teardown and removed
     // the segment from its active mappings: it unmaps normally, or -- when the
-    // SPDK unregister fails -- quarantines the mapping (retained, never reused
-    // for new registrations). Either way the old mapping is no longer usable on
-    // the receiver, so drop the local flag for INTERNAL_ERROR; also drop it for
-    // INVALID_PARAMS (server has no such mapping). Keep it on RPC_FAIL /
-    // RPC_TIMEOUT, where the RPC may never have reached the server and the
-    // mapping may still be alive.
+    // SPDK or transfer engine unregister fails -- quarantines the mapping
+    // (retained, never reused for new registrations). Either way the old
+    // mapping is no longer usable on the receiver, so drop the local flag for
+    // INTERNAL_ERROR and for INVALID_PARAMS (server has no such mapping). Keep
+    // it on RPC_FAIL / RPC_TIMEOUT, where the RPC may never have reached the
+    // server and the mapping may still be alive.
     if (ret.has_value() ||
         (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
                               ret.error() == ErrorCode::INVALID_PARAMS))) {

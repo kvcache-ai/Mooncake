@@ -956,6 +956,13 @@ class RealClient : public PyClient {
         // zero-copy (see RealClient::map_shm_internal_with_device). Must be
         // unregistered before munmap on every teardown path.
         bool spdk_registered = false;
+        // Set when the transfer engine's unregisterLocalMemory() failed during
+        // teardown: TE still holds this region (RdmaTransport does not
+        // deregister the MR when the metadata update fails, and
+        // TransferEngineImpl keeps its region record), so the mapping must not
+        // be munmapped until a later retry releases it (see
+        // RetryQuarantinedShmsLocked).
+        bool te_unregister_pending = false;
         bool is_ascend = false;
         bool is_ipc = false;
         // Ascend physical device id from dummy (dummy-real RPC).
@@ -1081,14 +1088,16 @@ class RealClient : public PyClient {
     void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
     void ReleaseAllAllocatedSegmentRecords();
 
-    // MappedShm whose spdk_mem_unregister failed during teardown. The mapping
-    // is deliberately retained (never munmapped) so SPDK does not hold a
-    // translation to a freed/reused VA; retried on later teardown entry points.
-    // Guarded by dummy_client_mutex_.
+    // MappedShm whose spdk_mem_unregister() (spdk_registered) or transfer
+    // engine unregisterLocalMemory() (te_unregister_pending) failed during
+    // teardown. The mapping is deliberately retained (never munmapped) so
+    // neither SPDK nor the transfer engine keeps a registration to a
+    // freed/reused VA; retried on later teardown entry points. Guarded by
+    // dummy_client_mutex_.
     std::vector<MappedShm> quarantine_shms_;
 
-    // Re-attempt unregister+munmap of quarantine_shms_. Caller must hold
-    // dummy_client_mutex_. Failures stay quarantined.
+    // Re-attempt TE + SPDK unregister and munmap of quarantine_shms_. Caller
+    // must hold dummy_client_mutex_. Failures stay quarantined.
     void RetryQuarantinedShmsLocked();
 };
 

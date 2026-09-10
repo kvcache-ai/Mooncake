@@ -1,5 +1,6 @@
 #include "shm_helper.h"
 
+#include <cerrno>
 #include <cstdlib>
 #include <cstring>
 #include <sys/mman.h>
@@ -263,7 +264,23 @@ void* ShmHelper::allocate(size_t size) {
             // registration of the same virtual address (e.g. mmap reuse after
             // free) does not return -EBUSY. The unregister path tolerates
             // ranges that were never fully registered.
-            SpdkWrapper::GetInstance().UnregisterMemory(base_addr, size);
+            const int rollback_rc =
+                SpdkWrapper::GetInstance().UnregisterMemory(base_addr, size);
+            // -EINVAL is the documented benign no-op for a range that never
+            // reached g_mem_reg_map (see SpdkWrapper::UnregisterMemory). Any
+            // other failure means SPDK may still retain (partial) registration
+            // state for this range, so mark it registered: free()/cleanup()
+            // will then attempt the unregister again and quarantine the mapping
+            // instead of munmapping while SPDK still holds a translation to it.
+            if (rollback_rc != 0 && rollback_rc != -EINVAL) {
+                LOG(ERROR)
+                    << "Failed to roll back incomplete SPDK registration: "
+                    << base_addr << ", size: " << size
+                    << ", rc: " << rollback_rc
+                    << "; treating the range as registered so teardown "
+                       "unregisters or quarantines it";
+                shm->spdk_registered = true;
+            }
         } else {
             shm->spdk_registered = true;
         }
