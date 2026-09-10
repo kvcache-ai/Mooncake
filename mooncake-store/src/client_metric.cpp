@@ -29,6 +29,8 @@ std::string TransferMetric::summary_metrics() {
     return ss.str();
 }
 
+// TODO(C1): Restore the a00f757 successful-call count summary on the
+// centralized side after P2P metric ownership is split.
 std::string MasterClientMetric::summary_metrics() {
     std::stringstream ss;
     ss << "=== RPC Metrics Summary ===\n";

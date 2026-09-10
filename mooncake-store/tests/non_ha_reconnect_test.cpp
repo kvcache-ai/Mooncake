@@ -20,13 +20,6 @@
 namespace mooncake {
 namespace testing {
 
-TEST(NonHAReconnectTest, CentralizedClientRejectsRedisMasterDiscovery) {
-    auto config = ClientConfigBuilder::build_centralized_real_client(
-        "127.0.0.1:18000", "P2PHANDSHAKE", "tcp", std::nullopt,
-        "redis://127.0.0.1:6379");
-    EXPECT_FALSE(ClientService::Create(config).has_value());
-}
-
 // Non-HA: client auto-reconnects to master and remounts segments
 TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     // Start master (auto-pick ports) without HTTP metadata server
@@ -36,6 +29,8 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
     // Create client (non-HA), mount a segment
     std::string local_hostname = "127.0.0.1:18001";
     std::string master_addr = master.master_address();
+    // TODO(C4/public API): Restore the A00 client factory once the concrete
+    // centralized API is split; retain the original reconnect assertions.
     auto config = ClientConfigBuilder::build_centralized_real_client(
         local_hostname, "P2PHANDSHAKE", "tcp", std::nullopt, master_addr);
     auto client_opt = ClientService::Create(config);

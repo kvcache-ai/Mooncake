@@ -101,6 +101,8 @@ bool initialize_client() {
     if (!FLAGS_device_name.empty()) {
         rdma_devices = FLAGS_device_name;
     }
+    // TODO(C4/public API): Replace this shared-facade factory adaptation with
+    // the concrete centralized API; preserve a00f757 scenarios and assertions.
     auto config = ClientConfigBuilder::build_centralized_real_client(
         FLAGS_local_hostname, FLAGS_metadata_connection_string, FLAGS_protocol,
         rdma_devices, FLAGS_master_address);

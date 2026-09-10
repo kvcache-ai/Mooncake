@@ -180,6 +180,8 @@ struct ClientMetric {
      * @return std::unique_ptr<ClientMetric>
      *
      */
+    // TODO(C1): Restore A00 environment-controlled creation/reporting after
+    // P2P metrics stop depending on this implementation.
     static std::unique_ptr<ClientMetric> Create(
         const std::map<std::string, std::string>& labels = {}) {
         return CreatePtr<ClientMetric>(labels);

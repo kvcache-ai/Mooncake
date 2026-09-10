@@ -623,6 +623,9 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << ", queue_size=" << config.async_route_queue_size;
     }
 
+    // TODO(C2): Bind atomically, obtain the actual listener port, and publish it
+    // in registration after runtime ownership is split; config port 0 alone
+    // does not fix the current getFreeTcpPort-to-bind race.
     // 9. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_, metrics_);
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -945,6 +948,7 @@ P2PClientService::InnerRegisterClient() {
     req.client_id = client_id_;
     req.segments = CollectTierSegments();
     req.ip_address = local_ip_;
+    // TODO(C2): Publish the bound listener port, not an unreserved probe result.
     req.rpc_port = client_rpc_port_;
 
     auto register_result = master_client_.RegisterClient(req);

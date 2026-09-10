@@ -214,6 +214,8 @@ tl::expected<void, ErrorCode> DramCacheTier::RegisterWithEngine(
     return {};
 }
 
+// TODO(C5): Finalize shared allocator ownership without centralized
+// metric side effects, then remove the central temporary observer wiring.
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 DramCacheTier::CreateAllocator() {
     const uintptr_t base_address =

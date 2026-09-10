@@ -77,6 +77,8 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
+    // TODO(C4/public API): Replace this shared-facade factory adaptation with
+    // the concrete centralized API; preserve a00f757 scenarios and assertions.
     auto config = ClientConfigBuilder::build_centralized_real_client(
         "localhost:17813", "P2PHANDSHAKE", FLAGS_protocol,
         rdma_devices.empty() ? std::nullopt

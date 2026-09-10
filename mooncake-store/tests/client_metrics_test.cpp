@@ -90,6 +90,8 @@ TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
 
     summary = metrics.summary_metrics();
 
+    // TODO(C1): Restore A00 successful-call count summaries and these original
+    // seven centralized cases when the shared P2P metric implementation splits.
     // Check that RPC calls are recorded
     EXPECT_TRUE(summary.find("GetReplicaList: total=2") != std::string::npos);
     EXPECT_TRUE(summary.find("MountSegment: total=1") != std::string::npos);
@@ -124,6 +126,7 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("RPC Metrics Summary") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Read: 5.00 MB") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Write: 10.00 MB") != std::string::npos);
+    // TODO(C1): Restore A00 "ExistKey: count=1" with centralized metrics.
     EXPECT_TRUE(summary.find("ExistKey: total=1") != std::string::npos);
 
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;

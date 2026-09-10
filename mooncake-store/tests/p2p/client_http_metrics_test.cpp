@@ -111,6 +111,8 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
 }
 
 // Test HTTP server endpoints directly
+// TODO(C1/C2): Separate these shared-metric fixture checks from the A00
+// centralized contract; do not expand or repair centralized baseline assertions.
 TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
     // Create a simple HTTP server that mimics the metrics server behavior
     const uint16_t test_port =
@@ -211,6 +213,8 @@ TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
 }
 
 // Test P2P client metrics HTTP endpoints
+// TODO(C1/C2): Replace copied P2P handlers with production runtime endpoints
+// after metric/runtime ownership is split; retain P2P output coverage.
 TEST_F(ClientHttpMetricsTest, P2PClientMetricsHttpEndpointsTest) {
     const uint16_t test_port = 19004;
 
