@@ -3030,8 +3030,8 @@ RealClient::acquire_buffer_dummy(const std::string &key,
     }
     auto &context = it->second;
 #ifdef USE_ASCEND_DIRECT
-    auto context_result =
-        set_context_from_dummy_shms(protocol, context.mapped_shms, "get_buffer");
+    auto context_result = set_context_from_dummy_shms(
+        protocol, context.mapped_shms, "get_buffer");
     if (!context_result) {
         return tl::unexpected(context_result.error());
     }
