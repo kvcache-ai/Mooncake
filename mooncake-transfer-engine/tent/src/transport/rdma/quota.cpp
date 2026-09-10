@@ -142,8 +142,11 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
                 int dev_id = tl_eligible[tl_rr_counter % tl_eligible.size()];
                 tl_rr_counter++;
                 slice_dev_ids.push_back(dev_id);
+                // Last slice takes what is left; see the header.
                 uint64_t this_slice_bytes =
-                    std::min(slice_bytes, total_length - offset);
+                    (i + 1 == num_slices)
+                        ? total_length - offset
+                        : std::min(slice_bytes, total_length - offset);
                 offset += this_slice_bytes;
                 // Baseline mode does not track inflight (release() and
                 // chargeDevice() skip it too); only lifetime traffic counts.
@@ -360,10 +363,16 @@ void DeviceSelector::selectMultiPath(const std::vector<Candidate>& candidates,
     }
     // Charge each device what its slices actually carry, in the caller's
     // slice order, so release() (which returns the slice's length) balances
-    // per device; ceil(total / n) per slice would not.
+    // per device; ceil(total / n) per slice would not. The last slice takes
+    // what is left rather than a whole block -- planRdmaSlices() folds a
+    // short tail into it -- so it can be longer than slice_bytes, and
+    // charging it a block would leave the fold released but never charged.
     uint64_t offset = 0;
     for (size_t i = first; i < slice_dev_ids.size(); ++i) {
-        const uint64_t bytes = std::min(slice_bytes, total_length - offset);
+        const uint64_t bytes =
+            (i + 1 == slice_dev_ids.size())
+                ? total_length - offset
+                : std::min(slice_bytes, total_length - offset);
         offset += bytes;
         auto& dev = devices_[slice_dev_ids[i]];
         dev.addInflight(bytes);
