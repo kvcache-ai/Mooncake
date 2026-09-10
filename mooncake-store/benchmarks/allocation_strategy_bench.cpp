@@ -1,7 +1,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
+#include <functional>
+#include <unordered_map>
 #include <iomanip>
 #include <iostream>
 #include <limits>
@@ -76,10 +79,63 @@ DEFINE_double(dsa_evict_ratio, 0.05,
               "the steady-state cluster fill closer to the fragmentation "
               "ceiling but trigger evictions more frequently.");
 DEFINE_string(size_class_pattern, "kv_mixed",
-              "Size-class churn pattern: kv_mixed, dsa_pair, or all");
+              "Size-class churn pattern: kv_mixed, dsa_pair, rl, or all");
 DEFINE_double(size_class_evict_ratio, 0.02,
               "Fraction of live objects to evict on each Allocate failure "
               "in size_class_churn mode.");
+DEFINE_double(size_class_release_prob, 0.0,
+              "Probability of releasing one random live object before each "
+              "measured size_class_churn allocation. 1.0 gives a "
+              "free-one/allocate-one steady state at the prefill level; 0 "
+              "keeps the allocate-only legacy behavior.");
+DEFINE_int64(rl_min_kib, 64,
+             "Smallest object size in KiB for the rl size-class pattern.");
+DEFINE_int64(rl_max_mib, 512,
+             "Largest object size in MiB for the rl size-class pattern.");
+DEFINE_string(rl_trace_file, "",
+              "Replay allocation sizes from a trace file (one size in bytes "
+              "per line, '#' starts a comment) instead of a synthetic "
+              "size-class pattern. Sizes are replayed in file order and "
+              "wrap around. Only used by --workload=size_class_churn.");
+DEFINE_int32(probe_mib, 0,
+             "At every fragmentation sample point, attempt one N MiB "
+             "single-replica allocation without eviction retry, release it "
+             "immediately, and report the success rate together with the "
+             "free space observed at probe time (0 = disabled).");
+DEFINE_string(segment_counts, "",
+              "Comma-separated segment counts for the size_class_churn "
+              "matrix (default: 1,10,100).");
+DEFINE_string(size_class_strategies, "random,free_ratio_first",
+              "Comma-separated allocation strategies for the size_class_churn "
+              "matrix: random, free_ratio_first, best_fit (production "
+              "strategies), largest_hole_first, reserved, hybrid (bench-only "
+              "placement experiments, see "
+              "--large_object_mib/--reserved_segments). hybrid = best_fit for "
+              "objects below --large_object_mib, largest_hole_first above.");
+DEFINE_string(replica_counts, "",
+              "Comma-separated replica counts for the size_class_churn matrix "
+              "(default: 1,2,3).");
+DEFINE_int32(large_object_mib, 256,
+             "Objects of at least this many MiB are 'large' for the reserved "
+             "strategy and go to the reserved segments only.");
+DEFINE_int32(best_fit_bucket_mib, 512,
+             "best_fit_bucketed: segments whose slack (largest hole minus "
+             "request) falls in the same bucket of this many MiB are treated "
+             "as equal and chosen at random, trading a little contiguity for "
+             "less traffic concentration.");
+DEFINE_int32(reserved_segments, 2,
+             "Number of segments (the last ones by index) reserved for large "
+             "objects in the reserved strategy.");
+DEFINE_string(rl_trace_events, "",
+              "Replay an ordered put/remove/evict event log ('kind key size' "
+              "per line, as written by extract_alloc_trace.py --events) "
+              "instead of a synthetic pattern. Puts allocate, removes and "
+              "evicts free; there is no eviction retry, so every failed put "
+              "is reported as a failure. Only used by "
+              "--workload=size_class_churn.");
+DEFINE_int32(trace_events_repeat, 1,
+             "Replay the event log this many times back to back (keys are "
+             "suffixed per pass) to reach steady state on short traces.");
 
 using namespace mooncake;
 
@@ -145,6 +201,8 @@ struct BenchConfig {
     // Size-class churn knobs (only used when workload_type ==
     // SIZE_CLASS_CHURN).
     std::string size_class_pattern = "kv_mixed";
+    // Bench-only strategy name for size_class_churn ("" = use strategy_type).
+    std::string bench_strategy;
 };
 
 struct UtilRatioStats {
@@ -159,6 +217,7 @@ struct UtilRatioStats {
 
 struct DistributionStats {
     double min = 0.0;
+    double p10 = 0.0;
     double p50 = 0.0;
     double p90 = 0.0;
     double p99 = 0.0;
@@ -177,13 +236,21 @@ struct FragmentationSnapshot {
 
 struct SizeClassSpec {
     std::string name;
+    // Fixed object size, or the inclusive lower bound when max_size > size.
     size_t size;
     int weight;
+    // Exclusive upper bound for ranged classes (sizes are drawn log-uniformly
+    // from [size, max_size)); 0 means a fixed-size class.
+    size_t max_size = 0;
+    // Observed mean size for trace-derived classes; 0 derives it from the
+    // range.
+    double mean_size = 0.0;
 };
 
 struct SizeClassStat {
     std::string name;
     size_t size = 0;
+    size_t max_size = 0;
     int weight = 0;
     int success_count = 0;
     int partial_count = 0;
@@ -283,6 +350,25 @@ struct SizeClassChurnResult : BenchResultBase {
     DistributionStats largest_free_mb_stats;
     FragmentationSnapshot final_fragmentation;
     std::vector<SizeClassStat> size_class_stats;
+    // Number of live objects released by --size_class_release_prob.
+    int released_count = 0;
+    // Large-allocation probe (--probe_mib); attempts == 0 when disabled.
+    size_t probe_bytes = 0;
+    int probe_attempts = 0;
+    int probe_success = 0;
+    DistributionStats probe_free_gb_stats;
+    DistributionStats probe_largest_free_mb_stats;
+    // Event replay: free space observed at each failed put.
+    DistributionStats fail_free_gb_stats;
+    DistributionStats fail_largest_free_mb_stats;
+    DistributionStats fail_size_mb_stats;
+    // Event replay: traffic concentration. write_skew = bytes written to the
+    // busiest segment / mean bytes per segment over the whole run;
+    // window_write_skew = the same ratio per sample window, averaged; the
+    // utilization stddev is averaged over the sample points.
+    double write_skew = 0.0;
+    double window_write_skew = 0.0;
+    double mean_util_stddev = 0.0;
 };
 
 static double computeClusterCapacityGB(int num_segments, size_t base_capacity,
@@ -491,6 +577,7 @@ static DistributionStats computeDistributionStats(std::vector<double>& values) {
     };
 
     stats.min = values.front();
+    stats.p10 = percentile(0.10);
     stats.p50 = percentile(0.50);
     stats.p90 = percentile(0.90);
     stats.p99 = percentile(0.99);
@@ -545,8 +632,156 @@ static FragmentationSnapshot computeFragmentationSnapshot(
     return snapshot;
 }
 
+static std::string humanSizeLabel(size_t bytes) {
+    static const char* const kUnits[] = {"B", "K", "M", "G", "T"};
+    int unit = 0;
+    double value = static_cast<double>(bytes);
+    while (value >= 1024.0 && unit < 4) {
+        value /= 1024.0;
+        ++unit;
+    }
+    std::ostringstream ss;
+    if (value == std::floor(value)) {
+        ss << static_cast<uint64_t>(value);
+    } else {
+        ss << std::fixed << std::setprecision(1) << value;
+    }
+    ss << kUnits[unit];
+    return ss.str();
+}
+
+// Expected value of a log-uniform draw on [lo, hi).
+static double logUniformMean(size_t lo, size_t hi) {
+    if (hi <= lo) return static_cast<double>(lo);
+    return (static_cast<double>(hi) - static_cast<double>(lo)) /
+           std::log(static_cast<double>(hi) / static_cast<double>(lo));
+}
+
+static double sizeClassMeanSize(const SizeClassSpec& spec) {
+    if (spec.mean_size > 0.0) return spec.mean_size;
+    if (spec.max_size > spec.size)
+        return logUniformMean(spec.size, spec.max_size);
+    return static_cast<double>(spec.size);
+}
+
+static size_t sampleSizeClassSize(const SizeClassSpec& spec,
+                                  std::mt19937& rng) {
+    if (spec.max_size <= spec.size) return spec.size;
+    std::uniform_real_distribution<double> dist(
+        std::log(static_cast<double>(spec.size)),
+        std::log(static_cast<double>(spec.max_size)));
+    auto size = static_cast<size_t>(std::exp(dist(rng)));
+    return std::clamp(size, spec.size, spec.max_size - 1);
+}
+
+// One equally weighted size class per octave over [min_size, max_size). With
+// log-uniform sampling inside each class this gives every size octave the
+// same share of allocations, which is the most hostile mix for large objects.
+static std::vector<SizeClassSpec> buildOctaveSpecs(size_t min_size,
+                                                   size_t max_size) {
+    std::vector<SizeClassSpec> specs;
+    if (min_size == 0 || max_size <= min_size) return specs;
+    for (size_t lo = min_size; lo < max_size; lo *= 2) {
+        size_t hi = std::min(lo * 2, max_size);
+        SizeClassSpec spec;
+        spec.name = humanSizeLabel(lo) + "-" + humanSizeLabel(hi);
+        spec.size = lo;
+        spec.max_size = hi;
+        spec.weight = 1;
+        specs.push_back(std::move(spec));
+    }
+    return specs;
+}
+
+static size_t sizeClassIndexForSize(const std::vector<SizeClassSpec>& specs,
+                                    size_t size) {
+    for (size_t i = 0; i < specs.size(); ++i) {
+        const auto& spec = specs[i];
+        if (spec.max_size > spec.size) {
+            if (size >= spec.size && size < spec.max_size) return i;
+        } else if (size == spec.size) {
+            return i;
+        }
+    }
+    return specs.empty() ? 0 : specs.size() - 1;
+}
+
+// Allocation sizes loaded from --rl_trace_file (one size in bytes per line).
+static std::vector<size_t> g_trace_sizes;
+
+static bool loadTraceSizes(const std::string& path, std::vector<size_t>& out) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    size_t malformed = 0;
+    while (std::getline(in, line)) {
+        auto hash = line.find('#');
+        if (hash != std::string::npos) line.erase(hash);
+        auto begin = line.find_first_not_of(" \t\r");
+        if (begin == std::string::npos) continue;
+        auto end = line.find_last_not_of(" \t\r");
+        line = line.substr(begin, end - begin + 1);
+        char* parse_end = nullptr;
+        unsigned long long value = std::strtoull(line.c_str(), &parse_end, 10);
+        if (parse_end == line.c_str() || *parse_end != '\0' || value == 0) {
+            ++malformed;
+            continue;
+        }
+        out.push_back(static_cast<size_t>(value));
+    }
+    if (malformed > 0) {
+        std::cout << "Ignored " << malformed << " malformed trace line(s) in "
+                  << path << std::endl;
+    }
+    return true;
+}
+
+// Trace-derived classes: one per power-of-two octave covering the observed
+// range, weighted by observed counts so the per-class breakdown and the
+// prefill budget reflect the recorded distribution.
+static std::vector<SizeClassSpec> buildTraceSpecs(
+    const std::vector<size_t>& sizes) {
+    if (sizes.empty()) return {};
+    const size_t min_size = *std::min_element(sizes.begin(), sizes.end());
+    const size_t max_size = *std::max_element(sizes.begin(), sizes.end());
+    size_t lo = 1;
+    while (lo * 2 <= min_size) lo *= 2;
+    size_t hi = lo;
+    while (hi <= max_size) hi *= 2;
+    auto octaves = buildOctaveSpecs(lo, hi);
+
+    std::vector<double> sums(octaves.size(), 0.0);
+    std::vector<int> counts(octaves.size(), 0);
+    for (size_t size : sizes) {
+        size_t idx = sizeClassIndexForSize(octaves, size);
+        sums[idx] += static_cast<double>(size);
+        ++counts[idx];
+    }
+
+    std::vector<SizeClassSpec> specs;
+    for (size_t i = 0; i < octaves.size(); ++i) {
+        if (counts[i] == 0) continue;
+        octaves[i].weight = counts[i];
+        octaves[i].mean_size = sums[i] / counts[i];
+        specs.push_back(octaves[i]);
+    }
+    return specs;
+}
+
 static std::vector<SizeClassSpec> getSizeClassSpecs(
     const std::string& pattern_name) {
+    if (pattern_name == "rl") {
+        const size_t min_size =
+            static_cast<size_t>(std::max<int64_t>(FLAGS_rl_min_kib, 0)) * KiB;
+        const size_t max_size =
+            static_cast<size_t>(std::max<int64_t>(FLAGS_rl_max_mib, 0)) * MiB;
+        return buildOctaveSpecs(min_size, max_size);
+    }
+
+    if (pattern_name == "trace") {
+        return buildTraceSpecs(g_trace_sizes);
+    }
+
     if (pattern_name == "kv_mixed") {
         return {
             {"small", 4 * KiB, 70},
@@ -586,6 +821,30 @@ static size_t chooseSizeClassIndex(const std::vector<SizeClassSpec>& specs,
     return specs.size() - 1;
 }
 
+struct SizeClassSample {
+    size_t class_idx = 0;
+    size_t size = 0;
+};
+
+// Draws allocation sizes either from the weighted synthetic size classes or,
+// when a trace is attached, by replaying the recorded sizes in order.
+struct SizeClassSampler {
+    std::vector<SizeClassSpec> specs;
+    const std::vector<size_t>* trace = nullptr;
+    size_t cursor = 0;
+
+    SizeClassSample next(std::mt19937& rng) {
+        if (trace != nullptr && !trace->empty()) {
+            size_t size = (*trace)[cursor % trace->size()];
+            ++cursor;
+            return {sizeClassIndexForSize(specs, size), size};
+        }
+        size_t idx = chooseSizeClassIndex(specs, rng);
+        if (specs.empty()) return {};
+        return {idx, sampleSizeClassSize(specs[idx], rng)};
+    }
+};
+
 static double computeWeightedAverageObjectSize(
     const std::vector<SizeClassSpec>& specs) {
     double weighted_size = 0.0;
@@ -593,7 +852,7 @@ static double computeWeightedAverageObjectSize(
 
     for (const auto& spec : specs) {
         if (spec.weight <= 0) continue;
-        weighted_size += static_cast<double>(spec.size) * spec.weight;
+        weighted_size += sizeClassMeanSize(spec) * spec.weight;
         total_weight += spec.weight;
     }
 
@@ -623,6 +882,180 @@ static size_t deriveSizeClassPrefillMaxAttempts(
                   kSizeClassPrefillAttemptMultiplier);
     return std::max(kSizeClassMinPrefillAttempts,
                     static_cast<size_t>(derived_attempts));
+}
+
+// Largest contiguous free region of a segment (max over its allocators).
+static size_t segmentLargestFree(const AllocatorManager& manager,
+                                 const std::string& name) {
+    const auto* allocators = manager.getAllocators(name);
+    if (!allocators) return 0;
+    size_t largest = 0;
+    for (const auto& registration : *allocators) {
+        const auto alloc = registration->GetAllocator();
+        if (!alloc) continue;
+        size_t v = alloc->getLargestFreeRegion();
+        if (v == kAllocatorUnknownFreeSpace) continue;
+        largest = std::max(largest, v);
+    }
+    return largest;
+}
+
+/**
+ * @brief Bench-only placement strategy: score every segment for the request
+ *        and allocate in descending score order. A score of -infinity marks
+ *        a segment as ineligible. Unlike RankedAllocationStrategy this ranks
+ *        all segments (no candidate sampling) and has no random fallback, so
+ *        the effect of the placement rule is measured in isolation.
+ */
+class BenchScoredStrategy : public RandomAllocationStrategy {
+   public:
+    using ScoreFn = std::function<double(const AllocatorManager&,
+                                         const std::string&, size_t)>;
+    explicit BenchScoredStrategy(ScoreFn score) : score_(std::move(score)) {}
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = {},
+        const std::set<std::string>& excluded_segments = {},
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        (void)preferred_segments;
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto& names = manager.getNames();
+        struct Candidate {
+            size_t idx;
+            double score;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(names.size());
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (excluded_segments.contains(names[i])) continue;
+            double s = score_(manager, names[i], slice_length);
+            if (s == -std::numeric_limits<double>::infinity()) continue;
+            candidates.push_back({i, s});
+        }
+        std::stable_sort(candidates.begin(), candidates.end(),
+                         [](const Candidate& a, const Candidate& b) {
+                             return a.score > b.score;
+                         });
+        std::vector<Replica> replicas;
+        for (const auto& c : candidates) {
+            if (replicas.size() >= replica_num) break;
+            auto buffer = allocateSingle(manager, names[c.idx], slice_length);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+            }
+        }
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return replicas;
+    }
+
+   private:
+    ScoreFn score_;
+};
+
+static constexpr double kIneligible = -std::numeric_limits<double>::infinity();
+
+// largest_hole_first: put the object into the segment with the largest
+// contiguous free region (the fragmentation_aware idea, ranked over all
+// segments).
+static double scoreLargestHoleFirst(const AllocatorManager& m,
+                                    const std::string& name, size_t size) {
+    size_t largest = segmentLargestFree(m, name);
+    return largest >= size ? static_cast<double>(largest) : kIneligible;
+}
+
+// best_fit: put the object into the segment whose largest hole is the
+// smallest one that still fits, so big holes are kept for big objects.
+static double scoreBestFit(const AllocatorManager& m, const std::string& name,
+                           size_t size) {
+    size_t largest = segmentLargestFree(m, name);
+    return largest >= size ? -static_cast<double>(largest - size) : kIneligible;
+}
+
+// reserved: the last --reserved_segments segments accept only objects of at
+// least --large_object_mib; all other segments accept only smaller objects.
+// Within each class the choice is random, like RandomAllocationStrategy.
+static double scoreReserved(const AllocatorManager& m, const std::string& name,
+                            size_t size) {
+    const auto& names = m.getNames();
+    const size_t reserved =
+        std::min<size_t>(std::max(FLAGS_reserved_segments, 0), names.size());
+    size_t idx = std::find(names.begin(), names.end(), name) - names.begin();
+    const bool is_reserved = idx + reserved >= names.size();
+    const bool is_large =
+        size >= static_cast<size_t>(std::max(FLAGS_large_object_mib, 0)) * MiB;
+    if (is_reserved != is_large) return kIneligible;
+    if (segmentLargestFree(m, name) < size) return kIneligible;
+    return static_cast<double>(std::rand()) / RAND_MAX;
+}
+
+// best_fit_bucketed: best fit with slack quantized into buckets; ties inside
+// a bucket are broken at random to spread traffic.
+static double scoreBestFitBucketed(const AllocatorManager& m,
+                                   const std::string& name, size_t size) {
+    size_t largest = segmentLargestFree(m, name);
+    if (largest < size) return kIneligible;
+    const double bucket =
+        static_cast<double>(std::max(FLAGS_best_fit_bucket_mib, 1)) * MiB;
+    const double slack_bucket = std::floor((largest - size) / bucket);
+    return -slack_bucket + static_cast<double>(std::rand()) / RAND_MAX * 0.5;
+}
+
+// hybrid: small objects best-fit into the tightest segment, large objects go
+// to the segment with the largest hole.
+static double scoreHybrid(const AllocatorManager& m, const std::string& name,
+                          size_t size) {
+    const bool is_large =
+        size >= static_cast<size_t>(std::max(FLAGS_large_object_mib, 0)) * MiB;
+    return is_large ? scoreLargestHoleFirst(m, name, size)
+                    : scoreBestFit(m, name, size);
+}
+
+static std::shared_ptr<AllocationStrategy> createBenchStrategy(
+    const BenchConfig& cfg, LocalSsdManager& local_ssd) {
+    const std::string& s = cfg.bench_strategy;
+    if (s.empty() || s == "random") {
+        return CreateAllocationStrategy(AllocationStrategyType::RANDOM,
+                                        local_ssd);
+    }
+    if (s == "free_ratio_first") {
+        return CreateAllocationStrategy(
+            AllocationStrategyType::FREE_RATIO_FIRST, local_ssd);
+    }
+    if (s == "largest_hole_first") {
+        return std::make_shared<BenchScoredStrategy>(scoreLargestHoleFirst);
+    }
+    if (s == "best_fit") {
+        return CreateAllocationStrategy(AllocationStrategyType::BEST_FIT,
+                                        local_ssd);
+    }
+    if (s == "reserved") {
+        return std::make_shared<BenchScoredStrategy>(scoreReserved);
+    }
+    if (s == "hybrid") {
+        return std::make_shared<BenchScoredStrategy>(scoreHybrid);
+    }
+    if (s == "best_fit_bucketed") {
+        return std::make_shared<BenchScoredStrategy>(scoreBestFitBucketed);
+    }
+    return nullptr;
+}
+
+static std::string benchStrategyLabel(const std::string& s) {
+    if (s == "random") return "Random";
+    if (s == "free_ratio_first") return "FreeRatioFirst";
+    if (s == "largest_hole_first") return "LargestHole";
+    if (s == "best_fit") return "BestFit";
+    if (s == "reserved") return "Reserved";
+    if (s == "hybrid") return "Hybrid";
+    if (s == "best_fit_bucketed") return "BestFitBucket";
+    return s;
 }
 
 static std::string strategyName(AllocationStrategyType type) {
@@ -1006,6 +1439,16 @@ static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
     }
 }
 
+// Release exactly one random live object (free-one/allocate-one churn).
+static void releaseRandomOne(std::vector<std::vector<Replica>>& live,
+                             std::mt19937& rng) {
+    if (live.empty()) return;
+    std::uniform_int_distribution<size_t> dist(0, live.size() - 1);
+    size_t idx = dist(rng);
+    std::swap(live[idx], live.back());
+    live.pop_back();  // Replica destructor returns memory to allocator.
+}
+
 // Try to allocate once; on failure, sample utilization before eviction.
 static bool dsaAllocateWithEvict(
     const std::shared_ptr<AllocationStrategy>& strategy,
@@ -1068,12 +1511,13 @@ static SizeClassAllocationResult sizeClassAllocateWithEvict(
 static SizeClassPrefillStats prefillSizeClassChurn(
     const std::shared_ptr<AllocationStrategy>& strategy,
     AllocatorManager& manager, const BenchConfig& cfg,
-    const std::vector<SizeClassSpec>& specs,
+    SizeClassSampler& sampler,
     std::vector<std::vector<Replica>>& live_allocations, std::mt19937& rng) {
     SizeClassPrefillStats stats;
-    if (cfg.prefill_pct <= 0 || specs.empty()) return stats;
+    if (cfg.prefill_pct <= 0 || sampler.specs.empty()) return stats;
     stats.requested_pct = cfg.prefill_pct;
-    stats.max_attempts = deriveSizeClassPrefillMaxAttempts(manager, cfg, specs);
+    stats.max_attempts =
+        deriveSizeClassPrefillMaxAttempts(manager, cfg, sampler.specs);
 
     int consec_failures = 0;
     int evict_throwaway = 0;
@@ -1088,11 +1532,10 @@ static SizeClassPrefillStats prefillSizeClassChurn(
             }
         }
 
-        size_t class_idx = chooseSizeClassIndex(specs, rng);
+        auto sample = sampler.next(rng);
         auto alloc_result = sizeClassAllocateWithEvict(
-            strategy, manager, specs[class_idx].size, cfg.replica_num,
-            live_allocations, rng, evict_throwaway,
-            FLAGS_size_class_evict_ratio);
+            strategy, manager, sample.size, cfg.replica_num, live_allocations,
+            rng, evict_throwaway, FLAGS_size_class_evict_ratio);
         ++stats.attempts;
         if (alloc_result.status == SizeClassAllocationStatus::FULL) {
             ++stats.full_count;
@@ -1244,8 +1687,13 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     AllocatorManager manager =
         createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
     LocalSsdManager local_ssd;
-    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
-    auto specs = getSizeClassSpecs(cfg.size_class_pattern);
+    auto strategy = createBenchStrategy(cfg, local_ssd);
+    SizeClassSampler sampler;
+    sampler.specs = getSizeClassSpecs(cfg.size_class_pattern);
+    if (cfg.size_class_pattern == "trace") {
+        sampler.trace = &g_trace_sizes;
+    }
+    const auto& specs = sampler.specs;
 
     std::vector<SizeClassStat> per_class_stats;
     per_class_stats.reserve(specs.size());
@@ -1254,9 +1702,21 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
         SizeClassStat stat;
         stat.name = spec.name;
         stat.size = spec.size;
+        stat.max_size = spec.max_size;
         stat.weight = spec.weight;
         per_class_stats.push_back(std::move(stat));
     }
+
+    const size_t probe_bytes =
+        static_cast<size_t>(std::max(FLAGS_probe_mib, 0)) * MiB;
+    const double release_prob =
+        std::clamp(FLAGS_size_class_release_prob, 0.0, 1.0);
+    std::uniform_real_distribution<double> release_dist(0.0, 1.0);
+    std::vector<double> probe_free_gb_samples;
+    std::vector<double> probe_largest_free_mb_samples;
+    int probe_attempts = 0;
+    int probe_success = 0;
+    int released_count = 0;
 
     std::vector<double> latencies;
     latencies.reserve(cfg.num_allocations);
@@ -1271,7 +1731,7 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
 
     std::mt19937 rng(42);
     SizeClassPrefillStats prefill_stats = prefillSizeClassChurn(
-        strategy, manager, cfg, specs, live_allocations, rng);
+        strategy, manager, cfg, sampler, live_allocations, rng);
 
     int success_count = 0;
     int partial_count = 0;
@@ -1283,12 +1743,18 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     auto total_start = std::chrono::high_resolution_clock::now();
 
     for (int i = 0; i < cfg.num_allocations; ++i) {
-        size_t class_idx = chooseSizeClassIndex(specs, rng);
-        const auto& spec = specs[class_idx];
+        if (release_prob > 0.0 && !live_allocations.empty() &&
+            release_dist(rng) < release_prob) {
+            releaseRandomOne(live_allocations, rng);
+            ++released_count;
+        }
+
+        auto sample = sampler.next(rng);
+        const size_t class_idx = sample.class_idx;
 
         auto t0 = std::chrono::high_resolution_clock::now();
         auto alloc_result = sizeClassAllocateWithEvict(
-            strategy, manager, spec.size, cfg.replica_num, live_allocations,
+            strategy, manager, sample.size, cfg.replica_num, live_allocations,
             rng, evict_count, FLAGS_size_class_evict_ratio);
         auto t1 = std::chrono::high_resolution_clock::now();
 
@@ -1316,6 +1782,17 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
             if (snapshot.valid) {
                 fragmentation_samples.push_back(snapshot.fragmentation_ratio);
                 largest_free_mb_samples.push_back(
+                    static_cast<double>(snapshot.largest_free_region) / MiB);
+            }
+            if (probe_bytes > 0 && snapshot.valid) {
+                // Single replica, no eviction retry; the result is dropped at
+                // the end of this block so the probe never changes the pool.
+                auto probe = strategy->Allocate(manager, probe_bytes, 1);
+                ++probe_attempts;
+                if (probe.has_value() && !probe->empty()) ++probe_success;
+                probe_free_gb_samples.push_back(
+                    static_cast<double>(snapshot.total_free_space) / GiB);
+                probe_largest_free_mb_samples.push_back(
                     static_cast<double>(snapshot.largest_free_region) / MiB);
             }
             auto s1 = std::chrono::high_resolution_clock::now();
@@ -1358,6 +1835,261 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
         computeDistributionStats(largest_free_mb_samples);
     res.final_fragmentation = computeFragmentationSnapshot(manager);
     res.size_class_stats = std::move(per_class_stats);
+    res.released_count = released_count;
+    res.probe_bytes = probe_bytes;
+    res.probe_attempts = probe_attempts;
+    res.probe_success = probe_success;
+    res.probe_free_gb_stats = computeDistributionStats(probe_free_gb_samples);
+    res.probe_largest_free_mb_stats =
+        computeDistributionStats(probe_largest_free_mb_samples);
+    computeLatencyStats(latencies, total_us, total_count, res);
+    return res;
+}
+
+struct TraceEvent {
+    char kind;  // 'p' put, 'r' remove, 'e' evict
+    std::string key;
+    size_t size;
+};
+
+static std::vector<TraceEvent> g_trace_events;
+
+static bool loadTraceEvents(const std::string& path,
+                            std::vector<TraceEvent>& out) {
+    std::ifstream in(path);
+    if (!in) return false;
+    std::string line;
+    size_t malformed = 0;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        // Format: "<kind> <key> <size>"; keys may contain spaces.
+        auto first = line.find(' ');
+        auto last = line.rfind(' ');
+        if (first == std::string::npos || last == first) {
+            ++malformed;
+            continue;
+        }
+        std::string kind = line.substr(0, first);
+        std::string key = line.substr(first + 1, last - first - 1);
+        char* end = nullptr;
+        unsigned long long size =
+            std::strtoull(line.c_str() + last + 1, &end, 10);
+        if (end == line.c_str() + last + 1 || *end != '\0') {
+            ++malformed;
+            continue;
+        }
+        char k = kind == "put"      ? 'p'
+                 : kind == "remove" ? 'r'
+                 : kind == "evict"  ? 'e'
+                                    : 0;
+        if (k == 0) {
+            ++malformed;
+            continue;
+        }
+        out.push_back({k, std::move(key), static_cast<size_t>(size)});
+    }
+    if (malformed > 0) {
+        std::cout << "Ignored " << malformed << " malformed event line(s) in "
+                  << path << std::endl;
+    }
+    return true;
+}
+
+// Replays put/remove/evict events with the real object lifetimes. No
+// eviction retry: a failed put is counted and its free-space picture is
+// recorded, exactly like action=put_start_alloc_failed in the master log.
+static SizeClassChurnResult runTraceEventsBenchmark(const BenchConfig& cfg) {
+    AllocatorManager manager =
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    LocalSsdManager local_ssd;
+    auto strategy = createBenchStrategy(cfg, local_ssd);
+
+    std::vector<size_t> put_sizes;
+    for (const auto& ev : g_trace_events) {
+        if (ev.kind == 'p') put_sizes.push_back(ev.size);
+    }
+    std::vector<SizeClassSpec> specs = buildTraceSpecs(put_sizes);
+    std::vector<SizeClassStat> per_class_stats;
+    std::vector<std::vector<double>> per_class_latencies(specs.size());
+    for (const auto& spec : specs) {
+        SizeClassStat stat;
+        stat.name = spec.name;
+        stat.size = spec.size;
+        stat.max_size = spec.max_size;
+        stat.weight = spec.weight;
+        per_class_stats.push_back(std::move(stat));
+    }
+
+    const size_t probe_bytes =
+        static_cast<size_t>(std::max(FLAGS_probe_mib, 0)) * MiB;
+    const int sample_interval = std::max(1, FLAGS_convergence_sample_interval);
+    const int repeat = std::max(1, FLAGS_trace_events_repeat);
+
+    std::unordered_map<std::string, std::vector<Replica>> live;
+    live.reserve(put_sizes.size());
+    std::unordered_map<std::string, double> bytes_per_segment;
+    std::unordered_map<std::string, double> window_bytes_per_segment;
+    std::vector<double> window_skews;
+    std::vector<double> util_stddev_samples;
+    auto account = [&](const std::vector<Replica>& replicas, size_t size) {
+        for (const auto& replica : replicas) {
+            for (const auto& name : replica.get_segment_names()) {
+                if (!name) continue;
+                bytes_per_segment[*name] += static_cast<double>(size);
+                window_bytes_per_segment[*name] += static_cast<double>(size);
+            }
+        }
+    };
+    auto skew_of = [&](const std::unordered_map<std::string, double>& m) {
+        if (m.empty()) return 0.0;
+        double total = 0.0, peak = 0.0;
+        for (const auto& [k, v] : m) {
+            total += v;
+            peak = std::max(peak, v);
+        }
+        const double mean = total / static_cast<double>(cfg.num_segments);
+        return mean > 0.0 ? peak / mean : 0.0;
+    };
+    std::vector<double> latencies;
+    latencies.reserve(put_sizes.size() * repeat);
+    std::vector<double> fragmentation_samples, largest_free_mb_samples;
+    std::vector<double> probe_free_gb_samples, probe_largest_free_mb_samples;
+    std::vector<double> fail_free_gb, fail_largest_free_mb, fail_size_mb;
+    int success_count = 0, partial_count = 0, failed_count = 0, total_count = 0,
+        released_count = 0, probe_attempts = 0, probe_success = 0;
+    double instrumentation_time_us = 0.0;
+
+    auto total_start = std::chrono::high_resolution_clock::now();
+    for (int pass = 0; pass < repeat; ++pass) {
+        const std::string suffix = repeat > 1 ? "#" + std::to_string(pass) : "";
+        for (const auto& ev : g_trace_events) {
+            if (ev.kind != 'p') {
+                auto it = live.find(ev.key + suffix);
+                if (it != live.end()) {
+                    live.erase(it);  // Replica destructors free the memory.
+                    ++released_count;
+                }
+                continue;
+            }
+            auto t0 = std::chrono::high_resolution_clock::now();
+            auto result = strategy->Allocate(manager, ev.size, cfg.replica_num);
+            auto t1 = std::chrono::high_resolution_clock::now();
+            double latency_ns =
+                std::chrono::duration<double, std::nano>(t1 - t0).count();
+            latencies.push_back(latency_ns);
+            size_t class_idx = sizeClassIndexForSize(specs, ev.size);
+            per_class_latencies[class_idx].push_back(latency_ns);
+            ++total_count;
+            ++per_class_stats[class_idx].total_count;
+            if (result.has_value() && !result->empty()) {
+                if (result->size() == static_cast<size_t>(cfg.replica_num)) {
+                    ++success_count;
+                    ++per_class_stats[class_idx].success_count;
+                } else {
+                    ++partial_count;
+                    ++per_class_stats[class_idx].partial_count;
+                }
+                account(result.value(), ev.size);
+                live[ev.key + suffix] = std::move(result.value());
+            } else {
+                ++failed_count;
+                ++per_class_stats[class_idx].failed_count;
+                auto s0 = std::chrono::high_resolution_clock::now();
+                auto snap = computeFragmentationSnapshot(manager);
+                fail_free_gb.push_back(snap.total_free_space / GiB);
+                fail_largest_free_mb.push_back(
+                    static_cast<double>(snap.largest_free_region) / MiB);
+                fail_size_mb.push_back(static_cast<double>(ev.size) / MiB);
+                auto s1 = std::chrono::high_resolution_clock::now();
+                instrumentation_time_us +=
+                    std::chrono::duration<double, std::micro>(s1 - s0).count();
+            }
+            if (total_count % sample_interval == 0) {
+                auto s0 = std::chrono::high_resolution_clock::now();
+                auto snapshot = computeFragmentationSnapshot(manager);
+                util_stddev_samples.push_back(
+                    computeUtilizationStdDev(manager));
+                window_skews.push_back(skew_of(window_bytes_per_segment));
+                window_bytes_per_segment.clear();
+                if (snapshot.valid) {
+                    fragmentation_samples.push_back(
+                        snapshot.fragmentation_ratio);
+                    largest_free_mb_samples.push_back(
+                        static_cast<double>(snapshot.largest_free_region) /
+                        MiB);
+                    if (probe_bytes > 0) {
+                        auto probe =
+                            strategy->Allocate(manager, probe_bytes, 1);
+                        ++probe_attempts;
+                        if (probe.has_value() && !probe->empty())
+                            ++probe_success;
+                        probe_free_gb_samples.push_back(
+                            static_cast<double>(snapshot.total_free_space) /
+                            GiB);
+                        probe_largest_free_mb_samples.push_back(
+                            static_cast<double>(snapshot.largest_free_region) /
+                            MiB);
+                    }
+                }
+                auto s1 = std::chrono::high_resolution_clock::now();
+                instrumentation_time_us +=
+                    std::chrono::duration<double, std::micro>(s1 - s0).count();
+            }
+        }
+    }
+    auto total_end = std::chrono::high_resolution_clock::now();
+    double total_us =
+        std::chrono::duration<double, std::micro>(total_end - total_start)
+            .count();
+    total_us = std::max(total_us - instrumentation_time_us, 1.0);
+
+    for (size_t i = 0; i < per_class_stats.size(); ++i) {
+        per_class_stats[i].latency_stats =
+            computeDistributionStats(per_class_latencies[i]);
+    }
+
+    SizeClassChurnResult res;
+    res.strategy_name = cfg.strategy_name;
+    res.num_segments = cfg.num_segments;
+    res.alloc_size = 0;
+    res.replica_num = cfg.replica_num;
+    res.skewed = cfg.skewed;
+    res.cluster_capacity_gb = computeClusterCapacityGB(
+        cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    res.final_util_stddev = computeUtilizationStdDev(manager);
+    res.final_avg_util = computeAverageUtilAll(manager);
+    res.success_count = success_count;
+    res.partial_count = partial_count;
+    res.failed_count = failed_count;
+    res.total_count = total_count;
+    res.pattern_name = "events";
+    res.fragmentation_stats = computeDistributionStats(fragmentation_samples);
+    res.largest_free_mb_stats =
+        computeDistributionStats(largest_free_mb_samples);
+    res.final_fragmentation = computeFragmentationSnapshot(manager);
+    res.size_class_stats = std::move(per_class_stats);
+    res.released_count = released_count;
+    res.probe_bytes = probe_bytes;
+    res.probe_attempts = probe_attempts;
+    res.probe_success = probe_success;
+    res.probe_free_gb_stats = computeDistributionStats(probe_free_gb_samples);
+    res.probe_largest_free_mb_stats =
+        computeDistributionStats(probe_largest_free_mb_samples);
+    res.fail_free_gb_stats = computeDistributionStats(fail_free_gb);
+    res.fail_largest_free_mb_stats =
+        computeDistributionStats(fail_largest_free_mb);
+    res.fail_size_mb_stats = computeDistributionStats(fail_size_mb);
+    res.write_skew = skew_of(bytes_per_segment);
+    if (!window_skews.empty()) {
+        res.window_write_skew =
+            std::accumulate(window_skews.begin(), window_skews.end(), 0.0) /
+            window_skews.size();
+    }
+    if (!util_stddev_samples.empty()) {
+        res.mean_util_stddev = std::accumulate(util_stddev_samples.begin(),
+                                               util_stddev_samples.end(), 0.0) /
+                               util_stddev_samples.size();
+    }
     computeLatencyStats(latencies, total_us, total_count, res);
     return res;
 }
@@ -1560,7 +2292,55 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
               << ", p99=" << r.fragmentation_stats.p99
               << ", max=" << r.fragmentation_stats.max
               << ", final_largest_free=" << std::setprecision(1)
-              << final_largest_free_mb << " MB" << std::endl;
+              << final_largest_free_mb << " MB"
+              << ", released=" << r.released_count << std::endl;
+
+    if (r.pattern_name == "events") {
+        std::cout << "Traffic summary [" << r.strategy_name
+                  << ", pattern=" << r.pattern_name
+                  << ", segments=" << r.num_segments
+                  << ", replica=" << r.replica_num
+                  << "]: write_skew(max/mean)=" << std::fixed
+                  << std::setprecision(2) << r.write_skew
+                  << ", window_write_skew=" << r.window_write_skew
+                  << ", mean_util_stddev=" << std::setprecision(4)
+                  << r.mean_util_stddev << std::endl;
+    }
+
+    if (r.failed_count > 0 && r.fail_size_mb_stats.valid) {
+        std::cout << "Failure summary [" << r.strategy_name
+                  << ", pattern=" << r.pattern_name
+                  << ", segments=" << r.num_segments
+                  << ", replica=" << r.replica_num
+                  << "]: failed_puts=" << r.failed_count
+                  << ", failed_size_mb min/p50/max=" << std::fixed
+                  << std::setprecision(1) << r.fail_size_mb_stats.min << "/"
+                  << r.fail_size_mb_stats.p50 << "/" << r.fail_size_mb_stats.max
+                  << ", free_at_failure_gb avg/min/max=" << std::setprecision(2)
+                  << r.fail_free_gb_stats.avg << "/" << r.fail_free_gb_stats.min
+                  << "/" << r.fail_free_gb_stats.max
+                  << ", largest_free_mb_at_failure p50/max="
+                  << std::setprecision(1) << r.fail_largest_free_mb_stats.p50
+                  << "/" << r.fail_largest_free_mb_stats.max << std::endl;
+    }
+
+    if (r.probe_bytes > 0) {
+        std::cout << "Probe summary [" << r.strategy_name
+                  << ", pattern=" << r.pattern_name
+                  << ", segments=" << r.num_segments
+                  << ", replica=" << r.replica_num
+                  << "]: probe_size=" << (r.probe_bytes / MiB)
+                  << " MiB, success=" << r.probe_success << "/"
+                  << r.probe_attempts
+                  << ", free_at_probe_gb avg/min/max=" << std::fixed
+                  << std::setprecision(2) << r.probe_free_gb_stats.avg << "/"
+                  << r.probe_free_gb_stats.min << "/"
+                  << r.probe_free_gb_stats.max
+                  << ", largest_free_mb p10/p50/max=" << std::setprecision(1)
+                  << r.probe_largest_free_mb_stats.p10 << "/"
+                  << r.probe_largest_free_mb_stats.p50 << "/"
+                  << r.probe_largest_free_mb_stats.max << std::endl;
+    }
 
     std::cout << "Size-class breakdown:";
     for (const auto& stat : r.size_class_stats) {
@@ -1568,8 +2348,11 @@ static void printSizeClassChurnResult(const SizeClassChurnResult& r) {
                             std::to_string(stat.partial_count) + "/" +
                             std::to_string(stat.failed_count) + "/" +
                             std::to_string(stat.total_count);
-        std::cout << " " << stat.name << "(" << (stat.size / KiB)
-                  << "KB,w=" << stat.weight
+        std::string size_label = stat.max_size > stat.size
+                                     ? ""
+                                     : std::to_string(stat.size / KiB) + "KB,";
+        std::cout << " " << stat.name << "(" << size_label
+                  << "w=" << stat.weight
                   << ",full/partial/failed/total=" << ratio
                   << ",p99_ns=" << std::fixed << std::setprecision(0)
                   << stat.latency_stats.p99 << ")";
@@ -1805,18 +2588,107 @@ static void runDsaMatrix() {
     }
 }
 
+static bool parsePositiveIntList(const std::string& text,
+                                 std::vector<int>& counts) {
+    counts.clear();
+    std::stringstream ss(text);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        auto begin = item.find_first_not_of(" \t");
+        if (begin == std::string::npos) continue;
+        auto end = item.find_last_not_of(" \t");
+        item = item.substr(begin, end - begin + 1);
+        char* parse_end = nullptr;
+        long value = std::strtol(item.c_str(), &parse_end, 10);
+        if (parse_end == item.c_str() || *parse_end != '\0' || value <= 0) {
+            return false;
+        }
+        counts.push_back(static_cast<int>(value));
+    }
+    return !counts.empty();
+}
+
 static void runSizeClassChurnMatrix() {
     std::vector<bool> skewed_options = {false, true};
     std::vector<int> segment_counts = {1, 10, 100};
     std::vector<int> replica_nums = {1, 2, 3};
-    std::vector<AllocationStrategyType> strategies = {
-        AllocationStrategyType::RANDOM,
-        AllocationStrategyType::FREE_RATIO_FIRST,
-    };
+
+    std::vector<std::string> strategies;
+    {
+        std::stringstream ss(FLAGS_size_class_strategies);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            auto b = item.find_first_not_of(" \t");
+            if (b == std::string::npos) continue;
+            auto e = item.find_last_not_of(" \t");
+            item = item.substr(b, e - b + 1);
+            BenchConfig probe_cfg;
+            probe_cfg.bench_strategy = item;
+            LocalSsdManager probe_ssd;
+            if (!createBenchStrategy(probe_cfg, probe_ssd)) {
+                std::cout << "Invalid size_class_strategies entry: " << item
+                          << ". Use random, free_ratio_first, "
+                             "largest_hole_first, best_fit, reserved, hybrid, "
+                             "or best_fit_bucketed."
+                          << std::endl;
+                return;
+            }
+            strategies.push_back(item);
+        }
+        if (strategies.empty()) {
+            std::cout << "size_class_strategies must not be empty" << std::endl;
+            return;
+        }
+    }
+
+    const bool events_mode = !FLAGS_rl_trace_events.empty();
+    if (events_mode) {
+        g_trace_events.clear();
+        if (!loadTraceEvents(FLAGS_rl_trace_events, g_trace_events)) {
+            std::cout << "Cannot open rl_trace_events: "
+                      << FLAGS_rl_trace_events << std::endl;
+            return;
+        }
+        if (g_trace_events.empty()) {
+            std::cout << "rl_trace_events contains no events: "
+                      << FLAGS_rl_trace_events << std::endl;
+            return;
+        }
+    }
+
+    if (!FLAGS_segment_counts.empty() &&
+        !parsePositiveIntList(FLAGS_segment_counts, segment_counts)) {
+        std::cout << "Invalid segment_counts: " << FLAGS_segment_counts
+                  << ". Use a comma-separated list of positive integers."
+                  << std::endl;
+        return;
+    }
+    if (!FLAGS_replica_counts.empty() &&
+        !parsePositiveIntList(FLAGS_replica_counts, replica_nums)) {
+        std::cout << "Invalid replica_counts: " << FLAGS_replica_counts
+                  << ". Use a comma-separated list of positive integers."
+                  << std::endl;
+        return;
+    }
 
     std::vector<std::string> patterns;
-    if (FLAGS_size_class_pattern == "all") {
-        patterns = {"kv_mixed", "dsa_pair"};
+    if (events_mode) {
+        patterns = {"events"};
+    } else if (!FLAGS_rl_trace_file.empty()) {
+        g_trace_sizes.clear();
+        if (!loadTraceSizes(FLAGS_rl_trace_file, g_trace_sizes)) {
+            std::cout << "Cannot open rl_trace_file: " << FLAGS_rl_trace_file
+                      << std::endl;
+            return;
+        }
+        if (g_trace_sizes.empty()) {
+            std::cout << "rl_trace_file contains no allocation sizes: "
+                      << FLAGS_rl_trace_file << std::endl;
+            return;
+        }
+        patterns = {"trace"};
+    } else if (FLAGS_size_class_pattern == "all") {
+        patterns = {"kv_mixed", "dsa_pair", "rl"};
     } else {
         patterns = {FLAGS_size_class_pattern};
     }
@@ -1830,36 +2702,74 @@ static void runSizeClassChurnMatrix() {
     }
 
     for (const auto& pattern : patterns) {
+        if (pattern == "events") continue;
         if (getSizeClassSpecs(pattern).empty()) {
-            std::cout << "Invalid size_class_pattern: " << pattern
-                      << ". Use --size_class_pattern=kv_mixed, dsa_pair, or "
-                         "all."
-                      << std::endl;
+            if (pattern == "rl") {
+                std::cout << "Invalid rl size range: rl_min_kib="
+                          << FLAGS_rl_min_kib
+                          << " KiB, rl_max_mib=" << FLAGS_rl_max_mib
+                          << " MiB. Both must be positive with min < max."
+                          << std::endl;
+            } else {
+                std::cout << "Invalid size_class_pattern: " << pattern
+                          << ". Use --size_class_pattern=kv_mixed, dsa_pair, "
+                             "rl, or all."
+                          << std::endl;
+            }
             return;
         }
     }
 
-    std::cout << "\n=== Size-Class Churn Fragmentation Benchmark Matrix ===\n"
-              << "Workload: prefill to --prefill_pct if set, then run "
-              << FLAGS_num_allocations
-              << " mixed-size allocation attempts with fail-triggered random "
-                 "eviction and retry.\n"
-              << "Fragmentation: 1 - largest_free_region / total_free_space, "
-                 "sampled every --convergence_sample_interval allocations.\n"
-              << "Config: segment_capacity=" << FLAGS_segment_capacity
-              << " MB, prefill_pct=" << FLAGS_prefill_pct
-              << ", evict_ratio=" << FLAGS_size_class_evict_ratio
-              << ", size_class_pattern=" << FLAGS_size_class_pattern << "\n"
-              << "Patterns: kv_mixed = 4KB:70%, 256KB:20%, 3198KB:10%; "
-                 "dsa_pair = 3198KB:50%, 643KB:50%.\n"
-              << "Skewed setup: half nodes are (base + 50%) capacity, half are "
-                 "(base - 50%)\n"
-              << std::endl;
+    std::cout
+        << "\n=== Size-Class Churn Fragmentation Benchmark Matrix ===\n"
+        << "Workload: prefill to --prefill_pct if set, then run "
+        << FLAGS_num_allocations
+        << " mixed-size allocation attempts with fail-triggered random "
+           "eviction and retry.\n"
+        << "Fragmentation: 1 - largest_free_region / total_free_space, "
+           "sampled every --convergence_sample_interval allocations.\n"
+        << "Config: segment_capacity=" << FLAGS_segment_capacity
+        << " MB, prefill_pct=" << FLAGS_prefill_pct
+        << ", evict_ratio=" << FLAGS_size_class_evict_ratio
+        << ", release_prob=" << FLAGS_size_class_release_prob
+        << ", size_class_pattern=" << FLAGS_size_class_pattern
+        << ", probe_mib=" << FLAGS_probe_mib << "\n"
+        << "Patterns: kv_mixed = 4KB:70%, 256KB:20%, 3198KB:10%; "
+           "dsa_pair = 3198KB:50%, 643KB:50%; rl = log-uniform sizes "
+           "in ["
+        << FLAGS_rl_min_kib << " KiB, " << FLAGS_rl_max_mib
+        << " MiB], one equally weighted class per octave"
+        << (g_trace_sizes.empty()
+                ? std::string(".\n")
+                : "; trace = sequential replay of " +
+                      std::to_string(g_trace_sizes.size()) + " sizes from " +
+                      FLAGS_rl_trace_file + ".\n")
+        << (events_mode
+                ? "Events: replaying " + std::to_string(g_trace_events.size()) +
+                      " put/remove/evict events from " + FLAGS_rl_trace_events +
+                      " x" +
+                      std::to_string(std::max(1, FLAGS_trace_events_repeat)) +
+                      " with real lifetimes and no eviction retry; "
+                      "prefill and release_prob are ignored.\n"
+                : std::string())
+        << "Strategies: " << FLAGS_size_class_strategies
+        << " (largest_hole_first/best_fit/reserved are bench-only; "
+           "reserved keeps the last "
+        << FLAGS_reserved_segments
+        << " segment(s) for objects >= " << FLAGS_large_object_mib << " MiB).\n"
+        << "Release: before each measured allocation, one random live "
+           "object is released with probability release_prob.\n"
+        << "Probe: when probe_mib > 0, each fragmentation sample also "
+           "attempts one probe_mib single-replica allocation without "
+           "eviction and releases it immediately.\n"
+        << "Skewed setup: half nodes are (base + 50%) capacity, half are "
+           "(base - 50%)\n"
+        << std::endl;
 
     std::vector<BenchConfig> configs;
     for (const auto& pattern : patterns) {
         for (auto skew : skewed_options) {
-            for (auto strategy : strategies) {
+            for (const auto& strategy : strategies) {
                 for (auto segs : segment_counts) {
                     for (auto rep : replica_nums) {
                         if (rep > segs) continue;
@@ -1871,8 +2781,12 @@ static void runSizeClassChurnMatrix() {
                         cfg.replica_num = rep;
                         cfg.num_allocations = FLAGS_num_allocations;
                         cfg.skewed = skew;
-                        cfg.strategy_type = strategy;
-                        cfg.strategy_name = strategyName(strategy);
+                        cfg.strategy_type =
+                            strategy == "free_ratio_first"
+                                ? AllocationStrategyType::FREE_RATIO_FIRST
+                                : AllocationStrategyType::RANDOM;
+                        cfg.bench_strategy = strategy;
+                        cfg.strategy_name = benchStrategyLabel(strategy);
                         cfg.prefill_pct = FLAGS_prefill_pct;
                         cfg.workload_type = WorkloadType::SIZE_CLASS_CHURN;
                         cfg.size_class_pattern = pattern;
@@ -1885,7 +2799,7 @@ static void runSizeClassChurnMatrix() {
 
     bool first = true;
     std::string prev_pattern;
-    AllocationStrategyType prev_strategy = AllocationStrategyType::RANDOM;
+    std::string prev_strategy;
 
     for (const auto& cfg : configs) {
         if (first || cfg.size_class_pattern != prev_pattern) {
@@ -1895,13 +2809,14 @@ static void runSizeClassChurnMatrix() {
             first = true;
         }
 
-        if (first || cfg.strategy_type != prev_strategy) {
+        if (first || cfg.bench_strategy != prev_strategy) {
             printSizeClassChurnHeader();
-            prev_strategy = cfg.strategy_type;
+            prev_strategy = cfg.bench_strategy;
             first = false;
         }
 
-        auto result = runSizeClassChurnBenchmark(cfg);
+        auto result = events_mode ? runTraceEventsBenchmark(cfg)
+                                  : runSizeClassChurnBenchmark(cfg);
         printSizeClassChurnResult(result);
     }
 }
