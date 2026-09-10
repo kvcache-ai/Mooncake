@@ -42,6 +42,18 @@ bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
     }
     return false;
 }
+
+Status appendContext(Status primary, const char* context,
+                     const Status& detail) {
+    if (detail.ok()) return primary;
+    if (primary.ok()) return detail;
+    std::string message(primary.message());
+    if (!message.empty()) message += "\n";
+    message += context;
+    message += ": ";
+    message += detail.ToString();
+    return Status(primary.code(), message);
+}
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
@@ -90,7 +102,9 @@ Status SegmentTracker::add(uint64_t base, size_t length,
 
 Status SegmentTracker::addInBatch(
     std::vector<BufferDesc>& desc_list,
-    std::function<Status(std::vector<BufferDesc>&)> callback) {
+    std::function<Status(std::vector<BufferDesc>&)> callback,
+    std::vector<BufferDesc>& rollback_removed) {
+    rollback_removed.clear();
     std::vector<BufferDesc> new_desc_list;
     // Read-only pre-scan (see add()): skip the ref-count publication when no
     // entry duplicates an already-registered range.
@@ -139,24 +153,35 @@ Status SegmentTracker::addInBatch(
         // Roll back the duplicate ref-counts so a failed registration does
         // not leave buffers pinned forever.
         if (!bumped.empty()) {
-            manager_.updateLocal([&](SegmentDesc& desc) -> Status {
-                auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-                for (auto& range : bumped) {
-                    for (auto it = detail.buffers.begin();
-                         it != detail.buffers.end(); ++it) {
-                        if (it->addr == range.first &&
-                            it->length == range.second) {
-                            it->ref_count--;
-                            // The original owner unregistered while we held
-                            // the extra reference; drop the entry so it is
-                            // no longer advertised.
-                            if (it->ref_count == 0) detail.buffers.erase(it);
-                            break;
+            std::vector<BufferDesc> removed;
+            auto rollback_status =
+                manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+                    auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+                    for (auto& range : bumped) {
+                        for (auto it = detail.buffers.begin();
+                             it != detail.buffers.end(); ++it) {
+                            if (it->addr == range.first &&
+                                it->length == range.second) {
+                                it->ref_count--;
+                                // The original owner unregistered while we held
+                                // the extra reference; drop the entry so it is
+                                // no longer advertised.
+                                if (it->ref_count == 0) {
+                                    removed.push_back(*it);
+                                    detail.buffers.erase(it);
+                                }
+                                break;
+                            }
                         }
                     }
-                }
-                return Status::OK();
-            });
+                    return Status::OK();
+                });
+            if (!rollback_status.ok()) {
+                return appendContext(
+                    status, "registration rollback metadata update failed",
+                    rollback_status);
+            }
+            rollback_removed = std::move(removed);
         }
         return status;
     }

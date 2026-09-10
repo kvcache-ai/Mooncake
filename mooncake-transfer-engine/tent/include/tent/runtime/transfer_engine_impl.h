@@ -374,6 +374,7 @@ class TransferEngineImpl {
 
    private:
     friend class ProgressWorker;
+    friend class RegistrationRollbackTestPeer;
 
     Status construct();
 
@@ -388,6 +389,8 @@ class TransferEngineImpl {
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
+
+    Status deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
