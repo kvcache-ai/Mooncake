@@ -113,6 +113,19 @@ auto P2PClientManager::BuildClientList(
     return clients;
 }
 
+auto P2PClientManager::GetClientSnapshot(
+    P2PClientSelectionStrategy strategy) const
+    -> tl::expected<std::vector<std::shared_ptr<P2PClientMeta>>, ErrorCode> {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto clients = BuildClientList(strategy);
+    if (!clients) {
+        LOG(WARNING) << "fail to get client snapshot"
+                     << ", strategy=" << strategy;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return std::move(*clients);
+}
+
 auto P2PClientManager::ForEachClient(P2PClientSelectionStrategy strategy,
                                      const ClientVisitor& visitor)
     -> tl::expected<void, ErrorCode> {

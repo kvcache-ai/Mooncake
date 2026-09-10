@@ -56,6 +56,9 @@ class P2PClientManager final {
 
     auto GetClient(const UUID& client_id) -> std::shared_ptr<P2PClientMeta>;
     auto GetAllClients() -> std::vector<std::shared_ptr<P2PClientMeta>>;
+    // Return owning client handles in strategy order, with the map unlocked.
+    auto GetClientSnapshot(P2PClientSelectionStrategy strategy) const
+        -> tl::expected<std::vector<std::shared_ptr<P2PClientMeta>>, ErrorCode>;
 
     auto GetClientIdBySegmentName(const std::string& segment_name)
         -> tl::expected<UUID, ErrorCode>;

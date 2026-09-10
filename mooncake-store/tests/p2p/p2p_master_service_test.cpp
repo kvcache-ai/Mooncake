@@ -6,9 +6,11 @@
 #include <barrier>
 #include <chrono>
 #include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #define private public
@@ -785,7 +787,7 @@ TEST_F(P2PMasterServiceTest, BatchWriteRouteChecksEachObjectSize) {
     EXPECT_DOUBLE_EQ(result.responses[1].front().score, 0);
 }
 
-TEST_F(P2PMasterServiceTest, RandomBatchWriteRouteReusesPreparedOrder) {
+TEST_F(P2PMasterServiceTest, RandomBatchWriteRouteSharesClientOrder) {
     auto service = CreateService();
     service->GetClientManager().Stop();
     const UUID owner{1, 1};
@@ -822,67 +824,140 @@ TEST_F(P2PMasterServiceTest, RandomBatchWriteRouteReusesPreparedOrder) {
     }
 }
 
-TEST_F(P2PMasterServiceTest, PreparedWriteClientsFreezeCapacityButRecheckHealth) {
-    auto service = CreateService();
+TEST_F(P2PMasterServiceTest, BatchWriteRouteCompletesKeysAtDifferentClients) {
+    auto service = CreateService(/*max_client_per_key=*/3);
     service->GetClientManager().Stop();
-    const UUID client_id{1, 1};
-    auto segment = MakeP2PSegment("segment", 1000);
-    segment.usage = 100;
-    RegisterP2PClient(*service, client_id, {segment});
-    auto client = service->GetClientManager().GetClient(client_id);
-    ASSERT_NE(client, nullptr);
-    client->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
-        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
-    ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
+    const UUID first_id{1, 1}, second_id{2, 2}, third_id{3, 3};
+    auto first = MakeP2PSegment("first", 300);
+    auto second = MakeP2PSegment("second", 200);
+    auto third = MakeP2PSegment("third", 100);
+    RegisterP2PClient(*service, first_id, {first});
+    RegisterP2PClient(*service, second_id, {second});
+    RegisterP2PClient(*service, third_id, {third});
+    AddReplicaHelper(*service, "owned-a", 64, first_id, first.id);
+    AddReplicaHelper(*service, "owned-ab", 64, first_id, first.id);
+    AddReplicaHelper(*service, "owned-ab", 64, second_id, second.id);
+    AddReplicaHelper(*service, "capped", 64, first_id, first.id);
+    AddReplicaHelper(*service, "capped", 64, second_id, second.id);
+    AddReplicaHelper(*service, "capped", 64, third_id, third.id);
 
-    P2PGetWriteRouteRequest request{
-        .key = "new", .client_id = client_id, .object_size = 100};
-    request.config.remote_weight = 0.2;
-    const auto clients =
-        service->GetWriteRouteClients(request.client_id, request.config);
-    ASSERT_TRUE(clients.has_value());
-    ASSERT_EQ(clients->size(), 1);
-    auto select = [&] {
-        return service->InnerGetWriteRoute(request, *clients);
-    };
-    auto result = select();
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
-
-    ASSERT_EQ(client->Heartbeat().second, P2PClientStatus::HEALTH);
-    auto usage = client->UpdateSegmentUsages({{segment.id, 1000}});
-    ASSERT_EQ(usage.sub_results.front().error, ErrorCode::OK);
-    for (int i = 0; i < 2; ++i) {
-        result = select();
-        ASSERT_TRUE(result.has_value());
-        ASSERT_EQ(result->size(), 1);
-        EXPECT_EQ(result->front().available_capacity, 900);
-        EXPECT_DOUBLE_EQ(result->front().score, 0.9 * 0.8);
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = UUID{99, 99};
+    request.keys = {"new", "owned-a", "capped", "large", "owned-ab",
+                    "impossible", "owned-a"};
+    request.object_sizes = {64, 64, 64, 250, 64, 400, 64};
+    request.config.max_candidates = 1;
+    auto result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.responses.size(), request.keys.size());
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
+                  ErrorCode::REPLICA_NUM_EXCEEDED, ErrorCode::OK, ErrorCode::OK,
+                  ErrorCode::NO_AVAILABLE_CANDIDATE, ErrorCode::OK}));
+    const std::array<std::pair<size_t, UUID>, 5> expected = {{
+        {0, first_id}, {1, second_id}, {3, first_id}, {4, third_id}, {6, second_id}}};
+    for (const auto& [index, client_id] : expected) {
+        // Completed keys must not collect more clients while another key is
+        // still pending, including one that cannot be satisfied at all.
+        ASSERT_EQ(result.responses[index].size(), 1u);
+        EXPECT_EQ(result.responses[index].front().client_id, client_id);
     }
-    auto fresh = service->GetWriteRoute(request);
-    ASSERT_FALSE(fresh.has_value());
-    EXPECT_EQ(fresh.error(), ErrorCode::NO_AVAILABLE_CANDIDATE);
-
-    AddReplicaHelper(*service, "new", 100, client_id, segment.id);
-    result = select();
-    EXPECT_FALSE(result.has_value());
-
-    request.key = "unowned";
-    client->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
-        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
-    ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
-    EXPECT_FALSE(select().has_value());
-    ASSERT_EQ(client->Heartbeat().second, P2PClientStatus::HEALTH);
-    EXPECT_TRUE(select().has_value());
-    ASSERT_TRUE(service->UnregisterClient(client_id).has_value());
-    EXPECT_FALSE(select().has_value());
+    EXPECT_TRUE(result.responses[2].empty());
+    EXPECT_TRUE(result.responses[5].empty());
+    EXPECT_EQ(service->RemoveAll(), 3);
 }
 
-TEST_F(P2PMasterServiceTest, WriteRouteClientsFilterConfigBeforeKeySelection) {
+TEST_F(P2PMasterServiceTest, BatchWriteRouteStopsBeforeUnusedClient) {
     auto service = CreateService();
     service->GetClientManager().Stop();
-    const UUID first_id{1, 1};
-    const UUID second_id{2, 2};
+    const UUID first_id{1, 1}, second_id{2, 2}, unused_id{3, 3};
+    auto first = MakeP2PSegment("first", 300);
+    auto second = MakeP2PSegment("second", 200);
+    auto unused = MakeP2PSegment("unused", 100);
+    RegisterP2PClient(*service, first_id, {first});
+    RegisterP2PClient(*service, second_id, {second});
+    RegisterP2PClient(*service, unused_id, {unused});
+    AddReplicaHelper(*service, "owned", 64, first_id, first.id);
+    auto unused_client = service->GetClientManager().GetClient(unused_id);
+    ASSERT_NE(unused_client, nullptr);
+
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = UUID{99, 99};
+    request.keys = {"new", "owned"};
+    request.object_sizes = {64, 64};
+    request.config.max_candidates = 1;
+    std::promise<P2PBatchGetWriteRouteResponse> completed;
+    auto result = completed.get_future();
+    std::jthread worker;
+    {
+        // Capacity ordering only needs the segment aggregate. Scoring the
+        // unused client would block here, so completion proves early exit.
+        // Always release this lock before joining, including on a failure.
+        SharedMutexLocker block(&unused_client->client_mutex_);
+        worker = std::jthread([&] {
+            completed.set_value(service->BatchGetWriteRoute(request));
+        });
+        EXPECT_EQ(result.wait_for(std::chrono::seconds(2)),
+                  std::future_status::ready);
+    }
+    worker.join();
+    auto response = result.get();
+    ASSERT_EQ(response.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK}));
+    ASSERT_EQ(response.responses.size(), 2u);
+    ASSERT_EQ(response.responses[0].size(), 1u);
+    ASSERT_EQ(response.responses[1].size(), 1u);
+    EXPECT_EQ(response.responses[0].front().client_id, first_id);
+    EXPECT_EQ(response.responses[1].front().client_id, second_id);
+    EXPECT_EQ(service->RemoveAll(), 1);
+}
+
+TEST_F(P2PMasterServiceTest, BatchWriteRouteFullRankingAndReturnAllVisitAllClients) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID first_id{1, 1}, best_id{2, 2}, next_id{3, 3};
+    auto first = MakeP2PSegment("first", 1000);
+    first.usage = 500;  // Most free bytes, but a lower free ratio.
+    auto best = MakeP2PSegment("best", 300);
+    auto next = MakeP2PSegment("next", 200);
+    RegisterP2PClient(*service, first_id, {first});
+    RegisterP2PClient(*service, best_id, {best});
+    RegisterP2PClient(*service, next_id, {next});
+    AddReplicaHelper(*service, "owned", 64, best_id, best.id);
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = UUID{99, 99};
+    request.keys = {"new", "owned"};
+    request.object_sizes = {64, 64};
+    request.config.max_candidates = 1;
+    request.config.early_return = false;
+    auto result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK}));
+    ASSERT_EQ(result.responses.size(), 2u);
+    ASSERT_EQ(result.responses[0].size(), 1u);
+    ASSERT_EQ(result.responses[1].size(), 1u);
+    EXPECT_EQ(result.responses[0].front().client_id, best_id);
+    EXPECT_EQ(result.responses[1].front().client_id, next_id);
+
+    request.config.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
+    request.config.early_return = true;
+    result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK}));
+    ASSERT_EQ(result.responses.size(), 2u);
+    ASSERT_EQ(result.responses[0].size(), 3u);
+    ASSERT_EQ(result.responses[1].size(), 2u);
+    EXPECT_EQ(result.responses[0][0].client_id, best_id);
+    EXPECT_EQ(result.responses[0][1].client_id, next_id);
+    EXPECT_EQ(result.responses[0][2].client_id, first_id);
+    EXPECT_EQ(result.responses[1][0].client_id, next_id);
+    EXPECT_EQ(result.responses[1][1].client_id, first_id);
+    EXPECT_EQ(service->RemoveAll(), 1);
+}
+
+TEST_F(P2PMasterServiceTest, BatchWriteRouteUsesCurrentCapacityTiersAndHealth) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const UUID first_id{1, 1}, second_id{2, 2};
     auto first = MakeP2PSegment("first", 1000, {}, 10);
     first.usage = 100;
     auto second_top = MakeP2PSegment("second-top", 100, {}, 10);
@@ -897,44 +972,59 @@ TEST_F(P2PMasterServiceTest, WriteRouteClientsFilterConfigBeforeKeySelection) {
         std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
     ASSERT_EQ(second->CheckHealth().second, P2PClientStatus::DISCONNECTION);
 
-    P2PGetWriteRouteRequest request{
-        .key = "new", .client_id = UUID{99, 99}, .object_size = 64};
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = UUID{99, 99};
+    request.keys = {"small", "large", "zero"};
+    request.object_sizes = {64, 128, 0};
     request.config.tag_filters = {"skip"};
     request.config.priority_limit = 5;
     request.config.max_candidates = 1;
-    request.config.early_return = true;
-    const auto clients =
-        service->GetWriteRouteClients(request.client_id, request.config);
-    ASSERT_TRUE(clients.has_value());
-    ASSERT_EQ(clients->size(), 2);
-    // Total capacity determines traversal order, while config selects the
-    // eligible tiers. Disconnected clients remain available for later recovery.
-    EXPECT_EQ((*clients)[0].client->get_client_id(), second_id);
-    EXPECT_EQ((*clients)[1].client->get_client_id(), first_id);
-
-    auto result = service->InnerGetWriteRoute(request, *clients);
-    ASSERT_TRUE(result.has_value());
-    ASSERT_EQ(result->size(), 1);
-    EXPECT_EQ(result->front().client_id, first_id);
-
+    auto result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.error_codes, std::vector<ErrorCode>(3, ErrorCode::OK));
+    ASSERT_EQ(result.responses.size(), 3u);
+    for (const auto& candidates : result.responses) {
+        ASSERT_EQ(candidates.size(), 1u);
+        EXPECT_EQ(candidates.front().client_id, first_id);
+    }
     ASSERT_EQ(second->Heartbeat().second, P2PClientStatus::HEALTH);
-    result = service->InnerGetWriteRoute(request, *clients);
-    ASSERT_TRUE(result.has_value());
-    ASSERT_EQ(result->size(), 1);
-    EXPECT_EQ(result->front().client_id, second_id);
+    result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.error_codes, std::vector<ErrorCode>(3, ErrorCode::OK));
+    ASSERT_EQ(result.responses.size(), 3u);
+    for (const auto& candidates : result.responses) {
+        ASSERT_EQ(candidates.size(), 1u);
+    }
+    EXPECT_EQ(result.responses[0].front().client_id, second_id);
+    EXPECT_EQ(result.responses[1].front().client_id, first_id);
+    EXPECT_EQ(result.responses[2].front().client_id, second_id);
 
-    request.object_size = 128;
-    result = service->InnerGetWriteRoute(request, *clients);
-    ASSERT_TRUE(result.has_value());
-    ASSERT_EQ(result->size(), 1);
-    EXPECT_EQ(result->front().client_id, first_id);
+    auto usage = second->UpdateSegmentUsages({{second_top.id, 100}});
+    ASSERT_EQ(usage.sub_results.front().error, ErrorCode::OK);
+    result = service->BatchGetWriteRoute(request);
+    ASSERT_EQ(result.error_codes, std::vector<ErrorCode>(3, ErrorCode::OK));
+    ASSERT_EQ(result.responses.size(), 3u);
+    for (const auto& candidates : result.responses) {
+        ASSERT_EQ(candidates.size(), 1u);
+    }
+    EXPECT_EQ(result.responses[0].front().client_id, first_id);
+    EXPECT_EQ(result.responses[1].front().client_id, first_id);
+    EXPECT_EQ(result.responses[2].front().client_id, second_id);
+    EXPECT_EQ(result.responses[2].front().available_capacity, 0u);
+
+    ASSERT_TRUE(service->UnregisterClient(second_id).has_value());
+    AddReplicaHelper(*service, "small", 64, first_id, first.id);
+    result = service->BatchGetWriteRoute(request);
+    EXPECT_EQ(result.error_codes,
+              (std::vector<ErrorCode>{ErrorCode::NO_AVAILABLE_CANDIDATE,
+                                      ErrorCode::OK, ErrorCode::OK}));
+    ASSERT_EQ(result.responses.size(), 3u);
+    EXPECT_TRUE(result.responses[0].empty());
+    EXPECT_EQ(service->RemoveAll(), 1);
 }
 
-TEST_F(P2PMasterServiceTest, WriteRouteClientsApplyLocalRemoteConfig) {
+TEST_F(P2PMasterServiceTest, BatchWriteRouteAppliesWeightsOncePerClient) {
     auto service = CreateService();
     service->GetClientManager().Stop();
-    const UUID local_id{1, 1};
-    const UUID remote_id{2, 2};
+    const UUID local_id{1, 1}, remote_id{2, 2};
     auto local = MakeP2PSegment("local", 1000);
     local.usage = 200;
     auto remote = MakeP2PSegment("remote", 2000);
@@ -943,32 +1033,30 @@ TEST_F(P2PMasterServiceTest, WriteRouteClientsApplyLocalRemoteConfig) {
     RegisterP2PClient(*service, local_id, {local});
     RegisterP2PClient(*service, remote_id, {remote});
     RegisterP2PClient(*service, UUID{3, 3}, {excluded});
-
-    P2PWriteRouteConfig config;
-    config.tag_filters = {"skip"};
-    config.remote_weight = 0;
-    auto clients = service->GetWriteRouteClients(local_id, config);
-    ASSERT_TRUE(clients.has_value());
-    ASSERT_EQ(clients->size(), 1);
-    EXPECT_EQ(clients->front().client->get_client_id(), local_id);
-    EXPECT_DOUBLE_EQ(clients->front().candidate.score, 0.8);
-
-    config.remote_weight = 1;
-    clients = service->GetWriteRouteClients(local_id, config);
-    ASSERT_TRUE(clients.has_value());
-    ASSERT_EQ(clients->size(), 1);
-    EXPECT_EQ(clients->front().client->get_client_id(), remote_id);
-    EXPECT_DOUBLE_EQ(clients->front().candidate.score, 0.5);
-
-    config.remote_weight = 0.25;
-    clients = service->GetWriteRouteClients(local_id, config);
-    ASSERT_TRUE(clients.has_value());
-    ASSERT_EQ(clients->size(), 2);
-    for (const auto& entry : *clients) {
-        EXPECT_DOUBLE_EQ(entry.candidate.score,
-                         entry.client->get_client_id() == local_id
-                             ? 0.8 * 0.75
-                             : 0.5 * 0.25);
+    P2PBatchGetWriteRouteRequest request;
+    request.client_id = local_id;
+    request.keys = {"first", "second"};
+    request.object_sizes = {64, 64};
+    request.config.tag_filters = {"skip"};
+    request.config.max_candidates = P2PWriteRouteConfig::RETURN_ALL_CANDIDATES;
+    for (double weight : {0.0, 1.0, 0.25}) {
+        request.config.remote_weight = weight;
+        auto result = service->BatchGetWriteRoute(request);
+        ASSERT_EQ(result.error_codes, std::vector<ErrorCode>(2, ErrorCode::OK));
+        ASSERT_EQ(result.responses.size(), 2u);
+        for (const auto& candidates : result.responses) {
+            ASSERT_EQ(candidates.size(), weight == 0.25 ? 2u : 1u);
+            for (const auto& candidate : candidates) {
+                if (candidate.client_id == local_id) {
+                    EXPECT_LT(weight, 1.0);
+                    EXPECT_DOUBLE_EQ(candidate.score, 0.8 * (1.0 - weight));
+                } else {
+                    EXPECT_EQ(candidate.client_id, remote_id);
+                    EXPECT_GT(weight, 0.0);
+                    EXPECT_DOUBLE_EQ(candidate.score, 0.5 * weight);
+                }
+            }
+        }
     }
 }
 

@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -152,19 +153,12 @@ class P2PMasterService final {
     void OnSegmentRemoved(const P2PRouteLocation& location);
     static OwnerClientSet CollectRouteOwnerClients(const P2PRouteEntry& route);
 
-    struct WriteRouteClient {
-        std::shared_ptr<P2PClientMeta> client;
-        P2PWriteCandidate candidate;
-    };
-    // Collect config-eligible candidates in the manager's strategy order.
-    // InnerGetWriteRoute rechecks health/key constraints and ranks the result.
-    auto GetWriteRouteClients(const UUID& requester_id,
-                              const P2PWriteRouteConfig& config) const
-        -> tl::expected<std::vector<WriteRouteClient>, ErrorCode>;
-    auto InnerGetWriteRoute(
-        const P2PGetWriteRouteRequest& req,
-        const std::vector<WriteRouteClient>& clients) const
-        -> tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>;
+    // Shared single/batch selection: snapshot owners, then visit each client
+    // once and assign its candidate only to keys still needing candidates.
+    P2PBatchGetWriteRouteResponse SelectWriteRoutes(
+        std::span<const std::string_view> keys,
+        std::span<const uint64_t> object_sizes, const UUID& requester_id,
+        const P2PWriteRouteConfig& config) const;
 
     auto BuildRouteDescriptor(const P2PRouteLocation& location,
                               uint64_t object_size) const
