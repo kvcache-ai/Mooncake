@@ -30,8 +30,8 @@ size_t P2PStandbyMetadataStore::GetRouteKeyCount() const {
     return routes_.size();
 }
 
-void P2PStandbyMetadataStore::RestoreRoute(
-    const std::string& key, const P2PStandbyRouteEntry& route) {
+void P2PStandbyMetadataStore::RestoreRoute(const std::string& key,
+                                           const P2PStandbyRouteEntry& route) {
     std::lock_guard<std::mutex> lock(mutex_);
     routes_[key] = route;
 }
@@ -76,9 +76,8 @@ bool P2PStandbyMetadataStore::PublishRoute(const std::string& key,
     route.locations.push_back(location);
     VLOG(1) << "P2PStandbyMetadataStore::PublishRoute key=" << key
             << " client=" << location.client_id.first << ":"
-            << location.client_id.second
-            << " seg=" << location.segment_id.first << ":"
-            << location.segment_id.second
+            << location.client_id.second << " seg=" << location.segment_id.first
+            << ":" << location.segment_id.second
             << " total_replicas=" << route.locations.size();
     return true;
 }
@@ -151,7 +150,7 @@ void P2PStandbyMetadataStore::UnregisterClient(const UUID& client_id) {
 }
 
 void P2PStandbyMetadataStore::MountSegment(const UUID& client_id,
-                                         const P2PSegment& segment) {
+                                           const P2PSegment& segment) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& info = clients_[client_id];
     info.client_id = client_id;  // In case client wasn't registered yet

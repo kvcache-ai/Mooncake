@@ -276,7 +276,7 @@ std::string P2POpLogApplier::GetFailureReason() const {
 }
 
 bool P2POpLogApplier::HandleApplyFailure(const OpLogEntry& entry,
-                                      const char* reason) {
+                                         const char* reason) {
     if (IsBestEffortOpLogEntry(entry)) {
         HAMetricManager::instance().inc_oplog_best_effort_apply_skipped();
         LOG(ERROR) << "OpLogApplier: skipping best-effort entry after apply "
@@ -314,7 +314,8 @@ bool P2POpLogApplier::HandleApplyFailure(const OpLogEntry& entry,
     return false;
 }
 
-size_t P2POpLogApplier::ApplyOpLogEntries(const std::vector<OpLogEntry>& entries) {
+size_t P2POpLogApplier::ApplyOpLogEntries(
+    const std::vector<OpLogEntry>& entries) {
     size_t applied_count = 0;
     for (const auto& entry : entries) {
         if (ApplyOpLogEntry(entry)) {
@@ -546,8 +547,8 @@ size_t P2POpLogApplier::ProcessPendingEntries() {
     return processed_count;
 }
 
-P2POpLogApplier::GapResolveResult P2POpLogApplier::TryResolveGapsOnceForPromotion(
-    size_t max_ids) {
+P2POpLogApplier::GapResolveResult
+P2POpLogApplier::TryResolveGapsOnceForPromotion(size_t max_ids) {
     GapResolveResult r;
     if (oplog_store_ == nullptr) {
         return r;

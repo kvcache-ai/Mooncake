@@ -99,8 +99,7 @@ class P2POpLogApplier {
    private:
     bool ApplyOpLogEntryInternal(const OpLogEntry& entry);
     bool IsBestEffortOpLogEntry(const OpLogEntry& entry) const;
-    bool IsLateSkippedDeleteLikeOpLogEntry(
-        const OpLogEntry& entry) const;
+    bool IsLateSkippedDeleteLikeOpLogEntry(const OpLogEntry& entry) const;
 
     // Apply individual P2P OpTypes. Return true on success.
     bool ApplyPublishRoute(const OpLogEntry& entry);

@@ -51,24 +51,24 @@ static_assert(
     coro_rpc::func_id<&P2PMasterRpcService::HeartbeatServiceReady>() ==
     1980024971u);
 
-static_assert(std::is_same_v<decltype(P2PGetReadRouteRequest::key),
-                             std::string_view>);
+static_assert(
+    std::is_same_v<decltype(P2PGetReadRouteRequest::key), std::string_view>);
 static_assert(std::is_same_v<decltype(P2PBatchGetReadRouteRequest::keys),
                              std::vector<std::string_view>>);
-static_assert(std::is_same_v<decltype(P2PGetWriteRouteRequest::key),
-                             std::string_view>);
+static_assert(
+    std::is_same_v<decltype(P2PGetWriteRouteRequest::key), std::string_view>);
 static_assert(std::is_same_v<decltype(P2PBatchGetWriteRouteRequest::keys),
                              std::vector<std::string_view>>);
-static_assert(std::is_same_v<decltype(P2PPublishRouteRequest::key),
-                             std::string_view>);
-static_assert(std::is_same_v<decltype(P2PWithdrawRouteRequest::key),
-                             std::string_view>);
+static_assert(
+    std::is_same_v<decltype(P2PPublishRouteRequest::key), std::string_view>);
+static_assert(
+    std::is_same_v<decltype(P2PWithdrawRouteRequest::key), std::string_view>);
 static_assert(std::is_same_v<decltype(P2PBatchWithdrawRouteRequest::key),
                              std::string_view>);
-static_assert(std::is_same_v<decltype(P2PPublishRouteOperation::key),
-                             std::string_view>);
-static_assert(std::is_same_v<decltype(P2PWithdrawRouteOperation::key),
-                             std::string_view>);
+static_assert(
+    std::is_same_v<decltype(P2PPublishRouteOperation::key), std::string_view>);
+static_assert(
+    std::is_same_v<decltype(P2PWithdrawRouteOperation::key), std::string_view>);
 
 TEST(P2PRpcTypesTest, BatchRouteKeysDeserializeAsBufferViews) {
     const std::string publish_key = "publish-key";

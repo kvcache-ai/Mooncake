@@ -94,8 +94,8 @@ class ScopedStandbyRegistryProviders final {
 
     ~ScopedStandbyRegistryProviders() { Reset(); }
 
-    ScopedStandbyRegistryProviders(
-        const ScopedStandbyRegistryProviders&) = delete;
+    ScopedStandbyRegistryProviders(const ScopedStandbyRegistryProviders&) =
+        delete;
     ScopedStandbyRegistryProviders& operator=(
         const ScopedStandbyRegistryProviders&) = delete;
 
@@ -114,8 +114,7 @@ class ScopedStandbyRegistryProviders final {
 
 std::unique_ptr<P2PMasterRpcService> CreateActiveService(
     const P2PMasterConfig& config, ViewVersionId view_version) {
-    auto service =
-        std::make_unique<P2PMasterRpcService>(config, view_version);
+    auto service = std::make_unique<P2PMasterRpcService>(config, view_version);
     service->init();
     return service;
 }
@@ -123,8 +122,8 @@ std::unique_ptr<P2PMasterRpcService> CreateActiveService(
 }  // namespace
 
 int P2PMaster::RunActiveRpcServers(coro_rpc::coro_rpc_server& server,
-                                  P2PMasterRpcService& p2p_service,
-                                  std::function<void()> before_start) {
+                                   P2PMasterRpcService& p2p_service,
+                                   std::function<void()> before_start) {
     const bool dedicated_heartbeat = config_.rpc.heartbeat_port > 0;
     RegisterP2PRpcService(server, p2p_service,
                           /*include_heartbeat=*/!dedicated_heartbeat);
@@ -280,9 +279,8 @@ int P2PMaster::RunWithHA() {
         EtcdLeaseId lease_id = 0;
         ViewVersionId view_version = 0;
         master_view->ElectLeader(local_endpoint, view_version, lease_id);
-        auto keep_leader_thread =
-            std::thread([server = server.get(), view = master_view.get(),
-                         lease_id] {
+        auto keep_leader_thread = std::thread(
+            [server = server.get(), view = master_view.get(), lease_id] {
                 view->KeepLeader(lease_id);
                 server->stop();
             });
@@ -335,11 +333,10 @@ int P2PMaster::RunWithHA() {
                 master_registry_heartbeat->UpdateRole("primary", false);
             }
         };
-        const int run_result = RunActiveRpcServers(
-            *server, *active_service, std::move(mark_primary));
+        const int run_result = RunActiveRpcServers(*server, *active_service,
+                                                   std::move(mark_primary));
 #else
-        const int run_result =
-            RunActiveRpcServers(*server, *active_service);
+        const int run_result = RunActiveRpcServers(*server, *active_service);
 #endif
         active_service.reset();
         master_view->CancelKeepAlive(lease_id);

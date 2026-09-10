@@ -112,7 +112,8 @@ TEST_F(ClientHttpMetricsTest, ConfigWithLabels) {
 
 // Test HTTP server endpoints directly
 // TODO(C1/C2): Separate these shared-metric fixture checks from the A00
-// centralized contract; do not expand or repair centralized baseline assertions.
+// centralized contract; do not expand or repair centralized baseline
+// assertions.
 TEST_F(ClientHttpMetricsTest, HttpEndpointsTest) {
     // Create a simple HTTP server that mimics the metrics server behavior
     const uint16_t test_port =

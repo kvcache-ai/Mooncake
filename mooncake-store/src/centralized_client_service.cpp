@@ -89,9 +89,8 @@ CentralizedClientService::BatchQueryIp(const std::vector<UUID>& client_ids) {
     return master_client_.BatchQueryIp(client_ids);
 }
 
-tl::expected<
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-    ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
 CentralizedClientService::QueryByRegex(const std::string& regex) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
@@ -139,8 +138,8 @@ void CentralizedClientService::Destroy() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        auto result = InnerUnmountSegment(
-            reinterpret_cast<void*>(segment.base), segment.size);
+        auto result = InnerUnmountSegment(reinterpret_cast<void*>(segment.base),
+                                          segment.size);
         if (!result) {
             LOG(ERROR) << "Failed to unmount segment: "
                        << toString(result.error());
@@ -442,8 +441,7 @@ CentralizedClientService::BatchQuery(
             auto configured =
                 ApplyCentralizedReadRouteConfig(response[i].value(), config);
             if (!configured) {
-                results.emplace_back(
-                    tl::make_unexpected(configured.error()));
+                results.emplace_back(tl::make_unexpected(configured.error()));
                 continue;
             }
             results.emplace_back(std::make_unique<CentralizedQueryResult>(
@@ -2163,12 +2161,11 @@ bool CentralizedClientService::ReconnectToMaster(
                << current_master_address;
     auto err = master_client_.Connect(current_master_address);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Reconnect failed to " << current_master_address
-                   << ": " << toString(err);
+        LOG(ERROR) << "Reconnect failed to " << current_master_address << ": "
+                   << toString(err);
         return false;
     }
-    LOG(INFO) << "Reconnected to centralized master "
-              << current_master_address;
+    LOG(INFO) << "Reconnected to centralized master " << current_master_address;
     return true;
 }
 
@@ -2182,8 +2179,7 @@ void CentralizedClientService::StartPing(
     const bool is_ha_mode = IsHAMode(master_server_entry);
     std::string current_master_address = master_server_entry;
     if (is_ha_mode) {
-        auto err =
-            ResolveMasterAddress(current_master_address);
+        auto err = ResolveMasterAddress(current_master_address);
         if (err != ErrorCode::OK) {
             LOG(WARNING) << "Failed to resolve master before starting ping; "
                             "the ping loop will retry"
@@ -2192,8 +2188,8 @@ void CentralizedClientService::StartPing(
     }
 
     heartbeat_running_ = true;
-    heartbeat_thread_ = std::thread(
-        [this, is_ha_mode, current_master_address]() mutable {
+    heartbeat_thread_ =
+        std::thread([this, is_ha_mode, current_master_address]() mutable {
             PingThreadMain(is_ha_mode, std::move(current_master_address));
         });
 }

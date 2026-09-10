@@ -376,10 +376,9 @@ void AsyncMetadataNotifier::SendBatch(std::vector<PendingOp>& batch,
                 auto ec = resp.publish_results[i];
                 if (ec != ErrorCode::OK &&
                     ec != ErrorCode::REPLICA_ALREADY_EXISTS) {
-                    LOG(WARNING)
-                        << "BatchSyncRoutes PUBLISH key="
-                        << req.publish_operations[i].key
-                        << " failed: " << toString(ec);
+                    LOG(WARNING) << "BatchSyncRoutes PUBLISH key="
+                                 << req.publish_operations[i].key
+                                 << " failed: " << toString(ec);
                     if (failure_cb_) {
                         failure_cb_(req.publish_operations[i].key,
                                     req.publish_operations[i].segment_id, ec);
@@ -390,8 +389,8 @@ void AsyncMetadataNotifier::SendBatch(std::vector<PendingOp>& batch,
                 if (resp.withdraw_results[i] != ErrorCode::OK) {
                     LOG(WARNING)
                         << "BatchSyncRoutes WITHDRAW key="
-                        << req.withdraw_operations[i].key << " failed: "
-                        << toString(resp.withdraw_results[i]);
+                        << req.withdraw_operations[i].key
+                        << " failed: " << toString(resp.withdraw_results[i]);
                 }
             }
             return;

@@ -430,8 +430,8 @@ class RedisChaosTest : public ::testing::Test {
         while (std::chrono::steady_clock::now() < deadline) {
             std::string master_address;
             ViewVersionId next_version = 0;
-            auto err = master_view_->GetMasterView(master_address,
-                                                   next_version);
+            auto err =
+                master_view_->GetMasterView(master_address, next_version);
             if (err == ErrorCode::OK) {
                 int index = MasterIndexFromAddress(master_address);
                 if (index >= 0 && index < kMasterNum) {

@@ -33,7 +33,6 @@ namespace mooncake {
 
 using WriteConfig = std::variant<ReplicateConfig, WriteRouteRequestConfig>;
 
-
 /**
  * @brief Result of a query operation containing replica information
  */
@@ -536,8 +535,8 @@ class ClientService {
     tl::expected<ViewVersionId, ErrorCode> RegisterClient()
         EXCLUDES(registration_mutex_);
 
-    virtual tl::expected<ViewVersionId, ErrorCode>
-    InnerRegisterClient() REQUIRES(registration_mutex_) = 0;
+    virtual tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient()
+        REQUIRES(registration_mutex_) = 0;
 
     /**
      * @brief Hook invoked when a local (client-initiated) request enters

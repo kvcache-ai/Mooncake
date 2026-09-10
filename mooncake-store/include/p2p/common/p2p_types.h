@@ -115,8 +115,8 @@ YLT_REFL(WriteRouteRequestConfig, max_candidates, strategy, remote_weight,
 
 inline std::ostream& operator<<(std::ostream& os,
                                 const WriteRouteRequestConfig& config) {
-    os << "WriteRouteRequestConfig: { max_candidates: "
-       << config.max_candidates << ", strategy: " << config.strategy
+    os << "WriteRouteRequestConfig: { max_candidates: " << config.max_candidates
+       << ", strategy: " << config.strategy
        << ", remote_weight: " << config.remote_weight
        << ", local_write_waterline: " << config.local_write_waterline
        << ", top_tier_only: " << (config.top_tier_only ? "true" : "false")

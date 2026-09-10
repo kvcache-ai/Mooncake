@@ -122,11 +122,8 @@ bool MasterProcessHandler::start() {
         // Execute the master
         std::string rpc_address_arg = "--rpc-address=" + config_.rpc_address;
         std::string rpc_port_arg = "--rpc-port=" + std::to_string(port_);
-        std::vector<std::string> args = {
-            master_path_,
-            "--enable-ha=true",
-            rpc_address_arg,
-            rpc_port_arg};
+        std::vector<std::string> args = {master_path_, "--enable-ha=true",
+                                         rpc_address_arg, rpc_port_arg};
 
         if (config_.max_client_per_key.has_value()) {
             args.emplace_back("--max-client-per-key=" +

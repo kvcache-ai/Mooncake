@@ -103,19 +103,17 @@ P2PClientService::P2PClientService(
         std::make_unique<RuntimeConfigStore>(DeploymentMode::P2P);
 }
 
-bool P2PClientService::IsHAMode(
-    const std::string& master_server_entry) const {
+bool P2PClientService::IsHAMode(const std::string& master_server_entry) const {
     return master_server_entry.rfind(kEtcdPrefix, 0) == 0 ||
            master_server_entry.rfind(kRedisPrefix, 0) == 0;
 }
 
-void P2PClientService::SetMasterDiscoveryConfig(
-    const P2PClientConfig& config) {
+void P2PClientService::SetMasterDiscoveryConfig(const P2PClientConfig& config) {
     master_view_.reset();
     master_view_entry_.clear();
-    master_discovery_config_.cluster_id =
-        config.redis_cluster_id.empty() ? DEFAULT_CLUSTER_ID
-                                        : config.redis_cluster_id;
+    master_discovery_config_.cluster_id = config.redis_cluster_id.empty()
+                                              ? DEFAULT_CLUSTER_ID
+                                              : config.redis_cluster_id;
     master_discovery_config_.redis_username = config.redis_username;
     master_discovery_config_.redis_password = config.redis_password;
     master_discovery_config_.redis_db_index = config.redis_db_index;
@@ -198,8 +196,7 @@ ErrorCode P2PClientService::ConnectToMaster(
     return master_client_.Connect(master_server_entry);
 }
 
-void P2PClientService::StartHeartbeat(
-    const std::string& master_server_entry) {
+void P2PClientService::StartHeartbeat(const std::string& master_server_entry) {
     if (heartbeat_running_) {
         LOG(WARNING) << "Heartbeat thread already running, skip starting";
         return;
@@ -220,15 +217,14 @@ void P2PClientService::StartHeartbeat(
     }
 
     heartbeat_running_ = true;
-    heartbeat_thread_ = std::thread(
-        [this, is_ha_mode, current_master_address]() mutable {
-            HeartbeatThreadMain(is_ha_mode,
-                                std::move(current_master_address));
+    heartbeat_thread_ =
+        std::thread([this, is_ha_mode, current_master_address]() mutable {
+            HeartbeatThreadMain(is_ha_mode, std::move(current_master_address));
         });
 }
 
-void P2PClientService::HeartbeatThreadMain(
-    bool is_ha_mode, std::string current_master_address) {
+void P2PClientService::HeartbeatThreadMain(bool is_ha_mode,
+                                           std::string current_master_address) {
     constexpr int kMaxHeartbeatFailCount = 10;
     constexpr int kHeartbeatIntervalMs = 1000;
     int heartbeat_fail_count = 0;
@@ -243,8 +239,8 @@ void P2PClientService::HeartbeatThreadMain(
             register_client_future = std::future<void>();
         }
 
-        auto heartbeat_result = master_client_.Heartbeat(
-            build_heartbeat_request());
+        auto heartbeat_result =
+            master_client_.Heartbeat(build_heartbeat_request());
         if (heartbeat_result) {
             heartbeat_fail_count = 0;
             HandleHeartbeatResponse(heartbeat_result.value(),
@@ -324,8 +320,8 @@ void P2PClientService::HandleHeartbeatTaskResult(
     }
 }
 
-bool P2PClientService::ReconnectToMaster(
-    bool is_ha_mode, std::string& current_master_address) {
+bool P2PClientService::ReconnectToMaster(bool is_ha_mode,
+                                         std::string& current_master_address) {
     if (is_ha_mode) {
         LOG(ERROR) << "Heartbeat failure threshold exceeded; fetching latest "
                       "P2P master view and reconnecting";
@@ -352,8 +348,8 @@ bool P2PClientService::ReconnectToMaster(
                << current_master_address;
     auto err = master_client_.Connect(current_master_address);
     if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Reconnect failed to " << current_master_address
-                   << ": " << toString(err);
+        LOG(ERROR) << "Reconnect failed to " << current_master_address << ": "
+                   << toString(err);
         return false;
     }
     LOG(INFO) << "Reconnected to P2P master " << current_master_address;
@@ -374,9 +370,8 @@ P2PClientService::BatchQueryIp(const std::vector<UUID>& client_ids) {
     return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
 }
 
-tl::expected<
-    std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
-    ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
 P2PClientService::QueryByRegex(const std::string& regex) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
@@ -624,8 +619,8 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << ", queue_size=" << config.async_route_queue_size;
     }
 
-    // TODO(C2): Bind atomically, obtain the actual listener port, and publish it
-    // in registration after runtime ownership is split; config port 0 alone
+    // TODO(C2): Bind atomically, obtain the actual listener port, and publish
+    // it in registration after runtime ownership is split; config port 0 alone
     // does not fix the current getFreeTcpPort-to-bind race.
     // 9. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_, metrics_);
@@ -943,13 +938,13 @@ std::vector<P2PSegment> P2PClientService::CollectTierSegments() const {
     return segments;
 }
 
-tl::expected<ViewVersionId, ErrorCode>
-P2PClientService::InnerRegisterClient() {
+tl::expected<ViewVersionId, ErrorCode> P2PClientService::InnerRegisterClient() {
     P2PRegisterClientRequest req;
     req.client_id = client_id_;
     req.segments = CollectTierSegments();
     req.ip_address = local_ip_;
-    // TODO(C2): Publish the bound listener port, not an unreserved probe result.
+    // TODO(C2): Publish the bound listener port, not an unreserved probe
+    // result.
     req.rpc_port = client_rpc_port_;
 
     auto register_result = master_client_.RegisterClient(req);
@@ -1974,8 +1969,8 @@ P2PClientService::BatchFetchReadRoutes(
     // Single batch RPC to master
     std::vector<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
         responses;
-    responses = master_client_.BatchGetReadRoute(
-        miss_keys, ToP2PReadRouteConfig(config));
+    responses = master_client_.BatchGetReadRoute(miss_keys,
+                                                 ToP2PReadRouteConfig(config));
     for (size_t k = 0; k < responses.size(); ++k) {
         if (!responses[k]) {
             if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -2463,9 +2458,8 @@ P2PClientService::BuildRouteIter(std::string_view key,
 async_simple::coro::Lazy<std::vector<P2PClientService::ResolvedRoute>>
 P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
                                                const ReadRouteConfig& config) {
-    auto replica_result =
-        co_await master_client_.AsyncGetReadRoute(
-            key, ToP2PReadRouteConfig(config));
+    auto replica_result = co_await master_client_.AsyncGetReadRoute(
+        key, ToP2PReadRouteConfig(config));
     if (!replica_result) {
         if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to query replica list, key=" << key
@@ -2597,8 +2591,8 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // 3) Local miss + healthy: fall back to master.
-    auto result = master_client_.GetReadRoute(
-        object_key, ToP2PReadRouteConfig(config));
+    auto result =
+        master_client_.GetReadRoute(object_key, ToP2PReadRouteConfig(config));
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
                      << ", key=" << object_key << ", error=" << result.error();
@@ -2645,8 +2639,7 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
     for (size_t i = 0; i < responses.size(); ++i) {
         if (responses[i]) {
             results.emplace_back(std::make_unique<QueryResult>(
-                ToFacadeReplicaDescriptors(
-                    std::move(responses[i].value()))));
+                ToFacadeReplicaDescriptors(std::move(responses[i].value()))));
         } else {
             results.emplace_back(tl::unexpected(responses[i].error()));
         }

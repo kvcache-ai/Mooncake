@@ -283,8 +283,8 @@ class P2PClientService final : public ClientService {
      * LOCAL_ONLY (heartbeat stopped), also restarts the heartbeat and drives
      * metadata recovery back to FULL.
      */
-    tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient()
-        override REQUIRES(registration_mutex_);
+    tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient() override
+        REQUIRES(registration_mutex_);
 
     /**
      * @brief Unregister body without the in-flight guard. Used by Stop() to
@@ -307,11 +307,10 @@ class P2PClientService final : public ClientService {
                              std::string current_master_address);
     bool ReconnectToMaster(bool is_ha_mode,
                            std::string& current_master_address);
-    void HandleHeartbeatResponse(
-        const P2PHeartbeatResponse& response,
-        const std::string& current_master_address,
-        const std::function<void()>& register_client,
-        std::future<void>& register_client_future);
+    void HandleHeartbeatResponse(const P2PHeartbeatResponse& response,
+                                 const std::string& current_master_address,
+                                 const std::function<void()>& register_client,
+                                 std::future<void>& register_client_future);
     void HandleHeartbeatTaskResult(const HeartbeatTaskResult& task_result);
     P2PHeartbeatRequest build_heartbeat_request();
     void OnHAEvent(HAEvent event);

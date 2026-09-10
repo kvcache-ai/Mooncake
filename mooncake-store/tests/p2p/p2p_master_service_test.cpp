@@ -669,8 +669,10 @@ TEST_F(P2PMasterServiceTest, BatchWriteRoutesMatchSingleRequests) {
                 auto batch = service->BatchGetWriteRoute(request);
                 ASSERT_EQ(batch.responses.size(), request.keys.size());
                 ASSERT_EQ(batch.error_codes.size(), request.keys.size());
-                EXPECT_EQ(batch.error_codes[2], ErrorCode::NO_AVAILABLE_CANDIDATE);
-                EXPECT_EQ(batch.error_codes[3], ErrorCode::REPLICA_NUM_EXCEEDED);
+                EXPECT_EQ(batch.error_codes[2],
+                          ErrorCode::NO_AVAILABLE_CANDIDATE);
+                EXPECT_EQ(batch.error_codes[3],
+                          ErrorCode::REPLICA_NUM_EXCEEDED);
                 for (size_t i = 0; i < request.keys.size(); ++i) {
                     auto single = service->GetWriteRoute(
                         {.key = request.keys[i],
@@ -795,9 +797,9 @@ TEST_F(P2PMasterServiceTest, RandomBatchWriteRouteSharesClientOrder) {
     RegisterP2PClient(*service, owner, {owner_segment});
     AddReplicaHelper(*service, "owned", 64, owner, owner_segment.id);
     for (uint64_t i = 2; i <= 4; ++i) {
-        RegisterP2PClient(*service, UUID{i, i},
-                         {MakeP2PSegment("remote-" + std::to_string(i),
-                                         i * 4096)});
+        RegisterP2PClient(
+            *service, UUID{i, i},
+            {MakeP2PSegment("remote-" + std::to_string(i), i * 4096)});
     }
     P2PBatchGetWriteRouteRequest request;
     request.client_id = owner;
@@ -843,18 +845,22 @@ TEST_F(P2PMasterServiceTest, BatchWriteRouteCompletesKeysAtDifferentClients) {
 
     P2PBatchGetWriteRouteRequest request;
     request.client_id = UUID{99, 99};
-    request.keys = {"new", "owned-a", "capped", "large", "owned-ab",
-                    "impossible", "owned-a"};
+    request.keys = {"new",      "owned-a",    "capped", "large",
+                    "owned-ab", "impossible", "owned-a"};
     request.object_sizes = {64, 64, 64, 250, 64, 400, 64};
     request.config.max_candidates = 1;
     auto result = service->BatchGetWriteRoute(request);
     ASSERT_EQ(result.responses.size(), request.keys.size());
     EXPECT_EQ(result.error_codes,
-              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
-                  ErrorCode::REPLICA_NUM_EXCEEDED, ErrorCode::OK, ErrorCode::OK,
+              (std::vector<ErrorCode>{
+                  ErrorCode::OK, ErrorCode::OK, ErrorCode::REPLICA_NUM_EXCEEDED,
+                  ErrorCode::OK, ErrorCode::OK,
                   ErrorCode::NO_AVAILABLE_CANDIDATE, ErrorCode::OK}));
-    const std::array<std::pair<size_t, UUID>, 5> expected = {{
-        {0, first_id}, {1, second_id}, {3, first_id}, {4, third_id}, {6, second_id}}};
+    const std::array<std::pair<size_t, UUID>, 5> expected = {{{0, first_id},
+                                                              {1, second_id},
+                                                              {3, first_id},
+                                                              {4, third_id},
+                                                              {6, second_id}}};
     for (const auto& [index, client_id] : expected) {
         // Completed keys must not collect more clients while another key is
         // still pending, including one that cannot be satisfied at all.
@@ -893,9 +899,8 @@ TEST_F(P2PMasterServiceTest, BatchWriteRouteStopsBeforeUnusedClient) {
         // unused client would block here, so completion proves early exit.
         // Always release this lock before joining, including on a failure.
         SharedMutexLocker block(&unused_client->client_mutex_);
-        worker = std::jthread([&] {
-            completed.set_value(service->BatchGetWriteRoute(request));
-        });
+        worker = std::jthread(
+            [&] { completed.set_value(service->BatchGetWriteRoute(request)); });
         EXPECT_EQ(result.wait_for(std::chrono::seconds(2)),
                   std::future_status::ready);
     }
@@ -911,7 +916,8 @@ TEST_F(P2PMasterServiceTest, BatchWriteRouteStopsBeforeUnusedClient) {
     EXPECT_EQ(service->RemoveAll(), 1);
 }
 
-TEST_F(P2PMasterServiceTest, BatchWriteRouteFullRankingAndReturnAllVisitAllClients) {
+TEST_F(P2PMasterServiceTest,
+       BatchWriteRouteFullRankingAndReturnAllVisitAllClients) {
     auto service = CreateService();
     service->GetClientManager().Stop();
     const UUID first_id{1, 1}, best_id{2, 2}, next_id{3, 3};
@@ -968,7 +974,8 @@ TEST_F(P2PMasterServiceTest, BatchWriteRouteUsesCurrentCapacityTiersAndHealth) {
     RegisterP2PClient(*service, UUID{3, 3}, {excluded});
     auto second = service->GetClientManager().GetClient(second_id);
     ASSERT_NE(second, nullptr);
-    second->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
+    second->health_state_.last_heartbeat =
+        std::chrono::steady_clock::now() -
         std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
     ASSERT_EQ(second->CheckHealth().second, P2PClientStatus::DISCONNECTION);
 
@@ -1311,18 +1318,18 @@ TEST_F(P2PMasterServiceTest, BatchSyncRoutesAppliesMixedOperations) {
 
     auto response = service->BatchSyncRoutes(request);
     EXPECT_EQ(response.publish_results,
-              (std::vector<ErrorCode>{ErrorCode::OK,
-                                      ErrorCode::SEGMENT_NOT_FOUND,
-                                      ErrorCode::OK}));
-    EXPECT_EQ(response.withdraw_results,
-              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
-                                      ErrorCode::OK}));
+              (std::vector<ErrorCode>{
+                  ErrorCode::OK, ErrorCode::SEGMENT_NOT_FOUND, ErrorCode::OK}));
+    EXPECT_EQ(
+        response.withdraw_results,
+        (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK, ErrorCode::OK}));
     EXPECT_TRUE(*service->ExistKey("new"));
     EXPECT_FALSE(*service->ExistKey("existing"));
     EXPECT_FALSE(*service->ExistKey("cycle"));
 }
 
-TEST_F(P2PMasterServiceTest, BatchSyncRoutesPreservesDuplicateErrorsAcrossShards) {
+TEST_F(P2PMasterServiceTest,
+       BatchSyncRoutesPreservesDuplicateErrorsAcrossShards) {
     auto service = CreateService();
     const auto client = generate_uuid();
     const auto segment = MakeP2PSegment();
@@ -1338,7 +1345,8 @@ TEST_F(P2PMasterServiceTest, BatchSyncRoutesPreservesDuplicateErrorsAcrossShards
     std::string same, other;
     for (size_t i = 0; i < 100000 && (same.empty() || other.empty()); ++i) {
         std::string key = "batch-shard-" + std::to_string(i);
-        if (service->GetRouteShardIndex(key) == service->GetRouteShardIndex(first)) {
+        if (service->GetRouteShardIndex(key) ==
+            service->GetRouteShardIndex(first)) {
             if (same.empty()) same = key;
         } else if (other.empty()) {
             other = key;
@@ -1354,10 +1362,11 @@ TEST_F(P2PMasterServiceTest, BatchSyncRoutesPreservesDuplicateErrorsAcrossShards
         {.key = first, .object_size = 65, .segment_id = segment.id},
     };
     response = service->BatchSyncRoutes(request);
-    EXPECT_EQ(response.publish_results,
-              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
-                                      ErrorCode::REPLICA_ALREADY_EXISTS,
-                                      ErrorCode::OK, ErrorCode::INVALID_PARAMS}));
+    EXPECT_EQ(
+        response.publish_results,
+        (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
+                                ErrorCode::REPLICA_ALREADY_EXISTS,
+                                ErrorCode::OK, ErrorCode::INVALID_PARAMS}));
     EXPECT_TRUE(response.withdraw_results.empty());
     EXPECT_EQ(service->GetKeyCount(), 3u);
     auto route = service->GetReadRoute(first);
@@ -1377,12 +1386,13 @@ TEST_F(P2PMasterServiceTest, BatchSyncRoutesPreservesDuplicateErrorsAcrossShards
         EXPECT_TRUE(response.publish_results.empty());
         EXPECT_EQ(response.withdraw_results,
                   std::vector<ErrorCode>(request.withdraw_operations.size(),
-                                          ErrorCode::OK));
+                                         ErrorCode::OK));
         EXPECT_EQ(service->GetKeyCount(), 0u);
     }
 }
 
-TEST_F(P2PMasterServiceTest, RegexAndRoutesRemainConsistentDuringClientRemoval) {
+TEST_F(P2PMasterServiceTest,
+       RegexAndRoutesRemainConsistentDuringClientRemoval) {
     auto service = CreateService();
     service->GetClientManager().Stop();
     auto& metrics = P2PMasterMetricManager::instance();
@@ -1398,13 +1408,16 @@ TEST_F(P2PMasterServiceTest, RegexAndRoutesRemainConsistentDuringClientRemoval) 
     std::jthread mutations([&] {
         start.arrive_and_wait();
         for (int i = 0; i < 128; ++i) {
-            auto published = service->PublishRoute(
-                {.key = "live", .object_size = 64,
-                 .client_id = writer, .segment_id = live_segment.id});
+            auto published =
+                service->PublishRoute({.key = "live",
+                                       .object_size = 64,
+                                       .client_id = writer,
+                                       .segment_id = live_segment.id});
             EXPECT_TRUE(published.has_value());
-            auto withdrawn = service->WithdrawRoute(
-                {.key = "live", .client_id = writer,
-                 .segment_id = live_segment.id});
+            auto withdrawn =
+                service->WithdrawRoute({.key = "live",
+                                        .client_id = writer,
+                                        .segment_id = live_segment.id});
             if (!withdrawn) {
                 EXPECT_TRUE(withdrawn.error() == ErrorCode::OBJECT_NOT_FOUND ||
                             withdrawn.error() == ErrorCode::REPLICA_NOT_FOUND);
@@ -1418,7 +1431,8 @@ TEST_F(P2PMasterServiceTest, RegexAndRoutesRemainConsistentDuringClientRemoval) 
             if (routes) {
                 for (const auto& route : *routes) {
                     EXPECT_EQ(route.object_size, 64u);
-                    EXPECT_TRUE(route.client_id == retiring || route.client_id == writer);
+                    EXPECT_TRUE(route.client_id == retiring ||
+                                route.client_id == writer);
                 }
             } else {
                 EXPECT_TRUE(routes.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -1432,7 +1446,8 @@ TEST_F(P2PMasterServiceTest, RegexAndRoutesRemainConsistentDuringClientRemoval) 
     });
     std::jthread lifecycle([&] {
         start.arrive_and_wait();
-        EXPECT_TRUE(service->UnmountSegment(old_segment.id, retiring).has_value());
+        EXPECT_TRUE(
+            service->UnmountSegment(old_segment.id, retiring).has_value());
         EXPECT_TRUE(service->UnregisterClient(retiring).has_value());
     });
     start.arrive_and_wait();
@@ -1454,8 +1469,7 @@ TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
     std::vector<P2PSegment> segments;
     segments.reserve(kReplicaCount);
     for (size_t index = 0; index < kReplicaCount; ++index) {
-        segments.push_back(MakeP2PSegment("segment-" +
-                                         std::to_string(index)));
+        segments.push_back(MakeP2PSegment("segment-" + std::to_string(index)));
     }
     RegisterP2PClient(*service, client_id, segments);
 
@@ -1471,8 +1485,7 @@ TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
             request.client_id = client_id;
             request.segment_id = segments[index].id;
             auto result = service->PublishRoute(request);
-            errors[index] =
-                result.has_value() ? ErrorCode::OK : result.error();
+            errors[index] = result.has_value() ? ErrorCode::OK : result.error();
         });
     }
     for (auto& worker : workers) {
@@ -1492,8 +1505,7 @@ TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
             request.client_id = client_id;
             request.segment_id = segments[index].id;
             auto result = service->WithdrawRoute(request);
-            errors[index] =
-                result.has_value() ? ErrorCode::OK : result.error();
+            errors[index] = result.has_value() ? ErrorCode::OK : result.error();
         });
     }
     for (auto& worker : workers) {
@@ -1552,8 +1564,7 @@ TEST_F(P2PMasterServiceTest, UnregisterClientPartialKeepsOtherOwner) {
     auto get_res = service->GetReadRoute("key1");
     ASSERT_TRUE(get_res.has_value());
     EXPECT_EQ(1, get_res.value().size());
-    EXPECT_EQ(client2,
-              get_res.value()[0].client_id);
+    EXPECT_EQ(client2, get_res.value()[0].client_id);
 }
 
 TEST_F(P2PMasterServiceTest,
@@ -1576,8 +1587,7 @@ TEST_F(P2PMasterServiceTest,
     auto route = service->GetReadRoute("key1");
     ASSERT_TRUE(route.has_value());
     ASSERT_EQ(route.value().size(), 1);
-    EXPECT_EQ(route.value().front().client_id,
-              client2);
+    EXPECT_EQ(route.value().front().client_id, client2);
 }
 
 TEST_F(P2PMasterServiceTest, UnregisterClientIdempotent) {
@@ -1607,8 +1617,8 @@ TEST_F(P2PMasterServiceTest, CapturedClientCannotPublishAfterUnregister) {
     auto mount = old_client->MountSegment(segment);
     ASSERT_FALSE(mount.has_value());
     EXPECT_EQ(mount.error(), ErrorCode::CLIENT_UNHEALTHY);
-    auto publish = service->InnerPublishRoute("late", client_id, segment.id,
-                                               64, old_client);
+    auto publish = service->InnerPublishRoute("late", client_id, segment.id, 64,
+                                              old_client);
     ASSERT_FALSE(publish.has_value());
     EXPECT_EQ(publish.error(), ErrorCode::CLIENT_UNHEALTHY);
     EXPECT_EQ(old_client->GetAvailableCapacity(), 0);
@@ -1687,7 +1697,8 @@ TEST_F(P2PMasterServiceTest, RegexHandlesEmptyInvalidAndUnmatchedPatterns) {
     EXPECT_EQ(service->RemoveAll(), 1);
 }
 
-TEST_F(P2PMasterServiceTest, RegexPreservesLongKeysAndAllLocationsAcrossShards) {
+TEST_F(P2PMasterServiceTest,
+       RegexPreservesLongKeysAndAllLocationsAcrossShards) {
     auto service = CreateService();
     auto& metrics = P2PMasterMetricManager::instance();
     const auto initial_key_count = metrics.get_key_count();
@@ -1803,7 +1814,8 @@ TEST_F(P2PMasterServiceTest, ReadRouteChoosesEligibleTierAndRechecksHealth) {
     EXPECT_EQ(route->front().segment_id, high.id);
     auto client = service->GetClientManager().GetClient(client_id);
     ASSERT_NE(client, nullptr);
-    client->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
+    client->health_state_.last_heartbeat =
+        std::chrono::steady_clock::now() -
         std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
     ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
     route = service->GetReadRoute("key", config);
@@ -1857,11 +1869,9 @@ TEST_F(P2PMasterServiceTest, GetReplicaListAggregatesPerClient) {
     ASSERT_TRUE(res.has_value());
     // Two segment-replicas on the same client collapse to one route.
     EXPECT_EQ(1, res.value().size());
-    EXPECT_EQ(client_id,
-              res.value()[0].client_id);
+    EXPECT_EQ(client_id, res.value()[0].client_id);
     // Representative is the highest-priority segment.
-    EXPECT_EQ(seg_hi.id,
-              res.value()[0].segment_id);
+    EXPECT_EQ(seg_hi.id, res.value()[0].segment_id);
 }
 
 // ============================================================

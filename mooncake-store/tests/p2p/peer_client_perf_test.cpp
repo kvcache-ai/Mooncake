@@ -56,7 +56,8 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
 // throughput and concurrency benefits.
 // Failure-path RPC overhead: this fixture does not initialize TransferEngine.
 // TODO(C5): Add successful data-path benchmarks with error counts and byte
-// validation after data-path ownership is split; keep same-key values immutable.
+// validation after data-path ownership is split; keep same-key values
+// immutable.
 class PeerClientPerfTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -481,8 +482,10 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         const char* metadata_addr = std::getenv("MC_METADATA_ADDR");
         const char* local_hostname = std::getenv("MC_LOCAL_HOSTNAME");
 
-        if (!metadata_addr || !*metadata_addr || !local_hostname || !*local_hostname) {
-            GTEST_SKIP() << "MC_METADATA_ADDR and MC_LOCAL_HOSTNAME are required";
+        if (!metadata_addr || !*metadata_addr || !local_hostname ||
+            !*local_hostname) {
+            GTEST_SKIP()
+                << "MC_METADATA_ADDR and MC_LOCAL_HOSTNAME are required";
         }
 
         local_hostname_ = std::string(local_hostname);
@@ -565,8 +568,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         std::string endpoint = "127.0.0.1:" + std::to_string(actual_port);
         auto connect_result = peer_client_->Connect(endpoint);
         ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
-
-
     }
 
     void TearDown() override {

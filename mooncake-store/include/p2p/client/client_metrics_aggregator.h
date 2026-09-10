@@ -51,7 +51,8 @@ class ClientMetricsAggregator {
                               CounterGroup& group);
 
     // Updates retention aggregates using this client's stored baseline.
-    // Callers must hold mutex_ and replace or erase the stored snapshot afterwards.
+    // Callers must hold mutex_ and replace or erase the stored snapshot
+    // afterwards.
     void UpdateRetention(const UUID& client_id,
                          const KeyRetentionSnapshot& current);
 

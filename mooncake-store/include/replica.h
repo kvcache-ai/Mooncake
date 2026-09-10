@@ -176,8 +176,7 @@ class Replica {
           status_(status),
           refcnt_(0) {
         // Automatic update allocated_file_size via RAII
-        MasterMetricManager::instance().inc_allocated_file_size(
-            object_size);
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
     Replica(UUID client_id, uint64_t object_size,

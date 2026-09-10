@@ -46,8 +46,7 @@ class InProcP2PMasterConfigBuilder {
         return *this;
     }
 
-    InProcP2PMasterConfigBuilder& set_heartbeat_rpc_thread_num(
-        uint32_t value) {
+    InProcP2PMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t value) {
         config_.heartbeat_rpc_thread_num = value;
         return *this;
     }
@@ -81,8 +80,7 @@ class InProcP2PMaster {
 
             P2PMasterConfig wms_cfg;
             wms_cfg.metrics.enable_reporting = false;
-            wms_cfg.rpc.heartbeat_port =
-                config.heartbeat_rpc_port.value_or(0);
+            wms_cfg.rpc.heartbeat_port = config.heartbeat_rpc_port.value_or(0);
             wms_cfg.routes.max_clients_per_key = 0;  // no limit for P2P
 
             if (config.client_live_ttl_sec.has_value()) {

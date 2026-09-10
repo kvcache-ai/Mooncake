@@ -27,9 +27,9 @@ P2PSegment Segment(UUID id = {1, 1}, std::string name = "segment",
                       .usage = usage};
 }
 
-std::shared_ptr<P2PClientMeta> Client(
-    UUID id = {10, 10}, int64_t disconnect_timeout_sec = 2,
-    int64_t crash_timeout_sec = 5) {
+std::shared_ptr<P2PClientMeta> Client(UUID id = {10, 10},
+                                      int64_t disconnect_timeout_sec = 2,
+                                      int64_t crash_timeout_sec = 5) {
     P2PClientMeta::SetTimeouts(disconnect_timeout_sec, crash_timeout_sec);
     return std::make_shared<P2PClientMeta>(id, "127.0.0.1", 50051);
 }
@@ -125,9 +125,9 @@ TEST(P2PClientMetaTest, RecycleInvokesSegmentRemovalCallback) {
 TEST(P2PClientMetaTest, ConcurrentRecycleOnlyRemovesSegmentsOnce) {
     auto client = Client({7, 7});
     for (uint64_t i = 0; i < 32; ++i) {
-        ASSERT_TRUE(client->MountSegment(
-                              Segment({i + 1, i + 1}, std::to_string(i)))
-                        .has_value());
+        ASSERT_TRUE(
+            client->MountSegment(Segment({i + 1, i + 1}, std::to_string(i)))
+                .has_value());
     }
     std::atomic<size_t> removed{0};
     client->SetSegmentRemovalCallback(
@@ -278,12 +278,12 @@ TEST(P2PClientMetaTest, UpdateUsageReportsPerSegmentErrors) {
 
 TEST(P2PClientMetaTest, ScoresOnlyEligibleSegments) {
     auto client = Client();
-    ASSERT_TRUE(client->MountSegment(
-                          Segment({1, 1}, "slow", 1000, 1, {"cold"}, 100))
-                    .has_value());
-    ASSERT_TRUE(client->MountSegment(
-                          Segment({2, 2}, "fast", 2000, 10, {"hot"}, 500))
-                    .has_value());
+    ASSERT_TRUE(
+        client->MountSegment(Segment({1, 1}, "slow", 1000, 1, {"cold"}, 100))
+            .has_value());
+    ASSERT_TRUE(
+        client->MountSegment(Segment({2, 2}, "fast", 2000, 10, {"hot"}, 500))
+            .has_value());
 
     P2PWriteRouteConfig config;
     config.top_tier_only = true;
@@ -333,8 +333,9 @@ TEST(P2PClientMetaTest, WriteCandidateUsesEligibleCapacity) {
                     .has_value());
     ASSERT_TRUE(client->MountSegment(Segment({3, 3}, "peer", 1000, 10, {}, 500))
                     .has_value());
-    ASSERT_TRUE(client->MountSegment(
-                          Segment({4, 4}, "filtered", 4000, 20, {"skip"}, 1000))
+    ASSERT_TRUE(client
+                    ->MountSegment(
+                        Segment({4, 4}, "filtered", 4000, 20, {"skip"}, 1000))
                     .has_value());
 
     P2PWriteRouteConfig config;
@@ -378,16 +379,15 @@ TEST(P2PClientMetaTest, FullTierRemainsEligibleForZeroSizeKeys) {
 
 TEST(P2PClientMetaTest, CandidateCapacityAndScoreUseTheSameSegmentVersion) {
     auto client = Client();
-    ASSERT_TRUE(client->MountSegment(Segment({1, 1}, "segment", 1000))
-                    .has_value());
+    ASSERT_TRUE(
+        client->MountSegment(Segment({1, 1}, "segment", 1000)).has_value());
     std::atomic<bool> start{false};
     std::thread writer([&]() {
         while (!start.load(std::memory_order_acquire)) {
         }
         for (size_t i = 0; i < 1000; ++i) {
-            auto result = client->UpdateSegmentUsages(
-                {TierUsageInfo{.segment_id = {1, 1},
-                               .usage = i % 2 == 0 ? 100u : 900u}});
+            auto result = client->UpdateSegmentUsages({TierUsageInfo{
+                .segment_id = {1, 1}, .usage = i % 2 == 0 ? 100u : 900u}});
             ASSERT_EQ(result.sub_results.size(), 1);
             EXPECT_EQ(result.sub_results[0].error, ErrorCode::OK);
         }

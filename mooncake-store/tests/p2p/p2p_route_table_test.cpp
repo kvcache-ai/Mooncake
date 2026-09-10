@@ -65,18 +65,18 @@ TEST(P2PRouteTableTest, RejectsInvalidSizeAndDuplicateLocation) {
 
 TEST(P2PRouteTableTest, CountsUniqueClientsForRouteLimit) {
     P2PRouteTable table;
-    ASSERT_TRUE(
-        table.Publish("key", 1024, Location(kClientA, UUID{11, 11}),
-                      /*max_client_per_key=*/1)
-            .has_value());
-    EXPECT_TRUE(
-        table.Publish("key", 1024, Location(kClientA, UUID{12, 12}),
-                      /*max_client_per_key=*/1)
-            .has_value());
+    ASSERT_TRUE(table
+                    .Publish("key", 1024, Location(kClientA, UUID{11, 11}),
+                             /*max_client_per_key=*/1)
+                    .has_value());
+    EXPECT_TRUE(table
+                    .Publish("key", 1024, Location(kClientA, UUID{12, 12}),
+                             /*max_client_per_key=*/1)
+                    .has_value());
 
-    auto second_client = table.Publish(
-        "key", 1024, Location(kClientB, UUID{13, 13}),
-        /*max_client_per_key=*/1);
+    auto second_client =
+        table.Publish("key", 1024, Location(kClientB, UUID{13, 13}),
+                      /*max_client_per_key=*/1);
     ASSERT_FALSE(second_client.has_value());
     EXPECT_EQ(second_client.error(), ErrorCode::REPLICA_NUM_EXCEEDED);
 }
@@ -87,8 +87,8 @@ TEST(P2PRouteTableTest, WithdrawPreconditionFailureKeepsRoute) {
     const auto location = Location(kClientA, segment_id);
     ASSERT_TRUE(table.Publish("key", 1024, location).has_value());
 
-    auto result = table.Withdraw(
-        "key", location, [] { return ErrorCode::INTERNAL_ERROR; });
+    auto result = table.Withdraw("key", location,
+                                 [] { return ErrorCode::INTERNAL_ERROR; });
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
     EXPECT_TRUE(table.RouteExists("key"));
@@ -110,8 +110,7 @@ TEST(P2PRouteTableTest, WithdrawSkipsPreconditionForMissingTarget) {
     EXPECT_EQ(missing_key.error(), ErrorCode::OBJECT_NOT_FOUND);
     EXPECT_FALSE(precondition_called);
 
-    auto missing_location =
-        table.Withdraw("key", other_location, precondition);
+    auto missing_location = table.Withdraw("key", other_location, precondition);
     ASSERT_FALSE(missing_location.has_value());
     EXPECT_EQ(missing_location.error(), ErrorCode::REPLICA_NOT_FOUND);
     EXPECT_FALSE(precondition_called);

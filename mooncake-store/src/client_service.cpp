@@ -138,8 +138,7 @@ void ClientService::InnerStopHeartbeat() {
 
 void ClientService::Destroy() {}
 
-tl::expected<ViewVersionId, ErrorCode>
-ClientService::RegisterClient() {
+tl::expected<ViewVersionId, ErrorCode> ClientService::RegisterClient() {
     MutexLocker lk(&registration_mutex_);
     InflightTracker::Guard guard = AcquireInflightGuard();
     if (!guard.is_valid()) {

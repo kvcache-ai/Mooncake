@@ -128,12 +128,10 @@ ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
         }
     }
 
-    auto result =
-        invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
+    auto result = invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
     if (!result.has_value() && is_same_addr) {
         timer.LogResponse("error_code=", result.error());
-        result =
-            invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
+        result = invoke_rpc<&P2PMasterRpcService::ServiceReady, std::string>();
     }
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
@@ -149,8 +147,8 @@ ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
         return ErrorCode::INVALID_VERSION;
     }
 
-    auto hb_ready = invoke_rpc<&P2PMasterRpcService::HeartbeatServiceReady,
-                               uint32_t>();
+    auto hb_ready =
+        invoke_rpc<&P2PMasterRpcService::HeartbeatServiceReady, uint32_t>();
     if (!hb_ready.has_value()) {
         LOG(ERROR) << "HeartbeatServiceReady probe failed: error_code="
                    << hb_ready.error()
@@ -163,22 +161,21 @@ ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
     const bool master_dedicated = *hb_ready > 0;
     if (client_dedicated != master_dedicated) {
         LOG(ERROR) << "Heartbeat routing mismatch: client_hb_port="
-                   << heartbeat_rpc_port_
-                   << " master_hb_port=" << *hb_ready
+                   << heartbeat_rpc_port_ << " master_hb_port=" << *hb_ready
                    << " (one side is dedicated, the other is legacy)";
-        timer.LogResponse("error_code=",
-                          ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
+        timer.LogResponse("error_code=", ErrorCode::HEARTBEAT_ROUTING_MISMATCH);
         client_addr_param_.clear();
         return ErrorCode::HEARTBEAT_ROUTING_MISMATCH;
     }
 
     if (client_dedicated) {
-        auto hb_result = invoke_rpc_via<&P2PMasterRpcService::ServiceReady,
-                                        std::string>(heartbeat_accessor_);
+        auto hb_result =
+            invoke_rpc_via<&P2PMasterRpcService::ServiceReady, std::string>(
+                heartbeat_accessor_);
         if (!hb_result.has_value() && is_same_addr) {
             hb_result =
-                invoke_rpc_via<&P2PMasterRpcService::ServiceReady,
-                               std::string>(heartbeat_accessor_);
+                invoke_rpc_via<&P2PMasterRpcService::ServiceReady, std::string>(
+                    heartbeat_accessor_);
         }
         if (!hb_result.has_value()) {
             LOG(ERROR) << "Dedicated heartbeat RPC server unreachable at"
@@ -199,8 +196,7 @@ tl::expected<bool, ErrorCode> P2PMasterClient::ExistKey(
     std::string_view object_key) {
     ScopedVLogTimer timer(1, "P2PMasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
-    auto result =
-        invoke_rpc<&P2PMasterRpcService::ExistKey, bool>(object_key);
+    auto result = invoke_rpc<&P2PMasterRpcService::ExistKey, bool>(object_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -216,8 +212,8 @@ std::vector<tl::expected<bool, ErrorCode>> P2PMasterClient::BatchExistKey(
 }
 
 tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>
-P2PMasterClient::GetReadRoute(
-    std::string_view key, const P2PReadRouteConfig& config) {
+P2PMasterClient::GetReadRoute(std::string_view key,
+                              const P2PReadRouteConfig& config) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetReadRoute");
     timer.LogRequest("object_key=", key);
     auto result = invoke_rpc<&P2PMasterRpcService::GetReadRoute,
@@ -229,17 +225,16 @@ P2PMasterClient::GetReadRoute(
 
 async_simple::coro::Lazy<
     tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
-P2PMasterClient::AsyncGetReadRoute(
-    std::string_view key, const P2PReadRouteConfig& config) {
-    co_return co_await invoke_rpc_async<
-        &P2PMasterRpcService::GetReadRoute, std::vector<P2PRouteDescriptor>>(
+P2PMasterClient::AsyncGetReadRoute(std::string_view key,
+                                   const P2PReadRouteConfig& config) {
+    co_return co_await invoke_rpc_async<&P2PMasterRpcService::GetReadRoute,
+                                        std::vector<P2PRouteDescriptor>>(
         P2PGetReadRouteRequest{.key = key, .config = config});
 }
 
 std::vector<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
-P2PMasterClient::BatchGetReadRoute(
-    const std::vector<std::string_view>& keys,
-    const P2PReadRouteConfig& config) {
+P2PMasterClient::BatchGetReadRoute(const std::vector<std::string_view>& keys,
+                                   const P2PReadRouteConfig& config) {
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchGetReadRoute");
     timer.LogRequest("requests_count=", keys.size());
     if (keys.empty()) return {};
@@ -273,17 +268,15 @@ P2PMasterClient::BatchGetReadRoute(
         if (result->error_codes[i] == ErrorCode::OK) {
             response.push_back(std::move(result->responses[i]));
         } else {
-            response.emplace_back(
-                tl::make_unexpected(result->error_codes[i]));
+            response.emplace_back(tl::make_unexpected(result->error_codes[i]));
         }
     }
     timer.LogResponse("result=", response.size(), " requests");
     return response;
 }
 
-tl::expected<
-    std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
-    ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
+             ErrorCode>
 P2PMasterClient::GetReadRouteByRegex(std::string_view regex) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetReadRouteByRegex");
     timer.LogRequest("Regex=", regex);
@@ -317,12 +310,13 @@ tl::expected<P2PHeartbeatResponse, ErrorCode> P2PMasterClient::Heartbeat(
     return result;
 }
 
-tl::expected<P2PClientStatus, ErrorCode>
-P2PMasterClient::QueryClientStatus(const UUID& client_id) {
+tl::expected<P2PClientStatus, ErrorCode> P2PMasterClient::QueryClientStatus(
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "P2PMasterClient::QueryClientStatus");
     timer.LogRequest("client_id=", client_id);
-    auto result = invoke_rpc<&P2PMasterRpcService::QueryClientStatus,
-                             P2PClientStatus>(client_id);
+    auto result =
+        invoke_rpc<&P2PMasterRpcService::QueryClientStatus, P2PClientStatus>(
+            client_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -330,31 +324,31 @@ P2PMasterClient::QueryClientStatus(const UUID& client_id) {
 tl::expected<void, ErrorCode> P2PMasterClient::MountSegment(
     const P2PSegment& segment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::MountSegment");
-    timer.LogRequest("segment_name=", segment.name,
-                     ", client_id=", client_id_);
+    timer.LogRequest("segment_name=", segment.name, ", client_id=", client_id_);
     auto result = invoke_rpc<&P2PMasterRpcService::MountSegment, void>(
         P2PMountSegmentRequest{.client_id = client_id_, .segment = segment});
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<ViewVersionId, ErrorCode>
-P2PMasterClient::RegisterClient(const P2PRegisterClientRequest& req) {
+tl::expected<ViewVersionId, ErrorCode> P2PMasterClient::RegisterClient(
+    const P2PRegisterClientRequest& req) {
     ScopedVLogTimer timer(1, "P2PMasterClient::RegisterClient");
     timer.LogRequest("client_id=", client_id_,
                      ", segments_count=", req.segments.size());
-    auto result = invoke_rpc<&P2PMasterRpcService::RegisterClient,
-                             ViewVersionId>(req);
+    auto result =
+        invoke_rpc<&P2PMasterRpcService::RegisterClient, ViewVersionId>(req);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<ViewVersionId, ErrorCode>
-P2PMasterClient::UnregisterClient(const UUID& client_id) {
+tl::expected<ViewVersionId, ErrorCode> P2PMasterClient::UnregisterClient(
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "P2PMasterClient::UnregisterClient");
     timer.LogRequest("client_id=", client_id_);
-    auto result = invoke_rpc<&P2PMasterRpcService::UnregisterClient,
-                             ViewVersionId>(client_id);
+    auto result =
+        invoke_rpc<&P2PMasterRpcService::UnregisterClient, ViewVersionId>(
+            client_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -396,8 +390,7 @@ tl::expected<void, ErrorCode> P2PMasterClient::WithdrawRoute(
     ScopedVLogTimer timer(1, "P2PMasterClient::WithdrawRoute");
     timer.LogRequest("key=", req.key);
 
-    auto result =
-        invoke_rpc<&P2PMasterRpcService::WithdrawRoute, void>(req);
+    auto result = invoke_rpc<&P2PMasterRpcService::WithdrawRoute, void>(req);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -407,8 +400,9 @@ std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchWithdrawRoute(
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchWithdrawRoute");
     timer.LogRequest("key=", req.key, "segment_count=", req.segment_ids.size());
 
-    auto result = invoke_batch_rpc<&P2PMasterRpcService::BatchWithdrawRoute,
-                                   void>(req.segment_ids.size(), req);
+    auto result =
+        invoke_batch_rpc<&P2PMasterRpcService::BatchWithdrawRoute, void>(
+            req.segment_ids.size(), req);
     timer.LogResponse("result=", result.size(), " routes");
     return result;
 }
@@ -430,8 +424,8 @@ tl::expected<void, ErrorCode> P2PMasterClient::CompleteRouteSync(
     ScopedVLogTimer timer(1, "P2PMasterClient::CompleteRouteSync");
     timer.LogRequest("client_id=", client_id);
 
-    auto result = invoke_rpc<&P2PMasterRpcService::CompleteRouteSync, void>(
-        client_id);
+    auto result =
+        invoke_rpc<&P2PMasterRpcService::CompleteRouteSync, void>(client_id);
     timer.LogResponseExpected(result);
     return result;
 }

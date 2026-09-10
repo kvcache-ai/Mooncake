@@ -82,8 +82,8 @@ auto P2PRouteTable::Publish(std::string_view key, uint64_t object_size,
     return MutationResult{.created_key = true};
 }
 
-void P2PRouteTable::RemoveReverseIndex(
-    std::string_view key, const P2PRouteLocation& location) {
+void P2PRouteTable::RemoveReverseIndex(std::string_view key,
+                                       const P2PRouteLocation& location) {
     auto location_it = keys_by_location_.find(location);
     if (location_it == keys_by_location_.end()) {
         LOG(ERROR) << "Route reverse index is missing a location"
@@ -101,8 +101,8 @@ void P2PRouteTable::RemoveReverseIndex(
     }
 }
 
-void P2PRouteTable::RemoveAllReverseIndexes(
-    std::string_view key, const P2PRouteEntry& entry) {
+void P2PRouteTable::RemoveAllReverseIndexes(std::string_view key,
+                                            const P2PRouteEntry& entry) {
     for (const auto& location : entry.locations) {
         RemoveReverseIndex(key, location);
     }

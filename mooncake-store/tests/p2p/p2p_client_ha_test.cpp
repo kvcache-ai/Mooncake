@@ -20,8 +20,7 @@ P2PClientService MakeClient() {
 
 class FailingP2PMasterView : public P2PMasterView {
    public:
-    void ElectLeader(const std::string& master_address,
-                     ViewVersionId& version,
+    void ElectLeader(const std::string& master_address, ViewVersionId& version,
                      EtcdLeaseId& lease_id) override {
         (void)master_address;
         (void)version;
@@ -98,8 +97,7 @@ TEST(P2PClientHATest, UsesDefaultClusterIdForRedisDiscovery) {
     auto client = MakeClient();
     client.SetMasterDiscoveryConfig(config);
 
-    EXPECT_EQ(client.master_discovery_config_.cluster_id,
-              DEFAULT_CLUSTER_ID);
+    EXPECT_EQ(client.master_discovery_config_.cluster_id, DEFAULT_CLUSTER_ID);
 }
 
 TEST(P2PClientHATest, EmptyClusterIdFallsBackToDefaultClusterId) {
@@ -109,8 +107,7 @@ TEST(P2PClientHATest, EmptyClusterIdFallsBackToDefaultClusterId) {
 
     client.SetMasterDiscoveryConfig(config);
 
-    EXPECT_EQ(client.master_discovery_config_.cluster_id,
-              DEFAULT_CLUSTER_ID);
+    EXPECT_EQ(client.master_discovery_config_.cluster_id, DEFAULT_CLUSTER_ID);
 }
 
 TEST(P2PClientHATest, StoresRedisDiscoveryConfig) {

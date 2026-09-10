@@ -322,9 +322,9 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
     UUID churn_client{9999, 9999};
     std::thread remover([&]() {
         for (int i = 1; i <= kIterations; ++i) {
-            auto snap = MakeRetentionSnapshot(
-                i, i * 3, RetentionBucketWith(2, i),
-                RetentionBucketWith(3, i * 3));
+            auto snap =
+                MakeRetentionSnapshot(i, i * 3, RetentionBucketWith(2, i),
+                                      RetentionBucketWith(3, i * 3));
             snap.total_request.get_requests = i;
             Update(churn_client, snap);
             Remove(churn_client);
@@ -504,9 +504,8 @@ TEST_F(ClientMetricsAggregatorTest,
        RetentionReplacementHandlesMissingAndMalformedBuckets) {
     const UUID steady_client{1, 1};
     const UUID changing_client{2, 2};
-    Update(steady_client,
-           MakeRetentionSnapshot(5, 7, RetentionBucketWith(0, 5),
-                                 RetentionBucketWith(1, 7)));
+    Update(steady_client, MakeRetentionSnapshot(5, 7, RetentionBucketWith(0, 5),
+                                                RetentionBucketWith(1, 7)));
 
     auto expect_retention = [&](int64_t live_count, int64_t removed_count,
                                 int64_t live_samples, int64_t removed_samples,
@@ -515,7 +514,8 @@ TEST_F(ClientMetricsAggregatorTest,
         const std::string prefix = "master_cluster_key_retention_";
         ExpectMetricValue(text, prefix + "live_count", live_count);
         ExpectMetricValue(text, prefix + "removed_count", removed_count);
-        ExpectMetricValue(text, prefix + "live_age_seconds_count", live_samples);
+        ExpectMetricValue(text, prefix + "live_age_seconds_count",
+                          live_samples);
         ExpectMetricValue(text, prefix + "removed_age_seconds_count",
                           removed_samples);
         ExpectMetricValue(text, prefix + "all_lifetime_seconds_count",
@@ -545,8 +545,8 @@ TEST_F(ClientMetricsAggregatorTest,
            MakeRetentionSnapshot(8, 9, {99}, RetentionBucketWith(3, 9)));
     expect_retention(13, 16, 5, 16, 5, 7);
 
-    const auto restored = MakeRetentionSnapshot(
-        1, 2, RetentionBucketWith(0, 1), RetentionBucketWith(1, 2));
+    const auto restored = MakeRetentionSnapshot(1, 2, RetentionBucketWith(0, 1),
+                                                RetentionBucketWith(1, 2));
     Update(changing_client, restored);
     expect_retention(6, 9, 6, 9, 6, 9);
     Update(changing_client, restored);

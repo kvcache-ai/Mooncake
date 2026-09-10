@@ -103,18 +103,17 @@ bool initialize_client() {
     if (tiered_config.find("16106127360") != std::string::npos) {
         uint64_t capacity_bytes =
             FLAGS_ram_buffer_size_gb * 1024ull * 1024 * 1024;
-        tiered_config =
-            "{\"tiers\": [{\"type\": \"DRAM\", \"capacity\": " +
-            std::to_string(capacity_bytes) +
-            ", \"priority\": 10, \"allocator_type\": \"OFFSET\"}]}";
+        tiered_config = "{\"tiers\": [{\"type\": \"DRAM\", \"capacity\": " +
+                        std::to_string(capacity_bytes) +
+                        ", \"priority\": 10, \"allocator_type\": \"OFFSET\"}]}";
     }
     auto config = ClientConfigBuilder::build_p2p_real_client(
         FLAGS_local_hostname, FLAGS_metadata_connection_string, FLAGS_protocol,
         device_names, FLAGS_master_address, tiered_config, 0, nullptr, "",
         12345,
         /*rpc_thread_num=*/2, /*lock_shard_count=*/1024,
-        /*route_cache_max_memory_bytes=*/FLAGS_route_cache_max_memory_mb * 1024 *
-            1024,
+        /*route_cache_max_memory_bytes=*/FLAGS_route_cache_max_memory_mb *
+            1024 * 1024,
         /*route_cache_ttl_ms=*/FLAGS_route_cache_ttl_ms,
         FLAGS_p2p_local_transfer_mode, FLAGS_local_memcpy_async_worker_num);
     auto client_opt = ClientService::Create(config);

@@ -97,7 +97,8 @@ class P2PMasterService final {
 
     /**
      * @brief Batch get write routes for multiple keys.
-     *        Reuses capacity snapshots while checking owners and health per key.
+     *        Reuses capacity snapshots while checking owners and health per
+     * key.
      */
     auto BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req)
         -> P2PBatchGetWriteRouteResponse;

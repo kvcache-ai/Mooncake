@@ -110,9 +110,9 @@ TEST_F(RedisElectionHelperTest, ElectLeaderAndGetMasterView) {
     ASSERT_GT(version, 0);
     ASSERT_GT(lease_id, 0);
 
-    P2PRedisMasterView reader(
-        FLAGS_cluster_id, FLAGS_redis_endpoint, FLAGS_redis_password, 0,
-        FLAGS_redis_ttl_sec, 1, FLAGS_redis_username);
+    P2PRedisMasterView reader(FLAGS_cluster_id, FLAGS_redis_endpoint,
+                              FLAGS_redis_password, 0, FLAGS_redis_ttl_sec, 1,
+                              FLAGS_redis_username);
     ASSERT_EQ(ErrorCode::OK, reader.Connect());
 
     std::string got_address;

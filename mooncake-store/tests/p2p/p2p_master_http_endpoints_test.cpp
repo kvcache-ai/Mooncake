@@ -341,9 +341,8 @@ TEST_F(P2PMasterHttpEndpointsTest,
     const auto body = ParseJson(resp.resp_body, "batch routes");
     ASSERT_TRUE(body["responses"].isArray());
     ASSERT_EQ(body["responses"].size(), 3u);
-    EXPECT_EQ(body["error_codes"],
-              ErrorCodes({ErrorCode::OK, ErrorCode::OK,
-                          ErrorCode::OBJECT_NOT_FOUND}));
+    EXPECT_EQ(body["error_codes"], ErrorCodes({ErrorCode::OK, ErrorCode::OK,
+                                               ErrorCode::OBJECT_NOT_FOUND}));
     ASSERT_EQ(body["responses"][0].size(), 1u);
     ASSERT_EQ(body["responses"][1].size(), 1u);
     EXPECT_EQ(body["responses"][2], Json::Value(Json::arrayValue));
@@ -360,9 +359,8 @@ TEST_F(P2PMasterHttpEndpointsTest,
     RemoveKey(key1, segment_id_b_);
 
     // Once removed, the same keys must now be reported as missing.
-    auto resp_after_remove =
-        HttpGet(http_base_url_ + "/batch_query_routes?keys=" + key0 + "," +
-                key1);
+    auto resp_after_remove = HttpGet(
+        http_base_url_ + "/batch_query_routes?keys=" + key0 + "," + key1);
     ASSERT_EQ(resp_after_remove.status, 200)
         << "body=" << resp_after_remove.resp_body;
     const auto removed =
@@ -370,9 +368,9 @@ TEST_F(P2PMasterHttpEndpointsTest,
     ASSERT_EQ(removed["responses"].size(), 2u);
     EXPECT_EQ(removed["responses"][0], Json::Value(Json::arrayValue));
     EXPECT_EQ(removed["responses"][1], Json::Value(Json::arrayValue));
-    EXPECT_EQ(removed["error_codes"],
-              ErrorCodes({ErrorCode::OBJECT_NOT_FOUND,
-                          ErrorCode::OBJECT_NOT_FOUND}));
+    EXPECT_EQ(
+        removed["error_codes"],
+        ErrorCodes({ErrorCode::OBJECT_NOT_FOUND, ErrorCode::OBJECT_NOT_FOUND}));
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,

@@ -85,8 +85,9 @@ class ClientIntegrationTest : public ::testing::Test {
    protected:
     static std::shared_ptr<CentralizedClientService> CreateClient(
         const std::string& host_name) {
-        // TODO(C4/public API): Replace this shared-facade factory adaptation with
-        // the concrete centralized API; preserve a00f757 scenarios and assertions.
+        // TODO(C4/public API): Replace this shared-facade factory adaptation
+        // with the concrete centralized API; preserve a00f757 scenarios and
+        // assertions.
         auto config = ClientConfigBuilder::build_centralized_real_client(
             host_name, "P2PHANDSHAKE", FLAGS_protocol, std::nullopt,
             master_address_);

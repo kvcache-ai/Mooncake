@@ -88,8 +88,8 @@ class P2PMasterClient final {
     [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
         const UUID& segment_id);
 
-    [[nodiscard]] tl::expected<P2PClientStatus, ErrorCode>
-    QueryClientStatus(const UUID& client_id);
+    [[nodiscard]] tl::expected<P2PClientStatus, ErrorCode> QueryClientStatus(
+        const UUID& client_id);
 
     [[nodiscard]] tl::expected<P2PHeartbeatResponse, ErrorCode> Heartbeat(
         const P2PHeartbeatRequest& req);
@@ -97,11 +97,11 @@ class P2PMasterClient final {
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const P2PSegment& segment);
 
-    [[nodiscard]] tl::expected<ViewVersionId, ErrorCode>
-    RegisterClient(const P2PRegisterClientRequest& req);
+    [[nodiscard]] tl::expected<ViewVersionId, ErrorCode> RegisterClient(
+        const P2PRegisterClientRequest& req);
 
-    [[nodiscard]] tl::expected<ViewVersionId, ErrorCode>
-    UnregisterClient(const UUID& client_id);
+    [[nodiscard]] tl::expected<ViewVersionId, ErrorCode> UnregisterClient(
+        const UUID& client_id);
 
     [[nodiscard]] tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>
     GetWriteRoute(const P2PGetWriteRouteRequest& req);

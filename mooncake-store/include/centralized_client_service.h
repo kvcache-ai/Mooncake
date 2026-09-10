@@ -244,8 +244,8 @@ class CentralizedClientService
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
-    tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient()
-        override REQUIRES(registration_mutex_);
+    tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient() override
+        REQUIRES(registration_mutex_);
 
     tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     BatchGetOffloadObjectFromStorage(const std::vector<std::string>& keys,

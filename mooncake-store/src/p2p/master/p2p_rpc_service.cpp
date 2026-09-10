@@ -16,8 +16,8 @@
 
 namespace mooncake {
 
-P2PMasterRpcService::P2PMasterRpcService(
-    const P2PMasterConfig& config, ViewVersionId view_version)
+P2PMasterRpcService::P2PMasterRpcService(const P2PMasterConfig& config,
+                                         ViewVersionId view_version)
     : master_service_(config, view_version),
       http_server_(4, static_cast<uint16_t>(config.metrics.http_port)),
       metric_report_running_(config.metrics.enable_reporting),
@@ -40,8 +40,8 @@ void P2PMasterRpcService::init() {
                 std::string metrics_summary =
                     P2PMasterMetricManager::instance().get_summary_string();
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
-                std::this_thread::sleep_for(std::chrono::seconds(
-                    kP2PMetricReportIntervalSeconds));
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(kP2PMetricReportIntervalSeconds));
             }
         });
     }
@@ -198,15 +198,14 @@ std::vector<tl::expected<bool, ErrorCode>> P2PMasterRpcService::BatchExistKey(
         P2PMasterMetricManager::instance().inc_batch_exist_key_partial_success(
             failure_count);
     }
-    timer.LogResponse("total=", result.size(), ", success=",
-                      result.size() - failure_count,
+    timer.LogResponse("total=", result.size(),
+                      ", success=", result.size() - failure_count,
                       ", failures=", failure_count);
     return result;
 }
 
-tl::expected<
-    std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
-    ErrorCode>
+tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
+             ErrorCode>
 P2PMasterRpcService::GetReadRouteByRegex(std::string_view regex) {
     return execute_rpc(
         "GetReadRouteByRegex",
@@ -223,8 +222,7 @@ P2PMasterRpcService::GetReadRouteByRegex(std::string_view regex) {
 }
 
 tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>
-P2PMasterRpcService::GetReadRoute(
-    const P2PGetReadRouteRequest& req) {
+P2PMasterRpcService::GetReadRoute(const P2PGetReadRouteRequest& req) {
     return execute_rpc(
         "GetReadRoute",
         [&] { return master_service_.GetReadRoute(req.key, req.config); },
@@ -266,22 +264,22 @@ P2PBatchGetReadRouteResponse P2PMasterRpcService::BatchGetReadRoute(
                 VLOG(1) << "BatchGetReadRoute failed for key[" << i << "] '"
                         << req.keys[i] << "': " << toString(error);
             } else {
-                LOG(ERROR) << "BatchGetReadRoute failed for key[" << i
-                           << "] '" << req.keys[i] << "': " << toString(error);
+                LOG(ERROR) << "BatchGetReadRoute failed for key[" << i << "] '"
+                           << req.keys[i] << "': " << toString(error);
             }
         } else {
             response.responses[i] = std::move(*results[i]);
         }
     }
     if (failure_count == total_requests) {
-        P2PMasterMetricManager::instance()
-            .inc_batch_get_read_route_failures(failure_count);
+        P2PMasterMetricManager::instance().inc_batch_get_read_route_failures(
+            failure_count);
     } else if (failure_count != 0) {
         P2PMasterMetricManager::instance()
             .inc_batch_get_read_route_partial_success(failure_count);
     }
-    timer.LogResponse("total=", results.size(), ", success=",
-                      results.size() - failure_count,
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
                       ", failures=", failure_count);
     return response;
 }
@@ -310,21 +308,21 @@ tl::expected<void, ErrorCode> P2PMasterRpcService::MountSegment(
     const P2PMountSegmentRequest& req) {
     return execute_rpc(
         "MountSegment",
-        [&] { return master_service_.MountSegment(req.segment, req.client_id); },
+        [&] {
+            return master_service_.MountSegment(req.segment, req.client_id);
+        },
         [&](auto& timer) {
             timer.LogRequest("segment_name=", req.segment.name,
                              ", client_id=", req.client_id);
         },
-        [] {
-            P2PMasterMetricManager::instance().inc_mount_segment_requests();
-        },
+        [] { P2PMasterMetricManager::instance().inc_mount_segment_requests(); },
         [] {
             P2PMasterMetricManager::instance().inc_mount_segment_failures();
         });
 }
 
-tl::expected<P2PHeartbeatResponse, ErrorCode>
-P2PMasterRpcService::Heartbeat(const P2PHeartbeatRequest& req) {
+tl::expected<P2PHeartbeatResponse, ErrorCode> P2PMasterRpcService::Heartbeat(
+    const P2PHeartbeatRequest& req) {
     ScopedVLogTimer timer(1, "Heartbeat");
     timer.LogRequest("client_id=", req.client_id);
     P2PMasterMetricManager::instance().inc_heartbeat_requests();
@@ -333,8 +331,8 @@ P2PMasterRpcService::Heartbeat(const P2PHeartbeatRequest& req) {
     return result;
 }
 
-tl::expected<P2PClientStatus, ErrorCode>
-P2PMasterRpcService::QueryClientStatus(const UUID& client_id) {
+tl::expected<P2PClientStatus, ErrorCode> P2PMasterRpcService::QueryClientStatus(
+    const UUID& client_id) {
     ScopedVLogTimer timer(1, "QueryClientStatus");
     timer.LogRequest("client_id=", client_id);
     auto result = master_service_.QueryClientStatus(client_id);
@@ -342,8 +340,7 @@ P2PMasterRpcService::QueryClientStatus(const UUID& client_id) {
     return result;
 }
 
-tl::expected<ViewVersionId, ErrorCode>
-P2PMasterRpcService::RegisterClient(
+tl::expected<ViewVersionId, ErrorCode> P2PMasterRpcService::RegisterClient(
     const P2PRegisterClientRequest& req) {
     return execute_rpc(
         "RegisterClient", [&] { return master_service_.RegisterClient(req); },
@@ -359,24 +356,21 @@ P2PMasterRpcService::RegisterClient(
         });
 }
 
-tl::expected<ViewVersionId, ErrorCode>
-P2PMasterRpcService::UnregisterClient(const UUID& client_id) {
+tl::expected<ViewVersionId, ErrorCode> P2PMasterRpcService::UnregisterClient(
+    const UUID& client_id) {
     return execute_rpc(
         "UnregisterClient",
         [&] { return master_service_.UnregisterClient(client_id); },
         [&](auto& timer) { timer.LogRequest("client_id=", client_id); },
         [] {
-            P2PMasterMetricManager::instance()
-                .inc_unregister_client_requests();
+            P2PMasterMetricManager::instance().inc_unregister_client_requests();
         },
         [] {
-            P2PMasterMetricManager::instance()
-                .inc_unregister_client_failures();
+            P2PMasterMetricManager::instance().inc_unregister_client_failures();
         });
 }
 
-tl::expected<std::string, ErrorCode>
-P2PMasterRpcService::ServiceReady() {
+tl::expected<std::string, ErrorCode> P2PMasterRpcService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 

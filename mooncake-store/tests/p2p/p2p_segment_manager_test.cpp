@@ -62,10 +62,10 @@ TEST(P2PSegmentManagerTest, RejectsDuplicateAndMissingSegments) {
 
 TEST(P2PSegmentManagerTest, MaintainsCapacityAndUsageAggregate) {
     P2PSegmentManager manager;
-    ASSERT_TRUE(manager.MountSegment(Segment({1, 1}, "a", 4096, 100))
-                    .has_value());
-    ASSERT_TRUE(manager.MountSegment(Segment({2, 2}, "b", 8192, 200))
-                    .has_value());
+    ASSERT_TRUE(
+        manager.MountSegment(Segment({1, 1}, "a", 4096, 100)).has_value());
+    ASSERT_TRUE(
+        manager.MountSegment(Segment({2, 2}, "b", 8192, 200)).has_value());
     EXPECT_EQ(manager.GetCapacityUsage(),
               std::make_pair(size_t{12288}, size_t{300}));
 
@@ -134,8 +134,7 @@ TEST(P2PSegmentManagerTest, ConcurrentUsageAndUnmountRemainConsistent) {
         worker.join();
     }
     ASSERT_TRUE(removed.has_value());
-    EXPECT_EQ(manager.GetCapacityUsage(),
-              std::make_pair(size_t{0}, size_t{0}));
+    EXPECT_EQ(manager.GetCapacityUsage(), std::make_pair(size_t{0}, size_t{0}));
 }
 
 class P2PSegmentMetricsTest : public ::testing::TestWithParam<MemoryType> {
@@ -212,7 +211,7 @@ TEST_P(P2PSegmentMetricsTest, UnmountBeforeUsageReportKeepsUsageZero) {
 }
 
 INSTANTIATE_TEST_SUITE_P(StorageTypes, P2PSegmentMetricsTest,
-                        ::testing::Values(MemoryType::DRAM, MemoryType::NVME));
+                         ::testing::Values(MemoryType::DRAM, MemoryType::NVME));
 
 }  // namespace
 }  // namespace mooncake

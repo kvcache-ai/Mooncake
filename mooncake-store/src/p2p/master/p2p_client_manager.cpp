@@ -67,9 +67,8 @@ std::vector<std::shared_ptr<P2PClientMeta>> P2PClientManager::GetAllClients() {
     return clients;
 }
 
-auto P2PClientManager::BuildClientList(
-    P2PClientSelectionStrategy strategy) const
-    -> std::optional<std::vector<std::shared_ptr<P2PClientMeta>>> {
+auto P2PClientManager::BuildClientList(P2PClientSelectionStrategy strategy)
+    const -> std::optional<std::vector<std::shared_ptr<P2PClientMeta>>> {
     std::vector<std::shared_ptr<P2PClientMeta>> clients;
     clients.reserve(client_metas_.size());
 
@@ -323,8 +322,8 @@ auto P2PClientManager::RegisterClient(const P2PRegisterClientRequest& req)
         if (inserted) {
             if (segment_removal_cb_) {
                 meta->SetSegmentRemovalCallback(
-                    [callback = segment_removal_cb_, client_id](
-                        const UUID& segment_id) {
+                    [callback = segment_removal_cb_,
+                     client_id](const UUID& segment_id) {
                         callback(P2PRouteLocation{.client_id = client_id,
                                                   .segment_id = segment_id});
                     });

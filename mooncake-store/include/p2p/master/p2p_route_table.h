@@ -23,9 +23,8 @@ namespace mooncake {
  */
 class P2PRouteTable final {
    private:
-    using RouteMap =
-        std::unordered_map<std::string, P2PRouteEntry, StringHash,
-                           std::equal_to<>>;
+    using RouteMap = std::unordered_map<std::string, P2PRouteEntry, StringHash,
+                                        std::equal_to<>>;
 
    public:
     struct MutationResult {

@@ -59,7 +59,8 @@ class RuntimeConfigTest : public ::testing::Test {
             "http://127.0.0.1:" + std::to_string(client_->GetHttpPort());
 
         // TODO(C2/C4): Separate shared-facade configuration checks by concrete
-        // client architecture; preserve A00 centralized behavior and assertions.
+        // client architecture; preserve A00 centralized behavior and
+        // assertions.
         centralized_store_ = std::make_unique<RuntimeConfigStore>(
             DeploymentMode::CENTRALIZATION);
     }

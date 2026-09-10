@@ -196,8 +196,8 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
         // Verify via master that the replica is on client_ (local).
-        auto resp = client_->GetMasterClient().GetReadRoute(
-            key, P2PReadRouteConfig{});
+        auto resp =
+            client_->GetMasterClient().GetReadRoute(key, P2PReadRouteConfig{});
         ASSERT_TRUE(resp.has_value());
         ASSERT_FALSE(resp.value().empty());
         EXPECT_EQ(resp.value()[0].client_id, client_->GetClientID());
@@ -225,8 +225,8 @@ TEST_F(P2PClientIntegrationTest, ForceLocalWriteBypass) {
         EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
         // Verify via master that the replica is on client2_ (remote).
-        auto resp = client_->GetMasterClient().GetReadRoute(
-            key, P2PReadRouteConfig{});
+        auto resp =
+            client_->GetMasterClient().GetReadRoute(key, P2PReadRouteConfig{});
         ASSERT_TRUE(resp.has_value());
         ASSERT_FALSE(resp.value().empty());
         EXPECT_EQ(resp.value()[0].client_id, client2_->GetClientID());
@@ -258,8 +258,8 @@ TEST_F(P2PClientIntegrationTest, WaterlineBypassWritesLocal) {
     EXPECT_EQ(std::string(buf.data(), buf.size()), data);
 
     // Verify via master that the replica is on client_ (local).
-    auto resp = client_->GetMasterClient().GetReadRoute(
-        key, P2PReadRouteConfig{});
+    auto resp =
+        client_->GetMasterClient().GetReadRoute(key, P2PReadRouteConfig{});
     ASSERT_TRUE(resp.has_value());
     ASSERT_FALSE(resp.value().empty());
     EXPECT_EQ(resp.value()[0].client_id, client_->GetClientID());
@@ -547,8 +547,7 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
             P2PGetReadRouteRequest{.key = key, .config = config});
         ASSERT_TRUE(routes.has_value());
         ASSERT_EQ(routes.value().size(), 1);
-        ASSERT_EQ(routes.value()[0].client_id,
-                  client_->GetClientID());
+        ASSERT_EQ(routes.value()[0].client_id, client_->GetClientID());
         ASSERT_EQ(routes.value()[0].object_size, data1.size());
     }
 
@@ -566,8 +565,7 @@ TEST_F(P2PClientIntegrationTest, PutOverwrite) {
             P2PGetReadRouteRequest{.key = key, .config = config});
         ASSERT_TRUE(routes.has_value());
         ASSERT_EQ(routes.value().size(), 1);
-        ASSERT_EQ(routes.value()[0].client_id,
-                  client_->GetClientID());
+        ASSERT_EQ(routes.value()[0].client_id, client_->GetClientID());
         ASSERT_EQ(routes.value()[0].object_size, data1.size());
     }
 
@@ -912,8 +910,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemotePutAndGet) {
             << "Forward Put should leave key on owner peer, mode=" << mode;
 
         ReadRouteConfig rcfg;
-        rcfg.max_candidates =
-            ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        rcfg.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<char> buf(payload.size(), 0);
         auto get_res =
@@ -983,8 +980,7 @@ TEST_F(P2PClientIntegrationTest, ForwardRemoteBatchPutAndBatchGet) {
         }
 
         ReadRouteConfig read_config;
-        read_config.max_candidates =
-            ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        read_config.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
 
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
@@ -1084,8 +1080,7 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollForwardRemoteBatchPutAndGet) {
         }
 
         ReadRouteConfig read_config;
-        read_config.max_candidates =
-            ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        read_config.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
         std::vector<std::vector<size_t>> all_sizes(batch_size);
@@ -1160,8 +1155,7 @@ TEST_F(P2PClientIntegrationTest, TeAsyncPollReverseRemoteBatchPutAndGet) {
         }
 
         ReadRouteConfig read_config;
-        read_config.max_candidates =
-            ReadRouteConfig::RETURN_ALL_CANDIDATES;
+        read_config.max_candidates = ReadRouteConfig::RETURN_ALL_CANDIDATES;
         std::vector<std::vector<char>> read_payloads(batch_size);
         std::vector<std::vector<void*>> all_buffers(batch_size);
         std::vector<std::vector<size_t>> all_sizes(batch_size);

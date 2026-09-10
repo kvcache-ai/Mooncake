@@ -90,8 +90,7 @@ class P2PMasterRpcService final {
         const P2PBatchWithdrawRouteRequest& req);
     P2PBatchSyncRoutesResponse BatchSyncRoutes(
         const P2PBatchSyncRoutesRequest& req);
-    tl::expected<void, ErrorCode> CompleteRouteSync(
-        const UUID& client_id);
+    tl::expected<void, ErrorCode> CompleteRouteSync(const UUID& client_id);
 
    private:
     void init_http_server();

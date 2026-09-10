@@ -12,9 +12,7 @@ int64_t P2PClientMeta::crash_timeout_sec_ = 0;
 
 P2PClientMeta::P2PClientMeta(const UUID& client_id,
                              const std::string& ip_address, uint16_t rpc_port)
-    : client_id_(client_id),
-      ip_address_(ip_address),
-      rpc_port_(rpc_port) {
+    : client_id_(client_id), ip_address_(ip_address), rpc_port_(rpc_port) {
     health_state_.status = P2PClientStatus::HEALTH;
     health_state_.last_heartbeat = std::chrono::steady_clock::now();
 }
@@ -77,8 +75,7 @@ tl::expected<void, ErrorCode> P2PClientMeta::UnmountSegment(
                 LOG(WARNING)
                     << "attempt to unmount segment but it does not exist"
                     << ", client_id=" << client_id_
-                    << ", segment_id=" << segment_id
-                    << ", ret=" << ret.error();
+                    << ", segment_id=" << segment_id << ", ret=" << ret.error();
                 return {};
             }
             LOG(ERROR) << "fail to unmount segment"
@@ -97,8 +94,7 @@ tl::expected<void, ErrorCode> P2PClientMeta::UnmountSegment(
     return {};
 }
 
-tl::expected<std::vector<P2PSegment>, ErrorCode>
-P2PClientMeta::GetSegments() {
+tl::expected<std::vector<P2PSegment>, ErrorCode> P2PClientMeta::GetSegments() {
     SharedMutexLocker lock(&client_mutex_, shared_lock);
     auto check_ret = InnerStatusCheck();
     if (!check_ret.has_value()) {
@@ -110,8 +106,8 @@ P2PClientMeta::GetSegments() {
     return segment_manager_.GetSegments();
 }
 
-tl::expected<std::pair<size_t, size_t>, ErrorCode>
-P2PClientMeta::QuerySegments(const std::string& segment_name) {
+tl::expected<std::pair<size_t, size_t>, ErrorCode> P2PClientMeta::QuerySegments(
+    const std::string& segment_name) {
     SharedMutexLocker lock(&client_mutex_, shared_lock);
     auto check_ret = InnerStatusCheck();
     if (!check_ret.has_value()) {
@@ -153,8 +149,7 @@ void P2PClientMeta::SetSegmentRemovalCallback(SegmentRemovalCallback cb) {
     segment_removal_cb_ = std::move(cb);
 }
 
-void P2PClientMeta::SetTimeouts(int64_t disconnect_sec,
-                                int64_t crash_sec) {
+void P2PClientMeta::SetTimeouts(int64_t disconnect_sec, int64_t crash_sec) {
     disconnect_timeout_sec_ = disconnect_sec;
     crash_timeout_sec_ = crash_sec;
 }

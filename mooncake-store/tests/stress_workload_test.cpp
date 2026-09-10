@@ -74,7 +74,7 @@ bool initialize_segment() {
     }
 
     auto result = g_client->MountSegment(g_segment_ptr, g_ram_buffer_size,
-                                        FLAGS_protocol);
+                                         FLAGS_protocol);
     if (!result.has_value()) {
         LOG(ERROR) << "Failed to mount segment: " << toString(result.error());
         return false;

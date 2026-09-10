@@ -268,9 +268,7 @@ TEST_F(HeartbeatLegacyMasterTest, HeartbeatPortMismatchFailsConnect) {
 // ---------------------------------------------------------------------------
 class HeartbeatDedicatedPortReconnectTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        master_ = std::make_unique<HeartbeatTestMaster>();
-    }
+    void SetUp() override { master_ = std::make_unique<HeartbeatTestMaster>(); }
     void TearDown() override { master_->Stop(); }
 
     std::unique_ptr<HeartbeatTestMaster> master_;

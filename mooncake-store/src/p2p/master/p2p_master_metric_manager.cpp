@@ -270,7 +270,7 @@ void P2PMasterMetricManager::update_metrics_for_zero_output() {
 
 // Memory Storage Metrics
 void P2PMasterMetricManager::inc_allocated_mem_size(const std::string& segment,
-                                                 int64_t val) {
+                                                    int64_t val) {
     mem_allocated_size_.inc(val);
     if (!segment.empty()) mem_allocated_size_per_segment_.inc({segment}, val);
 }
@@ -280,7 +280,7 @@ void P2PMasterMetricManager::inc_allocated_mem_size(int64_t val) {
 }
 
 void P2PMasterMetricManager::dec_allocated_mem_size(const std::string& segment,
-                                                 int64_t val) {
+                                                    int64_t val) {
     mem_allocated_size_.dec(val);
     if (!segment.empty()) mem_allocated_size_per_segment_.dec({segment}, val);
 }
@@ -294,13 +294,13 @@ void P2PMasterMetricManager::reset_allocated_mem_size() {
 }
 
 void P2PMasterMetricManager::inc_total_mem_capacity(const std::string& segment,
-                                                 int64_t val) {
+                                                    int64_t val) {
     mem_total_capacity_.inc(val);
     if (!segment.empty()) mem_total_capacity_per_segment_.inc({segment}, val);
 }
 
 void P2PMasterMetricManager::dec_total_mem_capacity(const std::string& segment,
-                                                 int64_t val) {
+                                                    int64_t val) {
     mem_total_capacity_.dec(val);
     if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
 }
@@ -523,7 +523,8 @@ void P2PMasterMetricManager::inc_batch_exist_key_requests(int64_t items) {
     batch_exist_key_requests_.inc(1);
     batch_exist_key_items_.inc(items);
 }
-void P2PMasterMetricManager::inc_batch_exist_key_failures(int64_t failed_items) {
+void P2PMasterMetricManager::inc_batch_exist_key_failures(
+    int64_t failed_items) {
     batch_exist_key_failures_.inc(1);
     batch_exist_key_failed_items_.inc(failed_items);
 }
@@ -932,7 +933,6 @@ std::string P2PMasterMetricManager::get_summary_string() {
     summary += client_metrics_aggregator_.Summary();
     return summary;
 }
-
 
 void P2PMasterMetricManager::update_arch_metrics_for_zero_output() {
     // inc(0) marks metrics changed so zeros serialize.

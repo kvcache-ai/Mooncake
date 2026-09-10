@@ -204,7 +204,8 @@ auto P2PMasterService::GetReadRouteByRegex(std::string_view regex_pattern)
             SharedMutexLocker lock(&shard.mutex, shared_lock);
             keys = shard.table.ListRouteKeys();
         }
-        // Keep owning keys only for this shard; regex evaluation stays unlocked.
+        // Keep owning keys only for this shard; regex evaluation stays
+        // unlocked.
         for (const auto& key : keys) {
             if (!std::regex_search(key, pattern)) {
                 continue;
@@ -225,8 +226,9 @@ auto P2PMasterService::GetReadRouteByRegex(std::string_view regex_pattern)
                 }
             }
             if (descriptors.empty()) {
-                LOG(WARNING) << "key=" << key
-                             << " matched by regex, but has no available routes.";
+                LOG(WARNING)
+                    << "key=" << key
+                    << " matched by regex, but has no available routes.";
                 continue;
             }
             results.emplace(key, std::move(descriptors));
@@ -235,8 +237,8 @@ auto P2PMasterService::GetReadRouteByRegex(std::string_view regex_pattern)
     return results;
 }
 
-auto P2PMasterService::GetReadRoute(
-    std::string_view key, const P2PReadRouteConfig& config)
+auto P2PMasterService::GetReadRoute(std::string_view key,
+                                    const P2PReadRouteConfig& config)
     -> tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode> {
     auto route = GetRouteSnapshot(key);
     if (!route.has_value()) {
@@ -602,8 +604,7 @@ std::vector<P2PRouteDescriptor> P2PMasterService::FilterRoutes(
         }
     }  // for over
 
-    if (config.max_candidates ==
-            P2PReadRouteConfig::RETURN_ALL_CANDIDATES ||
+    if (config.max_candidates == P2PReadRouteConfig::RETURN_ALL_CANDIDATES ||
         config.max_candidates >= candidates.size() || candidates.empty()) {
         // return all candidates
         std::vector<P2PRouteDescriptor> result;
@@ -654,8 +655,9 @@ P2PBatchGetWriteRouteResponse P2PMasterService::SelectWriteRoutes(
     response.error_codes.resize(keys.size(), ErrorCode::OK);
 
     if (keys.size() != object_sizes.size()) {
-        LOG(ERROR) << "BatchGetWriteRoute rejected inconsistent request arrays, keys="
-                   << keys.size() << ", sizes=" << object_sizes.size();
+        LOG(ERROR)
+            << "BatchGetWriteRoute rejected inconsistent request arrays, keys="
+            << keys.size() << ", sizes=" << object_sizes.size();
         std::fill(response.error_codes.begin(), response.error_codes.end(),
                   ErrorCode::INVALID_PARAMS);
         return response;
@@ -712,8 +714,8 @@ P2PBatchGetWriteRouteResponse P2PMasterService::SelectWriteRoutes(
             break;
         }
         const UUID client_id = client->get_client_id();
-        const double weight = client_id == requester_id ? 1.0 - remote_weight
-                                                        : remote_weight;
+        const double weight =
+            client_id == requester_id ? 1.0 - remote_weight : remote_weight;
         if (weight <= 0.0) {
             continue;
         }
@@ -757,7 +759,8 @@ P2PBatchGetWriteRouteResponse P2PMasterService::SelectWriteRoutes(
                       return std::tie(b.score, b.available_capacity) <
                              std::tie(a.score, a.available_capacity);
                   });
-        if (config.max_candidates != P2PWriteRouteConfig::RETURN_ALL_CANDIDATES &&
+        if (config.max_candidates !=
+                P2PWriteRouteConfig::RETURN_ALL_CANDIDATES &&
             candidates.size() > config.max_candidates) {
             candidates.resize(config.max_candidates);
         }
@@ -849,9 +852,11 @@ auto P2PMasterService::InnerWithdrawRoute(std::string_view key,
     return ApplyWithdrawLocked(shard.table, key, client_id, segment_id);
 }
 
-auto P2PMasterService::ApplyWithdrawLocked(
-    P2PRouteTable& table, std::string_view key, const UUID& client_id,
-    const UUID& segment_id) -> tl::expected<void, ErrorCode> {
+auto P2PMasterService::ApplyWithdrawLocked(P2PRouteTable& table,
+                                           std::string_view key,
+                                           const UUID& client_id,
+                                           const UUID& segment_id)
+    -> tl::expected<void, ErrorCode> {
     const P2PRouteLocation location{.client_id = client_id,
                                     .segment_id = segment_id};
     auto record_oplog = [&] {
@@ -927,8 +932,8 @@ auto P2PMasterService::BatchWithdrawRoute(
     return results;
 }
 
-auto P2PMasterService::BatchSyncRoutes(
-    const P2PBatchSyncRoutesRequest& request) -> P2PBatchSyncRoutesResponse {
+auto P2PMasterService::BatchSyncRoutes(const P2PBatchSyncRoutesRequest& request)
+    -> P2PBatchSyncRoutesResponse {
     P2PBatchSyncRoutesResponse response;
     response.publish_results.resize(request.publish_operations.size(),
                                     ErrorCode::OK);
@@ -940,11 +945,9 @@ auto P2PMasterService::BatchSyncRoutes(
         LOG(ERROR) << "BatchSyncRoutes: client not found"
                    << ", client_id=" << request.client_id;
         std::fill(response.publish_results.begin(),
-                  response.publish_results.end(),
-                  ErrorCode::CLIENT_NOT_FOUND);
+                  response.publish_results.end(), ErrorCode::CLIENT_NOT_FOUND);
         std::fill(response.withdraw_results.begin(),
-                  response.withdraw_results.end(),
-                  ErrorCode::CLIENT_NOT_FOUND);
+                  response.withdraw_results.end(), ErrorCode::CLIENT_NOT_FOUND);
         return response;
     }
 
@@ -953,8 +956,8 @@ auto P2PMasterService::BatchSyncRoutes(
         std::vector<size_t> withdraw_indices;
     };
     std::unordered_map<size_t, ShardBatch> batches;
-    const size_t operation_count = request.publish_operations.size() +
-                                   request.withdraw_operations.size();
+    const size_t operation_count =
+        request.publish_operations.size() + request.withdraw_operations.size();
     batches.reserve(std::min(operation_count, kRouteShardCount));
     for (size_t index = 0; index < request.publish_operations.size(); ++index) {
         const auto shard_index =
@@ -982,9 +985,9 @@ auto P2PMasterService::BatchSyncRoutes(
         }
         for (size_t index : batch.withdraw_indices) {
             const auto& operation = request.withdraw_operations[index];
-            auto result = ApplyWithdrawLocked(
-                shard.table, operation.key, request.client_id,
-                operation.segment_id);
+            auto result =
+                ApplyWithdrawLocked(shard.table, operation.key,
+                                    request.client_id, operation.segment_id);
             if (!result.has_value() &&
                 result.error() != ErrorCode::OBJECT_NOT_FOUND &&
                 result.error() != ErrorCode::REPLICA_NOT_FOUND) {

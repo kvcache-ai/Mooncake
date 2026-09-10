@@ -281,8 +281,10 @@ TEST_F(P2PMasterRpcTest, BatchWriteReturnsAlignedCandidateAndValidationErrors) {
     EXPECT_EQ(metrics.get_batch_get_write_route_requests(), requests + 2);
     EXPECT_EQ(metrics.get_batch_get_write_route_items(), items + 4);
     EXPECT_EQ(metrics.get_batch_get_write_route_failures(), failures + 1);
-    EXPECT_EQ(metrics.get_batch_get_write_route_partial_successes(), partial + 1);
-    EXPECT_EQ(metrics.get_batch_get_write_route_failed_items(), failed_items + 3);
+    EXPECT_EQ(metrics.get_batch_get_write_route_partial_successes(),
+              partial + 1);
+    EXPECT_EQ(metrics.get_batch_get_write_route_failed_items(),
+              failed_items + 3);
 }
 
 class GatedRpcHandler {
@@ -400,7 +402,8 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
                 LOG(ERROR) << "Unexpected listener probe failure: " << error;
                 return false;
             }
-            // Poll listener state; request/stop ordering is controlled by gates.
+            // Poll listener state; request/stop ordering is controlled by
+            // gates.
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
         return false;

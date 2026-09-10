@@ -95,8 +95,10 @@ void ClientMetricsAggregator::Update(const UUID& client_id,
     auto it = client_snapshots_.find(client_id);
     const ClientMetricSnapshot& previous =
         it != client_snapshots_.end() ? it->second : kZeroSnapshot;
-    ApplyDataMetricDelta(previous.total_request, snapshot.total_request, total_);
-    ApplyDataMetricDelta(previous.local_request, snapshot.local_request, local_);
+    ApplyDataMetricDelta(previous.total_request, snapshot.total_request,
+                         total_);
+    ApplyDataMetricDelta(previous.local_request, snapshot.local_request,
+                         local_);
     ApplyDataMetricDelta(previous.remote_request.data,
                          snapshot.remote_request.data, remote_);
     ApplyDelta(snapshot.remote_request.read_retries -
@@ -155,7 +157,8 @@ void ClientMetricsAggregator::UpdateRetention(
     const size_t num_buckets = p2p::metric_util::LifetimeBuckets().size() + 1;
 
     ApplyDelta(current.live_count - previous.live_count, key_live_count_);
-    ApplyDelta(current.removed_total - previous.removed_total, key_removed_count_);
+    ApplyDelta(current.removed_total - previous.removed_total,
+               key_removed_count_);
 
     const bool previous_live_valid =
         previous.live_age_buckets.size() == num_buckets;
