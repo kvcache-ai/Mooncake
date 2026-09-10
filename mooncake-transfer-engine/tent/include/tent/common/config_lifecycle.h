@@ -57,6 +57,13 @@ const char* configLifecycleName(ConfigLifecycle lifecycle);
 
 enum class ConfigDiagnosticCode : uint8_t {
     kInvalidRoot,
+    kInvalidPath,
+    kAmbiguousPath,
+    kInvalidType,
+    kOutOfRange,
+    kCrossFieldConstraint,
+    kBackendUnavailable,
+    kAnalysisLimitExceeded,
 };
 
 struct ConfigDiagnostic {

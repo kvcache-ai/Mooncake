@@ -73,6 +73,11 @@ std::string Config::dump(int indent) const {
     return config_data_.dump(indent);
 }
 
+json Config::toJson() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return config_data_;
+}
+
 bool Config::dumpSubtree(const std::string& key_path, std::string* out) const {
     if (!out || key_path.empty()) return false;
     std::lock_guard<std::mutex> lock(mutex_);
