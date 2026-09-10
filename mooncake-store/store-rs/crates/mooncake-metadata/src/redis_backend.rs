@@ -3378,10 +3378,10 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 1,
             }],
-            content_generation: 0,
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     struct EnvLockGuard;
 

@@ -4,6 +4,7 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::cold_tier::ColdBackingRoute;
+use crate::nof::NofBackingRoute;
 use crate::compat::CompatibilityDescriptor;
 use crate::identity::{
     ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope, DEFAULT_DOMAIN,
@@ -135,6 +136,8 @@ pub struct ObjectRoute {
     pub replicas: Vec<ReplicaRoute>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cold_backing: Option<ColdBackingRoute>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nof_backing: Option<NofBackingRoute>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1219,7 +1222,8 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
-        };
+
+            nof_backing: None,};
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, route);
@@ -1268,7 +1272,8 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-        };
+
+            nof_backing: None,};
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, route);

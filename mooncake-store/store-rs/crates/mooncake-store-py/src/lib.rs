@@ -3913,7 +3913,8 @@ mod tests {
             }],
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     fn init_python() {
         prepare_freethreaded_python();

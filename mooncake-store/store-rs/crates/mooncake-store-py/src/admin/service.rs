@@ -3341,11 +3341,11 @@ mod tests {
             sharing_scope: None,
             qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas,
             cold_backing: None,
+            nof_backing: None,
         }
     }
 
@@ -3514,7 +3514,6 @@ mod tests {
             sharing_scope: Some("tenant-a".to_string()),
             qos_tier: Some("default".to_string()),
             version: RouteVersion(7),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -3527,6 +3526,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "device-a".to_string(),
@@ -3580,7 +3580,6 @@ mod tests {
             sharing_scope: None,
             qos_tier: Some("default".to_string()),
             version: RouteVersion(7),
-            content_generation: 0,
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: vec![ReplicaRoute {
@@ -3593,6 +3592,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "device-a".to_string(),
@@ -3776,7 +3776,6 @@ mod tests {
                     sharing_scope: None,
                     qos_tier: None,
             version: RouteVersion(1),
-            content_generation: 0,
             state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: vec![ReplicaRoute {
@@ -3789,7 +3788,8 @@ mod tests {
                         tier: ReplicaTier::Nvme,
                         priority: 0,
                     }],
-                    cold_backing: None,
+            nof_backing: None,
+            cold_backing: None,
                 }),
             )
             .expect("route cas should succeed");

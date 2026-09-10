@@ -2657,7 +2657,8 @@ mod tests {
             }],
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     #[test]
     fn etcd_config_builders_cover_default_construction() {

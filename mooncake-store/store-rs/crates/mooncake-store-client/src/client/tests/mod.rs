@@ -3891,7 +3891,6 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
         sharing_scope: None,
         qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: writer.lease().compatibility.clone(),
         replicas: vec![
@@ -3917,6 +3916,7 @@ fn remove_retries_after_route_delete_conflict_with_partial_multi_replica_handoff
             },
         ],
         cold_backing: None,
+        nof_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route_v1, &object_id);
     let published = inner
@@ -6548,7 +6548,6 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
         route: mooncake_store_core::ObjectRoute {
             key: reader.scoped_key("default", "deadline-key"),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
             namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
             logical_key: Some("deadline-key".to_string()),
@@ -6558,6 +6557,7 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
             compatibility: reader.lease.compatibility.clone(),
             replicas: vec![replica.clone()],
             cold_backing: None,
+            nof_backing: None,
         },
         replica,
         fallback_replicas: VecDeque::new(),
@@ -8689,7 +8689,6 @@ fn routed_batch_put_from_uses_bounded_recheck_for_empty_conflict() {
         sharing_scope: None,
         qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: storage.lease().compatibility,
         replicas: vec![ReplicaRoute {
@@ -8703,6 +8702,7 @@ fn routed_batch_put_from_uses_bounded_recheck_for_empty_conflict() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &object_id);
     inner
@@ -11517,7 +11517,6 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         sharing_scope: None,
         qos_tier: None,
         version: RouteVersion(version),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
@@ -11531,6 +11530,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     let stale_releasable_route = local_route(1, &released_reservation);
     let stale_pending_route = local_route(2, &pending_reservation);
@@ -11549,7 +11549,6 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
         sharing_scope: None,
         qos_tier: None,
         version: RouteVersion(3),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
@@ -11563,6 +11562,7 @@ fn eviction_stale_prepass_keeps_same_key_pending_stale_tracked() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     let cas = client
         .route_directory
@@ -15476,7 +15476,6 @@ fn pending_reclaims_split_cold_backing_from_hot_replica_releases() {
         sharing_scope: None,
         qos_tier: Some("default".to_string()),
         version: RouteVersion(3),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
@@ -15498,6 +15497,7 @@ fn pending_reclaims_split_cold_backing_from_hot_replica_releases() {
             state: mooncake_store_core::ColdBackingState::Materialized,
             replicas: Vec::new(),
         }),
+        nof_backing: None,
     };
 
     let pending = client
@@ -16257,7 +16257,6 @@ fn local_read_prefers_replica_target_offset_over_segment_offset() {
         sharing_scope: None,
         qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: store.lease.compatibility.clone(),
         replicas: vec![ReplicaRoute {
@@ -16271,6 +16270,7 @@ fn local_read_prefers_replica_target_offset_over_segment_offset() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &object_id);
     store
@@ -16760,7 +16760,6 @@ fn readable_replica_selection_prefers_local_survivor() {
         sharing_scope: None,
         qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: local.lease().compatibility,
         replicas: vec![
@@ -16786,6 +16785,7 @@ fn readable_replica_selection_prefers_local_survivor() {
             },
         ],
         cold_backing: None,
+        nof_backing: None,
     };
 
     let local_segments = local.local_storage_segments();
@@ -17193,11 +17193,11 @@ fn evacuate_owned_replicas_reads_the_draining_replica_source() {
         sharing_scope: None,
         qos_tier: Some(mooncake_store_core::DEFAULT_QOS_TIER.to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: store_a.lease.compatibility.clone(),
         replicas: vec![store_b_replica, store_a_replica],
         cold_backing: None,
+        nof_backing: None,
     };
     mooncake_store_core::apply_route_identity(&mut route, &target_id);
     store_a
@@ -17734,7 +17734,6 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
         sharing_scope: Some("default".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
@@ -17748,6 +17747,7 @@ fn internal_allocator_and_store_state_cover_edge_cases() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     allocator.clear_pending_route(&pending_route, &owner);
     assert!(allocator.pending_allocations(now_ms()).is_empty());
@@ -17948,7 +17948,6 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
         sharing_scope: Some("default".to_string()),
         qos_tier: Some("default".to_string()),
         version: RouteVersion(1),
-        content_generation: 0,
         state: mooncake_store_core::RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: vec![ReplicaRoute {
@@ -17962,6 +17961,7 @@ fn local_allocator_pending_window_respects_publish_and_timeout() {
             priority: 0,
         }],
         cold_backing: None,
+        nof_backing: None,
     };
     allocator.clear_pending_route(&route, &owner);
     assert!(

@@ -5,8 +5,11 @@ pub mod hugepage;
 pub mod identity;
 pub mod identity_codec;
 pub mod lifecycle;
+mod nof;
 pub mod route;
 pub mod traits;
+
+pub use nof::{NofBackingReplica, NofBackingRoute, NofBackingRouteFilter};
 
 pub use cold_tier::{
     ColdBackingReplica, ColdBackingRoute, ColdBackingRouteFilter, ColdBackingState,

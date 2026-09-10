@@ -580,7 +580,8 @@ fn admin_service_cold_tier_object_lookup_uses_tenant_scoped_backend() {
                     "device-a",
                     ColdBackingState::Materialized,
                 )),
-            }),
+
+                nof_backing: None,}),
         )
         .expect("tenant-a route should store");
     tenant_b
@@ -602,7 +603,8 @@ fn admin_service_cold_tier_object_lookup_uses_tenant_scoped_backend() {
                     "device-b",
                     ColdBackingState::PendingOffload,
                 )),
-            }),
+
+                nof_backing: None,}),
         )
         .expect("tenant-b route should store");
 

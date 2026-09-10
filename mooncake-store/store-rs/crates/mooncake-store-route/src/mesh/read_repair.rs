@@ -210,7 +210,8 @@ mod tests {
             }],
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     fn test_route_different_replica(key: &str, version: u64) -> ObjectRoute {
         ObjectRoute {
@@ -235,7 +236,8 @@ mod tests {
             }],
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     #[test]
     fn repair_request_missing_generates_insert() {

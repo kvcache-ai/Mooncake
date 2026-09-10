@@ -263,7 +263,8 @@ pub(super) fn try_object_route(route: pb::ObjectRoute) -> Result<ObjectRoute> {
             .map(try_replica_route)
             .collect::<Result<Vec<_>>>()?,
         cold_backing: route.cold_backing.map(try_cold_backing_route).transpose()?,
-    };
+
+        nof_backing: None,};
     Ok(route)
 }
 

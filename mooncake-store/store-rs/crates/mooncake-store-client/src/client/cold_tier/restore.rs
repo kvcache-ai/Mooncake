@@ -1357,7 +1357,8 @@ fn build_owner_restored_route(
     }];
     mooncake_store_core::apply_route_identity(&mut next, object_id);
     next
-}
+
+    nof_backing: None,}
 
 fn sync_current_route_by_key(
     storage_owner: &StorageOwnerState,
