@@ -102,6 +102,16 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    // TODO(C5): Remove this temporary wiring after allocator ownership is
+    // split. Preserve a00f757 accounting without charging P2P tier allocations
+    // to centralized master metrics.
+    allocator->set_usage_observers(
+        [name = segment.name](int64_t bytes) {
+            MasterMetricManager::instance().inc_allocated_mem_size(name, bytes);
+        },
+        [name = segment.name](int64_t bytes) {
+            MasterMetricManager::instance().dec_allocated_mem_size(name, bytes);
+        });
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
@@ -318,5 +328,14 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    // TODO(C5): Remove alongside the ordinary segment usage-observer wiring
+    // when centralized and P2P tier allocator ownership is finalized.
+    cxl_global_allocator_->set_usage_observers(
+        [name = cxl_path](int64_t bytes) {
+            MasterMetricManager::instance().inc_allocated_mem_size(name, bytes);
+        },
+        [name = cxl_path](int64_t bytes) {
+            MasterMetricManager::instance().dec_allocated_mem_size(name, bytes);
+        });
 }
 }  // namespace mooncake
