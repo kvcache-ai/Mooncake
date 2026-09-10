@@ -181,10 +181,10 @@ class ObjectIndex {
     // Remove every lease whose expiry instant has passed.
     void EraseExpiredDynamicReplicationLeases(
         std::chrono::system_clock::time_point now) {
-        const int64_t now_ms = std::chrono::duration_cast<
-                                   std::chrono::milliseconds>(
-                                   now.time_since_epoch())
-                                   .count();
+        const int64_t now_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                now.time_since_epoch())
+                .count();
         std::unique_lock<std::shared_mutex> lock(leases_lock_);
         for (auto it = dynamic_replication_leases.begin();
              it != dynamic_replication_leases.end();) {

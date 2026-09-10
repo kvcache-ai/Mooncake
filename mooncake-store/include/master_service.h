@@ -60,7 +60,6 @@
 
 namespace mooncake {
 
-
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
 class MasterSnapshotRepository;
@@ -124,16 +123,17 @@ class MetadataScanBench;
  * 1. client_mutex_
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
- * 4. per-object ObjectEntry::mutex (via metadata::TenantCatalog::object_index Get)
+ * 4. per-object ObjectEntry::mutex (via metadata::TenantCatalog::object_index
+ * Get)
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
  * The per-object lock is never held together with the object route lock
- * (metadata::TenantCatalog::object_index): acquire one at a time, releasing before the
- * route mutation. Strict tenant admission and policy mutation paths that need
- * both tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
- * policy mutex first, then snapshot_mutex_.
+ * (metadata::TenantCatalog::object_index): acquire one at a time, releasing
+ * before the route mutation. Strict tenant admission and policy mutation paths
+ * that need both tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire
+ * the tenant policy mutex first, then snapshot_mutex_.
  * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
  * corresponding quota-table update. The segment mutex is released before
  * entering ShardedTenantQuotaTable, so these two locks are never nested.
