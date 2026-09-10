@@ -17,13 +17,11 @@ namespace {
 
 std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
                                        const std::string& group_id) {
-    return std::make_shared<ObjectEntry>(
-        std::make_unique<ObjectMetadata>(
-            UUID{1, 2}, std::chrono::system_clock::now(), 128,
-            std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, group_id, TenantId(), key));
+    return std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
+        UUID{1, 2}, std::chrono::system_clock::now(), 128,
+        std::vector<Replica>{}, std::nullopt, false, ObjectDataType::UNKNOWN,
+        group_id, TenantId(), key));
 }
-
 
 TEST(GroupIndexTest, StartsWithNoGroups) {
     GroupIndex index;

@@ -13,13 +13,11 @@ namespace {
 
 std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
                                        const std::string& group_id) {
-    return std::make_shared<ObjectEntry>(
-        std::make_unique<ObjectMetadata>(
-            UUID{1, 2}, std::chrono::system_clock::now(), 128,
-            std::vector<Replica>{}, std::nullopt, false,
-            ObjectDataType::UNKNOWN, group_id, TenantId(), key));
+    return std::make_shared<ObjectEntry>(std::make_unique<ObjectMetadata>(
+        UUID{1, 2}, std::chrono::system_clock::now(), 128,
+        std::vector<Replica>{}, std::nullopt, false, ObjectDataType::UNKNOWN,
+        group_id, TenantId(), key));
 }
-
 
 // --- InsertObject (route + group wiring) ---
 
@@ -34,8 +32,9 @@ TEST(TenantCatalogTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
     EXPECT_EQ(catalog.ObjectCount(), 1u);
     EXPECT_EQ(catalog.group_index.Members("g1").size(), 1u);
     ASSERT_NE(member->metadata().lease(), nullptr);  // shared lease wired
-    EXPECT_EQ(member->metadata().lease().get(),
-              catalog.group_index.LeaseFor("g1").get());  // same single shared lease
+    EXPECT_EQ(
+        member->metadata().lease().get(),
+        catalog.group_index.LeaseFor("g1").get());  // same single shared lease
 }
 
 TEST(TenantCatalogTest, InsertObjectDoesNotJoinForSingleton) {
@@ -45,7 +44,8 @@ TEST(TenantCatalogTest, InsertObjectDoesNotJoinForSingleton) {
     EXPECT_TRUE(catalog.InsertObject("k1", singleton));
 
     EXPECT_EQ(catalog.ObjectCount(), 1u);
-    EXPECT_TRUE(catalog.group_index.Members("g1").empty());  // singleton adds no group
+    EXPECT_TRUE(
+        catalog.group_index.Members("g1").empty());  // singleton adds no group
     // A singleton keeps the envelope's own never-granted lease: non-null but
     // expired, and distinct from any group's shared lease.
     EXPECT_NE(singleton->metadata().lease(), nullptr);
@@ -56,8 +56,7 @@ TEST(TenantCatalogTest, InsertObjectRejectsDuplicateKey) {
     TenantCatalog catalog;
     catalog.InsertObject("k1", MakeEntry("k1", "g1"));
     // Second insert for the same key is rejected; the original is intact.
-    EXPECT_FALSE(
-        catalog.InsertObject("k1", MakeEntry("k1", "g2")));
+    EXPECT_FALSE(catalog.InsertObject("k1", MakeEntry("k1", "g2")));
     EXPECT_EQ(catalog.ObjectCount(), 1u);
     EXPECT_EQ(catalog.group_index.Members("g1").size(), 1u);
     EXPECT_TRUE(catalog.group_index.Members("g2").empty());

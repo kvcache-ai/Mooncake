@@ -73,9 +73,7 @@ class TenantCatalog {
 
     // Empty of objects, group membership and (via ObjectIndex) in-flight
     // dynamic-replication leases.
-    bool Empty() const {
-        return group_index.Empty() && object_index.Empty();
-    }
+    bool Empty() const { return group_index.Empty() && object_index.Empty(); }
 
     // Remove a grouped entry's membership (object teardown path).
     void UnregisterGroupMember(const std::string& key,
@@ -103,8 +101,8 @@ class TenantCatalog {
             }
             ObjectMetadata& metadata = entry->metadata();
             const auto deadline = metadata.EvictionDeadline();
-            auto [it, inserted] = max_deadline_by_group.try_emplace(
-                metadata.group_id, deadline);
+            auto [it, inserted] =
+                max_deadline_by_group.try_emplace(metadata.group_id, deadline);
             if (!inserted) {
                 it->second = std::max(it->second, deadline);
             }
@@ -162,8 +160,7 @@ class TenantCatalog {
     }
     // Only erase when the route still resolves to `expected`; see
     // ObjectIndex::EraseIf.
-    bool EraseObjectIf(const std::string& key,
-                       const ObjectEntry* expected) {
+    bool EraseObjectIf(const std::string& key, const ObjectEntry* expected) {
         return object_index.EraseIf(key, expected);
     }
     bool ContainsObject(const std::string& key) const {

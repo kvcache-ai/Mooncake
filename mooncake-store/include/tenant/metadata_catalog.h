@@ -53,10 +53,10 @@ class MetadataCatalog {
     // Rebuild group membership and shared-lease deadlines from object metadata
     // in every tenant (snapshot / standby restore path).
     void RebuildGroupState() {
-        tenants_.Visit([](const TenantId&,
-                          const std::shared_ptr<TenantCatalog>& handle) {
-            handle->RebuildGroupState();
-        });
+        tenants_.Visit(
+            [](const TenantId&, const std::shared_ptr<TenantCatalog>& handle) {
+                handle->RebuildGroupState();
+            });
     }
 
    private:

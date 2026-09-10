@@ -61,7 +61,8 @@ TEST(TenantDirectoryTest, GetOrCreateReturnsWinningHandleToAllRacers) {
     const TenantId tenant("tenant-get-or-create");
 
     // Miss keeps the directory empty until the factory result is published.
-    auto created = dir.GetOrCreate(tenant, [] { return std::make_shared<int>(1); });
+    auto created =
+        dir.GetOrCreate(tenant, [] { return std::make_shared<int>(1); });
     ASSERT_NE(created, nullptr);
     EXPECT_EQ(*created, 1);
 

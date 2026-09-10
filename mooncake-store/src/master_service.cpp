@@ -2263,8 +2263,9 @@ void MasterService::EraseMetadata(TenantCatalog& tenant_state,
 }
 
 // EraseMetadata deletes the object metadata and also cleans up all
-// associated per-key state: offloading_tasks (with dec_refcnt),
-// processing_keys, replication_tasks, and promotion tasks.
+// associated per-key state on the entry: the offloading task (with
+// dec_refcnt), the processing flag, the replication task, and promotion
+// task state.
 // Callers no longer need to clean these up manually before calling.
 void MasterService::EraseMetadata(
     TenantCatalog& tenant_state,
@@ -5451,8 +5452,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                    key, object_id.tenant_id, tenant_state,
                                    object_entry->metadata(), retaining_clients,
                                    &tenant_accessor)) {
-                        // EraseMetadata handles processing,
-                        // replication_tasks, offloading_tasks (with
+                        // EraseMetadata handles the processing flag,
+                        // replication and offloading tasks (with
                         // dec_refcnt), and promotion task cleanup.
                         EraseMetadata(tenant_state, object_entry,
                                       object_id.tenant_id,
@@ -6122,9 +6123,9 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     // executor's guard across it: source/target Clients may be identical, and
     // two opposite copy operations must not hold their source guards while
     // waiting for each other's target guard. This CopyStart was already
-    // admitted while the source guard was held; the metadata shard remains
-    // locked, so terminal cleanup cannot pass this operation before its
-    // metadata changes become visible.
+    // admitted while the source guard was held; the entry lock stays held,
+    // so terminal cleanup cannot pass this operation before its metadata
+    // changes become visible.
     serving_guard.reset();
     AllocatorManager allocator_snapshot;
     {
@@ -6535,7 +6536,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
     std::vector<Replica> replicas;
     // See CopyStart: target allocation owns its own Client guard and must not
-    // be nested under the source executor's guard. The metadata shard keeps
+    // be nested under the source executor's guard. The entry lock keeps
     // terminal cleanup ordered after this already-admitted MoveStart.
     serving_guard.reset();
     if (metadata.GetReplicaBySegmentName(tgt_segment) == nullptr) {
@@ -7834,7 +7835,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
     }
     // Offloading is disabled: clear the pending queue to prevent unbounded
     // growth that would trigger KEYS_ULTRA_LIMIT in PushOffloadingQueue. We
-    // must also clean up corresponding offloading_tasks and decrement source
+    // must also clean up each entry's offloading task and decrement source
     // replica refcounts to avoid resource leaks and blocked writes
     // (OBJECT_HAS_REPLICATION_TASK).
     for (auto& task : *pending) {
@@ -8122,9 +8123,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!client_id) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
-        // Callers hold the source metadata shard. This serving observation is
-        // the admission point; terminal cleanup must acquire the same shard
-        // before it can remove the source or unregister the destination.
+        // Callers hold the source entry's lock. This serving observation is
+        // the admission point; terminal cleanup must take that lock before
+        // it can remove the source or unregister the destination.
         if (!liveness->IsServing()) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -8205,8 +8206,8 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    // TryPushPromotionQueue holds the source metadata shard, which orders a
-    // concurrently accepted enqueue before terminal cleanup.
+    // TryPushPromotionQueue runs under the source entry's lock, which orders
+    // a concurrently accepted enqueue before terminal cleanup.
     if (!liveness->IsServing()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9108,9 +9109,9 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
     if (!liveness) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    // The proposal caller holds the object's metadata shard. Observe serving
+    // The proposal caller holds the object's entry lock. Observe serving
     // eligibility without blocking on the Client transition mutex while that
-    // shard is held; offboarding cleanup is ordered after this shard section.
+    // lock is held; offboarding cleanup is ordered after this section.
     if (!liveness->IsServing()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9179,8 +9180,8 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
     auto& metadata = accessor.Get();
     auto object_entry = accessor.GetEntry();
 
-    // A primary Put/Upsert owns all PROCESSING replicas while the key is in
-    // processing_keys. Promotion must not establish a second owner.
+    // A primary Put/Upsert owns all PROCESSING replicas while the entry is
+    // processing. Promotion must not establish a second owner.
     if (accessor.InProcessing()) {
         EraseCandidateLocked(*object_entry);
         return PromotionQueueResult::kAlreadyInFlight;
@@ -9394,8 +9395,8 @@ auto MasterService::PromotionAllocStart(
     std::vector<Replica> staged_replicas;
     // Allocation is guarded by the selected memory Segment owner. Release the
     // holder guard first so a co-located holder cannot self-deadlock and two
-    // Clients cannot form a source/target lock cycle. The holder operation was
-    // already admitted and its metadata shard stays locked until the staged
+    // Clients cannot form a source/target lock cycle. The holder operation
+    // was already admitted and its entry lock stays held until the staged
     // replica and task state are committed or rolled back.
     serving_guard.reset();
     AllocatorManager allocator_snapshot;

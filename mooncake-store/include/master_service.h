@@ -158,11 +158,11 @@ class MasterService {
     friend class test::LocalDiskUnmountInterleavingTest;
     // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
     friend class test::MasterServiceSSDTest;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
-                                           // members
+    friend class ha::MasterSnapshotCodec;      // Allow codec to access private
+                                               // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
     friend class test::MasterServiceHATest;
 
@@ -1080,7 +1080,6 @@ class MasterService {
 
     // The per-object runtime task types are defined in object_entry_types.h.
 
-
     // The authoritative metadata boundary: owns the tenant registry and the
     // lifecycle rules (atomic get-or-create, no eager reclamation). RAII
     // metadata access is provided by the MetadataAccessorRO/RW handles below.
@@ -1174,7 +1173,6 @@ class MasterService {
         const TenantId& tenant_id) const;
     bool IsTenantRegistered(const TenantId& tenant_id) const;
 
-
     // Register a member key under a group and return the group's shared Lease
     // (creating it on first member). Returns nullptr for empty group_id.
     // Reads the member keys registered for `group_id`; empty if unregistered.
@@ -1236,8 +1234,8 @@ class MasterService {
     void EraseMetadata(
         TenantCatalog& tenant_state,
         const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
-        const TenantId& tenant_id, QuotaEraseMode quota_mode =
-                                       QuotaEraseMode::kFull,
+        const TenantId& tenant_id,
+        QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
         TenantCatalog* tenant_accessor = nullptr,
         const std::vector<std::string>& previous_media_hint = {});
     void EraseMetadata(TenantCatalog& tenant_state, const std::string& key,
@@ -1505,14 +1503,13 @@ class MasterService {
         MetadataAccessorRW(MasterService* service, ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              tenant_handle_(
-                  service_->catalog_.Lookup(object_id_.tenant_id)),
+              tenant_handle_(service_->catalog_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
               lock_(entry_ != nullptr ? entry_->LockUnique()
-                        : std::unique_lock<std::shared_mutex>()) {
+                                      : std::unique_lock<std::shared_mutex>()) {
             if (tenant_state_ != nullptr) {
                 service_->GetBoundTenantQuotaHandle(*tenant_state_);
             }
@@ -1701,8 +1698,8 @@ class MasterService {
 
         MasterService* service_;
         ObjectIdentity object_id_;
-        // Strong handle keeps the TenantCatalog alive for the accessor lifecycle
-        // even if the directory removes it (COW publish) mid-access.
+        // Strong handle keeps the TenantCatalog alive for the accessor
+        // lifecycle even if the directory removes it (COW publish) mid-access.
         std::shared_ptr<TenantCatalog> tenant_handle_;
         TenantCatalog* tenant_state_;
         // Pinned ObjectEntry (keeps the object alive) whose per-object mutex is
@@ -1760,14 +1757,14 @@ class MasterService {
                            ObjectIdentity object_id)
             : service_(service),
               object_id_(std::move(object_id)),
-              tenant_handle_(
-                  service_->catalog_.Lookup(object_id_.tenant_id)),
+              tenant_handle_(service_->catalog_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
               entry_(tenant_state_ != nullptr
                          ? tenant_state_->Pin(object_id_.user_key)
                          : nullptr),
               lock_(entry_ != nullptr ? entry_->LockShared()
-                                      : std::shared_lock<std::shared_mutex>()) {}
+                                      : std::shared_lock<std::shared_mutex>()) {
+        }
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1784,7 +1781,8 @@ class MasterService {
             return entry_->metadata();
         }
 
-        const TenantCatalog* GetTenantCatalog() const NO_THREAD_SAFETY_ANALYSIS {
+        const TenantCatalog* GetTenantCatalog() const
+            NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_;
         }
 

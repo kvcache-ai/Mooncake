@@ -87,8 +87,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
 
     // Friend access: any second live key in the same tenant (Default) keeps
     // the TenantCatalog non-empty. All of a tenant's keys live in a single
-    // TenantCatalog regardless of shard (there is no per-key shard to share), so
-    // a simple suffix suffices instead of a shard-index probe.
+    // TenantCatalog regardless of shard (there is no per-key shard to share),
+    // so a simple suffix suffices instead of a shard-index probe.
     std::string FindKeyOnSameShard(MasterService& service,
                                    const std::string& key) {
         (void)service;
