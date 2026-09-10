@@ -932,6 +932,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             }
         }
         if (options.internal) desc.internal = options.internal;
+        desc.permission = options.perm;
         desc_list.push_back(std::move(desc));
     }
 

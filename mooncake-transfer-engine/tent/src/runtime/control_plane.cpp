@@ -511,7 +511,11 @@ void ControlService::onSendData(const std::string_view& request,
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadWrite) {
+            response = "SendData failed: remote write permission denied";
+            return;
+        }
         auto status =
             Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
         if (!status.ok()) {
@@ -552,7 +556,12 @@ void ControlService::onRecvData(const std::string_view& request,
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadOnly &&
+            buffer->permission != kGlobalReadWrite) {
+            fail("RecvData failed: remote read permission denied");
+            return;
+        }
         auto& loader = Platform::getLoader();
         if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
             // assign() skips the resize() zero-fill pass.
