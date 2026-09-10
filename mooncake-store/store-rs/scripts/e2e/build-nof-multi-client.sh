@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+if [[ ! -f "${ROOT_DIR}/Cargo.toml" && -f "${ROOT_DIR}/mooncake-store/store-rs/Cargo.toml" ]]; then
+  ROOT_DIR="${ROOT_DIR}/mooncake-store/store-rs"
+fi
+
+source "${HOME}/.cargo/env" 2>/dev/null || true
+for command in cargo pkg-config ldd sha256sum; do
+  command -v "${command}" >/dev/null || {
+    echo "${command} is required; source the canonical Rust/SPDK environment first" >&2
+    exit 1
+  }
+done
+
+find_spdk_prefix() {
+  local candidate pc
+  for candidate in \
+    "${MOONCAKE_SPDK_PREFIX:-}" \
+    /nvme/cruz.zxp/spdk-26.05-host \
+    /opt/spdk-26.05 \
+    /nvme/cruz.zxp/spdk-26.05-generic \
+    /nvme/cruz.zxp/spdk-26.05-generic-src; do
+    [[ -n "${candidate}" ]] || continue
+    for pc in \
+      "${candidate}/install/lib/pkgconfig" \
+      "${candidate}/lib/pkgconfig" \
+      "${candidate}/build/lib/pkgconfig" \
+      "${candidate}/build/lib64/pkgconfig"; do
+      if [[ -f "${pc}/spdk_nvme.pc" && -f "${pc}/spdk_env_dpdk.pc" && -f "${pc}/spdk_syslibs.pc" ]]; then
+        printf '%s\n' "${candidate}"
+        return 0
+      fi
+    done
+  done
+  return 1
+}
+
+SPDK_PREFIX="$(find_spdk_prefix)" || {
+  cat >&2 <<'MSG'
+SPDK development package not found.
+Expected spdk_nvme.pc, spdk_env_dpdk.pc and spdk_syslibs.pc under:
+  /opt/spdk-26.05/install/lib/pkgconfig
+  /nvme/cruz.zxp/spdk-26.05-host/lib/pkgconfig
+Set MOONCAKE_SPDK_PREFIX to an equivalent SPDK prefix.
+MSG
+  exit 1
+}
+
+SPDK_PC_DIR=""
+for candidate in \
+  "${SPDK_PREFIX}/install/lib/pkgconfig" \
+  "${SPDK_PREFIX}/lib/pkgconfig" \
+  "${SPDK_PREFIX}/build/lib/pkgconfig" \
+  "${SPDK_PREFIX}/build/lib64/pkgconfig"; do
+  if [[ -f "${candidate}/spdk_nvme.pc" && -f "${candidate}/spdk_env_dpdk.pc" && -f "${candidate}/spdk_syslibs.pc" ]]; then
+    SPDK_PC_DIR="${candidate}"
+    break
+  fi
+done
+export MOONCAKE_SPDK_PREFIX="${SPDK_PREFIX}"
+export PKG_CONFIG_PATH="${SPDK_PC_DIR}${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+
+pkg-config --exists spdk_nvme spdk_env_dpdk spdk_syslibs || {
+  echo "SPDK pkg-config validation failed: ${SPDK_PC_DIR}" >&2
+  exit 1
+}
+SPDK_LIB_DIR="$(pkg-config --variable=libdir spdk_nvme 2>/dev/null || true)"
+if [[ -z "${SPDK_LIB_DIR}" || ! -d "${SPDK_LIB_DIR}" ]]; then
+  SPDK_LIB_DIR="$(cd "${SPDK_PC_DIR}/.." && pwd)"
+fi
+for library in libspdk_nvme.so libspdk_env_dpdk.so; do
+  [[ -e "${SPDK_LIB_DIR}/${library}" ]] || {
+    echo "${SPDK_LIB_DIR}/${library} is required; static-only SPDK packages are not supported by this test build" >&2
+    exit 1
+  }
+done
+
+source "${HOME}/.cargo/env" 2>/dev/null || true
+# Keep the build contract explicit. The four-node test is intentionally
+# CPU-only and must be reproducible from the locked dependency graph.
+# The four NoF initiators are CPU-only. Do not let CUDA headers in the build
+# container enable CUDA code paths that require a GPU at runtime. Set
+# MOONCAKE_ENABLE_CUDA=1 explicitly only for a GPU-capable validation host.
+export MOONCAKE_ENABLE_CUDA="${MOONCAKE_ENABLE_CUDA:-0}"
+NOF_LINKER="${NOF_LINKER:-${ROOT_DIR}/scripts/e2e/nof-spdk-linker.sh}"
+[[ -x "${NOF_LINKER}" ]] || {
+  echo "NoF linker wrapper is not executable: ${NOF_LINKER}" >&2
+  exit 1
+}
+export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER:-${NOF_LINKER}}"
+# Unit tests and the final binary use the same SPDK shared-library runtime.
+export LD_LIBRARY_PATH="${SPDK_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+PROFILE="${NOF_BUILD_PROFILE:-debug}"
+case "${PROFILE}" in
+  debug) PROFILE_ARGS=() ; BINARY="${ROOT_DIR}/target/debug/nof_multi_client" ;;
+  release) PROFILE_ARGS=(--release) ; BINARY="${ROOT_DIR}/target/release/nof_multi_client" ;;
+  *) echo "NOF_BUILD_PROFILE must be debug or release, got ${PROFILE}" >&2; exit 2 ;;
+esac
+
+cd "${ROOT_DIR}"
+cargo fmt --all -- --check
+cargo build --locked "${PROFILE_ARGS[@]}" -p mooncake-store-e2e --bin nof_multi_client \
+  --features nof-spdk
+
+if [[ "${NOF_RUN_UNIT_TESTS:-0}" == 1 ]]; then
+  cargo test --locked -p mooncake-store-client --lib --features nof-spdk nof
+fi
+
+[[ -x "${BINARY}" ]] || { echo "built binary not found: ${BINARY}" >&2; exit 1; }
+RUNTIME_DEPS="$(ldd -r "${BINARY}" 2>&1 || true)"
+if grep -Eq 'not found|undefined symbol:' <<<"${RUNTIME_DEPS}"; then
+  echo "SPDK runtime dependencies are unresolved for ${BINARY}" >&2
+  printf '%s\n' "${RUNTIME_DEPS}" >&2
+  exit 1
+fi
+
+printf 'built=%s\nspdk_prefix=%s\nspdk_lib_dir=%s\nlinker=%s\n' \
+  "${BINARY}" "${SPDK_PREFIX}" "${SPDK_LIB_DIR}" "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER}"
+printf 'commit=%s\ncargo=%s\nrustc=%s\nspdk_nvme=%s\n' \
+  "$(git rev-parse HEAD)" "$(cargo --version)" "$(rustc --version)" \
+  "$(pkg-config --modversion spdk_nvme)"
+sha256sum "${BINARY}"
