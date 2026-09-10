@@ -499,6 +499,11 @@ impl StoreClientBuilder {
         });
         let cold_tier_enabled = cold_tier::cold_tier_enabled();
         let nof_configured = !self.nof_targets.is_empty();
+        if nof_configured && effective_route_control != RouteControlMode::EmbeddedWrh {
+            return Err(StoreError::InvalidState(
+                "NoF targets require EmbeddedWrh route control".to_string(),
+            ));
+        }
         let resolved_cold_tier = if cold_tier_enabled {
             self.cold_tier_targets
                 .iter()
