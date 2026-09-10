@@ -1950,7 +1950,6 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (!tenant_handle) {
         return;
     }
-    tenant::TenantCatalog& tenant_accessor = *tenant_handle;
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Get(durable_entry.object_key);
     if (!object_entry) {
@@ -2013,13 +2012,13 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     ReleaseLocalDiskUsage(erased_replicas);
     FreeDfsReplicas(metadata.user_key, erased_replicas);
     if (erased_local_disk) {
-        tenant_accessor.OnDiskReplicaRemoved(erased_local_disk, metadata);
+        tenant_state.OnDiskReplicaRemoved(erased_local_disk, metadata);
     }
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
                                           erased_replica_ids);
     if (!metadata.IsValid()) {
         EraseMetadata(tenant_state, object_entry, tenant_id, quota_mode,
-                      &tenant_accessor);
+                      &tenant_state);
     } else {
         SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                           previous_media);
@@ -2039,10 +2038,9 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     if (!tenant_handle) {
         return;
     }
-    tenant::TenantCatalog& tenant_accessor = *tenant_handle;
     auto& tenant_state = *tenant_handle;
     EraseMetadata(tenant_state, durable_entry.object_key, tenant_id, quota_mode,
-                  &tenant_accessor);
+                  &tenant_state);
 }
 
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
@@ -8336,7 +8334,6 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
     const auto now = std::chrono::steady_clock::now();
     auto tenant_handle = catalog_.Lookup(object_id.tenant_id);
     if (!tenant_handle) return;
-    tenant::TenantCatalog& tenant_accessor = *tenant_handle;
     auto& tenant_state = *tenant_handle;
     auto object_entry = tenant_state.Get(object_id.user_key);
     if (!object_entry) return;
