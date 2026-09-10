@@ -356,7 +356,8 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
-                          ReplicaType replica_type = ReplicaType::MEMORY);
+                          ReplicaType replica_type = ReplicaType::MEMORY,
+                          uint32_t min_alignment_bytes = 1);
 
     ~OffsetBufferAllocator() override;
 
@@ -419,7 +420,8 @@ tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
-                      ReplicaType replica_type = ReplicaType::MEMORY);
+                      ReplicaType replica_type = ReplicaType::MEMORY,
+                      uint32_t min_alignment_bytes = 1);
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address

@@ -126,8 +126,9 @@ std::ostream& operator<<(std::ostream& os,
 
 // Wrapper class for __Allocator, it 1) supports thread-safe allocation and
 // deallocation, 2) supports creating a buffer or allocating a memory region
-// that is larger than the largest bin size (3.75GB). The __allocator class is
-// also optimized to:
+// that is larger than the largest bin size (3.75GB), and 3) supports a
+// configurable power-of-two minimum allocation unit via min_alignment_bytes.
+// The __allocator class is also optimized to:
 // 1) round up the allocated size to a bin size. This will a) slightly decrease
 // the memory utilization ratio in general cases, b) makes no difference when
 // the allocated size is equal to a bin size, c) largely improve the memory
@@ -142,7 +143,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Factory method to create shared_ptr<OffsetAllocator>
     static std::shared_ptr<OffsetAllocator> create(
         uint64_t base, size_t size, uint32 init_capacity = 128 * 1024,
-        uint32 max_capacity = (1 << 20));
+        uint32 max_capacity = (1 << 20), uint32 min_alignment_bytes = 1);
 
     // Disable copy constructor and copy assignment
     OffsetAllocator(const OffsetAllocator&) = delete;
@@ -227,7 +228,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
-                    uint32 max_capacity);
+                    uint32 max_capacity, uint32 min_alignment_bytes);
 
     // Private constructor for creating from saved state with pre-constructed
     // allocator This constructor is used during deserialization when we already

@@ -559,6 +559,23 @@ TEST_F(OffsetAllocatorTest, BasicAllocation) {
     EXPECT_NE(handle2->address(), OffsetAllocation::NO_SPACE);
 }
 
+TEST_F(OffsetAllocatorTest, MinimumAlignment) {
+    constexpr uint64_t BASE = 4096;
+    for (uint32 min_alignment_bytes : {512u, 4096u}) {
+        SCOPED_TRACE(min_alignment_bytes);
+        auto allocator = OffsetAllocator::create(BASE, 64 * 1024 * 1024, 16, 16,
+                                                 min_alignment_bytes);
+        auto first = allocator->allocate(513);
+        auto second = allocator->allocate(512);
+        ASSERT_TRUE(first.has_value());
+        ASSERT_TRUE(second.has_value());
+        EXPECT_EQ(first->size(), 513u);
+        EXPECT_EQ(first->address(), BASE);
+        EXPECT_EQ(second->address(),
+                  BASE + (min_alignment_bytes == 512 ? 1024 : 4096));
+    }
+}
+
 // Test allocation failure when out of space
 TEST_F(OffsetAllocatorTest, AllocationFailure) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024 * 1024;  // 1GB
