@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-from __future__ import annotations
-
 """Manual/nightly drain HTTP verification script.
 
 This script intentionally targets non-ASan builds only. The ASan CI gate uses
 TaskExecutorIntegrationTest.DrainJobCompleteFlow instead, because running the
 pybind store client inside a Python host process is not stable under ASan.
 """
+
+from __future__ import annotations
 
 import argparse
 import json

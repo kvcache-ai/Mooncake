@@ -10,6 +10,12 @@ except Exception:
     _torch = None
 
 from mooncake.store import MooncakeDistributedStore
+from mooncake.structured_object_store import (
+    MISSING,
+    _choose_leaf_codec,
+    _escape_key,
+    infer_structure,
+)
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -29,10 +35,6 @@ class TestClass:
     def __init__(self, version=1, shape=(1, 2, 3)):
         self.version = version
         self.shape = shape
-
-    def serialize_into(self, buffer):
-        struct.pack_into("i", buffer, 0, self.version)
-        struct.pack_into("3i", buffer, 4, *self.shape)
 
     def serialize_into(self):
         version_bytes = struct.pack("i", self.version)
@@ -332,14 +334,6 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         for rank in range(tp_size):
             self.store.remove(f"{key}_tp_{rank}")
-
-
-from mooncake.structured_object_store import (
-    MISSING,
-    _choose_leaf_codec,
-    _escape_key,
-    infer_structure,
-)
 
 
 class TestCodecInference(unittest.TestCase):

@@ -153,7 +153,7 @@ def run_single_bench(
     if match:
         return float(match.group(1)) / 1024.0
 
-    print(f"    WARNING: Could not parse throughput", file=sys.stderr)
+    print("    WARNING: Could not parse throughput", file=sys.stderr)
     for line in combined.strip().split("\n")[-3:]:
         print(f"      {line}", file=sys.stderr)
     return None
@@ -243,11 +243,11 @@ def main():
     # Write output file
     if args.output:
         with open(args.output, "w") as f:
-            f.write(f"# EFA Per-Transfer Latency Benchmark\n")
+            f.write("# EFA Per-Transfer Latency Benchmark\n")
             f.write(f"# Operation: {args.operation}\n")
             f.write(f"# Duration: {args.duration}s per point\n")
             f.write(f"# Mode: threads={args.threads}, batch_size={args.batch_size}\n")
-            f.write(f"#\n")
+            f.write("#\n")
             f.write(
                 f"{'block_bytes':>12}  {'block_size':>10}  {'gbps':>10}  {'latency_us':>12}\n"
             )

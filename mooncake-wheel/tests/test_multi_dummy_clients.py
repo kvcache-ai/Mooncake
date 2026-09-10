@@ -51,8 +51,8 @@ class TestMultiDummyClients(unittest.TestCase):
     def test_client_interaction(self):
         """Test basic Put/Get/Exist operations between multi dummy clients."""
         test_data = b"Hello, World!"
-        key1 = f"test_multi_dummy_client_interaction_client1"
-        key2 = f"test_multi_dummy_client_interaction_client2"
+        key1 = "test_multi_dummy_client_interaction_client1"
+        key2 = "test_multi_dummy_client_interaction_client2"
 
         # Test Put/Get/Remove interaction
         if self.client_id == "client1":

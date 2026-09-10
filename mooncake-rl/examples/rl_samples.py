@@ -1,5 +1,6 @@
 # This is a dummy RL training example for demonstrating the usage of Mooncake Store
 # in transmission of data between rollout engines and training engines when distributed
+import argparse
 import os
 import random
 import torch
@@ -404,9 +405,6 @@ def train(args):
             (rollout_id + 1) % args.eval_interval == 0
         ):
             rollout_manager.eval(rollout_id)
-
-
-import argparse
 
 
 def parse_args():

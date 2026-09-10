@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 try:
-    import paramiko
+    import paramiko  # noqa: F401 - imported to check availability.
 except ModuleNotFoundError:
     raise unittest.SkipTest("paramiko is required for SPDK target tests")
 

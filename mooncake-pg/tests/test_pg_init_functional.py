@@ -17,7 +17,7 @@ def _basic_init_worker(ctx: MooncakePGWorkerContext) -> None:
     assert (
         dist.get_rank() == ctx.rank
     ), f"rank mismatch: {dist.get_rank()} != {ctx.rank}"
-    assert dist.get_world_size() == ctx.world_size, f"world_size mismatch"
+    assert dist.get_world_size() == ctx.world_size, "world_size mismatch"
     # Simple collective to verify group works
     tensor = torch.tensor([ctx.rank + 1], dtype=torch.int32, device=device)
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)

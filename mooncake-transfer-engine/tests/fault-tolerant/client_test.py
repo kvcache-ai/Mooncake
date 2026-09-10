@@ -8,7 +8,7 @@ def main():
     context = zmq.Context()
     socket = context.socket(zmq.PULL)
     # server_hostname = input("Enter server hostname (without port): ")
-    socket.connect(f"tcp://localhost:5555")
+    socket.connect("tcp://localhost:5555")
 
     # Wait for buffer info from server
     print("Waiting for server buffer information...")

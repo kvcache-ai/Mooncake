@@ -13,7 +13,9 @@ import torch
 import torch.distributed as dist
 
 import mooncake._ep as native_ep
-import mooncake.pg  # Registers the Mooncake process-group backend for bootstrap.
+
+# Registers the Mooncake process-group backend for bootstrap.
+import mooncake.pg  # noqa: F401
 from mooncake.mooncake_ep_buffer import Buffer
 
 

@@ -97,7 +97,7 @@ def test_run_master_and_client():
                 print("✅ mooncake_client process terminated successfully")
             else:
                 stdout, stderr = client_process.communicate()
-                print(f"❌ mooncake_client failed to start")
+                print("❌ mooncake_client failed to start")
                 print(f"stdout: {stdout.decode()}")
                 print(f"stderr: {stderr.decode()}")
             # Terminate the process
@@ -107,7 +107,7 @@ def test_run_master_and_client():
             return True
         else:
             stdout, stderr = process.communicate()
-            print(f"❌ mooncake_master process failed to start")
+            print("❌ mooncake_master process failed to start")
             print(f"stdout: {stdout.decode()}")
             print(f"stderr: {stderr.decode()}")
             return False

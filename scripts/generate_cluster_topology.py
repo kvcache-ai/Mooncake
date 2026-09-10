@@ -7,7 +7,7 @@ import subprocess
 import paramiko
 from tqdm import tqdm
 from itertools import product
-from collections import defaultdict, Counter
+from collections import defaultdict
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -80,7 +80,7 @@ def list_rdma_devices(host, port, use_sudo):
         numa_str = ssh_exec(host, port, sysfs_cmd).strip()
         try:
             numa = int(numa_str)
-        except:
+        except (TypeError, ValueError):
             numa = -1
         results.append({"name": dev, "numa_node": numa})
     return results

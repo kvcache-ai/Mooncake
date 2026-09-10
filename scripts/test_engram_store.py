@@ -35,7 +35,8 @@ for path in (BUILD_STORE, WHEEL_DIR):
     if path.is_dir() and str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from mooncake.mooncake_config import MooncakeConfig
+# Imported after the build and wheel directories are added to sys.path above.
+from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
 
 GLOBAL_STORE = None
 STORE_MODULE = None

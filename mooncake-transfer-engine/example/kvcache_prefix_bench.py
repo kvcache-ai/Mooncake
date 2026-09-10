@@ -30,7 +30,7 @@ import json
 import signal
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 
 
 def parse_args():
@@ -171,7 +171,7 @@ def run_target(args):
     """Run as target node: allocate KV cache pool and wait."""
     from mooncake.engine import TransferEngine
 
-    print(f"=== Target Node ===")
+    print("=== Target Node ===")
     print(f"Pool size: {args.pool_size_gb} GB")
     print(f"Protocol: {args.protocol}")
 
@@ -196,7 +196,7 @@ def run_target(args):
     else:
         pool_addr, _, _ = allocate_cpu_memory(pool_bytes)
 
-    print(f"Registering memory with transfer engine...")
+    print("Registering memory with transfer engine...")
     t0 = time.time()
     ret = engine.register_memory(pool_addr, pool_bytes)
     reg_time = time.time() - t0
@@ -221,7 +221,7 @@ def run_initiator(args):
     """Run as initiator node: pull prefix KV cache and measure performance."""
     from mooncake.engine import TransferEngine
 
-    print(f"=== Initiator Node ===")
+    print("=== Initiator Node ===")
     print(f"Target: {args.target_server_name}")
     print(f"Pool size: {args.pool_size_gb} GB")
     print(f"Protocol: {args.protocol}")
@@ -234,7 +234,7 @@ def run_initiator(args):
     prefix_tokens_list = [int(x) for x in args.prefix_tokens.split(",")]
     transfer_sizes = [tokens * args.kv_bytes_per_token for tokens in prefix_tokens_list]
 
-    print(f"\nTest matrix:")
+    print("\nTest matrix:")
     for tokens, size in zip(prefix_tokens_list, transfer_sizes):
         print(f"  {tokens:>6} tokens -> {size / 1e6:.1f} MB transfer")
 

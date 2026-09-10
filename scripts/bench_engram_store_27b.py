@@ -162,10 +162,10 @@ def make_row_ids(engram_store, batch_size, seq_len):
     row_ids = []
     for b in range(batch_size):
         batch = []
-        for l in range(seq_len):
+        for pos in range(seq_len):
             token_rows = []
             for head, vocab_size in enumerate(engram_store.get_table_vocab_sizes()):
-                token_rows.append((b * seq_len + l + head) % vocab_size)
+                token_rows.append((b * seq_len + pos + head) % vocab_size)
             batch.append(token_rows)
         row_ids.append(batch)
     return row_ids

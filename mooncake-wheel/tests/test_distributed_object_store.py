@@ -678,7 +678,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         get_duration = system_stats["get_end"] - system_stats["get_start"]
         total_data_size_gb = (VALUE_SIZE * total_operations) / (1024**3)
 
-        print(f"\nConcurrent Stress Test Results:")
+        print("\nConcurrent Stress Test Results:")
         print(f"Total threads: {NUM_THREADS}")
         print(f"Operations per thread: {OPERATIONS_PER_THREAD}")
         print(f"Total operations: {total_operations}")
@@ -697,7 +697,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         Performs ~1000 random operations (put, get, remove) with random value sizes between 1KB and 64MB.
         After testing, all keys are removed.
         """
-        import random
 
         # Local reference dict to simulate expected dict behavior
         reference = {}
