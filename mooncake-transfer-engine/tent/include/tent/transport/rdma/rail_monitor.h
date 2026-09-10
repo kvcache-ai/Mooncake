@@ -108,8 +108,17 @@ class RailMonitor {
         // Last time available() let a transfer through as a recovery probe
         // while the rail was paused. Throttles the probe rate.
         std::chrono::steady_clock::time_point last_probe_time{};
+        // Half-Open: the cooldown timer expired (resume_time elapsed) but
+        // recovery is not yet proven. available() admits ONE trial transfer
+        // (via the fallback path); a trial success closes the rail
+        // (markRecovered), a trial failure escalates the cooldown and re-arms
+        // (markFailed). This replaces the old "expiry fully reopens" path,
+        // which slammed a still-dead peer with every slice and re-triggered
+        // the failure storm at 30s/60s/120s intervals.
+        bool half_open = false;
 
-        // Derived: a rail is paused iff a resume_time has been armed.
+        // Derived: a rail is paused iff a resume_time has been armed. The
+        // Half-Open sub-state (half_open) also has resume_time armed.
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
         }
