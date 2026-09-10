@@ -2666,6 +2666,16 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
         }
 #endif
         shm.te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+        // Record only the side that is still registered. Clear spdk_registered
+        // when the SPDK unregister above succeeded even though the mapping
+        // stays quarantined: a later RetryQuarantinedShmsLocked() would
+        // otherwise call spdk_mem_unregister() a second time, get the benign
+        // -EINVAL no-op for an already released range (SPDK memory.c: no
+        // segment is marked REGISTERED), treat it as a failure, and keep the
+        // mapping quarantined (never munmapped) forever.
+        shm.spdk_registered = !spdk_ok;
+#endif
         quarantine_shms_.push_back(std::move(shm));
         // std::move leaves raw pointer members unchanged; clear it so the
         // moved-from entry cannot be munmapped a second time.
@@ -2954,6 +2964,13 @@ tl::expected<void, ErrorCode> RealClient::ascend_unmap_shm_internal(
                                << "; quarantining mapping (never munmap)";
                 }
                 shm.te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+                // Clear spdk_registered when the SPDK unregister above
+                // succeeded: see unmap_shm_internal (a stale flag makes the
+                // retry re-unregister an already released range, get -EINVAL,
+                // and keep the mapping quarantined forever).
+                shm.spdk_registered = !spdk_ok;
+#endif
                 quarantine_shms_.push_back(std::move(shm));
                 // std::move leaves raw pointer members unchanged; clear it so
                 // the moved-from entry cannot be munmapped a second time.
@@ -3074,6 +3091,13 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
                                << "; quarantining mapping (never munmap)";
                 }
                 shm_it->te_unregister_pending = !te_ok;
+#ifdef USE_NOF
+                // Clear spdk_registered when the SPDK unregister above
+                // succeeded: see unmap_shm_internal (a stale flag makes the
+                // retry re-unregister an already released range, get -EINVAL,
+                // and keep the mapping quarantined forever).
+                shm_it->spdk_registered = !spdk_ok;
+#endif
                 quarantine_shms_.push_back(std::move(*shm_it));
                 // std::move leaves raw pointer members unchanged; clear it so
                 // the moved-from entry cannot be munmapped again (the entry is
