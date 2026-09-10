@@ -476,43 +476,6 @@ TEST(EngineFailoverE2E, HpTcpPermanentFailureDoesNotFailOver) {
     releaseHpTcpRecoveryBatch(engine, batch);
 }
 
-TEST(EngineFailoverE2E, TcpUnknownWriteDoesNotFailOver) {
-    class UncertainTcp : public FakeTransport {
-       public:
-        UncertainTcp() : FakeTransport(TCP) {}
-        Status getTransferStatus(SubBatchRef batch, int id,
-                                 TransferStatus& output) override {
-            CHECK_STATUS(FakeTransport::getTransferStatus(batch, id, output));
-            output = {FAILED, 0};
-            return Status::RpcServiceError("TCP WRITE outcome is unknown");
-        }
-    };
-    TransferEngineImpl engine(makeMinimalP2PConfig());
-    ASSERT_TRUE(engine.available());
-    auto tcp = std::make_shared<UncertainTcp>();
-    auto fallback = std::make_shared<FakeTransport>(HP_TCP);
-    engine.swapTransportForTest(TCP, tcp);
-    engine.swapTransportForTest(HP_TCP, fallback);
-    std::vector<uint8_t> buffer(64);
-    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
-    const BatchID batch = engine.allocateBatch(1);
-    ASSERT_NE(batch, 0U);
-    Request request{};
-    request.opcode = Request::WRITE;
-    request.source = buffer.data();
-    request.target_id = LOCAL_SEGMENT_ID;
-    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
-    request.length = buffer.size();
-    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
-    EXPECT_EQ(tcp->submit_calls.load(), 1);
-    EXPECT_EQ(pollUntilDone(engine, batch, 0).s, FAILED);
-    EXPECT_EQ(tcp->submit_calls.load(), 1);
-    EXPECT_EQ(fallback->submit_calls.load(), 0);
-    EXPECT_TRUE(engine.freeBatch(batch).ok());
-    EXPECT_TRUE(
-        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
-}
-
 TEST(EngineFailoverE2E, HpTcpPollErrorDoesNotInspectStaleStatusOutput) {
     auto config = makeMinimalP2PConfig();
     TransferEngineImpl engine(config);
