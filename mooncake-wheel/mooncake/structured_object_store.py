@@ -1115,9 +1115,7 @@ class MooncakeBundleTransfer:
                 raise KeyError(f"unknown DataProto field: {name!r}")
             if name not in batch_names or ref.field_index[name].section != "batch":
                 raise ValueError(f"DataProto matrix field {name!r} is not selected")
-        names = [
-            name for name in batch_names if include_rows or name in slices
-        ]
+        names = [name for name in batch_names if include_rows or name in slices]
         for name in names:
             columns = slices.get(name, slice(None))
             if not isinstance(columns, slice):

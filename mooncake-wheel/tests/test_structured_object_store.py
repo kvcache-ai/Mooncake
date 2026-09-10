@@ -2777,9 +2777,7 @@ def test_dataproto_immutable_result_does_not_commit_matrix_destination() -> None
     ref = transfer.put_dataproto(SimpleDataProto(batch={"matrix": matrix}))
     destination = np.full((2, 3), -1, dtype=np.int32)
 
-    with pytest.raises(
-        TypeError, match="DataProto result batch must be mutable"
-    ):
+    with pytest.raises(TypeError, match="DataProto result batch must be mutable"):
         transfer.get_dataproto(
             ref,
             batch_fields=["matrix"],
