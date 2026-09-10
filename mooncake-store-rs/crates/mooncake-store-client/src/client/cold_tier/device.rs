@@ -152,7 +152,13 @@ impl StorageOwnerState {
                 .cold_tier_devices
                 .nof_targets
                 .pending_backing(route, length, checksum)?;
-            return Ok(backing.map(super::super::PendingBackingRoute::Nof));
+            return Ok(backing.map(|backing| {
+                if self.cold_tier_devices.nof_targets.is_managed() {
+                    super::super::PendingBackingRoute::Managed(backing)
+                } else {
+                    super::super::PendingBackingRoute::Nof(backing)
+                }
+            }));
         }
         let select_devices = |s: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
             if replica_count > 1 {
@@ -176,7 +182,11 @@ impl StorageOwnerState {
                     .nof_targets
                     .pending_backing(route, length, checksum)?
                 {
-                    return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
+                    return Ok(Some(if self.cold_tier_devices.nof_targets.is_managed() {
+                        super::super::PendingBackingRoute::Managed(backing)
+                    } else {
+                        super::super::PendingBackingRoute::Nof(backing)
+                    }));
                 }
             }
             tracing::debug!(

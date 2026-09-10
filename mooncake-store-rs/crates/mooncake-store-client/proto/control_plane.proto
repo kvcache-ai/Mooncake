@@ -134,6 +134,22 @@ message ColdBackingReplica {
   string object_locator = 3;
 }
 
+message NofBackingRoute {
+  ClientRuntimeId owner = 1;
+  string target_id = 2;
+  string object_locator = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+  ColdBackingState state = 6;
+  repeated NofBackingReplica replicas = 7;
+}
+
+message NofBackingReplica {
+  ClientRuntimeId owner = 1;
+  string target_id = 2;
+  string object_locator = 3;
+}
+
 message ObjectRoute {
   string key = 1;
   uint64 version = 2;
@@ -149,6 +165,7 @@ message ObjectRoute {
   string qos_tier = 12;
   ColdBackingRoute cold_backing = 13;
   reserved 14;
+  NofBackingRoute nof_backing = 15;
 }
 
 message CasResult {

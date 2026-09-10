@@ -38,6 +38,42 @@ impl NofManagedLocator {
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
+
+    pub fn to_hex(&self) -> String {
+        let mut encoded = String::with_capacity(self.0.len() * 2);
+        for byte in &self.0 {
+            use std::fmt::Write;
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        encoded
+    }
+
+    pub fn from_hex(encoded: &str) -> Result<Self> {
+        if encoded.is_empty() || encoded.len() % 2 != 0 {
+            return Err(StoreError::InvalidState(
+                "managed NoF locator hex must contain a non-empty even number of digits"
+                    .to_string(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(encoded.len() / 2);
+        for pair in encoded.as_bytes().chunks_exact(2) {
+            let high = hex_digit(pair[0])?;
+            let low = hex_digit(pair[1])?;
+            bytes.push((high << 4) | low);
+        }
+        Self::new(bytes)
+    }
+}
+
+fn hex_digit(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(StoreError::InvalidState(
+            "managed NoF locator contains a non-hex digit".to_string(),
+        )),
+    }
 }
 
 pub struct NofManagedAllocationRequest {

@@ -1,4 +1,6 @@
-use super::cold_tier_codec::{pb_cold_backing_route, try_cold_backing_route};
+use super::cold_tier_codec::{
+    pb_cold_backing_route, pb_nof_backing_route, try_cold_backing_route, try_nof_backing_route,
+};
 use super::*;
 
 pub(super) fn decode_error(error: Option<pb::ErrorDetail>) -> Result<()> {
@@ -222,6 +224,7 @@ pub(super) fn pb_object_route(route: &ObjectRoute) -> pb::ObjectRoute {
         compatibility: Some(pb_compatibility(&route.compatibility)),
         replicas: route.replicas.iter().map(pb_replica_route).collect(),
         cold_backing: route.cold_backing.as_ref().map(pb_cold_backing_route),
+        nof_backing: route.nof_backing.as_ref().map(pb_nof_backing_route),
     }
 }
 
@@ -263,8 +266,8 @@ pub(super) fn try_object_route(route: pb::ObjectRoute) -> Result<ObjectRoute> {
             .map(try_replica_route)
             .collect::<Result<Vec<_>>>()?,
         cold_backing: route.cold_backing.map(try_cold_backing_route).transpose()?,
-
-        nof_backing: None,};
+        nof_backing: route.nof_backing.map(try_nof_backing_route).transpose()?,
+    };
     Ok(route)
 }
 

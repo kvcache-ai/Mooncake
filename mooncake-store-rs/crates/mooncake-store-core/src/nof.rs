@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::cold_tier::ColdBackingState;
+use crate::cold_tier::{ColdBackingReplica, ColdBackingRoute, ColdBackingState};
 use crate::identity::ClientRuntimeId;
 
 /// Placement metadata for a Mooncake-managed NoF object.
@@ -28,6 +28,46 @@ pub struct NofBackingReplica {
 }
 
 impl NofBackingRoute {
+    pub fn from_cold(route: &ColdBackingRoute) -> Self {
+        Self {
+            target_id: route.cold_tier_id.clone(),
+            owner: route.owner.clone(),
+            object_locator: route.object_locator.clone(),
+            length: route.length,
+            checksum: route.checksum,
+            state: route.state,
+            replicas: route
+                .replicas
+                .iter()
+                .map(|replica| NofBackingReplica {
+                    target_id: replica.cold_tier_id.clone(),
+                    owner: replica.owner.clone(),
+                    object_locator: replica.object_locator.clone(),
+                })
+                .collect(),
+        }
+    }
+
+    pub fn to_cold(&self) -> ColdBackingRoute {
+        ColdBackingRoute {
+            cold_tier_id: self.target_id.clone(),
+            owner: self.owner.clone(),
+            object_locator: self.object_locator.clone(),
+            length: self.length,
+            checksum: self.checksum,
+            state: self.state,
+            replicas: self
+                .replicas
+                .iter()
+                .map(|replica| ColdBackingReplica {
+                    cold_tier_id: replica.target_id.clone(),
+                    owner: replica.owner.clone(),
+                    object_locator: replica.object_locator.clone(),
+                })
+                .collect(),
+        }
+    }
+
     pub fn all_targets(&self) -> impl Iterator<Item = (&str, &ClientRuntimeId, &str)> {
         std::iter::once((
             self.target_id.as_str(),

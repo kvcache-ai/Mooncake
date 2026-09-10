@@ -8,8 +8,9 @@ use mooncake_store_core::{Result, StoreError};
 
 mod backend;
 mod backing;
-mod object;
 mod managed;
+mod managed_backend;
+mod object;
 mod physical;
 pub(in crate::client) mod physical_backend;
 mod runtime;

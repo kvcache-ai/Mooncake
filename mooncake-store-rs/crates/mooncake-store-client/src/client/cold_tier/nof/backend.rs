@@ -7,6 +7,7 @@ use crate::client::PersistentStorageBackendHealth;
 
 use super::backing::NofBacking;
 use super::ensure_batch_len;
+use super::managed::NofManagedLimits;
 use super::object::{NofObjectLimits, NofObjectShardWrite, NofObjectState};
 
 /// Unified NoF facade and capability container.
@@ -32,6 +33,35 @@ impl NofBackend {
         if has_object_io && object_limits.is_none() {
             return Err(StoreError::InvalidState(
                 "NoF logical-object capabilities require object limits".to_string(),
+            ));
+        }
+        let managed_capabilities = [
+            backing.managed_allocator().is_some(),
+            backing.managed_write().is_some(),
+            backing.managed_read().is_some(),
+        ];
+        let managed_count = managed_capabilities
+            .iter()
+            .filter(|present| **present)
+            .count();
+        if managed_count != 0 && managed_count != managed_capabilities.len() {
+            return Err(StoreError::InvalidState(
+                "managed NoF requires allocator, read and write capabilities together".to_string(),
+            ));
+        }
+        let managed_limits = backing
+            .managed_limits()
+            .map(NofManagedLimits::validate)
+            .transpose()?;
+        if managed_count != 0 && managed_limits.is_none() {
+            return Err(StoreError::InvalidState(
+                "managed NoF capabilities require managed limits".to_string(),
+            ));
+        }
+        if managed_count != 0 && has_object_io {
+            return Err(StoreError::InvalidState(
+                "one NoF backing cannot mix managed and provider-owned object capabilities"
+                    .to_string(),
             ));
         }
         Ok(Self {
