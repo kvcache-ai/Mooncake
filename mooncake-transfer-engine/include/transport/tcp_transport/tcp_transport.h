@@ -15,7 +15,11 @@
 #ifndef TCP_TRANSPORT_H_
 #define TCP_TRANSPORT_H_
 
+// <infiniband/verbs.h> is not used by TcpTransport itself; guard it so
+// TCP-only builds on platforms without libibverbs (e.g. macOS) compile.
+#ifdef __linux__
 #include <infiniband/verbs.h>
+#endif
 
 #include <atomic>
 #include <chrono>
