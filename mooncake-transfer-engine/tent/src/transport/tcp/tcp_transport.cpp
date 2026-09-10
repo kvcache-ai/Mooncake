@@ -189,6 +189,10 @@ Status TcpTransport::removeMemoryBuffer(BufferDesc &desc) {
 }
 
 void TcpTransport::startTransfer(TcpTask *task) {
+    // Terminal publication allows freeBatch() to destroy task immediately.
+    // The worker must own the callback and keep no task accesses after it.
+    auto notify_progress = std::move(task->notify_progress);
+    const auto progress_batch_id = task->progress_batch_id;
     if (task->request.target_id == LOCAL_SEGMENT_ID &&
         IsLoopbackEndpoint(local_segment_name_)) {
         LOG_FIRST_N(WARNING, 1)
@@ -213,7 +217,7 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
-    if (task->notify_progress) task->notify_progress(task->progress_batch_id);
+    if (notify_progress) notify_progress(progress_batch_id);
 }
 
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {
