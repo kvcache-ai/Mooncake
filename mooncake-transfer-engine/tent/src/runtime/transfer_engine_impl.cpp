@@ -3016,13 +3016,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         overall_status.s = worst_failure;
     }
     // else: some tasks still PENDING → overall_status.s stays PENDING
-    // Transfer-bound notifications may only be delivered once the transfer
-    // they are attached to has actually completed. The second parameter is
-    // "verify completion before sending", so passing the batch's completion
-    // into it inverted the guard: for a batch still in flight, or one that
-    // ended in failure, check was false and every hook fired anyway.
-    if (overall_status.s == COMPLETED)
-        CHECK_STATUS(maybeFireSubmitHooks(batch, /*check=*/false));
+    // A hook belongs to its own submit interval. Other intervals can still
+    // be pending or failed without withholding this interval's notification.
+    CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
 
