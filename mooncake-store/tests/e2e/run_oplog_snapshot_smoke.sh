@@ -3,7 +3,7 @@
 set -euo pipefail
 source "$(dirname -- "${BASH_SOURCE[0]}")/run_oplog_batch_cluster.sh"
 parse_up_options "$@"
-[[ ! -e "$RUN_DIR" ]] || die "snapshot smoke requires a fresh run directory"
+if [[ -e "$RUN_DIR" ]]; then die "snapshot smoke requires a fresh run directory"; fi
 MASTER_COUNT=2
 CLIENT_COUNT=0
 ENABLE_OPLOG_SNAPSHOT=true
