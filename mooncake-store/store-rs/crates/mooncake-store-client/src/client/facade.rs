@@ -2060,12 +2060,6 @@ impl StoreClient {
 
 impl Drop for StoreClient {
     fn drop(&mut self) {
-        if self.owns_cold_tier_lifecycle {
-            // Withdraw the NoF-manager label first. Other clients can take over
-            // targets while this client completes potentially longer route and
-            // local-device cleanup.
-            self.storage_owner.release_nof_ownership_on_shutdown();
-        }
         self.membership_sync.shutdown();
         self._async_eviction.shutdown();
         self.async_replica_tracking.shutdown();
@@ -2074,6 +2068,12 @@ impl Drop for StoreClient {
             && self.cold_tier_shutdown_mode == ColdTierShutdownMode::Restart
         {
             self.flush_pending_offloads_before_drain();
+        }
+        if self.owns_cold_tier_lifecycle {
+            // Complete the local NoF drain while this runtime still owns its
+            // targets. Only then withdraw the owner label so a replacement
+            // cannot start recovery while accepted writes are still flushing.
+            self.storage_owner.release_nof_ownership_on_shutdown();
         }
         self.cold_tier.shutdown();
         if self.owns_local_state_lifecycle
