@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <thread>
+#include "ascii_string.h"
 #include "spdk/spdk_wrapper.h"
 
 namespace mooncake {
@@ -38,7 +40,44 @@ bool ParseEnvBool(const char *name, bool *out) {
     return true;
 }
 
+std::string ResolveNvmeHostNqn() {
+    const auto normalize = [](std::string_view value,
+                              const char *source) -> std::string {
+        value = TrimAsciiWhitespace(value);
+        if (value.size() > SPDK_NVMF_NQN_MAX_LEN) {
+            LOG(WARNING) << "Ignoring NVMe Host NQN from " << source
+                         << ": value exceeds " << SPDK_NVMF_NQN_MAX_LEN
+                         << " bytes";
+            return {};
+        }
+        return std::string(value);
+    };
+
+    if (const char *value = std::getenv("MC_NVME_HOSTNQN")) {
+        auto hostnqn = normalize(value, "MC_NVME_HOSTNQN");
+        if (!hostnqn.empty()) {
+            return hostnqn;
+        }
+    }
+
+    const char *path = std::getenv("MC_NVME_HOSTNQN_PATH");
+    if (!path || !*path) {
+        path = "/etc/nvme/hostnqn";
+    }
+    std::ifstream file(path);
+    std::string hostnqn;
+    if (!std::getline(file, hostnqn)) {
+        return {};
+    }
+    return normalize(hostnqn, path);
+}
+
 void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
+    static const std::string hostnqn = ResolveNvmeHostNqn();
+    if (!hostnqn.empty()) {
+        std::memcpy(opts->hostnqn, hostnqn.c_str(), hostnqn.size() + 1);
+    }
+
     uint64_t v = 0;
     bool bv = false;
     opts->keep_alive_timeout_ms = 0;
@@ -67,7 +106,8 @@ void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
     if (ParseEnvBool("MC_NVME_DATA_DIGEST", &bv)) {
         opts->data_digest = bv;
     }
-    LOG(INFO) << "NVMe ctrlr opts: num_io_queues=" << opts->num_io_queues
+    LOG(INFO) << "NVMe ctrlr opts: hostnqn=" << opts->hostnqn
+              << ", num_io_queues=" << opts->num_io_queues
               << ", io_queue_size=" << opts->io_queue_size
               << ", io_queue_requests=" << opts->io_queue_requests
               << ", keep_alive_timeout_ms=" << opts->keep_alive_timeout_ms
