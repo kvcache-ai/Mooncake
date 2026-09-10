@@ -22,6 +22,7 @@ pub(in crate::client) use super::owner::{
 };
 pub use backend::NofBackend;
 pub use backing::NofBacking;
+#[allow(unused_imports)]
 pub use managed::{
     NofManagedAllocationRequest, NofManagedAllocator, NofManagedLimits, NofManagedLocator,
     NofManagedRead, NofManagedReadRequest, NofManagedWrite, NofManagedWriteRequest,
