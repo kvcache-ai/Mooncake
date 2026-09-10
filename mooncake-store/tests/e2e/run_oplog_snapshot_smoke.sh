@@ -120,8 +120,11 @@ wait "$(cat "$RUN_DIR/pids/master-$leader.pid")" 2>/dev/null || true
 wait_for_single_leader "$START_TIMEOUT_SEC"
 [[ "$(ready_leader_index)" == "$standby" ]] || die "restarted standby did not promote"
 wait_master_metric_at_least "$standby" master_active_clients 1 "$START_TIMEOUT_SEC"
-# The promoted controller is reused by the supervisor after leadership loss.
-# Verify that its coordinator can publish again after it returns to standby.
+# Bring the former leader back as standby after promotion and verify that its
+# coordinator can publish a new snapshot.
+start_master "$leader"
+wait_file_text "$RUN_DIR/logs/master-$leader.err" \
+  "Batch snapshot bootstrap complete" "$START_TIMEOUT_SEC"
 run_client seed "$RUN_DIR/workload/post-promotion.ack" --count=4 --start_index=300
 post_promotion=$(wait_snapshot "$second" "$(read_durable_sequence)")
 [[ -n "$post_promotion" ]] || die "post-promotion snapshot was not published"
