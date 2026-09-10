@@ -22,14 +22,9 @@ class P2PMasterMetricsTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
-TEST_F(P2PMasterMetricsTest, SingletonRoutingTest) {
-    // Idempotent singleton access.
-    EXPECT_EQ(&P2PMasterMetricManager::instance(),
-              &P2PMasterMetricManager::instance());
-}
-
 TEST_F(P2PMasterMetricsTest, CountersAndResetTest) {
     auto& metrics = P2PMasterMetricManager::instance();
+    EXPECT_EQ(&metrics, &P2PMasterMetricManager::instance());
 
     metrics.inc_get_read_route_requests();
     metrics.inc_get_read_route_by_regex_requests();

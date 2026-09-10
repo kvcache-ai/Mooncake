@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "p2p/master/p2p_segment_manager.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 
 namespace mooncake {
 namespace {
@@ -129,13 +130,89 @@ TEST(P2PSegmentManagerTest, ConcurrentUsageAndUnmountRemainConsistent) {
     }
     start.store(true, std::memory_order_release);
     auto removed = manager.UnmountSegment({1, 1});
-    ASSERT_TRUE(removed.has_value());
     for (auto& worker : workers) {
         worker.join();
     }
+    ASSERT_TRUE(removed.has_value());
     EXPECT_EQ(manager.GetCapacityUsage(),
               std::make_pair(size_t{0}, size_t{0}));
 }
+
+class P2PSegmentMetricsTest : public ::testing::TestWithParam<MemoryType> {
+   protected:
+    void SetUp() override { Metrics().reset_all_metrics(); }
+
+    void TearDown() override {
+        auto segments = manager_.GetSegments();
+        ASSERT_TRUE(segments.has_value());
+        for (const auto& segment : *segments) {
+            EXPECT_TRUE(manager_.UnmountSegment(segment.id).has_value());
+        }
+        Metrics().reset_all_metrics();
+    }
+
+    static P2PMasterMetricManager& Metrics() {
+        return P2PMasterMetricManager::instance();
+    }
+
+    void ExpectGauges(int64_t capacity, int64_t usage) {
+        const bool dram = GetParam() == MemoryType::DRAM;
+        EXPECT_EQ(Metrics().get_total_mem_capacity(), dram ? capacity : 0);
+        EXPECT_EQ(Metrics().get_allocated_mem_size(), dram ? usage : 0);
+        EXPECT_EQ(Metrics().get_total_file_capacity(), dram ? 0 : capacity);
+        EXPECT_EQ(Metrics().get_allocated_file_size(), dram ? 0 : usage);
+        if (dram) {
+            EXPECT_EQ(Metrics().get_segment_total_mem_capacity("metrics"),
+                      capacity);
+            EXPECT_EQ(Metrics().get_segment_allocated_mem_size("metrics"),
+                      usage);
+        }
+    }
+
+    P2PSegmentManager manager_;
+};
+
+TEST_P(P2PSegmentMetricsTest, MountUsageAndUnmountMaintainGauges) {
+    const auto segment = Segment({1, 1}, "metrics", 4096, 100, GetParam());
+    ASSERT_TRUE(manager_.MountSegment(segment).has_value());
+    ExpectGauges(4096, 100);
+    auto duplicate = manager_.MountSegment(segment);
+    ASSERT_FALSE(duplicate.has_value());
+    EXPECT_EQ(duplicate.error(), ErrorCode::SEGMENT_ALREADY_EXISTS);
+    ExpectGauges(4096, 100);
+    size_t previous = 100;
+    for (size_t usage : {size_t{500}, size_t{20}, size_t{0}, size_t{4096}}) {
+        auto old = manager_.UpdateSegmentUsage(segment.id, usage);
+        ASSERT_TRUE(old.has_value());
+        EXPECT_EQ(*old, previous);
+        previous = usage;
+        ExpectGauges(4096, usage);
+    }
+    auto invalid = manager_.UpdateSegmentUsage(segment.id, 4097);
+    ASSERT_FALSE(invalid.has_value());
+    EXPECT_EQ(invalid.error(), ErrorCode::INVALID_PARAMS);
+    ExpectGauges(4096, 4096);
+    ASSERT_TRUE(manager_.UnmountSegment(segment.id).has_value());
+    ExpectGauges(0, 0);
+    auto missing = manager_.UnmountSegment(segment.id);
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_EQ(missing.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    auto late_usage = manager_.UpdateSegmentUsage(segment.id, 20);
+    ASSERT_FALSE(late_usage.has_value());
+    EXPECT_EQ(late_usage.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ExpectGauges(0, 0);
+}
+
+TEST_P(P2PSegmentMetricsTest, UnmountBeforeUsageReportKeepsUsageZero) {
+    const auto segment = Segment({1, 1}, "metrics", 4096, 0, GetParam());
+    ASSERT_TRUE(manager_.MountSegment(segment).has_value());
+    ExpectGauges(4096, 0);
+    ASSERT_TRUE(manager_.UnmountSegment(segment.id).has_value());
+    ExpectGauges(0, 0);
+}
+
+INSTANTIATE_TEST_SUITE_P(StorageTypes, P2PSegmentMetricsTest,
+                        ::testing::Values(MemoryType::DRAM, MemoryType::NVME));
 
 }  // namespace
 }  // namespace mooncake

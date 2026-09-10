@@ -10,6 +10,8 @@
 #include "p2p/master/p2p_client_meta.h"
 #undef private
 
+#include "p2p/master/p2p_master_metric_manager.h"
+
 namespace mooncake {
 namespace {
 
@@ -78,9 +80,17 @@ TEST(P2PClientMetaTest, CrashedClientDoesNotRecover) {
 }
 
 TEST(P2PClientMetaTest, RecycleInvokesSegmentRemovalCallback) {
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto mem_capacity = metrics.get_total_mem_capacity();
+    const auto mem_usage = metrics.get_allocated_mem_size();
+    const auto file_capacity = metrics.get_total_file_capacity();
+    const auto file_usage = metrics.get_allocated_file_size();
     auto client = Client({7, 7});
-    ASSERT_TRUE(client->MountSegment(Segment({1, 1}, "a")).has_value());
-    ASSERT_TRUE(client->MountSegment(Segment({2, 2}, "b")).has_value());
+    auto dram = Segment({1, 1}, "recycle-dram", 4096, 1, {}, 100);
+    auto nvme = Segment({2, 2}, "recycle-nvme", 8192, 1, {}, 200);
+    nvme.memory_type = MemoryType::NVME;
+    ASSERT_TRUE(client->MountSegment(dram).has_value());
+    ASSERT_TRUE(client->MountSegment(nvme).has_value());
 
     std::vector<UUID> removed_segments;
     client->SetSegmentRemovalCallback([&](const UUID& segment_id) {
@@ -93,6 +103,10 @@ TEST(P2PClientMetaTest, RecycleInvokesSegmentRemovalCallback) {
     });
     client->RecycleMeta();
     EXPECT_EQ(removed_segments.size(), 2);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), mem_capacity);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), mem_usage);
+    EXPECT_EQ(metrics.get_total_file_capacity(), file_capacity);
+    EXPECT_EQ(metrics.get_allocated_file_size(), file_usage);
     auto segments = client->GetSegments();
     ASSERT_FALSE(segments.has_value());
     EXPECT_EQ(segments.error(), ErrorCode::CLIENT_UNHEALTHY);
@@ -102,6 +116,10 @@ TEST(P2PClientMetaTest, RecycleInvokesSegmentRemovalCallback) {
     EXPECT_TRUE(stored_segments->empty());
     client->RecycleMeta();
     EXPECT_EQ(removed_segments.size(), 2);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), mem_capacity);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), mem_usage);
+    EXPECT_EQ(metrics.get_total_file_capacity(), file_capacity);
+    EXPECT_EQ(metrics.get_allocated_file_size(), file_usage);
 }
 
 TEST(P2PClientMetaTest, ConcurrentRecycleOnlyRemovesSegmentsOnce) {

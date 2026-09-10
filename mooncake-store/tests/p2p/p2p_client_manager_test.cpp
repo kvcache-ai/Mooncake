@@ -4,6 +4,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <stop_token>
 #include <thread>
 #include <vector>
 #define private public
@@ -848,7 +849,17 @@ TEST_F(P2PClientManagerTest, MonitorDoesNotEraseReRegisteredClient) {
     old_client->health_state_.last_heartbeat =
         std::chrono::steady_clock::now() - std::chrono::seconds(3);
 
-    std::thread monitor([&] { mgr->ClientMonitorFunc(); });
+    std::jthread monitor([&](std::stop_token stop) {
+        // jthread destruction must also release a blocked callback after ASSERT.
+        std::stop_callback unblock(stop, [&] {
+            {
+                std::lock_guard lock(mutex);
+                release = true;
+            }
+            release_callback.notify_one();
+        });
+        mgr->ClientMonitorFunc();
+    });
     {
         std::unique_lock lock(mutex);
         ASSERT_TRUE(callback_started.wait_for(lock, std::chrono::seconds(2),
