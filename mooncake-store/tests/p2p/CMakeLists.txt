@@ -69,6 +69,7 @@ add_p2p_store_test(inflight_tracker_test inflight_tracker_test.cpp)
 add_p2p_store_test(async_metadata_notifier_test async_metadata_notifier_test.cpp)
 add_p2p_store_test(runtime_config_store_test runtime_config_store_test.cpp)
 add_p2p_store_test(client_metrics_aggregator_test client_metrics_aggregator_test.cpp)
+add_p2p_store_test(p2p_client_metrics_test p2p_client_metrics_test.cpp)
 add_p2p_store_test(client_http_metrics_test client_http_metrics_test.cpp)
 
 # tiered cache
