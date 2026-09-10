@@ -79,7 +79,7 @@ ordinary TP tensor objects, but there are no corresponding CP/DP/EP/PP method
 factories or `*_with_config` tensor methods. The former public
 `*_with_parallelism` family was removed by
 PR [#3772](https://github.com/kvcache-ai/Mooncake/pull/3772).
-See [Choosing a Parallel Tensor IO API](../api-reference/python/mooncake-store.md#choosing-a-parallel-tensor-io-api)
+See {ref}`Choosing a Parallel Tensor IO API <choosing-a-parallel-tensor-io-api>`
 for entry points and the distinction between parallel topology and Store
 replication configuration.
 
