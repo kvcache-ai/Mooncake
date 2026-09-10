@@ -121,9 +121,7 @@ class GatedHpTransport : public Transport {
         if (before_remove) before_remove(desc);
         trace_.add("hp-remove");
         ++removals;
-        auto status = hp.removeMemoryBuffer(desc);
-        if (after_remove) after_remove(desc);
-        return status;
+        return hp.removeMemoryBuffer(desc);
     }
     bool tracksLocalBuffer(const BufferDesc& desc) const override {
         return hp.tracksLocalBuffer(desc);
@@ -132,7 +130,7 @@ class GatedHpTransport : public Transport {
 
     HighPerformanceTcpTransport hp;
     std::function<void(const std::vector<BufferDesc>&)> before_add;
-    std::function<void(const BufferDesc&)> before_remove, after_remove;
+    std::function<void(const BufferDesc&)> before_remove;
     std::atomic<int> removals{0};
 
    private:
