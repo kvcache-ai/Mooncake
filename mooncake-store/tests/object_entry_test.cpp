@@ -7,7 +7,7 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 namespace {
 
 // Build a real metadata envelope for the accessor tests. ObjectMetadata is
@@ -44,5 +44,5 @@ TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
 }
 
 }  // namespace
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

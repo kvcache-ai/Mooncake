@@ -1,7 +1,7 @@
 #pragma once
 
 // Shared per-object runtime task types: tenant/object-scoped bookkeeping
-// records referenced by both MasterService and mooncake::tenant::ObjectEntry.
+// records referenced by both MasterService and mooncake::metadata::ObjectEntry.
 // Each is a small per-key state record, not a container.
 
 #include <chrono>

@@ -17,7 +17,7 @@
 #include "tenant/object_entry_types.h"
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 
 class ObjectEntry {
    public:
@@ -92,5 +92,5 @@ class ObjectEntry {
     mutable std::shared_mutex mutex;
 };
 
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

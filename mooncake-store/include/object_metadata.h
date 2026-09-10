@@ -2,7 +2,7 @@
 
 // Shared object metadata envelope: identity, replica set, lease and soft-pin
 // state for one object. Owned through a pointer by the tenant module
-// (mooncake::tenant::ObjectEntry).
+// (mooncake::metadata::ObjectEntry).
 //
 // NON-copyable / NON-movable and self-locking (holds a SpinLock); always own
 // it through a pointer (e.g. unique_ptr<ObjectMetadata>), never by value.

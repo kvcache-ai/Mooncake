@@ -9,7 +9,7 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 namespace {
 
 using TestDirectory = TenantDirectory<std::shared_ptr<int>>;
@@ -182,5 +182,5 @@ TEST(TenantDirectoryTest, VisitEnumeratesEveryTenantSnapshotConsistently) {
 }
 
 }  // namespace
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

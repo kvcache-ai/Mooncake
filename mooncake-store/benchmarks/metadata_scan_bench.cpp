@@ -186,7 +186,7 @@ class MetadataScanBench {
     // The promotion-retry and dynamic-replication expiry scans both walk
     // every entry and take its exclusive lock to inspect one flag.
     static double MeasureEntryLockScan(
-        const std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>>&
+        const std::vector<std::shared_ptr<mooncake::metadata::ObjectEntry>>&
             entries,
         uint64_t repeat) {
         const auto begin = std::chrono::steady_clock::now();
@@ -208,7 +208,8 @@ class MetadataScanBench {
     }
 
     static double MeasureSnapshotCopy(
-        const mooncake::tenant::TenantCatalog& tenant_state, uint64_t repeat) {
+        const mooncake::metadata::TenantCatalog& tenant_state,
+        uint64_t repeat) {
         const auto begin = std::chrono::steady_clock::now();
         uint64_t sink = 0;
         for (uint64_t r = 0; r < repeat; ++r) {
@@ -363,9 +364,9 @@ class MetadataScanBench {
         }
 
         std::cout << num_objects << "," << rss_mb << ","
-                  << sizeof(mooncake::tenant::ObjectEntry) << "," << std::fixed
-                  << std::setprecision(1) << snapshot_copy_us << ","
-                  << entry_lock_scan_us << "," << pop_none_us << ","
+                  << sizeof(mooncake::metadata::ObjectEntry) << ","
+                  << std::fixed << std::setprecision(1) << snapshot_copy_us
+                  << "," << entry_lock_scan_us << "," << pop_none_us << ","
                   << pop_all_us << "," << put_p50_baseline << ","
                   << put_p99_baseline << "," << put_p50_scan << ","
                   << put_p99_scan << std::endl;
@@ -378,7 +379,7 @@ class MetadataScanBench {
     // distinct groups (the per-put publication path). Reports aggregate
     // ops/s per thread count so the single-mutex serialization is visible.
     static void RunGroupIndexContention(
-        mooncake::tenant::TenantCatalog& tenant_state) {
+        mooncake::metadata::TenantCatalog& tenant_state) {
         std::cout << "group_index_threads,member_add_ops_per_s" << std::endl;
         for (int threads : {1, 4, 16, 32}) {
             std::atomic<uint64_t> total_ops{0};

@@ -1183,7 +1183,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         if (any_standby_kept_alive) {
             catalog_.Visit(
                 [&](const TenantId& tenant_id,
-                    const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                    const std::shared_ptr<metadata::TenantCatalog>& handle) {
                     (void)tenant_id;
                     auto& tenant = *handle;
                     auto objs = tenant.SnapshotObjects();
@@ -1570,14 +1570,14 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
 }
 
-std::shared_ptr<mooncake::tenant::TenantCatalog>
+std::shared_ptr<mooncake::metadata::TenantCatalog>
 MasterService::GetOrCreateTenantCatalogHandle(const TenantId& tenant_id) {
     // Atomic get-or-create: two concurrent first writers for different keys in
     // the same absent tenant must both land on the winning TenantCatalog, or
     // the loser's object would live in a TenantCatalog the directory can never
     // reach again.
     return catalog_.GetOrCreateTenant(tenant_id, [this, &tenant_id]() {
-        auto handle = std::make_shared<tenant::TenantCatalog>();
+        auto handle = std::make_shared<metadata::TenantCatalog>();
         if (enable_multi_tenants_) {
             handle->quota_account =
                 tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
@@ -1587,7 +1587,7 @@ MasterService::GetOrCreateTenantCatalogHandle(const TenantId& tenant_id) {
 }
 
 TenantQuotaHandle MasterService::GetBoundTenantQuotaHandle(
-    const tenant::TenantCatalog& tenant_state) const {
+    const metadata::TenantCatalog& tenant_state) const {
     if (!enable_multi_tenants_) {
         return nullptr;
     }
@@ -1646,7 +1646,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
 
     TenantQuotaUsageMap usage;
     catalog_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         // Collect handles, then lock each per-object (there is no tenant
         auto objs = tenant_state.SnapshotObjects();
@@ -1665,7 +1665,7 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     });
 
     catalog_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         tenant_state.quota_account =
             tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
@@ -1713,8 +1713,8 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     const std::string& group_id, bool allow_soft_pinned,
     std::chrono::system_clock::time_point now,
     const std::function<MasterService::EvictMemberOutcome(
-        const std::string&, ObjectMetadata&, tenant::TenantCatalog&,
-        tenant::TenantCatalog&)>& evict_one_member) {
+        const std::string&, ObjectMetadata&, metadata::TenantCatalog&,
+        metadata::TenantCatalog&)>& evict_one_member) {
     GroupEvictionResult result;
 
     // All members of a tenant live in a single tenant container, so look up
@@ -1842,7 +1842,7 @@ void MasterService::AccountCacheTotalRemoval(ObjectMetadata& metadata) {
 void MasterService::RebuildCacheTotalAccounting() {
     MasterMetricManager::instance().reset_cache_total_nums();
     catalog_.Visit([&](const TenantId&,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
@@ -1908,7 +1908,7 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
 }
 
 tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
-    tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata) {
+    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata) {
     if (!enable_multi_tenants_) {
         return {};
     }
@@ -2236,7 +2236,8 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
 // Key-based teardown: resolve the entry at call time, then run the shared
 // entry-based teardown below.
 void MasterService::ErasePromotionTaskLocked(
-    tenant::TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry) {
+    metadata::TenantCatalog& tenant_state,
+    mooncake::metadata::ObjectEntry& entry) {
     if (!entry.promotion_task.has_value()) {
         return;
     }
@@ -2255,10 +2256,10 @@ void MasterService::ErasePromotionTaskLocked(
 // task state.
 // Callers no longer need to clean these up manually before calling.
 void MasterService::EraseMetadata(
-    tenant::TenantCatalog& tenant_state,
-    const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
+    metadata::TenantCatalog& tenant_state,
+    const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
     const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    tenant::TenantCatalog* tenant_accessor,
+    metadata::TenantCatalog* tenant_accessor,
     const std::vector<std::string>& previous_media_hint) {
     if (!entry) {
         return;
@@ -2613,8 +2614,8 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
     const std::function<bool(const Replica&)>& is_stale) {
     std::optional<ErrorCode> first_persist_error;
     catalog_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
-        tenant::TenantCatalog& tenant_accessor = *handle;
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
+        metadata::TenantCatalog& tenant_accessor = *handle;
         auto& tenant_state = *handle;
         auto objs = handle->SnapshotObjects();
         std::vector<std::string> keys_to_erase;
@@ -2763,7 +2764,7 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
             bool unfinished_affiliated_replica = false;
             catalog_.Visit(
                 [&](const TenantId&,
-                    const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                    const std::shared_ptr<metadata::TenantCatalog>& handle) {
                     if (unfinished_affiliated_replica) {
                         return;
                     }
@@ -3583,7 +3584,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             auto tenant_handle =
                 GetOrCreateTenantCatalogHandle(object.tenant_id);
             auto& tenant_state = *tenant_handle;
-            auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
+            auto entry = std::make_shared<mooncake::metadata::ObjectEntry>(
                 std::make_unique<ObjectMetadata>(
                     standby_meta.client_id, now, standby_meta.size,
                     std::move(object.replicas), std::nullopt,
@@ -4369,7 +4370,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 }
 
 auto MasterService::AllocateAndInsertMetadata(
-    tenant::TenantCatalog& tenant_accessor, const UUID& client_id,
+    metadata::TenantCatalog& tenant_accessor, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& writer_host_id,
     const std::string& group_id, const TenantId& tenant_id,
@@ -4603,7 +4604,7 @@ auto MasterService::AllocateAndInsertMetadata(
         }
     }
 
-    auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
+    auto entry = std::make_shared<mooncake::metadata::ObjectEntry>(
         std::make_unique<ObjectMetadata>(
             client_id, now, value_length, std::move(replicas),
             std::move(committed_soft_pin_timeout), config.with_hard_pin,
@@ -4741,7 +4742,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             }
             auto tenant_handle =
                 GetOrCreateTenantCatalogHandle(object_id.tenant_id);
-            tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+            metadata::TenantCatalog& tenant_accessor = *tenant_handle;
             auto& tenant_state = *tenant_handle;
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
@@ -5413,7 +5414,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             // not affect routing.
             auto tenant_handle =
                 GetOrCreateTenantCatalogHandle(object_id.tenant_id);
-            tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+            metadata::TenantCatalog& tenant_accessor = *tenant_handle;
             auto& tenant_state = *tenant_handle;
             auto admission_result =
                 ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state), 0);
@@ -6960,7 +6961,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+        metadata::TenantCatalog& tenant_accessor = *tenant_handle;
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         for (const auto& entry : tenant_handle->SnapshotObjects()) {
@@ -7070,8 +7071,8 @@ long MasterService::RemoveAll(bool force) {
 
     // Delete metadata — runs concurrently with client SSD cleanup.
     catalog_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
-        tenant::TenantCatalog& tenant_accessor = *handle;
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
+        metadata::TenantCatalog& tenant_accessor = *handle;
         auto& tenant_state = *handle;
         std::vector<std::string> keys;
         for (const auto& entry : handle->SnapshotObjects()) {
@@ -7199,7 +7200,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
 
     auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+        metadata::TenantCatalog& tenant_accessor = *tenant_handle;
         auto& tenant_state = *tenant_handle;
         std::vector<std::string> keys;
         for (const auto& entry : tenant_handle->SnapshotObjects()) {
@@ -7299,7 +7300,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 
     auto tenant_handle = catalog_.Lookup(normalized_tenant);
     if (tenant_handle) {
-        tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+        metadata::TenantCatalog& tenant_accessor = *tenant_handle;
         auto& tenant_state = *tenant_handle;
         auto now = std::chrono::system_clock::now();
 
@@ -7426,7 +7427,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 }
 
 void MasterService::CancelPromotionTaskForRemovedReplicas(
-    tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::vector<ReplicaID>& removed_replica_ids) {
     if (removed_replica_ids.empty()) {
         return;
@@ -7456,9 +7457,9 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
 
 bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
-    tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
-    tenant::TenantCatalog* tenant_accessor) {
+    metadata::TenantCatalog* tenant_accessor) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner no longer retains
     // resources.
@@ -7478,9 +7479,9 @@ bool MasterService::CleanupStaleHandles(
 
 bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
-    tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& is_stale,
-    tenant::TenantCatalog* tenant_accessor) {
+    metadata::TenantCatalog* tenant_accessor) {
     const auto previous_kv_media = KvMediaSnapshot(metadata);
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
@@ -7652,7 +7653,7 @@ void MasterService::RunDfsEviction() {
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
     catalog_.Visit([&](const TenantId&,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         total += handle->ObjectCount();
     });
     return total;
@@ -8159,9 +8160,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     return {};
 }
 
-bool MasterService::CancelQueuedOffloadTask(tenant::TenantCatalog& tenant_state,
-                                            ObjectMetadata& metadata,
-                                            const ObjectIdentity& object_id) {
+bool MasterService::CancelQueuedOffloadTask(
+    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    const ObjectIdentity& object_id) {
     auto entry = tenant_state.Get(object_id.user_key);
     if (!entry || !entry->offloading_task.has_value()) {
         return true;
@@ -8235,7 +8236,8 @@ void MasterService::DecrementCandidateCount() {
     }
 }
 
-void MasterService::EraseCandidateLocked(mooncake::tenant::ObjectEntry& entry) {
+void MasterService::EraseCandidateLocked(
+    mooncake::metadata::ObjectEntry& entry) {
     if (entry.promotion_candidate.has_value()) {
         entry.promotion_candidate.reset();
         DecrementCandidateCount();
@@ -8252,7 +8254,7 @@ void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
 }
 
 void MasterService::RecordOrUpdateCandidateLocked(
-    mooncake::tenant::ObjectEntry& entry, uint8_t sketch_score,
+    mooncake::metadata::ObjectEntry& entry, uint8_t sketch_score,
     PromotionCandidateReason reason, ErrorCode last_error,
     uint32_t execution_failures) {
     const auto now = std::chrono::steady_clock::now();
@@ -8360,7 +8362,7 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
 
 void MasterService::ClearCandidatesForReload() {
     catalog_.Visit([&](const TenantId&,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         auto& tenant_state = *handle;
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
@@ -8394,7 +8396,7 @@ size_t MasterService::RunPromotionCandidateRetry() {
         std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
         catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                const std::shared_ptr<metadata::TenantCatalog>& handle) {
                 if (due_candidates.size() >= kPromotionRetryBatchSize) {
                     return;
                 }
@@ -8707,7 +8709,8 @@ int64_t MasterService::DynamicReplicationNowMs() {
 
 // Locked kernel — see the declaration for the lock requirement.
 void MasterService::ClearDynamicReplicationStateLocked(
-    tenant::TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry) {
+    metadata::TenantCatalog& tenant_state,
+    mooncake::metadata::ObjectEntry& entry) {
     entry.dynamic_replication_pending.reset();
     entry.dynamic_replication_cooldown =
         std::chrono::steady_clock::time_point{};
@@ -8721,8 +8724,8 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
     }
     const int64_t now_ms = DynamicReplicationNowMs();
     catalog_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
-        tenant::TenantCatalog& tenant_state = *handle;
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
+        metadata::TenantCatalog& tenant_state = *handle;
         auto objs = handle->SnapshotObjects();
         // (key, generation at detection) — the re-Get below must verify the
         // entry was not torn down and replaced, or the old task's failure
@@ -8762,7 +8765,7 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
 }
 
 bool MasterService::HasDynamicReplicationPending(
-    tenant::TenantCatalog& tenant_state, const std::string& key) {
+    metadata::TenantCatalog& tenant_state, const std::string& key) {
     auto entry = tenant_state.Get(key);
     if (!entry || !entry->dynamic_replication_pending.has_value()) {
         return false;
@@ -9710,8 +9713,9 @@ void MasterService::EvictionThreadFunc() {
                     snapshot_mutex_);
                 catalog_.Visit(
                     [&](const TenantId& tenant_id,
-                        const std::shared_ptr<tenant::TenantCatalog>& handle) {
-                        tenant::TenantCatalog& tenant_accessor = *handle;
+                        const std::shared_ptr<metadata::TenantCatalog>&
+                            handle) {
+                        metadata::TenantCatalog& tenant_accessor = *handle;
                         DiscardExpiredProcessingReplicas(tenant_accessor, now);
                     });
                 ReleaseExpiredDiscardedReplicas(now);
@@ -9756,7 +9760,7 @@ void MasterService::EvictionThreadFunc() {
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    tenant::TenantCatalog& tenant_accessor,
+    metadata::TenantCatalog& tenant_accessor,
     const std::chrono::system_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
@@ -10216,7 +10220,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
     }
 
     catalog_.Visit([&](const TenantId&,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         auto objs = handle->SnapshotObjects();
         for (const auto& entry : objs) {
             auto lk = entry->LockShared();
@@ -10249,7 +10253,7 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
         }
         catalog_.Visit(
             [&](const TenantId&,
-                const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                const std::shared_ptr<metadata::TenantCatalog>& handle) {
                 auto objs = handle->SnapshotObjects();
                 for (const auto& entry : objs) {
                     auto lk = entry->LockUnique();
@@ -10317,7 +10321,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             auto cleanup_now = now;
             catalog_.Visit(
                 [&](const TenantId& tid,
-                    const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                    const std::shared_ptr<metadata::TenantCatalog>& handle) {
                     auto& tenant_state = *handle;
                     // Collect handles, then lock each per-object.
                     auto objs = tenant_state.SnapshotObjects();
@@ -10347,7 +10351,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
         catalog_.Visit(
             [&](const TenantId&,
-                const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                const std::shared_ptr<metadata::TenantCatalog>& handle) {
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
                 auto objs = tenant_state.SnapshotObjects();
@@ -10443,7 +10447,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         return metadata.HasReplica(&Replica::fn_is_local_disk_replica);
     };
     auto evict_replicas =
-        [&, this](tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        [&, this](metadata::TenantCatalog& tenant_state,
+                  ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
@@ -10480,7 +10485,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
 
     auto try_evict_or_offload = [&, this](const std::string& key,
                                           ObjectMetadata& metadata,
-                                          tenant::TenantCatalog& tenant_state,
+                                          metadata::TenantCatalog& tenant_state,
                                           std::vector<std::vector<Replica>>&
                                               deferred_replicas) {
         if (!offload_on_evict_) {
@@ -10545,7 +10550,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             if (!tenant_handle) {
                 return {};
             }
-            tenant::TenantCatalog& tenant_state = *tenant_handle;
+            metadata::TenantCatalog& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Get(key);
             if (!object_entry) {
                 return {};
@@ -10599,8 +10604,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         auto evict_one_member =
             [&, this](const std::string& member_key,
                       ObjectMetadata& member_metadata,
-                      tenant::TenantCatalog& state,
-                      tenant::TenantCatalog& accessor) -> EvictMemberOutcome {
+                      metadata::TenantCatalog& state,
+                      metadata::TenantCatalog& accessor) -> EvictMemberOutcome {
             (void)accessor;
             const uint64_t freed = try_evict_or_offload(
                 member_key, member_metadata, state, deferred_replicas);
@@ -10629,7 +10634,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         {
             auto tenant_handle = catalog_.Lookup(normalized_tenant);
             if (tenant_handle) {
-                tenant::TenantCatalog& tenant_state = *tenant_handle;
+                metadata::TenantCatalog& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Get(key);
                 if (object_entry) {
                     bool invalid = false;
@@ -10659,7 +10664,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
         std::vector<std::vector<Replica>> deferred_replicas;
         std::vector<std::string> candidate_keys;
         {
-            tenant::TenantCatalog& tenant_state = *tenant_handle;
+            metadata::TenantCatalog& tenant_state = *tenant_handle;
             candidate_keys.reserve(tenant_state.ObjectCount());
             // Collect handles, then lock each per-object.
             auto objs = tenant_state.SnapshotObjects();
@@ -10744,7 +10749,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
     };
 
     auto evict_replicas =
-        [&, this](tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        [&, this](metadata::TenantCatalog& tenant_state,
+                  ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (enable_oplog_) {
                 return metadata.size *
@@ -10797,7 +10803,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     auto try_evict_or_offload =
         [&, this](
             const TenantId& tenant_id, const std::string& key,
-            ObjectMetadata& metadata, tenant::TenantCatalog& tenant_state,
+            ObjectMetadata& metadata, metadata::TenantCatalog& tenant_state,
             std::vector<std::vector<Replica>>& deferred_replicas) -> uint64_t {
         if (enable_oplog_) {
             return evict_replicas(tenant_state, metadata, deferred_replicas);
@@ -10957,7 +10963,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             if (!tenant_handle) {
                 return {};
             }
-            tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+            metadata::TenantCatalog& tenant_accessor = *tenant_handle;
             auto& tenant_state = *tenant_handle;
             auto object_entry = tenant_state.Get(key);
             if (!object_entry) {
@@ -11017,8 +11023,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         auto evict_one_member =
             [&, this](const std::string& member_key,
                       ObjectMetadata& member_metadata,
-                      tenant::TenantCatalog& state,
-                      tenant::TenantCatalog& accessor) -> EvictMemberOutcome {
+                      metadata::TenantCatalog& state,
+                      metadata::TenantCatalog& accessor) -> EvictMemberOutcome {
             (void)accessor;
             auto submission = persist_evict_oplog_or_skip(tenant_id, member_key,
                                                           member_metadata);
@@ -11051,7 +11057,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         {
             auto tenant_handle = catalog_.Lookup(tenant_id);
             if (tenant_handle) {
-                tenant::TenantCatalog& tenant_accessor = *tenant_handle;
+                metadata::TenantCatalog& tenant_accessor = *tenant_handle;
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Get(key);
                 if (!enable_oplog_ && object_entry) {
@@ -11104,8 +11110,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
     std::vector<std::chrono::system_clock::time_point> local_soft_pin;
 
     catalog_.Visit([&](const TenantId& tenant_id,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
-        tenant::TenantCatalog& tenant_accessor = *handle;
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
+        metadata::TenantCatalog& tenant_accessor = *handle;
         DiscardExpiredProcessingReplicas(tenant_accessor, now);
 
         auto& tenant_state = *handle;
@@ -11168,7 +11174,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         std::vector<Candidate> merged;
         catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                const std::shared_ptr<metadata::TenantCatalog>& handle) {
                 auto& tenant_state = *handle;
                 // Collect handles, then lock each per-object.
                 auto objs = tenant_state.SnapshotObjects();
@@ -11342,7 +11348,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 std::vector<std::pair<TenantId, std::string>> to_evict;
                 catalog_.Visit(
                     [&](const TenantId& tenant_id,
-                        const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                        const std::shared_ptr<metadata::TenantCatalog>&
+                            handle) {
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
@@ -11391,7 +11398,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 std::vector<std::pair<TenantId, std::string>> to_evict;
                 catalog_.Visit(
                     [&](const TenantId& tenant_id,
-                        const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                        const std::shared_ptr<metadata::TenantCatalog>&
+                            handle) {
                         if (target_evict_num <= 0 || stop_eviction_scan) {
                             return;
                         }
@@ -11442,7 +11450,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
 
     // The per-tenant container now holds its object route in a
-    // mooncake::tenant::ObjectIndex, which does not expose bucket shrinking.
+    // mooncake::metadata::ObjectIndex, which does not expose bucket shrinking.
     // (erase() on the old `metadata` map never returned bucket memory; the
     // ObjectIndex deliberately keeps this simple.)
 
@@ -11534,7 +11542,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
     // Count total objects first (a tenant's objects all live in one container),
     // then evict across tenants up to the target count.
     catalog_.Visit([&](const TenantId&,
-                       const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                       const std::shared_ptr<metadata::TenantCatalog>& handle) {
         object_count += handle->ObjectCount();
     });
     const long ideal_evict_num =
@@ -11542,12 +11550,12 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
 
     if (ideal_evict_num > 0) {
         catalog_.Visit([&](const TenantId& tenant_id,
-                           const std::shared_ptr<tenant::TenantCatalog>&
+                           const std::shared_ptr<metadata::TenantCatalog>&
                                handle) {
             if (evicted_count >= ideal_evict_num) {
                 return;
             }
-            tenant::TenantCatalog& tenant_accessor = *handle;
+            metadata::TenantCatalog& tenant_accessor = *handle;
             auto& tenant_state = *handle;
             auto objects = tenant_state.SnapshotObjects();
             for (auto& entry : objects) {
@@ -12072,11 +12080,11 @@ MasterService::MetadataSerializer::Serialize() {
     // directory slot on deserialize regardless of the entry key.
     packer.pack("shards");
 
-    std::vector<std::pair<TenantId, std::shared_ptr<tenant::TenantCatalog>>>
+    std::vector<std::pair<TenantId, std::shared_ptr<metadata::TenantCatalog>>>
         tenants_with_metadata;
     service_->catalog_.Visit(
         [&](const TenantId& tenant_id,
-            const std::shared_ptr<tenant::TenantCatalog>& handle) {
+            const std::shared_ptr<metadata::TenantCatalog>& handle) {
             if (handle->ObjectCount() > 0) {
                 tenants_with_metadata.emplace_back(tenant_id, handle);
             }
@@ -12269,7 +12277,7 @@ void MasterService::MetadataSerializer::Reset() {
         std::vector<TenantId> tenant_keys;
         service_->catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<tenant::TenantCatalog>&) {
+                const std::shared_ptr<metadata::TenantCatalog>&) {
                 tenant_keys.push_back(tenant_id);
             });
         for (const auto& tenant_id : tenant_keys) {
@@ -12288,7 +12296,7 @@ void MasterService::MetadataSerializer::Reset() {
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeTenant(
-    const TenantId& tenant_id, const tenant::TenantCatalog& tenant_state,
+    const TenantId& tenant_id, const metadata::TenantCatalog& tenant_state,
     MsgpackPacker& packer) const {
     // Tenant payload format: map with "metadata" field. Preserves the legacy
     // per-object layout [tenant_id, key, metadata_object].
@@ -12297,7 +12305,7 @@ MasterService::MetadataSerializer::SerializeTenant(
     // Sort keys to ensure a consistent serialization order (the client keys
     // within a single tenant; the tenant id is fixed). NOTE: sort may be slow
     // for large tenants.
-    std::vector<std::shared_ptr<mooncake::tenant::ObjectEntry>> entries;
+    std::vector<std::shared_ptr<mooncake::metadata::ObjectEntry>> entries;
     for (const auto& entry : tenant_state.SnapshotObjects()) {
         entries.push_back(entry);
     }
@@ -12396,7 +12404,7 @@ MasterService::MetadataSerializer::DeserializeTenant(
             service_->GetOrCreateTenantCatalogHandle(tenant_id);
         auto& tenant_state = *tenant_handle;
         const std::string user_key = key;
-        auto entry = std::make_shared<mooncake::tenant::ObjectEntry>(
+        auto entry = std::make_shared<mooncake::metadata::ObjectEntry>(
             std::make_unique<ObjectMetadata>(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
                 metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,
@@ -12635,7 +12643,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 // MetadataAccessorRW scope).
 tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(
-    tenant::TenantCatalog& tenant_state, const std::string& key,
+    metadata::TenantCatalog& tenant_state, const std::string& key,
     const UUID& dynamic_replication_lease_id, const UUID& client_id,
     const std::string& source_segment, uint64_t current_version_epoch,
     uint64_t dynamic_replication_version_epoch,
@@ -12689,7 +12697,7 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
 }
 
 void MasterService::RegisterDynamicReplicaStart(
-    tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
     const std::string& key, const std::string& source_segment,
     uint64_t version_epoch, const std::vector<std::string>& target_segments,
     const std::vector<ReplicaID>& replica_ids) {
@@ -13298,7 +13306,7 @@ void MasterService::ScheduleDrainJobTasks(DrainJob& job) {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                const std::shared_ptr<metadata::TenantCatalog>& handle) {
                 auto& tenant_state = *handle;
                 auto objs = tenant_state.SnapshotObjects();
                 for (const auto& entry : objs) {
@@ -13414,7 +13422,7 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         catalog_.Visit(
             [&](const TenantId& tenant_id,
-                const std::shared_ptr<tenant::TenantCatalog>& handle) {
+                const std::shared_ptr<metadata::TenantCatalog>& handle) {
                 auto objs = handle->SnapshotObjects();
                 for (const auto& entry : objs) {
                     const auto& key = entry->key();

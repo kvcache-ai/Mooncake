@@ -664,7 +664,7 @@ class MasterServiceHATest : public ::testing::Test {
         auto& tenant_state = *tenant_handle;
         auto entry = tenant_state.Get(key);
         if (!entry) {
-            entry = std::make_shared<mooncake::tenant::ObjectEntry>(
+            entry = std::make_shared<mooncake::metadata::ObjectEntry>(
                 std::make_unique<ObjectMetadata>(
                     holder_id, std::chrono::system_clock::now(), object_size,
                     std::vector<Replica>{}, std::nullopt, false,

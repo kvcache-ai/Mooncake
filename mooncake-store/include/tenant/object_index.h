@@ -25,7 +25,7 @@ class MasterServiceHATest;
 
 namespace mooncake {
 class MasterService;  // friend: the service owns and operates the store
-namespace tenant {
+namespace metadata {
 
 // The per-tenant ObjectIndex: the primary hash map (object key -> strong
 // ObjectEntry handle) plus the GroupIndex and the in-flight dynamic-
@@ -240,5 +240,5 @@ class ObjectIndex {
         dynamic_replication_leases;
 };
 
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

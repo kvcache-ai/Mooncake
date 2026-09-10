@@ -13,7 +13,7 @@
 #include "tenant_quota.h"
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 
 class TenantCatalog {
    public:
@@ -172,5 +172,5 @@ class TenantCatalog {
     }
 };
 
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

@@ -9,7 +9,7 @@
 #include "tenant/tenant_id.h"
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 
 // Read-optimized, copy-on-write registry mapping TenantId -> a strong handle to
 // that tenant's store.
@@ -117,5 +117,5 @@ class TenantDirectory {
     mutable std::mutex write_mutex_;
 };
 
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

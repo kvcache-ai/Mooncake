@@ -10,7 +10,7 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 namespace {
 
 // Build an entry with a minimal (128 B, replica-less) envelope; the store
@@ -118,5 +118,5 @@ TEST(ObjectIndexTest, WithObjectScopeRespectsPresenceAndAbsence) {
 }
 
 }  // namespace
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

@@ -21,7 +21,7 @@
 #include "tenant/tenant_id.h"
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 
 class MetadataCatalog {
    public:
@@ -66,5 +66,5 @@ class MetadataCatalog {
     TenantDirectory<std::shared_ptr<TenantCatalog>> tenants_;
 };
 
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

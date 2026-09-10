@@ -12,7 +12,7 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 namespace {
 
 std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
@@ -97,5 +97,5 @@ TEST(GroupIndexTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
 }
 
 }  // namespace
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake

@@ -234,7 +234,7 @@ class MasterServiceTest : public ::testing::Test {
         std::vector<Replica> winner_replicas;
         winner_replicas.emplace_back(
             Replica(client_id, 4096, "host:port", ReplicaStatus::COMPLETE));
-        auto winner = std::make_shared<mooncake::tenant::ObjectEntry>(
+        auto winner = std::make_shared<mooncake::metadata::ObjectEntry>(
             std::make_unique<ObjectMetadata>(
                 client_id, std::chrono::system_clock::now(), 4096,
                 std::move(winner_replicas), std::nullopt, false,
@@ -530,7 +530,7 @@ class MasterServiceTest : public ::testing::Test {
         // last member erases the (now-empty) group.
         service.catalog_.Visit(
             [&](const TenantId&,
-                const std::shared_ptr<mooncake::tenant::TenantCatalog>&
+                const std::shared_ptr<mooncake::metadata::TenantCatalog>&
                     handle) {
                 auto& tenant_state = *handle;
                 for (const auto& entry : tenant_state.SnapshotObjects()) {

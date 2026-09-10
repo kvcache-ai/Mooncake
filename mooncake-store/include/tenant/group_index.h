@@ -12,7 +12,7 @@
 #include "lease.h"
 
 namespace mooncake {
-namespace tenant {
+namespace metadata {
 
 // GroupIndex: group_id -> {shared Lease, member keys}. A group is not a
 // container of objects: it is a thin membership table plus a single shared
@@ -105,5 +105,5 @@ class GroupIndex {
     std::array<Stripe, kStripeCount> stripes_;
 };
 
-}  // namespace tenant
+}  // namespace metadata
 }  // namespace mooncake
