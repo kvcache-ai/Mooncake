@@ -582,7 +582,8 @@ mod tests {
             replicas: Vec::new(),
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     #[test]
     fn pending_route_uses_the_calling_runtime_not_the_heartbeat_owner() {

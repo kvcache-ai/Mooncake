@@ -461,7 +461,8 @@ fn route_from_recovered_cold_object(
             replicas: Vec::new(),
         }),
     }
-}
+
+    nof_backing: None,}
 
 pub(super) enum RecoveredObjectOutcome {
     Registered,
@@ -1441,7 +1442,8 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: Some(cold_backing.clone()),
-        };
+
+            nof_backing: None,};
         backend
             .put_object_with_route(Some(&route), &cold_backing, payload)
             .unwrap();

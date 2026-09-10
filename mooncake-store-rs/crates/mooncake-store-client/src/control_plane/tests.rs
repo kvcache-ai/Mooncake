@@ -1156,7 +1156,7 @@ fn sample_route(key: &str, version: u64, owner: &ClientRuntimeId) -> ObjectRoute
             priority: 1,
         }],
         cold_backing: None,
-        content_generation: 0,
+        nof_backing: None,
     }
 }
 
@@ -1891,7 +1891,7 @@ fn object_route_round_trip_preserves_namespace_fields() {
             priority: 0,
         }],
         cold_backing: None,
-        content_generation: 0,
+        nof_backing: None,
     };
 
     assert_eq!(
@@ -2017,7 +2017,6 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             sharing_scope: String::new(),
             qos_tier: String::new(),
             cold_backing: None,
-            content_generation: 0,
         };
 
         let cas_reply = service

@@ -53,7 +53,8 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
         }],
         cold_backing: None,
     }
-}
+
+    nof_backing: None,}
 
 // ---------------------------------------------------------------------------
 // Property: object route CAS semantics

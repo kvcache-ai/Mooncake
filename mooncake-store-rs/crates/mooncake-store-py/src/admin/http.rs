@@ -1174,6 +1174,7 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
+            nof_backing: None,
         }
     }
 
@@ -1567,6 +1568,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "ssd-a".to_string(),
@@ -1724,6 +1726,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "ssd-b".to_string(),
@@ -1902,6 +1905,7 @@ mod tests {
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
+                    nof_backing: None,
                     cold_backing: Some(ColdBackingRoute {
                         owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
                         cold_tier_id: "ssd-async-drain".to_string(),
@@ -1999,6 +2003,7 @@ mod tests {
                 tier: ReplicaTier::Dram,
                 priority: 0,
             }],
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "device-a".to_string(),
@@ -2078,6 +2083,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "device-a".to_string(),
@@ -2104,6 +2110,7 @@ mod tests {
             state: RouteState::Active,
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
+            nof_backing: None,
             cold_backing: Some(ColdBackingRoute {
                 owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                 cold_tier_id: "device-a".to_string(),
@@ -2131,6 +2138,7 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::new(),
             cold_backing: None,
+            nof_backing: None,
         };
         service
             .backend()
@@ -2235,6 +2243,7 @@ mod tests {
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
+                    nof_backing: None,
                     cold_backing: Some(ColdBackingRoute {
                         owner: ClientRuntimeId::new("store-a", ClientEpoch(7)),
                         cold_tier_id: "device-a".to_string(),
@@ -2262,6 +2271,7 @@ mod tests {
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
+                    nof_backing: None,
                     cold_backing: Some(ColdBackingRoute {
                         owner: ClientRuntimeId::new("store-b", ClientEpoch(8)),
                         cold_tier_id: "device-b".to_string(),
@@ -3129,6 +3139,7 @@ mod tests {
                     state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: Vec::new(),
+                    nof_backing: None,
                     cold_backing: Some(ColdBackingRoute {
                         owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
                         cold_tier_id: "ssd-blockers".to_string(),

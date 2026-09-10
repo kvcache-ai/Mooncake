@@ -308,7 +308,6 @@ impl StoreClient {
             warn!(
                 runtime = %self.lease.runtime,
                 key = %route.key.0,
-                content_generation = route.content_generation,
                 error = %error,
                 "request-local NoF delete failed"
             );
@@ -338,16 +337,6 @@ impl StoreClient {
             )),
             _ if force => Ok(None),
             _ => Err(StoreError::NotFound(format!("tenant={tenant} key={key}"))),
-        }
-    }
-
-    fn delete_replaced_nof_content_best_effort(
-        &self,
-        previous: &ObjectRoute,
-        replacement: &ObjectRoute,
-    ) {
-        if previous.content_generation != replacement.content_generation {
-            self.delete_nof_content_best_effort(previous);
         }
     }
 

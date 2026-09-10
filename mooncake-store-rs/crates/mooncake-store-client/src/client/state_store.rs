@@ -609,7 +609,8 @@ mod state_store_tests {
             }],
             cold_backing: None,
         }
-    }
+
+        nof_backing: None,}
 
     #[test]
     fn pending_hot_keys_accumulates_without_bound() {
