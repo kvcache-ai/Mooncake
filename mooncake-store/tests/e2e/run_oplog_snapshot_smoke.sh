@@ -47,7 +47,7 @@ if sys.argv[3]:
     assert ('MOONCAKE_TEST_FAILPOINT_DIR=' + sys.argv[3]).encode() in entries
 PYENV
 done
-summary=$("$INSPECTOR_BIN" summary --endpoints="$ETCD_ENDPOINTS" +  --cluster_id="$CLUSTER_ID" --json)
+summary=$("$INSPECTOR_BIN" summary --endpoints="$ETCD_ENDPOINTS" --cluster_id="$CLUSTER_ID" --json)
 python3 -c 'import json,sys; d=json.loads(sys.argv[1]); assert d["ok"]; assert not d["errors"]' "$summary"
 client_args=(--master_server_entry="etcd://$ETCD_ENDPOINTS"
   --engine_meta_url="http://127.0.0.1:$METADATA_PORT/metadata" --protocol=tcp
