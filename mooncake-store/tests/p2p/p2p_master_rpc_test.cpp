@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "p2p/master/p2p_master_client.h"
+#include "p2p/master/p2p_master_metric_manager.h"
 #include "p2p/master/p2p_rpc_service.h"
 #include "utils.h"
 
@@ -172,33 +173,50 @@ TEST_F(P2PMasterRpcTest, MixedSyncPreservesItemErrorsAndReadOrder) {
     EXPECT_EQ(async_routes->front().object_size, 2048u);
 }
 
-TEST_F(P2PMasterRpcTest, LifecycleAndBatchWithdrawPreserveResultOrder) {
+TEST_F(P2PMasterRpcTest, BatchWithdrawMissingAndRepeatedLocationsIsIdempotent) {
     ASSERT_TRUE(Publish("shared", first_.id).has_value());
     ASSERT_TRUE(Publish("shared", second_.id).has_value());
-    auto withdrawn = client_->BatchWithdrawRoute(
-        {.key = "shared",
-         .client_id = client_id_,
-         .segment_ids = {first_.id, generate_uuid(), second_.id}});
-    ASSERT_EQ(withdrawn.size(), 3u);
-    EXPECT_TRUE(withdrawn[0].has_value());
-    ASSERT_FALSE(withdrawn[1].has_value());
-    EXPECT_EQ(withdrawn[1].error(), ErrorCode::REPLICA_NOT_FOUND);
-    EXPECT_TRUE(withdrawn[2].has_value());
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto requests = metrics.get_batch_withdraw_route_requests();
+    const auto items = metrics.get_batch_withdraw_route_items();
+    const auto failures = metrics.get_batch_withdraw_route_failures();
+    const auto failed_items = metrics.get_batch_withdraw_route_failed_items();
+    const auto partial = metrics.get_batch_withdraw_route_partial_successes();
+    P2PBatchWithdrawRouteRequest request{
+        .key = "shared",
+        .client_id = client_id_,
+        .segment_ids = {first_.id, generate_uuid(), first_.id, second_.id}};
+    for (std::string_view key : {"shared", "shared", "missing-key"}) {
+        request.key = key;
+        auto withdrawn = client_->BatchWithdrawRoute(request);
+        ASSERT_EQ(withdrawn.size(), request.segment_ids.size());
+        for (const auto& result : withdrawn) {
+            EXPECT_TRUE(result.has_value());
+        }
+    }
+    auto exists = client_->ExistKey("shared");
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_FALSE(*exists);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_requests(), requests + 3);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_items(), items + 12);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_failures(), failures);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_failed_items(), failed_items);
+    EXPECT_EQ(metrics.get_batch_withdraw_route_partial_successes(), partial);
+}
 
+TEST_F(P2PMasterRpcTest, LifecycleRemovesRoutesAndUpdatesClientStatus) {
     const auto extra = MakeSegment("extra");
     ASSERT_TRUE(client_->MountSegment(extra).has_value());
     ASSERT_TRUE(Publish("unmounted", extra.id).has_value());
     ASSERT_TRUE(Publish("unregistered", first_.id).has_value());
     ASSERT_TRUE(client_->UnmountSegment(extra.id).has_value());
-    auto exists =
-        client_->BatchExistKey({"shared", "unmounted", "unregistered"});
-    ASSERT_EQ(exists.size(), 3u);
+    auto exists = client_->BatchExistKey({"unmounted", "unregistered"});
+    ASSERT_EQ(exists.size(), 2u);
     for (const auto& result : exists) {
         ASSERT_TRUE(result.has_value()) << result.error();
     }
     EXPECT_FALSE(*exists[0]);
-    EXPECT_FALSE(*exists[1]);
-    EXPECT_TRUE(*exists[2]);
+    EXPECT_TRUE(*exists[1]);
 
     auto heartbeat = client_->Heartbeat({.client_id = client_id_});
     ASSERT_TRUE(heartbeat.has_value()) << heartbeat.error();
