@@ -44,7 +44,7 @@ __device__ __forceinline__ void validateRemoteSignal(
     }
 }
 
-__device__ __forceinline__ void drainTransfers(
+static __device__ __noinline__ void drainTransfers(
     const DeviceTransferHandle& handle, const GlobalRank* peers,
     uint32_t peer_count) {
     // One thread drains after all producers stop submitting. P2P has no

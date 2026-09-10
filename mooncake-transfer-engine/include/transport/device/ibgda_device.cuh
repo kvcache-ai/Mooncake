@@ -110,12 +110,16 @@ __device__ __forceinline__ IbgdaPollResult mc_ibgda_poll_cq(
             *reinterpret_cast<volatile uint16_t*>(&qp->cq->wqe_counter);
         uint8_t opcode = qp->cq->op_own >> 4;
         if (opcode == 0xD) {
+#ifndef NDEBUG
             printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
                    qp->cq->timestamp >> 56);
+#endif
             return IbgdaPollResult::Failed;
         }
         if (!(opcode == 0x0 || opcode == 0xF)) {
+#ifndef NDEBUG
             printf("[EP IBGDA] Unexpected CQE opcode=0x%x\n", opcode);
+#endif
             return IbgdaPollResult::Failed;
         }
         wq_tail = mc_bswap16(cq_be) + 1;
