@@ -208,6 +208,29 @@ class ClientRequester {
         const std::string &client_addr, Args &&...args);
 };
 
+// Describes the shutdown state transition performed by RealClient::Close().
+//
+// Frontends (the standalone binary, the Python bindings, the C API) only supply
+// this configuration; the client owns the whole transition. Both fields are
+// signed, so both must be non-negative: Close() rejects a negative value with
+// INVALID_PARAMS instead of reinterpreting it as the default below.
+struct CloseOptions {
+    // Grace period announced to the master. Zero (the default) unmounts
+    // immediately and preserves the deterministic teardown semantics.
+    std::chrono::milliseconds grace_period{0};
+
+    // Hard upper bound for the graceful wait, counted from the moment Close()
+    // starts waiting. Zero lets the client derive it, and that is what every
+    // frontend passes: the bound depends on the client's own confirmation
+    // schedule (see kGracefulUnmountConfirmInterval /
+    // kGracefulUnmountConfirmRetries), so the client is the only party able to
+    // compute a value that can actually observe completion. Exposed for
+    // in-process C++ callers that need to cap the wait themselves; a value
+    // below the derived bound makes the wait give up before the master can
+    // confirm anything.
+    std::chrono::milliseconds timeout{0};
+};
+
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
