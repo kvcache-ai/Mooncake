@@ -20,16 +20,76 @@ capabilities:
 | --- | --- | --- |
 | logical-object I/O | `NofObjectWrite`, `NofObjectRead`, `NofObjectQuery`, `NofObjectDelete` | provider namespace, object, and manifest semantics |
 | provider-addressed physical I/O | `NofPhysicalWrite`, `NofPhysicalRead`, `NofPhysicalQuery`, `NofPhysicalDelete` | complete-object I/O by deterministic key; the provider owns lookup metadata and privately chooses its record layout |
+| Mooncake-managed I/O | `NofManagedWrite`, `NofManagedRead`, `NofManagedAllocator` | complete-object I/O that returns an opaque locator; Mooncake persists placement in `ObjectRoute.nof_backing` and the target owner drives reserve/release/recovery through route CAS |
 | health | `NofHealth` | liveness and optional capacity information |
 
 Missing capabilities remain missing. Mooncake does not recreate them with a provider CLI, a
 private service API, or a parallel disk-management implementation.
 
 For KVCS, no provider placement is stored in `ObjectRoute`. Mooncake does not persist a KVCS
-target, owner, locator, manifest, shard map, object length, or checksum. Each request derives the
-provider key from the stable scoped logical key and asks the configured KVCS targets directly.
-`ObjectRoute.version` is control-plane state and is not part of that key. Target selection is a
-request-local I/O descriptor and is never published through route CAS or exposed by the admin API.
+target, owner, locator, manifest, shard map, object length, or checksum. The route keeps only the
+logical object identity. Each request derives the provider key from the stable scoped logical key
+and asks the configured KVCS targets directly. `ObjectRoute.version` is control-plane state and is
+not part of that key. Target and owner information is a request-local I/O descriptor and is never
+published through route CAS or exposed by the admin API.
+
+This route-free rule follows metadata authority, not the Standard/Low-Level or logical/physical
+API shape. The included ExtentStore executor is the opposite case: its allocator returns an opaque
+location, so Mooncake persists a distinct `NofBackingRoute`. That route is authoritative for target
+and replica placement and is replayed at startup to rebuild the allocator. Record framing, aligned
+extent layout, and free-range management remain private to ExtentStore. KVCS never enters this
+managed-route path.
+
+### Target registration and owner assignment
+
+NoF target registration reuses the existing Cold Tier target catalog and runtime lifecycle, but
+its owner is assigned differently from a local disk:
+
+| Stage | Local disk | NoF target |
+| --- | --- | --- |
+| target registration | `ColdTierTargetConfig` is resolved and registered on the node that owns the disk | `NofTargetConfig` binds the remote executor and stable target identity |
+| initial owner | the registering node's current runtime is the owner | an eligible active runtime is selected after registration |
+| shared management | existing Cold Tier owner, health, allocator, placement, and cleanup paths | the same paths after the owner assignment |
+
+For a local disk, `bootstrap_cold_tier_device` records the current runtime as the device owner
+because that runtime is the only one with a local backend. A NoF target is visible to every client
+that has the same static target inventory, so registration first makes the target available to the
+shared catalog and then assigns one active runtime as its owner. Joining a client does not move an
+existing target.
+
+The owner assignment is target-scoped. It uses the existing active client leases and stable
+rendezvous balancing to spread targets across clients. The assignment is persisted through the
+existing external route metadata authority, using the same Embedded WRH authority/CAS and
+read-repair path as other shared control metadata. Redis is not a second owner database and is
+not read on the data path.
+
+Every client keeps a local executor handle for every statically configured NoF target. The owner
+does not proxy reads or payload writes. For provider-owned KVCS targets, the owner is used only
+for the shared heartbeat and target-health view; KVCS remains authoritative for provider
+placement, manifests, and disk maintenance. For Mooncake-managed ExtentStore targets, the owner
+also performs target allocation, route publication, release, recovery, and maintenance.
+
+### Device lifecycle and maintenance ownership
+
+NoF does not introduce a second disk register/unregister control plane. Local disks continue to
+use the existing Cold Tier device API and `ColdTierDeviceRecord` state/CAS transitions
+(`register`, `unregister`, `disable`, `enable`, and drain). `NofTargetConfig` and
+`SpdkNofBlockDevice::connect` bind the remote data plane and then enter the same target/runtime
+management framework; they do not duplicate local disk lifecycle logic.
+
+Managed ExtentStore targets also reuse the existing Cold Tier scheduler. The same high/low
+watermarks drive bounded victim selection, route-safe `PendingDelete` transitions, and allocator
+release through the normal owner path. The shared `PersistentStorageBackend::compact` interface is
+used by local ExtentStore and Managed NoF: local ExtentStore removes fully dead non-active
+segments, while Managed NoF returns allocator quarantine to its free-range index after the grace
+period. Neither implementation moves a live route without a route CAS and locator update.
+
+Released NoF extents do not have a second persistent quarantine journal. Graceful owner handoff
+fences and flushes accepted writes before recovery, and recovery rebuilds the allocator only from
+materialized routes while stale locators are rejected. Persisting the in-memory quarantine alone
+would not solve a crashed-process transport-fencing problem; if crash-time late I/O becomes a
+supported requirement, it needs a device/session epoch fence in the SPDK transport rather than
+another allocator journal.
 
 Mooncake remains authoritative for logical object existence, while KVCS remains authoritative for
 provider layout and provider-internal metadata:
@@ -80,6 +140,68 @@ Changing a target set does not create a metadata migration. Because KVCS 0.4.0 h
 Mooncake cannot enumerate or reclaim provider records that are unreachable from a current logical
 route and target configuration.
 
+## Replica write coordination
+
+The existing memory-replica policy chooses one primary client for a logical write. When several
+clients hold memory replicas, only that primary may trigger the Cold Tier/NoF write. Secondary
+memory replicas do not independently write the same object, publish a second route, or select a
+different NoF replica set.
+
+The primary reuses the shared Cold Tier replica policy to select the NoF targets and to apply the
+configured success condition. Target writes may run in parallel, but the operation has one logical
+writer:
+
+```text
+memory-replica primary
+    -> shared target placement and replica policy
+    -> direct writes to selected target executors
+    -> target-owner route publication for each successful target
+    -> return after the existing replica success condition
+```
+
+For Standard KVCS, one provider target is selected because KVCS owns its internal replication and
+manifest. For Low-Level KVCS, all targets selected by `nof_replica_count` receive the same
+derived key. For Mooncake-managed ExtentStore, each selected target has an independent
+`NofBackingRoute` location and its own target owner.
+
+If a request arrives at a secondary memory replica, the existing memory-replica forwarding path
+chooses the primary before any NoF side effect. NoF does not add a second leader-election or
+replica-repair algorithm.
+
+## Managed ExtentStore and SPDK
+
+`ExtentStoreExecutor` implements the managed traits. A write receives the complete object once,
+allocates an aligned ExtentStore record, flushes the block device, and returns an opaque locator.
+Publication is owner-driven: the target owner reserves an extent, CAS-publishes a
+`PendingWrite` location in `ObjectRoute.nof_backing`, the writer performs the direct write and
+flush, and the owner CAS-publishes `Materialized`. If the CAS fails or the entry is deleted,
+the owner releases the locator; released extents stay quarantined for a grace period before
+reuse so late direct writes cannot overwrite a recycled extent. Reads, deletes, replicas,
+load balancing, retries, and owner-scoped health reuse the existing Cold Tier runtime.
+
+The managed owner rebuilds ExtentStore state from materialized routes after an abnormal owner
+loss or when a target is brought back online. It lists routes filtered by `target_id` and
+`Materialized` state and passes their opaque locators to `NofManagedAllocator::recover`.
+ExtentStore rebuilds its free ranges from those routes; it does not keep a second allocation
+journal. Objects absent from the live route set are therefore reclaimable; unrecoverable records
+are skipped and warned about instead of fencing the whole target. This metadata scan is specific
+to managed executors and is never used for KVCS.
+
+Normal shutdown uses the graceful-drain route-snapshot handoff described in
+[Ownership and health](#ownership-and-health). The replacement calls
+`NofManagedAllocator::recover` with the transferred snapshot and does not enumerate the target
+route index again. Crash takeover and target re-online use the route-index lookup above. The fast
+path transfers metadata only; it does not move payloads or change executor locators.
+
+`SpdkNofBlockDevice` is the transport below ExtentStore. It attaches an NVMe-oF controller, uses
+per-worker qpairs and DMA buffers, performs aligned block I/O, exposes geometry and transport
+statistics, and implements the flush barrier. Extent alignment is not part of the generic NoF
+traits.
+
+A StoreClient target set uses exactly one authority mode. Provider-owned KVCS targets and
+Mooncake-managed ExtentStore targets are configured on separate clients so recovery and deletion
+semantics cannot be mixed.
+
 ## Object layout and batching
 
 Cold Tier's existing `ValueChunkPlan` is the only object-splitting planner:
@@ -122,19 +244,88 @@ Low-Level `nof_replica_count` is clamped to `1..=8` and defaults to 1. The share
 `ReplicaLoadBalanceStrategy` selects write targets using provider score, accumulated writes, and
 target ID.
 
-NoF heartbeat ownership reuses client leases and Rendezvous hashing. Clients with the same
-target-set fingerprint derive the same `target_id -> heartbeat owner` assignment:
+Each NoF target has one current runtime owner for its control plane. The owner record is target
+scoped and stored through the existing external route metadata authority:
 
-- each client probes only the targets it owns;
-- a background heartbeat runs once per second; request paths use its cached result;
-- three consecutive failures exclude a target and one success restores it;
-- owners publish unhealthy target IDs in the existing client lease;
-- graceful shutdown releases ownership immediately, while crash takeover follows lease expiry and
-  epoch fencing.
+```text
+target_id
+owner_runtime
+owner_generation
+state: Active | Draining | Recovering
+record_version
+handoff_id
+```
 
-Ownership applies only to heartbeat work. Every client keeps its own SDK client for each configured
-remote target and may read, write, or delete that target directly; the heartbeat owner never
-proxies, authorizes, or gates data I/O.
+`record_version` is used by the existing metadata CAS. `owner_generation` fences stale owner
+requests after a handoff; it is not an object version, route version, or client epoch.
+
+The registration section above defines the initial owner. After assignment, local disks and NoF
+targets use the same Cold Tier health, placement, replica, cleanup, and runtime lifecycle. Adding
+a client does not rebalance existing owners.
+
+All clients still create their own executor handle for every configured NoF target. The owner does
+not proxy data I/O:
+
+- reads use the materialized route and call the target executor directly;
+- payload writes are sent directly to the executor;
+- only target allocation, route publication/deletion, allocator recovery, GC/reclaim, and
+  owner-scoped health require the current owner.
+
+### Owner state transitions
+
+Every target-management request carries `(target_id, owner_runtime, owner_generation)`. The
+recipient accepts it only when the assignment is still `Active` and all three values match.
+Therefore a former owner cannot allocate, publish, delete, reclaim, or update health after a
+successful handoff.
+
+Initial assignment and crash takeover use a metadata CAS:
+
+```text
+missing -> Recovering -> Active
+Active(old owner) -> Recovering(new owner, generation + 1) -> Active
+```
+
+Only the client that wins the CAS enters recovery. If another client joins, the existing owner
+record remains unchanged.
+
+### Graceful drain fast path
+
+Normal shutdown must not make the replacement owner rediscover the target from scratch. The
+outgoing owner follows the existing client `Draining` lifecycle:
+
+1. change the target assignment from `Active` to `Draining`;
+2. reject new target-management mutations and wait for accepted mutations to finish;
+3. fence and flush accepted executor writes;
+4. obtain one authoritative route snapshot filtered by `target_id`;
+5. select an eligible replacement and CAS the assignment to `Recovering` with a new generation;
+6. transfer the route snapshot, handoff ID, and generation fence to the replacement;
+7. let the replacement rebuild the executor allocator from that snapshot and CAS the assignment to
+   `Active`;
+8. publish the replacement's first health/capacity heartbeat.
+
+The route snapshot is metadata only. It does not move payloads, change locators, or grant the new
+owner data-proxy rights. The replacement calls the same executor `recover` interface used by the
+slow path, but it does not enumerate the target route index again.
+
+If the replacement is unavailable, the snapshot transfer fails, or the old owner disappears, the
+replacement falls back to the normal target-scoped route lookup and recovery path. That slow path
+is the crash/re-online path, not the normal shutdown path.
+
+The executor fence is local to the outgoing process: it waits for writes accepted by that
+executor, but it is not a cross-client data-plane lock. Route states (`PendingWrite`,
+`Materialized`, and `PendingDelete`), existing publication fences, and the allocator's reuse grace
+period protect against late writes from another client.
+
+### Heartbeat health
+
+Owner heartbeat is separate from owner handoff. A background heartbeat runs once per second and
+request paths consume its cached result:
+
+- each client probes only targets assigned to it;
+- three consecutive failures exclude a target from placement and one success restores it;
+- the owner publishes unhealthy target IDs and optional capacity in the existing client lease;
+- a target health failure does not by itself reassign the owner;
+- owner reassignment occurs on explicit drain, client lease expiry, or loss of owner eligibility.
 
 KVCS Low-Level health uses the public existence query and reports no capacity because the 0.4.0 ABI
 has no capacity call. Standard exposes no KVCS health capability, so the framework treats a
@@ -163,17 +354,24 @@ client/cold_tier/
     object.rs
     physical.rs
     physical_backend.rs
+    managed.rs
+    managed_backend.rs
     runtime.rs
+    extent_store/
+      block.rs
+      executor.rs
+      spdk.rs
     kvcs/
       capi.rs
       executor.rs
       physical_layout.rs
 ```
 
-The traits and Cold Tier adapters in this source tree implement provider-owned access. KVCS
-configuration, C API calls, and its private Low-Level layout live under `nof/kvcs/`.
-`physical_backend.rs` passes complete objects to a key-addressed provider; it defines no chunk,
-extent, alignment, record format, or persisted placement route.
+KVCS configuration, C API calls, and its private Low-Level layout live under `nof/kvcs/`.
+`physical_backend.rs` passes complete objects to a key-addressed provider and never publishes a
+route. `managed_backend.rs` is the thin bridge between the existing Cold Tier state machine and a
+locator-returning executor. It owns locator encoding, batch bounds, flush-before-publication, and
+rollback; ExtentStore alone owns extent alignment and record layout.
 
 ## Install KVCS SDK and EFC
 
@@ -268,6 +466,23 @@ export LD_LIBRARY_PATH="$KVCS_SDK_ROOT/mock/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_P
 `KVCS_SDK_USE_MOCK` is a build-time switch; changing only `LD_LIBRARY_PATH` cannot turn a
 production-linked binary into a mock build.
 
+
+### SPDK build dependency
+
+The managed ExtentStore executor itself is pure Rust. Enable `nof-spdk` only when the NVMe-oF SPDK
+transport is required. Install [SPDK](https://spdk.io/doc/getting_started.html) with the
+`spdk_nvme`, `spdk_env_dpdk`, and `spdk_syslibs` pkg-config files, then point the build at either
+an installed prefix or an SPDK build tree:
+
+```shell
+export MOONCAKE_SPDK_PREFIX=/opt/spdk-26.05
+cargo build -p mooncake-store-client --features nof-spdk --offline
+```
+
+Without `nof-spdk`, `mooncake-nof-sys` does not compile or link the C++ shim. The transport shim is
+the only C++ layer; allocation, record codec, checksum, buffer pooling, replica policy, and route
+lifecycle reuse existing Rust components.
+
 ## Runtime configuration
 
 | Variable | Mode | Meaning |
@@ -302,8 +517,10 @@ server-side EFC mountpoints and the Mooncake application configuration. It suppl
 
 The application bootstrap that constructs each `StoreClient` reads that static inventory and calls
 `nof_targets` once. Every client sharing a route namespace registers the same target IDs and data
-plane so that every client can query and read every target directly. Heartbeat ownership only
-distributes health probes; it does not register targets, proxy I/O, or authorize requests.
+plane so that every client can query and read every target directly. Registration is followed by
+the common target-owner assignment: local disks keep the registering node as owner, while NoF
+targets are assigned to one eligible active runtime. The owner manages target control-plane
+operations and health; it does not proxy I/O or authorize ordinary reads.
 
 Create one shared SDK client per EFC socket and bind its configured mountpoints:
 
@@ -333,6 +550,24 @@ let client = StoreClientBuilder::new(metadata, "storage-0")
     .build(expires_at_ms)?;
 ```
 
+Register a managed ExtentStore target by wrapping an exclusive block-device region. The block
+device may be an SPDK NVMe-oF namespace or another implementation of `NofBlockDevice`:
+
+```rust,ignore
+let executor = Arc::new(ExtentStoreExecutor::new(
+    block_device,
+    ExtentStoreExecutorConfig {
+        base_offset: 0,
+        size_bytes: 16 * 1024 * 1024 * 1024,
+    },
+)?);
+let target = NofTargetConfig::new("nof-disk-0", NofBackend::new(executor)?)?;
+let client = StoreClientBuilder::new(metadata, "storage-0")
+    .nof_target(target)
+    .nof_replica_count(2)
+    .build(expires_at_ms)?;
+```
+
 `KvcsCapiExecutor::new()` is the environment-variable convenience constructor for a single target.
 `with_low_level_config` remains a single-target convenience API. Standard mode uses
 `with_standard_config`; the provider owns its internal placement, so it is registered as one
@@ -356,6 +591,92 @@ object write. Mooncake does not maintain a second shard manifest or independentl
 partially accepted write. Correct retry and incomplete-manifest behavior therefore depends on the
 KVCS Standard API's idempotency and manifest contract.
 
+## Four-node managed NoF validation
+
+The SPDK shim is compiled as a static Rust/C++ shim and links the external SPDK/DPDK
+libraries dynamically. This is intentional: the four NoF hosts run Ubuntu 24.04/glibc 2.39,
+while the canonical Rust build container is Ubuntu 22.04/glibc 2.35. Linking the host-built SPDK
+archives statically in the container produces `__isoc23_*`/`__strlcpy_chk` ABI failures. The
+build therefore requires the SPDK shared libraries and keeps their directory in
+`LD_LIBRARY_PATH` when the test binary runs.
+
+The reproducible commands are:
+
+```shell
+# Run inside the canonical Mooncake Store-RS container.
+source /root/.cargo/env
+export MOONCAKE_SPDK_PREFIX=/nvme/cruz.zxp/spdk-26.05-host
+# The reserved initiator and NoF hosts are CPU-only.
+export MOONCAKE_ENABLE_CUDA=0
+scripts/e2e/build-nof-multi-client.sh
+# Optional: run the SPDK-backed NoF unit-test subset with the same environment.
+NOF_RUN_UNIT_TESTS=1 scripts/e2e/build-nof-multi-client.sh
+```
+
+The multi-client build defaults `MOONCAKE_ENABLE_CUDA` to `0` because the
+reserved validation hosts have no CUDA device. Override it explicitly to `1`
+only when running the binary on a GPU-capable initiator. This avoids compiling
+CUDA pointer/copy paths that fail during CPU-only validation even when CUDA
+headers are present in the canonical build container.
+
+`build-nof-multi-client.sh` validates `spdk_nvme.pc`, `spdk_env_dpdk.pc`,
+`spdk_syslibs.pc`, the shared SPDK libraries, Rust formatting, and the final binary's dynamic
+library resolution. The test artifact is `target/debug/nof_multi_client` (or the release path when
+`NOF_BUILD_PROFILE=release`). The bastion runner passes the same profile through to staging; set
+`NOF_RUN_UNIT_TESTS=1` to run the NoF unit subset before any target reset.
+
+`run-nof-multi-client.sh` repeats `ldd -r` on the actual initiator after adding its SPDK runtime
+directory, and writes hostname, kernel, interface inventory, binary hash, and runtime-library
+status to `run-manifest.txt`. A run is not started when a shared library or symbol is unresolved.
+
+The canonical four-node command runs on the bastion. It builds in the container, resets
+only the provisioned NoF image on all four targets, stages the exact binary and runner with
+`rsync`, verifies the binary SHA256 on the initiator, and runs the test on the reserved initiator.
+The initiator cannot reliably SSH to target public addresses, so target cleanup is deliberately
+performed from the bastion:
+
+```shell
+# On 11.158.240.229.
+rsync -a -e 'ssh -o BatchMode=yes' \
+  root@10.88.0.5:/nvme/cruz.zxp/Mooncake-Store-RS-nof-pr2-integrated/scripts/e2e/run-nof-multi-client-from-bastion.sh \
+  /tmp/run-nof-multi-client-from-bastion.sh
+bash /tmp/run-nof-multi-client-from-bastion.sh
+```
+
+The default topology is fixed in the script: build container `root@10.88.0.5`, initiator
+`root@182.92.21.56` / `192.168.22.80`, and Redis `redis://192.168.22.78:6382/0`. Override
+`NOF_BUILD_HOST`, `NOF_BUILD_ROOT`, `NOF_INITIATOR_HOST`, `NOF_BIND_IP`, `NOF_REDIS_URL`,
+`NOF_SPDK_LIB_DIR`, or `NOF_CLIENT_TIMEOUT_SECONDS` only for an explicitly different test
+reservation. Every reset stops `mooncake-nvmf.service`, removes and recreates
+`/var/lib/mooncake-nof/nof.img` at exactly 16 GiB, verifies the size, and restarts the service;
+it never touches the system NVMe disk. Run logs and the manifest are left under
+`/tmp/mooncake-nof-multi-client/logs/<run-tag>/` on the initiator.
+
+For a manually staged run, use `scripts/e2e/run-nof-multi-client.sh` with
+`NOF_RESET_TARGETS=0`, `NOF_SKIP_TARGET_SSH_CHECK=1`, `NOF_BIND_IP=192.168.22.80`, and the
+same Redis/SPDK settings after performing the reset from the bastion. Do not use `scp`.
+
+The runner sets `MC_STORE_RS_ENABLE_COLD_TIER=1`, creates per-run registration, write/offload,
+and read-start barriers, and starts the client IDs from `NOF_CLIENT_IDS` with
+`NOF_REPLICA_COUNT`. Each client writes a disjoint object set, waits until all configured clients
+finish offload and the routes report materialized Managed NoF backing, then all clients issue
+`batch_get_into` reads concurrently and verify the complete object set. The test binary uses
+`NoopTransport` for the local hot segment, so it does not claim to validate remote hot-memory
+transfers; the cross-client assertion is the managed NoF read path. A passing run must contain the
+configured write/offload and read verification counts in each client log. The target list is
+configured by `NOF_TARGETS`, client IDs by `NOF_CLIENT_IDS`, and the image size by
+`NOF_TEST_IMAGE_BYTES`; the reset operation removes and recreates only
+`/var/lib/mooncake-nof/nof.img` and never touches the system NVMe disk.
+
+The default runner target inventory is the four-host validation topology, but it is not fixed:
+
+| public host | NoF LAN endpoint |
+| --- | --- |
+| `8.141.27.180` | `192.168.22.78:4420` |
+| `182.92.21.56` | `192.168.22.80:4420` |
+| `47.93.122.112` | `192.168.22.81:4420` |
+| `59.110.29.176` | `192.168.22.82:4420` |
+
 ## Validation
 
 Default build and tests do not require KVCS:
@@ -365,6 +686,14 @@ cargo fmt --all -- --check
 MOONCAKE_SKIP_NATIVE_BUILD=1 cargo test -p mooncake-store-core --offline
 MOONCAKE_SKIP_NATIVE_BUILD=1 \
   cargo test -p mooncake-store-client --lib --offline -- --test-threads=1
+```
+
+Managed ExtentStore validation does not require KVCS or SPDK:
+
+```shell
+MOONCAKE_SKIP_NATIVE_BUILD=1 \
+  cargo test -p mooncake-store-client --lib \
+  client::cold_tier::nof::extent_store:: --offline -- --test-threads=1
 ```
 
 Official mock validation:
@@ -423,3 +752,11 @@ The official mock validates ABI marshalling, error handling, and executor behavi
 exercise real I/O, shared memory, Redis, timeouts, failover, disk faults, capacity, watermarks, or
 performance. It also omits the full shard details needed for a Standard sharded-object read, so
 that path requires live EFC and Redis.
+
+## Compatibility
+
+Managed NoF routes are new in this change. `ObjectRoute.nof_backing` uses a fresh protobuf field
+(15; field 14 stays reserved) and the metadata capability gate rejects NoF backing routes on
+backends built before this change. Clusters upgrading to this version must not carry NoF routes
+written by pre-release development builds: their `NofBackingRoute` field numbers differ and would
+decode as empty. Clear any experimental `nof_backing` routes before upgrading.

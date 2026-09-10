@@ -1,9 +1,11 @@
 use crate::{
-    NofBackend, NofBacking, NofHealth, NofObjectDelete, NofObjectLimits,
-    NofObjectQuery, NofObjectRead, NofObjectShardWrite, NofObjectState, NofObjectWrite,
-    NofPhysicalDelete, NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest,
-    NofPhysicalRead, NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest,
-    NofStorageHealth, NofTargetConfig,
+    NofBackend, NofBacking, NofHealth, NofManagedAllocationRequest, NofManagedAllocator,
+    NofManagedLimits, NofManagedLocator, NofManagedRead, NofManagedReadRequest, NofManagedWrite,
+    NofManagedWriteRequest, NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead,
+    NofObjectShardWrite, NofObjectState, NofObjectWrite, NofPhysicalDelete,
+    NofPhysicalDeleteRequest, NofPhysicalQuery, NofPhysicalQueryRequest, NofPhysicalRead,
+    NofPhysicalReadRequest, NofPhysicalWrite, NofPhysicalWriteRequest, NofStorageHealth,
+    NofTargetConfig,
 };
 
 struct FakePhysicalNof {
@@ -116,6 +118,102 @@ impl NofHealth for FakePhysicalNof {
                 "fake NoF target is unavailable".to_string(),
             ))
         }
+    }
+}
+
+#[derive(Default)]
+struct FakeManagedNof {
+    records: Mutex<std::collections::HashMap<NofManagedLocator, Vec<u8>>>,
+    writes: AtomicUsize,
+}
+
+impl NofManagedWrite for FakeManagedNof {
+    fn put_batch(&self, requests: &[NofManagedWriteRequest<'_>]) -> Vec<Result<()>> {
+        let mut records = self.records.lock();
+        requests
+            .iter()
+            .map(|request| {
+                records.insert(request.locator.clone(), request.value.to_vec());
+                self.writes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })
+            .collect()
+    }
+
+    fn flush(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+impl NofManagedRead for FakeManagedNof {
+    fn get_batch(&self, requests: &[NofManagedReadRequest]) -> Vec<Result<Option<Vec<u8>>>> {
+        let records = self.records.lock();
+        requests
+            .iter()
+            .map(|request| Ok(records.get(&request.locator).cloned()))
+            .collect()
+    }
+}
+
+impl NofManagedAllocator for FakeManagedNof {
+    fn recover(&self, _records: &[NofManagedReadRequest]) -> Result<()> {
+        Ok(())
+    }
+
+    fn reserve_batch(
+        &self,
+        requests: &[NofManagedAllocationRequest],
+    ) -> Vec<Result<NofManagedLocator>> {
+        requests
+            .iter()
+            .map(|request| NofManagedLocator::new(request.key.as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn release_batch(&self, requests: &[NofManagedReadRequest]) -> Vec<Result<()>> {
+        let mut records = self.records.lock();
+        requests
+            .iter()
+            .map(|request| {
+                records.remove(&request.locator);
+                Ok(())
+            })
+            .collect()
+    }
+}
+
+impl NofBacking for FakeManagedNof {
+
+    fn managed_limits(&self) -> Option<NofManagedLimits> {
+        Some(NofManagedLimits {
+            max_batch_items: 16,
+            max_batch_bytes: 1024 * 1024,
+        })
+    }
+
+    fn managed_write(&self) -> Option<&dyn NofManagedWrite> {
+        Some(self)
+    }
+
+    fn managed_read(&self) -> Option<&dyn NofManagedRead> {
+        Some(self)
+    }
+
+    fn managed_allocator(&self) -> Option<&dyn NofManagedAllocator> {
+        Some(self)
+    }
+
+    fn health_capability(&self) -> Option<&dyn NofHealth> {
+        Some(self)
+    }
+}
+
+impl NofHealth for FakeManagedNof {
+    fn health(&self) -> Result<NofStorageHealth> {
+        Ok(NofStorageHealth {
+            capacity_bytes: Some(1024 * 1024),
+            available_bytes: Some(1024 * 1024),
+        })
     }
 }
 
@@ -272,6 +370,30 @@ fn physical_nof_client(
         .register_local_memory()
         .expect("physical NoF local memory should register");
     (client, primary, replica)
+}
+
+#[test]
+fn nof_targets_require_shared_embedded_route_metadata() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let target = NofTargetConfig::new(
+        "nof-metadata-only",
+        NofBackend::new(Arc::new(FakePhysicalNof::default()))
+            .expect("physical NoF backend should build"),
+    )
+    .expect("NoF target should build");
+    let error = match StoreClientBuilder::new(metadata, "nof-metadata-only-client")
+        .route_control(RouteControlMode::MetadataOnly)
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new("nof-metadata-only-segment")))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_target(target)
+        .build(test_future_expiry_ms())
+    {
+        Ok(_) => panic!("NoF owner metadata cannot use process-local MetadataOnly mode"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, StoreError::InvalidState(message) if message.contains("EmbeddedWrh")));
 }
 
 #[test]
@@ -477,7 +599,7 @@ fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
         let client = StoreClientBuilder::new(metadata.clone(), stable_id)
             .state(ClientLifecycleState::Active)
             .label("storage", "true")
-            .route_control(RouteControlMode::MetadataOnly)
+            .route_control(RouteControlMode::EmbeddedWrh)
             .transport(Arc::new(TestTransport::new(segment)))
             .local_memory(storage_config_with_bytes(512))
             .nof_target(target.clone())
