@@ -827,7 +827,7 @@ mod tests {
             cold_backing: None,
         }
 
-        nof_backing: None,}
+    }
 
     #[test]
     fn route_directory_default_batch_get_uses_single_lookup() {

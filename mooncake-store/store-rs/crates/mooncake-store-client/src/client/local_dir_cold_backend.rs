@@ -460,9 +460,8 @@ fn route_from_recovered_cold_object(
             state: mooncake_store_core::ColdBackingState::Materialized,
             replicas: Vec::new(),
         }),
+        nof_backing: None,
     }
-
-    nof_backing: None,}
 
 pub(super) enum RecoveredObjectOutcome {
     Registered,

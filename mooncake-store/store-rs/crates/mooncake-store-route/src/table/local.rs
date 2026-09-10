@@ -337,7 +337,7 @@ mod tests {
             cold_backing: None,
         }
 
-        nof_backing: None,}
+}
 
     #[test]
     fn replace_ignores_stale_route_at_version_floor() {
