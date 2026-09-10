@@ -96,7 +96,7 @@ fn publish_initial_write_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
-    if backing.is_nof() {
+    if backing.is_request_local() {
         enqueue_pending_offload_with_length(storage_owner, route, backing.backing().length);
         storage_owner.sync_route(route);
         return Ok(None);
@@ -534,6 +534,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
     else {
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     };
+    let managed_nof = route.nof_backing.is_some();
     let (cold_backing, transient_nof) = match pending_persistent_backing(&route) {
         Some(backing) => (backing, false),
         None => {
@@ -557,7 +558,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
     let device_id = cold_tier_device_id(&cold_backing);
-    let device = if transient_nof {
+    let device = if transient_nof || managed_nof {
         None
     } else {
         let Some(device) = devices.get(device_id).cloned() else {
@@ -634,6 +635,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
             route,
             cold_backing,
             transient_nof,
+            managed_nof,
             payload,
             device,
             permit,
@@ -664,7 +666,11 @@ pub(in super::super) fn clear_unavailable_pending_cold_backing(
     }
     let mut next = route.clone();
     next.version = next.version.next();
-    next.cold_backing = None;
+    if route.nof_backing.is_some() {
+        next.nof_backing = None;
+    } else {
+        next.cold_backing = None;
+    }
     let cas = storage_owner.route_ops.compare_and_swap_route(
         &route.key,
         Some(route.version),
@@ -973,6 +979,7 @@ fn write_pending_offload_payloads(
                     &mut next_route,
                     &materialized_cold_backing,
                     prepared.transient_nof,
+                    prepared.managed_nof,
                 );
                 ready.push(PendingOffloadReadyRoute {
                     index,
@@ -1066,6 +1073,7 @@ fn write_pending_offload_replicas(
             &mut ready_route.next_route,
             &ready_route.materialized_cold_backing,
             prepared.transient_nof,
+            prepared.managed_nof,
         );
     }
 }
@@ -1074,9 +1082,15 @@ fn publish_materialized_backing(
     route: &mut ObjectRoute,
     backing: &mooncake_store_core::ColdBackingRoute,
     transient_nof: bool,
+    managed_nof: bool,
 ) {
-    debug_assert!(!transient_nof);
-    route.cold_backing = Some(backing.clone());
+    debug_assert!(!transient_nof || !managed_nof);
+    if managed_nof {
+        route.cold_backing = None;
+        route.nof_backing = Some(mooncake_store_core::NofBackingRoute::from_cold(backing));
+    } else if !transient_nof {
+        route.cold_backing = Some(backing.clone());
+    }
 }
 
 fn cas_pending_offload_routes(
@@ -1264,7 +1278,7 @@ fn reserve_pending_offload_batch(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
 ) -> Result<()> {
-    if pending[0].transient_nof {
+    if pending[0].transient_nof || pending[0].managed_nof {
         return Ok(());
     }
     let reserved_bytes = sum_pending_offload_payload_bytes(pending)?;
@@ -1333,7 +1347,7 @@ fn settle_pending_offload_batch(
     used_add_bytes: i64,
     reserved_release_bytes: i64,
 ) -> Result<()> {
-    if pending[0].transient_nof {
+    if pending[0].transient_nof || pending[0].managed_nof {
         return Ok(());
     }
     storage_owner.apply_cold_tier_usage_delta(

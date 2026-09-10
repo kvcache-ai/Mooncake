@@ -7,6 +7,7 @@ use crate::identity::{
     ClientRuntimeId, ClientStableId, LogicalObjectId, NamespaceScope, ReuseIdentity,
 };
 use crate::lifecycle::{ClientLifecycleState, HandoffPlan};
+use crate::nof::NofBackingRouteFilter;
 use crate::route::{
     CasResult, ClientLease, ObjectKey, ObjectRoute, RouteCasRequest, RoutePolicy,
     RoutePolicyDomain, RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName,
@@ -197,6 +198,41 @@ pub trait MetadataBackend: Send + Sync {
     /// The default implementation filters the full route set in memory and is
     /// intended for tests or small datasets. Production backends should provide
     /// a scope-aware implementation.
+    /// Lists routes containing Mooncake-managed NoF backing for one target.
+    ///
+    /// The default implementation is intentionally simple; indexed metadata backends can
+    /// override it without changing the owner/recovery contract.
+    fn list_object_routes_by_nof_backing(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        let mut routes = Vec::new();
+        for route in self.list_object_routes()? {
+            let Some(backing) = route.nof_backing.as_ref() else {
+                continue;
+            };
+            let target_matches = |target_id: &str| {
+                filter
+                    .target_id
+                    .as_ref()
+                    .is_none_or(|expected| expected == target_id)
+            };
+            let contains_target = target_matches(&backing.target_id)
+                || backing
+                    .replicas
+                    .iter()
+                    .any(|replica| target_matches(&replica.target_id));
+            if !contains_target || filter.state.is_some_and(|state| backing.state != state) {
+                continue;
+            }
+            routes.push(route);
+            if filter.limit.is_some_and(|limit| routes.len() >= limit) {
+                break;
+            }
+        }
+        Ok(routes)
+    }
+
     fn list_object_routes_in_scope(&self, scope: &NamespaceScope) -> Result<Vec<ObjectRoute>> {
         Ok(self
             .list_object_routes()?
@@ -825,8 +861,8 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
+            nof_backing: None,
         }
-
     }
 
     #[test]

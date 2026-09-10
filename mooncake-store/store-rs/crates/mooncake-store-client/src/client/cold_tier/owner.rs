@@ -217,6 +217,19 @@ impl NofOwnerState {
         self.owners.read().get(target_id).cloned()
     }
 
+    pub(super) fn list_managed_routes(
+        &self,
+        target_id: &str,
+    ) -> Result<Vec<mooncake_store_core::ObjectRoute>> {
+        self.metadata.list_object_routes_by_nof_backing(
+            &mooncake_store_core::NofBackingRouteFilter {
+                target_id: Some(target_id.to_string()),
+                state: Some(mooncake_store_core::ColdBackingState::Materialized),
+                limit: None,
+            },
+        )
+    }
+
     pub(super) fn locally_owned_target_ids(&self) -> Vec<String> {
         self.owners
             .read()
@@ -477,6 +490,13 @@ impl NofHeartbeatMonitor {
     }
 
     pub(super) fn start(state: Arc<NofOwnerState>) -> Result<Self> {
+        Self::start_with_hook(state, None)
+    }
+
+    pub(super) fn start_with_hook(
+        state: Arc<NofOwnerState>,
+        hook: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Result<Self> {
         let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
         let stable_id = state.local_runtime.stable_id.0.clone();
         let initial_delay = Duration::from_millis(crate::client::stable_phase_spread_ms(
@@ -495,6 +515,9 @@ impl NofHeartbeatMonitor {
                 }
                 loop {
                     state.heartbeat_owned_targets();
+                    if let Some(hook) = hook.as_ref() {
+                        hook();
+                    }
                     match shutdown_rx.recv_timeout(TARGET_HEARTBEAT_INTERVAL) {
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,

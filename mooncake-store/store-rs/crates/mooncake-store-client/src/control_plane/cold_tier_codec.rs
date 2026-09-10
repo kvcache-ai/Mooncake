@@ -98,3 +98,68 @@ pub(super) fn try_cold_backing_route(
             .collect::<Result<Vec<_>>>()?,
     })
 }
+
+pub(super) fn pb_nof_backing_route(
+    route: &mooncake_store_core::NofBackingRoute,
+) -> pb::NofBackingRoute {
+    pb::NofBackingRoute {
+        owner: Some(pb_runtime_id(&route.owner)),
+        target_id: route.target_id.clone(),
+        object_locator: route.object_locator.clone(),
+        length: route.length,
+        checksum: route.checksum,
+        state: pb_cold_backing_state(route.state),
+        replicas: route
+            .replicas
+            .iter()
+            .map(|replica| pb::NofBackingReplica {
+                owner: Some(pb_runtime_id(&replica.owner)),
+                target_id: replica.target_id.clone(),
+                object_locator: replica.object_locator.clone(),
+            })
+            .collect(),
+    }
+}
+
+pub(super) fn try_nof_backing_route(
+    route: pb::NofBackingRoute,
+) -> Result<mooncake_store_core::NofBackingRoute> {
+    let owner = route
+        .owner
+        .as_ref()
+        .map(try_runtime_id)
+        .transpose()?
+        .ok_or_else(|| {
+            StoreError::Transport("control plane NoF backing is missing owner".to_string())
+        })?;
+    let replicas = route
+        .replicas
+        .into_iter()
+        .map(|replica| {
+            let owner = replica
+                .owner
+                .as_ref()
+                .map(try_runtime_id)
+                .transpose()?
+                .ok_or_else(|| {
+                    StoreError::Transport(
+                        "control plane NoF backing replica is missing owner".to_string(),
+                    )
+                })?;
+            Ok(mooncake_store_core::NofBackingReplica {
+                owner,
+                target_id: replica.target_id,
+                object_locator: replica.object_locator,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(mooncake_store_core::NofBackingRoute {
+        owner,
+        target_id: route.target_id,
+        object_locator: route.object_locator,
+        length: route.length,
+        checksum: route.checksum,
+        state: try_cold_backing_state(route.state)?,
+        replicas,
+    })
+}

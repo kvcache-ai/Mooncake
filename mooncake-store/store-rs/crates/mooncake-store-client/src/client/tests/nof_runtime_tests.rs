@@ -480,6 +480,74 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
     assert!(replica.records.lock().is_empty());
 }
 
+
+#[test]
+fn managed_nof_persists_route_reads_cold_and_releases_locator() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend = Arc::new(FakeManagedNof::default());
+    let target = NofTargetConfig::new(
+        "nof-managed-a",
+        NofBackend::new(backend.clone()).expect("managed NoF backend should build"),
+    )
+    .expect("managed NoF target should build");
+    let client = StoreClientBuilder::new(metadata, "nof-managed-runtime")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new("nof-managed-segment")))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_target(target)
+        .build(test_future_expiry_ms())
+        .expect("managed NoF client should build");
+    client
+        .register_local_memory()
+        .expect("managed NoF local memory should register");
+
+    let payload = [31u8; 150];
+    client
+        .put("managed-nof-key", &payload)
+        .expect("managed NoF put should succeed");
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .expect("managed NoF offload should run"),
+        1
+    );
+    let route = client
+        .query_route("managed-nof-key")
+        .expect("managed route query should succeed")
+        .expect("managed route should exist");
+    assert!(route.cold_backing.is_none());
+    let backing = route
+        .nof_backing
+        .as_ref()
+        .expect("managed route should persist NoF placement");
+    assert_eq!(backing.target_id, "nof-managed-a");
+    assert_eq!(
+        backing.state,
+        mooncake_store_core::ColdBackingState::Materialized
+    );
+    assert_eq!(backend.records.lock().len(), 1);
+
+    force_cold_only_route(&client, "managed-nof-key");
+    assert_eq!(
+        client
+            .get("managed-nof-key")
+            .expect("managed NoF cold restore should succeed"),
+        payload
+    );
+
+    client
+        .remove("managed-nof-key", true)
+        .expect("managed NoF delete should succeed");
+    assert!(
+        wait_for_nof_reclaims(&client, || backend.records.lock().is_empty()),
+        "managed NoF locator remains allocated: {:?}",
+        backend.records.lock().keys().collect::<Vec<_>>()
+    );
+}
+
 #[test]
 fn physical_nof_requires_the_configured_replica_count_before_offload() {
     let _cold_tier_env = enable_cold_tier_for_test();

@@ -52,7 +52,8 @@ fn make_route(key: &ObjectKey, segment: &str) -> ObjectRoute {
             priority: 0,
         }],
         cold_backing: None,
-        nof_backing: None,    }
+        nof_backing: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
