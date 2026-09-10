@@ -282,6 +282,23 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
     }
     return {};
 }
+
+// DummyClient copy RPCs do not carry device_id; setup_dummy already stored it
+// on each mapped SHM. Use that so the RPC thread has an ACL context before TE
+// submitTransfer / aclrtGetDevice.
+template <typename MappedShms>
+tl::expected<void, ErrorCode> set_context_from_dummy_shms(
+    const std::string &protocol, const MappedShms &mapped_shms,
+    const char *action) {
+    int32_t device_id = kInvalidPhysicalDeviceId;
+    for (const auto &shm : mapped_shms) {
+        if (shm.device_id != kInvalidPhysicalDeviceId) {
+            device_id = shm.device_id;
+            break;
+        }
+    }
+    return set_context_if_needed(protocol, device_id, action);
+}
 #endif
 
 size_t sum_value_sizes(const std::vector<std::span<const char>> &values) {
@@ -2003,13 +2020,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
     const std::string &key, std::span<const char> value,
-    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    auto context_result = set_context_if_needed(protocol, device_id, "put");
-    if (!context_result) {
-        return context_result;
-    }
-#endif
+    const ReplicateConfig &config, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2017,6 +2028,13 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_internal(key, value, config, context.client_buffer_allocator);
 }
@@ -2111,14 +2129,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
-    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    auto context_result =
-        set_context_if_needed(protocol, device_id, "put_batch");
-    if (!context_result) {
-        return context_result;
-    }
-#endif
+    const ReplicateConfig &config, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2126,6 +2137,13 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put_batch");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_batch_internal(keys, values, config,
                               context.client_buffer_allocator);
@@ -2214,14 +2232,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     const std::string &key, std::vector<std::span<const char>> values,
-    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    auto context_result =
-        set_context_if_needed(protocol, device_id, "put_parts");
-    if (!context_result) {
-        return context_result;
-    }
-#endif
+    const ReplicateConfig &config, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2229,6 +2240,13 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put_parts");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_parts_internal(key, values, config,
                               context.client_buffer_allocator);
@@ -3003,21 +3021,21 @@ tl::expected<void, ErrorCode> RealClient::release_hot_cache(
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::acquire_buffer_dummy(const std::string &key, int32_t device_id,
+RealClient::acquire_buffer_dummy(const std::string &key,
                                  const UUID &client_id) {
-#ifdef USE_ASCEND_DIRECT
-    auto context_result =
-        set_context_if_needed(protocol, device_id, "get_buffer");
-    if (!context_result) {
-        return tl::unexpected(context_result.error());
-    }
-#endif
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "get_buffer");
+    if (!context_result) {
+        return tl::unexpected(context_result.error());
+    }
+#endif
 
     auto buffer_handle =
         get_buffer_internal(key, context.client_buffer_allocator);
@@ -3132,21 +3150,9 @@ tl::expected<void, ErrorCode> RealClient::batch_release_hot_cache(
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
 RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
-                                       int32_t device_id,
                                        const UUID &client_id) {
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
-
-#ifdef USE_ASCEND_DIRECT
-    auto context_result =
-        set_context_if_needed(protocol, device_id, "batch_get_buffer");
-    if (!context_result) {
-        for (auto &r : results) {
-            r = tl::unexpected(context_result.error());
-        }
-        return results;
-    }
-#endif
 
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto ctx_it = shm_contexts_.find(client_id);
@@ -3155,6 +3161,16 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
             r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         return results;
     }
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_from_dummy_shms(
+        protocol, ctx_it->second.mapped_shms, "batch_get_buffer");
+    if (!context_result) {
+        for (auto &r : results) {
+            r = tl::unexpected(context_result.error());
+        }
+        return results;
+    }
+#endif
 
     // Use batch_get_buffer_internal with dummy's allocator
     lock.unlock();
