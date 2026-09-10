@@ -1442,12 +1442,14 @@ class MasterService {
     // hold it (e.g. a MetadataAccessorRW scope); the plain entry points Pin
     // the entry and take the lock themselves. A helper must never serve
     // locked and unlocked callers at once.
-    void RecordOrUpdateCandidateLocked(mooncake::metadata::ObjectEntry& entry,
+    void RecordOrUpdateCandidateLocked(metadata::TenantCatalog& tenant_state,
+                                       mooncake::metadata::ObjectEntry& entry,
                                        uint8_t sketch_score,
                                        PromotionCandidateReason reason,
                                        ErrorCode last_error,
                                        uint32_t execution_failures = 0);
-    void EraseCandidateLocked(mooncake::metadata::ObjectEntry& entry);
+    void EraseCandidateLocked(metadata::TenantCatalog& tenant_state,
+                              mooncake::metadata::ObjectEntry& entry);
     void EraseCandidate(const ObjectIdentity& object_id);
     void DecrementCandidateCount();
     void BackoffCandidate(const ObjectIdentity& object_id,

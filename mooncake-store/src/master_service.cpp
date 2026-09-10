@@ -2317,7 +2317,7 @@ bool MasterService::TearDownEntryLocked(
     // The global candidate count must be settled here: an erased entry can
     // no longer reach the retry loop's expiry path, so its candidate would
     // permanently leak a slot toward the admission limit.
-    EraseCandidateLocked(entry);
+    EraseCandidateLocked(tenant_state, entry);
     ClearDynamicReplicationStateLocked(tenant_state, entry);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
@@ -8294,9 +8294,11 @@ void MasterService::DecrementCandidateCount() {
 }
 
 void MasterService::EraseCandidateLocked(
+    metadata::TenantCatalog& tenant_state,
     mooncake::metadata::ObjectEntry& entry) {
     if (entry.promotion_candidate.has_value()) {
         entry.promotion_candidate.reset();
+        tenant_state.UnindexPromotionCandidate(entry.key());
         DecrementCandidateCount();
     }
 }
@@ -8307,10 +8309,11 @@ void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
     auto entry = tenant_handle->Get(object_id.user_key);
     if (entry == nullptr) return;
     auto lock = entry->LockUnique();
-    EraseCandidateLocked(*entry);
+    EraseCandidateLocked(*tenant_handle, *entry);
 }
 
 void MasterService::RecordOrUpdateCandidateLocked(
+    metadata::TenantCatalog& tenant_state,
     mooncake::metadata::ObjectEntry& entry, uint8_t sketch_score,
     PromotionCandidateReason reason, ErrorCode last_error,
     uint32_t execution_failures) {
@@ -8358,6 +8361,7 @@ void MasterService::RecordOrUpdateCandidateLocked(
                            .last_error = last_error,
                            .retry_count = 0,
                            .execution_failures = execution_failures};
+    tenant_state.IndexPromotionCandidate(key);
     MasterMetricManager::instance().inc_promotion_candidate_recorded();
     VLOG(1) << "promotion_candidate_recorded key=" << key;
 }
@@ -8409,7 +8413,7 @@ void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
     if (ttl_expired || c.retry_count >= kPromotionCandidateMaxRetries) {
         VLOG(1) << "promotion_candidate_gave_up key=" << object_id.user_key
                 << " retries=" << c.retry_count;
-        EraseCandidateLocked(*object_entry);
+        EraseCandidateLocked(tenant_state, *object_entry);
         MasterMetricManager::instance()
             .inc_promotion_candidate_expired_evaluated();
     } else {
@@ -8424,7 +8428,7 @@ void MasterService::ClearCandidatesForReload() {
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             auto lk = entry->LockUnique();
-            EraseCandidateLocked(*entry);
+            EraseCandidateLocked(tenant_state, *entry);
         }
     });
     promotion_candidate_count_.store(0, std::memory_order_relaxed);
@@ -8458,18 +8462,23 @@ size_t MasterService::RunPromotionCandidateRetry() {
                     return;
                 }
                 auto& tenant_state = *handle;
-                // Collect handles, then lock each per-object.
-                auto objs = handle->SnapshotObjects();
-                std::vector<std::string> keys_to_drop;
-                for (const auto& entry : objs) {
+                // Enumerate the sparse candidate index instead of scanning
+                // the whole route; every key is revalidated under its entry
+                // lock and stale keys are dropped from the index on sight.
+                for (const auto& key : handle->PromotionCandidateKeys()) {
                     if (due_candidates.size() >= kPromotionRetryBatchSize) {
                         break;
                     }
-                    auto lk = entry->LockUnique();
-                    if (!entry->promotion_candidate.has_value()) {
+                    auto entry = handle->Get(key);
+                    if (!entry) {
+                        tenant_state.UnindexPromotionCandidate(key);
                         continue;
                     }
-                    const std::string& key = entry->key();
+                    auto lk = entry->LockUnique();
+                    if (!entry->promotion_candidate.has_value()) {
+                        tenant_state.UnindexPromotionCandidate(key);
+                        continue;
+                    }
                     PromotionCandidate& c = *entry->promotion_candidate;
 
                     const bool ttl_expired =
@@ -8478,19 +8487,18 @@ size_t MasterService::RunPromotionCandidateRetry() {
                         c.retry_count >= kPromotionCandidateMaxRetries) {
                         VLOG(1) << "promotion_candidate_expired key=" << key
                                 << " retry_count=" << c.retry_count;
-                        const uint32_t saved_retry_count = c.retry_count;
-                        keys_to_drop.push_back(key);
                         // retry_count == 0: scheduler never reached this
                         // candidate before TTL elapsed — scan budget was
                         // too small. retry_count > 0: scheduler evaluated
                         // it but gave up after retries or TTL.
-                        if (saved_retry_count == 0) {
+                        if (c.retry_count == 0) {
                             MasterMetricManager::instance()
                                 .inc_promotion_candidate_expired_unevaluated();
                         } else {
                             MasterMetricManager::instance()
                                 .inc_promotion_candidate_expired_evaluated();
                         }
+                        EraseCandidateLocked(tenant_state, *entry);
                         continue;
                     }
                     if (c.retry_after > now) {
@@ -8505,19 +8513,12 @@ size_t MasterService::RunPromotionCandidateRetry() {
                             &Replica::fn_is_memory_replica) ||
                         !entry->metadata().HasReplica(
                             &Replica::fn_is_local_disk_replica)) {
-                        keys_to_drop.push_back(key);
+                        EraseCandidateLocked(tenant_state, *entry);
                         continue;
                     }
 
                     due_candidates.push_back(ObjectIdentity{
                         .tenant_id = tenant_id, .user_key = key});
-                }
-                for (const auto& key : keys_to_drop) {
-                    auto e = tenant_state.Get(key);
-                    if (e) {
-                        auto lk = e->LockUnique();
-                        EraseCandidateLocked(*e);
-                    }
                 }
             });
     }
@@ -9216,7 +9217,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
             MetadataAccessorRW accessor(this, object_id);
             if (accessor.Exists()) {
                 RecordOrUpdateCandidateLocked(
-                    *accessor.GetEntry(), freq,
+                    accessor.GetTenantCatalog(), *accessor.GetEntry(), freq,
                     PromotionCandidateReason::kWatermark, ErrorCode::OK);
             }
         }
@@ -9236,7 +9237,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
     // A primary Put/Upsert owns all PROCESSING replicas while the entry is
     // processing. Promotion must not establish a second owner.
     if (accessor.InProcessing()) {
-        EraseCandidateLocked(*object_entry);
+        EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
         return PromotionQueueResult::kAlreadyInFlight;
     }
 
@@ -9249,11 +9250,11 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         // promotion is executing) or the holder's mailbox is gone.
         local_ssd_manager_.TouchPromotion(
             object_entry->promotion_task->holder_id, object_id.tenant_id, key);
-        EraseCandidateLocked(*object_entry);
+        EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
         return PromotionQueueResult::kAlreadyInFlight;
     }
     if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
-        EraseCandidateLocked(*object_entry);
+        EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
         return PromotionQueueResult::kMemoryReplicaPresent;
     }
 
@@ -9264,7 +9265,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
                                if (source == nullptr) source = &r;
                            });
     if (source == nullptr) {
-        EraseCandidateLocked(*object_entry);
+        EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
         return PromotionQueueResult::kNoLocalDiskSource;
     }
 
@@ -9278,9 +9279,9 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         promotion_queue_limit_) {
         MasterMetricManager::instance().inc_promotion_rejected_cap();
         if (record_candidate) {
-            RecordOrUpdateCandidateLocked(*object_entry, freq,
-                                          PromotionCandidateReason::kQueueCap,
-                                          ErrorCode::OK);
+            RecordOrUpdateCandidateLocked(
+                accessor.GetTenantCatalog(), *object_entry, freq,
+                PromotionCandidateReason::kQueueCap, ErrorCode::OK);
         }
         return PromotionQueueResult::kQueueCapRejected;
     }
@@ -9297,18 +9298,18 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         VLOG(1) << "promotion_push_failed key=" << key
                 << " error=" << push_result.error();
         if (push_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
-            EraseCandidateLocked(*object_entry);
+            EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
             return PromotionQueueResult::kAlreadyInFlight;
         }
         if (push_result.error() == ErrorCode::SEGMENT_NOT_FOUND ||
             push_result.error() == ErrorCode::INVALID_PARAMS) {
-            EraseCandidateLocked(*object_entry);
+            EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
             return PromotionQueueResult::kNoLocalDiskSource;
         }
         if (record_candidate) {
-            RecordOrUpdateCandidateLocked(*object_entry, freq,
-                                          PromotionCandidateReason::kPushFailed,
-                                          push_result.error());
+            RecordOrUpdateCandidateLocked(
+                accessor.GetTenantCatalog(), *object_entry, freq,
+                PromotionCandidateReason::kPushFailed, push_result.error());
         }
         return PromotionQueueResult::kPushFailed;
     }
@@ -9329,7 +9330,7 @@ PromotionQueueResult MasterService::TryPushPromotionQueue(
         execution_failures =
             object_entry->promotion_candidate->execution_failures;
     }
-    EraseCandidateLocked(*object_entry);
+    EraseCandidateLocked(accessor.GetTenantCatalog(), *object_entry);
     if (object_entry != nullptr) {
         object_entry->promotion_task =
             PromotionTask{.source_id = source->id(),
@@ -9725,8 +9726,9 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
             const uint8_t freq =
                 promotion_sketch_ ? promotion_sketch_->count(admission_key) : 0;
             RecordOrUpdateCandidateLocked(
-                *object_entry, freq, PromotionCandidateReason::kExecutionFailed,
-                ErrorCode::OK, prior_failures + 1);
+                tenant_state, *object_entry, freq,
+                PromotionCandidateReason::kExecutionFailed, ErrorCode::OK,
+                prior_failures + 1);
         }
     }
 

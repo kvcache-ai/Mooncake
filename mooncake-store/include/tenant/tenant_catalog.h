@@ -5,7 +5,9 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "tenant/group_index.h"
@@ -73,6 +75,28 @@ class TenantCatalog {
                 entry->promotion_candidate->retry_after = epoch;
             }
         }
+    }
+
+    // Sparse index of keys with an active promotion candidate. The entry's
+    // promotion_candidate stays the single source of truth; this only lets
+    // the retry loop enumerate candidates without scanning the whole route.
+    // Membership is maintained by the candidate record/erase chokepoints.
+    void IndexPromotionCandidate(const std::string& key) {
+        std::lock_guard lock(promotion_candidate_keys_mutex_);
+        promotion_candidate_keys_.insert(key);
+    }
+    void UnindexPromotionCandidate(const std::string& key) {
+        std::lock_guard lock(promotion_candidate_keys_mutex_);
+        promotion_candidate_keys_.erase(key);
+    }
+    std::vector<std::string> PromotionCandidateKeys() const {
+        std::lock_guard lock(promotion_candidate_keys_mutex_);
+        return {promotion_candidate_keys_.begin(),
+                promotion_candidate_keys_.end()};
+    }
+    size_t PromotionCandidateKeyCountForTesting() const {
+        std::lock_guard lock(promotion_candidate_keys_mutex_);
+        return promotion_candidate_keys_.size();
     }
 
     // Empty of objects, group membership and (via ObjectIndex) in-flight
@@ -172,9 +196,14 @@ class TenantCatalog {
         return object_index.Contains(key);
     }
     size_t ObjectCount() const { return object_index.ObjectCount(); }
+
     std::vector<std::shared_ptr<ObjectEntry>> SnapshotObjects() const {
         return object_index.SnapshotObjects();
     }
+
+   private:
+    mutable std::mutex promotion_candidate_keys_mutex_;
+    std::unordered_set<std::string> promotion_candidate_keys_;
 };
 
 }  // namespace metadata

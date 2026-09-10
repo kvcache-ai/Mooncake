@@ -61,6 +61,12 @@ class PromotionOnHitTest : public ::testing::Test {
             ->CountPromotionCandidatesForTesting();
     }
 
+    static size_t CountPromotionCandidateKeysForTesting(
+        MasterService* service, const TenantId& tenant) {
+        auto handle = service->catalog_.Lookup(tenant);
+        return handle ? handle->PromotionCandidateKeyCountForTesting() : 0;
+    }
+
     static constexpr uint32_t MaxPromotionCandidateRetriesForTesting() {
         return MasterService::kPromotionCandidateMaxRetries;
     }
@@ -1047,6 +1053,52 @@ TEST_F(PromotionOnHitTest, QueueLimitRejectsBeyondCap) {
         << "k2's rejection must increment promotion_rejected_cap";
 
     service->RemoveAll();
+}
+
+// The sparse candidate index in TenantCatalog must mirror the entry-side
+// candidate state: the retry loop enumerates the index, so drift would
+// silently drop retry candidates. Recording indexes; teardown unindexes.
+TEST_F(PromotionOnHitTest, CandidateIndexMirrorsEntryState) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.promotion_queue_limit = 0;  // every admission is cap-rejected,
+                                       // leaving standing candidates
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "seg_idx", kDefaultSegmentBase, seg_size);
+
+    const std::string k1 = "cand_idx_first";
+    const std::string k2 = "cand_idx_second";
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k1, 1024,
+                                       seg.segment_name));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, k2, 1024,
+                                       seg.segment_name));
+
+    ASSERT_TRUE(service->GetReplicaList(k1, TenantId::Default()).has_value());
+    ASSERT_TRUE(service->GetReplicaList(k2, TenantId::Default()).has_value());
+    EXPECT_EQ(CountPromotionCandidateKeysForTesting(service.get(),
+                                                    TenantId::Default()),
+              2u);
+    EXPECT_EQ(
+        CountPromotionCandidateKeysForTesting(service.get(),
+                                              TenantId::Default()),
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()));
+
+    // Erasing the objects tears the candidates down and unindexes them.
+    // Forced: the standing candidates hold fresh leases, so a non-forced
+    // sweep would just skip them.
+    service->RemoveAll(/*force=*/true);
+    EXPECT_EQ(CountPromotionCandidateKeysForTesting(service.get(),
+                                                    TenantId::Default()),
+              0u);
+    EXPECT_EQ(
+        CountPromotionCandidatesForTesting(service.get(), TenantId::Default()),
+        0u);
 }
 
 // PromotionObjectHeartbeat caps the per-call response at kMaxPerHeartbeat
