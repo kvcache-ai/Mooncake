@@ -1216,17 +1216,17 @@ class MasterService {
             const std::string&, ObjectMetadata&, tenant::TenantCatalog&,
             tenant::TenantCatalog&)>& evict_one_member);
 
-    // Erase an object's entry + all per-key state. The entry-based form is the
-    // single choke-point for stripping per-key state; the key-based overload
-    // pins the entry (no-op when absent) and forwards.
+    // Erase an object's entry + all per-key state. Takes the entry handle
+    // directly and is the single choke-point for stripping per-key state;
+    // callers starting from a key resolve it with TenantCatalog::Get() (a
+    // null handle is a no-op).
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
         kAbortOnly,
     };
-    // Entry-based teardown of a previously pinned entry (the caller may have
-    // extra state wired to it that a fresh Pin could no longer observe).
-    // Key-based teardown resolves the entry at call time. Both erase the
+    // The entry may be a previously pinned handle (the caller may have extra
+    // state wired to it that a fresh Get could no longer observe). Erases the
     // route slot only when it still resolves to the torn-down entry, and the
     // teardown runs at most once per entry (metadata is taken under the
     // object lock).
@@ -1237,10 +1237,6 @@ class MasterService {
         QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
         tenant::TenantCatalog* tenant_accessor = nullptr,
         const std::vector<std::string>& previous_media_hint = {});
-    void EraseMetadata(tenant::TenantCatalog& tenant_state, const std::string& key,
-                       const TenantId& tenant_id,
-                       QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
-                       tenant::TenantCatalog* tenant_accessor = nullptr);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata);
