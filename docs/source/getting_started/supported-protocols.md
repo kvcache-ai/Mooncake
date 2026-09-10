@@ -208,6 +208,24 @@ export MC_FORCE_MNNVL=true
 
 **Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
 
+**Host memory over NVLink (TENT, EGM):** on Grace-Blackwell systems the GPUs of
+an NVLink domain can also address each other's host DRAM (Extended GPU Memory).
+The TENT `mnnvl` transport exports host buffers this way when
+`transports/mnnvl/egm` is enabled (`MC_MNNVL_EGM=1`, off by default), adding the
+`dram_to_dram` and `gpu_to_dram` capabilities so CPU-resident data (weight or
+KV caches) moves over NVLink instead of the NIC:
+
+```bash
+export MC_ENABLE_MNNVL=1   # select the TENT mnnvl transport
+export MC_MNNVL_EGM=1      # transports/mnnvl/egm
+```
+
+Only buffers allocated with `allocateLocalMemory("cpu:<numa>")` (or any
+`cuMemCreate` allocation with a `HOST_NUMA` location and a fabric handle) are
+exported; other host memory keeps the previous `cudaHostRegister` behaviour and
+is reachable through RDMA/TCP as before. Requires an IMEX domain spanning the
+peers and EGM enabled in the driver.
+
 ### MUSA Transport (musa)
 
 **Description:** Moore Threads GPU IPC transport for P2P copies over the
