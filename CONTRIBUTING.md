@@ -90,6 +90,13 @@ git add .pre-commit-config.yaml
 git commit -m "chore: pre-commit autoupdate"
 ```
 
+Mechanical formatting-only commits are listed in `.git-blame-ignore-revs` so
+blame skips them. GitHub's blame view honors the file automatically; enable it
+for local `git blame` with:
+```bash
+git config blame.ignoreRevsFile .git-blame-ignore-revs
+```
+
 If clang-format or its `git-clang-format` helper is missing, install the LLVM
 20 package (Ubuntu example):
 ```bash
