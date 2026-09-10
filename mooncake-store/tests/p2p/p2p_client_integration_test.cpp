@@ -44,6 +44,8 @@ class P2PClientIntegrationTest : public ::testing::Test {
         size_t te_async_poll_worker_num = 32) {
         if (rpc_port == 0) rpc_port = getFreeTcpPort();
 
+        // TODO(C2): Bind the client listener atomically and publish its actual
+        // port after runtime ownership is split; remove the port-probe race.
         auto config = ClientConfigBuilder::build_p2p_real_client(
             host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
             R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
@@ -57,14 +59,19 @@ class P2PClientIntegrationTest : public ::testing::Test {
         config.te_async_poll_worker_num = te_async_poll_worker_num;
 
         config.async_sender_thread_count = 0;
+        // Endpoint behavior is covered by the dedicated HTTP fixture.
+        config.enable_http_server = false;
 
         auto client = std::make_shared<P2PClientService>(
             config.metadata_connstring, config.http_port,
             config.enable_http_server, config.labels);
 
         auto err = client->Init(config);
-        EXPECT_EQ(err, ErrorCode::OK)
-            << "Init failed: " << static_cast<int>(err);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "P2P fixture initialization failed: " << err;
+            ADD_FAILURE() << "Init failed: " << static_cast<int>(err);
+            return nullptr;
+        }
 
         return client;
     }
