@@ -1502,6 +1502,7 @@ struct TransferEngineImpl::PreparedSubmit {
     struct Task {
         size_t merged_task_index{0};
         size_t task_id{0};
+        size_t public_length{0};
     };
 
     struct Owner {
@@ -1889,7 +1890,8 @@ Status TransferEngineImpl::prepareSubmit(
         } else {
             owner.derived_task_ids.push_back(task_id);
         }
-        prepared.tasks.push_back({merged_task_index, task_id});
+        prepared.tasks.push_back({merged_task_index, task_id,
+                                  request_list[public_task_index].length});
     }
     return Status::OK();
 }
@@ -1932,6 +1934,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
+            task.public_length = task_plan.public_length;
             if (task.type != UNSPEC) {
                 auto owner_it =
                     owner_task_id_by_merged_task.find(merged_task_id);
@@ -1948,6 +1951,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = merged_request;
+        task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
@@ -2153,6 +2157,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = owner.request;
+        task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time = prepared.submit_time;
         task.type = UNSPEC;
@@ -2857,7 +2862,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                 task_status.s = public_status;
                 task_status.transferred_bytes =
                     public_status == COMPLETED
-                        ? batch->task_list[public_task_id].request.length
+                        ? batch->task_list[public_task_id].public_length
                         : 0;
                 return Status::OK();
             }
@@ -2887,7 +2892,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     recordTaskCompletionMetrics(batch->task_list[poll_task_id], prev_status,
                                 task_status.s);
 
-    if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
+    if (task_status.s == COMPLETED) {
+        task_status.transferred_bytes =
+            batch->task_list[public_task_id].public_length;
+        CHECK_STATUS(maybeFireSubmitHooks(batch));
+    }
     return Status::OK();
 }
 
