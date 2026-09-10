@@ -13,33 +13,38 @@ from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
-DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
+DEFAULT_DEFAULT_KV_LEASE_TTL = 5000  # 5000 milliseconds
 # Use environment variable if set, otherwise use default
-default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
+default_kv_lease_ttl = int(
+    os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL)
+)
+
 
 def cuda_available():
     return _torch is not None and _torch.cuda.is_available()
+
 
 # Define a test class for serialization
 class TestClass:
     def __init__(self, version=1, shape=(1, 2, 3)):
         self.version = version
         self.shape = shape
-    
+
     def serialize_into(self, buffer):
         struct.pack_into("i", buffer, 0, self.version)
         struct.pack_into("3i", buffer, 4, *self.shape)
-        
+
     def serialize_into(self):
         version_bytes = struct.pack("i", self.version)
         shape_bytes = struct.pack("3i", *self.shape)
         return (version_bytes, shape_bytes)
-        
+
     def deserialize_from(buffer):
         version = struct.unpack_from("i", buffer, 0)[0]
         shape = struct.unpack_from("3i", buffer, 4)
         return TestClass(version, shape)
-         
+
+
 def get_client(store):
     """Initialize and setup the distributed store client."""
     protocol = os.getenv("PROTOCOL", "tcp")
@@ -47,19 +52,19 @@ def get_client(store):
     local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
     metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
     global_segment_size = 3200 * 1024 * 1024  # 3200 MB
-    local_buffer_size = 512 * 1024 * 1024     # 512 MB
+    local_buffer_size = 512 * 1024 * 1024  # 512 MB
     master_server_address = os.getenv("MASTER_SERVER", "127.0.0.1:50051")
-    
+
     retcode = store.setup(
-        local_hostname, 
-        metadata_server, 
+        local_hostname,
+        metadata_server,
         global_segment_size,
-        local_buffer_size, 
-        protocol, 
+        local_buffer_size,
+        protocol,
         device_name,
-        master_server_address
+        master_server_address,
     )
-    
+
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
 
@@ -87,7 +92,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.allclose(tensor, retrieved))
 
         # Int tensor
-        tensor_int = torch.tensor([1,2,3,4], dtype=torch.int32)
+        tensor_int = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
         key_int = "test_tensor_int"
         result = self.store.put_tensor(key_int, tensor_int)
         self.assertEqual(result, 0)
@@ -196,7 +201,9 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertEqual(self.store.put(raw_key, raw), 0)
 
         dst = torch.empty(len(raw), dtype=torch.uint8, device="cuda")
-        self.assertEqual(self.store.get_into(raw_key, dst.data_ptr(), len(raw)), len(raw))
+        self.assertEqual(
+            self.store.get_into(raw_key, dst.data_ptr(), len(raw)), len(raw)
+        )
         expected = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
         self.assertTrue(torch.equal(dst, expected))
 
@@ -223,9 +230,11 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.allclose(tensor_2d, retrieved_tensor))
 
         # Test with 3D int tensor
-        tensor_3d = torch.tensor([[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int64)
+        tensor_3d = torch.tensor(
+            [[[1, 2], [3, 4]], [[5, 6], [7, 8]]], dtype=torch.int64
+        )
         key_3d = "test_tensor_with_metadata_3d"
-        
+
         result = self.store.put_tensor(key_3d, tensor_3d)
         self.assertEqual(result, 0)
 
@@ -239,7 +248,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_2d)
         self.store.remove(key_3d)
 
-             
     def _assert_empty_tensor_equal(self, expected, actual):
         import torch
 
@@ -293,7 +301,9 @@ class TestDistributedObjectStore(unittest.TestCase):
             retrieved = self.store.get_tensor_into(key, buffer_ptr, buffer_size)
             self._assert_empty_tensor_equal(tensor, retrieved)
 
-            self.assertEqual(self.store.put_tensor_from(key_from, buffer_ptr, total_length), 0)
+            self.assertEqual(
+                self.store.put_tensor_from(key_from, buffer_ptr, total_length), 0
+            )
             self._assert_empty_tensor_equal(tensor, self.store.get_tensor(key_from))
         finally:
             self.store.unregister_buffer(buffer_ptr)
@@ -310,7 +320,9 @@ class TestDistributedObjectStore(unittest.TestCase):
         split_dim = 0
 
         self.assertEqual(
-            self.store.put_tensor_with_tp(key, tensor, tp_size=tp_size, split_dim=split_dim),
+            self.store.put_tensor_with_tp(
+                key, tensor, tp_size=tp_size, split_dim=split_dim
+            ),
             0,
         )
         for rank in range(tp_size):
@@ -331,21 +343,28 @@ from mooncake.structured_object_store import (
 
 
 class TestCodecInference(unittest.TestCase):
-
     def test_tensor(self):
         import torch
+
         d = _choose_leaf_codec([torch.tensor([1, 2]), torch.tensor([3])])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
     def test_tensor_mixed_dtype(self):
         import torch
-        d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
+
+        d = _choose_leaf_codec(
+            [
+                torch.tensor([1], dtype=torch.float32),
+                torch.tensor([1], dtype=torch.int64),
+            ]
+        )
         self.assertFalse(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
     def test_tensor_mixed_ndim(self):
         import torch
+
         d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
@@ -513,5 +532,5 @@ class TestCodecInference(unittest.TestCase):
             infer_structure("r", [deep, deep], [], [])
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     unittest.main()

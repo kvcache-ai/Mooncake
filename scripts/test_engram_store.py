@@ -273,12 +273,16 @@ class EngramStoreTestBase(unittest.TestCase):
 
         cfg = self.create_config()
         if store_marker is Ellipsis:
-            engram_store = self.EngramStore(layer_id=layer_id, config=cfg, store=self.store)
+            engram_store = self.EngramStore(
+                layer_id=layer_id, config=cfg, store=self.store
+            )
             self._created_engram_stores.append(engram_store)
         elif store_marker is None:
             engram_store = self.EngramStore(layer_id=layer_id, config=cfg)
         else:
-            engram_store = self.EngramStore(layer_id=layer_id, config=cfg, store=store_marker)
+            engram_store = self.EngramStore(
+                layer_id=layer_id, config=cfg, store=store_marker
+            )
             self._created_engram_stores.append(engram_store)
         return cfg, engram_store
 
@@ -308,7 +312,9 @@ class TestEngramStoreMetadata(EngramStoreTestBase):
 
     def test_creation_without_store_keeps_metadata_accessible(self):
         layer_id = self._next_layer_id
-        cfg, engram_store = self.create_engram_store(layer_id=layer_id, store_marker=None)
+        cfg, engram_store = self.create_engram_store(
+            layer_id=layer_id, store_marker=None
+        )
         self.assertEqual(engram_store.get_num_heads(), len(cfg.table_vocab_sizes))
         self.assertEqual(engram_store.get_embedding_dim(), cfg.embedding_dim)
         self.assertEqual(engram_store.get_store_keys()[0], f"engram:l{layer_id}:h0")

@@ -111,9 +111,7 @@ def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
             key = keys[head_idx]
             rc = store_obj.put_from(key, cursor, nbytes)
             if rc != 0:
-                raise RuntimeError(
-                    f"CXL put_from fallback failed for {key}, rc={rc}"
-                )
+                raise RuntimeError(f"CXL put_from fallback failed for {key}, rc={rc}")
             published_keys.append(key)
             cursor += aligned
     except Exception:
@@ -125,7 +123,9 @@ def populate_store(engram_store, store_obj):
     keys = engram_store.get_store_keys()
     embedding_buffers = []
     for vocab_size in engram_store.get_table_vocab_sizes():
-        emb = np.random.randn(vocab_size, engram_store.get_embedding_dim()).astype(np.float32)
+        emb = np.random.randn(vocab_size, engram_store.get_embedding_dim()).astype(
+            np.float32
+        )
         embedding_buffers.append(emb)
 
     t0 = time.perf_counter()

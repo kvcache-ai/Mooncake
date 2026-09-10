@@ -52,6 +52,7 @@ def find_local_named_group(
         return None, None
     return group_spec, groups.get(group_spec.name)
 
+
 def create_named_groups(
     topology: TopologySpec,
     *,
@@ -77,18 +78,14 @@ def destroy_named_groups(groups: dict[str, object]) -> None:
 def build_tp_only_topology() -> TopologySpec:
     return TopologySpec(
         world_size=4,
-        ordered_groups=(
-            GroupSpec("tp0", "tp", (0, 1, 2, 3)),
-        ),
+        ordered_groups=(GroupSpec("tp0", "tp", (0, 1, 2, 3)),),
     )
 
 
 def build_tp_only_topology_2() -> TopologySpec:
     return TopologySpec(
         world_size=2,
-        ordered_groups=(
-            GroupSpec("tp0", "tp", (0, 1)),
-        ),
+        ordered_groups=(GroupSpec("tp0", "tp", (0, 1)),),
     )
 
 

@@ -19,6 +19,7 @@ import os
 import socket
 import subprocess
 
+
 def discover_nvmeof_targets(nqn, transport, traddr, trsvcid):
     """Discover NVMe-oF targets."""
     cmd = f"nvme discover -t {transport} -a {traddr} -s {trsvcid}"
@@ -29,6 +30,7 @@ def discover_nvmeof_targets(nqn, transport, traddr, trsvcid):
     print(f"Discovered NVMe-oF targets:\n{result.stdout}")
     return result.stdout
 
+
 def connect_nvmeof_target(nqn, transport, traddr, trsvcid):
     """Connect to NVMe-oF target."""
     cmd = f"nvme connect -t {transport} -n {nqn} -a {traddr} -s {trsvcid}"
@@ -38,6 +40,7 @@ def connect_nvmeof_target(nqn, transport, traddr, trsvcid):
         return None
     print(f"Connected to NVMe-oF target:\n{result.stdout}")
     return result.stdout
+
 
 def mount_nvme_device(device, mount_point):
     """Mount the NVMe device to a specific mount point."""
@@ -50,9 +53,12 @@ def mount_nvme_device(device, mount_point):
     print(f"Mounted {device} on {mount_point}")
     return mount_point
 
+
 if __name__ == "__main__":
     if len(sys.argv) != 5:
-        print("Usage: python mount.py <etcd_host> <segment_name> <file_path> <local_path>")
+        print(
+            "Usage: python mount.py <etcd_host> <segment_name> <file_path> <local_path>"
+        )
         sys.exit(1)
 
     os.environ.pop("HTTP_PROXY", None)
@@ -74,7 +80,7 @@ if __name__ == "__main__":
     print(buffers)
 
     buffer = next((b for b in buffers if b["file_path"] == file_path), None)
-    buffer['local_path_map'][local_server_name] = local_path
+    buffer["local_path_map"][local_server_name] = local_path
 
     etcd.put(segment_name, json.dumps(segment))
     print(etcd.get(segment_name)[0])
@@ -82,5 +88,4 @@ if __name__ == "__main__":
     etcd.put(segment_name, json.dumps(segment))
     print(etcd.get(segment_name)[0])
 
-  # TODO: mount the buffer to local_path, currently users should mount buffers manually
-
+# TODO: mount the buffer to local_path, currently users should mount buffers manually

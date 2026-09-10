@@ -29,7 +29,6 @@ MLA_MODEL_CONFIG = {
         "kv_precision_bytes": 2,  # BF16
         "indexer_precision_bytes": 2,  # BF16
     },
-
     # Kimi-K2.6: 61 layers, 64 tokens/page
     # KV: 61 layers × 64 tokens × (512+64) × 2 = 73,728 bytes/page
     # Per token: 1,152 bytes
@@ -68,8 +67,15 @@ class MLALayout(KVLayout):
     Used in: GLM-5, Kimi-K2.6
     """
 
-    def __init__(self, num_layers: int, kv_lora_rank: int, qk_rope_head_dim: int,
-                 index_head_dim: int, precision_bytes: int, page_size_tokens: int = 512):
+    def __init__(
+        self,
+        num_layers: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        index_head_dim: int,
+        precision_bytes: int,
+        page_size_tokens: int = 512,
+    ):
         """Initialize MLA layout
 
         Args:
@@ -91,7 +97,11 @@ class MLALayout(KVLayout):
         # Each entry contains KV + Indexer for all layers for page_size_tokens
         # Per layer: page_size_tokens × (kv_lora_rank + qk_rope_head_dim + index_head_dim) × precision_bytes
         # Total: per_layer_size × num_layers
-        per_layer_size = page_size_tokens * (kv_lora_rank + qk_rope_head_dim + index_head_dim) * precision_bytes
+        per_layer_size = (
+            page_size_tokens
+            * (kv_lora_rank + qk_rope_head_dim + index_head_dim)
+            * precision_bytes
+        )
         self.value_size_bytes = per_layer_size * num_layers
 
         # Store page_size for backward compatibility
@@ -112,15 +122,14 @@ class MLALayout(KVLayout):
         """
         for hash_id in request.hash_ids:
             yield StorageAccess(
-                page_id=hash_id,
-                offset_in_page=0,
-                length=self.value_size_bytes
+                page_id=hash_id, offset_in_page=0, length=self.value_size_bytes
             )
 
 
 # ============================================================================
 # Utility Functions
 # ============================================================================
+
 
 def get_model_config(model_name: str) -> dict:
     """Get MLA model configuration by name
@@ -158,17 +167,22 @@ def create_layout(model_config: dict, page_size_tokens: int = 64) -> MLALayout:
     Raises:
         ValueError: If model configuration is invalid
     """
-    required_fields = ['num_layers', 'kv_lora_rank', 'qk_rope_head_dim',
-                       'index_head_dim', 'kv_precision_bytes']
+    required_fields = [
+        "num_layers",
+        "kv_lora_rank",
+        "qk_rope_head_dim",
+        "index_head_dim",
+        "kv_precision_bytes",
+    ]
     for field in required_fields:
         if field not in model_config:
             raise ValueError(f"Missing required field: {field}")
 
     return MLALayout(
-        num_layers=model_config['num_layers'],
-        kv_lora_rank=model_config['kv_lora_rank'],
-        qk_rope_head_dim=model_config['qk_rope_head_dim'],
-        index_head_dim=model_config['index_head_dim'],
-        precision_bytes=model_config['kv_precision_bytes'],
+        num_layers=model_config["num_layers"],
+        kv_lora_rank=model_config["kv_lora_rank"],
+        qk_rope_head_dim=model_config["qk_rope_head_dim"],
+        index_head_dim=model_config["index_head_dim"],
+        precision_bytes=model_config["kv_precision_bytes"],
         page_size_tokens=page_size_tokens,
     )

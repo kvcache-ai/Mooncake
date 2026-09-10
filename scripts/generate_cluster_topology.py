@@ -15,9 +15,13 @@ from scipy.optimize import linear_sum_assignment
 def is_local_host(host):
     return host in ("localhost", "127.0.0.1", socket.gethostname())
 
+
 def local_exec(command):
-    result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    result = subprocess.run(
+        command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
     return result.stdout.decode() + result.stderr.decode()
+
 
 def ssh_exec(host, port, command):
     if is_local_host(host):
@@ -32,24 +36,39 @@ def ssh_exec(host, port, command):
     client.close()
     return out + err
 
+
 def get_machine_id(host, port):
     return ssh_exec(host, port, "cat /etc/machine-id").strip()
 
 
 # -------------------- Section 1: SSH + RDMA Testing --------------------
 def parse_args():
-    parser = argparse.ArgumentParser(description="Transfer Engine Cluster Topology Generator")
+    parser = argparse.ArgumentParser(
+        description="Transfer Engine Cluster Topology Generator"
+    )
     parser.add_argument("--src-host", default="localhost", help="Source hostname")
     parser.add_argument("--dst-host", required=True, help="Destination hostname")
-    parser.add_argument("--src-port", type=int, default=22, help="SSH port for source host")
-    parser.add_argument("--dst-port", type=int, default=22, help="SSH port for destination host")
-    parser.add_argument("--sudo", action="store_true", help="Use sudo for remote commands")
-    parser.add_argument("--file", default="cluster-topology.json", help="Path of the generated cluster topology file")
+    parser.add_argument(
+        "--src-port", type=int, default=22, help="SSH port for source host"
+    )
+    parser.add_argument(
+        "--dst-port", type=int, default=22, help="SSH port for destination host"
+    )
+    parser.add_argument(
+        "--sudo", action="store_true", help="Use sudo for remote commands"
+    )
+    parser.add_argument(
+        "--file",
+        default="cluster-topology.json",
+        help="Path of the generated cluster topology file",
+    )
     return parser.parse_args()
 
 
 def list_rdma_devices(host, port, use_sudo):
-    cmd = ("sudo " if use_sudo else "") + "ibv_devices | grep -v device | awk '{print $1}'"
+    cmd = (
+        "sudo " if use_sudo else ""
+    ) + "ibv_devices | grep -v device | awk '{print $1}'"
     out = ssh_exec(host, port, cmd)
     devs = out.strip().splitlines()
 
@@ -100,22 +119,34 @@ def run_rdmatest(src, dst, dev1, dev2, use_sudo):
     cmd_prefix_src = numactl_prefix(dev1["numa_node"]) + prefix
     cmd_prefix_dst = numactl_prefix(dev2["numa_node"]) + prefix
 
-    ssh_exec(dst["host"], dst["port"],
-             f"{prefix}pkill ib_write_bw; {cmd_prefix_dst}nohup ib_write_bw --ib-dev={dev2['name']} > /tmp/bw_server.log 2>&1 &")
+    ssh_exec(
+        dst["host"],
+        dst["port"],
+        f"{prefix}pkill ib_write_bw; {cmd_prefix_dst}nohup ib_write_bw --ib-dev={dev2['name']} > /tmp/bw_server.log 2>&1 &",
+    )
     time.sleep(0.5)
 
-    bw_output = ssh_exec(src["host"], src["port"],
-                         f"{cmd_prefix_src}ib_write_bw {dst['host']} --ib-dev={dev1['name']}")
+    bw_output = ssh_exec(
+        src["host"],
+        src["port"],
+        f"{cmd_prefix_src}ib_write_bw {dst['host']} --ib-dev={dev1['name']}",
+    )
     bw_val = parse_bandwidth(bw_output)
     if bw_val is None:
         return None
 
-    ssh_exec(dst["host"], dst["port"],
-             f"{prefix}pkill ib_read_lat; {cmd_prefix_dst}nohup ib_read_lat --ib-dev={dev2['name']} > /tmp/lat_server.log 2>&1 &")
+    ssh_exec(
+        dst["host"],
+        dst["port"],
+        f"{prefix}pkill ib_read_lat; {cmd_prefix_dst}nohup ib_read_lat --ib-dev={dev2['name']} > /tmp/lat_server.log 2>&1 &",
+    )
     time.sleep(0.5)
 
-    lat_output = ssh_exec(src["host"], src["port"],
-                          f"{cmd_prefix_src}ib_read_lat {dst['host']} --ib-dev={dev1['name']}")
+    lat_output = ssh_exec(
+        src["host"],
+        src["port"],
+        f"{cmd_prefix_src}ib_read_lat {dst['host']} --ib-dev={dev1['name']}",
+    )
     lat_val = parse_latency(lat_output)
 
     return {
@@ -124,7 +155,7 @@ def run_rdmatest(src, dst, dev1, dev2, use_sudo):
         "src_numa": dev1["numa_node"],
         "dst_numa": dev2["numa_node"],
         "bandwidth": bw_val,
-        "latency": lat_val
+        "latency": lat_val,
     }
 
 
@@ -144,7 +175,7 @@ def save_results(filepath, results):
 def build_partition_map(endpoints):
     partition_map = defaultdict(list)
     for ep in endpoints:
-        if not np.isfinite(ep.get("latency", float('inf'))):
+        if not np.isfinite(ep.get("latency", float("inf"))):
             continue
         key = f"{ep['src_numa']}-{ep['dst_numa']}"
         partition_map[key].append(ep)
@@ -152,8 +183,8 @@ def build_partition_map(endpoints):
 
 
 def solve_partition_group(pairs, allow_partial=False):
-    src_devs = sorted(set(ep['src_dev'] for ep in pairs))
-    dst_devs = sorted(set(ep['dst_dev'] for ep in pairs))
+    src_devs = sorted(set(ep["src_dev"] for ep in pairs))
+    dst_devs = sorted(set(ep["dst_dev"] for ep in pairs))
 
     N_src = len(src_devs)
     N_dst = len(dst_devs)
@@ -167,9 +198,9 @@ def solve_partition_group(pairs, allow_partial=False):
     latency_map = {}
 
     for ep in pairs:
-        i = idx_src[ep['src_dev']]
-        j = idx_dst[ep['dst_dev']]
-        cost[i, j] = ep['latency']
+        i = idx_src[ep["src_dev"]]
+        j = idx_dst[ep["dst_dev"]]
+        cost[i, j] = ep["latency"]
         valid[i, j] = True
         latency_map[(i, j)] = ep
 
@@ -203,14 +234,18 @@ def process_host_pair(record):
         if optimal:
             result[part_key] = optimal
 
-        used_src = set(ep['src_dev'] for ep in optimal)
-        used_dst = set(ep['dst_dev'] for ep in optimal)
-        extras = [ep for ep in part_eps if ep['src_dev'] not in used_src and ep['dst_dev'] not in used_dst]
+        used_src = set(ep["src_dev"] for ep in optimal)
+        used_dst = set(ep["dst_dev"] for ep in optimal)
+        extras = [
+            ep
+            for ep in part_eps
+            if ep["src_dev"] not in used_src and ep["dst_dev"] not in used_dst
+        ]
         extra_opt = solve_partition_group(extras, allow_partial=True)
         if extra_opt:
             result[part_key + "_extra"] = extra_opt
 
-    record['partition_matchings'] = result
+    record["partition_matchings"] = result
 
 
 # -------------------- Main Orchestration --------------------
@@ -227,14 +262,25 @@ def main():
     result_file = args.file
     all_results = load_results(result_file)
 
-    existing_idx = next((i for i, e in enumerate(all_results)
-                         if e["src_host"] == src_machine_id and e["dst_host"] == dst_machine_id),
-                        None)
+    existing_idx = next(
+        (
+            i
+            for i, e in enumerate(all_results)
+            if e["src_host"] == src_machine_id and e["dst_host"] == dst_machine_id
+        ),
+        None,
+    )
 
     if existing_idx is not None:
-        confirm = input(f"\nEntry already exists for {src_machine_id} → {dst_machine_id}. "
-                        f"Do you want to overwrite and re-test? (y = overwrite and retest / n = skip): ").strip().lower()
-        if confirm != 'y':
+        confirm = (
+            input(
+                f"\nEntry already exists for {src_machine_id} → {dst_machine_id}. "
+                f"Do you want to overwrite and re-test? (y = overwrite and retest / n = skip): "
+            )
+            .strip()
+            .lower()
+        )
+        if confirm != "y":
             print("Skipping test and keeping existing result.")
             return
         else:
@@ -247,7 +293,9 @@ def main():
     total = len(devices_src) * len(devices_dst)
     endpoints = []
 
-    for dev1, dev2 in tqdm(product(devices_src, devices_dst), total=total, desc="Testing", unit="test"):
+    for dev1, dev2 in tqdm(
+        product(devices_src, devices_dst), total=total, desc="Testing", unit="test"
+    ):
         result = run_rdmatest(src, dst, dev1, dev2, use_sudo)
         if result:
             endpoints.append(result)
@@ -255,7 +303,7 @@ def main():
     new_entry = {
         "src_host": src_machine_id,
         "dst_host": dst_machine_id,
-        "endpoints": endpoints
+        "endpoints": endpoints,
     }
 
     if existing_idx is not None:

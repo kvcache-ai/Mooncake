@@ -69,14 +69,18 @@ def _ordering_worker(
 
     num_msgs = 4
     if ctx.rank == 0:
-        send_tensors = [torch.tensor([i], dtype=torch.int64, device=device) for i in range(num_msgs)]
+        send_tensors = [
+            torch.tensor([i], dtype=torch.int64, device=device) for i in range(num_msgs)
+        ]
         ops = [dist.P2POp(op=dist.isend, tensor=t, peer=1) for t in send_tensors]
         works = dist.batch_isend_irecv(ops)
         for work in works:
             work.wait()
         value = "ok"
     else:
-        recv_tensors = [torch.empty(1, dtype=torch.int64, device=device) for _ in range(num_msgs)]
+        recv_tensors = [
+            torch.empty(1, dtype=torch.int64, device=device) for _ in range(num_msgs)
+        ]
         ops = [dist.P2POp(op=dist.irecv, tensor=t, peer=0) for t in recv_tensors]
         works = dist.batch_isend_irecv(ops)
         for work in works:
@@ -116,7 +120,9 @@ def _multiple_senders_worker(
         value = [int(recv_from_0.cpu().item()), int(recv_from_2.cpu().item())]
     elif ctx.rank == 2:
         send_tensor = torch.tensor([200], dtype=torch.int64, device=device)
-        works = dist.batch_isend_irecv([dist.P2POp(op=dist.isend, tensor=send_tensor, peer=1)])
+        works = dist.batch_isend_irecv(
+            [dist.P2POp(op=dist.isend, tensor=send_tensor, peer=1)]
+        )
         for work in works:
             work.wait()
         value = "ok"
@@ -159,8 +165,9 @@ def _p2p_fault_detection_worker(
         w.wait()
     ctx.synchronize()
     for w in works:
-        assert pg.get_local_success(w), \
-            f"rank {ctx.rank} round 1: all P2P ops should succeed locally"
+        assert pg.get_local_success(
+            w
+        ), f"rank {ctx.rank} round 1: all P2P ops should succeed locally"
         failed_ranks_hint = pg.get_failed_ranks_hint(w)
         assert (
             failed_ranks_hint.cpu().tolist() == [0] * ctx.world_size
@@ -185,12 +192,15 @@ def _p2p_fault_detection_worker(
     for w, peer in zip(works, [p for p in peers for _ in range(2)]):
         failed_ranks_hint = pg.get_failed_ranks_hint(w)
         expected = (
-            broken_peer_failed_ranks_hint if peer == BROKEN_RANK else normal_failed_ranks_hint
+            broken_peer_failed_ranks_hint
+            if peer == BROKEN_RANK
+            else normal_failed_ranks_hint
         )
         assert failed_ranks_hint.cpu().tolist() == expected
         if peer == BROKEN_RANK:
-            assert not pg.get_local_success(w), \
-                f"rank {ctx.rank} round 2: P2P with broken peer should fail locally"
+            assert not pg.get_local_success(
+                w
+            ), f"rank {ctx.rank} round 2: P2P with broken peer should fail locally"
 
     expected_active_ranks = [1] * ctx.world_size
     expected_active_ranks[BROKEN_RANK] = 0
@@ -270,7 +280,6 @@ class TestMooncakePGP2PCPU(_P2PMixin, MooncakePGCPUBackendTestCase):
 
 
 class TestMooncakePGP2PCUDA(_P2PMixin, MooncakePGCUDABackendTestCase):
-
     @classmethod
     def configure_for_cuda_device_count(cls, device_count: int) -> None:
         if device_count < 2:
