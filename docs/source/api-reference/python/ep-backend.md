@@ -524,6 +524,20 @@ capacity consistent when propagating committed PG membership into EP.
 - PG benchmark harness: `mooncake-pg/benchmark/README.md`
 - EP correctness and failure simulation: `python/tests/ep/test_ep_grid.py`
 - EP wrapper example: `python/tests/ep/test_mooncake_ep.py`
+- NCCL EP rank-replacement recovery: `python/tests/ep/test_elastic_buffer_recovery.py`
+
+Run the NCCL EP recovery tests from the repository root with two visible CUDA
+devices and NCCL-enabled EP/PG extensions:
+
+```bash
+python -m pytest -q python/tests/ep/test_elastic_buffer_recovery.py
+```
+
+These tests check dispatch/combine before and after worker replacement, reject
+stale EP handles, and cover reserved PG capacity and a `mooncake-cpu` control
+group. The EP data path remains on the GPUs when the control group uses CPU
+tensors. The tests reuse the PG worker harness and honor
+`MOONCAKE_PGTEST_DEVICE_FILTERS` for NIC selection.
 
 See [PG/EP troubleshooting](../../troubleshooting/pg-ep-troubleshooting.md) for
 common setup and runtime issues.

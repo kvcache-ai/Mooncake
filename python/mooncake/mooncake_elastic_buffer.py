@@ -159,6 +159,12 @@ def _resolve_nccl_membership_masks(rank_masks: Sequence[Sequence[int]]) -> None:
         )
 
 
+def _bootstrap_collective_device(group: dist.ProcessGroup) -> str:
+    """Choose metadata tensors independently of the GPU EP data path."""
+    backend = str(dist.get_backend(group)).lower()
+    return "cpu" if backend in {"gloo", "mooncake-cpu"} else "cuda"
+
+
 def _select_transport_for_group(
     group: dist.ProcessGroup,
     requested: str,
@@ -181,9 +187,7 @@ def _select_transport_for_group(
         num_nvlink_ranks,
         allow_hybrid_mode,
     )
-    collective_device = (
-        "cpu" if str(dist.get_backend(group)).lower() == "gloo" else "cuda"
-    )
+    collective_device = _bootstrap_collective_device(group)
     group_size = group.size()
     local_state = torch.tensor(
         [
@@ -413,14 +417,10 @@ class ElasticBuffer:
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
         from mooncake import ep
 
-        has_nccl_device_support = getattr(ep, "has_nccl_device_support", None)
-        nccl_available = bool(
-            has_nccl_device_support is not None and has_nccl_device_support()
-        )
         self.transport = _select_transport_for_group(
             self.group,
             self.requested_transport,
-            nccl_available,
+            ep.has_nccl_device_support(),
             self.num_ranks,
             self.num_rdma_ranks,
             self.num_nvlink_ranks,
@@ -473,7 +473,7 @@ class ElasticBuffer:
         # native static cast to MooncakeBackend. PyTorch exposes custom process
         # groups through its base ProcessGroup type, so query the registered
         # backend name instead of relying on the Python wrapper's type name.
-        if dist.get_backend(self.backend) != "mooncake":
+        if "mooncake" not in str(dist.get_backend(self.backend)).lower():
             return [1] * self.num_ranks
 
         from mooncake.ep import get_active_ranks
@@ -490,9 +490,7 @@ class ElasticBuffer:
             active_mask = self._active_ranks_mask()
         except Exception:
             active_mask = []
-        collective_device = (
-            "cpu" if str(dist.get_backend(self.group)).lower() == "gloo" else "cuda"
-        )
+        collective_device = _bootstrap_collective_device(self.group)
         local_mask = torch.full(
             (self.num_ranks,), -1, dtype=torch.int32, device=collective_device
         )
@@ -642,8 +640,7 @@ class ElasticBuffer:
 
     def _exchange_nccl_unique_id(self, ep: Any) -> List[int]:
         create_unique_id = getattr(ep, "create_nccl_unique_id", None)
-        backend = str(dist.get_backend(self.group)).lower()
-        collective_device = "cpu" if backend == "gloo" else "cuda"
+        collective_device = _bootstrap_collective_device(self.group)
         root_global_rank = dist.get_global_rank(self.group, 0)
 
         # NCCL requires ncclGetUniqueId to be called once per communicator.
@@ -720,11 +717,10 @@ class ElasticBuffer:
             torch.cuda.synchronize()
             from mooncake import ep
 
-            has_nccl_device_support = getattr(ep, "has_nccl_device_support", None)
             selected_transport = _select_transport_for_group(
                 self.group,
                 self.requested_transport,
-                bool(has_nccl_device_support is not None and has_nccl_device_support()),
+                ep.has_nccl_device_support(),
                 self.num_ranks,
                 self.num_rdma_ranks,
                 self.num_nvlink_ranks,

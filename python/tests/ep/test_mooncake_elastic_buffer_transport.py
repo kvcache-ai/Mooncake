@@ -12,6 +12,7 @@ import torch.distributed as dist
 
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
+    _bootstrap_collective_device,
     _requested_transport,
     _resolve_nccl_membership_masks,
     _resolve_transport_consensus,
@@ -113,17 +114,21 @@ def test_invalid_transport_is_rejected(monkeypatch) -> None:
         _requested_transport("auto")
 
 
-def test_group_transport_selection_uses_every_rank_capability(monkeypatch) -> None:
+@pytest.mark.parametrize("backend_name", ["gloo", "mooncake-cpu"])
+def test_group_transport_selection_uses_every_rank_capability(
+    monkeypatch, backend_name: str
+) -> None:
     class Group:
         @staticmethod
         def size() -> int:
             return 2
 
     test_group = Group()
-    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+    monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
 
     def fake_all_gather(gathered_states, local_state, group=None) -> None:
         assert group is test_group
+        assert local_state.device.type == "cpu"
         for state in gathered_states:
             state.copy_(local_state)
         # Simulate rank 1 having the same request but no usable NCCL backend.
@@ -259,16 +264,20 @@ def test_nccl_reconfiguration_rejects_incomplete_membership(
         _resolve_nccl_membership_masks(rank_masks)
 
 
+@pytest.mark.parametrize("backend_name", ["gloo", "mooncake-cpu"])
 @pytest.mark.parametrize("active_mask", [[1, 1], [1, 1, 0, 0]])
-def test_nccl_membership_accepts_reserved_capacity(monkeypatch, active_mask) -> None:
+def test_nccl_membership_accepts_reserved_capacity(
+    monkeypatch, active_mask, backend_name: str
+) -> None:
     buffer = object.__new__(ElasticBuffer)
     buffer.num_ranks = 2
     buffer.group = object()
     monkeypatch.setattr(buffer, "_active_ranks_mask", lambda: active_mask)
-    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+    monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
 
     def fake_all_gather(gathered_masks, local_mask, group=None) -> None:
         assert group is buffer.group
+        assert local_mask.device.type == "cpu"
         assert local_mask.tolist() == [1, 1]
         assert len(gathered_masks) == buffer.num_ranks
         for mask in gathered_masks:
@@ -342,7 +351,10 @@ def test_handle_without_generation_remains_valid_for_ibgda() -> None:
     buffer._validate_handle_generation(LegacyHandle())
 
 
-def test_active_rank_mask_uses_registered_mooncake_backend(monkeypatch) -> None:
+@pytest.mark.parametrize("backend_name", ["mooncake", "mooncake-cpu"])
+def test_active_rank_mask_uses_registered_mooncake_backend(
+    monkeypatch, backend_name: str
+) -> None:
     backend = object()
     buffer = object.__new__(ElasticBuffer)
     buffer.backend = backend
@@ -352,9 +364,51 @@ def test_active_rank_mask_uses_registered_mooncake_backend(monkeypatch) -> None:
     fake_ep = types.ModuleType("mooncake.ep")
     fake_ep.get_active_ranks = lambda group: torch.tensor([1, 0])
     monkeypatch.setitem(sys.modules, "mooncake.ep", fake_ep)
-    monkeypatch.setattr(dist, "get_backend", lambda group: "mooncake")
+    monkeypatch.setattr(dist, "get_backend", lambda group: backend_name)
     synchronized_devices = []
     monkeypatch.setattr(torch.cuda, "synchronize", synchronized_devices.append)
 
     assert buffer._active_ranks_mask() == [1, 0]
     assert synchronized_devices == [3]
+
+
+@pytest.mark.parametrize("backend_name", ["gloo", "nccl"])
+def test_non_mooncake_group_uses_full_membership(monkeypatch, backend_name) -> None:
+    buffer = object.__new__(ElasticBuffer)
+    buffer.backend = object()
+    buffer.num_ranks = 2
+    monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
+    # No native EP/PG helper is available for these process-group backends.
+    monkeypatch.setitem(sys.modules, "mooncake.ep", types.ModuleType("mooncake.ep"))
+    assert buffer._active_ranks_mask() == [1, 1]
+
+
+@pytest.mark.parametrize(
+    ("backend_name", "device"),
+    [("gloo", "cpu"), ("mooncake-cpu", "cpu"), ("mooncake", "cuda"), ("nccl", "cuda")],
+)
+def test_bootstrap_collective_device(monkeypatch, backend_name, device) -> None:
+    monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
+    assert _bootstrap_collective_device(object()) == device
+
+
+@pytest.mark.parametrize("backend_name", ["gloo", "mooncake-cpu"])
+def test_nccl_unique_id_exchange_uses_cpu_metadata(monkeypatch, backend_name) -> None:
+    buffer = object.__new__(ElasticBuffer)
+    buffer.group = object()
+    buffer.rank_idx = 0
+    expected_id = list(range(buffer._NCCL_UNIQUE_ID_WORDS))
+    fake_ep = types.SimpleNamespace(create_nccl_unique_id=lambda: expected_id)
+    monkeypatch.setattr(dist, "get_backend", lambda _: backend_name)
+    monkeypatch.setattr(dist, "get_global_rank", lambda group, rank: 0)
+    broadcasts = []
+
+    def fake_broadcast(tensor, src, group) -> None:
+        assert group is buffer.group
+        assert src == 0
+        assert tensor.device.type == "cpu"
+        broadcasts.append(tensor.tolist())
+
+    monkeypatch.setattr(dist, "broadcast", fake_broadcast)
+    assert buffer._exchange_nccl_unique_id(fake_ep) == expected_id
+    assert broadcasts == [[0], expected_id]
