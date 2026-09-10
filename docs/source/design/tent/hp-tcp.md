@@ -9,8 +9,11 @@ scheduling.
 ## Architecture
 
 Each worker owns one `asio::io_context` and one thread. Each peer has a
-configured number of persistent lanes, and request IDs distribute operations
-across them. A stable hash of peer and lane selects the owner; socket state
+configured number of persistent lanes. A separate sequence for each peer
+rotates operations across them, so interleaved traffic to other peers cannot
+pin a peer to one lane. Each sequence starts at that peer's first request ID
+to preserve its initial lane choice. Request IDs remain globally unique.
+A stable hash of peer and lane selects the owner; socket state
 never moves between workers, and operations on a lane are FIFO. ASIO provides
 the event queue; process-wide task and byte admission limits bound all accepted
 work, including callbacks waiting in that queue.
