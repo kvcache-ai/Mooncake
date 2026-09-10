@@ -16,30 +16,21 @@
 
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <map>
 #include <set>
-#include <stdexcept>
 #include <thread>
+
+#include "tent/common/config_parser.h"
+#include "tent/runtime/admission_queue.h"
 
 namespace mooncake {
 namespace tent {
 namespace {
 
 using Values = std::map<std::string, json>;
-using Code = ConfigDiagnosticCode;
-enum class Kind { kBool, kString, kUnsigned, kRpcInteger, kNumber };
 
-struct Rule {
-    std::string path;
-    Kind kind;
-    json default_value;
-    uint64_t maximum{0};
-    uint64_t minimum{0};
-};
-
-// Unknown consumers may distinguish integer/float representations. JSON's
-// operator== considers 1 and 1.0 equal, including inside arrays/objects.
+// Unknown consumers may distinguish integer/float representations, including
+// inside arrays. JSON's operator== alone considers 1 and 1.0 equal.
 bool sameValue(const json& lhs, const json& rhs) {
     if (lhs.type() != rhs.type()) return false;
     if (!lhs.is_structured()) return lhs == rhs;
@@ -57,263 +48,221 @@ constexpr std::string_view kTransports[] = {
     "io_uring",     "nvlink", "mnnvl", "gds",  "ascend_direct",
     "sunrise_link", "tpu",    "mpcomm"};
 
-// Defaults/ranges follow construct(), getRpcServer{Port,Threads}FromConfig(),
-// QueueLimits, and the shared failover defaults introduced by #3934. Keep these
-// checks outside the legacy loader: it intentionally defaults on type errors.
-std::vector<Rule> rules() {
-    constexpr auto size_max = std::numeric_limits<size_t>::max();
-    std::vector<Rule> result = {
-        {"rpc_server_hostname", Kind::kString, ""},
-        {"rpc_server_port", Kind::kRpcInteger, 0, 65535},
-        {"rpc_server_threads", Kind::kRpcInteger, 1, 1024, 1},
-        {"merge_requests", Kind::kBool, true},
-        {"max_failover_attempts", Kind::kUnsigned, kDefaultMaxFailoverAttempts,
-         std::numeric_limits<int>::max()},
-        {"enable_auto_failover_on_poll", Kind::kBool,
-         kDefaultAutoFailoverOnPoll},
-        {"enable_progress_worker", Kind::kBool, false},
-        {"enable_runtime_queue", Kind::kBool, false},
-        {"runtime_queue/max_outstanding_owners", Kind::kUnsigned, 1024,
-         size_max},
-        {"runtime_queue/max_outstanding_bytes", Kind::kUnsigned, 1ULL << 30,
-         size_max},
-        {"runtime_queue/staging_owner_reserve", Kind::kUnsigned, 0, size_max},
-        {"runtime_queue/staging_byte_reserve", Kind::kUnsigned, 0, size_max},
-        {"runtime_queue/deadline_aware", Kind::kBool, false},
-        // Nonpositive MLU thresholds disable degradation; do not reject them.
-        {"runtime_queue/mlu_local_threshold", Kind::kNumber, 0.0},
-        {"runtime_queue/promotion_slack_ns", Kind::kUnsigned, 0,
-         std::numeric_limits<uint64_t>::max()},
-        {"runtime_queue/max_dispatch_owners", Kind::kUnsigned, 64, size_max},
-        {"runtime_queue/max_dispatch_bytes", Kind::kUnsigned, 64ULL << 20,
-         size_max},
-        {"runtime_queue/progress_fallback_interval_us", Kind::kUnsigned, 50000,
-         static_cast<uint64_t>(std::numeric_limits<int64_t>::max())},
-    };
-    for (auto transport : kTransports) {
-        result.push_back({"transports/" + std::string(transport) + "/enable",
-                          Kind::kBool, nullptr});
-    }
-    return result;
-}
-
-void diagnose(std::vector<ConfigDiagnostic>& out, Code code,
-              const std::string& path, const std::string& message) {
-    if (out.size() >= 64) return;
-    if (out.size() == 63) {
-        out.push_back({Code::kAnalysisLimitExceeded, "$",
-                       "Configuration diagnostic limit exceeded"});
-        return;
-    }
-    // Do not echo oversized or control-character-containing paths.
+Status invalidConfig(const std::string& path, const std::string& message) {
+    // Never echo an oversized/control-character-containing path or raw values.
     const bool safe =
         path.size() <= 256 &&
         std::none_of(path.begin(), path.end(),
                      [](unsigned char c) { return c < 32 || c == 127; });
-    out.push_back({code, safe ? path : "$", message});
+    return Status::InvalidArgument((safe ? path : "$") + ": " + message +
+                                   LOC_MARK);
 }
 
 struct Analysis {
+    // Raw entries point into this owned document. Keep containers until their
+    // consumers check them, so an object cannot hide a mistyped scalar field.
+    json document;
+    std::map<std::string, const json*> inputs;
     Values values;
-    std::vector<ConfigDiagnostic>& diagnostics;
-    const std::vector<Rule>& fields;
+    std::set<std::string> validated_paths;
     size_t visited{0};
 
-    const Rule* rule(const std::string& path) const {
-        auto it = std::find_if(fields.begin(), fields.end(),
-                               [&](const Rule& r) { return r.path == path; });
-        return it == fields.end() ? nullptr : &*it;
-    }
-
-    bool container(const std::string& path) const {
-        return std::any_of(fields.begin(), fields.end(), [&](const Rule& r) {
-            return r.path.starts_with(path + "/");
-        });
-    }
-
-    void collect(const json& node, const std::string& path, size_t depth = 0) {
+    Status collect(const json& node, const std::string& path,
+                   size_t depth = 0) {
         if (++visited > 4096 || depth > 32 || path.size() > 256 ||
             std::count(path.begin(), path.end(), '/') >= 32) {
-            diagnose(diagnostics, Code::kAnalysisLimitExceeded, "$",
-                     "Configuration path, depth or value limit exceeded");
-            return;
+            return invalidConfig(
+                "$", "Configuration path, depth or value limit exceeded");
         }
-        const bool group = path.empty() || container(path);
-        if (group && node.is_null()) return;  // legacy missing/default values
-        if (group && !node.is_object()) {
-            diagnose(diagnostics,
-                     path.empty() ? Code::kInvalidRoot : Code::kInvalidType,
-                     path.empty() ? "$" : path, "Expected a JSON object");
-            return;
-        }
-        if (!rule(path) && node.is_object() && (group || !node.empty())) {
-            for (auto it = node.begin(); it != node.end(); ++it) {
-                if (visited > 4096) break;
-                const auto& key = it.key();
-                const auto child = path.empty() ? key : path + "/" + key;
-                // Config only supports slash-containing flat aliases at root.
-                if (key.empty() || key.front() == '/' || key.back() == '/' ||
-                    key.find("//") != std::string::npos ||
-                    (!path.empty() && key.find('/') != std::string::npos) ||
-                    std::any_of(key.begin(), key.end(), [](unsigned char c) {
-                        return c < 32 || c == 127;
-                    })) {
-                    diagnose(diagnostics, Code::kInvalidPath, child,
-                             "Invalid canonical configuration path");
-                    continue;
-                }
-                // HP TCP consumes the entire transport object through its
-                // dedicated parser, not Config::get() on individual flat keys.
-                if (path.empty() && key == "transports/hp_tcp/enable") {
-                    diagnose(
-                        diagnostics, Code::kInvalidPath, child,
-                        "HP TCP enable must be inside its transport object");
-                    continue;
-                }
-                // A flat object alias does not expose its children through
-                // Config::get("a/b/c"); reject that misleading representation.
-                if (key.find('/') != std::string::npos && it->is_object() &&
-                    !rule(child)) {
-                    diagnose(diagnostics, Code::kInvalidPath, child,
-                             "Flat object aliases are not supported");
-                    continue;
-                }
-                collect(*it, child, depth + 1);
+        if (!path.empty()) {
+            auto [it, inserted] = inputs.emplace(path, &node);
+            if (!inserted && !sameValue(*it->second, node)) {
+                return invalidConfig(
+                    path, "Conflicting flat and nested configuration values");
             }
-            return;
         }
-        auto [it, inserted] = values.emplace(path, node);
-        if (!inserted && !sameValue(it->second, node)) {
-            diagnose(diagnostics, Code::kAmbiguousPath, path,
-                     "Conflicting flat and nested configuration values");
+        if (!node.is_object()) return Status::OK();
+        for (auto it = node.begin(); it != node.end(); ++it) {
+            const auto& key = it.key();
+            const auto child = path.empty() ? key : path + "/" + key;
+            if (key.empty() || key.front() == '/' || key.back() == '/' ||
+                key.find("//") != std::string::npos ||
+                (!path.empty() && key.find('/') != std::string::npos) ||
+                std::any_of(key.begin(), key.end(), [](unsigned char c) {
+                    return c < 32 || c == 127;
+                })) {
+                return invalidConfig(child,
+                                     "Invalid canonical configuration path");
+            }
+            if (path.empty() && key == "transports/hp_tcp/enable") {
+                return invalidConfig(
+                    child, "HP TCP enable must be inside its transport object");
+            }
+            if (key.find('/') != std::string::npos && it->is_object()) {
+                return invalidConfig(child,
+                                     "Flat object aliases are not supported");
+            }
+            CHECK_STATUS(collect(*it, child, depth + 1));
         }
+        return Status::OK();
     }
 
-    void validate(const Rule& field) {
-        if (field.path == "transports/hp_tcp/enable" &&
-            values.contains(field.path) && values.at(field.path).is_null()) {
-            diagnose(diagnostics, Code::kInvalidType, field.path,
-                     "HP TCP enable must be a boolean");
-            return;
-        }
-        auto& value =
-            values.try_emplace(field.path, field.default_value).first->second;
-        if (value.is_null()) value = field.default_value;
-        if (value.is_null()) return;  // unspecified transport enable flag
-        const auto range_message = [&] {
-            return "Expected an integer in range [" +
-                   std::to_string(field.minimum) + ", " +
-                   std::to_string(field.maximum) + "]";
-        };
-        if (field.kind == Kind::kRpcInteger && value.is_string()) {
-            try {
-                const auto text = value.get<std::string>();
-                size_t consumed = 0;
-                const auto number = std::stoll(text, &consumed);
-                if (consumed == text.size()) value = number;
-            } catch (const std::out_of_range&) {
-                diagnose(diagnostics, Code::kOutOfRange, field.path,
-                         range_message());
-                return;
-            } catch (const std::invalid_argument&) {
-            }
-        }
-        bool type_ok = false;
-        const char* type_message = "Expected an integer";
-        switch (field.kind) {
-            case Kind::kBool:
-                type_ok = value.is_boolean();
-                type_message = "Expected a boolean";
-                break;
-            case Kind::kString:
-                type_ok = value.is_string();
-                type_message = "Expected a string";
-                break;
-            case Kind::kNumber:
-                type_ok = value.is_number();
-                type_message = "Expected a finite number";
-                break;
-            case Kind::kUnsigned:
-                type_ok = value.is_number_integer();
-                break;
-            case Kind::kRpcInteger:
-                type_ok = value.is_number_integer();
-                type_message = "Expected an integer or integer string";
-                break;
-        }
-        if (!type_ok) {
-            diagnose(diagnostics, Code::kInvalidType, field.path, type_message);
-            return;
-        }
-        if (field.kind == Kind::kUnsigned || field.kind == Kind::kRpcInteger) {
-            // Check signedness/range BEFORE narrowing. json::get<T>() alone can
-            // silently wrap an oversized unsigned or a negative integer.
-            if ((!value.is_number_unsigned() && value.get<int64_t>() < 0) ||
-                value.get<uint64_t>() < field.minimum ||
-                value.get<uint64_t>() > field.maximum) {
-                diagnose(diagnostics, Code::kOutOfRange, field.path,
-                         range_message());
-                return;
-            }
-            value = value.get<uint64_t>();
-        } else if (field.kind == Kind::kNumber) {
-            if (!std::isfinite(value.get<double>())) {
-                diagnose(diagnostics, Code::kOutOfRange, field.path,
-                         "Expected a finite number");
-            }
-            value = value.get<double>();
-        }
+    const json* input(const std::string& path) const {
+        const auto it = inputs.find(path);
+        return it == inputs.end() ? nullptr : it->second;
     }
 
-    void run(const Config& config, const ConfigValidationContext& context) {
-        // One frozen capture, not a sequence of individually locked get()s.
-        collect(config.toJson(), "");
-        if (!diagnostics.empty()) return;
-        for (const auto& field : fields) validate(field);
-        if (!diagnostics.empty()) return;
-        auto flag = [&](const std::string& path, bool fallback) {
-            const auto& value = values.at(path);
-            return value.is_null() ? fallback : value.get<bool>();
-        };
-        // construct() uses an explicit TCP enable to choose RPC thread
-        // defaults, whereas loadTransports() defaults TCP itself to enabled.
-        // Preserve both.
-        if (!config.contains("rpc_server_threads")) {
-            values["rpc_server_threads"] =
-                flag("transports/tcp/enable", false)
-                    ? std::min(8U, std::max(4U, context.hardware_concurrency))
-                    : 1U;
+    Status readGroup(const std::string& path) {
+        const auto* node = input(path);
+        if (node && !node->is_null() && !node->is_object()) {
+            return invalidConfig(path, "Expected a JSON object");
         }
-        if (flag("enable_runtime_queue", false)) {
-            values["enable_progress_worker"] = true;
-            for (const auto* path : {"runtime_queue/max_dispatch_owners",
-                                     "runtime_queue/max_dispatch_bytes"}) {
-                if (values.at(path).get<uint64_t>() == 0) {
-                    diagnose(diagnostics, Code::kCrossFieldConstraint, path,
-                             "Enabled runtime queue requires a nonzero "
-                             "dispatch window");
-                }
+        inputs.erase(path);
+        return Status::OK();
+    }
+
+    void remember(const std::string& path, json value) {
+        inputs.erase(path);
+        values[path] = std::move(value);
+        validated_paths.insert(path);
+    }
+
+    Status readBool(const std::string& path, bool fallback,
+                    bool* output = nullptr) {
+        bool value = fallback;
+        const auto* node = input(path);
+        if (node && !node->is_null()) {
+            CHECK_STATUS(parseBoolConfigValue(*node, path, &value));
+        }
+        remember(path, value);
+        if (output) *output = value;
+        return Status::OK();
+    }
+
+    Status readString(const std::string& path, const std::string& fallback) {
+        const auto* node = input(path);
+        if (node && !node->is_null() && !node->is_string()) {
+            return invalidConfig(path, "must be a string");
+        }
+        remember(path, node && !node->is_null() ? *node : json(fallback));
+        return Status::OK();
+    }
+
+    template <typename T>
+    Status readUnsigned(const std::string& path, T fallback,
+                        T* output = nullptr) {
+        T value = fallback;
+        const auto* node = input(path);
+        if (node && !node->is_null()) {
+            CHECK_STATUS(parseUnsignedConfigValue(*node, path, &value));
+        }
+        remember(path, static_cast<uint64_t>(value));
+        if (output) *output = value;
+        return Status::OK();
+    }
+
+    Status readNumber(const std::string& path, double fallback) {
+        double value = fallback;
+        const auto* node = input(path);
+        if (node && !node->is_null()) {
+            if (!node->is_number() || !std::isfinite(node->get<double>())) {
+                return invalidConfig(path, "must be a finite number");
+            }
+            value = node->get<double>();
+        }
+        remember(path, value);
+        return Status::OK();
+    }
+
+    bool flag(const std::string& path, bool fallback) const {
+        const auto& value = values.at(path);
+        return value.is_null() ? fallback : value.get<bool>();
+    }
+
+    Status readTransportFlags() {
+        CHECK_STATUS(readGroup("transports"));
+        for (auto transport : kTransports) {
+            const auto group = "transports/" + std::string(transport);
+            CHECK_STATUS(readGroup(group));
+            const auto path = group + "/enable";
+            const auto* node = input(path);
+            if (node && (!node->is_null() || transport == "hp_tcp")) {
+                bool enabled = false;
+                CHECK_STATUS(parseBoolConfigValue(*node, path, &enabled));
+                remember(path, enabled);
+            } else {
+                // Preserve absence: device/environment selection is outside
+                // preflight. HP TCP's parser rejects explicit null.
+                remember(path, nullptr);
             }
         }
-        // Same two invariants as admission_queue.cpp::validateLimits(). Zero
-        // total capacity and negative MLU (disabled) remain legal.
-        for (const auto& [reserve, total] :
-             {std::pair{"runtime_queue/staging_owner_reserve",
-                        "runtime_queue/max_outstanding_owners"},
-              std::pair{"runtime_queue/staging_byte_reserve",
-                        "runtime_queue/max_outstanding_bytes"}}) {
-            if (values.at(reserve).get<uint64_t>() >
-                values.at(total).get<uint64_t>()) {
-                diagnose(diagnostics, Code::kCrossFieldConstraint, reserve,
-                         "Staging reserve exceeds total queue capacity");
-            }
-        }
-        if (flag("transports/hp_tcp/enable", false) &&
-            flag("transports/tcp/enable", true)) {
-            diagnose(diagnostics, Code::kCrossFieldConstraint,
-                     "transports/hp_tcp/enable",
-                     "HP TCP and TCP cannot both be enabled");
-        }
+        return Status::OK();
+    }
+
+    Status validateRpc(const Config& config,
+                       const ConfigValidationContext& context) {
+        CHECK_STATUS(readString("rpc_server_hostname", ""));
+        uint16_t port = 0;
+        CHECK_STATUS(getRpcServerPortFromConfig(config, 0, port));
+        remember("rpc_server_port", static_cast<uint64_t>(port));
+        const size_t fallback =
+            getDefaultRpcServerThreads(config, context.hardware_concurrency);
+        size_t threads = 0;
+        CHECK_STATUS(getRpcServerThreadsFromConfig(config, fallback, threads));
+        remember("rpc_server_threads", static_cast<uint64_t>(threads));
+        return Status::OK();
+    }
+
+    Status validateRuntime() {
+        CHECK_STATUS(readBool("merge_requests", true));
+        CHECK_STATUS(
+            readUnsigned("max_failover_attempts", kDefaultMaxFailoverAttempts));
+        CHECK_STATUS(readBool("enable_auto_failover_on_poll",
+                              kDefaultAutoFailoverOnPoll));
+        CHECK_STATUS(readBool("enable_progress_worker", false));
+        CHECK_STATUS(readBool("enable_runtime_queue", false));
+        CHECK_STATUS(readGroup("runtime_queue"));
+
+        QueueLimits limits;
+        CHECK_STATUS(readUnsigned("runtime_queue/max_outstanding_owners",
+                                  size_t{1024},
+                                  &limits.max_outstanding_owners));
+        CHECK_STATUS(readUnsigned("runtime_queue/max_outstanding_bytes",
+                                  size_t{1} << 30,
+                                  &limits.max_outstanding_bytes));
+        CHECK_STATUS(readUnsigned("runtime_queue/staging_owner_reserve",
+                                  limits.staging_owner_reserve,
+                                  &limits.staging_owner_reserve));
+        CHECK_STATUS(readUnsigned("runtime_queue/staging_byte_reserve",
+                                  limits.staging_byte_reserve,
+                                  &limits.staging_byte_reserve));
+        CHECK_STATUS(
+            readBool("runtime_queue/deadline_aware", limits.deadline_aware));
+        // Nonpositive thresholds disable degradation and remain valid.
+        CHECK_STATUS(readNumber("runtime_queue/mlu_local_threshold",
+                                limits.mlu_local_threshold));
+        CHECK_STATUS(readUnsigned("runtime_queue/promotion_slack_ns",
+                                  limits.promotion_slack_ns));
+        CHECK_STATUS(limits.validate());
+
+        size_t max_owners = 0, max_bytes = 0;
+        CHECK_STATUS(readUnsigned("runtime_queue/max_dispatch_owners",
+                                  size_t{64}, &max_owners));
+        CHECK_STATUS(readUnsigned("runtime_queue/max_dispatch_bytes",
+                                  size_t{64} << 20, &max_bytes));
+        CHECK_STATUS(readUnsigned("runtime_queue/progress_fallback_interval_us",
+                                  int64_t{50000}));
+        const bool enabled = flag("enable_runtime_queue", false);
+        CHECK_STATUS(
+            validateRuntimeQueueDispatchWindow(enabled, max_owners, max_bytes));
+        if (enabled) values["enable_progress_worker"] = true;
+        return Status::OK();
+    }
+
+    Status validateTransports(const ConfigValidationContext& context) {
+        CHECK_STATUS(validateTcpTransportSelection(
+            flag("transports/tcp/enable", true),
+            flag("transports/hp_tcp/enable", false)));
         for (auto transport : kTransports) {
             const auto path =
                 "transports/" + std::string(transport) + "/enable";
@@ -321,10 +270,31 @@ struct Analysis {
                 std::find(context.compiled_transports.begin(),
                           context.compiled_transports.end(),
                           transport) == context.compiled_transports.end()) {
-                diagnose(diagnostics, Code::kBackendUnavailable, path,
-                         "Explicitly enabled transport is not compiled in");
+                return invalidConfig(
+                    path, "explicitly enabled transport is not compiled in");
             }
         }
+        return Status::OK();
+    }
+
+    Status run(const Config& config, const ConfigValidationContext& context) {
+        document = config.toJson();
+        if (!document.is_null() && !document.is_object()) {
+            return invalidConfig("$",
+                                 "Configuration root must be a JSON object");
+        }
+        CHECK_STATUS(collect(document, ""));
+        CHECK_STATUS(readTransportFlags());
+        CHECK_STATUS(validateRpc(config, context));
+        CHECK_STATUS(validateRuntime());
+        CHECK_STATUS(validateTransports(context));
+        // Covered fields were consumed above. Keep unknown leaves and empty
+        // objects for structural diff; traversed containers are not changes.
+        for (const auto& [path, node] : inputs) {
+            if (!node->is_object() || node->empty())
+                values.emplace(path, *node);
+        }
+        return Status::OK();
     }
 };
 
@@ -333,8 +303,7 @@ struct Analysis {
 ConfigValidationContext currentConfigValidationContext() {
     ConfigValidationContext context{{"tcp", "hp_tcp", "shm"},
                                     std::thread::hardware_concurrency()};
-    // Match compile guards in runtime/transport_loader.cpp, without probing
-    // topology or initializing process-wide platform/metrics singletons.
+    // Match runtime/transport_loader.cpp without probing devices or services.
 #ifdef USE_RDMA
     context.compiled_transports.push_back("rdma");
 #endif
@@ -372,11 +341,9 @@ ConfigChangePlan planTentConfigChange(const Config& current,
     ConfigChangePlan plan;
     plan.current = current.freeze();
     plan.candidate = &current == &candidate ? plan.current : candidate.freeze();
-    const auto fields = rules();
-    Analysis before{{}, plan.current_diagnostics, fields};
-    Analysis after{{}, plan.candidate_diagnostics, fields};
-    before.run(*plan.current, context);
-    after.run(*plan.candidate, context);
+    Analysis before, after;
+    plan.current_status = before.run(*plan.current, context);
+    plan.candidate_status = after.run(*plan.candidate, context);
     if (!plan.valid()) return plan;
     std::set<std::string> paths;
     for (const auto& [path, value] : before.values) paths.insert(path);
@@ -388,13 +355,13 @@ ConfigChangePlan planTentConfigChange(const Config& current,
             sameValue(old->second, next->second))
             continue;
         if (plan.changes.size() == 128) {
-            diagnose(plan.candidate_diagnostics, Code::kAnalysisLimitExceeded,
-                     "$", "Configuration change limit exceeded");
+            plan.candidate_status =
+                invalidConfig("$", "Configuration change limit exceeded");
             plan.changes.clear();
             return plan;
         }
         auto disposition = ConfigChangeDisposition::kUnsupported;
-        if (after.rule(path)) {
+        if (after.validated_paths.contains(path)) {
             disposition =
                 classifyConfigPath(path) == ConfigLifecycle::kRuntimeCandidate
                     ? ConfigChangeDisposition::kRuntimeCandidate

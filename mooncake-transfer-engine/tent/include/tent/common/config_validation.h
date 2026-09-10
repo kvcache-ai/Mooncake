@@ -16,6 +16,7 @@
 #define TENT_CONFIG_VALIDATION_H
 
 #include "tent/common/config_lifecycle.h"
+#include "tent/common/status.h"
 
 namespace mooncake {
 namespace tent {
@@ -46,17 +47,18 @@ struct ConfigChangePlan {
     // afterwards cannot change this plan. No generation is assigned/published.
     std::shared_ptr<const Config> current;
     std::shared_ptr<const Config> candidate;
-    std::vector<ConfigDiagnostic> current_diagnostics;
-    std::vector<ConfigDiagnostic> candidate_diagnostics;
+    // Follow the existing Status convention: InvalidArgument identifying the
+    // field/component and reason. Each input reports its first validation
+    // error.
+    Status current_status;
+    Status candidate_status;
     // Sorted by canonical path; values are omitted to avoid disclosing secrets.
     std::vector<ConfigChange> changes;
 
     // Only validates the documented scope below. Unchanged out-of-scope fields
     // are carried through; changes to them are always kUnsupported.
     // A valid plan is not permission to apply: inspect every disposition.
-    bool valid() const {
-        return current_diagnostics.empty() && candidate_diagnostics.empty();
-    }
+    bool valid() const { return current_status.ok() && candidate_status.ok(); }
 };
 
 // Side-effect-free analysis of two COMPLETE, already-loaded configurations,
@@ -75,9 +77,9 @@ struct ConfigChangePlan {
 // Conflicting flat/nested aliases are rejected, not resolved silently. Unknown
 // fields use structural comparison. HP TCP enable must be nested because its
 // dedicated parser consumes a transport object. Flat object aliases are outside
-// this initial scope. Diagnostics never include input values.
-// Limits: 32 path levels, 256 bytes/path, 4096 visited nodes, 64
-// diagnostics/input and 128 changes; exceeding a limit makes the plan invalid
+// this initial scope. Error messages never include input values.
+// Limits: 32 path levels, 256 bytes/path, 4096 visited nodes, one Status per
+// input and 128 changes; exceeding a limit makes the plan invalid
 // (never a partial plan). kRuntimeCandidate is eligibility only, NOT a promise
 // of live application.
 ConfigChangePlan planTentConfigChange(

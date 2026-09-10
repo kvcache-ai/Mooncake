@@ -18,24 +18,20 @@
 #include <limits>
 
 #include "tent/common/config_validation.h"
+#include "tent/common/config_parser.h"
 
 namespace mooncake {
 namespace tent {
 namespace {
 
-using Code = ConfigDiagnosticCode;
 using Disposition = ConfigChangeDisposition;
 
 const ConfigValidationContext kCpuBuild{{"tcp", "hp_tcp", "shm"}, 16};
 
-bool hasDiagnostic(const std::vector<ConfigDiagnostic>& diagnostics, Code code,
-                   const std::string& path) {
-    return std::any_of(diagnostics.begin(), diagnostics.end(),
-                       [&](const ConfigDiagnostic& d) {
-                           return d.code == code && d.path == path;
-                       });
+bool hasError(const Status& status, const std::string& reason) {
+    return status.IsInvalidArgument() &&
+           status.message().find(reason) != std::string_view::npos;
 }
-
 bool hasChange(const ConfigChangePlan& plan, const std::string& path,
                Disposition disposition) {
     return std::any_of(
@@ -161,8 +157,8 @@ TEST(ConfigValidationTest,
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
     EXPECT_FALSE(plan.valid());
     EXPECT_TRUE(plan.changes.empty());
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics, Code::kAmbiguousPath,
-                              "runtime_queue/max_dispatch_owners"));
+    EXPECT_TRUE(
+        hasError(plan.candidate_status, "runtime_queue/max_dispatch_owners"));
     EXPECT_EQ(candidate.get("runtime_queue/max_dispatch_owners", 0), 8);
 }
 
@@ -178,14 +174,13 @@ TEST(ConfigValidationTest, RejectsMalformedPathsAndRootShapes) {
         auto plan = planTentConfigChange(current, candidate, kCpuBuild);
         EXPECT_FALSE(plan.valid()) << input;
         EXPECT_TRUE(plan.changes.empty());
-        EXPECT_EQ(plan.candidate_diagnostics.front().code, Code::kInvalidPath);
+        EXPECT_TRUE(plan.candidate_status.IsInvalidArgument());
     }
     for (const auto* input : {"[]", "123", "true", "\"object\""}) {
         Config candidate;
         ASSERT_TRUE(candidate.load(input).ok());
         auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-        EXPECT_TRUE(
-            hasDiagnostic(plan.candidate_diagnostics, Code::kInvalidRoot, "$"));
+        EXPECT_TRUE(hasError(plan.candidate_status, "$"));
     }
 }
 
@@ -200,8 +195,7 @@ TEST(ConfigValidationTest, NullAndEmptyGroupsUseDefaults) {
     EXPECT_TRUE(plan.changes.empty());
     candidate.set("runtime_queue", 123);
     plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics, Code::kInvalidType,
-                              "runtime_queue"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "runtime_queue"));
 }
 
 TEST(ConfigValidationTest, RejectsWrongTypesInsteadOfSilentlyDefaulting) {
@@ -225,8 +219,7 @@ TEST(ConfigValidationTest, RejectsWrongTypesInsteadOfSilentlyDefaulting) {
         candidate.set(path, value);
         auto plan = planTentConfigChange(current, candidate, kCpuBuild);
         EXPECT_FALSE(plan.valid()) << path;
-        EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                                  Code::kInvalidType, path));
+        EXPECT_TRUE(hasError(plan.candidate_status, path));
     }
 }
 
@@ -249,9 +242,7 @@ TEST(ConfigValidationTest, ChecksRangeBeforeIntegerNarrowing) {
         Config candidate;
         candidate.set(path, value);
         auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-        EXPECT_TRUE(
-            hasDiagnostic(plan.candidate_diagnostics, Code::kOutOfRange, path))
-            << path;
+        EXPECT_TRUE(hasError(plan.candidate_status, path)) << path;
     }
     Config candidate;
     candidate.set("rpc_server_port", 65535);
@@ -269,8 +260,8 @@ TEST(ConfigValidationTest, PreservesNonFiniteNumbersForValidation) {
         Config candidate;
         candidate.set("runtime_queue/mlu_local_threshold", value);
         auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-        EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics, Code::kOutOfRange,
-                                  "runtime_queue/mlu_local_threshold"));
+        EXPECT_TRUE(hasError(plan.candidate_status,
+                             "runtime_queue/mlu_local_threshold"));
     }
 }
 
@@ -282,13 +273,10 @@ TEST(ConfigValidationTest, QueueReservesCannotExceedCapacity) {
     candidate.set("runtime_queue/staging_byte_reserve", 2);
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
     EXPECT_FALSE(plan.valid());
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kCrossFieldConstraint,
-                              "runtime_queue/staging_owner_reserve"));
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kCrossFieldConstraint,
-                              "runtime_queue/staging_byte_reserve"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "staging owner reserve"));
     candidate.set("runtime_queue/staging_owner_reserve", 1);
+    plan = planTentConfigChange(current, candidate, kCpuBuild);
+    EXPECT_TRUE(hasError(plan.candidate_status, "staging byte reserve"));
     candidate.set("runtime_queue/staging_byte_reserve", 1);
     EXPECT_TRUE(planTentConfigChange(current, candidate, kCpuBuild).valid());
 }
@@ -303,13 +291,12 @@ TEST(ConfigValidationTest, QueueDispatchWindowsAreRequiredOnlyWhenEnabled) {
     EXPECT_TRUE(planTentConfigChange(current, candidate, kCpuBuild).valid());
     candidate.set("enable_runtime_queue", true);
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_EQ(plan.candidate_diagnostics.size(), 2);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kCrossFieldConstraint,
-                              "runtime_queue/max_dispatch_owners"));
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kCrossFieldConstraint,
-                              "runtime_queue/max_dispatch_bytes"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "dispatch window"));
+    candidate.set("runtime_queue/max_dispatch_owners", 1);
+    plan = planTentConfigChange(current, candidate, kCpuBuild);
+    EXPECT_TRUE(hasError(plan.candidate_status, "dispatch window"));
+    candidate.set("runtime_queue/max_dispatch_bytes", 1);
+    EXPECT_TRUE(planTentConfigChange(current, candidate, kCpuBuild).valid());
 }
 
 TEST(ConfigValidationTest, AccountsForDerivedProgressWorkerAndRpcDefaults) {
@@ -357,9 +344,7 @@ TEST(ConfigValidationTest, BuildCapabilitiesApplyOnlyToExplicitEnables) {
     EXPECT_TRUE(planTentConfigChange(current, candidate, kCpuBuild).valid());
     candidate.set("transports/rdma/enable", true);
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kBackendUnavailable,
-                              "transports/rdma/enable"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "transports/rdma/enable"));
     auto rdma_build = kCpuBuild;
     rdma_build.compiled_transports.push_back("rdma");
     plan = planTentConfigChange(current, candidate, rdma_build);
@@ -378,9 +363,8 @@ TEST(ConfigValidationTest, HpTcpRequiresExplicitlyDisablingDefaultTcp) {
     Config current, candidate;
     candidate.set("transports/hp_tcp/enable", true);
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kCrossFieldConstraint,
-                              "transports/hp_tcp/enable"));
+    EXPECT_TRUE(hasError(plan.candidate_status,
+                         "tcp and hp_tcp cannot be enabled together"));
     candidate.set("transports/tcp/enable", false);
     EXPECT_TRUE(planTentConfigChange(current, candidate, kCpuBuild).valid());
     ASSERT_TRUE(candidate
@@ -388,13 +372,11 @@ TEST(ConfigValidationTest, HpTcpRequiresExplicitlyDisablingDefaultTcp) {
       "transports/tcp/enable":false})")
                     .ok());
     plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics, Code::kInvalidPath,
-                              "transports/hp_tcp/enable"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "transports/hp_tcp/enable"));
     ASSERT_TRUE(
         candidate.load(R"({"transports":{"hp_tcp":{"enable":null}}})").ok());
     plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics, Code::kInvalidType,
-                              "transports/hp_tcp/enable"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "transports/hp_tcp/enable"));
 }
 
 TEST(ConfigValidationTest, OwnsInputsAndDoesNotChangePublishedSnapshots) {
@@ -427,22 +409,58 @@ TEST(ConfigValidationTest, ReportsInvalidCurrentInputSeparately) {
     current.set("rpc_server_port", -1);
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
     EXPECT_FALSE(plan.valid());
-    EXPECT_FALSE(plan.current_diagnostics.empty());
-    EXPECT_TRUE(plan.candidate_diagnostics.empty());
+    EXPECT_FALSE(plan.current_status.ok());
+    EXPECT_TRUE(plan.candidate_status.ok());
     EXPECT_TRUE(plan.changes.empty());
+}
+
+TEST(ConfigValidationTest, ReportsBothInputErrorsUsingStatus) {
+    Config current, candidate;
+    current.set("rpc_server_port", -1);
+    candidate.set("merge_requests", "invalid-boolean");
+    const auto plan = planTentConfigChange(current, candidate, kCpuBuild);
+    EXPECT_TRUE(hasError(plan.current_status, "rpc_server_port"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "merge_requests"));
+    EXPECT_FALSE(plan.valid());
+    EXPECT_TRUE(plan.changes.empty());
+    EXPECT_NE(plan.candidate_status.ToString().find("InvalidArgument"),
+              std::string::npos);
+}
+
+TEST(ConfigValidationTest, SharedRpcParsersPreserveOutputOnInvalidInput) {
+    Config config;
+    uint16_t port = 1234;
+    size_t threads = 4;
+    config.set("rpc_server_port", std::numeric_limits<uint64_t>::max());
+    config.set("rpc_server_threads", "1025");
+    EXPECT_TRUE(
+        getRpcServerPortFromConfig(config, 0, port).IsInvalidArgument());
+    EXPECT_TRUE(
+        getRpcServerThreadsFromConfig(config, 1, threads).IsInvalidArgument());
+    EXPECT_EQ(port, 1234);
+    EXPECT_EQ(threads, 4);
+
+    config.set("rpc_server_port", "  +65535");
+    config.set("rpc_server_threads", "1024");
+    ASSERT_TRUE(getRpcServerPortFromConfig(config, 0, port).ok());
+    ASSERT_TRUE(getRpcServerThreadsFromConfig(config, 1, threads).ok());
+    EXPECT_EQ(port, 65535);
+    EXPECT_EQ(threads, 1024);
+    config.set("rpc_server_threads", nullptr);
+    ASSERT_TRUE(getRpcServerThreadsFromConfig(config, 8, threads).ok());
+    EXPECT_EQ(threads, 8);
 }
 
 TEST(ConfigValidationTest, BoundsOutputAndNeverIncludesValues) {
     Config current, candidate;
     candidate.set("rpc_server_port", "SECRET_TOKEN_VALUE");
     auto plan = planTentConfigChange(current, candidate, kCpuBuild);
-    for (const auto& d : plan.candidate_diagnostics) {
-        EXPECT_EQ(d.message.find("SECRET_TOKEN_VALUE"), std::string::npos);
-    }
+    EXPECT_TRUE(plan.candidate_status.IsInvalidArgument());
+    EXPECT_EQ(plan.candidate_status.message().find("SECRET_TOKEN_VALUE"),
+              std::string_view::npos);
     candidate.set(std::string(257, 'x'), true);
     plan = planTentConfigChange(current, candidate, kCpuBuild);
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kAnalysisLimitExceeded, "$"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "$"));
 
     Config many_changes;
     for (size_t i = 0; i < 129; ++i)
@@ -450,8 +468,7 @@ TEST(ConfigValidationTest, BoundsOutputAndNeverIncludesValues) {
     plan = planTentConfigChange(current, many_changes, kCpuBuild);
     EXPECT_FALSE(plan.valid());
     EXPECT_TRUE(plan.changes.empty());
-    EXPECT_TRUE(hasDiagnostic(plan.candidate_diagnostics,
-                              Code::kAnalysisLimitExceeded, "$"));
+    EXPECT_TRUE(hasError(plan.candidate_status, "$"));
 
     json bad_paths = json::object();
     for (size_t i = 0; i < 100; ++i) bad_paths["/key" + std::to_string(i)] = i;
@@ -459,9 +476,10 @@ TEST(ConfigValidationTest, BoundsOutputAndNeverIncludesValues) {
     ASSERT_TRUE(many_errors.load(bad_paths.dump()).ok());
     plan = planTentConfigChange(current, many_errors, kCpuBuild);
     EXPECT_FALSE(plan.valid());
-    EXPECT_EQ(plan.candidate_diagnostics.size(), 64);
-    EXPECT_EQ(plan.candidate_diagnostics.back().code,
-              Code::kAnalysisLimitExceeded);
+    EXPECT_TRUE(hasError(plan.candidate_status,
+                         "Invalid canonical configuration path"));
+    EXPECT_LT(plan.candidate_status.message().size(), 1024);
+    EXPECT_TRUE(plan.changes.empty());
 }
 
 TEST(ConfigValidationTest, LimitsDepthAndInputCount) {
@@ -475,8 +493,7 @@ TEST(ConfigValidationTest, LimitsDepthAndInputCount) {
         many_values.set("key" + std::to_string(i), i);
     auto plan = planTentConfigChange(many_values, many_values, kCpuBuild);
     EXPECT_FALSE(plan.valid());
-    EXPECT_TRUE(hasDiagnostic(plan.current_diagnostics,
-                              Code::kAnalysisLimitExceeded, "$"));
+    EXPECT_TRUE(hasError(plan.current_status, "$"));
 }
 
 }  // namespace
