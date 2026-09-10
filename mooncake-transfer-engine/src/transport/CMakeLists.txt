@@ -41,6 +41,9 @@ if(USE_CXL)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
 
+add_subdirectory(shm_transport)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
+
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
 elseif(USE_ASCEND)

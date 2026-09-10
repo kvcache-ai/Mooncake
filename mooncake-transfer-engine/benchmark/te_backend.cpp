@@ -125,6 +125,54 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
     return numa_alloc_onnode(size, buffer_id);
 }
 
+static int parseIndex(const std::string& loc) {
+    auto pos = loc.find(':');
+    if (pos == std::string::npos || pos + 1 >= loc.size()) {
+        throw std::invalid_argument("Invalid loc format: " + loc);
+    }
+    return std::stoi(loc.substr(pos + 1));
+}
+
+// POSIX shm mmap does not place pages. Bind the mapping before first touch
+// so DRAM buffers land on the same node as numa_alloc_onnode(size, node).
+static void bindShmBufferToNode(void* addr, size_t size, int node) {
+    if (!addr || size == 0) return;
+    if (numa_available() < 0) {
+        LOG(WARNING)
+            << "tebench: NUMA unavailable; shm buffer not bound to cpu:"
+            << node;
+        return;
+    }
+    if (node < 0 || node >= numa_num_configured_nodes()) {
+        LOG(WARNING) << "tebench: invalid NUMA node " << node;
+        return;
+    }
+    numa_tonode_memory(addr, size, node);
+    const long page_size = sysconf(_SC_PAGESIZE);
+    auto* p = static_cast<char*>(addr);
+    if (page_size > 0) {
+        for (size_t off = 0; off < size; off += static_cast<size_t>(page_size))
+            p[off] = 0;
+    }
+    p[size - 1] = 0;
+}
+
+static std::string cpuLocationFromPages(void* addr, int expected_node) {
+    const auto expected = "cpu:" + std::to_string(expected_node);
+    const auto entries = getMemoryLocation(addr, 1, true);
+    if (entries.empty() || entries[0].location.rfind("cpu:", 0) != 0) {
+        LOG(WARNING) << "tebench: could not resolve NUMA node for shm buffer, "
+                        "registering as "
+                     << expected;
+        return expected;
+    }
+    if (parseIndex(entries[0].location) != expected_node) {
+        LOG(WARNING) << "tebench: shm buffer intended for " << expected
+                     << " is on " << entries[0].location;
+    }
+    return entries[0].location;
+}
+
 static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) && defined(USE_MNNVL)
     CUmemGenericAllocationHandle handle;
@@ -153,16 +201,36 @@ static void freeMemoryPool(void* addr, size_t size) {
 
 int TEBenchRunner::allocateBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
+    const bool use_shm = engine_->getTransport("shm") != nullptr;
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
         pinned_buffer_list_.resize(num_buffers, nullptr);
+        shm_backed_.assign(num_buffers, 0);
         for (int i = 0; i < num_buffers; ++i) {
-            auto location = "cpu:" + std::to_string(i);
-            pinned_buffer_list_[i] =
-                allocateMemoryPool(total_buffer_size, i, false);
+            std::string location = "cpu:" + std::to_string(i);
+            if (use_shm) {
+                pinned_buffer_list_[i] =
+                    engine_->allocateSharedMemory(total_buffer_size);
+                shm_backed_[i] = 1;
+                if (pinned_buffer_list_[i]) {
+                    bindShmBufferToNode(pinned_buffer_list_[i],
+                                        total_buffer_size, i);
+                    location = cpuLocationFromPages(pinned_buffer_list_[i], i);
+                }
+            } else {
+                pinned_buffer_list_[i] =
+                    allocateMemoryPool(total_buffer_size, i, false);
+            }
             if (!pinned_buffer_list_[i]) return -1;
-            engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                         total_buffer_size, location);
+            if (engine_->registerLocalMemory(pinned_buffer_list_[i],
+                                             total_buffer_size, location)) {
+                LOG(ERROR) << "Failed to register DRAM buffer " << i;
+                return -1;
+            }
+        }
+        if (use_shm) {
+            LOG(INFO) << "tebench: DRAM buffers allocated from POSIX shm "
+                         "and bound to NUMA nodes";
         }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (XferBenchConfig::seg_type == "VRAM") {
@@ -197,10 +265,15 @@ int TEBenchRunner::freeBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         if (!pinned_buffer_list_[i]) continue;
-        engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
-        freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+        if (i < shm_backed_.size() && shm_backed_[i]) {
+            engine_->freeSharedMemory(pinned_buffer_list_[i]);
+        } else {
+            engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
+            freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+        }
     }
     pinned_buffer_list_.clear();
+    shm_backed_.clear();
     return 0;
 }
 
@@ -208,8 +281,9 @@ TEBenchRunner::TEBenchRunner() {
     signal(SIGINT, signalHandlerV0);
     signal(SIGTERM, signalHandlerV0);
     // Disable auto-discovery when an explicit non-RDMA xport is requested
-    // (e.g. flagcx) so we can installTransport() ourselves below.
-    bool auto_disc = XferBenchConfig::xport_type != "flagcx";
+    // (e.g. flagcx, shm) so we can installTransport() ourselves below.
+    bool auto_disc = XferBenchConfig::xport_type != "flagcx" &&
+                     XferBenchConfig::xport_type != "shm";
     engine_ = std::make_unique<mooncake::TransferEngine>(auto_disc);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"
@@ -232,6 +306,13 @@ TEBenchRunner::TEBenchRunner() {
         auto* xp = engine_->installTransport("flagcx", nullptr);
         LOG_ASSERT(xp) << "installTransport(flagcx) failed";
         LOG(INFO) << "tebench: FlagCX transport installed";
+    }
+    if (XferBenchConfig::xport_type == "shm") {
+        if (!engine_->getTransport("shm")) {
+            auto* shm = engine_->installTransport("shm", nullptr);
+            LOG_ASSERT(shm) << "installTransport(shm) failed";
+        }
+        LOG(INFO) << "tebench: SHM transport installed";
     }
     init_ok_ = (allocateBuffers() == 0);
     if (!init_ok_) {
@@ -311,14 +392,6 @@ int TEBenchRunner::stopInitiator() {
         thread.join();
     }
     return 0;
-}
-
-static int parseIndex(const std::string& loc) {
-    auto pos = loc.find(':');
-    if (pos == std::string::npos || pos + 1 >= loc.size()) {
-        throw std::invalid_argument("Invalid loc format: " + loc);
-    }
-    return std::stoi(loc.substr(pos + 1));
 }
 
 void TEBenchRunner::pinThread(int thread_id) {
