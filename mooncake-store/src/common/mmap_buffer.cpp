@@ -1,25 +1,11 @@
-#include "utils.h"
-#include "random.h"
+#include "common/client_buffer_allocation.h"
+
+#include "../config/mmap_arena_config.h"
 #include "mmap_arena.h"
-#include "common.h"
 
-#include "ascii_string.h"
-#include "bool_parser.h"
-#include "environ.h"
-
-#include <gflags/gflags.h>
-#include <glog/logging.h>
-#include <ifaddrs.h>
-#include <net/if.h>
-#include <netdb.h>
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <unistd.h>
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
-#include <csignal>
-#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -27,68 +13,18 @@
 #include <numaif.h>
 #include <sys/mman.h>
 #include <thread>
+#include <unistd.h>
 #include <vector>
-// Feature flag to enable/disable arena allocator. Disabled by default so the
-// library does not pre-map a large pool unless the operator opts in via gflag
-// or an explicit MC_MMAP_ARENA_POOL_SIZE environment override.
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
 DEFINE_bool(use_mmap_arena_allocator, false,
             "Enable the lock-free mmap arena allocator for mmap buffers");
-
-// Arena pool size (default 8GiB when explicitly enabled without an env
-// override).
 DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
               "Arena allocator pool size in bytes");
-#include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
-
-bool isPortAvailable(int port) {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return false;
-
-    int opt = 1;
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    bool available = (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0);
-    close(sock);
-    return available;
-}
-
-// AutoPortBinder implementation
-AutoPortBinder::AutoPortBinder(int min_port, int max_port)
-    : socket_fd_(-1), port_(-1) {
-    for (int attempt = 0; attempt < 20; ++attempt) {
-        int port = randomUniform(min_port, max_port);
-
-        socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-        if (socket_fd_ < 0) continue;
-
-        sockaddr_in addr = {};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port);
-
-        if (bind(socket_fd_, (sockaddr *)&addr, sizeof(addr)) == 0) {
-            port_ = port;
-            break;
-        } else {
-            close(socket_fd_);
-            socket_fd_ = -1;
-        }
-    }
-}
-
-AutoPortBinder::~AutoPortBinder() {
-    if (socket_fd_ >= 0) {
-        close(socket_fd_);
-    }
-}
 
 // Global arena instance (lazy initialization)
 static std::unique_ptr<MmapArena> g_mmap_arena;
@@ -97,64 +33,17 @@ static std::atomic<uint64_t> g_arena_oom_fallback_count{0};
 static std::atomic<uint64_t> g_arena_noop_free_count{0};
 
 static void initializeGlobalArena() {
-    const std::string env_pool_size =
-        Environ::GetString("MC_MMAP_ARENA_POOL_SIZE", "");
-    // Allow env var to override the gflag (useful when loaded as .so from
-    // Python). An explicit pool-size env var is also treated as an opt-in,
-    // because pybind11 users cannot easily pass gflags.
-    const std::string env_disable =
-        Environ::GetString("MC_DISABLE_MMAP_ARENA", "");
-    const std::optional<bool> disable_override = TryParseBool(env_disable);
-    if (!env_disable.empty() && !disable_override.has_value()) {
-        LOG(WARNING) << "Ignoring invalid MC_DISABLE_MMAP_ARENA='"
-                     << env_disable
-                     << "'; accepted values: 1/0, true/false, yes/no, on/off";
-    }
-    const bool arena_requested =
-        FLAGS_use_mmap_arena_allocator || !env_pool_size.empty();
-    const bool arena_disabled = disable_override.value_or(false);
-    if (!arena_requested || arena_disabled) {
-        LOG(INFO) << "=== ARENA ALLOCATOR DISABLED ===";
-        if (arena_disabled) {
-            LOG(INFO) << "MC_DISABLE_MMAP_ARENA=" << env_disable
-                      << " forces direct mmap()";
-        } else {
-            LOG(INFO) << "Arena is opt-in; set --use_mmap_arena_allocator or "
-                         "MC_MMAP_ARENA_POOL_SIZE to enable it";
-        }
+    const MmapArenaConfig config = MmapArenaConfig::FromEnvironment(
+        FLAGS_use_mmap_arena_allocator, FLAGS_mmap_arena_pool_size);
+    if (!config.enabled) {
         return;
     }
 
     g_mmap_arena = std::make_unique<MmapArena>();
-    // Keep arena init consistent with the direct-mmap path:
-    //   MC_STORE_USE_HUGEPAGE=1  -> strict: hard fail if hugepage mmap fails
-    //   unset                    -> permissive: try hugepages, retry on
-    //                               regular pages if HugeTLB is unavailable
-    // This preserves both pre-existing contracts and avoids surprising
-    // operators with a silent hugepage downgrade.
-    const bool hugepages_explicitly_requested =
-        get_hugepage_size_from_env() > 0;
-
-    // Allow env var override since gflags cannot be set from Python (pybind11).
-    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
-    // etc.
-    uint64_t arena_pool_size = FLAGS_mmap_arena_pool_size;
-    if (!env_pool_size.empty()) {
-        const uint64_t parsed = string_to_byte_size(env_pool_size);
-        if (parsed > 0) {
-            arena_pool_size = parsed;
-            LOG(INFO) << "MC_MMAP_ARENA_POOL_SIZE override: " << env_pool_size
-                      << " (" << byte_size_to_string(arena_pool_size) << ")";
-        } else {
-            LOG(WARNING) << "Invalid MC_MMAP_ARENA_POOL_SIZE='" << env_pool_size
-                         << "', using default "
-                         << byte_size_to_string(FLAGS_mmap_arena_pool_size);
-        }
-    }
 
     bool success =
-        g_mmap_arena->initialize(arena_pool_size, MmapArena::kMinAlignment,
-                                 !hugepages_explicitly_requested);
+        g_mmap_arena->initialize(config.pool_size, MmapArena::kMinAlignment,
+                                 !config.hugepages_explicitly_requested);
 
     if (success) {
         auto stats = g_mmap_arena->getStats();
@@ -165,7 +54,7 @@ static void initializeGlobalArena() {
     } else {
         LOG(ERROR) << "=== ARENA INITIALIZATION FAILED ===";
         LOG(ERROR) << "Falling back to traditional mmap()";
-        if (hugepages_explicitly_requested) {
+        if (config.hugepages_explicitly_requested) {
             LOG(ERROR) << "MC_STORE_USE_HUGEPAGE is set, so the fallback path "
                           "will also require hugepages";
         }
@@ -475,192 +364,4 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
-tl::expected<std::string, int> httpGet(const std::string &url) {
-    coro_http::coro_http_client client;
-    auto res = client.get(url);
-    if (res.status == 200) {
-        return std::string(res.resp_body);
-    }
-    return tl::unexpected(res.status);
-}
-
-tl::expected<std::string, std::string> GetInterfaceIPv4Address(
-    const std::string &interface_name) {
-    if (interface_name.empty()) {
-        return tl::unexpected(std::string("network interface name is empty"));
-    }
-
-    struct ifaddrs *interfaces = nullptr;
-    if (getifaddrs(&interfaces) != 0) {
-        return tl::unexpected("getifaddrs failed: " +
-                              std::string(strerror(errno)));
-    }
-    std::unique_ptr<struct ifaddrs, decltype(&freeifaddrs)> interface_guard(
-        interfaces, freeifaddrs);
-
-    bool found_interface = false;
-    bool interface_is_up = false;
-    for (auto *current = interfaces; current != nullptr;
-         current = current->ifa_next) {
-        if (current->ifa_name == nullptr ||
-            interface_name != current->ifa_name) {
-            continue;
-        }
-
-        found_interface = true;
-        if ((current->ifa_flags & IFF_UP) == 0) {
-            continue;
-        }
-        interface_is_up = true;
-
-        if (current->ifa_addr == nullptr ||
-            current->ifa_addr->sa_family != AF_INET) {
-            continue;
-        }
-
-        char host[NI_MAXHOST] = {};
-        auto *ipv4_addr = reinterpret_cast<sockaddr_in *>(current->ifa_addr);
-        if (getnameinfo(reinterpret_cast<sockaddr *>(ipv4_addr),
-                        sizeof(*ipv4_addr), host, sizeof(host), nullptr, 0,
-                        NI_NUMERICHOST) == 0) {
-            return std::string(host);
-        }
-    }
-
-    if (!found_interface) {
-        return tl::unexpected("network interface '" + interface_name +
-                              "' was not found");
-    }
-    if (!interface_is_up) {
-        return tl::unexpected("network interface '" + interface_name +
-                              "' is down");
-    }
-    return tl::unexpected("network interface '" + interface_name +
-                          "' has no IPv4 address");
-}
-
-int getFreeTcpPort() {
-    int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) return -1;
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = htons(0);
-    if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-        ::close(sock);
-        return -1;
-    }
-    socklen_t len = sizeof(addr);
-    if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) != 0) {
-        ::close(sock);
-        return -1;
-    }
-    int port = ntohs(addr.sin_port);
-    ::close(sock);
-    return port;
-}
-
-std::vector<int> getFreeTcpPorts(int count) {
-    std::vector<int> ports;
-    std::vector<int> sockets;
-    ports.reserve(count);
-    sockets.reserve(count);
-
-    for (int i = 0; i < count; ++i) {
-        int sock = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) break;
-        sockaddr_in addr{};
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = htons(0);
-        if (::bind(sock, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) !=
-            0) {
-            ::close(sock);
-            break;
-        }
-        socklen_t len = sizeof(addr);
-        if (::getsockname(sock, reinterpret_cast<sockaddr *>(&addr), &len) !=
-            0) {
-            ::close(sock);
-            break;
-        }
-        ports.push_back(ntohs(addr.sin_port));
-        sockets.push_back(sock);
-    }
-
-    for (int sock : sockets) {
-        ::close(sock);
-    }
-    return ports;
-}
-
-int64_t time_gen() {
-    return std::chrono::duration_cast<std::chrono::seconds>(
-               std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-static bool IsUsableMooncakeHostId(std::string_view host_id) {
-    return !host_id.empty() &&
-           !AsciiCaseInsensitiveEquals(host_id, "localhost") &&
-           host_id != "127.0.0.1" && host_id != "0.0.0.0" && host_id != "::1" &&
-           host_id != "[::1]" && host_id != "::" && host_id != "[::]";
-}
-
-static std::string NormalizeMooncakeHostId(std::string_view value) {
-    const std::string hostname(TrimAsciiWhitespace(value));
-    const std::string host_id = (hostname == "::1" || hostname == "::")
-                                    ? hostname
-                                    : std::string(TrimAsciiWhitespace(
-                                          getHostNameWithoutPort(hostname)));
-    return IsUsableMooncakeHostId(host_id) ? host_id : "";
-}
-
-std::string ResolveMooncakeHostId(const std::string &local_hostname) {
-    const std::string configured_host_id(
-        TrimAsciiWhitespace(Environ::GetString("MOONCAKE_HOST_ID", "")));
-    if (!configured_host_id.empty()) {
-        return NormalizeMooncakeHostId(configured_host_id);
-    }
-
-    return NormalizeMooncakeHostId(local_hostname);
-}
-
-static std::string SanitizeKey(const std::string &key) {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        const bool invalid =
-            c == '\0' || kInvalidChars.find(c) != std::string_view::npos;
-        sanitized_key.push_back(invalid ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string ResolvePathFromKey(const std::string &key,
-                               const std::string &root_dir,
-                               const std::string &fsdir) {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
-    // Safely construct path using std::filesystem
-    namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
-
-    // Combine directory path with sanitized filename
-    fs::path full_path =
-        fs::path(root_dir) / fsdir / dir_path / SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
-}
 }  // namespace mooncake

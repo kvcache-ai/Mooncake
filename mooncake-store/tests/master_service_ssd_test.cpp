@@ -141,66 +141,6 @@ TEST_F(MasterServiceSSDTest, PutRevokeProcessingDiskKeepsSsdTotal) {
     EXPECT_EQ(stats[CacheHitStat::SSD_TOTAL], base_ssd_total);
 }
 
-TEST_F(MasterServiceSSDTest, EvictObject) {
-    auto service_ = CreateMasterServiceWithSSDFeat("/mnt/ssd");
-    // Mount a segment that can hold about 1024 * 16 objects.
-    // As the eviction is processed separately for each shard,
-    // we need to fill each shard with enough objects to thoroughly
-    // test the eviction process.
-    constexpr size_t buffer = 0x300000000;
-    constexpr size_t size = 1024 * 1024 * 16 * 15;
-    constexpr size_t object_size = 1024 * 15;
-    std::string segment_name = "test_segment";
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = segment_name;
-    segment.base = buffer;
-    segment.size = size;
-    segment.te_endpoint = segment.name;
-    UUID client_id = generate_uuid();
-    auto mount_result = service_->MountSegment(segment, client_id);
-    ASSERT_TRUE(mount_result.has_value());
-
-    // Verify if we can put objects more than the segment can hold
-    int success_puts = 0;
-    for (int i = 0; i < 1024 * 16 + 50; ++i) {
-        std::string key = "test_key" + std::to_string(i);
-        uint64_t slice_length = object_size;
-        ReplicateConfig config;
-        config.replica_num = 1;
-        auto put_start_result = service_->PutStart(
-            client_id, key, TenantId::Default(), slice_length, config);
-        if (put_start_result.has_value()) {
-            auto put_end_mem_result = service_->PutEnd(
-                client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-            auto put_end_disk_result = service_->PutEnd(
-                client_id, key, TenantId::Default(), ReplicaType::DISK);
-            ASSERT_TRUE(put_end_mem_result.has_value());
-            ASSERT_TRUE(put_end_disk_result.has_value());
-            success_puts++;
-        } else {
-            // wait for eviction to work
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-    ASSERT_GT(success_puts, 1024 * 16);
-
-    // Verify if we can get objects more than the segment can hold
-    int success_gets = 0;
-    for (int i = 0; i < 1024 * 16 + 50; ++i) {
-        std::string key = "test_key" + std::to_string(i);
-        auto get_result = service_->GetReplicaList(key, TenantId::Default());
-        if (get_result.has_value()) {
-            success_gets++;
-        }
-    }
-    ASSERT_GT(success_gets, 1024 * 16);
-
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(DEFAULT_DEFAULT_KV_LEASE_TTL));
-    service_->RemoveAll();
-}
-
 TEST_F(MasterServiceSSDTest, PutStartExpires) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();

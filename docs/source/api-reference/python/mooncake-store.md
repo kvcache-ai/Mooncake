@@ -277,6 +277,33 @@ Zero-copy operations require registered memory buffers. For repeated reads and w
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
 
+For a contiguous PyTorch CPU tensor, including one created with
+`pin_memory=True`, pass its address and **byte size**:
+
+```python
+import torch
+
+# Assumes store.setup(...) or store.setup_dummy(...) has already succeeded.
+tensor = torch.empty(1024, dtype=torch.float32, pin_memory=True)
+tensor.fill_(1)
+ptr = tensor.data_ptr()
+size = tensor.numel() * tensor.element_size()
+assert store.register_buffer(ptr, size) == 0
+try:
+    assert store.put_from("pinned_tensor", ptr, size) == 0
+    tensor.zero_()
+    assert store.get_into("pinned_tensor", ptr, size) == size
+    assert torch.all(tensor == 1)
+finally:
+    assert store.unregister_buffer(ptr) == 0
+```
+
+Keep the tensor alive and its storage unchanged until all operations finish and
+the buffer is unregistered. `put_from` stores raw bytes; it does not serialize
+the tensor's shape or dtype. With `setup_dummy()`, external CPU buffers use
+shared-memory staging and read copy-back across the RealClient process boundary.
+Pinned allocation alone does not make this path zero-copy.
+
 #### unregister_buffer()
 Unregister a previously registered buffer.
 

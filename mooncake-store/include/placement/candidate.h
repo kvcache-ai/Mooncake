@@ -8,28 +8,33 @@
 
 namespace mooncake {
 
-enum class PlacementTargetKind {
+enum class AllocationCandidateKind {
     NATIVE = 0,
     CXL,
 };
 
-inline constexpr size_t kPlacementTargetKindCount =
-    static_cast<size_t>(PlacementTargetKind::CXL) + 1;
+inline constexpr size_t kAllocationCandidateKindCount =
+    static_cast<size_t>(AllocationCandidateKind::CXL) + 1;
 
 // A stable allocation endpoint published to PlacementIndex. RegionResource
-// owns the target and must outlive every placement reference to it.
-class PlacementTarget {
+// owns the candidate and must outlive every placement reference to it.
+class AllocationCandidate {
    public:
-    virtual ~PlacementTarget() = default;
+    virtual ~AllocationCandidate() = default;
 
     virtual std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const = 0;
-    virtual PlacementTargetKind Kind() const noexcept = 0;
+    virtual AllocationCandidateKind Kind() const noexcept = 0;
 
     size_t Capacity() const { return allocator_->capacity(); }
     size_t Used() const { return allocator_->size(); }
 
+    const std::shared_ptr<BufferAllocatorBase>& allocator_handle()
+        const noexcept {
+        return allocator_;
+    }
+
    protected:
-    explicit PlacementTarget(std::shared_ptr<BufferAllocatorBase> allocator)
+    explicit AllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator)
         : allocator_(std::move(allocator)) {}
 
     BufferAllocatorBase& allocator() const noexcept { return *allocator_; }

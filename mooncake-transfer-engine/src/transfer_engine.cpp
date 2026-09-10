@@ -165,6 +165,14 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
     return impl_->unregisterLocalMemory(addr, update_metadata);
 }
 
+void* TransferEngine::allocateSharedMemory(size_t length) {
+    return impl_->allocateSharedMemory(length);
+}
+
+int TransferEngine::freeSharedMemory(void* addr) {
+    return impl_->freeSharedMemory(addr);
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     return impl_->submitTransfer(batch_id, entries);
@@ -586,6 +594,20 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
         return (int)status.code();
     } else
         return impl_->unregisterLocalMemory(addr, update_metadata);
+}
+
+void* TransferEngine::allocateSharedMemory(size_t length) {
+    if (use_tent_) {
+        LOG(WARNING) << "allocateSharedMemory is classic TE only; use TENT "
+                        "allocateLocalMemory with SHM enabled";
+        return nullptr;
+    }
+    return impl_->allocateSharedMemory(length);
+}
+
+int TransferEngine::freeSharedMemory(void* addr) {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->freeSharedMemory(addr);
 }
 
 int TransferEngine::registerLocalMemoryBatch(

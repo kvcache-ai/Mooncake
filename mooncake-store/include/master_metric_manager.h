@@ -11,6 +11,8 @@
 #include "ylt/metric/gauge.hpp"
 #include "ylt/metric/histogram.hpp"
 
+#include "client_liveness.h"
+
 namespace mooncake {
 
 struct TieredStorageUsageSnapshot;
@@ -136,6 +138,17 @@ class MasterMetricManager {
     void inc_active_clients(int64_t val = 1);
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
+    void client_liveness_record_created();
+    void client_liveness_became_suspected();
+    void client_liveness_recovered();
+    void client_liveness_became_offline();
+    void on_client_liveness_record_removed(ClientLivenessState state);
+    void reset_client_liveness_metrics(int64_t active_records = 0);
+    void inc_client_offboarding_queue_depth(int64_t jobs = 1);
+    void dec_client_offboarding_queue_depth(int64_t jobs = 1);
+    void inc_client_offboarding_retry();
+    void inc_client_offboarding_alert();
+    void observe_client_offboarding_duration_ms(int64_t duration_ms);
 
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);
@@ -578,6 +591,16 @@ class MasterMetricManager {
 
     // Cluster Metrics
     ylt::metric::gauge_t active_clients_;
+    ylt::metric::gauge_t client_liveness_active_clients_;
+    ylt::metric::gauge_t client_liveness_suspected_clients_;
+    ylt::metric::gauge_t client_liveness_offline_clients_;
+    ylt::metric::counter_t client_liveness_suspected_transitions_;
+    ylt::metric::counter_t client_liveness_recoveries_;
+    ylt::metric::counter_t client_liveness_offline_transitions_;
+    ylt::metric::gauge_t pending_client_offboarding_jobs_metric_;
+    ylt::metric::histogram_t client_offboarding_duration_ms_;
+    ylt::metric::counter_t client_offboarding_retries_;
+    ylt::metric::counter_t client_offboarding_alerts_;
 
     // Operation Statistics
     ylt::metric::counter_t put_start_requests_;

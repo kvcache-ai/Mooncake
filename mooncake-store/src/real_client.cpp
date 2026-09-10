@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "common/client_buffer_allocation.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
@@ -25,10 +26,12 @@
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
+#include "config/cxl_segment_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
-#include "utils.h"
+#include "common/network.h"
+#include "common/result.h"
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "device/accelerator_registry.h"
@@ -902,17 +905,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // registration limit split it into balanced chunks; other transports use
     // one segment.
     if (protocol == "cxl") {
-        size_t cxl_dev_size = 0;
-        const char *env = std::getenv("MC_CXL_DEV_SIZE");
-        if (env) {
-            cxl_dev_size =
-                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
-                                              .allow_leading_plus = true})
-                    .value_or(0);
-        } else {
+        const auto cxl_config = CxlSegmentConfig::FromEnvironment();
+        if (!cxl_config.device_size.has_value()) {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
+        const size_t cxl_dev_size = *cxl_config.device_size;
 
         void *ptr = client_->GetBaseAddr();
         LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
@@ -5019,6 +5017,41 @@ RealClient::get_into_ranges_shm_helper(
     const std::map<std::string, CachedQueryResultResponse>
         &cached_query_results,
     int32_t device_id, const UUID &client_id) {
+    return get_into_ranges_shm_helper_impl(
+        dummy_buffers, std::vector<size_t>(dummy_buffers.size()), nullptr,
+        all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        cached_query_results, device_id, client_id);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_staged_shm_helper(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &dummy_buffer_sizes,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
+    int32_t device_id, const UUID &client_id) {
+    return get_into_ranges_shm_helper_impl(
+        dummy_buffers, dummy_buffer_sizes, &dummy_buffer_sizes, all_keys,
+        all_dst_offsets, all_src_offsets, all_sizes, cached_query_results,
+        device_id, client_id);
+}
+
+std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+RealClient::get_into_ranges_shm_helper_impl(
+    const std::vector<uint64_t> &dummy_buffers,
+    const std::vector<size_t> &dummy_buffer_sizes,
+    const std::vector<size_t> *buffer_capacities,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results,
+    int32_t device_id, const UUID &client_id) {
 #ifdef USE_ASCEND_DIRECT
     if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
             device_id)) {
@@ -5041,10 +5074,10 @@ RealClient::get_into_ranges_shm_helper(
             ErrorCode::INVALID_PARAMS);
     }
 
-    std::vector<size_t> capacities;
+    std::vector<size_t> mapped_capacities;
     auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
-        it->second, dummy_buffers, std::vector<size_t>(dummy_buffers.size()),
-        client_id, &capacities);
+        it->second, dummy_buffers, dummy_buffer_sizes, client_id,
+        buffer_capacities == nullptr ? &mapped_capacities : nullptr);
     if (!real_buffers_result) {
         return build_ranged_read_internal_error_results(
             dummy_buffers.size(), all_keys, all_dst_offsets,
@@ -5053,9 +5086,13 @@ RealClient::get_into_ranges_shm_helper(
 
     auto query_result_cache =
         build_query_result_cache_from_cached_results(cached_query_results);
+    const std::vector<size_t> *capacities = &mapped_capacities;
+    if (buffer_capacities != nullptr) {
+        capacities = buffer_capacities;
+    }
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
-        all_sizes, &capacities,
+        all_sizes, capacities,
         query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
@@ -5432,7 +5469,7 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
         return -1;
     }
 
-    if (size == 0) {
+    if (size == 0 && metadata_size == 0) {
         LOG(WARNING) << "Attempting to put empty data for key: " << key;
         return 0;
     }

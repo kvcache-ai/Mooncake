@@ -3,20 +3,21 @@ add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
-    utils.cpp
-    mmap_arena.cpp
+    common/network.cpp
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
-    utils/file_util.cpp)
+    common/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
     config/local_file_snapshot_config.cpp
+    segment_allocator_registration.cpp
+    client_offboarding.cpp
     master_service.cpp
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
@@ -24,6 +25,11 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
+    segment/catalog.cpp
+    segment/pool.cpp
+    segment/pool_mount.cpp
+    segment/pool_write_access.cpp
+    segment/pool_read_access.cpp
     segment.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
@@ -72,13 +78,18 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha_metric_manager.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
-    client_buffer_allocation.cpp
+    common/client_buffer_allocation.cpp
+    mmap_arena.cpp
+    config/mmap_arena_config.cpp
+    common/mmap_buffer.cpp
     client_service.cpp
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
+    config/nvme_kv_connector_config.cpp
+    config/nvme_kv_u32_parser.cpp
     nvme_kv_executor_io_uring.cpp
     nvme_kv_executor_ioctl.cpp
     nvme_kv_executor_util.cpp
@@ -99,7 +110,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/file_storage_config.cpp
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
+    config/cxl_segment_config.cpp
+    config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
+    config/nof_register_config.cpp
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
@@ -168,7 +182,7 @@ if(AWSSDK_FOUND)
   message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
   set(HAVE_AWS_SDK TRUE)
   # Add S3 related source files
-  list(APPEND MOONCAKE_STORE_MASTER_SOURCES utils/s3_helper.cpp)
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES common/s3_helper.cpp)
 else()
   message(STATUS "AWS SDK not found, S3 functionality will be disabled")
   set(HAVE_AWS_SDK FALSE)

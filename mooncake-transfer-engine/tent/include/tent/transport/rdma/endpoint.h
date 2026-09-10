@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "context.h"
+#include "tent/common/concurrent/ticket_lock.h"
 
 namespace mooncake {
 namespace tent {
@@ -32,6 +33,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
         uint64_t padding[7];
     };
 
+    // Not synchronized: every access goes through queue_lock_list_[qp_index]
+    // (submitSlices / acknowledge) or the endpoint write lock (teardown).
     struct BoundedSliceQueue {
         size_t head, tail, capacity, count;
         std::vector<RdmaSlice*> entries;
@@ -187,11 +190,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
    private:
     int setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
-                    std::vector<uint32_t> peer_qp_num_list,
+                    std::vector<uint32_t> peer_qp_num_list, int local_gid_index,
                     std::string* reply_msg = nullptr);
 
     int setupOneQP(int qp_index, const std::string& peer_gid, uint16_t peer_lid,
-                   uint32_t peer_qp_num, std::string* reply_msg = nullptr);
+                   uint32_t peer_qp_num, int local_gid_index,
+                   std::string* reply_msg = nullptr);
 
     // Returns the pool segment owning qp_index, or nullptr when no pools are
     // configured (the default single-pool case). Read-only after construct().
@@ -225,22 +229,23 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     RdmaContext* context_;
     EndPointParams* params_;
     std::string endpoint_name_;
+    // Immutable address generation used to create this endpoint's QPs and
+    // bootstrap descriptors. A context refresh evicts the whole endpoint.
+    RdmaAddressSnapshot local_address_;
 
     std::vector<ibv_qp*> qp_list_;
     // Per-pool QP layout, resolved once in construct() from params_->qp_pools.
     // Empty = default single pool spanning all of qp_list_. Each segment's
     // [begin, begin+num_qp) indexes into qp_list_. Read-only after construct().
     std::vector<QpPoolSegment> qp_pool_segments_;
-    // One queue per data QP. With the default lane layout a queue pair is
-    // posted and polled by a single worker lane. A qp_pools layout with
-    // fewer QPs than lanes folds several lanes onto one queue pair, and
-    // then two lanes can reach the same queue at once: submitSlices and
-    // acknowledge both hold only a read guard, which does not exclude them
-    // from each other, and the queue itself is unsynchronized. That is a
-    // data race in that layout, not a property this code relies on; it
-    // needs a per-QP lock. reset/deconstruct are synchronized by the
-    // endpoint lifecycle lock.
+    // One queue per data QP, in posting order, so acknowledge() can retire
+    // everything up to a completed slice. A qp_pools layout with fewer QPs
+    // than lanes lets several lanes reach one queue under the shared read
+    // guard; queue_lock_list_[i] serializes posting and acknowledging on
+    // QP i, and is uncontended in the default one-lane-per-QP layout.
+    // reset/deconstruct are synchronized by the endpoint lifecycle lock.
     std::vector<BoundedSliceQueue> slice_queue_;
+    TicketLock* queue_lock_list_;
     WrDepthBlock* wr_depth_list_;
     std::atomic<int> inflight_slices_;
     uint32_t padding_[7];

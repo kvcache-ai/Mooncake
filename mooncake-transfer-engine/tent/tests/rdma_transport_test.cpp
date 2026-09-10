@@ -19,11 +19,20 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -55,6 +64,16 @@ class RdmaTransportTestPeer {
         transport.local_buffer_manager_.setTopology(topology);
         transport.params_ = std::make_shared<RdmaParams>();
         transport.conf_ = std::make_shared<Config>();
+    }
+
+    static void bindMetadata(RdmaTransport& transport,
+                             std::shared_ptr<ControlService> metadata) {
+        transport.metadata_ = std::move(metadata);
+    }
+
+    static void bindContexts(RdmaTransport& transport,
+                             RdmaContextSet contexts) {
+        transport.context_set_ = std::move(contexts);
     }
 
     // Runs the monitorThread() 1 Hz reclaim tick without starting any worker
@@ -217,6 +236,18 @@ class RdmaContextTestPeer {
         context.endpoint_store_.reset();
     }
 
+    static void seedAddress(RdmaContext& context,
+                            const std::string& device_name, uint16_t lid,
+                            int gid_index, const ibv_gid& gid,
+                            RdmaContext::DeviceStatus status) {
+        std::lock_guard<std::mutex> guard(context.address_mutex_);
+        context.device_name_ = device_name;
+        context.lid_ = lid;
+        context.gid_index_ = gid_index;
+        context.gid_ = gid;
+        context.status_ = status;
+    }
+
     static void unbindDevice(RdmaContext& context) {
         context.native_context_ = nullptr;
     }
@@ -228,12 +259,32 @@ class RdmaContextTestPeer {
 // it and puts the slice on the queue pair the way submitSlices would.
 class RdmaEndPointTestPeer {
    public:
+    static RdmaAddressSnapshot localAddress(const RdmaEndPoint& endpoint) {
+        return endpoint.local_address_;
+    }
+
     static void pretendPosted(const std::shared_ptr<RdmaEndPoint>& endpoint,
                               int qp_index, RdmaSlice* slice) {
         ASSERT_TRUE(endpoint->reserveQuota(qp_index, 1));
         slice->qp_index = qp_index;
         slice->ep_weak_ptr = endpoint;
+        std::lock_guard<TicketLock> guard(endpoint->queue_lock_list_[qp_index]);
         endpoint->slice_queue_[qp_index].push(slice);
+    }
+    static void markReady(const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        endpoint->status_.store(RdmaEndPoint::EP_READY,
+                                std::memory_order_relaxed);
+    }
+    static bool queueEmpty(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                           int qp_index) {
+        return endpoint->slice_queue_[qp_index].empty();
+    }
+    static int wrDepth(const std::shared_ptr<RdmaEndPoint>& endpoint,
+                       int qp_index) {
+        return endpoint->wr_depth_list_[qp_index].value.load();
+    }
+    static int inflightSlices(const std::shared_ptr<RdmaEndPoint>& endpoint) {
+        return endpoint->inflight_slices_.load();
     }
 };
 
@@ -598,13 +649,18 @@ class RdmaContextEventTest : public ::testing::Test {
     DeviceSelector* selector_ = nullptr;
 };
 
-TEST_F(RdmaContextEventTest, PortErrAndPortActiveFlipAvailability) {
+TEST_F(RdmaContextEventTest,
+       PortActiveKeepsDeviceUnavailableWhenAddressRefreshFails) {
     fire(IBV_EVENT_PORT_ERR, ourPort());
     EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
     EXPECT_LT(selector_->getAggregateEwmaBandwidth(), 0.0);
+
+    // This fixture deliberately has no usable verbs context. PORT_ACTIVE must
+    // not re-admit a NIC whose current address cannot be queried. The success
+    // path is covered by RdmaAddressRefreshEventTest below.
     fire(IBV_EVENT_PORT_ACTIVE, ourPort());
-    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
-    EXPECT_GT(selector_->getAggregateEwmaBandwidth(), 0.0);
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+    EXPECT_LT(selector_->getAggregateEwmaBandwidth(), 0.0);
 }
 
 TEST_F(RdmaContextEventTest, EventsForAnotherPortAreIgnored) {
@@ -651,7 +707,14 @@ struct FakePortVerbs {
     ibv_context native{};      // placeholder handle, never dereferenced
     uint8_t active_speed = 0;  // what ibv_query_port reports
     uint8_t active_width = 0;
+    ibv_port_state state = IBV_PORT_ACTIVE;
+    uint16_t lid = 0;
+    int gid_table_len = 8;
     int query_port_rc = 0;
+    ibv_gid gid{};
+    int expected_gid_index = 3;
+    int query_gid_rc = 0;
+    int query_gid_calls = 0;
     uint64_t speed_100mbps = 0;  // what ibv_query_port_speed reports
     int query_speed_rc = 0;
     int query_speed_calls = 0;
@@ -662,9 +725,24 @@ int fakeQueryPort(ibv_context* context, uint8_t, ibv_port_attr* attr) {
     if (context != &fake_port.native) return EINVAL;
     if (fake_port.query_port_rc) return fake_port.query_port_rc;
     *attr = {};
-    attr->state = IBV_PORT_ACTIVE;
+    attr->state = fake_port.state;
     attr->active_speed = fake_port.active_speed;
     attr->active_width = fake_port.active_width;
+    attr->lid = fake_port.lid;
+    attr->gid_tbl_len = fake_port.gid_table_len;
+    return 0;
+}
+
+int fakeQueryGid(ibv_context* context, uint8_t, int gid_index, ibv_gid* gid) {
+    ++fake_port.query_gid_calls;
+    if (context != &fake_port.native ||
+        gid_index != fake_port.expected_gid_index)
+        return EINVAL;
+    if (fake_port.query_gid_rc) {
+        errno = fake_port.query_gid_rc;
+        return fake_port.query_gid_rc;
+    }
+    *gid = fake_port.gid;
     return 0;
 }
 
@@ -688,9 +766,10 @@ class RdmaContextFakeVerbsTest : public ::testing::Test {
         context_ = std::make_unique<RdmaContext>(transport_);
         auto& verbs = RdmaContextTestPeer::verbs(*context_);
         verbs.ibv_query_port_default = fakeQueryPort;
+        verbs.ibv_query_gid = fakeQueryGid;
         verbs.ibv_query_port_speed = fakeQueryPortSpeed;
-        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native,
-                                        std::make_shared<RdmaParams>());
+        params_ = std::make_shared<RdmaParams>();
+        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native, params_);
     }
 
     void TearDown() override {
@@ -701,6 +780,7 @@ class RdmaContextFakeVerbsTest : public ::testing::Test {
 
     RdmaTransport transport_;
     std::unique_ptr<RdmaContext> context_;
+    std::shared_ptr<RdmaParams> params_;
 };
 
 TEST_F(RdmaContextFakeVerbsTest, EffectiveSpeedPreferredWhenVerbReportsIt) {
@@ -789,11 +869,22 @@ TEST(RdmaContextEventChainTest, PortActiveReseedsOnlyWhenTheSpeedChanged) {
     fake_port = FakePortVerbs{};
     fake_port.active_speed = 128;
     fake_port.active_width = 2;  // 400G
+    fake_port.lid = 1;
+    fake_port.gid.raw[15] = 1;
     auto& verbs = RdmaContextTestPeer::verbs(context);
     verbs.ibv_query_port_default = fakeQueryPort;
+    verbs.ibv_query_gid = fakeQueryGid;
     verbs.ibv_query_port_speed = fakeQueryPortSpeed;
-    RdmaContextTestPeer::bindDevice(context, &fake_port.native,
-                                    std::make_shared<RdmaParams>());
+    auto params = std::make_shared<RdmaParams>();
+    params->device.gid_index = fake_port.expected_gid_index;
+    RdmaContextTestPeer::bindDevice(context, &fake_port.native, params);
+    RdmaContextTestPeer::seedAddress(context, "mc-absent-rnic-1", fake_port.lid,
+                                     fake_port.expected_gid_index,
+                                     fake_port.gid,
+                                     RdmaContext::DEVICE_ENABLED);
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport, metadata);
+    ASSERT_TRUE(transport.setupLocalSegment().ok());
 
     // Pretend init seeded it at 400G and it learned ~45 GB/s since.
     ASSERT_EQ(context.refreshPortAttributes(), 0);
@@ -821,6 +912,235 @@ TEST(RdmaContextEventChainTest, PortActiveReseedsOnlyWhenTheSpeedChanged) {
     EXPECT_TRUE(selector->isDeviceAvailable(kDev));
 
     RdmaContextTestPeer::unbindDevice(context);
+}
+
+// The complete address-refresh chain: a GID_CHANGE event re-queries both
+// address components, publishes them into the local segment descriptor, and
+// leaves the device available. All verbs are fakes, so no RNIC is required.
+class RdmaAddressRefreshEventTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        fake_port = FakePortVerbs{};
+        fake_port.active_speed = 128;
+        fake_port.active_width = 2;
+        fake_port.lid = kNewLid;
+        fake_port.gid.raw[15] = kNewGidByte;
+
+        topology_ = std::make_shared<Topology>();
+        ASSERT_TRUE(topology_
+                        ->parse(R"({"nics":[
+                            {"name":"mc-fake-rnic","type":0,"numa_node":0}]})")
+                        .ok());
+        RdmaTransportTestPeer::bindTopology(transport_, topology_);
+
+        metadata_ = std::make_shared<ControlService>("p2p", "", nullptr);
+        RdmaTransportTestPeer::bindMetadata(transport_, metadata_);
+
+        context_ = std::make_shared<RdmaContext>(transport_);
+        params_ = std::make_shared<RdmaParams>();
+        params_->device.port = kPort;
+        params_->device.gid_index = fake_port.expected_gid_index;
+        auto& verbs = RdmaContextTestPeer::verbs(*context_);
+        verbs.ibv_query_port_default = fakeQueryPort;
+        verbs.ibv_query_gid = fakeQueryGid;
+        verbs.ibv_query_port_speed = fakeQueryPortSpeed;
+        RdmaContextTestPeer::bindDevice(*context_, &fake_port.native, params_);
+
+        ibv_gid old_gid{};
+        old_gid.raw[15] = kOldGidByte;
+        RdmaContextTestPeer::seedAddress(*context_, kDeviceName, kOldLid,
+                                         fake_port.expected_gid_index, old_gid,
+                                         RdmaContext::DEVICE_ENABLED);
+        RdmaTransportTestPeer::bindContexts(transport_, {context_});
+
+        ASSERT_TRUE(
+            metadata_->segmentManager()
+                .updateLocal([&](SegmentDesc& segment) -> Status {
+                    segment.name = "local";
+                    segment.type = SegmentType::Memory;
+                    auto& devices =
+                        std::get<MemorySegmentDesc>(segment.detail).devices;
+                    DeviceDesc device;
+                    device.name = kDeviceName;
+                    device.lid = kOldLid;
+                    device.gid = context_->gid();
+                    devices.push_back(std::move(device));
+                    return Status::OK();
+                })
+                .ok());
+
+        workers_ = RdmaTransportTestPeer::makeWorkers(transport_);
+        selector_ = workers_->getDeviceSelector();
+        ASSERT_NE(selector_, nullptr);
+        ASSERT_TRUE(selector_->isDeviceAvailable(kDev));
+    }
+
+    void TearDown() override {
+        workers_.reset();
+        RdmaTransportTestPeer::bindContexts(transport_, {});
+        RdmaContextTestPeer::unbindDevice(*context_);
+        context_.reset();
+    }
+
+    void fire(ibv_event_type type, int port = kPort) {
+        ibv_async_event event{};
+        event.event_type = type;
+        event.element.port_num = port;
+        RdmaTransportTestPeer::applyContextEvent(*workers_, kDev, *context_,
+                                                 event);
+    }
+
+    DeviceDesc publishedDevice() const {
+        auto local = metadata_->segmentManager().getLocal();
+        auto* device = local ? local->findDevice(kDeviceName) : nullptr;
+        return device ? *device : DeviceDesc{};
+    }
+
+    static constexpr int kDev = 0;
+    static constexpr uint8_t kPort = 1;
+    static constexpr uint16_t kOldLid = 7;
+    static constexpr uint16_t kNewLid = 9;
+    static constexpr uint8_t kOldGidByte = 0x11;
+    static constexpr uint8_t kNewGidByte = 0x22;
+    static constexpr const char* kDeviceName = "mc-fake-rnic";
+
+    RdmaTransport transport_;
+    std::shared_ptr<Topology> topology_;
+    std::shared_ptr<ControlService> metadata_;
+    std::shared_ptr<RdmaContext> context_;
+    std::shared_ptr<RdmaParams> params_;
+    std::unique_ptr<Workers> workers_;
+    DeviceSelector* selector_ = nullptr;
+};
+
+TEST_F(RdmaAddressRefreshEventTest, GidChangeRefreshesPublishedAddress) {
+    fire(IBV_EVENT_GID_CHANGE);
+
+    const auto address = context_->address();
+    EXPECT_EQ(address.lid, kNewLid);
+    EXPECT_EQ(address.gid_index, fake_port.expected_gid_index);
+    EXPECT_EQ(address.gid, "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:22");
+    const auto published = publishedDevice();
+    ASSERT_EQ(published.name, kDeviceName);
+    EXPECT_EQ(published.lid, address.lid);
+    EXPECT_EQ(published.gid, address.gid);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST_F(RdmaAddressRefreshEventTest, LidChangeRefreshesPublishedAddress) {
+    fake_port.gid.raw[15] = kOldGidByte;
+    fire(IBV_EVENT_LID_CHANGE);
+
+    const auto address = context_->address();
+    EXPECT_EQ(address.lid, kNewLid);
+    EXPECT_EQ(address.gid, "00:00:00:00:00:00:00:00:00:00:00:00:00:00:00:11");
+    const auto published = publishedDevice();
+    ASSERT_EQ(published.name, kDeviceName);
+    EXPECT_EQ(published.lid, kNewLid);
+}
+
+TEST_F(RdmaAddressRefreshEventTest, AddressEventForAnotherPortIsIgnored) {
+    const auto before = context_->address();
+
+    fire(IBV_EVENT_GID_CHANGE, kPort + 1);
+
+    const auto after = context_->address();
+    EXPECT_EQ(after.lid, before.lid);
+    EXPECT_EQ(after.gid, before.gid);
+    EXPECT_EQ(fake_port.query_gid_calls, 0);
+}
+
+TEST_F(RdmaAddressRefreshEventTest,
+       NonPausableContextSkipsAddressAndMetadataRefresh) {
+    ibv_gid old_gid{};
+    old_gid.raw[15] = kOldGidByte;
+    RdmaContextTestPeer::seedAddress(*context_, kDeviceName, kOldLid,
+                                     fake_port.expected_gid_index, old_gid,
+                                     RdmaContext::DEVICE_DISABLED);
+    const auto before = context_->address();
+
+    fire(IBV_EVENT_GID_CHANGE);
+
+    EXPECT_EQ(fake_port.query_gid_calls, 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_DISABLED);
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+    const auto after = context_->address();
+    EXPECT_EQ(after.lid, before.lid);
+    EXPECT_EQ(after.gid, before.gid);
+    const auto published = publishedDevice();
+    EXPECT_EQ(published.lid, before.lid);
+    EXPECT_EQ(published.gid, before.gid);
+}
+
+TEST_F(RdmaAddressRefreshEventTest,
+       AddressChangeWhilePortDownKeepsNicUnavailable) {
+    fake_port.state = IBV_PORT_DOWN;
+    const auto before = context_->address();
+
+    fire(IBV_EVENT_GID_CHANGE);
+
+    const auto after = context_->address();
+    EXPECT_EQ(after.lid, before.lid);
+    EXPECT_EQ(after.gid, before.gid);
+    EXPECT_EQ(fake_port.query_gid_calls, 0);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_PAUSED);
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST_F(RdmaAddressRefreshEventTest, RefreshFailureKeepsOldAddressAndPausesNic) {
+    fake_port.query_gid_rc = EIO;
+    const auto before = context_->address();
+
+    fire(IBV_EVENT_GID_CHANGE);
+
+    const auto after = context_->address();
+    EXPECT_EQ(after.lid, before.lid);
+    EXPECT_EQ(after.gid, before.gid);
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_PAUSED);
+    EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+    const auto published = publishedDevice();
+    ASSERT_EQ(published.name, kDeviceName);
+    EXPECT_EQ(published.lid, before.lid);
+    EXPECT_EQ(published.gid, before.gid);
+}
+
+TEST_F(RdmaAddressRefreshEventTest, PortActivePublishesInitiallyMissingNic) {
+    // The port was down during setupLocalSegment(), so this NIC was omitted.
+    // Its hardware address did not change while down; publication is still
+    // required before it can be made selectable.
+    fake_port.lid = kOldLid;
+    fake_port.gid = {};
+    fake_port.gid.raw[15] = kOldGidByte;
+    ASSERT_TRUE(
+        metadata_->segmentManager()
+            .updateLocal([&](SegmentDesc& segment) -> Status {
+                std::get<MemorySegmentDesc>(segment.detail).devices.clear();
+                return Status::OK();
+            })
+            .ok());
+    context_->pause();
+    ASSERT_TRUE(selector_->setDeviceAvailable(kDev, false).ok());
+
+    fire(IBV_EVENT_PORT_ACTIVE);
+
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    const auto published = publishedDevice();
+    ASSERT_EQ(published.name, kDeviceName);
+    EXPECT_EQ(published.lid, kOldLid);
+    EXPECT_EQ(published.gid, context_->address().gid);
+}
+
+TEST_F(RdmaAddressRefreshEventTest, PortActiveRefreshesBeforeReenable) {
+    context_->pause();
+    ASSERT_TRUE(selector_->setDeviceAvailable(kDev, false).ok());
+
+    fire(IBV_EVENT_PORT_ACTIVE);
+
+    EXPECT_EQ(context_->status(), RdmaContext::DEVICE_ENABLED);
+    EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
+    EXPECT_EQ(context_->address().lid, kNewLid);
+    EXPECT_EQ(publishedDevice().gid, context_->address().gid);
 }
 
 // A slice that hits the software timeout turns terminal here, not on the CQ,
@@ -1516,6 +1836,10 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ibv_mr mr{};
     };
     static FakeState fake;
+    // Posting order as the hardware saw it: postSend appends every work
+    // request it is handed, so a poller can replay completions in that order.
+    static std::mutex post_mutex;
+    static std::vector<RdmaSlice*> post_order;
 
     static ibv_cq* createCq(ibv_context*, int, void*, ibv_comp_channel*, int) {
         return &fake.cq;
@@ -1528,10 +1852,25 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
     static int modifyQp(ibv_qp*, ibv_qp_attr*, int) { return 0; }
     static ibv_mr* regMr(ibv_pd*, void*, size_t, int) { return &fake.mr; }
     static int deregMr(ibv_mr*) { return 0; }
+    // ibv_post_send is an inline over qp->context->ops, so a fake context
+    // with this op lets submitSlices run for real against the fake QPs.
+    static int postSend(ibv_qp*, ibv_send_wr* wr, ibv_send_wr** bad_wr) {
+        std::lock_guard<std::mutex> guard(post_mutex);
+        for (auto* w = wr; w; w = w->next)
+            post_order.push_back(reinterpret_cast<RdmaSlice*>(w->wr_id));
+        *bad_wr = nullptr;
+        return 0;
+    }
 
     void SetUp() override {
         fake = FakeState{};
+        {
+            std::lock_guard<std::mutex> guard(post_mutex);
+            post_order.clear();
+        }
         fake.native.num_comp_vectors = 1;
+        fake.native.ops.post_send = postSend;
+        for (auto& qp : fake.qp) qp.context = &fake.native;
 
         auto topology = std::make_shared<Topology>();
         ASSERT_TRUE(topology
@@ -1572,6 +1911,11 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
         ASSERT_EQ(notify_cq_.construct(context_.get(), 4096, 0), 0);
         RdmaContextTestPeer::bindResources(*context_, &fake.pd, {&cq_},
                                            &notify_cq_);
+        ibv_gid local_gid{};
+        local_gid.raw[15] = 0x11;
+        RdmaContextTestPeer::seedAddress(*context_, "mc-absent-rnic-1",
+                                         /*lid=*/7, /*gid_index=*/3, local_gid,
+                                         RdmaContext::DEVICE_ENABLED);
 
         endpoint_ = std::make_shared<RdmaEndPoint>();
         ASSERT_EQ(
@@ -1591,6 +1935,25 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
             RdmaContextTestPeer::unbindResources(*context_);
             RdmaContextTestPeer::unbindDevice(*context_);
         }
+    }
+
+    // A slice with a task behind it, not yet posted anywhere.
+    RdmaSlice* makeSlice() {
+        auto* task = RdmaTaskStorage::Get().allocate();
+        task->num_slices = 1;
+        task->status_word = PENDING;
+        task->first_error = PENDING;
+        task->request.opcode = Request::WRITE;
+        task->ref();  // the batch's reference
+        task->ref();  // the slice's, dropped by updateSliceStatus()
+        auto* slice = RdmaSliceStorage::Get().allocate();
+        slice->task = task;
+        slice->length = kLen;
+        slice->word = PENDING;
+        slice->rail_monitor = nullptr;
+        tasks_.push_back(task);
+        slices_.push_back(slice);
+        return slice;
     }
 
     // A slice charged to the NIC, owned by `lane`, and posted on the shared
@@ -1662,6 +2025,27 @@ class RdmaWorkersSharedQpTest : public ::testing::Test {
 };
 
 RdmaWorkersSharedQpTest::FakeState RdmaWorkersSharedQpTest::fake;
+std::mutex RdmaWorkersSharedQpTest::post_mutex;
+std::vector<RdmaSlice*> RdmaWorkersSharedQpTest::post_order;
+
+TEST_F(RdmaWorkersSharedQpTest, EndpointPinsConstructionAddressGeneration) {
+    const auto endpoint_address =
+        RdmaEndPointTestPeer::localAddress(*endpoint_);
+    ASSERT_EQ(endpoint_address.lid, 7);
+    ASSERT_EQ(endpoint_address.gid_index, 3);
+
+    ibv_gid next_gid{};
+    next_gid.raw[15] = 0x22;
+    RdmaContextTestPeer::seedAddress(*context_, "mc-absent-rnic-1", /*lid=*/9,
+                                     /*gid_index=*/4, next_gid,
+                                     RdmaContext::DEVICE_ENABLED);
+
+    const auto pinned = RdmaEndPointTestPeer::localAddress(*endpoint_);
+    EXPECT_EQ(pinned.lid, endpoint_address.lid);
+    EXPECT_EQ(pinned.gid, endpoint_address.gid);
+    EXPECT_EQ(pinned.gid_index, endpoint_address.gid_index);
+    EXPECT_NE(context_->address().gid, pinned.gid);
+}
 
 TEST_F(RdmaWorkersSharedQpTest, TimeoutSweepGivesTheOtherLaneItsSliceBack) {
     // Lane 1 posted first, so lane 0's timeout sweeps it off the queue pair
@@ -1881,6 +2265,111 @@ TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
     EXPECT_EQ(lane0.inflight_slices.load(), 0);
 }
 
+// A qp_pools layout with fewer queue pairs than lanes has two lanes posting
+// to and acknowledging on one queue pair at once. They share the endpoint's
+// read guard, so the queue pair's slice queue has to serialize them itself:
+// every slice posted is acknowledged exactly once, and the queue and its
+// work-request depth end empty.
+TEST_F(RdmaWorkersSharedQpTest, TwoLanesOnOneQueuePairKeepTheSliceQueueIntact) {
+    constexpr int kSlices = 20000;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> slices;
+    for (int i = 0; i < kSlices; ++i) slices.push_back(makeSlice());
+
+    std::atomic<int> posted{0};
+    std::atomic<int> overflows{0};
+    std::thread poster([&] {
+        for (int i = 0; i < kSlices; ++i) {
+            std::vector<RdmaSlice*> one{slices[i]};
+            for (;;) {
+                int n = 0;
+                try {
+                    n = endpoint_->submitSlices(one, /*qp_index=*/0, nullptr);
+                } catch (const std::runtime_error&) {
+                    overflows.fetch_add(1);
+                    break;
+                }
+                if (n == 1) break;
+                std::this_thread::yield();  // queue pair full; the poller
+                                            // drains
+            }
+            posted.store(i + 1, std::memory_order_release);
+        }
+    });
+    std::thread poller([&] {
+        for (int i = 0; i < kSlices; ++i) {
+            while (posted.load(std::memory_order_acquire) <= i)
+                std::this_thread::yield();
+            endpoint_->acknowledge(slices[i], COMPLETED);
+        }
+    });
+    poster.join();
+    poller.join();
+
+    EXPECT_EQ(overflows.load(), 0);
+    int completed = 0, tasks_completed = 0;
+    for (auto* slice : slices) {
+        completed += (slice->word == COMPLETED);
+        tasks_completed += (slice->task->status_word == COMPLETED);
+    }
+    EXPECT_EQ(completed, kSlices);
+    EXPECT_EQ(tasks_completed, kSlices);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
+}
+
+// Two lanes posting to one queue pair must leave the slice queue in the order
+// the hardware received the work requests: acknowledge() retires everything
+// ahead of a completed slice, so a queue that disagrees with the QP would
+// stamp a later slice with an earlier one's outcome. The fake post_send
+// records the hardware order; replaying completions in that order must find
+// each slice at the head and pop exactly one.
+TEST_F(RdmaWorkersSharedQpTest, TwoPostersOnOneQueuePairKeepPostingOrder) {
+    constexpr size_t kPerLane = 10000;
+    RdmaEndPointTestPeer::markReady(endpoint_);
+    std::vector<RdmaSlice*> lane0, lane1;
+    for (size_t i = 0; i < kPerLane; ++i) {
+        lane0.push_back(makeSlice());
+        lane1.push_back(makeSlice());
+    }
+
+    auto post_all = [&](std::vector<RdmaSlice*>& mine) {
+        for (auto* slice : mine) {
+            std::vector<RdmaSlice*> one{slice};
+            while (endpoint_->submitSlices(one, /*qp_index=*/0, nullptr) != 1)
+                std::this_thread::yield();  // queue pair full; the poller
+                                            // drains
+        }
+    };
+    std::atomic<size_t> popped_one{0};
+    std::thread poster0(post_all, std::ref(lane0));
+    std::thread poster1(post_all, std::ref(lane1));
+    std::thread poller([&] {
+        for (size_t i = 0; i < 2 * kPerLane; ++i) {
+            RdmaSlice* next = nullptr;
+            while (!next) {
+                {
+                    std::lock_guard<std::mutex> guard(post_mutex);
+                    if (post_order.size() > i) next = post_order[i];
+                }
+                if (!next) std::this_thread::yield();
+            }
+            if (endpoint_->acknowledge(next, COMPLETED) == 1u)
+                popped_one.fetch_add(1);
+        }
+    });
+    poster0.join();
+    poster1.join();
+    poller.join();
+
+    // Every completion found its slice at the head of the queue.
+    EXPECT_EQ(popped_one.load(), 2 * kPerLane);
+    EXPECT_TRUE(RdmaEndPointTestPeer::queueEmpty(endpoint_, 0));
+    EXPECT_EQ(RdmaEndPointTestPeer::wrDepth(endpoint_, 0), 0);
+    EXPECT_EQ(RdmaEndPointTestPeer::inflightSlices(endpoint_), 0);
+}
+
 TEST(RdmaContextPortSpeedTest, RefreshOnInertContextIsRejected) {
     RdmaTransport transport;
     RdmaContext context(transport);
@@ -1900,6 +2389,36 @@ TEST_F(RdmaContextEventTest, RecoveryPollLeavesInertContextsAlone) {
     RdmaTransportTestPeer::resumePausedContexts(*workers_);
 
     EXPECT_FALSE(selector_->isDeviceAvailable(kDev));
+}
+
+TEST(RdmaContextPauseTest, TransitionAndAlreadyPausedAreSuccessful) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    ibv_gid gid{};
+    gid.raw[15] = 1;
+    RdmaContextTestPeer::seedAddress(context, "fake-rnic", /*lid=*/1,
+                                     /*gid_index=*/0, gid,
+                                     RdmaContext::DEVICE_ENABLED);
+
+    EXPECT_EQ(context.pause(), 0);
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_PAUSED);
+    EXPECT_EQ(context.pause(), 0);  // idempotent
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_PAUSED);
+}
+
+TEST(RdmaContextPauseTest, RejectsUninitializedAndDisabledStates) {
+    RdmaTransport transport;
+    RdmaContext context(transport);
+    EXPECT_EQ(context.pause(), -1);
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_UNINIT);
+
+    ibv_gid gid{};
+    gid.raw[15] = 1;
+    RdmaContextTestPeer::seedAddress(context, "fake-rnic", /*lid=*/1,
+                                     /*gid_index=*/0, gid,
+                                     RdmaContext::DEVICE_DISABLED);
+    EXPECT_EQ(context.pause(), -1);
+    EXPECT_EQ(context.status(), RdmaContext::DEVICE_DISABLED);
 }
 
 TEST(RdmaContextPortStateTest, QueryOnInertContextIsRejected) {
@@ -1941,6 +2460,9 @@ TEST(RdmaPausedContextRecoveryTest, PollActivatesPausedContextWithLivePort) {
     RdmaContext& context = *contexts[0];
     if (context.status() != RdmaContext::DEVICE_ENABLED)
         GTEST_SKIP() << device_name << " has no usable active port";
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    RdmaTransportTestPeer::bindMetadata(transport, metadata);
+    ASSERT_TRUE(transport.setupLocalSegment().ok());
 
     auto workers = RdmaTransportTestPeer::makeWorkers(transport);
     auto* selector = workers->getDeviceSelector();
@@ -2124,6 +2646,57 @@ TEST(RdmaQuiesceTest, TransportQuiesceSyncsTopologyDevicesViaPlatform) {
     EXPECT_TRUE(transport.quiesce().ok());
     EXPECT_TRUE(Platform::getLoader().synchronizeDevices(topology.get()).ok());
 }
+
+#ifdef USE_CUDA
+TEST(RdmaQuiesceTest, SynchronizeDevicesDoesNotCreateIdlePrimaryContexts) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count < 2) {
+        GTEST_SKIP() << "need at least 2 CUDA devices";
+    }
+    ASSERT_EQ(cuInit(0), CUDA_SUCCESS);
+
+    auto primary_active = [](int device) {
+        CUdevice cu_dev = 0;
+        if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+        unsigned int flags = 0;
+        int active = 0;
+        return cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) ==
+                   CUDA_SUCCESS &&
+               active != 0;
+    };
+
+    int idle = -1;
+    for (int i = 1; i < device_count; ++i) {
+        if (!primary_active(i)) {
+            idle = i;
+            break;
+        }
+    }
+    if (idle < 0) {
+        GTEST_SKIP() << "need an idle GPU besides cuda:0";
+    }
+
+    // Only cuda:0 is in use. Topology still lists every visible GPU.
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    ASSERT_TRUE(primary_active(0));
+
+    auto topology = std::make_shared<Topology>();
+    for (int i = 0; i < device_count; ++i) {
+        Topology::MemEntry memory;
+        memory.name = "cuda:" + std::to_string(i);
+        memory.type = Topology::MEM_CUDA;
+        memory.numa_node = 0;
+        topology->mem_list_.push_back(std::move(memory));
+    }
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    EXPECT_TRUE(transport.quiesce().ok());
+    EXPECT_TRUE(Platform::getLoader().synchronizeDevices(topology.get()).ok());
+    EXPECT_TRUE(primary_active(0));
+    EXPECT_FALSE(primary_active(idle));
+}
+#endif
 
 TEST(RdmaQuiesceTest, WorkersQuiesceWithoutStartRejectsSubmit) {
     auto topology = std::make_shared<Topology>();

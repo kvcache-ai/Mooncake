@@ -279,6 +279,9 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
         return restored.error();
     }
 
+    LOG(INFO) << "Batch snapshot bootstrap complete: snapshot_seq="
+              << restored->last_included_seq
+              << " applied_seq=" << restored->last_applied_seq;
     // The provider has already replayed the suffix in temporary state. The
     // running reader/applier starts from that proven final sequence.
     metadata_store_ = std::move(temporary_metadata);
@@ -508,7 +511,7 @@ bool HotStandbyService::IsReadyForPromotion() const {
 }
 
 ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
-    uint64_t current_applied_seq_id) {
+    uint64_t current_applied_seq_id, PromotionCatchUpPolicy policy) {
     (void)current_applied_seq_id;
     if (!config_.enable_oplog_following) {
         LOG(INFO) << "Promotion does not require final OpLog catch-up";
@@ -521,15 +524,15 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
 
     if (catch_up_batch_kv_backend_for_testing_) {
         return FinalCatchUpBatchRecordsLocked(
-            *catch_up_batch_kv_backend_for_testing_);
+            *catch_up_batch_kv_backend_for_testing_, policy);
     }
 
     EtcdHaKvBackend batch_backend;
-    return FinalCatchUpBatchRecordsLocked(batch_backend);
+    return FinalCatchUpBatchRecordsLocked(batch_backend, policy);
 }
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
-    HaKvBackend& backend) {
+    HaKvBackend& backend, PromotionCatchUpPolicy policy) {
     std::unique_ptr<OpLogBatchStandbyReader> local_reader;
     OpLogBatchStandbyReader* reader = batch_standby_reader_.get();
     if (reader == nullptr) {
@@ -543,20 +546,30 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
         std::max(initial_retry_delay, std::chrono::milliseconds(1000));
     const auto no_progress_timeout =
         std::chrono::seconds(config_.batch_oplog_retry_timeout_sec);
+    const auto legacy_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(30);
     auto last_progress = std::chrono::steady_clock::now();
     auto retry_delay = initial_retry_delay;
     auto wait_to_retry = [&] {
         const auto now = std::chrono::steady_clock::now();
-        if (now - last_progress >= no_progress_timeout) {
+        const auto deadline =
+            policy == PromotionCatchUpPolicy::kLegacyTotalDeadline
+                ? legacy_deadline
+                : last_progress + no_progress_timeout;
+        if (now >= deadline) {
             return false;
         }
         std::this_thread::sleep_for(std::min(
             retry_delay, std::chrono::duration_cast<std::chrono::milliseconds>(
-                             no_progress_timeout - (now - last_progress))));
+                             deadline - now)));
         retry_delay = std::min(retry_delay * 2, max_retry_delay);
         return true;
     };
     for (;;) {
+        if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
+            std::chrono::steady_clock::now() >= legacy_deadline) {
+            return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        }
         const uint64_t expected_before =
             oplog_applier_->GetExpectedSequenceId();
         const auto cursor_before = reader->GetLastAppliedDurablePrefix();
@@ -567,6 +580,9 @@ ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
             expected_after > expected_before || cursor_after != cursor_before;
         if (made_progress) {
             last_progress = std::chrono::steady_clock::now();
+            retry_delay = initial_retry_delay;
+        } else if (policy == PromotionCatchUpPolicy::kLegacyTotalDeadline &&
+                   result.error == ErrorCode::OK) {
             retry_delay = initial_retry_delay;
         }
         if (result.error != ErrorCode::OK) {
@@ -616,7 +632,8 @@ ErrorCode HotStandbyService::Promote() {
               << " entries"
               << ", state: " << StandbyStateToString(GetState());
 
-    auto internal_err = PreparePromotionLocked(current_applied_seq_id);
+    auto internal_err = PreparePromotionLocked(
+        current_applied_seq_id, PromotionCatchUpPolicy::kLegacyTotalDeadline);
     if (internal_err != ErrorCode::OK) {
         return internal_err;
     }
@@ -638,11 +655,11 @@ ErrorCode HotStandbyService::Promote() {
 }
 
 ErrorCode HotStandbyService::PreparePromotionLocked(
-    uint64_t current_applied_seq_id) {
+    uint64_t current_applied_seq_id, PromotionCatchUpPolicy policy) {
     NotifySnapshotPromotion();
     StopReplicationLoop();
     ErrorCode catch_up_err =
-        FinalCatchUpForPromotionLocked(current_applied_seq_id);
+        FinalCatchUpForPromotionLocked(current_applied_seq_id, policy);
     if (catch_up_err != ErrorCode::OK) {
         state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
         return catch_up_err;
@@ -690,7 +707,8 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
               << " entries"
               << ", state: " << StandbyStateToString(GetState());
 
-    auto internal_err = PreparePromotionLocked(current_applied_seq_id);
+    auto internal_err = PreparePromotionLocked(
+        current_applied_seq_id, PromotionCatchUpPolicy::kLegacyTotalDeadline);
     if (internal_err != ErrorCode::OK) {
         return internal_err;
     }
@@ -749,7 +767,8 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
     }
 
     const uint64_t current_applied_seq_id = GetSyncStatus().applied_seq_id;
-    ErrorCode err = PreparePromotionLocked(current_applied_seq_id);
+    ErrorCode err = PreparePromotionLocked(
+        current_applied_seq_id, PromotionCatchUpPolicy::kBoundedNoProgress);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
