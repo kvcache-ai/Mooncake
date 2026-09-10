@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <barrier>
 #include <chrono>
 #include <functional>
 #include <memory>
@@ -1233,6 +1234,131 @@ TEST_F(P2PMasterServiceTest, BatchSyncRoutesAppliesMixedOperations) {
     EXPECT_FALSE(*service->ExistKey("cycle"));
 }
 
+TEST_F(P2PMasterServiceTest, BatchSyncRoutesPreservesDuplicateErrorsAcrossShards) {
+    auto service = CreateService();
+    const auto client = generate_uuid();
+    const auto segment = MakeP2PSegment();
+    RegisterP2PClient(*service, client, {segment});
+    P2PBatchSyncRoutesRequest request;
+    request.client_id = client;
+    auto response = service->BatchSyncRoutes(request);
+    EXPECT_TRUE(response.publish_results.empty());
+    EXPECT_TRUE(response.withdraw_results.empty());
+
+    // Pick two keys in the same shard and a third in another shard.
+    const std::string first = "batch-shard-key";
+    std::string same, other;
+    for (size_t i = 0; i < 100000 && (same.empty() || other.empty()); ++i) {
+        std::string key = "batch-shard-" + std::to_string(i);
+        if (service->GetRouteShardIndex(key) == service->GetRouteShardIndex(first)) {
+            if (same.empty()) same = key;
+        } else if (other.empty()) {
+            other = key;
+        }
+    }
+    ASSERT_FALSE(same.empty());
+    ASSERT_FALSE(other.empty());
+    request.publish_operations = {
+        {.key = first, .object_size = 64, .segment_id = segment.id},
+        {.key = other, .object_size = 64, .segment_id = segment.id},
+        {.key = first, .object_size = 64, .segment_id = segment.id},
+        {.key = same, .object_size = 64, .segment_id = segment.id},
+        {.key = first, .object_size = 65, .segment_id = segment.id},
+    };
+    response = service->BatchSyncRoutes(request);
+    EXPECT_EQ(response.publish_results,
+              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
+                                      ErrorCode::REPLICA_ALREADY_EXISTS,
+                                      ErrorCode::OK, ErrorCode::INVALID_PARAMS}));
+    EXPECT_TRUE(response.withdraw_results.empty());
+    EXPECT_EQ(service->GetKeyCount(), 3u);
+    auto route = service->GetReadRoute(first);
+    ASSERT_TRUE(route.has_value());
+    ASSERT_EQ(route->size(), 1u);
+    EXPECT_EQ(route->front().object_size, 64u);
+
+    request.publish_operations.clear();
+    request.withdraw_operations = {
+        {.key = other, .segment_id = segment.id},
+        {.key = first, .segment_id = segment.id},
+        {.key = first, .segment_id = segment.id},
+        {.key = same, .segment_id = segment.id},
+    };
+    for (int replay = 0; replay < 2; ++replay) {
+        response = service->BatchSyncRoutes(request);
+        EXPECT_TRUE(response.publish_results.empty());
+        EXPECT_EQ(response.withdraw_results,
+                  std::vector<ErrorCode>(request.withdraw_operations.size(),
+                                          ErrorCode::OK));
+        EXPECT_EQ(service->GetKeyCount(), 0u);
+    }
+}
+
+TEST_F(P2PMasterServiceTest, RegexAndRoutesRemainConsistentDuringClientRemoval) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto initial_keys = metrics.get_key_count();
+    const UUID retiring{1, 1}, writer{2, 2};
+    auto old_segment = MakeP2PSegment("retiring");
+    auto live_segment = MakeP2PSegment("writer");
+    RegisterP2PClient(*service, retiring, {old_segment});
+    RegisterP2PClient(*service, writer, {live_segment});
+    AddReplicaHelper(*service, "live", 64, retiring, old_segment.id);
+    AddReplicaHelper(*service, "retained", 64, writer, live_segment.id);
+    std::barrier start(4);
+    std::jthread mutations([&] {
+        start.arrive_and_wait();
+        for (int i = 0; i < 128; ++i) {
+            auto published = service->PublishRoute(
+                {.key = "live", .object_size = 64,
+                 .client_id = writer, .segment_id = live_segment.id});
+            EXPECT_TRUE(published.has_value());
+            auto withdrawn = service->WithdrawRoute(
+                {.key = "live", .client_id = writer,
+                 .segment_id = live_segment.id});
+            if (!withdrawn) {
+                EXPECT_TRUE(withdrawn.error() == ErrorCode::OBJECT_NOT_FOUND ||
+                            withdrawn.error() == ErrorCode::REPLICA_NOT_FOUND);
+            }
+        }
+    });
+    std::jthread reads([&] {
+        start.arrive_and_wait();
+        for (int i = 0; i < 128; ++i) {
+            auto routes = service->GetReadRoute("live");
+            if (routes) {
+                for (const auto& route : *routes) {
+                    EXPECT_EQ(route.object_size, 64u);
+                    EXPECT_TRUE(route.client_id == retiring || route.client_id == writer);
+                }
+            } else {
+                EXPECT_TRUE(routes.error() == ErrorCode::OBJECT_NOT_FOUND ||
+                            routes.error() == ErrorCode::REPLICA_IS_NOT_READY);
+            }
+            auto matched = service->GetReadRouteByRegex("^live$");
+            EXPECT_TRUE(matched.has_value());
+            auto removed = service->RemoveByRegex("^live$");
+            EXPECT_TRUE(removed.has_value());
+        }
+    });
+    std::jthread lifecycle([&] {
+        start.arrive_and_wait();
+        EXPECT_TRUE(service->UnmountSegment(old_segment.id, retiring).has_value());
+        EXPECT_TRUE(service->UnregisterClient(retiring).has_value());
+    });
+    start.arrive_and_wait();
+    mutations.join();
+    reads.join();
+    lifecycle.join();
+    EXPECT_EQ(service->GetKeyCount(), 1u);
+    EXPECT_EQ(metrics.get_key_count(), initial_keys + 1);
+    AddReplicaHelper(*service, "live", 64, writer, live_segment.id);
+    ASSERT_TRUE(service->UnregisterClient(writer).has_value());
+    EXPECT_EQ(service->GetKeyCount(), 0u);
+    EXPECT_EQ(metrics.get_key_count(), initial_keys);
+}
+
 TEST_F(P2PMasterServiceTest, RouteShardLockSerializesConcurrentMutations) {
     constexpr size_t kReplicaCount = 16;
     auto service = CreateService();
@@ -1545,13 +1671,59 @@ TEST_F(P2PMasterServiceTest, FilterReplicasWithTagAndPriority) {
     P2PReadRouteConfig config;
     config.max_candidates = 10;
     config.tag_filters = {"memory"};
-    config.priority_limit = 0;
+    config.priority_limit = 2;
 
     auto res = service->GetReadRoute("key1", config);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(1, res.value().size());
-    EXPECT_EQ(client2,
-              res.value()[0].client_id);
+    ASSERT_EQ(res->size(), 1u);
+    EXPECT_EQ(res->front().client_id, client2);
+    config.priority_limit = 3;
+    res = service->GetReadRoute("key1", config);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    config.tag_filters.clear();
+    config.priority_limit = 10;
+    res = service->GetReadRoute("key1", config);
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(res->size(), 1u);
+    EXPECT_EQ(res->front().client_id, client1);
+    config.priority_limit = 11;
+    res = service->GetReadRoute("key1", config);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(P2PMasterServiceTest, ReadRouteChoosesEligibleTierAndRechecksHealth) {
+    auto service = CreateService();
+    service->GetClientManager().Stop();
+    const auto client_id = generate_uuid();
+    auto high = MakeP2PSegment("high", 4096, {"skip"}, 10);
+    auto low = MakeP2PSegment("low", 4096, {}, 5);
+    RegisterP2PClient(*service, client_id, {high, low});
+    AddReplicaHelper(*service, "key", 64, client_id, high.id);
+    AddReplicaHelper(*service, "key", 64, client_id, low.id);
+    P2PReadRouteConfig config;
+    config.tag_filters = {"skip"};
+    auto route = service->GetReadRoute("key", config);
+    ASSERT_TRUE(route.has_value());
+    ASSERT_EQ(route->size(), 1u);
+    EXPECT_EQ(route->front().segment_id, low.id);
+    config.tag_filters.clear();
+    route = service->GetReadRoute("key", config);
+    ASSERT_TRUE(route.has_value());
+    ASSERT_EQ(route->size(), 1u);
+    EXPECT_EQ(route->front().segment_id, high.id);
+    auto client = service->GetClientManager().GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    client->health_state_.last_heartbeat = std::chrono::steady_clock::now() -
+        std::chrono::seconds(P2PClientMeta::disconnect_timeout_sec_ + 1);
+    ASSERT_EQ(client->CheckHealth().second, P2PClientStatus::DISCONNECTION);
+    route = service->GetReadRoute("key", config);
+    ASSERT_FALSE(route.has_value());
+    EXPECT_EQ(route.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_EQ(client->Heartbeat().second, P2PClientStatus::HEALTH);
+    EXPECT_TRUE(service->GetReadRoute("key", config).has_value());
+    EXPECT_EQ(service->RemoveAll(), 1);
 }
 
 TEST_F(P2PMasterServiceTest, FilterReplicasWithMaxCandidates) {
@@ -1576,12 +1748,10 @@ TEST_F(P2PMasterServiceTest, FilterReplicasWithMaxCandidates) {
 
     auto res = service->GetReadRoute("key1", config);
     ASSERT_TRUE(res.has_value());
-    EXPECT_EQ(3, res.value().size());
-
-    // The top 3 should have priorities 5, 4, 3 (descending)
-    // Verify the first one has the highest priority
-    EXPECT_EQ(client_ids[4],
-              res.value()[0].client_id);
+    ASSERT_EQ(res->size(), 3u);
+    for (size_t i = 0; i < res->size(); ++i) {
+        EXPECT_EQ((*res)[i].client_id, client_ids[4 - i]);
+    }
 }
 
 // A client holding the key on multiple segments (tiers) is aggregated into a

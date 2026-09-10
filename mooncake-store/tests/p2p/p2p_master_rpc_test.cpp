@@ -112,6 +112,11 @@ class P2PMasterRpcTest : public ::testing::Test {
 
 TEST_F(P2PMasterRpcTest, MixedSyncPreservesItemErrorsAndReadOrder) {
     ASSERT_TRUE(Publish("existing", first_.id).has_value());
+    auto& metrics = P2PMasterMetricManager::instance();
+    const auto published = metrics.get_publish_route_requests();
+    const auto publish_failures = metrics.get_publish_route_failures();
+    const auto withdrawn = metrics.get_withdraw_route_requests();
+    const auto withdraw_failures = metrics.get_withdraw_route_failures();
     {
         // Request string_views must not become stored route-key references.
         const std::string new_key = "new-key";
@@ -137,6 +142,11 @@ TEST_F(P2PMasterRpcTest, MixedSyncPreservesItemErrorsAndReadOrder) {
                   (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
                                           ErrorCode::OK}));
     }
+
+    EXPECT_EQ(metrics.get_publish_route_requests(), published + 3);
+    EXPECT_EQ(metrics.get_publish_route_failures(), publish_failures + 1);
+    EXPECT_EQ(metrics.get_withdraw_route_requests(), withdrawn + 3);
+    EXPECT_EQ(metrics.get_withdraw_route_failures(), withdraw_failures);
 
     const auto routes = client_->BatchGetReadRoute(
         {"new-key", "existing", "bad-segment", "cycle", "new-key"}, {});

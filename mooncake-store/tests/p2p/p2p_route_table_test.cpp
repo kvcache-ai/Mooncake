@@ -157,5 +157,39 @@ TEST(P2PRouteTableTest, RepeatedCleanupLeavesNoDanglingReverseKeys) {
     EXPECT_EQ(second_cleanup.removed_key_count, 0);
 }
 
+TEST(P2PRouteTableTest, RemoveAndClearAllowLongKeyRepublishAndLocationCleanup) {
+    P2PRouteTable table;
+    const auto first = Location(kClientA, kSharedSegment);
+    const auto second = Location(kClientB, kSharedSegment);
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < 2000; ++i) {
+        keys.push_back(std::string(256, 'k') + std::to_string(i));
+        ASSERT_TRUE(table.Publish(keys.back(), 64, first).has_value());
+        ASSERT_TRUE(table.Publish(keys.back(), 64, second).has_value());
+    }
+    for (const auto& key : keys) {
+        ASSERT_TRUE(table.RemoveKey(key));
+        ASSERT_TRUE(table.Publish(key, 64, first).has_value());
+    }
+    auto stale_second = table.RemoveLocation(second);
+    EXPECT_EQ(stale_second.removed_routes, 0u);
+    auto removed = table.RemoveLocation(first);
+    EXPECT_EQ(removed.removed_routes, keys.size());
+    EXPECT_EQ(removed.removed_key_count, keys.size());
+    for (const auto& key : keys) {
+        ASSERT_TRUE(table.Publish(key, 64, first).has_value());
+    }
+    EXPECT_EQ(table.Clear(), keys.size());
+    for (const auto& key : keys) {
+        ASSERT_TRUE(table.Publish(key, 64, second).has_value());
+    }
+    auto stale_first = table.RemoveLocation(first);
+    EXPECT_EQ(stale_first.removed_routes, 0u);
+    removed = table.RemoveLocation(second);
+    EXPECT_EQ(removed.removed_routes, keys.size());
+    EXPECT_EQ(removed.removed_key_count, keys.size());
+    EXPECT_EQ(table.GetRouteKeyCount(), 0u);
+}
+
 }  // namespace
 }  // namespace mooncake
