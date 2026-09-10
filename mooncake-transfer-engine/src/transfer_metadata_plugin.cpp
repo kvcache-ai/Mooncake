@@ -214,7 +214,8 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     // Ensure client_ is in a usable state.  If the context carries a latched
     // I/O error (common after a TCP idle-timeout drop), attempt one reconnect.
     // Must be called with access_client_mutex_ held.
-    // Returns false when the context is unavailable after the reconnect attempt.
+    // Returns false when the context is unavailable after the reconnect
+    // attempt.
     bool ensureConnected() {
         if (!client_) return false;
         if (client_->err == 0) return true;
@@ -273,8 +274,8 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
             LOG(WARNING) << "RedisStoragePlugin: SET " << key
                          << " got null reply, retrying after reconnect";
             if (!reconnect()) return false;
-            resp = (redisReply *)redisCommand(
-                client_, "SET %s %s", key.c_str(), json_file.c_str());
+            resp = (redisReply *)redisCommand(client_, "SET %s %s", key.c_str(),
+                                              json_file.c_str());
         }
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to put " << key
