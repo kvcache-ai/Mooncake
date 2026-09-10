@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
+#include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <optional>
 #include <string>
@@ -43,7 +46,35 @@ class ScopedEnvVar {
     std::optional<std::string> original_;
 };
 
+class TempDir {
+   public:
+    explicit TempDir(const std::string& prefix) {
+        static std::atomic<int64_t> counter{0};
+        path_ = std::filesystem::temp_directory_path() /
+                (prefix + "_" + std::to_string(::getpid()) + "_" +
+                 std::to_string(++counter));
+        path_str_ = path_.string();
+        std::filesystem::create_directories(path_);
+    }
+
+    ~TempDir() {
+        std::error_code ec;
+        std::filesystem::remove_all(path_, ec);
+    }
+
+    const std::string& path() const { return path_str_; }
+
+    std::string file(const std::string& name) const {
+        return (path_ / name).string();
+    }
+
+   private:
+    std::filesystem::path path_;
+    std::string path_str_;
+};
+
 struct DistributedStorageEnvironment {
+    ScopedEnvVar root_dirs{"MOONCAKE_DFS_ROOT_DIRS"};
     ScopedEnvVar root_dir{"MOONCAKE_DFS_ROOT_DIR"};
     ScopedEnvVar legacy_root_dir{"MOONCAKE_DISTRIBUTED_ROOT_DIR"};
     ScopedEnvVar fs_adapter{"MOONCAKE_DFS_FS_ADAPTER"};
@@ -64,6 +95,7 @@ struct DistributedStorageEnvironment {
 
 void ExpectDefaultConfig(const DistributedStorageConfig& config) {
     EXPECT_EQ(config.fsdir, "/mnt/3fs/mooncake");
+    EXPECT_TRUE(config.root_dirs.empty());
     EXPECT_EQ(config.fs_adapter_type, "hf3fs");
     EXPECT_FALSE(config.enable_health_check);
     EXPECT_EQ(config.shard_count, 64);
@@ -158,6 +190,51 @@ TEST_F(DistributedStorageConfigTest, PreservesAliasPrecedence) {
     const auto preferred = DistributedStorageConfig::FromEnvironment();
     EXPECT_EQ(preferred.fsdir, "/tmp/preferred-dfs");
     EXPECT_EQ(preferred.fs_adapter_type, "hf3fs");
+}
+
+TEST_F(DistributedStorageConfigTest, ReadsAndSelectsExplicitRootDirs) {
+    TempDir root0("dfs_config_root0");
+    TempDir root1("dfs_config_root1");
+    const std::string root_list =
+        "  " + root0.path() + ", " + root1.path() + "  ";
+
+    env.root_dirs.Set(root_list.c_str());
+    env.root_dir.Set("");
+    env.fs_adapter.Set("posix");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.root_dirs,
+              (std::vector<std::string>{root0.path(), root1.path()}));
+    EXPECT_EQ(config.RootForShard(0), root0.path());
+    EXPECT_EQ(config.RootForShard(1), root1.path());
+    EXPECT_EQ(config.RootForShard(2), root0.path());
+    EXPECT_TRUE(config.Validate());
+    EXPECT_NE(config.FormatStr().find("root_dirs=[" + root0.path() + "," +
+                                      root1.path() + "]"),
+              std::string::npos);
+}
+
+TEST_F(DistributedStorageConfigTest, RejectsEmptyExplicitRootList) {
+    env.root_dirs.Set("");
+    env.fs_adapter.Set("posix");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    ASSERT_EQ(config.root_dirs.size(), 1);
+    EXPECT_TRUE(config.root_dirs.front().empty());
+    EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(DistributedStorageConfigTest, PreservesEmptyExplicitRootEntries) {
+    env.root_dirs.Set("/tmp/root0,,/tmp/root1,");
+    env.fs_adapter.Set("posix");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+
+    EXPECT_EQ(config.root_dirs,
+              (std::vector<std::string>{"/tmp/root0", "", "/tmp/root1", ""}));
+    EXPECT_FALSE(config.Validate());
 }
 
 TEST_F(DistributedStorageConfigTest, EmptyPreferredRootOverridesAlias) {
@@ -257,6 +334,37 @@ TEST(DistributedStorageConfigValidationTest, RejectsInvalidBaseSettings) {
         mutate(config);
         EXPECT_FALSE(config.Validate());
     }
+}
+
+TEST(DistributedStorageConfigValidationTest, ValidatesExplicitRootDirectories) {
+    TempDir root0("dfs_validation_root0");
+    TempDir root1("dfs_validation_root1");
+    auto config = ValidConfig();
+    config.fsdir.clear();
+    config.root_dirs = {root0.path(), root1.path()};
+    ASSERT_TRUE(config.Validate());
+
+    auto hf3fs = config;
+    hf3fs.fs_adapter_type = "hf3fs";
+    EXPECT_FALSE(hf3fs.Validate());
+
+    auto relative = config;
+    relative.root_dirs = {"relative/root"};
+    EXPECT_FALSE(relative.Validate());
+
+    auto missing = config;
+    missing.root_dirs = {root0.file("missing")};
+    EXPECT_FALSE(missing.Validate());
+
+    const std::string file_path = root0.file("not_a_directory");
+    std::ofstream(file_path) << "data";
+    auto regular_file = config;
+    regular_file.root_dirs = {file_path};
+    EXPECT_FALSE(regular_file.Validate());
+
+    auto duplicate = config;
+    duplicate.root_dirs = {root0.path(), root0.file(".")};
+    EXPECT_FALSE(duplicate.Validate());
 }
 
 TEST(DistributedStorageConfigValidationTest, RejectsInvalidAllocatorSettings) {

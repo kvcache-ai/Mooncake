@@ -100,7 +100,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
-    std::string root_dir_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
     DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;

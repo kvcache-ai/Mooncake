@@ -61,6 +61,7 @@ class EnvGuard {
         Save("MOONCAKE_DFS_EVICTION_LOW_WATERMARK");
         Save("MOONCAKE_DFS_DEFERRED_FREE_SECONDS");
         Save("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL");
+        Save("MOONCAKE_DFS_ROOT_DIRS");
         Save("MOONCAKE_DFS_ROOT_DIR");
         Save("MOONCAKE_DFS_SHARD_COUNT");
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
@@ -79,6 +80,7 @@ class EnvGuard {
     }
 
     void Set(const char* key, const char* value) { ::setenv(key, value, 1); }
+    void Unset(const char* key) { ::unsetenv(key); }
 
    private:
     void Save(const std::string& key) {
@@ -118,6 +120,7 @@ class AlignedBuffer {
 };
 
 void ConfigurePosixDfs(EnvGuard& env) {
+    env.Unset("MOONCAKE_DFS_ROOT_DIRS");
     env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
     env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
     env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "0");
@@ -329,6 +332,40 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(10, 64), "10");
     EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(63, 64), "63");
     EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(100, 1000), "100");
+}
+
+TEST(DfsGlobalAllocatorTest, PlacesShardsRoundRobinAcrossRoots) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir root0("dfs_alloc_root0");
+    TempDir root1("dfs_alloc_root1");
+
+    auto config = MakeAllocatorConfig(root0.path(), 4, 1024 * 1024, 4096);
+    config.root_dirs = {root0.path(), root1.path()};
+
+    DfsGlobalAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    for (int shard_idx = 0; shard_idx < config.shard_count; ++shard_idx) {
+        const TempDir& expected_root = shard_idx % 2 == 0 ? root0 : root1;
+        const std::string file_name =
+            "dfs_shard_" +
+            DfsGlobalAllocator::FormatShardIdx(shard_idx, config.shard_count) +
+            ".data";
+        EXPECT_TRUE(std::filesystem::exists(expected_root.file(file_name)))
+            << "shard_idx=" << shard_idx;
+    }
+
+    auto descriptor = allocator.Allocate("multi-root-key", 100);
+    ASSERT_TRUE(descriptor);
+    EXPECT_EQ(
+        descriptor->file_path,
+        (std::filesystem::path(config.RootForShard(descriptor->shard_idx)) /
+         ("dfs_shard_" +
+          DfsGlobalAllocator::FormatShardIdx(descriptor->shard_idx,
+                                             config.shard_count) +
+          ".data"))
+            .string());
 }
 
 TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
@@ -1100,6 +1137,65 @@ TEST_F(DfsBackendTest, FailurePaths) {
         adapter.ReadFile(tmp_->file("does_not_exist"), buf, sizeof(buf));
     ASSERT_FALSE(read.has_value());
     EXPECT_EQ(read.error(), ErrorCode::FILE_NOT_FOUND);
+}
+
+TEST(DfsStorageBackendTest, OpensAndUsesShardsAcrossRoots) {
+    TempDir root0("dfs_backend_root0");
+    TempDir root1("dfs_backend_root1");
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = root0.path();
+
+    DistributedStorageConfig config;
+    config.fsdir = root0.path();
+    config.root_dirs = {root0.path(), root1.path()};
+    config.fs_adapter_type = "posix";
+    config.shard_count = 2;
+    config.shard_capacity = 1024 * 1024;
+    config.alignment = 4096;
+
+    DistributedStorageBackend backend(file_config, config,
+                                      std::make_unique<PosixFsAdapter>());
+    ASSERT_TRUE(backend.Init());
+
+    const std::string shard0 = root0.file(
+        "dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(0, 2) + ".data");
+    const std::string shard1 = root1.file(
+        "dfs_shard_" + DfsGlobalAllocator::FormatShardIdx(1, 2) + ".data");
+    ASSERT_TRUE(std::filesystem::exists(shard0));
+    ASSERT_TRUE(std::filesystem::exists(shard1));
+
+    AlignedBuffer input0(4096);
+    AlignedBuffer input1(4096);
+    ASSERT_NE(input0.data(), nullptr);
+    ASSERT_NE(input1.data(), nullptr);
+    input0.Fill('A');
+    input1.Fill('B');
+
+    const DistributedFSDescriptor descriptor0{shard0, 0, input0.size(),
+                                              input0.size(), 0};
+    const DistributedFSDescriptor descriptor1{shard1, 0, input1.size(),
+                                              input1.size(), 1};
+    auto write_results = backend.BatchWrite(
+        {{"key0", descriptor0, {{input0.data(), input0.size()}}},
+         {"key1", descriptor1, {{input1.data(), input1.size()}}}});
+    ASSERT_EQ(write_results.size(), 2);
+    ASSERT_TRUE(write_results[0]);
+    ASSERT_TRUE(write_results[1]);
+
+    AlignedBuffer output0(4096);
+    AlignedBuffer output1(4096);
+    ASSERT_NE(output0.data(), nullptr);
+    ASSERT_NE(output1.data(), nullptr);
+    auto read_results = backend.BatchRead(
+        {{"key0", descriptor0, {{output0.data(), output0.size()}}},
+         {"key1", descriptor1, {{output1.data(), output1.size()}}}});
+    ASSERT_EQ(read_results.size(), 2);
+    ASSERT_TRUE(read_results[0]);
+    ASSERT_TRUE(read_results[1]);
+    EXPECT_EQ(std::memcmp(input0.data(), output0.data(), input0.size()), 0);
+    EXPECT_EQ(std::memcmp(input1.data(), output1.data(), input1.size()), 0);
 }
 
 TEST(DfsStorageFactoryTest, CreatesDistributedBackendWithPosixAdapter) {

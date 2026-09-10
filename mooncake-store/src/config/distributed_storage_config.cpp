@@ -4,27 +4,82 @@
 #include <chrono>
 #include <filesystem>
 #include <sstream>
+#include <string_view>
+#include <unordered_set>
 
+#include "ascii_string.h"
 #include "environ.h"
 #include "environment_variables.h"
 
 namespace mooncake {
 
-bool DistributedStorageConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
-        return false;
+namespace {
+
+std::vector<std::string> ParseRootDirs(std::string_view value) {
+    std::vector<std::string> roots;
+    size_t begin = 0;
+    for (size_t end = value.find(',', begin); end != std::string_view::npos;
+         end = value.find(',', begin)) {
+        const std::string_view root = value.substr(begin, end - begin);
+        roots.emplace_back(TrimAsciiWhitespace(root));
+        begin = end + 1;
     }
-    if (!std::filesystem::path(fsdir).is_absolute()) {
-        LOG(ERROR)
-            << "DistributedStorageConfig: fsdir must be an absolute path: "
-            << fsdir;
-        return false;
+    roots.emplace_back(TrimAsciiWhitespace(value.substr(begin)));
+    return roots;
+}
+
+}  // namespace
+
+bool DistributedStorageConfig::Validate() const {
+    if (root_dirs.empty()) {
+        if (fsdir.empty()) {
+            LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
+            return false;
+        }
+        if (!std::filesystem::path(fsdir).is_absolute()) {
+            LOG(ERROR)
+                << "DistributedStorageConfig: fsdir must be an absolute path: "
+                << fsdir;
+            return false;
+        }
     }
     if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
+    }
+    if (!root_dirs.empty()) {
+        if (fs_adapter_type != "posix") {
+            LOG(ERROR) << "DistributedStorageConfig: multiple DFS roots are "
+                          "supported only by the posix adapter";
+            return false;
+        }
+
+        std::unordered_set<std::string> canonical_roots;
+        for (const auto& root : root_dirs) {
+            const std::filesystem::path root_path(root);
+            if (root.empty() || !root_path.is_absolute()) {
+                LOG(ERROR) << "DistributedStorageConfig: every DFS root must "
+                              "be a non-empty absolute path: "
+                           << root;
+                return false;
+            }
+
+            std::error_code ec;
+            const auto canonical_root =
+                std::filesystem::canonical(root_path, ec);
+            if (ec || !std::filesystem::is_directory(canonical_root, ec)) {
+                LOG(ERROR) << "DistributedStorageConfig: DFS root must be an "
+                              "existing directory: "
+                           << root;
+                return false;
+            }
+            if (!canonical_roots.insert(canonical_root.string()).second) {
+                LOG(ERROR) << "DistributedStorageConfig: duplicate DFS root: "
+                           << root;
+                return false;
+            }
+        }
     }
     if (shard_count <= 0) {
         LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
@@ -48,6 +103,12 @@ bool DistributedStorageConfig::Validate() const {
         return false;
     }
     return true;
+}
+
+const std::string& DistributedStorageConfig::RootForShard(
+    size_t shard_idx) const {
+    if (root_dirs.empty()) return fsdir;
+    return root_dirs[shard_idx % root_dirs.size()];
 }
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
@@ -85,7 +146,9 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Environ::ReadOr(Variables::MOONCAKE_DISTRIBUTED_ROOT_DIR, config.fsdir);
     config.fsdir =
         Environ::ReadOr(Variables::MOONCAKE_DFS_ROOT_DIR, legacy_root_dir);
-    if (!std::filesystem::path(config.fsdir).is_absolute()) {
+    if (const auto roots = Environ::Read(Variables::MOONCAKE_DFS_ROOT_DIRS)) {
+        config.root_dirs = ParseRootDirs(*roots);
+    } else if (!std::filesystem::path(config.fsdir).is_absolute()) {
         config.fsdir = std::filesystem::absolute(config.fsdir).string();
     }
 
@@ -127,7 +190,16 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
 
 std::string DistributedStorageConfig::FormatStr() const {
     std::ostringstream oss;
-    oss << "fsdir=" << fsdir << ", fs_adapter_type=" << fs_adapter_type
+    oss << "fsdir=" << fsdir;
+    if (!root_dirs.empty()) {
+        oss << ", root_dirs=[";
+        for (size_t i = 0; i < root_dirs.size(); ++i) {
+            if (i != 0) oss << ',';
+            oss << root_dirs[i];
+        }
+        oss << ']';
+    }
+    oss << ", fs_adapter_type=" << fs_adapter_type
         << ", enable_health_check=" << enable_health_check
         << ", shard_count=" << shard_count
         << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment

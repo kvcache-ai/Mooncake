@@ -1,13 +1,18 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace mooncake {
 
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
+    // An explicitly configured, ordered list of POSIX roots. When empty,
+    // fsdir remains the backward-compatible single-root configuration.
+    std::vector<std::string> root_dirs;
     std::string fs_adapter_type = "hf3fs";
     bool enable_health_check = false;
     int shard_count = 64;
@@ -22,6 +27,7 @@ struct DistributedStorageConfig {
 
     bool Validate() const;
     bool ValidateForAllocator() const;
+    const std::string& RootForShard(size_t shard_idx) const;
     static DistributedStorageConfig FromEnvironment();
     std::string FormatStr() const;
 };

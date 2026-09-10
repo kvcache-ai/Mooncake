@@ -149,7 +149,7 @@ class DfsGlobalAllocator {
     int SelectShard(const std::string& key) const;
     uint64_t AlignSize(uint64_t size) const;
 
-    std::string mount_path_;
+    std::vector<std::string> shard_paths_;
     int shard_count_ = 0;
     uint64_t alignment_ = 4096;
     std::vector<std::unique_ptr<ShardState>> shards_;
