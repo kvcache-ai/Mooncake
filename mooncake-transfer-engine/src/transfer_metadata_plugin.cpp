@@ -72,8 +72,9 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     RedisStoragePlugin(const std::string &metadata_uri)
         : client_(nullptr), metadata_uri_(metadata_uri) {
         auto hostname_port = parseHostNameWithPort(metadata_uri);
-        client_ =
-            redisConnect(hostname_port.first.c_str(), hostname_port.second);
+        host_ = hostname_port.first;
+        port_ = hostname_port.second;
+        client_ = redisConnect(host_.c_str(), port_);
         if (!client_) {
             LOG(ERROR) << "RedisStoragePlugin: unable to connect "
                        << metadata_uri_;
@@ -95,6 +96,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         if (!client_) {
             return;
         }
+
+        // Store credentials so reconnect() can re-authenticate after a
+        // TCP disconnect (e.g. load-balancer idle timeout).
+        username_ = username;
+        password_ = password;
+        db_index_ = db_index;
 
         if (!password.empty()) {
             redisReply *reply = nullptr;
@@ -139,12 +146,98 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
+    // Attempt to establish a fresh TCP connection to the Redis server and
+    // re-issue AUTH / SELECT when credentials or a non-default DB were
+    // configured.  Must be called with access_client_mutex_ held.
+    // Returns true if the new connection is healthy, false otherwise.
+    bool reconnect() {
+        if (client_) {
+            redisFree(client_);
+            client_ = nullptr;
+        }
+        client_ = redisConnect(host_.c_str(), port_);
+        if (!client_) {
+            LOG(ERROR) << "RedisStoragePlugin: reconnect failed (OOM) to "
+                       << metadata_uri_;
+            return false;
+        }
+        if (client_->err) {
+            LOG(ERROR) << "RedisStoragePlugin: reconnect failed to "
+                       << metadata_uri_ << ": " << client_->errstr;
+            redisFree(client_);
+            client_ = nullptr;
+            return false;
+        }
+
+        if (!password_.empty()) {
+            redisReply *reply = nullptr;
+            if (!username_.empty()) {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b %b", username_.data(), username_.size(),
+                    password_.data(), password_.size()));
+            } else {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b", password_.data(), password_.size()));
+            }
+            bool auth_ok = reply && reply->type != REDIS_REPLY_ERROR;
+            freeReplyObject(reply);
+            if (!auth_ok) {
+                LOG(ERROR)
+                    << "RedisStoragePlugin: re-authentication failed after "
+                       "reconnect to "
+                    << metadata_uri_;
+                redisFree(client_);
+                client_ = nullptr;
+                return false;
+            }
+        }
+
+        if (db_index_ != 0) {
+            auto *reply = static_cast<redisReply *>(
+                redisCommand(client_, "SELECT %d", db_index_));
+            bool sel_ok = reply && reply->type != REDIS_REPLY_ERROR;
+            freeReplyObject(reply);
+            if (!sel_ok) {
+                LOG(ERROR)
+                    << "RedisStoragePlugin: SELECT failed after reconnect to "
+                    << metadata_uri_;
+                redisFree(client_);
+                client_ = nullptr;
+                return false;
+            }
+        }
+
+        LOG(INFO) << "RedisStoragePlugin: reconnected to " << metadata_uri_;
+        return true;
+    }
+
+    // Ensure client_ is in a usable state.  If the context carries a latched
+    // I/O error (common after a TCP idle-timeout drop), attempt one reconnect.
+    // Must be called with access_client_mutex_ held.
+    // Returns false when the context is unavailable after the reconnect attempt.
+    bool ensureConnected() {
+        if (!client_) return false;
+        if (client_->err == 0) return true;
+        LOG(WARNING) << "RedisStoragePlugin: connection error (" << client_->err
+                     << "): " << client_->errstr
+                     << " — attempting reconnect to " << metadata_uri_;
+        return reconnect();
+    }
+
     virtual bool get(const std::string &key, Json::Value &value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return false;
+        if (!ensureConnected()) return false;
 
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
+        if (!resp) {
+            // redisCommand returns nullptr on connection-level errors;
+            // try reconnect once and retry.
+            LOG(WARNING) << "RedisStoragePlugin: GET " << key
+                         << " got null reply, retrying after reconnect";
+            if (!reconnect()) return false;
+            resp = (redisReply *)redisCommand(client_, "GET %s", key.c_str());
+        }
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
                        << " from " << metadata_uri_;
@@ -170,12 +263,19 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
     virtual bool set(const std::string &key, const Json::Value &value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return false;
+        if (!ensureConnected()) return false;
 
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         redisReply *resp = (redisReply *)redisCommand(
             client_, "SET %s %s", key.c_str(), json_file.c_str());
+        if (!resp) {
+            LOG(WARNING) << "RedisStoragePlugin: SET " << key
+                         << " got null reply, retrying after reconnect";
+            if (!reconnect()) return false;
+            resp = (redisReply *)redisCommand(
+                client_, "SET %s %s", key.c_str(), json_file.c_str());
+        }
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to put " << key
                        << " from " << metadata_uri_;
@@ -187,10 +287,16 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
     virtual bool remove(const std::string &key) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return false;
+        if (!ensureConnected()) return false;
 
         redisReply *resp =
             (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
+        if (!resp) {
+            LOG(WARNING) << "RedisStoragePlugin: DEL " << key
+                         << " got null reply, retrying after reconnect";
+            if (!reconnect()) return false;
+            resp = (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
+        }
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to remove " << key
                        << " from " << metadata_uri_;
@@ -202,6 +308,11 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
     redisContext *client_;
     const std::string metadata_uri_;
+    std::string host_;
+    int port_{6379};
+    std::string username_;
+    std::string password_;
+    uint8_t db_index_{0};
     std::mutex access_client_mutex_;
 };
 #endif  // USE_REDIS
