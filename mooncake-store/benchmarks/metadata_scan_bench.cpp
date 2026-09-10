@@ -280,6 +280,8 @@ class MetadataScanBench {
                 std::chrono::duration<double, std::micro>>(pop_end -
                                                            pop_all_begin)
                 .count();
+        RunGroupIndexContention(*tenant_handle);
+
         LOG(INFO) << "index: upsert_total_us=" << index_upsert_us
                   << ", pop_none=" << none_popped << " in " << pop_none_us
                   << "us, pop_all=" << all_popped << " in " << pop_all_us
@@ -371,6 +373,43 @@ class MetadataScanBench {
     }
 
     static inline std::atomic<uint64_t> sink_work_{0};
+
+    // GroupIndex contention: N threads performing LeaseFor + AddMember on
+    // distinct groups (the per-put publication path). Reports aggregate
+    // ops/s per thread count so the single-mutex serialization is visible.
+    static void RunGroupIndexContention(
+        mooncake::tenant::TenantCatalog& tenant_state) {
+        std::cout << "group_index_threads,member_add_ops_per_s" << std::endl;
+        for (int threads : {1, 4, 16, 32}) {
+            std::atomic<uint64_t> total_ops{0};
+            std::atomic<bool> stop{false};
+            std::vector<std::thread> workers;
+            for (int t = 0; t < threads; ++t) {
+                workers.emplace_back([&, t]() {
+                    uint64_t ops = 0;
+                    const std::string prefix =
+                        "group_t" + std::to_string(t) + "_";
+                    while (!stop.load(std::memory_order_relaxed)) {
+                        const std::string group =
+                            prefix + std::to_string(ops % 4096);
+                        auto lease = tenant_state.group_index.LeaseFor(group);
+                        tenant_state.group_index.AddMember(
+                            group, "member_" + std::to_string(ops));
+                        if (lease) {
+                            ++ops;
+                        }
+                    }
+                    total_ops.fetch_add(ops);
+                });
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            stop.store(true, std::memory_order_relaxed);
+            for (auto& worker : workers) {
+                worker.join();
+            }
+            std::cout << threads << "," << total_ops.load() / 2 << std::endl;
+        }
+    }
 };
 
 }  // namespace mooncake::benchmarks
