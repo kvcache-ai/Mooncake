@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
-#include <memory>
+#include <optional>
 #include <set>
 #include <string>
 #include <unordered_map>
@@ -14,10 +14,7 @@
 
 #include "ha/snapshot/allocator_snapshot_codec.h"
 #include "ha/snapshot/local_ssd_codec.h"
-#include "segment/pool.h"
-#include "segment/pool_write_access.h"
-#include "segment/pool_read_access.h"
-#include "segment/snapshot_view.h"
+#include "segment/snapshot.h"
 #include "serialize/serializer.h"
 #include "common/zstd_util.h"
 
@@ -26,12 +23,12 @@ namespace {
 
 struct DecodedMountedRegion final {
     MountedRegion mounted;
-    std::shared_ptr<BufferAllocatorBase> allocator;
+    std::optional<OffsetBufferAllocatorSnapshot> allocator;
 };
 
 tl::expected<void, SerializationError> EncodeMountedRegion(
-    const MountedRegion& mounted, const BufferAllocatorBase* allocator,
-    MsgpackPacker& packer) {
+    const MountedRegion& mounted,
+    const OffsetBufferAllocatorSnapshot& allocator, MsgpackPacker& packer) {
     // Preserved wire shape: [segment_id, segment_name, segment_base,
     // segment_size, te_endpoint, status, has_allocator, allocator, host_id].
     packer.pack_array(9);
@@ -41,15 +38,10 @@ tl::expected<void, SerializationError> EncodeMountedRegion(
     packer.pack(static_cast<uint64_t>(mounted.segment.size));
     packer.pack(mounted.segment.te_endpoint);
     packer.pack(static_cast<int16_t>(mounted.status));
-    if (allocator) {
-        packer.pack(true);
-        auto encoded = AllocatorSnapshotCodec::Encode(*allocator, packer);
-        if (!encoded) {
-            return tl::make_unexpected(encoded.error());
-        }
-    } else {
-        packer.pack(false);
-        packer.pack_nil();
+    packer.pack(true);
+    auto encoded = AllocatorSnapshotCodec::Encode(allocator, packer);
+    if (!encoded) {
+        return tl::make_unexpected(encoded.error());
     }
     packer.pack(mounted.segment.host_id);
     return {};
@@ -82,6 +74,11 @@ tl::expected<DecodedMountedRegion, SerializationError> DecodeMountedRegion(
         decoded.mounted.segment.te_endpoint = array[4].as<std::string>();
         decoded.mounted.status =
             static_cast<SegmentStatus>(array[5].as<int16_t>());
+        if (!IsKnownSegmentStatus(decoded.mounted.status)) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot MountedRegion has invalid status"));
+        }
         decoded.mounted.kind = RegionKind::HOST_MEMORY;
 
         if (array[6].as<bool>()) {
@@ -124,54 +121,32 @@ IndexFields(const msgpack::object& object) {
 
 tl::expected<std::vector<uint8_t>, SerializationError>
 StoreResourceSnapshotCodec::Encode(
-    const SegmentPoolSnapshotView& view,
+    const SegmentPoolSnapshot& snapshot,
     const LocalSsdPersistedState& local_ssd_state) {
-    const auto allocator_type = view.GetMemoryAllocatorType();
-    if (!allocator_type || *allocator_type != BufferAllocatorType::OFFSET) {
+    if (snapshot.memory_allocator_type != BufferAllocatorType::OFFSET) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::SERIALIZE_UNSUPPORTED,
             "snapshot SegmentPool memory driver is not offset"));
     }
-    if (view.HasKind(RegionKind::CXL)) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::SERIALIZE_UNSUPPORTED,
-            "snapshot SegmentPool CXL resource is unsupported"));
-    }
-
     msgpack::sbuffer buffer;
     MsgpackPacker packer(&buffer);
     packer.pack_map(5);
 
     packer.pack("ma");
-    packer.pack(static_cast<int32_t>(*allocator_type));
+    packer.pack(static_cast<int32_t>(snapshot.memory_allocator_type));
 
     packer.pack("an");
-    std::vector<std::string> active_names;
-    view.Placement().GetActiveSegmentNames(AllocationCandidateKind::NATIVE,
-                                           active_names);
-    packer.pack_array(active_names.size());
-    for (const auto& name : active_names) {
+    packer.pack_array(snapshot.active_names.size());
+    for (const auto& name : snapshot.active_names) {
         packer.pack(name);
     }
 
     packer.pack("ms");
-    std::vector<std::pair<UUID, MountedRegion>> mounted_regions;
-    for (const auto& mounted : view.Catalog().Regions()) {
-        mounted_regions.emplace_back(mounted.segment.id, mounted);
-    }
-    std::sort(
-        mounted_regions.begin(), mounted_regions.end(),
-        [](const auto& lhs, const auto& rhs) { return lhs.first < rhs.first; });
-    packer.pack_map(mounted_regions.size());
-    for (const auto& [id, mounted] : mounted_regions) {
-        auto allocator = view.GetAllocator(id);
-        if (!allocator) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::SERIALIZE_FAIL,
-                "snapshot mounted region has no driver resource"));
-        }
-        packer.pack(UuidToString(id));
-        auto encoded = EncodeMountedRegion(mounted, allocator.get(), packer);
+    packer.pack_map(snapshot.regions.size());
+    for (const auto& region : snapshot.regions) {
+        packer.pack(UuidToString(region.mounted.segment.id));
+        auto encoded =
+            EncodeMountedRegion(region.mounted, region.allocator, packer);
         if (!encoded) {
             return tl::make_unexpected(encoded.error());
         }
@@ -179,8 +154,8 @@ StoreResourceSnapshotCodec::Encode(
 
     packer.pack("cs");
     std::map<UUID, std::vector<UUID>> clients;
-    for (const auto& [id, mounted] : mounted_regions) {
-        clients[mounted.client_id].push_back(id);
+    for (const auto& region : snapshot.regions) {
+        clients[region.mounted.client_id].push_back(region.mounted.segment.id);
     }
     packer.pack_map(clients.size());
     for (const auto& [client, regions] : clients) {
@@ -200,10 +175,8 @@ StoreResourceSnapshotCodec::Encode(
                          buffer.size(), 3);
 }
 
-tl::expected<LocalSsdPersistedState, SerializationError>
-StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
-                                   const std::vector<uint8_t>& data,
-                                   bool account_capacity_metrics) {
+tl::expected<StoreResourceSnapshot, SerializationError>
+StoreResourceSnapshotCodec::Decode(const std::vector<uint8_t>& data) {
     std::vector<uint8_t> decompressed;
     try {
         decompressed = zstd_decompress(data);
@@ -237,13 +210,11 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
         return tl::make_unexpected(local_ssd.error());
     }
 
-    const auto memory_allocator_type =
-        segment_pool.AcquireReadAccess().GetMemoryAllocatorType();
     const auto allocator_field = fields->find("ma");
-    if (!memory_allocator_type || allocator_field == fields->end() ||
+    if (allocator_field == fields->end() ||
         allocator_field->second->type != msgpack::type::POSITIVE_INTEGER ||
-        static_cast<BufferAllocatorType>(
-            allocator_field->second->as<int32_t>()) != *memory_allocator_type) {
+        allocator_field->second->via.u64 !=
+            static_cast<uint64_t>(BufferAllocatorType::OFFSET)) {
         return tl::make_unexpected(
             SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                "snapshot SegmentPool allocator type mismatch"));
@@ -305,11 +276,10 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
                 segment.size == 0 ||
                 segment.base >
                     std::numeric_limits<uintptr_t>::max() - segment.size ||
-                region->allocator->getSegmentName() != segment.name ||
-                region->allocator->getTransportEndpoint() !=
-                    segment.te_endpoint ||
-                region->allocator->base() != segment.base ||
-                region->allocator->capacity() != segment.size) {
+                region->allocator->segment_name != segment.name ||
+                region->allocator->transport_endpoint != segment.te_endpoint ||
+                region->allocator->base != segment.base ||
+                region->allocator->capacity != segment.size) {
                 return tl::make_unexpected(SerializationError(
                     ErrorCode::DESERIALIZE_FAIL,
                     "snapshot contains invalid adopted resource"));
@@ -398,50 +368,21 @@ StoreResourceSnapshotCodec::Decode(SegmentPool& segment_pool,
             "snapshot active region names do not match mounted regions"));
     }
 
-    std::vector<UUID> order;
-    order.reserve(decoded.size());
-    for (const auto& name : active_names) {
-        for (const auto& [id, region] : decoded) {
-            if (region.mounted.status == SegmentStatus::OK &&
-                region.mounted.segment.name == name &&
-                std::find(order.begin(), order.end(), id) == order.end()) {
-                order.push_back(id);
-            }
-        }
+    StoreResourceSnapshot snapshot;
+    snapshot.segment_pool.active_names = std::move(active_names);
+    snapshot.segment_pool.regions.reserve(decoded.size());
+    for (auto& [id, region] : decoded) {
+        snapshot.segment_pool.regions.push_back(
+            {std::move(region.mounted), std::move(*region.allocator)});
     }
-    for (const auto& [id, region] : decoded) {
-        (void)region;
-        if (std::find(order.begin(), order.end(), id) == order.end()) {
-            order.push_back(id);
-        }
-    }
-
-    auto access = segment_pool.AcquireWriteAccess();
-    std::vector<RegionMountTxn> prepared;
-    prepared.reserve(order.size());
-    for (const auto& id : order) {
-        auto& region = decoded.at(id);
-        auto next = access.PrepareAdopt(region.mounted, region.allocator,
-                                        account_capacity_metrics,
-                                        /*replacing_pool=*/true);
-        if (!next) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "snapshot SegmentPool failed to adopt allocator"));
-        }
-        prepared.push_back(std::move(*next));
-    }
-    // Preparing is transactional and leaves the currently published pool
-    // untouched. Once every resource is ready, replacement is no-fail.
-    access.Clear();
-    for (auto& region : prepared) {
-        if (region.Commit(access) != ErrorCode::OK) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "snapshot SegmentPool failed to commit adopted allocator"));
-        }
-    }
-    return std::move(*local_ssd);
+    // Match CaptureSnapshot's canonical ID order for stable re-encoding.
+    std::sort(snapshot.segment_pool.regions.begin(),
+              snapshot.segment_pool.regions.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.mounted.segment.id < rhs.mounted.segment.id;
+              });
+    snapshot.local_ssd = std::move(*local_ssd);
+    return snapshot;
 }
 
 }  // namespace mooncake::ha

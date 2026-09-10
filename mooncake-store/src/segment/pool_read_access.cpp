@@ -2,12 +2,6 @@
 
 namespace mooncake {
 
-std::optional<BufferAllocatorType>
-SegmentPool::ReadAccess::GetMemoryAllocatorType() const {
-    const auto* driver = GetDriver(RegionKind::HOST_MEMORY);
-    return driver ? driver->allocator_type() : std::nullopt;
-}
-
 const RegionDriver* SegmentPool::ReadAccess::GetDriver(RegionKind kind) const {
     auto driver = drivers_.find(kind);
     return driver == drivers_.end() ? nullptr : driver->second.get();

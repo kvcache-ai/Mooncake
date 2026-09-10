@@ -101,13 +101,13 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
 
 tl::expected<RegionMountTxn, ErrorCode> SegmentPool::WriteAccess::PrepareAdopt(
     MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator,
-    bool account_capacity_metrics, bool replacing_pool) {
+    bool account_capacity_metrics, AdoptMode mode) {
     mounted.kind = ClassifyRegion(mounted.segment);
     RegionDriver* driver = segment_pool_.GetDriver(mounted.kind);
     if (!driver) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
     }
-    if (!replacing_pool) {
+    if (mode == AdoptMode::Insert) {
         if (catalog_.Find(mounted.segment.id)) {
             return tl::make_unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
         }

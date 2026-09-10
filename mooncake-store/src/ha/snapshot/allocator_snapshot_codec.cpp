@@ -2,32 +2,36 @@
 
 #include <fmt/format.h>
 
-#include "master_metric_manager.h"
+#include <exception>
+#include <limits>
 
 namespace mooncake::ha {
 
 tl::expected<void, SerializationError> AllocatorSnapshotCodec::Encode(
-    const BufferAllocatorBase& allocator, MsgpackPacker& packer) {
-    const auto* offset = dynamic_cast<const OffsetBufferAllocator*>(&allocator);
-    if (!offset) {
+    const OffsetBufferAllocatorSnapshot& snapshot, MsgpackPacker& packer) {
+    if (!snapshot.allocation_state.layout) {
         return tl::make_unexpected(SerializationError(
-            ErrorCode::SERIALIZE_UNSUPPORTED,
-            "snapshot allocator is not OffsetBufferAllocator"));
+            ErrorCode::SERIALIZE_FAIL, "snapshot allocator has no layout"));
     }
-
-    // Preserved wire shape: [segment_name, base, total_size, current_size,
-    // transport_endpoint, offset_allocator].
+    // Preserve the legacy OffsetBufferAllocator and OffsetAllocator arrays.
     packer.pack_array(6);
-    packer.pack(offset->segment_name_);
-    packer.pack(static_cast<uint64_t>(offset->base_));
-    packer.pack(static_cast<uint64_t>(offset->total_size_));
-    packer.pack(static_cast<uint64_t>(offset->size()));
-    packer.pack(offset->transport_endpoint_);
-    return Serializer<offset_allocator::OffsetAllocator>::serialize(
-        *offset->offset_allocator_, packer);
+    packer.pack(snapshot.segment_name);
+    packer.pack(static_cast<uint64_t>(snapshot.base));
+    packer.pack(static_cast<uint64_t>(snapshot.capacity));
+    packer.pack(static_cast<uint64_t>(snapshot.used_bytes));
+    packer.pack(snapshot.transport_endpoint);
+    const auto& layout = snapshot.allocation_state;
+    packer.pack_array(6);
+    packer.pack(layout.base);
+    packer.pack(layout.multiplier_bits);
+    packer.pack(layout.capacity);
+    packer.pack(layout.allocated_size);
+    packer.pack(layout.allocated_num);
+    return Serializer<offset_allocator::__Allocator>::serialize(*layout.layout,
+                                                                packer);
 }
 
-tl::expected<std::shared_ptr<BufferAllocatorBase>, SerializationError>
+tl::expected<OffsetBufferAllocatorSnapshot, SerializationError>
 AllocatorSnapshotCodec::Decode(const msgpack::object& object) {
     if (object.type != msgpack::type::ARRAY || object.via.array.size != 6) {
         return tl::make_unexpected(SerializationError(
@@ -42,25 +46,44 @@ AllocatorSnapshotCodec::Decode(const msgpack::object& object) {
         auto total_size = static_cast<size_t>(array[2].as<uint64_t>());
         auto current_size = static_cast<size_t>(array[3].as<uint64_t>());
         std::string transport_endpoint = array[4].as<std::string>();
-
-        auto offset_allocator =
-            Serializer<offset_allocator::OffsetAllocator>::deserialize(
-                array[5]);
-        if (!offset_allocator) {
-            return tl::make_unexpected(offset_allocator.error());
+        // Usage is restored into signed metrics and must describe bytes within
+        // this allocator, not wrap the gauge or exceed its capacity.
+        if (current_size > total_size ||
+            current_size >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot OffsetBufferAllocator has invalid usage"));
         }
 
-        auto allocator = std::make_shared<OffsetBufferAllocator>(
-            segment_name, base, total_size, transport_endpoint);
-        allocator->offset_allocator_ = std::move(*offset_allocator);
-        allocator->RestoreUsageBytes(current_size);
-
-        // Restore bypasses allocate(), while destruction still decrements the
-        // current size. Keep metric accounting symmetric for live and temporary
-        // snapshot readers.
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment_name, static_cast<int64_t>(current_size));
-        return std::shared_ptr<BufferAllocatorBase>(std::move(allocator));
+        if (array[5].type != msgpack::type::ARRAY ||
+            array[5].via.array.size != 6) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot OffsetAllocator is not an array[6]"));
+        }
+        const auto* state = array[5].via.array.ptr;
+        auto layout =
+            Serializer<offset_allocator::__Allocator>::deserialize(state[5]);
+        if (!layout) {
+            return tl::make_unexpected(layout.error());
+        }
+        offset_allocator::OffsetAllocatorSnapshot allocation_state{
+            state[0].as<uint64_t>(), state[1].as<uint64_t>(),
+            state[2].as<uint64_t>(), state[3].as<uint64_t>(),
+            state[4].as<uint64_t>(), std::move(*layout)};
+        if (allocation_state.base != base ||
+            allocation_state.capacity != total_size) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "snapshot allocator bounds are inconsistent"));
+        }
+        return OffsetBufferAllocatorSnapshot{std::move(segment_name),
+                                             base,
+                                             total_size,
+                                             current_size,
+                                             std::move(transport_endpoint),
+                                             std::move(allocation_state)};
     } catch (const std::exception& error) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,

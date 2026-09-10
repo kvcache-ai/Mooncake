@@ -13,6 +13,20 @@ enum class SegmentStatus {
     UNMOUNTING,
 };
 
+// Rejects raw integer values that do not map to a declared status.
+constexpr bool IsKnownSegmentStatus(SegmentStatus status) noexcept {
+    switch (status) {
+        case SegmentStatus::UNDEFINED:
+        case SegmentStatus::OK:
+        case SegmentStatus::DRAINING:
+        case SegmentStatus::DRAINED:
+        case SegmentStatus::GRACEFULLY_UNMOUNTING:
+        case SegmentStatus::UNMOUNTING:
+            return true;
+    }
+    return false;
+}
+
 constexpr int SegmentStatusAvailabilityRank(SegmentStatus status) noexcept {
     switch (status) {
         case SegmentStatus::OK:

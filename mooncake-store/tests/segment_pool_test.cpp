@@ -3,21 +3,31 @@
 #include <gtest/gtest.h>
 #include <msgpack.hpp>
 
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <functional>
 #include <future>
-#include <memory>
+#include <limits>
 #include <map>
+#include <memory>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 
-#include "master_metric_manager.h"
-#include "ha/snapshot/store_resource_snapshot_codec.h"
-#include "segment/snapshot_view.h"
 #include "common/zstd_util.h"
+#include "ha/snapshot/local_ssd_codec.h"
+#include "ha/snapshot/store_resource_snapshot_codec.h"
+#include "master_metric_manager.h"
+#include "segment.h"
 #include "segment/pool_read_access.h"
 #include "segment/pool_write_access.h"
+#include "segment/snapshot.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake::test {
@@ -74,34 +84,76 @@ void CommitUnmount(SegmentPool& pool, const Segment& segment,
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
+tl::expected<std::vector<uint8_t>, SerializationError> CaptureAndEncode(
+    const SegmentPool& pool, const LocalSsdPersistedState& local_ssd) {
+    auto snapshot = pool.CaptureSnapshot();
+    if (!snapshot) {
+        return tl::make_unexpected(
+            SerializationError(snapshot.error(), "capture SegmentPool failed"));
+    }
+    return ha::StoreResourceSnapshotCodec::Encode(*snapshot, local_ssd);
+}
+
+tl::expected<LocalSsdPersistedState, SerializationError> DecodeAndRestore(
+    SegmentPool& pool, const std::vector<uint8_t>& bytes,
+    bool account_capacity) {
+    auto decoded = ha::StoreResourceSnapshotCodec::Decode(bytes);
+    if (!decoded) return tl::make_unexpected(decoded.error());
+    auto restored = pool.RestoreSnapshot(std::move(decoded->segment_pool),
+                                         account_capacity);
+    if (!restored)
+        return tl::make_unexpected(
+            SerializationError(restored.error(), "restore SegmentPool failed"));
+    return std::move(decoded->local_ssd);
+}
+
+// Mutate the unpacked wire payload rather than duplicating the codec in tests.
+std::vector<uint8_t> RewriteSnapshot(
+    const std::vector<uint8_t>& snapshot,
+    const std::function<void(msgpack::object&, msgpack::zone&)>& rewrite) {
+    const auto bytes = zstd_decompress(snapshot);
+    auto unpacked = msgpack::unpack(reinterpret_cast<const char*>(bytes.data()),
+                                    bytes.size());
+    auto root = unpacked.get();
+    rewrite(root, *unpacked.zone());
+
+    msgpack::sbuffer buffer;
+    msgpack::pack(buffer, root);
+    return zstd_compress(reinterpret_cast<const uint8_t*>(buffer.data()),
+                         buffer.size(), 3);
+}
+
+msgpack::object& SnapshotField(msgpack::object& root, std::string_view name) {
+    for (uint32_t i = 0; i < root.via.map.size; ++i) {
+        auto& item = root.via.map.ptr[i];
+        if (item.key.as<std::string>() == name) {
+            return item.val;
+        }
+    }
+
+    throw std::runtime_error("missing snapshot field");
+}
+
+std::string PackLocalSsd(const LocalSsdPersistedState& state) {
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    EXPECT_TRUE(ha::LocalSsdCodec::Encode(state, packer).has_value());
+    return {buffer.data(), buffer.size()};
+}
+
 std::vector<uint8_t> ReplaceSnapshotActiveNames(
     const std::vector<uint8_t>& snapshot,
     const std::vector<std::string>& active_names) {
-    const auto decompressed = zstd_decompress(snapshot);
-    const auto unpacked =
-        msgpack::unpack(reinterpret_cast<const char*>(decompressed.data()),
-                        decompressed.size());
-    const auto& root = unpacked.get();
+    return RewriteSnapshot(snapshot, [&](auto& root, auto& zone) {
+        SnapshotField(root, "an") = msgpack::object(active_names, zone);
+    });
+}
 
-    msgpack::sbuffer buffer;
-    MsgpackPacker packer(&buffer);
-    packer.pack_map(root.via.map.size);
-    for (uint32_t i = 0; i < root.via.map.size; ++i) {
-        const auto& item = root.via.map.ptr[i];
-        packer.pack(item.key);
-        if (item.key.type == msgpack::type::STR &&
-            std::string_view(item.key.via.str.ptr, item.key.via.str.size) ==
-                "an") {
-            packer.pack_array(active_names.size());
-            for (const auto& name : active_names) {
-                packer.pack(name);
-            }
-        } else {
-            packer.pack(item.val);
-        }
-    }
-    return zstd_compress(reinterpret_cast<const uint8_t*>(buffer.data()),
-                         buffer.size(), 3);
+std::vector<uint8_t> ReplaceSnapshotAllocatorType(
+    const std::vector<uint8_t>& snapshot, uint64_t allocator_type) {
+    return RewriteSnapshot(snapshot, [&](auto& root, auto&) {
+        SnapshotField(root, "ma") = msgpack::object(allocator_type);
+    });
 }
 
 }  // namespace
@@ -1044,7 +1096,7 @@ TEST(SegmentPoolTest, AdoptRejectsCatalogConflictWithoutReplacingResource) {
     EXPECT_EQ(access.Catalog().Regions().size(), 1U);
 }
 
-TEST(SegmentPoolTest, SnapshotViewDoesNotAcquireInheritedPoolMutex) {
+TEST(SegmentPoolTest, SnapshotCaptureDoesNotAcquireInheritedPoolMutex) {
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "fork-safe");
@@ -1053,12 +1105,80 @@ TEST(SegmentPoolTest, SnapshotViewDoesNotAcquireInheritedPoolMutex) {
         ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
 
         // A fork child can inherit this mutex as locked by a vanished thread.
-        // Encoding must use only the lock-free snapshot view.
-        auto encoded = ha::StoreResourceSnapshotCodec::Encode(
-            pool.GetSnapshotView(), LocalSsdPersistedState{});
+        // Capture must not acquire the inherited runtime lock.
+        auto encoded = CaptureAndEncode(pool, LocalSsdPersistedState{});
         ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
     }
     CommitUnmount(pool, segment, client);
+}
+
+TEST(SegmentPoolTest, CapturedSnapshotOutlivesPoolAndPreservesOriginalLayout) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline_used = metrics.get_allocated_mem_size();
+    const auto baseline_capacity = metrics.get_total_mem_capacity();
+    const auto segment = MakeSegment(0, "detached-snapshot", "tcp", "host-a");
+    const UUID client = generate_uuid();
+    std::optional<SegmentPoolSnapshot> snapshot;
+    std::vector<uint8_t> original_bytes;
+    uintptr_t first_address = 0;
+    uintptr_t last_address = 0;
+    {
+        SegmentPool pool(Drivers());
+        ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+                  ErrorCode::OK);
+        auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+        auto first = allocator->allocate(4096);
+        auto hole = allocator->allocate(4096);
+        auto last = allocator->allocate(4096);
+        ASSERT_NE(first, nullptr);
+        ASSERT_NE(hole, nullptr);
+        ASSERT_NE(last, nullptr);
+        first_address = reinterpret_cast<uintptr_t>(first->data());
+        last_address = reinterpret_cast<uintptr_t>(last->data());
+        hole.reset();
+        const auto used = metrics.get_allocated_mem_size();
+        auto captured = pool.CaptureSnapshot();
+        ASSERT_TRUE(captured.has_value());
+        snapshot.emplace(std::move(*captured));
+        EXPECT_EQ(metrics.get_allocated_mem_size(), used);
+        auto encoded = ha::StoreResourceSnapshotCodec::Encode(*snapshot, {});
+        ASSERT_TRUE(encoded.has_value());
+        original_bytes = std::move(*encoded);
+
+        // Change both allocation bins/nodes and catalog/placement after
+        // capture.
+        first.reset();
+        last.reset();
+        auto all = allocator->allocate(kRegionSize);
+        ASSERT_NE(all, nullptr);
+        ASSERT_EQ(pool.AcquireWriteAccess().SetSegmentStatusByName(
+                      segment.name, SegmentStatus::DRAINED),
+                  ErrorCode::OK);
+        pool.AcquireWriteAccess().Clear();
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+    auto encoded = ha::StoreResourceSnapshotCodec::Encode(*snapshot, {});
+    ASSERT_TRUE(encoded.has_value());
+    EXPECT_EQ(*encoded, original_bytes);
+    snapshot.reset();
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
+
+    SegmentPool restored(Drivers());
+    ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
+    EXPECT_EQ(restored.GetMemoryUsage().used_bytes, 8192U);
+    auto access = restored.AcquireReadAccess();
+    const auto* mounted = access.Catalog().Find(segment.id);
+    ASSERT_NE(mounted, nullptr);
+    EXPECT_EQ(mounted->status, SegmentStatus::OK);
+    EXPECT_EQ(mounted->client_id, client);
+    EXPECT_EQ(mounted->segment.host_id, segment.host_id);
+    EXPECT_TRUE(access.Placement().Contains(segment.name,
+                                            AllocationCandidateKind::NATIVE));
+    auto next = access.GetAllocator(segment.id)->allocate(4096);
+    ASSERT_NE(next, nullptr);
+    EXPECT_NE(reinterpret_cast<uintptr_t>(next->data()), first_address);
+    EXPECT_NE(reinterpret_cast<uintptr_t>(next->data()), last_address);
 }
 
 TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
@@ -1067,8 +1187,7 @@ TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
     auto segment = MakeSegment(0, "snapshot", "tcp", "host-a");
     ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
               ErrorCode::OK);
-    auto encoded = ha::StoreResourceSnapshotCodec::Encode(
-        source.GetSnapshotView(), LocalSsdPersistedState{});
+    auto encoded = CaptureAndEncode(source, LocalSsdPersistedState{});
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
 
     SegmentPool restored(Drivers());
@@ -1079,8 +1198,7 @@ TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
     ASSERT_EQ(
         restored.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
         ErrorCode::OK);
-    auto decoded =
-        ha::StoreResourceSnapshotCodec::Decode(restored, *encoded, false);
+    auto decoded = DecodeAndRestore(restored, *encoded, false);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
 
     {
@@ -1097,14 +1215,217 @@ TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
     CommitUnmount(source, segment, client);
 }
 
+TEST(SegmentPoolTest, DecodeReturnsDetachedStateWithoutMetricSideEffects) {
+    SegmentPool source(Drivers());
+    const auto segment = MakeSegment(0, "decode-detached");
+    const auto client = generate_uuid();
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    auto allocator = source.AcquireReadAccess().GetAllocator(segment.id);
+    auto buffer = allocator->allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+    auto encoded = CaptureAndEncode(source, {});
+    ASSERT_TRUE(encoded);
+    auto& metrics = MasterMetricManager::instance();
+    const auto used = metrics.get_allocated_mem_size();
+    const auto capacity = metrics.get_total_mem_capacity();
+    {
+        auto decoded = ha::StoreResourceSnapshotCodec::Decode(*encoded);
+        ASSERT_TRUE(decoded);
+        ASSERT_EQ(decoded->segment_pool.regions.size(), 1U);
+        EXPECT_EQ(decoded->segment_pool.regions.front().allocator.used_bytes,
+                  4096U);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), used);
+        EXPECT_EQ(metrics.get_total_mem_capacity(), capacity);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), used);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), capacity);
+}
+
+TEST(SegmentPoolTest, SnapshotDecodeReencodePreservesBytes) {
+    SegmentPool pool(Drivers());
+    const UUID client{1, 1};
+    auto first = MakeSegment(0, "roundtrip-z");
+    auto second = MakeSegment(1, "roundtrip-a");
+    auto inactive = MakeSegment(2, "roundtrip-inactive");
+    // ID order differs from both mount order and active-name order.
+    first.id = UUID{0, 3};
+    second.id = UUID{0, 1};
+    inactive.id = UUID{0, 2};
+    {
+        auto access = pool.AcquireWriteAccess();
+        for (const auto* segment : {&first, &second, &inactive}) {
+            ASSERT_EQ(access.MountSegment(*segment, client), ErrorCode::OK);
+        }
+        ASSERT_EQ(access.SetSegmentStatusByName(inactive.name,
+                                                SegmentStatus::DRAINED),
+                  ErrorCode::OK);
+    }
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    for (bool reverse_region_order : {false, true}) {
+        SCOPED_TRACE(reverse_region_order);
+        auto input = *encoded;
+        if (reverse_region_order) {
+            input = RewriteSnapshot(*encoded, [](auto& root, auto&) {
+                auto& regions = SnapshotField(root, "ms").via.map;
+                std::reverse(regions.ptr, regions.ptr + regions.size);
+            });
+        }
+        auto decoded = ha::StoreResourceSnapshotCodec::Decode(input);
+        ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+        const auto& snapshot = decoded->segment_pool;
+        ASSERT_EQ(snapshot.regions.size(), 3U);
+        EXPECT_EQ(snapshot.regions[0].mounted.segment.id, second.id);
+        EXPECT_EQ(snapshot.regions[1].mounted.segment.id, inactive.id);
+        EXPECT_EQ(snapshot.regions[2].mounted.segment.id, first.id);
+        EXPECT_EQ(snapshot.active_names,
+                  (std::vector<std::string>{first.name, second.name}));
+
+        auto reencoded = ha::StoreResourceSnapshotCodec::Encode(
+            snapshot, decoded->local_ssd);
+        ASSERT_TRUE(reencoded.has_value()) << reencoded.error().message;
+        EXPECT_EQ(*reencoded, *encoded);
+    }
+}
+
+TEST(SegmentPoolTest, RestoreSnapshotRejectsConflictsBeforeReplacingPool) {
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(0, "restore-conflict");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto snapshot = pool.CaptureSnapshot();
+    auto duplicate = pool.CaptureSnapshot();
+    ASSERT_TRUE(snapshot);
+    ASSERT_TRUE(duplicate);
+    snapshot->regions.push_back(std::move(duplicate->regions.front()));
+    EXPECT_FALSE(pool.RestoreSnapshot(std::move(*snapshot), true));
+    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+
+    auto invalid = pool.CaptureSnapshot();
+    ASSERT_TRUE(invalid);
+    invalid->regions.front().allocator.allocation_state.layout.reset();
+    EXPECT_FALSE(pool.RestoreSnapshot(std::move(*invalid), true));
+    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+}
+
+TEST(SegmentPoolTest, AllocatorRestoreFactoryRejectsInvalidState) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_allocated_mem_size();
+    const auto segment = MakeSegment(0, "restore-factory");
+    auto state =
+        offset_allocator::OffsetAllocator::create(segment.base, segment.size);
+    ASSERT_NE(state, nullptr);
+
+    auto snapshot = [&] {
+        return OffsetBufferAllocatorSnapshot{
+            segment.name,        segment.base,
+            segment.size,        0,
+            segment.te_endpoint, state->CaptureSnapshot()};
+    };
+    const auto expect_rejected = [](OffsetBufferAllocatorSnapshot candidate) {
+        auto restored = OffsetBufferAllocator::Restore(std::move(candidate));
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), ErrorCode::INVALID_PARAMS);
+    };
+    auto missing = snapshot();
+    missing.allocation_state.layout.reset();
+    expect_rejected(std::move(missing));
+    auto invalid_usage = snapshot();
+    invalid_usage.used_bytes = segment.size + 1;
+    expect_rejected(std::move(invalid_usage));
+    auto mismatched = snapshot();
+    ++mismatched.allocation_state.base;
+    expect_rejected(std::move(mismatched));
+    auto overflow = snapshot();
+    overflow.used_bytes = std::numeric_limits<size_t>::max();
+    expect_rejected(std::move(overflow));
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+
+    {
+        auto restored = OffsetBufferAllocator::Restore(snapshot());
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->size(), 0U);
+        EXPECT_EQ((*restored)->capacity(), segment.size);
+
+        auto buffer = (*restored)->allocate(4096);
+        ASSERT_NE(buffer, nullptr);
+        EXPECT_EQ((*restored)->size(), 4096U);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4096);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+}
+
+TEST(SegmentPoolTest, SnapshotReplacementPreservesAllocatedMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_allocated_mem_size();
+
+    for (bool account_capacity : {false, true}) {
+        SegmentPool pool(Drivers());
+        const UUID client = generate_uuid();
+        auto segment = MakeSegment(0, "snapshot-allocated-metrics");
+        ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+                  ErrorCode::OK);
+        auto buffer =
+            pool.AcquireReadAccess().GetAllocator(segment.id)->allocate(4096);
+        ASSERT_NE(buffer, nullptr);
+        auto encoded = CaptureAndEncode(pool, LocalSsdPersistedState{});
+        ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+        auto decoded = DecodeAndRestore(pool, *encoded, account_capacity);
+        ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+        buffer.reset();  // The replaced allocator is no longer live.
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4096);
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 4096);
+        EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                  account_capacity ? kRegionSize : 0);
+        {
+            auto next = pool.AcquireReadAccess()
+                            .GetAllocator(segment.id)
+                            ->allocate(4096);
+            ASSERT_NE(next, nullptr);
+            EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+                      8192);
+        }
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 4096);
+        pool.AcquireWriteAccess().Clear();
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    }
+}
+
+TEST(SegmentPoolTest, OutOfRangeSnapshotAllocatorTypeReturnsError) {
+    SegmentPool pool(Drivers());
+    const UUID client = generate_uuid();
+    auto segment = MakeSegment(0, "snapshot-invalid-allocator-type");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    auto encoded = CaptureAndEncode(pool, LocalSsdPersistedState{});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    for (const uint64_t value :
+         {uint64_t{std::numeric_limits<int32_t>::max()} + 1,
+          std::numeric_limits<uint64_t>::max()}) {
+        auto corrupted = ReplaceSnapshotAllocatorType(*encoded, value);
+        ASSERT_NO_THROW({
+            auto result = DecodeAndRestore(pool, corrupted, false);
+            ASSERT_FALSE(result.has_value());
+            EXPECT_EQ(result.error().code, ErrorCode::DESERIALIZE_FAIL);
+        });
+        EXPECT_NE(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
+    }
+    CommitUnmount(pool, segment, client);
+}
+
 TEST(SegmentPoolTest, InvalidSnapshotDoesNotReplacePublishedPool) {
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "snapshot-active");
     ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
               ErrorCode::OK);
-    auto encoded = ha::StoreResourceSnapshotCodec::Encode(
-        source.GetSnapshotView(), LocalSsdPersistedState{});
+    auto encoded = CaptureAndEncode(source, LocalSsdPersistedState{});
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
 
     SegmentPool restored(Drivers());
@@ -1112,8 +1433,7 @@ TEST(SegmentPoolTest, InvalidSnapshotDoesNotReplacePublishedPool) {
     ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(stale, client),
               ErrorCode::OK);
     auto corrupted = ReplaceSnapshotActiveNames(*encoded, {});
-    auto result =
-        ha::StoreResourceSnapshotCodec::Decode(restored, corrupted, false);
+    auto result = DecodeAndRestore(restored, corrupted, false);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error().code, ErrorCode::DESERIALIZE_FAIL);
 
@@ -1124,6 +1444,627 @@ TEST(SegmentPoolTest, InvalidSnapshotDoesNotReplacePublishedPool) {
     }
 
     CommitUnmount(source, segment, client);
+}
+
+TEST(SegmentPoolTest, SnapshotInteroperatesWithLegacySerializer) {
+    SegmentPool source(Drivers());
+    const UUID client = generate_uuid();
+    // Preserve insertion order, not lexicographic name order.
+    auto first = MakeSegment(0, "compat-z", "tcp", "host-a");
+    auto second = MakeSegment(1, "compat-a", "tcp", "host-b");
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(first, client),
+              ErrorCode::OK);
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(second, client),
+              ErrorCode::OK);
+
+    LocalSsdPersistedState ssd;
+    ssd[client] = LocalSsdPersistedClient{
+        .enable_offloading = true,
+        .total_capacity_bytes = 12345,
+        .pending_offloads = {
+            {"tenant/key",
+             OffloadTaskItem{
+                 .tenant_id = "tenant", .key = "key", .size = 4096}}}};
+    auto encoded = CaptureAndEncode(source, ssd);
+    ASSERT_TRUE(encoded.has_value());
+
+    SegmentManager legacy(BufferAllocatorType::OFFSET);
+    SegmentSerializer serializer(&legacy);
+    auto old_decoded = serializer.Deserialize(*encoded);
+    ASSERT_TRUE(old_decoded.has_value()) << old_decoded.error().message;
+    EXPECT_EQ(PackLocalSsd(*old_decoded), PackLocalSsd(ssd));
+
+    MountedSegment mounted;
+    ASSERT_EQ(legacy.getView().GetMountedSegment(first.id, mounted),
+              ErrorCode::OK);
+    EXPECT_EQ(mounted.segment.host_id, first.host_id);
+
+    auto old_encoded = serializer.Serialize(*old_decoded);
+    ASSERT_TRUE(old_encoded.has_value());
+
+    SegmentPool restored(Drivers());
+    auto decoded = DecodeAndRestore(restored, *old_encoded, false);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    EXPECT_EQ(PackLocalSsd(*decoded), PackLocalSsd(ssd));
+    {
+        auto access = restored.AcquireReadAccess();
+        ASSERT_EQ(access.Catalog().Regions().size(), 2U);
+        ASSERT_NE(access.Catalog().Find(first.id), nullptr);
+        EXPECT_EQ(access.Catalog().Find(first.id)->client_id, client);
+        std::vector<std::string> names;
+        access.Placement().GetActiveSegmentNames(
+            AllocationCandidateKind::NATIVE, names);
+        EXPECT_EQ(names, (std::vector<std::string>{first.name, second.name}));
+    }
+
+    // Historical MountedSegment arrays had no host_id, and ld was optional.
+    auto historical = RewriteSnapshot(*old_encoded, [](auto& root, auto&) {
+        auto& regions = SnapshotField(root, "ms");
+        for (uint32_t i = 0; i < regions.via.map.size; ++i) {
+            regions.via.map.ptr[i].val.via.array.size = 8;
+        }
+
+        for (uint32_t i = 0; i < root.via.map.size; ++i) {
+            if (root.via.map.ptr[i].key.template as<std::string>() == "ld") {
+                root.via.map.ptr[i] = root.via.map.ptr[root.via.map.size - 1];
+                --root.via.map.size;
+                break;
+            }
+        }
+    });
+    decoded = DecodeAndRestore(restored, historical, false);
+    ASSERT_TRUE(decoded.has_value());
+    EXPECT_TRUE(decoded->empty());
+    EXPECT_TRUE(restored.AcquireReadAccess()
+                    .Catalog()
+                    .Find(first.id)
+                    ->segment.host_id.empty());
+}
+
+TEST(SegmentPoolTest, SnapshotRestoresPlacementAndEveryLifecycleStatus) {
+    SegmentPool source(Drivers());
+    const UUID client = generate_uuid();
+    std::vector<Segment> segments;
+    const std::vector<SegmentStatus> statuses{
+        SegmentStatus::OK,        SegmentStatus::OK,
+        SegmentStatus::UNDEFINED, SegmentStatus::DRAINING,
+        SegmentStatus::DRAINED,   SegmentStatus::GRACEFULLY_UNMOUNTING,
+        SegmentStatus::UNMOUNTING};
+    for (size_t i = 0; i < statuses.size(); ++i) {
+        segments.push_back(MakeSegment(i, "lifecycle-" + std::to_string(i),
+                                       "tcp", "host-" + std::to_string(i)));
+        auto access = source.AcquireWriteAccess();
+        ASSERT_EQ(
+            access.MountSegment(segments.back(), i == 1 ? UUID{8, 9} : client),
+            ErrorCode::OK);
+        ASSERT_EQ(
+            access.SetSegmentStatusByName(segments.back().name, statuses[i]),
+            ErrorCode::OK);
+    }
+
+    // Same-name regions must all survive; only their logical name is
+    // deduplicated.
+    auto sibling = MakeSegment(8, segments[0].name, "tcp", segments[0].host_id);
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(sibling, client),
+              ErrorCode::OK);
+    auto encoded = CaptureAndEncode(source, {});
+    ASSERT_TRUE(encoded.has_value());
+    SegmentPool restored(Drivers());
+    ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
+    {
+        auto access = restored.AcquireReadAccess();
+        EXPECT_EQ(access.Catalog().Regions().size(), segments.size() + 1);
+        for (size_t i = 0; i < segments.size(); ++i) {
+            const auto* region = access.Catalog().Find(segments[i].id);
+            ASSERT_NE(region, nullptr);
+            EXPECT_EQ(region->status, statuses[i]);
+            EXPECT_EQ(region->client_id, i == 1 ? (UUID{8, 9}) : client);
+            EXPECT_EQ(access.Placement().Contains(
+                          segments[i].name, AllocationCandidateKind::NATIVE),
+                      statuses[i] == SegmentStatus::OK);
+            EXPECT_NE(access.GetAllocator(segments[i].id), nullptr);
+        }
+        std::vector<std::string> names;
+        access.Placement().GetActiveSegmentNames(
+            AllocationCandidateKind::NATIVE, names);
+        EXPECT_EQ(names, (std::vector<std::string>{segments[0].name,
+                                                   segments[1].name}));
+        std::vector<std::string> by_host;
+        access.Placement().VisitHostOrderedSegmentNames(
+            segments[1].host_id, "key", [&](auto name) {
+                by_host.emplace_back(name);
+                return false;
+            });
+        ASSERT_EQ(by_host.size(), 2U);
+        EXPECT_EQ(by_host.front(), segments[1].name);
+        const auto* entry = access.Placement().Find(
+            segments[0].name, AllocationCandidateKind::NATIVE);
+        ASSERT_NE(entry, nullptr);
+        EXPECT_EQ(entry->candidates.size(), 2U);
+    }
+
+    CommitUnmount(restored, segments[0], client);
+    EXPECT_TRUE(restored.AcquireReadAccess().Placement().Contains(
+        sibling.name, AllocationCandidateKind::NATIVE));
+    CommitUnmount(restored, sibling, client);
+    EXPECT_FALSE(restored.AcquireReadAccess().Placement().Contains(
+        sibling.name, AllocationCandidateKind::NATIVE));
+    auto buffer = restored.AcquireReadAccess()
+                      .GetAllocator(segments[1].id)
+                      ->allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+}
+
+TEST(SegmentPoolTest,
+     SnapshotPreservesFragmentationAndLegacyAllocationHandles) {
+    SegmentManager legacy(BufferAllocatorType::OFFSET);
+    const UUID client = generate_uuid();
+    const auto segment = MakeSegment(0, "snapshot-handles");
+    ASSERT_EQ(legacy.getSegmentAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+
+    // SegmentManager does not release capacity in its destructor.
+    legacy.releaseCapacityMetrics();
+    auto allocator = legacy.getSegmentAccess().GetAllocator(segment.id);
+    auto first = allocator->allocate(4096);
+    auto hole = allocator->allocate(4096);
+    auto last = allocator->allocate(4096);
+    ASSERT_NE(first, nullptr);
+    ASSERT_NE(hole, nullptr);
+    ASSERT_NE(last, nullptr);
+    hole.reset();
+
+    msgpack::sbuffer handles;
+    MsgpackPacker packer(&handles);
+    packer.pack_array(2);
+    ASSERT_TRUE(
+        Serializer<AllocatedBuffer>::serialize(*first, legacy.getView(), packer)
+            .has_value());
+    ASSERT_TRUE(
+        Serializer<AllocatedBuffer>::serialize(*last, legacy.getView(), packer)
+            .has_value());
+
+    auto encoded = SegmentSerializer(&legacy).Serialize({});
+    ASSERT_TRUE(encoded.has_value());
+    SegmentPool restored(Drivers());
+    ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
+    auto target = std::dynamic_pointer_cast<OffsetBufferAllocator>(
+        restored.AcquireReadAccess().GetAllocator(segment.id));
+    ASSERT_NE(target, nullptr);
+    EXPECT_EQ(restored.GetMemoryUsage().used_bytes, 8192U);
+
+    auto next = target->allocate(4096);
+    ASSERT_NE(next, nullptr);
+    EXPECT_NE(next->data(), first->data());
+    EXPECT_NE(next->data(), last->data());
+    next.reset();
+
+    auto objects = msgpack::unpack(handles.data(), handles.size());
+    for (uint32_t i = 0; i < 2; ++i) {
+        const auto& fields = objects.get().via.array.ptr[i].via.array;
+        auto handle =
+            Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
+                fields.ptr[4], target->getOffsetAllocator());
+        ASSERT_TRUE(handle.has_value());
+        auto buffer = std::make_unique<AllocatedBuffer>(
+            target, reinterpret_cast<void*>(fields.ptr[1].as<uint64_t>()),
+            fields.ptr[0].as<uint64_t>(), std::move(**handle));
+        buffer.reset();
+        EXPECT_EQ(restored.GetMemoryUsage().used_bytes, (1U - i) * 4096U);
+    }
+
+    // Restored handles released and coalesced every block.
+    auto all = target->allocate(kRegionSize);
+    ASSERT_NE(all, nullptr);
+}
+
+TEST(SegmentPoolTest, MalformedSnapshotsPreservePublishedResourcesAndMetrics) {
+    SegmentPool pool(Drivers());
+    const UUID client = generate_uuid();
+    const auto segment = MakeSegment(0, "snapshot-atomic");
+    const auto other = MakeSegment(1, "snapshot-atomic-other");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(other, client),
+              ErrorCode::OK);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto live = allocator->allocate(4096);
+    ASSERT_NE(live, nullptr);
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value());
+    auto& metrics = MasterMetricManager::instance();
+    const auto used = metrics.get_allocated_mem_size();
+    const auto capacity = metrics.get_total_mem_capacity();
+
+    using Rewrite = std::function<void(msgpack::object&, msgpack::zone&)>;
+    const std::vector<std::pair<std::string, Rewrite>> cases{
+        {"missing owner",
+         [](auto& root, auto&) { SnapshotField(root, "cs").via.map.size = 0; }},
+        {"duplicate ownership",
+         [](auto& root, auto&) {
+             auto& ids = SnapshotField(root, "cs").via.map.ptr[0].val;
+             ids.via.array.ptr[1] = ids.via.array.ptr[0];
+         }},
+        {"unknown owned region",
+         [](auto& root, auto& zone) {
+             SnapshotField(root, "cs").via.map.ptr[0].val.via.array.ptr[0] =
+                 msgpack::object(UuidToString(UUID{99, 99}), zone);
+         }},
+        {"duplicate region",
+         [](auto& root, auto&) {
+             auto& regions = SnapshotField(root, "ms");
+             regions.via.map.ptr[1] = regions.via.map.ptr[0];
+         }},
+        {"invalid status",
+         [](auto& root, auto&) {
+             SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[5] =
+                 msgpack::object(99);
+         }},
+        {"mismatched base",
+         [](auto& root, auto&) {
+             SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[2] =
+                 msgpack::object(uint64_t{1});
+         }},
+        {"mismatched capacity",
+         [](auto& root, auto&) {
+             SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[3] =
+                 msgpack::object(uint64_t{1});
+         }},
+        {"mismatched name",
+         [](auto& root, auto& zone) {
+             SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[1] =
+                 msgpack::object(std::string("wrong"), zone);
+         }},
+        {"mismatched endpoint",
+         [](auto& root, auto& zone) {
+             SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[4] =
+                 msgpack::object(std::string("wrong"), zone);
+         }},
+        {"broken allocator",
+         [](auto& root, auto&) {
+             SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[7] =
+                 msgpack::object();
+         }},
+        {"usage exceeds capacity",
+         [](auto& root, auto&) {
+             SnapshotField(root, "ms")
+                 .via.map.ptr[1]
+                 .val.via.array.ptr[7]
+                 .via.array.ptr[3] = msgpack::object(uint64_t{kRegionSize + 1});
+         }},
+        {"usage overflows metrics",
+         [](auto& root, auto&) {
+             auto& allocator =
+                 SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[7];
+             allocator.via.array.ptr[2] =
+                 msgpack::object(std::numeric_limits<uint64_t>::max());
+             allocator.via.array.ptr[3] = allocator.via.array.ptr[2];
+         }},
+        {"second adoption fails",
+         [&](auto& root, auto& zone) {
+             // A zero UUID passes payload consistency checks but is rejected by
+             // the memory driver. The first active region has already staged.
+             const auto zero = msgpack::object(UuidToString(UUID{0, 0}), zone);
+             auto& regions = SnapshotField(root, "ms");
+             for (uint32_t i = 0; i < regions.via.map.size; ++i) {
+                 auto& item = regions.via.map.ptr[i];
+                 if (item.key.template as<std::string>() ==
+                     UuidToString(other.id)) {
+                     item.key = zero;
+                     item.val.via.array.ptr[0] = zero;
+                 }
+             }
+             auto& ids = SnapshotField(root, "cs").via.map.ptr[0].val;
+             for (uint32_t i = 0; i < ids.via.array.size; ++i) {
+                 if (ids.via.array.ptr[i].template as<std::string>() ==
+                     UuidToString(other.id)) {
+                     ids.via.array.ptr[i] = zero;
+                 }
+             }
+         }},
+        {"invalid local ssd",
+         [](auto& root, auto&) {
+             SnapshotField(root, "ld") = msgpack::object(42);
+         }},
+    };
+
+    for (const auto& [name, rewrite] : cases) {
+        SCOPED_TRACE(name);
+        auto corrupted = RewriteSnapshot(*encoded, rewrite);
+        auto result = DecodeAndRestore(pool, corrupted, true);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error().code, name == "second adoption fails"
+                                           ? ErrorCode::INVALID_PARAMS
+                                           : ErrorCode::DESERIALIZE_FAIL);
+        EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+
+        if (name == "second adoption fails") {
+            EXPECT_EQ(result.error().message, "restore SegmentPool failed");
+        } else if (name == "usage exceeds capacity" ||
+                   name == "usage overflows metrics") {
+            EXPECT_EQ(result.error().message,
+                      "snapshot OffsetBufferAllocator has invalid usage");
+        }
+
+        EXPECT_EQ(pool.AcquireReadAccess().Catalog().Regions().size(), 2U);
+        EXPECT_TRUE(pool.AcquireReadAccess().Placement().Contains(
+            segment.name, AllocationCandidateKind::NATIVE));
+        EXPECT_EQ(pool.GetMemoryUsage().used_bytes, 4096U);
+        EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, 2 * kRegionSize);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), used);
+        EXPECT_EQ(metrics.get_total_mem_capacity(), capacity);
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 4096);
+    }
+}
+
+TEST(SegmentPoolTest, SnapshotReadersAndEmptyReplacementBalanceMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    SegmentPool source(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-reader");
+    ASSERT_EQ(
+        source.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+        ErrorCode::OK);
+    auto live =
+        source.AcquireReadAccess().GetAllocator(segment.id)->allocate(4096);
+    ASSERT_NE(live, nullptr);
+    auto encoded = CaptureAndEncode(source, {});
+    ASSERT_TRUE(encoded.has_value());
+
+    SegmentPool empty(Drivers());
+    auto empty_encoded = CaptureAndEncode(empty, {});
+    ASSERT_TRUE(empty_encoded.has_value());
+    const auto baseline_used = metrics.get_allocated_mem_size();
+    const auto baseline_capacity = metrics.get_total_mem_capacity();
+
+    for (bool account_capacity : {false, true}) {
+        for (bool clear_with_empty : {false, true}) {
+            {
+                SegmentPool reader(Drivers());
+                for (int i = 0; i < 3; ++i) {
+                    ASSERT_TRUE(
+                        DecodeAndRestore(reader, *encoded, account_capacity)
+                            .has_value());
+                    EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 4096U);
+                    EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes,
+                              kRegionSize);
+                    EXPECT_EQ(metrics.get_allocated_mem_size(),
+                              baseline_used + 4096);
+                    EXPECT_EQ(metrics.get_total_mem_capacity(),
+                              baseline_capacity +
+                                  (account_capacity ? kRegionSize : 0));
+                }
+
+                if (clear_with_empty) {
+                    ASSERT_TRUE(DecodeAndRestore(reader, *empty_encoded,
+                                                 account_capacity)
+                                    .has_value());
+                    EXPECT_TRUE(
+                        reader.AcquireReadAccess().Catalog().Regions().empty());
+                    EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0U);
+                    EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0U);
+                    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
+                }
+            }
+            EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
+            EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+            EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+                      4096);
+            EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                      kRegionSize);
+        }
+    }
+}
+
+TEST(SegmentPoolTest, SnapshotReplacementBalancesExternallyRetainedAllocator) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_allocated_mem_size();
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-retained");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto retained = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto old_buffer = retained->allocate(4096);
+    ASSERT_NE(old_buffer, nullptr);
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value());
+    ASSERT_TRUE(DecodeAndRestore(pool, *encoded, true).has_value());
+    EXPECT_NE(pool.AcquireReadAccess().GetAllocator(segment.id), retained);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 8192);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 8192);
+
+    // Clearing the replacement must not erase the old allocator's usage label.
+    pool.AcquireWriteAccess().Clear();
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 4096);
+
+    old_buffer.reset();
+    retained.reset();
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    EXPECT_EQ(pool.GetMemoryUsage().used_bytes, 0U);
+}
+
+TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
+    auto& metrics = MasterMetricManager::instance();
+    for (bool retain_allocator : {false, true}) {
+        SCOPED_TRACE(retain_allocator);
+        const std::string name = "snapshot-label-cleanup";
+        const std::string label = "segment=\"" + name + "\"";
+        std::shared_ptr<BufferAllocatorBase> retained;
+        {
+            SegmentPool source(Drivers());
+            auto segment = MakeSegment(0, name);
+            ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment,
+                                                               generate_uuid()),
+                      ErrorCode::OK);
+            auto live = source.AcquireReadAccess()
+                            .GetAllocator(segment.id)
+                            ->allocate(4096);
+            ASSERT_NE(live, nullptr);
+            auto encoded = CaptureAndEncode(source, {});
+            ASSERT_TRUE(encoded.has_value());
+            SegmentPool restored(Drivers());
+            ASSERT_TRUE(DecodeAndRestore(restored, *encoded, true).has_value());
+            if (retain_allocator) {
+                retained =
+                    restored.AcquireReadAccess().GetAllocator(segment.id);
+            }
+            EXPECT_NE(metrics.serialize_metrics().find(label),
+                      std::string::npos);
+        }
+        if (retain_allocator) {
+            EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 4096);
+            EXPECT_NE(metrics.serialize_metrics().find(label),
+                      std::string::npos);
+        }
+        retained.reset();
+        EXPECT_EQ(metrics.get_segment_allocated_mem_size(name), 0);
+        EXPECT_EQ(metrics.get_segment_total_mem_capacity(name), 0);
+        EXPECT_EQ(metrics.serialize_metrics().find(label), std::string::npos);
+    }
+}
+
+TEST(SegmentPoolTest, EmptySnapshotAllocatorKeepsOtherPoolsCapacityLabels) {
+    SegmentPool source(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-shared-capacity");
+    ASSERT_EQ(
+        source.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+        ErrorCode::OK);
+    auto encoded = CaptureAndEncode(source, {});
+    ASSERT_TRUE(encoded.has_value());
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_total_mem_capacity();
+    {
+        SegmentPool reader(Drivers());
+        ASSERT_TRUE(DecodeAndRestore(reader, *encoded, true).has_value());
+        EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                  2 * kRegionSize);
+        reader.AcquireWriteAccess().Clear();
+    }
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              kRegionSize);
+    source.AcquireWriteAccess().Clear();
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
+TEST(SegmentPoolTest, SnapshotRejectsUnsupportedDriversAndCorruptContainers) {
+    RegionDriverConfig config;
+    config.memory_allocator = BufferAllocatorType::CACHELIB;
+    auto drivers = CreateRegionDrivers(config);
+    ASSERT_TRUE(drivers.has_value());
+    SegmentPool unsupported(std::move(*drivers));
+    auto encoded = CaptureAndEncode(unsupported, {});
+    ASSERT_FALSE(encoded.has_value());
+    EXPECT_EQ(encoded.error().code, ErrorCode::SERIALIZE_UNSUPPORTED);
+
+    SegmentPool cxl(Drivers(true));
+    ASSERT_EQ(cxl.AcquireWriteAccess().MountSegment(
+                  MakeSegment(0, "snapshot-cxl", "cxl"), generate_uuid()),
+              ErrorCode::OK);
+    encoded = CaptureAndEncode(cxl, {});
+    ASSERT_FALSE(encoded.has_value());
+    EXPECT_EQ(encoded.error().code, ErrorCode::SERIALIZE_UNSUPPORTED);
+
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(1, "snapshot-container");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+
+    // Invalid zstd, invalid MessagePack, and a valid non-map root.
+    const uint8_t invalid_msgpack = 0xc1;
+    const uint8_t array = 0x90;
+    const std::vector<std::vector<uint8_t>> corrupt{
+        {},
+        {1, 2, 3},
+        zstd_compress(&invalid_msgpack, 1, 3),
+        zstd_compress(&array, 1, 3)};
+    for (const auto& bytes : corrupt) {
+        auto decoded = DecodeAndRestore(pool, bytes, false);
+        ASSERT_FALSE(decoded.has_value());
+        EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
+        EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+    }
+}
+
+TEST(SegmentPoolTest, ForkedSnapshotEncodesWhileAnotherThreadOwnsPoolLock) {
+    SegmentPool pool(Drivers());
+    const UUID client = generate_uuid();
+    const auto segment = MakeSegment(0, "real-fork");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+              ErrorCode::OK);
+    auto live =
+        pool.AcquireReadAccess().GetAllocator(segment.id)->allocate(4096);
+    ASSERT_NE(live, nullptr);
+
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    std::promise<void> locked, release;
+    auto released = release.get_future();
+    std::thread holder([&] {
+        auto access = pool.AcquireWriteAccess();
+        locked.set_value();
+        released.wait();
+    });
+    locked.get_future().wait();
+
+    const pid_t child = fork();
+    if (child == 0) {
+        close(fds[0]);
+        alarm(10);  // A lock regression must fail, not hang the test suite.
+        auto encoded = CaptureAndEncode(pool, {});
+        if (!encoded) {
+            _exit(1);
+        }
+
+        size_t offset = 0;
+        while (offset < encoded->size()) {
+            const auto n = write(fds[1], encoded->data() + offset,
+                                 encoded->size() - offset);
+            if (n < 0 && errno == EINTR) {
+                continue;
+            }
+            if (n <= 0) {
+                _exit(2);
+            }
+            offset += static_cast<size_t>(n);
+        }
+        _exit(0);
+    }
+
+    close(fds[1]);
+    release.set_value();
+    holder.join();
+
+    std::vector<uint8_t> bytes;
+    uint8_t chunk[4096];
+    ssize_t n;
+    while ((n = read(fds[0], chunk, sizeof(chunk))) != 0) {
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n < 0) {
+            break;
+        }
+        bytes.insert(bytes.end(), chunk, chunk + n);
+    }
+    close(fds[0]);
+    ASSERT_GT(child, 0);
+
+    int status = 0;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    ASSERT_EQ(waited, child);
+    ASSERT_TRUE(WIFEXITED(status)) << status;
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+
+    SegmentPool restored(Drivers());
+    ASSERT_TRUE(DecodeAndRestore(restored, bytes, false).has_value());
+    EXPECT_EQ(restored.GetMemoryUsage().used_bytes, 4096U);
+    EXPECT_NE(restored.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
 }
 
 }  // namespace mooncake::test

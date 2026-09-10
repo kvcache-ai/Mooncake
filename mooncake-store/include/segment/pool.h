@@ -8,12 +8,11 @@
 #include "placement/replica_allocator.h"
 #include "segment/catalog.h"
 #include "segment/region_driver.h"
+#include "segment/snapshot.h"
 #include "segment/usage.h"
 #include "storage_usage.h"
 
 namespace mooncake {
-
-class SegmentPoolSnapshotView;
 
 class SegmentPool final {
     struct AccessKey {
@@ -30,7 +29,18 @@ class SegmentPool final {
 
     WriteAccess AcquireWriteAccess();
     ReadAccess AcquireReadAccess() const;
-    SegmentPoolSnapshotView GetSnapshotView() const noexcept;
+
+    // Capture detached data without acquiring pool/allocator locks. Only call
+    // in a forked snapshot child or with all relevant state externally
+    // quiesced. After capture, the result is independent of this pool's
+    // lifetime/mutations.
+    tl::expected<SegmentPoolSnapshot, ErrorCode> CaptureSnapshot() const;
+
+    // Consumes the snapshot, staging all resources before replacing the pool.
+    // Preparation failure leaves published state unchanged. Temporary readers
+    // may omit capacity accounting.
+    tl::expected<void, ErrorCode> RestoreSnapshot(
+        SegmentPoolSnapshot snapshot, bool account_capacity_metrics);
 
     // Holds the Pool read lock through candidate selection and allocation.
     template <ReplicaPlacementPolicy Policy = RandomPlacementPolicy>
@@ -58,8 +68,6 @@ class SegmentPool final {
     const RegionDriver* GetDriver(RegionKind kind) const;
     RegionResource* GetResource(const MountedRegion& mounted);
     const RegionResource* GetResource(const MountedRegion& mounted) const;
-
-    friend class SegmentPoolSnapshotView;
 
     mutable std::shared_mutex pool_mutex_;
     PlacementIndex placement_index_;

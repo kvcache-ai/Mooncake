@@ -24,6 +24,8 @@ class SegmentPool::WriteAccess final {
     class RegionUnmountTxn;
     class RegionGracefulUnmountTxn;
 
+    enum class AdoptMode { Insert, ReplacePool };
+
     WriteAccess(AccessKey, SegmentPool& segment_pool);
 
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
@@ -34,11 +36,11 @@ class SegmentPool::WriteAccess final {
     tl::expected<RegionMountTxn, ErrorCode> PrepareRestore(
         const Segment& segment, const UUID& client_id,
         std::span<const AllocatedBuffer::Descriptor> descriptors);
-    // When replacing_pool is true, the caller must Clear() the pool before
-    // committing any prepared transactions. Used by snapshot replacement.
+    // ReplacePool ignores conflicts with the old catalog. The caller must
+    // validate the replacement and Clear() before committing transactions.
     tl::expected<RegionMountTxn, ErrorCode> PrepareAdopt(
         MountedRegion mounted, std::shared_ptr<BufferAllocatorBase> allocator,
-        bool account_capacity_metrics, bool replacing_pool = false);
+        bool account_capacity_metrics, AdoptMode mode = AdoptMode::Insert);
     void Clear() noexcept;
 
     tl::expected<RegionUnmountTxn, ErrorCode> PrepareUnmount(

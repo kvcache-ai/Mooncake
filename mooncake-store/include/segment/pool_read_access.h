@@ -18,7 +18,6 @@ class SegmentPool::ReadAccess final {
 
     const RegionCatalog& Catalog() const;
     const PlacementIndex& Placement() const;
-    std::optional<BufferAllocatorType> GetMemoryAllocatorType() const;
 
     std::shared_ptr<BufferAllocatorBase> GetAllocator(
         const UUID& region_id) const;

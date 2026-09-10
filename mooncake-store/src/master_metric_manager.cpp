@@ -678,6 +678,7 @@ void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
                                                  int64_t val) {
     mem_total_capacity_.dec(val);
     if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
+    remove_segment_metrics(segment);
 }
 
 void MasterMetricManager::reset_total_mem_capacity() {
@@ -713,6 +714,11 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 }
 
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
+    if (segment.empty() ||
+        mem_allocated_size_per_segment_.value({segment}) != 0 ||
+        mem_total_capacity_per_segment_.value({segment}) != 0) {
+        return;
+    }
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
 }

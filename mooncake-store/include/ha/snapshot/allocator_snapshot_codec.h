@@ -1,7 +1,5 @@
 #pragma once
 
-#include <memory>
-
 #include <msgpack.hpp>
 #include <ylt/util/tl/expected.hpp>
 
@@ -15,9 +13,9 @@ namespace mooncake::ha {
 class AllocatorSnapshotCodec final {
    public:
     static tl::expected<void, SerializationError> Encode(
-        const BufferAllocatorBase& allocator, MsgpackPacker& packer);
-    static tl::expected<std::shared_ptr<BufferAllocatorBase>,
-                        SerializationError>
+        const OffsetBufferAllocatorSnapshot& snapshot, MsgpackPacker& packer);
+
+    static tl::expected<OffsetBufferAllocatorSnapshot, SerializationError>
     Decode(const msgpack::object& object);
 };
 

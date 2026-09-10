@@ -2,6 +2,7 @@
 #include <vector>
 
 #include "serialize/serializer.h"
+#include "ha/snapshot/allocator_snapshot_codec.h"
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "master_service.h"
@@ -980,21 +981,15 @@ Serializer<OffsetBufferAllocator>::serialize(
     packer.pack_array(6);
 
     // Serialize basic properties
-    packer.pack(allocator.segment_name_);
-    packer.pack(static_cast<uint64_t>(allocator.base_));
-    packer.pack(static_cast<uint64_t>(allocator.total_size_));
+    packer.pack(allocator.getSegmentName());
+    packer.pack(static_cast<uint64_t>(allocator.base()));
+    packer.pack(static_cast<uint64_t>(allocator.capacity()));
     packer.pack(static_cast<uint64_t>(allocator.size()));
-    packer.pack(allocator.transport_endpoint_);
+    packer.pack(allocator.getTransportEndpoint());
 
     // Serialize offset_allocator
-    auto result =
-        Serializer<mooncake::offset_allocator::OffsetAllocator>::serialize(
-            *allocator.getOffsetAllocator(), packer);
-    if (!result) {
-        return tl::unexpected(result.error());
-    }
-
-    return {};
+    return Serializer<mooncake::offset_allocator::OffsetAllocator>::serialize(
+        *allocator.getOffsetAllocator(), packer);
 }
 
 auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
@@ -1014,42 +1009,15 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
     }
 
     try {
-        msgpack::object *array = obj.via.array.ptr;
-
-        // Deserialize basic properties
-        std::string segment_name = array[0].as<std::string>();
-        auto base = static_cast<size_t>(array[1].as<uint64_t>());
-        auto total_size = static_cast<size_t>(array[2].as<uint64_t>());
-        auto cur_size = static_cast<size_t>(array[3].as<uint64_t>());
-        std::string transport_endpoint = array[4].as<std::string>();
-
-        // Deserialize offset_allocator
-        auto offset_allocator_result = Serializer<
-            mooncake::offset_allocator::OffsetAllocator>::deserialize(array[5]);
-        if (!offset_allocator_result) {
-            return tl::unexpected(offset_allocator_result.error());
+        auto snapshot = ha::AllocatorSnapshotCodec::Decode(obj);
+        if (!snapshot) return tl::unexpected(snapshot.error());
+        auto allocator = OffsetBufferAllocator::Restore(std::move(*snapshot));
+        if (!allocator) {
+            return tl::unexpected(SerializationError(
+                allocator.error(),
+                "deserialize OffsetBufferAllocator rejected its state"));
         }
-
-        // Create OffsetBufferAllocator instance
-        auto allocator = std::make_shared<OffsetBufferAllocator>(
-            segment_name, base, total_size, transport_endpoint);
-
-        // Set internal member variable values
-        allocator->offset_allocator_ = offset_allocator_result.value();
-        allocator->RestoreUsageBytes(cur_size);
-
-        // The snapshot restores usage directly from persisted data
-        // without going through the live allocate()/adoptImportedBuffer()
-        // paths, so no inc_allocated_mem_size() was paired with it. The
-        // allocator destructor still calls dec_allocated_mem_size(usage)
-        // to undo its contribution to the global metric; without a matching
-        // inc the gauge would go negative and wrap to ~16M TB when formatted
-        // as uint64. Pair it here so the accounting stays symmetric and the
-        // gauge ends at 0 after this (often throwaway) allocator is destroyed.
-        MasterMetricManager::instance().inc_allocated_mem_size(
-            segment_name, static_cast<int64_t>(cur_size));
-
-        return allocator;
+        return std::move(*allocator);
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,

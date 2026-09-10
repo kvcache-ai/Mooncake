@@ -4,8 +4,10 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 
 #include "master_metric_manager.h"
 
@@ -219,6 +221,7 @@ CachelibBufferAllocator::~CachelibBufferAllocator() {
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
                                                                size());
+        MasterMetricManager::instance().remove_segment_metrics(segment_name_);
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
                                                                size());
@@ -384,10 +387,54 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
     }
 }
 
+OffsetBufferAllocator::OffsetBufferAllocator(
+    OffsetBufferAllocatorSnapshot snapshot,
+    std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator)
+    : segment_name_(std::move(snapshot.segment_name)),
+      base_(snapshot.base),
+      total_size_(snapshot.capacity),
+      transport_endpoint_(std::move(snapshot.transport_endpoint)),
+      replica_type_(ReplicaType::MEMORY),
+      offset_allocator_(std::move(offset_allocator)) {}
+
+tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
+OffsetBufferAllocator::Restore(OffsetBufferAllocatorSnapshot snapshot) {
+    const auto used_bytes = snapshot.used_bytes;
+    if (snapshot.allocation_state.base != snapshot.base ||
+        snapshot.allocation_state.capacity != snapshot.capacity ||
+        used_bytes > snapshot.capacity ||
+        used_bytes >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto offset_allocator = offset_allocator::OffsetAllocator::Restore(
+        std::move(snapshot.allocation_state));
+    if (!offset_allocator) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto allocator =
+        std::shared_ptr<OffsetBufferAllocator>(new OffsetBufferAllocator(
+            std::move(snapshot), std::move(*offset_allocator)));
+    // No allocation handles exist yet. Pair restored usage with the same
+    // accounting that allocate()/destruction use, before publishing the object.
+    MasterMetricManager::instance().inc_allocated_mem_size(
+        allocator->segment_name_, static_cast<int64_t>(used_bytes));
+    allocator->SetUsageBytesForRestore(used_bytes);
+    return allocator;
+}
+
+OffsetBufferAllocatorSnapshot OffsetBufferAllocator::CaptureSnapshot() const {
+    return {segment_name_,       base_,
+            total_size_,         size(),
+            transport_endpoint_, offset_allocator_->CaptureSnapshot()};
+}
+
 OffsetBufferAllocator::~OffsetBufferAllocator() {
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
                                                                size());
+        MasterMetricManager::instance().remove_segment_metrics(segment_name_);
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
                                                                size());

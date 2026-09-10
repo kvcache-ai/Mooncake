@@ -5,6 +5,7 @@
 #include <atomic>
 #include <memory>
 #include <optional>
+#include <type_traits>
 #include <vector>
 #include <algorithm>
 #include <glog/logging.h>
@@ -21,6 +22,7 @@ using NodeIndex = uint32;
 // Forward declarations
 class OffsetAllocator;
 class __Allocator;
+struct OffsetAllocatorSnapshot;
 
 static constexpr uint32 NUM_TOP_BINS = 32;
 static constexpr uint32 BINS_PER_LEAF = 8;
@@ -191,6 +193,15 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics() const;
 
+    // Deep-copy persisted layout without locking. Only for a forked snapshot
+    // child or externally quiesced state; the result owns no live resources.
+    OffsetAllocatorSnapshot CaptureSnapshot() const;
+
+    // Consumes a captured snapshot and rebuilds the allocator from its layout.
+    // Returns std::nullopt when the snapshot is internally inconsistent.
+    static std::optional<std::shared_ptr<OffsetAllocator>> Restore(
+        OffsetAllocatorSnapshot snapshot);
+
     // Serialize the allocator with serializer.
     template <typename T>
     void serialize_to(T& serializer) const;
@@ -245,7 +256,10 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 class __Allocator {
    public:
     __Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity);
+    // Excludes __Allocator itself, so copy construction never resolves to this
+    // serializer overload instead of the copy constructor.
     template <typename T>
+        requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
     __Allocator(T& serializer) noexcept(false);
     __Allocator(__Allocator&& other);
     ~__Allocator() = default;
@@ -265,6 +279,9 @@ class __Allocator {
     void serialize_to(T& serializer) const;
 
    private:
+    // Detaches the bin/node state for OffsetAllocator::CaptureSnapshot().
+    __Allocator(const __Allocator&) = default;
+
     uint32 insertNodeIntoBin(uint32 size, uint32 dataOffset);
     void removeNodeFromBin(uint32 nodeIndex);
 
@@ -296,6 +313,17 @@ class __Allocator {
     friend class OffsetAllocatorTest;  // for unit tests
     friend class mooncake::Serializer<__Allocator>;
     friend class OffsetAllocator;  // for visit_used_nodes / createHandleAtNode
+};
+
+// Owned allocation metadata. No runtime allocator, handles or mutex are
+// retained. The internal bin/node layout is deeply copied during capture.
+struct OffsetAllocatorSnapshot {
+    uint64_t base;
+    uint64_t multiplier_bits;
+    uint64_t capacity;
+    uint64_t allocated_size;
+    uint64_t allocated_num;
+    std::unique_ptr<__Allocator> layout;
 };
 
 // Template method implementations
@@ -381,6 +409,7 @@ void __Allocator::serialize_to(T& serializer) const {
 }
 
 template <typename T>
+    requires(!std::is_same_v<std::remove_cvref_t<T>, __Allocator>)
 __Allocator::__Allocator(T& serializer) {
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {

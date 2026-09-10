@@ -1,5 +1,4 @@
 #include "segment/pool.h"
-#include "segment/snapshot_view.h"
 
 #include "segment/pool_write_access.h"
 #include "segment/pool_read_access.h"
@@ -31,10 +30,6 @@ tl::expected<Replica, ErrorCode> SegmentPool::AllocateInSegment(
     auto access = AcquirePlacementAccess();
     return ReplicaAllocator(PreferredOnlyPlacementPolicy(kind))
         .AllocateFrom(access, size, segment_name, replica_type);
-}
-
-SegmentPoolSnapshotView SegmentPool::GetSnapshotView() const noexcept {
-    return SegmentPoolSnapshotView(this);
 }
 
 StorageUsageSnapshot SegmentPool::GetMemoryUsageSnapshot() const {

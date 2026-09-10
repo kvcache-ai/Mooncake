@@ -6,6 +6,7 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <stdexcept>
 
 #include "common/byte_size.h"
 #include "mutex.h"
@@ -548,6 +549,31 @@ std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
     // Use a custom deleter to allow private constructor
     return std::shared_ptr<OffsetAllocator>(
         new OffsetAllocator(base, size, init_capacity, max_capacity));
+}
+
+OffsetAllocatorSnapshot OffsetAllocator::CaptureSnapshot() const {
+    // The snapshot owns its layout: it can outlive this allocator and must
+    // never observe later mutations, so the bin/node state is copied here.
+    // The copy constructor is private; OffsetAllocator is a friend.
+    std::unique_ptr<__Allocator> layout(new __Allocator(*m_allocator));
+    return {m_base,           m_multiplier_bits, m_capacity,
+            m_allocated_size, m_allocated_num,   std::move(layout)};
+}
+std::optional<std::shared_ptr<OffsetAllocator>> OffsetAllocator::Restore(
+    OffsetAllocatorSnapshot snapshot) {
+    if (!snapshot.layout || snapshot.multiplier_bits >= 64 ||
+        snapshot.multiplier_bits != calculateMultiplier(snapshot.capacity) ||
+        snapshot.layout->m_size !=
+            (snapshot.capacity >> snapshot.multiplier_bits) ||
+        snapshot.allocated_size > snapshot.capacity) {
+        return std::nullopt;
+    }
+    auto allocator = std::shared_ptr<OffsetAllocator>(new OffsetAllocator(
+        snapshot.base, snapshot.capacity, snapshot.multiplier_bits,
+        std::move(snapshot.layout)));
+    allocator->m_allocated_size = snapshot.allocated_size;
+    allocator->m_allocated_num = snapshot.allocated_num;
+    return allocator;
 }
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
