@@ -375,7 +375,7 @@ class MetadataScanBench {
 
     static inline std::atomic<uint64_t> sink_work_{0};
 
-    // GroupIndex contention: N threads performing LeaseFor + AddMember on
+    // GroupIndex contention: N threads performing AddMember on
     // distinct groups (the per-put publication path). Reports aggregate
     // ops/s per thread count so the single-mutex serialization is visible.
     static void RunGroupIndexContention(
@@ -393,8 +393,7 @@ class MetadataScanBench {
                     while (!stop.load(std::memory_order_relaxed)) {
                         const std::string group =
                             prefix + std::to_string(ops % 4096);
-                        auto lease = tenant_state.group_index.LeaseFor(group);
-                        tenant_state.group_index.AddMember(
+                        auto lease = tenant_state.group_index.AddMember(
                             group, "member_" + std::to_string(ops));
                         if (lease) {
                             ++ops;

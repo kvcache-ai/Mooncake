@@ -34,7 +34,7 @@ TEST(TenantCatalogTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
     ASSERT_NE(member->metadata().lease(), nullptr);  // shared lease wired
     EXPECT_EQ(
         member->metadata().lease().get(),
-        catalog.group_index.LeaseFor("g1").get());  // same single shared lease
+        catalog.group_index.LeaseForTest("g1").get());  // single shared lease
 }
 
 TEST(TenantCatalogTest, InsertObjectDoesNotJoinForSingleton) {
@@ -75,7 +75,6 @@ TEST(TenantCatalogTest, EmptyTracksRouteGroupsAndLeases) {
     EXPECT_TRUE(catalog.Empty());
 
     // Group membership also counts.
-    catalog.group_index.LeaseFor("g1");
     catalog.group_index.AddMember("g1", "k1");
     EXPECT_FALSE(catalog.Empty());
     catalog.group_index.RemoveMember("g1", "k1");
@@ -95,7 +94,6 @@ TEST(TenantCatalogTest,
     // A grouped member is just a flat route entry with a group_id annotation.
     auto member = MakeEntry("k2", "g1");
     catalog.object_index.Insert("k2", member);
-    catalog.group_index.LeaseFor("g1");
     catalog.group_index.AddMember("g1", "k2");
 
     EXPECT_EQ(catalog.ObjectCount(), 1u);

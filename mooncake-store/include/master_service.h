@@ -1237,6 +1237,26 @@ class MasterService {
         QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
         metadata::TenantCatalog* tenant_accessor = nullptr,
         const std::vector<std::string>& previous_media_hint = {});
+    // Erase variant for callers that already hold entry->mutex and validated
+    // under it. Claims teardown under that lock (no-op when already torn
+    // down), releases the lock and performs the identity-checked route
+    // mutation. Takes ownership of the lock.
+    void EraseMetadataLocked(
+        metadata::TenantCatalog& tenant_state,
+        const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
+        const TenantId& tenant_id,
+        std::unique_lock<std::shared_mutex> object_lock,
+        QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
+        metadata::TenantCatalog* tenant_accessor = nullptr,
+        const std::vector<std::string>& previous_media_hint = {});
+    // Locked kernel behind both erases — caller holds entry->mutex and has
+    // already claimed teardown. Returns whether the entry had a completed
+    // LOCAL_DISK replica, needed by the post-route accounting.
+    bool TearDownEntryLocked(
+        metadata::TenantCatalog& tenant_state,
+        mooncake::metadata::ObjectEntry& entry, const TenantId& tenant_id,
+        QuotaEraseMode quota_mode,
+        const std::vector<std::string>& previous_media_hint);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata);
@@ -1306,9 +1326,11 @@ class MasterService {
 
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client no longer retains resources.
+    // Caller holds entry->mutex; entry is the owner of metadata.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        metadata::TenantCatalog& tenant_state,
+        mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
         metadata::TenantCatalog* tenant_accessor = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
@@ -1316,7 +1338,8 @@ class MasterService {
     // count) instead of duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        metadata::TenantCatalog& tenant_state,
+        mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
         metadata::TenantCatalog* tenant_accessor = nullptr);
 
@@ -1377,11 +1400,11 @@ class MasterService {
         const ObjectIdentity& object_id, Replica& replica,
         std::vector<UUID>* mirror_clients = nullptr);
 
-    // Cancels the offload task on `object_id`, releasing the source refcnt
+    // Cancels the offload task on `entry`, releasing the source refcnt
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
-    // store worker.
-    bool CancelQueuedOffloadTask(metadata::TenantCatalog& tenant_state,
+    // store worker. Caller holds entry->mutex.
+    bool CancelQueuedOffloadTask(mooncake::metadata::ObjectEntry& entry,
                                  ObjectMetadata& metadata,
                                  const ObjectIdentity& object_id);
 
@@ -1452,8 +1475,11 @@ class MasterService {
     // Locked kernel — caller must hold the entry's mutex.
     void ErasePromotionTaskLocked(metadata::TenantCatalog& tenant_state,
                                   mooncake::metadata::ObjectEntry& entry);
+    // Cancels a promotion task whose alloc_id is among the removed replicas.
+    // Caller holds entry->mutex; entry is the owner of metadata.
     void CancelPromotionTaskForRemovedReplicas(
-        metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        metadata::TenantCatalog& tenant_state,
+        mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1536,7 +1562,7 @@ class MasterService {
                     },
                     &removed_replica_ids);
                 service_->CancelPromotionTaskForRemovedReplicas(
-                    *tenant_state_, metadata, removed_replica_ids);
+                    *tenant_state_, *entry_, metadata, removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(metadata);
                 if (service_->enable_multi_tenants_ &&
@@ -1570,10 +1596,12 @@ class MasterService {
             }
         }
 
-        // Check if metadata exists
+        // Check if metadata exists. A torn-down entry keeps its metadata
+        // wired until the route slot is erased, but its accounting is already
+        // released, so it must not read as present.
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr && entry_ != nullptr &&
-                   entry_->metadata().IsValid();
+                   !entry_->is_torn_down && entry_->metadata().IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1606,13 +1634,15 @@ class MasterService {
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase(const std::vector<std::string>& previous_media_hint = {})
             NO_THREAD_SAFETY_ANALYSIS {
-            // Release the per-object lock first; EraseMetadata re-locks it for
-            // teardown and releases it before the route mutation. The two locks
-            // are never held together.
-            lock_ = std::unique_lock<std::shared_mutex>();
-            service_->EraseMetadata(*tenant_state_, entry_,
-                                    object_id_.tenant_id, QuotaEraseMode::kFull,
-                                    tenant_state_, previous_media_hint);
+            // The accessor's lock moves into EraseMetadataLocked: teardown is
+            // claimed under it (keeping the caller's checks atomic with the
+            // delete) and released only before the route mutation.
+            if (entry_ == nullptr) {
+                return;
+            }
+            service_->EraseMetadataLocked(
+                *tenant_state_, entry_, object_id_.tenant_id, std::move(lock_),
+                QuotaEraseMode::kFull, tenant_state_, previous_media_hint);
             entry_.reset();
         }
 
@@ -1642,11 +1672,15 @@ class MasterService {
                     client_id, now, total_length, std::move(replicas),
                     std::nullopt, enable_hard_pin, data_type, group_id,
                     object_id_.tenant_id, object_id_.user_key));
+            // Lock before publishing: an unlocked peek at the half-wired
+            // envelope would read invalid and auto-clean it. Deadlock-free
+            // because no path takes the route lock and then an entry lock.
+            lock_ = entry->LockUnique();
             if (!tenant_state_->InsertObject(object_id_.user_key, entry)) {
                 // A concurrent writer already inserted this key. Re-pin the
                 // existing entry and use it instead of the orphan we built.
-                // Drop any lock EnsureTenantCatalog() took first, or the same
-                // thread would re-lock a mutex it already holds.
+                // Drop the orphan's lock first, or the same thread would
+                // re-lock a mutex it already holds.
                 lock_ = std::unique_lock<std::shared_mutex>();
                 entry_.reset();
                 entry_ = tenant_state_->Get(object_id_.user_key);
@@ -1663,7 +1697,6 @@ class MasterService {
             // write in flight), so it must not be marked processing. Primary
             // write processing is set by the PutStart/Upsert paths.
             entry_ = entry;
-            lock_ = entry_->LockUnique();
         }
 
        private:
@@ -1729,7 +1762,8 @@ class MasterService {
 
         // Serialize a single tenant's metadata (per-tenant payload).
         tl::expected<void, SerializationError> SerializeTenant(
-            const TenantId& tenant_id, const metadata::TenantCatalog& tenant_state,
+            const TenantId& tenant_id,
+            const metadata::TenantCatalog& tenant_state,
             MsgpackPacker& packer) const;
 
         // Deserialize a single tenant's payload into the TenantDirectory.
@@ -1761,10 +1795,12 @@ class MasterService {
                                       : std::shared_lock<std::shared_mutex>()) {
         }
 
-        // Check if metadata exists
+        // Check if metadata exists. A torn-down entry keeps its metadata
+        // wired until the route slot is erased, but its accounting is already
+        // released, so it must not read as present.
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_ != nullptr && entry_ != nullptr &&
-                   entry_->metadata().IsValid();
+                   !entry_->is_torn_down && entry_->metadata().IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
@@ -1960,7 +1996,8 @@ class MasterService {
     // Locked kernel — caller must hold the entry's mutex. Drops the pending
     // DR task state and erases the key's lease-table records.
     void ClearDynamicReplicationStateLocked(
-        metadata::TenantCatalog& tenant_state, mooncake::metadata::ObjectEntry& entry);
+        metadata::TenantCatalog& tenant_state,
+        mooncake::metadata::ObjectEntry& entry);
     void CleanupExpiredDynamicReplicationState();
     // Caller must hold the entry's mutex.
     bool HasDynamicReplicationPending(metadata::TenantCatalog& tenant_state,

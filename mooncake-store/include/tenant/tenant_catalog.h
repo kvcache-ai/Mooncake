@@ -35,10 +35,14 @@ class TenantCatalog {
         }
         const std::string group_id = entry->group_id();
         if (!group_id.empty()) {
-            entry->metadata().SetLease(group_index.LeaseFor(group_id));
-            if (!group_index.AddMember(group_id, entry->key())) {
+            // One atomic group operation: materialize + register + fetch the
+            // paired lease, so membership and the metadata's lease can never
+            // disagree across a concurrent destroy/recreate of the group.
+            auto lease = group_index.AddMember(group_id, entry->key());
+            if (lease == nullptr) {
                 return false;
             }
+            entry->metadata().SetLease(std::move(lease));
         }
         if (!object_index.Insert(entry->key(), entry)) {
             if (!group_id.empty()) {
@@ -113,13 +117,14 @@ class TenantCatalog {
                 continue;
             }
             ObjectMetadata& metadata = entry->metadata();
-            auto lease = group_index.LeaseFor(metadata.group_id);
-            group_index.AddMember(metadata.group_id, entry->key());
+            auto lease = group_index.AddMember(metadata.group_id, entry->key());
             auto it = max_deadline_by_group.find(metadata.group_id);
-            if (it != max_deadline_by_group.end()) {
-                lease->ExtendTo(it->second);
+            if (lease != nullptr) {
+                if (it != max_deadline_by_group.end()) {
+                    lease->ExtendTo(it->second);
+                }
+                metadata.SetLease(std::move(lease));
             }
-            metadata.SetLease(lease);
         }
     }
 

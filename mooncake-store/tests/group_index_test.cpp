@@ -23,17 +23,12 @@ std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
         group_id, TenantId(), key));
 }
 
-TEST(GroupIndexTest, StartsWithNoGroups) {
-    GroupIndex index;
-    EXPECT_TRUE(index.Members("g1").empty());
-}
-
-TEST(GroupIndexTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
+TEST(GroupIndexTest, AddMemberCreatesAndSharesOneLeasePerGroup) {
     GroupIndex index;
 
-    auto a1 = index.LeaseFor("g1");
-    auto a2 = index.LeaseFor("g1");
-    auto b = index.LeaseFor("g2");
+    auto a1 = index.AddMember("g1", "k1");
+    auto a2 = index.AddMember("g1", "k2");
+    auto b = index.AddMember("g2", "k1");
 
     ASSERT_NE(a1, nullptr);
     EXPECT_EQ(a1.get(), a2.get());  // same group -> same shared Lease
@@ -42,10 +37,9 @@ TEST(GroupIndexTest, LeaseForCreatesAndSharesOneLeasePerGroup) {
 
 TEST(GroupIndexTest, AddRemoveGroupMembers) {
     GroupIndex index;
-    index.LeaseFor("g1");
 
-    EXPECT_TRUE(index.AddMember("g1", "k1"));
-    EXPECT_TRUE(index.AddMember("g1", "k2"));
+    EXPECT_NE(index.AddMember("g1", "k1"), nullptr);
+    EXPECT_NE(index.AddMember("g1", "k2"), nullptr);
 
     auto members = index.Members("g1");
     EXPECT_EQ(members.size(), 2u);
@@ -56,15 +50,16 @@ TEST(GroupIndexTest, AddRemoveGroupMembers) {
     EXPECT_EQ(after[0], "k2");
 }
 
-TEST(GroupIndexTest, AddingToUndefinedGroupIsRejected) {
+TEST(GroupIndexTest, DuplicateMemberIsRejected) {
     GroupIndex index;
-    // Group must be materialized via LeaseFor before members are registered.
-    EXPECT_FALSE(index.AddMember("nope", "k1"));
+    EXPECT_NE(index.AddMember("g1", "k1"), nullptr);
+    // Already registered -> nullptr (the caller reports already-exists).
+    EXPECT_EQ(index.AddMember("g1", "k1"), nullptr);
+    EXPECT_EQ(index.Members("g1").size(), 1u);
 }
 
 TEST(GroupIndexTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
     GroupIndex index;
-    index.LeaseFor("g1");
     index.AddMember("g1", "k1");
 
     EXPECT_EQ(index.Members("g1").size(), 1u);
@@ -75,25 +70,23 @@ TEST(GroupIndexTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
 
 TEST(GroupIndexTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
     GroupIndex index;
-    index.LeaseFor("g1");
-    index.AddMember("g1", "k1");
+    auto g1 = index.AddMember("g1", "k1");
     index.AddMember("g1", "k2");
 
     // Distinct groups get independent shared leases.
-    auto g2 = index.LeaseFor("g2");
+    auto g2 = index.AddMember("g2", "k1");
     ASSERT_NE(g2, nullptr);
-    EXPECT_NE(index.LeaseFor("g1").get(), g2.get());
+    EXPECT_NE(g1.get(), g2.get());
 
     // All-or-none: every member of the group shares the one Lease, so a live
     // shared lease protects the whole group and one deadline expires it all.
     const auto now = std::chrono::system_clock::now();
 
-    auto shared = index.LeaseFor("g1");
-    shared->GrantReadLease(std::chrono::milliseconds(10'000));
-    EXPECT_FALSE(shared->IsExpired(now));
+    g1->GrantReadLease(std::chrono::milliseconds(10'000));
+    EXPECT_FALSE(g1->IsExpired(now));
 
-    shared->SetDeadline(now);
-    EXPECT_TRUE(shared->IsExpired(now));
+    g1->SetDeadline(now);
+    EXPECT_TRUE(g1->IsExpired(now));
 }
 
 }  // namespace

@@ -555,9 +555,8 @@ class MasterServiceTest : public ::testing::Test {
         if (!tenant_handle) {
             return nullptr;
         }
-        // The shared group Lease is single-sourced in the tenant's
-        // object_index.
-        return tenant_handle->group_index.LeaseFor(group_id);
+        // The shared group Lease is single-sourced in the group index.
+        return tenant_handle->group_index.LeaseForTest(group_id);
     }
 
     void ReRouteRestoredObjectsMigrationForTest(MasterService& service) {

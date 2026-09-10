@@ -1736,7 +1736,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
         return IsEvictableMemoryReplica(replica);
     };
 
-    std::vector<std::string> members_to_erase;
+    std::vector<std::shared_ptr<metadata::ObjectEntry>> members_to_erase;
     for (const auto& member_key : member_keys) {
         auto entry = tenant_state.Get(member_key);
         if (!entry) {
@@ -1769,16 +1769,18 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
             result.error = member_outcome.error;
             break;
         }
-        // Members other than the trigger are erased here (after the lock is
-        // released); the trigger is erased by the caller. gated by
+        // Non-trigger members classified invalid are erased after the lock
+        // is released; the trigger is erased by the caller. Gated by
         // !enable_oplog_ like the original callback path.
         if (member_key != key && !enable_oplog_ && !member_metadata.IsValid()) {
-            members_to_erase.push_back(member_key);
+            members_to_erase.push_back(entry);
         }
     }
-    // Erase invalid non-trigger members WITHOUT holding any entry lock.
-    for (const auto& member_key : members_to_erase) {
-        EraseMetadata(tenant_state, tenant_state.Get(member_key), tenant_id,
+    // The entry-based erase re-locks each member and only drops the route
+    // slot when it still resolves to the torn-down entry, so a same-key
+    // replacement published meanwhile survives.
+    for (const auto& member_entry : members_to_erase) {
+        EraseMetadata(tenant_state, member_entry, tenant_id,
                       QuotaEraseMode::kFull, &tenant_state);
     }
     // NOTE: empty tenants are deliberately left in the directory. An
@@ -1955,6 +1957,9 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (!object_entry) {
         return;
     }
+    // The vector and ledger mutations below race any lock-holding point op
+    // (Get/PutEnd) unless they run under the entry's mutex.
+    auto object_lock = object_entry->LockUnique();
 
     std::unordered_set<ReplicaID> ids(replica_ids.begin(), replica_ids.end());
     auto& metadata = object_entry->metadata();
@@ -2014,11 +2019,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_local_disk) {
         tenant_state.OnDiskReplicaRemoved(erased_local_disk, metadata);
     }
-    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+    CancelPromotionTaskForRemovedReplicas(tenant_state, *object_entry, metadata,
                                           erased_replica_ids);
     if (!metadata.IsValid()) {
-        EraseMetadata(tenant_state, object_entry, tenant_id, quota_mode,
-                      &tenant_state);
+        EraseMetadataLocked(tenant_state, object_entry, tenant_id,
+                            std::move(object_lock), quota_mode, &tenant_state);
     } else {
         SyncKvObjectState(durable_entry.object_key, metadata, tenant_id,
                           previous_media);
@@ -2255,31 +2260,13 @@ void MasterService::ErasePromotionTaskLocked(
 // dec_refcnt), the processing flag, the replication task, and promotion
 // task state.
 // Callers no longer need to clean these up manually before calling.
-void MasterService::EraseMetadata(
+bool MasterService::TearDownEntryLocked(
     metadata::TenantCatalog& tenant_state,
-    const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
-    const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    metadata::TenantCatalog* tenant_accessor,
+    mooncake::metadata::ObjectEntry& entry, const TenantId& tenant_id,
+    QuotaEraseMode quota_mode,
     const std::vector<std::string>& previous_media_hint) {
-    if (!entry) {
-        return;
-    }
-    // Take the per-object lock for teardown so concurrent point ops on the same
-    // object are excluded. Release it before the route mutation so entry->mutex
-    // and route_lock_ are never held together (lock-order invariant).
-    auto object_lock = entry->LockUnique();
-    // Claim teardown ownership under the object lock. A concurrent eraser
-    // that pinned this entry before the route erase would otherwise run the
-    // whole teardown again and double-release refcounts, quota charges and
-    // KV removal events. The metadata stays wired (only the flag flips), so
-    // readers holding a pin never observe null metadata.
-    if (entry->is_torn_down) {
-        return;
-    }
-    entry->is_torn_down = true;
-    const std::string key = entry->key();
-    const std::string group_id = entry->group_id();
-    ObjectMetadata& metadata = entry->metadata();
+    const std::string key = entry.key();
+    ObjectMetadata& metadata = entry.metadata();
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -2303,36 +2290,35 @@ void MasterService::EraseMetadata(
     // When BatchEvict deletes metadata, Store Worker may still have an
     // in-flight offload for this key. Without this cleanup the task
     // becomes an orphan that only expires after 600s.
-    if (entry->offloading_task.has_value()) {
-        auto source =
-            metadata.GetReplicaByID(entry->offloading_task->source_id);
+    if (entry.offloading_task.has_value()) {
+        auto source = metadata.GetReplicaByID(entry.offloading_task->source_id);
         if (source != nullptr) {
             source->dec_refcnt();
         }
-        entry->offloading_task.reset();
+        entry.offloading_task.reset();
 
         // The mailbox entry must be dropped too, otherwise the next
         // OffloadObjectHeartbeat drains a task-less key back to the client and
         // produces an orphan bucket.
         local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
     }
-    entry->is_processing = false;
-    if (entry->replication_task.has_value()) {
+    entry.is_processing = false;
+    if (entry.replication_task.has_value()) {
         auto source =
-            metadata.GetReplicaByID(entry->replication_task->source_id);
+            metadata.GetReplicaByID(entry.replication_task->source_id);
         if (source != nullptr) {
             source->dec_refcnt();
         }
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
-                           entry->replication_task->pending_quota_charge_bytes);
-        entry->replication_task.reset();
+                           entry.replication_task->pending_quota_charge_bytes);
+        entry.replication_task.reset();
     }
-    ErasePromotionTaskLocked(tenant_state, *entry);
+    ErasePromotionTaskLocked(tenant_state, entry);
     // The global candidate count must be settled here: an erased entry can
     // no longer reach the retry loop's expiry path, so its candidate would
     // permanently leak a slot toward the admission limit.
-    EraseCandidateLocked(*entry);
-    ClearDynamicReplicationStateLocked(tenant_state, *entry);
+    EraseCandidateLocked(entry);
+    ClearDynamicReplicationStateLocked(tenant_state, entry);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     FreeDfsReplicas(key, metadata.GetAllReplicas());
@@ -2369,6 +2355,28 @@ void MasterService::EraseMetadata(
             }
             break;
     }
+    return had_completed_disk;
+}
+
+void MasterService::EraseMetadataLocked(
+    metadata::TenantCatalog& tenant_state,
+    const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
+    const TenantId& tenant_id, std::unique_lock<std::shared_mutex> object_lock,
+    QuotaEraseMode quota_mode, metadata::TenantCatalog* tenant_accessor,
+    const std::vector<std::string>& previous_media_hint) {
+    // Claim teardown ownership under the caller-held object lock. A
+    // concurrent eraser that pinned this entry before the route erase would
+    // otherwise run the whole teardown again and double-release refcounts,
+    // quota charges and KV removal events. The metadata stays wired (only
+    // the flag flips), so readers holding a pin never observe null metadata.
+    if (entry->is_torn_down) {
+        return;
+    }
+    entry->is_torn_down = true;
+    const std::string key = entry->key();
+    const std::string group_id = entry->group_id();
+    bool had_completed_disk = TearDownEntryLocked(
+        tenant_state, *entry, tenant_id, quota_mode, previous_media_hint);
     // Release the object lock BEFORE the route mutation, so the route erase
     // (EraseObjectIf, route_lock_ unique) never runs under an entry lock.
     object_lock.unlock();
@@ -2380,6 +2388,28 @@ void MasterService::EraseMetadata(
         tenant_accessor->OnDiskReplicaRemoved(had_completed_disk);
     }
     tenant_state.UnregisterGroupMember(key, group_id);
+}
+
+// EraseMetadata deletes the object metadata and also cleans up all
+// associated per-key state on the entry: the offloading task (with
+// dec_refcnt), the processing flag, the replication task, and promotion
+// task state.
+// Callers no longer need to clean these up manually before calling.
+void MasterService::EraseMetadata(
+    metadata::TenantCatalog& tenant_state,
+    const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
+    const TenantId& tenant_id, QuotaEraseMode quota_mode,
+    metadata::TenantCatalog* tenant_accessor,
+    const std::vector<std::string>& previous_media_hint) {
+    if (!entry) {
+        return;
+    }
+    // Take the per-object lock for teardown so concurrent point ops on the
+    // same object are excluded, then hand it to EraseMetadataLocked, which
+    // releases it before the route mutation (lock-order invariant).
+    auto object_lock = entry->LockUnique();
+    EraseMetadataLocked(tenant_state, entry, tenant_id, std::move(object_lock),
+                        quota_mode, tenant_accessor, previous_media_hint);
 }
 
 void MasterService::ReleaseLocalDiskUsage(
@@ -2618,7 +2648,6 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         metadata::TenantCatalog& tenant_accessor = *handle;
         auto& tenant_state = *handle;
         auto objs = handle->SnapshotObjects();
-        std::vector<std::string> keys_to_erase;
         for (const auto& entry : objs) {
             // Pre-check under the entry's shared lock so a sweep that finds
             // nothing never takes a write lock. The match is re-classified
@@ -2651,9 +2680,11 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         continue;
                     }
                 }
-                if (CleanupStaleHandles(key, tenant_id, tenant_state, metadata,
-                                        is_stale, &tenant_accessor)) {
-                    keys_to_erase.push_back(key);
+                if (CleanupStaleHandles(key, tenant_id, tenant_state, *entry,
+                                        metadata, is_stale, &tenant_accessor)) {
+                    EraseMetadataLocked(tenant_state, entry, tenant_id,
+                                        std::move(lk), QuotaEraseMode::kFull,
+                                        &tenant_accessor);
                 }
             } else if (!metadata.IsValid()) {
                 if (enable_ha_) {
@@ -2678,12 +2709,10 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                         continue;
                     }
                 }
-                keys_to_erase.push_back(key);
+                EraseMetadataLocked(tenant_state, entry, tenant_id,
+                                    std::move(lk), QuotaEraseMode::kFull,
+                                    &tenant_accessor);
             }
-        }
-        for (const auto& key : keys_to_erase) {
-            EraseMetadata(tenant_state, tenant_state.Get(key), tenant_id,
-                          QuotaEraseMode::kFull, &tenant_accessor);
         }
     });
     if (first_persist_error) {
@@ -4609,6 +4638,11 @@ auto MasterService::AllocateAndInsertMetadata(
             client_id, now, value_length, std::move(replicas),
             std::move(committed_soft_pin_timeout), config.with_hard_pin,
             config.data_type, group_id, tenant_id, key));
+    // Lock before publishing: an unlocked peek at the PROCESSING-only entry
+    // would read invalid and auto-clean it, and the post-publication wiring
+    // (ledger adopt, soft-pin action, is_processing) must not race a lock
+    // holder. Deadlock-free because no path takes the route lock first.
+    auto object_lock = entry->LockUnique();
     if (!tenant_state.InsertObject(key, entry)) {
         FreeDfsReplicas(key, entry->metadata().GetAllReplicas());
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -4622,6 +4656,7 @@ auto MasterService::AllocateAndInsertMetadata(
             LogTenantQuotaLedgerError(adopt_result, "adopt_pending", tenant_id,
                                       key);
             refund_pending_quota();
+            object_lock.unlock();
             tenant_state.EraseObjectIf(key, entry.get());
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -4752,12 +4787,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
             auto entry = tenant_state.Get(key);
             if (entry) {
-                // Hold the per-object lock for the read-modify block. PutEnd
-                // holds the same entry->mutex while calling mark_complete(),
-                // so these reads/writes must be excluded. The lock is released
-                // just before every EraseMetadata call, which re-acquires it
-                // and releases it before the route mutation (the two locks are
-                // never held together).
+                // Hold the per-object lock for the read-modify block; PutEnd
+                // holds the same entry->mutex while calling mark_complete().
+                // The lock moves into each EraseMetadataLocked below, which
+                // releases it before the route mutation.
                 auto entry_lock = entry->LockUnique();
                 auto cleanup_plan = BuildStaleHandleCleanupPlan(
                     entry->metadata(), retaining_clients);
@@ -4773,11 +4806,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(
                                    key, object_id.tenant_id, tenant_state,
-                                   entry->metadata(), retaining_clients,
+                                   *entry, entry->metadata(), retaining_clients,
                                    &tenant_accessor)) {
-                        entry_lock.unlock();
-                        EraseMetadata(tenant_state, entry, object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &tenant_accessor);
+                        EraseMetadataLocked(
+                            tenant_state, entry, object_id.tenant_id,
+                            std::move(entry_lock), QuotaEraseMode::kFull,
+                            &tenant_accessor);
                         entry.reset();
                     }
                 }
@@ -4810,9 +4844,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                             metadata.put_start_time +
                                 put_start_release_timeout_sec_);
                     }
-                    entry_lock.unlock();
-                    EraseMetadata(tenant_state, entry, object_id.tenant_id,
-                                  QuotaEraseMode::kFull, &tenant_accessor);
+                    EraseMetadataLocked(
+                        tenant_state, entry, object_id.tenant_id,
+                        std::move(entry_lock), QuotaEraseMode::kFull,
+                        &tenant_accessor);
                     entry.reset();
                 }
             }
@@ -5423,6 +5458,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             }
 
             auto object_entry = tenant_state.Get(key);
+            // Hold the per-object lock across the whole read-modify-write
+            // region (stale cleanup, preemption, Case B/C rewrite), so a
+            // concurrent Get/PutEnd/Remove serializes behind it. The lock
+            // moves into EraseMetadataLocked, which releases it before the
+            // route mutation.
+            std::unique_lock<std::shared_mutex> entry_lock;
+            if (object_entry != nullptr) {
+                entry_lock = object_entry->LockUnique();
+            }
 
             // --- Step 0: stale handle cleanup ---
             if (object_entry != nullptr) {
@@ -5440,14 +5484,15 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             ErrorCode::OBJECT_ALREADY_EXISTS);
                     } else if (CleanupStaleHandles(
                                    key, object_id.tenant_id, tenant_state,
-                                   object_entry->metadata(), retaining_clients,
-                                   &tenant_accessor)) {
-                        // EraseMetadata handles the processing flag,
+                                   *object_entry, object_entry->metadata(),
+                                   retaining_clients, &tenant_accessor)) {
+                        // EraseMetadataLocked handles the processing flag,
                         // replication and offloading tasks (with
                         // dec_refcnt), and promotion task cleanup.
-                        EraseMetadata(tenant_state, object_entry,
-                                      object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &tenant_accessor);
+                        EraseMetadataLocked(
+                            tenant_state, object_entry, object_id.tenant_id,
+                            std::move(entry_lock), QuotaEraseMode::kFull,
+                            &tenant_accessor);
                         object_entry.reset();
                     }
                 }
@@ -5503,7 +5548,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // over. Once a store worker owns the task it is reading the
                 // source buffer for its SSD write, so the upsert waits for
                 // NotifyOffloadSuccess to clear the marker instead.
-                if (!CancelQueuedOffloadTask(tenant_state, metadata,
+                if (!CancelQueuedOffloadTask(*object_entry, metadata,
                                              object_id)) {
                     LOG(INFO) << "key=" << key
                               << ", error=object_has_offloading_task";
@@ -5539,9 +5584,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                             *case_a_committed_soft_pin_timeout <= now) {
                             case_a_committed_soft_pin_timeout.reset();
                         }
-                        EraseMetadata(tenant_state, object_entry,
-                                      object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &tenant_accessor);
+                        EraseMetadataLocked(
+                            tenant_state, object_entry, object_id.tenant_id,
+                            std::move(entry_lock), QuotaEraseMode::kFull,
+                            &tenant_accessor);
                         object_entry.reset();
                     } else {
                         auto settle_result = SettlePrimaryWriteQuotaIfReady(
@@ -5697,9 +5743,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         std::move(old_replicas),
                         now + put_start_release_timeout_sec_);
                 }
-                EraseMetadata(tenant_state, object_entry, object_id.tenant_id,
-                              QuotaEraseMode::kPreserveOld, &tenant_accessor,
-                              previous_kv_media);
+                EraseMetadataLocked(tenant_state, object_entry,
+                                    object_id.tenant_id, std::move(entry_lock),
+                                    QuotaEraseMode::kPreserveOld,
+                                    &tenant_accessor, previous_kv_media);
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
@@ -6972,6 +7019,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
             if (!object_entry) {
                 continue;
             }
+            // Checks and erase are atomic: the lock moves into
+            // EraseMetadataLocked, which releases it before the route erase.
+            auto entry_lock = object_entry->LockUnique();
             ObjectMetadata& metadata = object_entry->metadata();
             if (std::regex_search(key, pattern)) {
                 if (!force && !metadata.IsLeaseExpired()) {
@@ -7031,9 +7081,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                         continue;
                     }
                 }
-                EraseMetadata(tenant_state, tenant_state.Get(key),
-                              normalized_tenant, QuotaEraseMode::kFull,
-                              &tenant_accessor);
+                EraseMetadataLocked(tenant_state, object_entry,
+                                    normalized_tenant, std::move(entry_lock),
+                                    QuotaEraseMode::kFull, &tenant_accessor);
                 removed_count++;
             }
         }
@@ -7083,6 +7133,9 @@ long MasterService::RemoveAll(bool force) {
             if (!object_entry) {
                 continue;
             }
+            // Checks and erase are atomic: the lock moves into
+            // EraseMetadataLocked, which releases it before the route erase.
+            auto entry_lock = object_entry->LockUnique();
             ObjectMetadata& metadata = object_entry->metadata();
             // Record the tenant only once the loop actually reaches an
             // object. A tenant row can outlive its objects, and recording
@@ -7139,9 +7192,10 @@ long MasterService::RemoveAll(bool force) {
                 }
 
                 total_freed_size += metadata.size * mem_rep_count;
-                ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadata(tenant_state, tenant_state.Get(key), tenant_id,
-                              QuotaEraseMode::kFull, &tenant_accessor);
+                ErasePromotionTaskLocked(tenant_state, *object_entry);
+                EraseMetadataLocked(tenant_state, object_entry, tenant_id,
+                                    std::move(entry_lock),
+                                    QuotaEraseMode::kFull, &tenant_accessor);
                 removed_count++;
             } else {
                 // Only a skipped object means the tenant is not empty.
@@ -7211,6 +7265,9 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
             if (!object_entry) {
                 continue;
             }
+            // Checks and erase are atomic: the lock moves into
+            // EraseMetadataLocked, which releases it before the route erase.
+            auto entry_lock = object_entry->LockUnique();
             ObjectMetadata& metadata = object_entry->metadata();
             saw_any_object = true;
             if ((force || metadata.IsLeaseExpired(now)) &&
@@ -7261,10 +7318,10 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                     }
                 }
                 total_freed_size += metadata.size * mem_rep_count;
-                ErasePromotionTaskIfPresent(tenant_state, key);
-                EraseMetadata(tenant_state, tenant_state.Get(key),
-                              normalized_tenant, QuotaEraseMode::kFull,
-                              &tenant_accessor);
+                ErasePromotionTaskLocked(tenant_state, *object_entry);
+                EraseMetadataLocked(tenant_state, object_entry,
+                                    normalized_tenant, std::move(entry_lock),
+                                    QuotaEraseMode::kFull, &tenant_accessor);
                 removed_count++;
             } else {
                 skipped_any_object = true;
@@ -7315,6 +7372,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                 continue;
             }
+            // Checks and erase are atomic: the lock moves into
+            // EraseMetadataLocked, which releases it before the route erase.
+            auto entry_lock = object_entry->LockUnique();
 
             ObjectMetadata& metadata = object_entry->metadata();
             // Clean up stale replica handles (consistent with single Remove).
@@ -7335,12 +7395,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             ? ErrorCode::OBJECT_NOT_FOUND
                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                     continue;
-                } else if (CleanupStaleHandles(
-                               key, normalized_tenant, tenant_state, metadata,
-                               retaining_clients, &tenant_accessor)) {
-                    EraseMetadata(tenant_state, tenant_state.Get(key),
-                                  normalized_tenant, QuotaEraseMode::kFull,
-                                  &tenant_accessor);
+                } else if (CleanupStaleHandles(key, normalized_tenant,
+                                               tenant_state, *object_entry,
+                                               metadata, retaining_clients,
+                                               &tenant_accessor)) {
+                    EraseMetadataLocked(
+                        tenant_state, object_entry, normalized_tenant,
+                        std::move(entry_lock), QuotaEraseMode::kFull,
+                        &tenant_accessor);
                     results[original_idx] =
                         tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
                     continue;
@@ -7409,9 +7471,9 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     continue;
                 }
             }
-            EraseMetadata(tenant_state, tenant_state.Get(key),
-                          normalized_tenant, QuotaEraseMode::kFull,
-                          &tenant_accessor);
+            EraseMetadataLocked(tenant_state, object_entry, normalized_tenant,
+                                std::move(entry_lock), QuotaEraseMode::kFull,
+                                &tenant_accessor);
             results[original_idx] = {};  // Success
         }
     } else {
@@ -7427,28 +7489,23 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
 }
 
 void MasterService::CancelPromotionTaskForRemovedReplicas(
-    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state,
+    mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
     const std::vector<ReplicaID>& removed_replica_ids) {
-    if (removed_replica_ids.empty()) {
-        return;
-    }
-
-    auto entry = tenant_state.Get(metadata.user_key);
-    if (!entry || !entry->promotion_task.has_value() ||
-        entry->promotion_task->alloc_id == 0 ||
+    if (removed_replica_ids.empty() || !entry.promotion_task.has_value() ||
+        entry.promotion_task->alloc_id == 0 ||
         std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
-                  entry->promotion_task->alloc_id) ==
+                  entry.promotion_task->alloc_id) ==
             removed_replica_ids.end()) {
         return;
     }
 
-    if (auto* source =
-            metadata.GetReplicaByID(entry->promotion_task->source_id);
+    if (auto* source = metadata.GetReplicaByID(entry.promotion_task->source_id);
         source != nullptr) {
         source->dec_refcnt();
     }
-    const UUID holder_id = entry->promotion_task->holder_id;
-    ErasePromotionTaskLocked(tenant_state, *entry);
+    const UUID holder_id = entry.promotion_task->holder_id;
+    ErasePromotionTaskLocked(tenant_state, entry);
 
     // Best-effort cleanup of a task that may still be queued on the holder.
     local_ssd_manager_.RemovePromotion(holder_id, metadata.tenant_id,
@@ -7457,7 +7514,8 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
 
 bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
-    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state,
+    mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
     metadata::TenantCatalog* tenant_accessor) {
     // Removes replicas with invalid allocators (memory replicas on unmounted
@@ -7467,7 +7525,7 @@ bool MasterService::CleanupStaleHandles(
     // LOCAL_DISK sweep (ClearLocalDiskHandlesOwnedBy) shares this accounting
     // rather than duplicating it.
     return CleanupStaleHandles(
-        key, tenant_id, tenant_state, metadata,
+        key, tenant_id, tenant_state, entry, metadata,
         [&retaining_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
@@ -7479,7 +7537,8 @@ bool MasterService::CleanupStaleHandles(
 
 bool MasterService::CleanupStaleHandles(
     const std::string& key, const TenantId& tenant_id,
-    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    metadata::TenantCatalog& tenant_state,
+    mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& is_stale,
     metadata::TenantCatalog* tenant_accessor) {
     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -7490,7 +7549,7 @@ bool MasterService::CleanupStaleHandles(
     std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(metadata, is_stale,
                                           &removed_replica_ids);
-    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+    CancelPromotionTaskForRemovedReplicas(tenant_state, entry, metadata,
                                           removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
@@ -7623,10 +7682,9 @@ void MasterService::RunDfsEviction() {
                     PublishKvRemovedAfterEvict(candidate.key,
                                                metadata.size * erased, "disk",
                                                metadata, tenant_id);
-                    // Release the object lock before the route mutation.
-                    entry_lock.unlock();
-                    EraseMetadata(tenant_state, object_entry, tenant_id,
-                                  QuotaEraseMode::kFull);
+                    EraseMetadataLocked(tenant_state, object_entry, tenant_id,
+                                        std::move(entry_lock),
+                                        QuotaEraseMode::kFull);
                 }
             }
         }
@@ -8161,13 +8219,12 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
 }
 
 bool MasterService::CancelQueuedOffloadTask(
-    metadata::TenantCatalog& tenant_state, ObjectMetadata& metadata,
+    mooncake::metadata::ObjectEntry& entry, ObjectMetadata& metadata,
     const ObjectIdentity& object_id) {
-    auto entry = tenant_state.Get(object_id.user_key);
-    if (!entry || !entry->offloading_task.has_value()) {
+    if (!entry.offloading_task.has_value()) {
         return true;
     }
-    const auto& mirror_clients = entry->offloading_task->mirror_clients;
+    const auto& mirror_clients = entry.offloading_task->mirror_clients;
     if (mirror_clients.empty()) {
         return false;
     }
@@ -8177,11 +8234,11 @@ bool MasterService::CancelQueuedOffloadTask(
         return false;
     }
 
-    auto source = metadata.GetReplicaByID(entry->offloading_task->source_id);
+    auto source = metadata.GetReplicaByID(entry.offloading_task->source_id);
     if (source != nullptr) {
         source->dec_refcnt();
     }
-    entry->offloading_task.reset();
+    entry.offloading_task.reset();
     return true;
 }
 
@@ -9781,10 +9838,11 @@ void MasterService::DiscardExpiredProcessingReplicas(
         break;
     }
 
-    std::vector<std::string> erase_keys;
     // Processing-key loop: every processing object carries is_processing on
-    // its entry; process each in place under the per-object lock, collecting
-    // keys that must be erased (after the route iteration releases its lock).
+    // its entry; process each in place under the per-object lock. Invalid
+    // entries are erased under the same held lock; the route slot is only
+    // dropped when it still resolves to the torn-down entry, so a same-key
+    // replacement published meanwhile survives.
     for (const auto& entry : entries) {
         auto lk = entry->LockUnique();
         if (!entry->is_processing) {
@@ -9796,7 +9854,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             metadata.ClearPendingSoftPinIfNoViableReplica();
             if (!metadata.IsValid()) {
-                erase_keys.push_back(key);
+                EraseMetadataLocked(tenant_state, entry, tenant_id,
+                                    std::move(lk), QuotaEraseMode::kFull,
+                                    &tenant_accessor);
             } else {
                 auto settle_result =
                     SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
@@ -9865,7 +9925,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
             if (!metadata.IsValid()) {
-                erase_keys.push_back(key);
+                EraseMetadataLocked(tenant_state, entry, tenant_id,
+                                    std::move(lk), QuotaEraseMode::kFull,
+                                    &tenant_accessor);
             } else {
                 auto settle_result =
                     SettlePrimaryWriteQuotaIfReady(tenant_state, metadata);
@@ -9875,12 +9937,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             }
         }
     }
-    for (const auto& key : erase_keys) {
-        EraseMetadata(tenant_state, tenant_state.Get(key), tenant_id,
-                      QuotaEraseMode::kFull, &tenant_accessor);
-    }
 
-    std::vector<std::string> replication_erase_keys;
     for (const auto& entry : entries) {
         auto lk = entry->LockUnique();
         if (!entry->replication_task.has_value()) {
@@ -9988,16 +10045,13 @@ void MasterService::DiscardExpiredProcessingReplicas(
             ClearDynamicReplicationStateLocked(tenant_state, *entry);
         }
         if (!metadata.IsValid()) {
-            replication_erase_keys.push_back(key);
+            EraseMetadataLocked(tenant_state, entry, tenant_id, std::move(lk),
+                                QuotaEraseMode::kFull, &tenant_accessor);
         } else {
             ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                                replication_task.pending_quota_charge_bytes);
             entry->replication_task.reset();
         }
-    }
-    for (const auto& key : replication_erase_keys) {
-        EraseMetadata(tenant_state, tenant_state.Get(key), tenant_id,
-                      QuotaEraseMode::kFull, &tenant_accessor);
     }
 
     for (const auto& entry : entries) {
@@ -10323,20 +10377,23 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 [&](const TenantId& tid,
                     const std::shared_ptr<metadata::TenantCatalog>& handle) {
                     auto& tenant_state = *handle;
-                    // Collect handles, then lock each per-object.
+                    // Collect handles, then lock each per-object. Keep the
+                    // pinned handle so the erase below tears down exactly the
+                    // inspected entry, never a same-key replacement.
                     auto objs = tenant_state.SnapshotObjects();
-                    std::vector<std::string> keys_to_erase;
+                    std::vector<std::shared_ptr<metadata::ObjectEntry>>
+                        stale_entries;
                     for (const auto& entry : objs) {
                         auto lk = entry->LockShared();
                         if (entry->metadata().HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
                             entry->metadata().IsLeaseExpired(cleanup_now)) {
                             VLOG(1) << "clear metadata key=" << entry->key();
-                            keys_to_erase.push_back(entry->key());
+                            stale_entries.push_back(entry);
                         }
                     }
-                    for (const auto& key : keys_to_erase) {
-                        EraseMetadata(tenant_state, tenant_state.Get(key), tid);
+                    for (const auto& entry : stale_entries) {
+                        EraseMetadata(tenant_state, entry, tid);
                     }
                 });
         }
@@ -10579,9 +10636,9 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                                                normalized_tenant);
                 }
                 if (!metadata.IsValid()) {
-                    entry_lock.unlock();
-                    EraseMetadata(tenant_state, object_entry,
-                                  normalized_tenant);
+                    EraseMetadataLocked(
+                        tenant_state, object_entry, normalized_tenant,
+                        std::move(entry_lock), QuotaEraseMode::kFull);
                 }
                 return result;
             }
@@ -10637,15 +10694,11 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 metadata::TenantCatalog& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Get(key);
                 if (object_entry) {
-                    bool invalid = false;
-                    {
-                        // Read IsValid under the per-object lock.
-                        auto lk = object_entry->LockUnique();
-                        invalid = !object_entry->metadata().IsValid();
-                    }
-                    if (invalid) {
-                        EraseMetadata(tenant_state, object_entry,
-                                      normalized_tenant);
+                    auto lk = object_entry->LockUnique();
+                    if (!object_entry->metadata().IsValid()) {
+                        EraseMetadataLocked(tenant_state, object_entry,
+                                            normalized_tenant, std::move(lk),
+                                            QuotaEraseMode::kFull);
                     }
                 }
             }
@@ -10998,9 +11051,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                                tenant_id);
                 }
                 if (!enable_oplog_ && !metadata.IsValid()) {
-                    entry_lock.unlock();
-                    EraseMetadata(tenant_state, object_entry, tenant_id,
-                                  QuotaEraseMode::kFull, &tenant_accessor);
+                    EraseMetadataLocked(tenant_state, object_entry, tenant_id,
+                                        std::move(entry_lock),
+                                        QuotaEraseMode::kFull,
+                                        &tenant_accessor);
                 }
                 return result;
             }
@@ -11061,15 +11115,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 auto& tenant_state = *tenant_handle;
                 auto object_entry = tenant_state.Get(key);
                 if (!enable_oplog_ && object_entry) {
-                    bool invalid = false;
-                    {
-                        // Read IsValid under the per-object lock.
-                        auto lk = object_entry->LockUnique();
-                        invalid = !object_entry->metadata().IsValid();
-                    }
-                    if (invalid) {
-                        EraseMetadata(tenant_state, object_entry, tenant_id,
-                                      QuotaEraseMode::kFull, &tenant_accessor);
+                    auto lk = object_entry->LockUnique();
+                    if (!object_entry->metadata().IsValid()) {
+                        EraseMetadataLocked(tenant_state, object_entry,
+                                            tenant_id, std::move(lk),
+                                            QuotaEraseMode::kFull,
+                                            &tenant_accessor);
                     }
                 }
             }
@@ -11674,9 +11725,9 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                 PublishKvRemovedAfterEvict(key, metadata.size * erased, "disk",
                                            metadata, tenant_id);
                 if (!metadata.IsValid()) {
-                    lk.unlock();
-                    EraseMetadata(tenant_state, entry, tenant_id,
-                                  QuotaEraseMode::kFull, &tenant_accessor);
+                    EraseMetadataLocked(tenant_state, entry, tenant_id,
+                                        std::move(lk), QuotaEraseMode::kFull,
+                                        &tenant_accessor);
                 }
             }
         });
