@@ -1866,6 +1866,36 @@ Status TransferEngineImpl::prepareSubmit(
     auto merged =
         mergeRequests(request_list, merge_boundaries, merge_requests_);
 
+    // Limit only oversized merges that would use standard TCP. In
+    // particular, an UNSPEC request selected for RDMA/HP TCP keeps its own
+    // transport's limits. Ordinary-size submissions need no extra route lookup
+    // or allocation here, and a too-large single request remains independent.
+    if (merged.request_list.size() < request_list.size()) {
+        std::vector<bool> tcp_limited;
+        for (size_t i = 0; i < merged.request_list.size(); ++i) {
+            const auto& request = merged.request_list[i];
+            if (request.length <= tcpMaxTransferBytes(request.opcode)) continue;
+            if (request.transport_hint == TCP ||
+                (request.transport_hint == UNSPEC &&
+                 resolveTransport(request, 0).transport == TCP)) {
+                if (tcp_limited.empty())
+                    tcp_limited.resize(merged.request_list.size(), false);
+                tcp_limited[i] = true;
+            }
+        }
+        if (!tcp_limited.empty()) {
+            for (const auto& [public_id, owner_id] : merged.task_lookup) {
+                if (tcp_limited[owner_id]) {
+                    auto& limit = merge_boundaries[public_id].max_merge_bytes;
+                    limit = std::min<uint64_t>(
+                        limit,
+                        tcpMaxTransferBytes(request_list[public_id].opcode));
+                }
+            }
+            merged = mergeRequests(request_list, merge_boundaries, true);
+        }
+    }
+
     prepared.owners.reserve(merged.request_list.size());
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
