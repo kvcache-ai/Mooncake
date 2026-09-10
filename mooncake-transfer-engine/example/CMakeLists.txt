@@ -117,6 +117,46 @@ if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
   endif()
 endif()
 
+option(BUILD_MACA_IBGDA_TEST "Build the manual two-rank MACA IBGDA correctness suite" OFF)
+if(BUILD_MACA_IBGDA_TEST)
+  if(NOT USE_MACA)
+    message(FATAL_ERROR "BUILD_MACA_IBGDA_TEST requires USE_MACA=ON")
+  endif()
+  find_program(MACA_IBGDA_COMPILER NAMES mxcc
+               HINTS "${MACA_ROOT}/mxgpu_llvm/bin" "${MACA_ROOT}/bin"
+                     "$ENV{MACA_CLANG_PATH}")
+  if(NOT MACA_IBGDA_COMPILER)
+    message(FATAL_ERROR "BUILD_MACA_IBGDA_TEST requires the MACA compiler mxcc")
+  endif()
+  set(_maca_ibgda_object "${CMAKE_CURRENT_BINARY_DIR}/maca_ibgda_suite.o")
+  set(_maca_ibgda_depfile "${CMAKE_CURRENT_BINARY_DIR}/maca_ibgda_suite.d")
+  set(_maca_ibgda_depfile_argument)
+  if(CMAKE_GENERATOR MATCHES "^Ninja" OR
+     (CMAKE_GENERATOR MATCHES "Makefiles" AND CMAKE_VERSION VERSION_GREATER_EQUAL 3.20))
+    set(_maca_ibgda_depfile_argument DEPFILE "${_maca_ibgda_depfile}")
+  endif()
+  add_custom_command(
+    OUTPUT "${_maca_ibgda_object}"
+    COMMAND "${MACA_IBGDA_COMPILER}" -std=c++20 -O3
+            --compiler-options=-fPIC -DUSE_MACA=1 -DMOONCAKE_EP_USE_MACA=1
+            "-I${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include"
+            "-I${MACA_INCLUDE_DIR}" "-I${MACA_ROOT}/tools/cu-bridge/include"
+            -MMD -MT "${_maca_ibgda_object}" -MF "${_maca_ibgda_depfile}"
+            -c "${CMAKE_CURRENT_SOURCE_DIR}/maca_ibgda_suite.cu"
+            -o "${_maca_ibgda_object}"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/maca_ibgda_suite.cu"
+            "${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include/transport/device/ibgda_device.cuh"
+            "${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include/transport/device/maca/maca_ops.cuh"
+    ${_maca_ibgda_depfile_argument}
+    VERBATIM)
+  set_source_files_properties("${_maca_ibgda_object}"
+                              PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+  add_executable(maca_ibgda_suite "${_maca_ibgda_object}")
+  target_link_libraries(maca_ibgda_suite PRIVATE transfer_engine glog::glog
+                       ${MACA_RUNTIME_LIBS} mccompiler runtime_cu symbol_cu)
+  set_target_properties(maca_ibgda_suite PROPERTIES LINKER_LANGUAGE CXX)
+endif()
+
 add_executable(show_link ${WORKSPACE}/show_link.cpp)
 target_link_libraries(show_link PUBLIC transfer_engine gflags::gflags
                                        glog::glog)
