@@ -58,8 +58,8 @@ shared catalog and then assigns one active runtime as its owner. Joining a clien
 existing target.
 
 The owner assignment is target-scoped. It uses the existing active client leases and stable
-rendezvous balancing to spread targets across clients. The assignment is persisted through the
-existing external route metadata authority, using the same Embedded WRH authority/CAS and
+rendezvous balancing to spread targets across clients. The assignment is coordinated through the
+existing shared route metadata authority, using the same Embedded WRH authority/CAS and
 read-repair path as other shared control metadata. Redis is not a second owner database and is
 not read on the data path.
 
@@ -245,7 +245,7 @@ Low-Level `nof_replica_count` is clamped to `1..=8` and defaults to 1. The share
 target ID.
 
 Each NoF target has one current runtime owner for its control plane. The owner record is target
-scoped and stored through the existing external route metadata authority:
+scoped and coordinated through the existing shared route metadata authority:
 
 ```text
 target_id
@@ -258,6 +258,10 @@ handoff_id
 
 `record_version` is used by the existing metadata CAS. `owner_generation` fences stale owner
 requests after a handoff; it is not an object version, route version, or client epoch.
+
+This shared route authority is distinct from provider-owned external metadata. External metadata
+is the provider's own object/manifest state (for example KVCS shard manifests) and is not used to
+store NoF owner assignments or Mooncake-managed handoff snapshots.
 
 The registration section above defines the initial owner. After assignment, local disks and NoF
 targets use the same Cold Tier health, placement, replica, cleanup, and runtime lifecycle. Adding
