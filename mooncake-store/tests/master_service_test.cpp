@@ -1190,6 +1190,79 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     EXPECT_EQ(2u, service_->GetKeyCount());
 }
 
+// A mass client expiry marks handles stale all over the metadata table, so
+// the sweep pre-checks every entry under its shared lock and takes the
+// entry's write lock only when the pre-check matches, re-classifying under
+// it. Dropping and retaking the lock between the two must not cost
+// coverage: every key of the departed segment is erased, and every key of a
+// live segment survives.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepPreservesCoverage) {
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const std::string stale_segment_name = "batch_sweep_stale_segment";
+    const std::string live_segment_name = "batch_sweep_live_segment";
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, stale_segment_name, 0x300000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
+                                                   0x400000000, kSegmentSize);
+
+    constexpr size_t kKeysPerSegment = 100;
+
+    std::vector<std::string> stale_keys;
+    std::vector<std::string> live_keys;
+    for (size_t i = 0;
+         stale_keys.size() + live_keys.size() < 2 * kKeysPerSegment; ++i) {
+        const std::string key = "batch_sweep_key_" + std::to_string(i);
+
+        const bool on_stale_segment = stale_keys.size() < kKeysPerSegment;
+        const UUID& client_id =
+            on_stale_segment ? stale_segment.client_id : live_segment.client_id;
+        const std::string& segment_name =
+            on_stale_segment ? stale_segment_name : live_segment_name;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+
+        auto put_start = service->PutStart(client_id, key, TenantId::Default(),
+                                           1024, config);
+        ASSERT_TRUE(put_start.has_value()) << "key=" << key;
+        ASSERT_EQ(1u, put_start->size());
+        ASSERT_EQ(segment_name, (*put_start)[0]
+                                    .get_memory_descriptor()
+                                    .buffer_descriptor.transport_endpoint_);
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+        (on_stale_segment ? stale_keys : live_keys).push_back(key);
+    }
+
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
+    // "merely hidden from the read paths by the unmount".
+    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
+    for (const auto& key : stale_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
+            << "key=" << key;
+    }
+    for (const auto& key : live_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
+        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
+        EXPECT_TRUE(get_result->replicas[0].is_memory_replica())
+            << "key=" << key;
+    }
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
     auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
     auto service = std::make_unique<MasterService>(config);

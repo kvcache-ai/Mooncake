@@ -1046,7 +1046,12 @@ class MasterService {
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Tenant walk shared by the two sweeps above; removes completed replicas
-    // matching is_stale, erasing a key when no valid replica remains.
+    // matching is_stale, erasing a key when no valid replica remains. Each
+    // entry is pre-checked under its shared lock so a sweep that finds
+    // nothing never takes a write lock, and only matching entries are
+    // cleaned, one entry lock at a time: a mass client expiry marks handles
+    // stale table-wide, and holding tenant metadata broadly while walking it
+    // would block unrelated RPCs until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
     bool ProcessClientOffboardingJob(ClientOffboardingJob& job);

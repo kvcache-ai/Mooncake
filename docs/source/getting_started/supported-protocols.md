@@ -16,6 +16,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
+| **shm** | None (POSIX shm, same host) | Same-host DRAM copies without NIC loopback | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
 | **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
@@ -307,6 +308,30 @@ export MC_INTRANODE_NVLINK=true
 
 **Requirements:**
 - CXL-capable hardware
+
+### SHM Transport (shm)
+
+**Description:** Same-host DRAM copies over POSIX shared memory. Classic Transfer Engine maps the peer's named shm object, relocates the peer virtual address into the local mapping, and `memcpy`s. This is a first-class transport like HIP, not a replacement for `CxlTransport` (DAX offset addressing).
+
+**Use When:**
+- Two processes on the same machine exchange DRAM buffers
+- You want to avoid RDMA/TCP loopback for that path
+
+**Requirements:**
+- Linux POSIX shm (`/dev/shm`)
+- Buffers allocated with `TransferEngine::allocateSharedMemory` (ordinary `malloc` cannot be exported)
+- Runtime opt-in: `MC_FORCE_SHM=1`, or `installTransport("shm")`. With `-DENABLE_MULTI_PROTOCOL=ON` this adds SHM next to RDMA/TCP (`rdma,shm` / `tcp,shm`); without it, SHM is the only transport.
+- Same-host SHM **and** cross-host RDMA/TCP in one engine: build with `-DENABLE_MULTI_PROTOCOL=ON` (segment protocol becomes `rdma,shm` or `tcp,shm`)
+
+**Limitations:**
+- Same host only. Without `ENABLE_MULTI_PROTOCOL`, `MC_FORCE_SHM=1` (or `installTransport("shm")` after another transport) sets `segment.protocol` to `shm` and replaces RDMA/TCP routing; `installTransport("shm")` logs a WARNING when it overwrites a non-empty protocol. Coexistence needs `-DENABLE_MULTI_PROTOCOL=ON`.
+- `registerLocalMemory` must use the pointer from `allocateSharedMemory` (a shorter prefix is allowed). A sub-range or overflowing range returns an error instead of silently skipping. Ordinary `malloc` is still skipped so TCP/RDMA can register it.
+- Same-UID only: objects are created `0600` with POSIX names `/mooncake_<pid>_xxxxxxxx`. Creator and consumer must share a user; a hostname match does not imply a shared `/dev/shm` (for example Kubernetes `hostNetwork` pods).
+- Crash or `SIGKILL` can leave objects in `/dev/shm` until reboot; there is no automatic reaper.
+- After `freeSharedMemory` + `allocateSharedMemory`, a peer that still has a cached mapping probes the POSIX name before memcpy. An unlinked object is dropped and the segment descriptor is refetched once; a changed virtual address still requires the initiator to read the new `BufferDesc.addr` (relocate cannot guess a new offset). Background refresh remains optional via `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`.
+- Relocate caches at most 32 mmap'd peer objects per target. An in-flight copy pins its mapping so prune/cap cannot `munmap` it until memcpy returns; the cache may briefly exceed 32 while pins are held.
+- Default off because the path is not NUMA-aware
+- Mooncake Store segments are not shm-backed until a follow-up allocator change
 
 ### Ascend Transport (ascend)
 

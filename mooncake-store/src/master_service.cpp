@@ -2631,6 +2631,17 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
         auto objs = handle->SnapshotObjects();
         std::vector<std::string> keys_to_erase;
         for (const auto& entry : objs) {
+            // Pre-check under the entry's shared lock so a sweep that finds
+            // nothing never takes a write lock. The match is re-classified
+            // under the unique lock below, since the entry may have changed
+            // in between.
+            {
+                auto pre_lk = entry->LockShared();
+                if (!entry->metadata().HasReplica(is_stale) &&
+                    entry->metadata().IsValid()) {
+                    continue;
+                }
+            }
             auto lk = entry->LockUnique();
             ObjectMetadata& metadata = entry->metadata();
             const std::string key = entry->key();

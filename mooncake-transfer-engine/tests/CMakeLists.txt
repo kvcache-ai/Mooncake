@@ -147,6 +147,18 @@ if(USE_CXL)
   add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
 endif()
 
+add_executable(shm_transport_test ${WORKSPACE}/shm_transport_test.cpp)
+target_link_libraries(shm_transport_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME shm_transport_test COMMAND shm_transport_test)
+
+if(USE_TCP)
+  add_executable(shm_transport_e2e_test ${WORKSPACE}/shm_transport_e2e_test.cpp)
+  target_link_libraries(shm_transport_e2e_test PUBLIC transfer_engine gtest
+                                                      gtest_main)
+  add_test(NAME shm_transport_e2e_test COMMAND shm_transport_e2e_test)
+endif()
+
 if(USE_NVMEOF)
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
