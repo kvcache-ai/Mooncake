@@ -70,6 +70,8 @@ class RdmaTransport : public Transport {
 
     virtual Status uninstall();
 
+    Status quiesce() override;
+
     virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size);
 
     virtual Status freeSubBatch(SubBatchRef& batch);
@@ -122,6 +124,11 @@ class RdmaTransport : public Transport {
    public:
     Status setupLocalSegment();
 
+    // Update one RNIC's published address after a GID/LID change. The local
+    // descriptor is rolled back if registry synchronization fails.
+    Status refreshLocalDeviceDesc(const std::string& device_name, uint16_t lid,
+                                  const std::string& gid);
+
     std::shared_ptr<Config> config() const { return conf_; }
 
    private:
@@ -155,6 +162,19 @@ class RdmaTransport : public Transport {
     RWSpinlock notify_endpoint_map_lock_;
     std::unordered_map<uint32_t, std::weak_ptr<RdmaEndPoint>>
         notify_qp_to_endpoint_;
+
+    enum class NotifyCompletionAction {
+        SkipSilently,         // expected flush from a retiring or gone endpoint
+        ReportOnly,           // no live endpoint left to act on
+        DisableNotification,  // fault confined to the notify QP
+        RetireEndpoint,       // the peer or the path may be gone
+    };
+
+    // Decides what a failed notification completion costs. Only defined for
+    // error completions; endpoint_ready means the endpoint is still EP_READY.
+    static NotifyCompletionAction classifyNotifyCompletion(ibv_wc_status status,
+                                                           bool endpoint_alive,
+                                                           bool endpoint_ready);
 
     // Register/unregister notification QP (called by Endpoint)
     void registerNotifyQp(uint32_t qp_num,

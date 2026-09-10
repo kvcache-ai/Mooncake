@@ -48,7 +48,7 @@ echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
-python -m pip install pytest
+python -m pip install pytest hypothesis==6.141.0
 python -m pytest reshard_tests -q
 
 echo "Verifying mooncake_master entry point..."

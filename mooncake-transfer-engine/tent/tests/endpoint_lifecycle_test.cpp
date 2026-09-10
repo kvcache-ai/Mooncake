@@ -14,7 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "tent/common/utils/string_builder.h"
 #include "tent/transport/rdma/endpoint.h"
@@ -36,6 +39,36 @@ class EndpointTestAccess {
         endpoint.peer_qp_num_list_ = peer_qp_num_list;
         endpoint.status_.store(RdmaEndPoint::EP_READY,
                                std::memory_order_relaxed);
+    }
+
+    static void markNotifyConnected(RdmaEndPoint& endpoint) {
+        endpoint.notify_connected_.store(true, std::memory_order_relaxed);
+    }
+
+    static bool notifyConnected(const RdmaEndPoint& endpoint) {
+        return endpoint.notify_connected_.load(std::memory_order_relaxed);
+    }
+
+    static constexpr size_t notifyBufferSize() {
+        return RdmaEndPoint::kNotifyBufferSize;
+    }
+
+    static constexpr size_t notifyMaxPendingSends() {
+        return RdmaEndPoint::kNotifyMaxPendingSends;
+    }
+
+    static char* notifySlotPtr(char* base, size_t idx) {
+        return RdmaEndPoint::notifySlotPtr(base, idx);
+    }
+
+    static bool encodeNotifyPayload(char* slot, const std::string& name,
+                                    const std::string& msg, uint32_t* out_len) {
+        return RdmaEndPoint::encodeNotifyPayload(slot, name, msg, out_len);
+    }
+
+    static bool decodeNotifyPayload(const char* data, size_t byte_len,
+                                    std::string* name, std::string* msg) {
+        return RdmaEndPoint::decodeNotifyPayload(data, byte_len, name, msg);
     }
 };
 
@@ -103,6 +136,107 @@ TEST(EndpointLifecycleTest, NotificationFailsWhenEndpointIsNotConnected) {
     RdmaEndPoint endpoint;
 
     EXPECT_FALSE(endpoint.sendNotification("name", "message"));
+}
+
+TEST(EndpointLifecycleTest, NotifySlotsAreAdjacentAndNonOverlapping) {
+    std::vector<char> buf(EndpointTestAccess::notifyMaxPendingSends() *
+                          EndpointTestAccess::notifyBufferSize());
+    char* slot0 = EndpointTestAccess::notifySlotPtr(buf.data(), 0);
+    char* slot1 = EndpointTestAccess::notifySlotPtr(buf.data(), 1);
+    char* last = EndpointTestAccess::notifySlotPtr(
+        buf.data(), EndpointTestAccess::notifyMaxPendingSends() - 1);
+    EXPECT_EQ(slot0, buf.data());
+    EXPECT_EQ(static_cast<size_t>(slot1 - slot0),
+              EndpointTestAccess::notifyBufferSize());
+    EXPECT_EQ(static_cast<size_t>(last - slot0),
+              (EndpointTestAccess::notifyMaxPendingSends() - 1) *
+                  EndpointTestAccess::notifyBufferSize());
+    EXPECT_EQ(last + EndpointTestAccess::notifyBufferSize(),
+              buf.data() + buf.size());
+}
+
+TEST(EndpointLifecycleTest, NotifyAdjacentSlotsDoNotCrosstalk) {
+    // Recv used to be 256 independent vectors. After coalescing, a wrong
+    // offset would mix payload from a neighbor slot.
+    const size_t slot_size = EndpointTestAccess::notifyBufferSize();
+    const size_t nslots = EndpointTestAccess::notifyMaxPendingSends();
+    std::vector<char> buf(nslots * slot_size, '\xee');
+    const size_t indices[] = {0, 1, 2, 127, 254, 255};
+    uint32_t encoded[6] = {};
+    for (size_t i = 0; i < 6; ++i) {
+        const size_t idx = indices[i];
+        std::string name = "n" + std::to_string(idx);
+        std::string msg =
+            "payload-" + std::to_string(idx) + std::string(2048, 'x');
+        ASSERT_TRUE(EndpointTestAccess::encodeNotifyPayload(
+            EndpointTestAccess::notifySlotPtr(buf.data(), idx), name, msg,
+            &encoded[i]));
+        ASSERT_GT(encoded[i], 8u);
+        ASSERT_LE(encoded[i], slot_size);
+    }
+    for (size_t i = 0; i < 6; ++i) {
+        const size_t idx = indices[i];
+        std::string name;
+        std::string msg;
+        ASSERT_TRUE(EndpointTestAccess::decodeNotifyPayload(
+            EndpointTestAccess::notifySlotPtr(buf.data(), idx), encoded[i],
+            &name, &msg))
+            << "slot " << idx;
+        EXPECT_EQ(name, "n" + std::to_string(idx));
+        EXPECT_EQ(msg,
+                  "payload-" + std::to_string(idx) + std::string(2048, 'x'));
+        // Trailing bytes in the 64KiB slot stay the fill pattern, so a
+        // too-long read would have picked up 0xee as name_len.
+        ASSERT_TRUE(EndpointTestAccess::decodeNotifyPayload(
+            EndpointTestAccess::notifySlotPtr(buf.data(), idx), slot_size,
+            &name, &msg));
+        EXPECT_EQ(name, "n" + std::to_string(idx));
+    }
+    // Slot 3 was never written; decoding the fill pattern must fail rather
+    // than returning a neighbor's payload.
+    std::string name;
+    std::string msg;
+    EXPECT_FALSE(EndpointTestAccess::decodeNotifyPayload(
+        EndpointTestAccess::notifySlotPtr(buf.data(), 3), slot_size, &name,
+        &msg));
+}
+
+TEST(EndpointLifecycleTest, NotifyPayloadRejectedWhenLargerThanSlot) {
+    std::vector<char> slot(EndpointTestAccess::notifyBufferSize());
+    uint32_t encoded = 0;
+    std::string too_big(EndpointTestAccess::notifyBufferSize(), 'z');
+    EXPECT_FALSE(EndpointTestAccess::encodeNotifyPayload(slot.data(), "n",
+                                                         too_big, &encoded));
+}
+
+TEST(EndpointLifecycleTest, NotifyLocalFaultKeepsEndpointServingData) {
+    // A fault confined to the notify QP must not retire the endpoint: doing so
+    // moves every data QP to ERR and flushes in-flight transfers.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+
+    endpoint.disableNotification("notify QP local completion error");
+
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_READY);
+    EXPECT_FALSE(EndpointTestAccess::notifyConnected(endpoint));
+    // The caller now learns notifications are gone instead of silently posting
+    // to a dead QP.
+    EXPECT_FALSE(endpoint.sendNotification("name", "message"));
+}
+
+TEST(EndpointLifecycleTest, DisableNotificationIsIdempotent) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+
+    endpoint.disableNotification("first");
+    endpoint.disableNotification("second");
+
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_READY);
+    EXPECT_FALSE(EndpointTestAccess::notifyConnected(endpoint));
 }
 
 TEST(EndpointLifecycleTest, SharedFromThisUsesRealEndpointOwnership) {
@@ -185,6 +319,10 @@ TEST(EndpointLifecycleTest, BootstrapWithNewPeerQpsRetiresEstablishedEndpoint) {
 
     EXPECT_FALSE(endpoint.accept(peer_desc, local_desc).ok());
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    // The failed accept does not populate a GID. The transport retries on a
+    // newly inserted endpoint in the same bootstrap RPC so the initiator is
+    // not left with an empty reply.
+    EXPECT_TRUE(local_desc.local_gid.empty());
 }
 
 TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {

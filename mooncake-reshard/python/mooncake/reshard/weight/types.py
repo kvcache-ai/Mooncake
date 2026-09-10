@@ -5,10 +5,16 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
-from typing import Literal, TypeVar, cast
+from dataclasses import asdict, dataclass
+from math import prod
+from typing import Literal, Optional, TypeVar, Union, cast
 
-from ..contracts.ids import PlacementFragmentId, RuntimeFragmentId, TensorId
+from ..contracts import PlacementFragmentId, TensorId
+from ..contracts import RuntimeBindingFragment as _RuntimeBindingFragment
+
+# Preserve the existing weight.types import surface while keeping the canonical
+# runtime fragment definition resource-neutral in mooncake.reshard.contracts.
+RuntimeBindingFragment = _RuntimeBindingFragment
 
 _MAX_U64 = (1 << 64) - 1
 ParallelAxisKind = Literal["dp", "pp", "ep", "tp"]
@@ -77,7 +83,7 @@ class OwnershipAxis:
         _validate_parallel_axis_kind(self.kind)
 
 
-ParallelAxis = SplitAxis | ReplicatedAxis | OwnershipAxis
+ParallelAxis = Union[SplitAxis, ReplicatedAxis, OwnershipAxis]
 
 
 @dataclass(frozen=True)
@@ -91,8 +97,8 @@ class TensorDescriptor:
     shard_dims: tuple[int, ...]
     layout_fingerprint: str
     parallel_axes: tuple[ParallelAxis, ...]
-    layer_id: int | None = None
-    expert_id: int | None = None
+    layer_id: Optional[int] = None
+    expert_id: Optional[int] = None
 
     def __post_init__(self) -> None:
         shape = _require_integer_tuple(self.global_shape, "global_shape", minimum=1)
@@ -153,6 +159,35 @@ class TensorDescriptor:
         _require_nonempty_string(self.layout_fingerprint, "layout_fingerprint")
 
 
+def validate_fragment_geometry(
+    tensor: TensorDescriptor,
+    *,
+    fragment_id: str,
+    global_offset: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    nbytes: int,
+) -> None:
+    """Validate shared local geometry without requiring complete tensor coverage."""
+
+    ndim = len(tensor.global_shape)
+    if len(global_offset) != ndim or len(local_shape) != ndim:
+        raise ValueError(f"fragment rank mismatch: {fragment_id}")
+    for offset, extent, total in zip(
+        global_offset,
+        local_shape,
+        tensor.global_shape,
+    ):
+        if offset + extent > total:
+            raise ValueError(f"fragment is out of bounds: {fragment_id}")
+
+    expected_nbytes = prod(local_shape) * tensor.itemsize
+    if nbytes != expected_nbytes:
+        raise ValueError(
+            f"fragment byte size mismatch: {fragment_id}: "
+            f"expected {expected_nbytes}, got {nbytes}"
+        )
+
+
 def canonical_strides_bytes(
     shape: tuple[int, ...],
     itemsize: int,
@@ -174,6 +209,7 @@ class PlacementFragment:
     local_shape: tuple[int, ...]
     nbytes: int
     rank: ParallelRank
+    pipeline_stage_id: Optional[int]
     aliases: tuple[TensorId, ...]
     placement_fragment_id: PlacementFragmentId
 
@@ -184,8 +220,9 @@ class PlacementFragment:
         local_shape: tuple[int, ...],
         nbytes: int,
         rank: ParallelRank,
+        pipeline_stage_id: Optional[int] = None,
         aliases: tuple[TensorId, ...] = (),
-        placement_fragment_id: PlacementFragmentId | None = None,
+        placement_fragment_id: Optional[PlacementFragmentId] = None,
     ) -> None:
         normalized_offset = _require_integer_tuple(
             global_offset,
@@ -201,6 +238,8 @@ class PlacementFragment:
         _require_u64(nbytes, "nbytes", minimum=1)
         if not isinstance(rank, ParallelRank):
             raise ValueError("rank must be a ParallelRank")  # noqa: TRY004
+        if pipeline_stage_id is not None:
+            _require_integer(pipeline_stage_id, "pipeline_stage_id", minimum=0)
         normalized_aliases = _normalize_aliases(aliases)
         if normalized_aliases:
             if len(normalized_aliases) < 2:
@@ -220,6 +259,7 @@ class PlacementFragment:
                 local_shape=normalized_shape,
                 nbytes=nbytes,
                 rank=rank,
+                pipeline_stage_id=pipeline_stage_id,
                 aliases=normalized_aliases,
             )
         object.__setattr__(self, "tensor_id", tensor_id)
@@ -227,6 +267,7 @@ class PlacementFragment:
         object.__setattr__(self, "local_shape", normalized_shape)
         object.__setattr__(self, "nbytes", nbytes)
         object.__setattr__(self, "rank", rank)
+        object.__setattr__(self, "pipeline_stage_id", pipeline_stage_id)
         object.__setattr__(self, "aliases", normalized_aliases)
         object.__setattr__(self, "placement_fragment_id", resolved_fragment_id)
 
@@ -235,74 +276,6 @@ class PlacementFragment:
         """Expose the common fragment identifier used by future planners."""
 
         return self.placement_fragment_id
-
-
-@dataclass(frozen=True)
-class RuntimeBindingFragment:
-    """Contiguous physical runtime view for one placement fragment."""
-
-    placement_fragment_id: PlacementFragmentId
-    fragment_id: RuntimeFragmentId
-    address: int
-    nbytes: int
-    worker_id: str
-    endpoint: str
-    device: str
-    itemsize: int
-    local_shape: tuple[int, ...]
-    strides_bytes: tuple[int, ...]
-    storage_address: int
-    storage_nbytes: int
-    storage_offset_bytes: int
-    owner: object | None = field(default=None, compare=False, repr=False)
-
-    def __post_init__(self) -> None:
-        for name in (
-            "placement_fragment_id",
-            "fragment_id",
-            "worker_id",
-            "endpoint",
-            "device",
-        ):
-            _require_nonempty_string(getattr(self, name), name)
-        _require_address_range(self.address, self.nbytes)
-        _require_integer(self.itemsize, "runtime itemsize", minimum=1)
-        local_shape = _require_integer_tuple(
-            self.local_shape,
-            "runtime local_shape",
-            minimum=1,
-        )
-        strides_bytes = _require_integer_tuple(
-            self.strides_bytes,
-            "runtime strides_bytes",
-            minimum=0,
-        )
-        if len(strides_bytes) != len(local_shape):
-            raise ValueError("runtime stride rank differs from local_shape")
-        if any(
-            extent > 1 and stride == 0
-            for extent, stride in zip(local_shape, strides_bytes)
-        ):
-            raise ValueError(
-                "runtime stride must be positive for non-singleton dimensions"
-            )
-        strides_bytes = _normalize_singleton_strides_bytes(
-            local_shape,
-            strides_bytes,
-            self.itemsize,
-        )
-        object.__setattr__(self, "local_shape", local_shape)
-        object.__setattr__(self, "strides_bytes", strides_bytes)
-        _require_address_range(self.storage_address, self.storage_nbytes)
-        _require_u64(self.storage_offset_bytes, "storage_offset_bytes")
-        if self.storage_offset_bytes > _MAX_U64 - self.storage_address:
-            raise ValueError("normalized runtime address must fit in 64 bits")
-        if self.address != self.storage_address + self.storage_offset_bytes:
-            raise ValueError(
-                "runtime address must equal storage_address plus storage_offset_bytes"
-            )
-        if self.storage_offset_bytes > self.storage_nbytes - self.nbytes:
-            raise ValueError("runtime view exceeds storage allocation bounds")
 
 
 def _require_nonempty_string(value: object, name: str) -> str:
@@ -315,7 +288,7 @@ def _require_integer(
     value: object,
     name: str,
     *,
-    minimum: int | None = None,
+    minimum: Optional[int] = None,
 ) -> int:
     if type(value) is not int:
         raise ValueError(f"{name} must be an integer")
@@ -329,13 +302,6 @@ def _require_u64(value: object, name: str, *, minimum: int = 0) -> int:
     if integer > _MAX_U64:
         raise ValueError(f"{name} must fit in an unsigned 64-bit integer")
     return integer
-
-
-def _require_address_range(address: object, nbytes: object) -> None:
-    normalized_address = _require_u64(address, "address", minimum=1)
-    normalized_nbytes = _require_u64(nbytes, "nbytes", minimum=1)
-    if normalized_nbytes > _MAX_U64 - normalized_address:
-        raise ValueError("address range must fit in an unsigned 64-bit integer")
 
 
 def require_sha256_digest(value: object, name: str) -> None:
@@ -392,6 +358,7 @@ def _canonical_placement_fragment_id(
     local_shape: tuple[int, ...],
     nbytes: int,
     rank: ParallelRank,
+    pipeline_stage_id: Optional[int],
     aliases: tuple[TensorId, ...],
 ) -> PlacementFragmentId:
     content = {
@@ -403,20 +370,10 @@ def _canonical_placement_fragment_id(
         "rank": asdict(rank),
         "aliases": aliases,
     }
+    if pipeline_stage_id is not None:
+        content["pipeline_stage_id"] = pipeline_stage_id
     encoded = json.dumps(content, sort_keys=True, separators=(",", ":")).encode()
     return PlacementFragmentId(f"sha256:{hashlib.sha256(encoded).hexdigest()}")
-
-
-def _normalize_singleton_strides_bytes(
-    shape: tuple[int, ...],
-    strides_bytes: tuple[int, ...],
-    itemsize: int,
-) -> tuple[int, ...]:
-    canonical = canonical_strides_bytes(shape, itemsize)
-    return tuple(
-        expected if extent == 1 else observed
-        for extent, observed, expected in zip(shape, strides_bytes, canonical)
-    )
 
 
 def _validate_parallel_axis_kind(kind: ParallelAxisKind) -> None:

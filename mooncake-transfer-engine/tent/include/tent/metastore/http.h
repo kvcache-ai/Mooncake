@@ -18,6 +18,7 @@
 #include "tent/runtime/metastore.h"
 
 #include <atomic>
+#include <mutex>
 #include <curl/curl.h>
 
 namespace mooncake {
@@ -55,6 +56,9 @@ class HttpMetaStore : public MetaStore {
 
    private:
     std::atomic<bool> connected_;
+    // Each op uses its own local curl handle (ScopedCurl), so nothing curl is
+    // shared; this lock only serializes ops defensively.
+    std::mutex client_mutex_;
     std::string endpoint_;
 };
 }  // namespace tent

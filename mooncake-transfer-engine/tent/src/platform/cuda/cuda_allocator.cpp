@@ -16,12 +16,52 @@
 #include "tent/common/status.h"
 
 #include <bits/stdint-uintn.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
-#include <numa.h>
 #include <glog/logging.h>
+#include <mutex>
+#include <numa.h>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+// cuInit is process-global and idempotent; still call it once so the driver
+// probe is not re-entered on every topology device.
+bool ensureCudaDriverInit() {
+    static std::once_flag flag;
+    static CUresult result = CUDA_ERROR_NOT_INITIALIZED;
+    std::call_once(flag, []() { result = cuInit(0); });
+    return result == CUDA_SUCCESS;
+}
+
+// Driver-API probe: true iff this process already has a primary context on
+// `device`. Does not create one. Topology lists every visible GPU for NIC
+// affinity; cudaSetDevice on those names would allocate idle-card contexts
+// when the process can see more GPUs than this rank uses.
+bool cudaPrimaryContextIsActive(int device) {
+    if (!ensureCudaDriverInit()) return false;
+    CUdevice cu_dev = 0;
+    if (cuDeviceGet(&cu_dev, device) != CUDA_SUCCESS) return false;
+    unsigned int flags = 0;
+    int active = 0;
+    if (cuDevicePrimaryCtxGetState(cu_dev, &flags, &active) != CUDA_SUCCESS) {
+        return false;
+    }
+    return active != 0;
+}
+
+// Bare cudaGetDevice() can implicitly create GPU 0 when this thread has no
+// current context. Only save/restore the caller's device when one exists.
+bool cudaHasCurrentContext() {
+    if (!ensureCudaDriverInit()) return false;
+    CUcontext ctx = nullptr;
+    return cuCtxGetCurrent(&ctx) == CUDA_SUCCESS && ctx != nullptr;
+}
+
+}  // namespace
+
 Status CudaPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {
     LocationParser location(options.location);
@@ -60,11 +100,76 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
+    //
+    // cudaMemcpyAsync routes the copy through its stream's device context, so
+    // the stream must live on the device owning the device-side buffer.
+    // Control-plane RPC worker threads sit on cuda:0 while a registered buffer
+    // may live on cuda:R; taking the stream from the buffer's device routes the
+    // copy correctly without mutating the calling thread's current device.
+    // Host-only copies keep the current device.
+    int device_id = getPointerDeviceId(dst);
+    if (device_id == CUDAStreamPool::kCurrentDevice) {
+        device_id = getPointerDeviceId(src);
+    }
+
     CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
+    return Status::OK();
+}
+
+Status CudaPlatform::synchronizeDevices(const Topology* topology) {
+    const std::vector<int> devices =
+        topologyDeviceIndices(topology, Topology::MEM_CUDA);
+    if (devices.empty()) return Status::OK();
+
+    int device_count = 0;
+    cudaError_t err = cudaGetDeviceCount(&device_count);
+    if (err != cudaSuccess || device_count <= 0) {
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "CudaPlatform::synchronizeDevices "
+                            "cudaGetDeviceCount failed: "
+                         << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+        return Status::OK();
+    }
+
+    int saved = 0;
+    const bool have_saved =
+        cudaHasCurrentContext() && cudaGetDevice(&saved) == cudaSuccess;
+    if (!have_saved) (void)cudaGetLastError();
+
+    for (int device : devices) {
+        if (device >= device_count) continue;
+        if (!cudaPrimaryContextIsActive(device)) continue;
+        err = cudaSetDevice(device);
+        if (err != cudaSuccess) {
+            LOG(WARNING) << "CudaPlatform::synchronizeDevices cudaSetDevice("
+                         << device << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+            continue;
+        }
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess) {
+            LOG(WARNING)
+                << "CudaPlatform::synchronizeDevices cudaDeviceSynchronize "
+                   "device "
+                << device << " failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
+    if (have_saved) {
+        err = cudaSetDevice(saved);
+        if (err != cudaSuccess) {
+            LOG(WARNING)
+                << "CudaPlatform::synchronizeDevices restore cudaSetDevice("
+                << saved << ") failed: " << cudaGetErrorString(err);
+            (void)cudaGetLastError();
+        }
+    }
     return Status::OK();
 }
 }  // namespace tent

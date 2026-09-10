@@ -16,6 +16,7 @@
 #include <utility>
 
 namespace mooncake {
+
 namespace {
 
 using CompletionHandle = std::shared_ptr<::mooncakePgCompletion>;
@@ -88,7 +89,17 @@ void MooncakeWorkTracker::retainUntilShutdown(std::any resources) noexcept {
     retained_until_shutdown_.push_back(std::move(resources));
 }
 
+void MooncakeWorkTracker::notifyCapture(bool capturing) noexcept {
+    if (capturing) {
+        capture_depth_.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        capture_depth_.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
+
 void MooncakeWorkTracker::evictCompleted() noexcept {
+    // cudaEventQuery is illegal while any captured work is still live.
+    if (capture_depth_.load(std::memory_order_relaxed) > 0) return;
     std::vector<RetiredResources> candidates;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -204,11 +215,11 @@ MooncakeWorkCuda::MooncakeWorkCuda(c10d::OpType opType,
                                    std::shared_ptr<c10::Event> event,
                                    FailedRanksHint failedRanksHint,
                                    std::shared_ptr<MooncakeWorkTracker> tracker,
-                                   std::vector<at::Tensor> keepAlive)
+                                   std::vector<at::Tensor> keepAlive,
+                                   bool is_captured)
     : Work(-1, opType),
       event_(std::move(event)),
-      is_captured_(at::cuda::currentStreamCaptureStatus() !=
-                   c10::cuda::CaptureStatus::None),
+      is_captured_(is_captured),
       failed_ranks_hint_(std::move(failedRanksHint)),
       tracker_(std::move(tracker)),
       keep_alive_(std::move(keepAlive)) {
@@ -218,6 +229,9 @@ MooncakeWorkCuda::MooncakeWorkCuda(c10d::OpType opType,
 MooncakeWorkCuda::~MooncakeWorkCuda() {
     if (!tracker_) return;
     if (is_captured_) {
+        // Captured graph resources remain valid until the graph has released
+        // its references; the tracker owns them through shutdown.
+        tracker_->notifyCapture(false);
         tracker_->retainUntilShutdown(makeTrackedResources(
             std::move(event_), std::move(failed_ranks_hint_),
             std::move(keep_alive_)));

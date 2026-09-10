@@ -7,7 +7,9 @@
 #include <vector>   // Required by histogram serialization
 #include <cmath>
 
-#include "utils.h"
+#include "common/byte_size.h"
+#include "segment.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -61,6 +63,36 @@ MasterMetricManager::MasterMetricManager()
       // Initialize cluster metrics
       active_clients_("master_active_clients",
                       "Total number of active clients"),
+      client_liveness_active_clients_(
+          "master_client_liveness_active_clients",
+          "Store Client liveness records currently Active"),
+      client_liveness_suspected_clients_(
+          "master_client_liveness_suspected_clients",
+          "Store Client liveness records currently Suspected"),
+      client_liveness_offline_clients_(
+          "master_client_liveness_offline_clients",
+          "Store Client liveness records currently Offline"),
+      client_liveness_suspected_transitions_(
+          "master_client_liveness_suspected_transitions_total",
+          "Store Client Active to Suspected transitions"),
+      client_liveness_recoveries_(
+          "master_client_liveness_recoveries_total",
+          "Store Client Suspected to Active recoveries"),
+      client_liveness_offline_transitions_(
+          "master_client_liveness_offline_transitions_total",
+          "Store Client Suspected to Offline transitions"),
+      pending_client_offboarding_jobs_metric_(
+          "master_client_offboarding_queue_depth",
+          "Queued or running Store Client offboarding jobs"),
+      client_offboarding_duration_ms_(
+          "master_client_offboarding_duration_ms",
+          "Asynchronous Store Client offboarding duration in milliseconds",
+          {1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000, 30000}),
+      client_offboarding_retries_("master_client_offboarding_retries_total",
+                                  "Retried Store Client offboarding attempts"),
+      client_offboarding_alerts_(
+          "master_client_offboarding_alerts_total",
+          "Offboarding retries at or above the operator alert threshold"),
 
       // Initialize Request Counters
       put_start_requests_("master_put_start_requests_total",
@@ -360,6 +392,11 @@ MasterMetricManager::MasterMetricManager()
           "master_promotion_failed_total",
           "Total promotion tasks aborted by holder via "
           "NotifyPromotionFailure (holder reported a downstream failure)"),
+      promotion_execution_gave_up_(
+          "master_promotion_execution_gave_up_total",
+          "Total promotion admission chains permanently abandoned after "
+          "kMaxPromotionExecutionFailures consecutive execution failures "
+          "(self-sustaining cycle stopped; reads can still re-admit)"),
       promotion_cancelled_(
           "master_promotion_cancelled_total",
           "Total promotion tasks removed because the prerequisite went "
@@ -477,9 +514,17 @@ MasterMetricManager::MasterMetricManager()
           "Total number of MarkTaskToComplete requests received"),
       mark_task_to_complete_failures_(
           "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+          "Total number of failed MarkTaskToComplete requests"),
+      build_info_("mooncake_build_info",
+                  "Build version of the running master; the value is always 1 "
+                  "and the version strings are carried by the labels",
+                  {{"version", GetMooncakeStoreVersion()},
+                   {"display_version", MOONCAKE_DISPLAY_VERSION}}) {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
+    // Info-style metric: emit a single series for the build this binary was
+    // compiled from. Set once here because the value never changes at runtime.
+    build_info_.update(1);
 }
 
 // --- Metric Interface Methods ---
@@ -493,6 +538,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
+    client_liveness_active_clients_.update(0);
+    client_liveness_suspected_clients_.update(0);
+    client_liveness_offline_clients_.update(0);
+    pending_client_offboarding_jobs_metric_.update(0);
     mem_cache_nums_.update(0);
     file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
@@ -500,10 +549,16 @@ void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Counters (use inc(0) to mark as changed)
     promotion_admitted_.inc(0);
+    client_liveness_suspected_transitions_.inc(0);
+    client_liveness_recoveries_.inc(0);
+    client_liveness_offline_transitions_.inc(0);
+    client_offboarding_retries_.inc(0);
+    client_offboarding_alerts_.inc(0);
     promotion_completed_.inc(0);
     promotion_completed_bytes_.inc(0);
     promotion_expired_.inc(0);
     promotion_failed_.inc(0);
+    promotion_execution_gave_up_.inc(0);
     promotion_cancelled_.inc(0);
     promotion_rejected_frequency_.inc(0);
     promotion_rejected_watermark_.inc(0);
@@ -627,6 +682,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
+    client_offboarding_duration_ms_.observe(0);
     nof_heartbeat_probe_latency_ms_.observe(0);
 
     // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
@@ -676,15 +732,6 @@ int64_t MasterMetricManager::get_total_mem_capacity() {
     return mem_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_mem_used_ratio(void) {
-    double allocated = mem_allocated_size_.value();
-    double capacity = mem_total_capacity_.value();
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
-}
-
 int64_t MasterMetricManager::get_segment_allocated_mem_size(
     const std::string& segment) {
     return mem_allocated_size_per_segment_.value({segment});
@@ -708,16 +755,6 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
 void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
     mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
-}
-
-double MasterMetricManager::get_segment_mem_used_ratio(
-    const std::string& segment) {
-    double allocated = get_segment_allocated_mem_size(segment);
-    double capacity = get_segment_total_mem_capacity(segment);
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
 }
 
 // NoF segment Metrics
@@ -761,13 +798,44 @@ int64_t MasterMetricManager::get_total_nof_capacity() {
     return nof_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_nof_used_ratio(void) {
-    double allocated = nof_allocated_size_.value();
-    double capacity = nof_total_capacity_.value();
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
+void MasterMetricManager::project_storage_usage(
+    const TieredStorageUsageSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(storage_projection_mutex_);
+
+    auto project_tier = [](const StorageUsageSnapshot& tier,
+                           ylt::metric::gauge_t& allocated,
+                           ylt::metric::gauge_t& capacity,
+                           ylt::metric::dynamic_gauge_1t& allocated_by_segment,
+                           ylt::metric::dynamic_gauge_1t& capacity_by_segment,
+                           std::set<std::string>& projected_segments) {
+        allocated.update(static_cast<int64_t>(tier.used_bytes));
+        capacity.update(static_cast<int64_t>(tier.capacity_bytes));
+
+        std::set<std::string> current_segments;
+        for (const auto& [segment_name, usage] : tier.segments) {
+            current_segments.insert(segment_name);
+            allocated_by_segment.update({segment_name},
+                                        static_cast<int64_t>(usage.used_bytes));
+            capacity_by_segment.update(
+                {segment_name}, static_cast<int64_t>(usage.capacity_bytes));
+        }
+        for (const auto& segment_name : projected_segments) {
+            if (!current_segments.contains(segment_name)) {
+                allocated_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+                capacity_by_segment.remove_label_value(
+                    {{"segment", segment_name}});
+            }
+        }
+        projected_segments = std::move(current_segments);
+    };
+
+    project_tier(snapshot.memory, mem_allocated_size_, mem_total_capacity_,
+                 mem_allocated_size_per_segment_,
+                 mem_total_capacity_per_segment_, projected_mem_segments_);
+    project_tier(snapshot.nof, nof_allocated_size_, nof_total_capacity_,
+                 nof_allocated_size_per_segment_,
+                 nof_total_capacity_per_segment_, projected_nof_segments_);
 }
 
 int64_t MasterMetricManager::get_segment_allocated_nof_size(
@@ -784,16 +852,6 @@ void MasterMetricManager::remove_nof_segment_metrics(
     const std::string& segment) {
     nof_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
     nof_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
-}
-
-double MasterMetricManager::get_segment_nof_used_ratio(
-    const std::string& segment) {
-    double allocated = get_segment_allocated_nof_size(segment);
-    double capacity = get_segment_total_nof_capacity(segment);
-    if (capacity == 0) {
-        return 0.0;
-    }
-    return allocated / capacity;
 }
 
 // File Storage Metrics
@@ -874,6 +932,79 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+void MasterMetricManager::client_liveness_record_created() {
+    client_liveness_active_clients_.inc(1);
+}
+
+void MasterMetricManager::client_liveness_became_suspected() {
+    client_liveness_active_clients_.dec(1);
+    client_liveness_suspected_clients_.inc(1);
+    client_liveness_suspected_transitions_.inc(1);
+}
+
+void MasterMetricManager::client_liveness_recovered() {
+    client_liveness_suspected_clients_.dec(1);
+    client_liveness_active_clients_.inc(1);
+    client_liveness_recoveries_.inc(1);
+}
+
+void MasterMetricManager::client_liveness_became_offline() {
+    client_liveness_suspected_clients_.dec(1);
+    client_liveness_offline_clients_.inc(1);
+    client_liveness_offline_transitions_.inc(1);
+}
+
+void MasterMetricManager::on_client_liveness_record_removed(
+    ClientLivenessState state) {
+    switch (state) {
+        case ClientLivenessState::ACTIVE:
+            client_liveness_active_clients_.dec(1);
+            break;
+        case ClientLivenessState::SUSPECTED:
+            client_liveness_suspected_clients_.dec(1);
+            break;
+        case ClientLivenessState::OFFLINE:
+            client_liveness_offline_clients_.dec(1);
+            break;
+    }
+}
+
+void MasterMetricManager::reset_client_liveness_metrics(
+    int64_t active_records) {
+    client_liveness_active_clients_.dec(
+        client_liveness_active_clients_.value());
+    client_liveness_suspected_clients_.dec(
+        client_liveness_suspected_clients_.value());
+    client_liveness_offline_clients_.dec(
+        client_liveness_offline_clients_.value());
+    pending_client_offboarding_jobs_metric_.dec(
+        pending_client_offboarding_jobs_metric_.value());
+    if (active_records > 0) {
+        client_liveness_active_clients_.inc(active_records);
+    }
+}
+
+void MasterMetricManager::inc_client_offboarding_queue_depth(int64_t jobs) {
+    pending_client_offboarding_jobs_metric_.inc(jobs);
+}
+
+void MasterMetricManager::dec_client_offboarding_queue_depth(int64_t jobs) {
+    pending_client_offboarding_jobs_metric_.dec(jobs);
+}
+
+void MasterMetricManager::inc_client_offboarding_retry() {
+    client_offboarding_retries_.inc(1);
+}
+
+void MasterMetricManager::inc_client_offboarding_alert() {
+    client_offboarding_alerts_.inc(1);
+}
+
+void MasterMetricManager::observe_client_offboarding_duration_ms(
+    int64_t duration_ms) {
+    client_offboarding_duration_ms_.observe(duration_ms);
 }
 
 // Store-observed cache reuse metrics
@@ -1179,6 +1310,9 @@ void MasterMetricManager::inc_promotion_expired(int64_t val) {
 }
 void MasterMetricManager::inc_promotion_failed(int64_t val) {
     promotion_failed_.inc(val);
+}
+void MasterMetricManager::inc_promotion_execution_gave_up(int64_t val) {
+    promotion_execution_gave_up_.inc(val);
 }
 void MasterMetricManager::inc_promotion_cancelled(int64_t val) {
     promotion_cancelled_.inc(val);
@@ -1600,6 +1734,9 @@ int64_t MasterMetricManager::get_promotion_expired() {
 int64_t MasterMetricManager::get_promotion_failed() {
     return promotion_failed_.value();
 }
+int64_t MasterMetricManager::get_promotion_execution_gave_up() {
+    return promotion_execution_gave_up_.value();
+}
 int64_t MasterMetricManager::get_promotion_cancelled() {
     return promotion_cancelled_.value();
 }
@@ -1812,9 +1949,20 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
+    serialize_metric(client_liveness_active_clients_);
+    serialize_metric(client_liveness_suspected_clients_);
+    serialize_metric(client_liveness_offline_clients_);
+    serialize_metric(pending_client_offboarding_jobs_metric_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
+    serialize_metric(client_offboarding_duration_ms_);
+
+    serialize_metric(client_liveness_suspected_transitions_);
+    serialize_metric(client_liveness_recoveries_);
+    serialize_metric(client_liveness_offline_transitions_);
+    serialize_metric(client_offboarding_retries_);
+    serialize_metric(client_offboarding_alerts_);
 
     // Serialize Request Counters
     serialize_metric(exist_key_requests_);
@@ -1972,6 +2120,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(promotion_candidate_dropped_limit_);
     serialize_metric(tenant_quota_reject_total_);
     serialize_metric(tenant_evict_bytes_total_);
+    serialize_metric(build_info_);
 
     // Serialize Snapshot Metrics
     serialize_metric(snapshot_duration_ms_);

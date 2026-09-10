@@ -15,6 +15,7 @@
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/platform.h"
+#include "tent/runtime/topology.h"
 #include "tent/thirdparty/nlohmann/json.h"
 
 #include <algorithm>
@@ -374,8 +375,7 @@ bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
             type_str = kMemoryTypeCuda;
             break;
         case MTYPE_ROCM:
-            type_str = "rocm";
-            break;
+            return isAmdGpuLocationType(pattern);
         case MTYPE_TPU:
             type_str = "tpu";
             break;

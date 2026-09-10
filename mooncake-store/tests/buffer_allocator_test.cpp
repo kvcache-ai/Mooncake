@@ -15,6 +15,15 @@
 
 namespace mooncake {
 
+namespace {
+
+LiveAllocation ToLiveAllocation(uintptr_t base,
+                                const AllocatedBuffer::Descriptor& descriptor) {
+    return {descriptor.buffer_address_ - base, descriptor.size_};
+}
+
+}  // namespace
+
 // Test fixture for BufferAllocator tests
 class BufferAllocatorTest : public ::testing::Test {
    protected:
@@ -34,16 +43,12 @@ class BufferAllocatorTest : public ::testing::Test {
         const std::string& segment_name, size_t base_offset, size_t size,
         BufferAllocatorType allocator_type) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
-        switch (allocator_type) {
-            case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(
-                    segment_name, base, size, segment_name);
-            default:
-                throw std::invalid_argument("Invalid allocator type");
+        auto allocator = CreateBufferAllocator(allocator_type, segment_name,
+                                               base, size, segment_name);
+        if (!allocator) {
+            throw std::invalid_argument("Invalid allocator test parameters");
         }
+        return std::move(*allocator);
     }
 
     void VerifyAllocatedBuffer(const AllocatedBuffer& bufHandle,
@@ -134,7 +139,7 @@ TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
     EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
 }
 
-TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
+TEST_F(BufferAllocatorTest, ImportOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;
     const std::string segment = "restore-segment";
@@ -149,13 +154,16 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     ASSERT_NE(removed, nullptr);
     ASSERT_NE(last, nullptr);
 
-    std::vector<AllocatedBuffer::Descriptor> descriptors = {
+    const std::vector<AllocatedBuffer::Descriptor> descriptors = {
         first->get_descriptor(), last->get_descriptor()};
+    std::vector<LiveAllocation> allocations = {
+        ToLiveAllocation(kBase, descriptors[0]),
+        ToLiveAllocation(kBase, descriptors[1])};
     const auto removed_descriptor = removed->get_descriptor();
     removed.reset();
 
-    auto restored = RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                                 endpoint, descriptors);
+    auto restored = ImportOffsetBufferAllocator(segment, kBase, kCapacity,
+                                                endpoint, allocations);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), descriptors.size());
     EXPECT_EQ(restored->allocator->size(),
@@ -169,111 +177,119 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     ASSERT_NE(new_buffer, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(new_buffer->data()),
               removed_descriptor.buffer_address_);
-
-    auto wrong_endpoint = descriptors;
-    wrong_endpoint[0].transport_endpoint_ = "other-endpoint";
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                              endpoint, wrong_endpoint)
-                     .has_value());
-
-    auto duplicate = descriptors;
-    duplicate.push_back(descriptors.front());
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                              endpoint, duplicate)
-                     .has_value());
-
-    auto out_of_range = descriptors;
-    out_of_range[0].buffer_address_ = kBase + kCapacity;
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                              endpoint, out_of_range)
-                     .has_value());
 }
 
-TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsValidatesRangesAndOrder) {
+TEST_F(BufferAllocatorTest, ImportOffsetAllocationsValidatesRangesAndOrder) {
     constexpr uintptr_t kBase = 0x190000000ULL;
     constexpr size_t kCapacity = 4096;
     const std::string segment = "restore-validation";
     const std::string endpoint = "restore-validation-endpoint";
-    auto descriptor = [&](uintptr_t address, uint64_t size) {
-        return AllocatedBuffer::Descriptor{size, address, "tcp", endpoint};
+    auto allocation = [&](uintptr_t address, uint64_t size) {
+        return LiveAllocation{address - kBase, size};
     };
 
-    std::vector<AllocatedBuffer::Descriptor> unsorted = {
-        descriptor(kBase + 512, 64), descriptor(kBase + 128, 64)};
-    auto restored = RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                                 endpoint, unsorted);
+    std::vector<LiveAllocation> unsorted = {allocation(kBase + 512, 64),
+                                            allocation(kBase + 128, 64)};
+    auto restored = ImportOffsetBufferAllocator(segment, kBase, kCapacity,
+                                                endpoint, unsorted);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), unsorted.size());
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers[0]->data()),
-              unsorted[0].buffer_address_);
+              kBase + unsorted[0].offset_from_base);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers[1]->data()),
-              unsorted[1].buffer_address_);
+              kBase + unsorted[1].offset_from_base);
 
-    std::vector<AllocatedBuffer::Descriptor> overlapping = {
-        descriptor(kBase + 128, 100), descriptor(kBase + 200, 32)};
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                              endpoint, overlapping)
+    std::vector<LiveAllocation> overlapping = {allocation(kBase + 128, 100),
+                                               allocation(kBase + 200, 32)};
+    EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
+                                             endpoint, overlapping)
                      .has_value());
 
-    std::vector<AllocatedBuffer::Descriptor> normalized_past_end = {
-        descriptor(kBase + kCapacity - 100, 100)};
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                              endpoint, normalized_past_end)
+    std::vector<LiveAllocation> normalized_past_end = {
+        allocation(kBase + kCapacity - 100, 100)};
+    EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
+                                             endpoint, normalized_past_end)
                      .has_value());
 
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(
+    EXPECT_FALSE(ImportOffsetBufferAllocator(
                      segment, std::numeric_limits<size_t>::max() - 100, 200,
                      endpoint, {})
                      .has_value());
-    std::vector<AllocatedBuffer::Descriptor> descriptor_overflow = {
-        descriptor(std::numeric_limits<uintptr_t>::max() - 10, 20)};
-    EXPECT_FALSE(RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
-                                              endpoint, descriptor_overflow)
+    std::vector<LiveAllocation> allocation_overflow = {
+        {std::numeric_limits<uintptr_t>::max() - kBase - 10, 20}};
+    EXPECT_FALSE(ImportOffsetBufferAllocator(segment, kBase, kCapacity,
+                                             endpoint, allocation_overflow)
                      .has_value());
 }
 
-TEST_F(BufferAllocatorTest, RestoredOffsetHandleReleasesItsExactAddress) {
+TEST_F(BufferAllocatorTest, ImportedOffsetHandleReleasesItsExactAddress) {
     constexpr uintptr_t kBase = 0x1A0000000ULL;
     constexpr size_t kCapacity = 4096;
     const std::string endpoint = "restore-release";
-    std::vector<AllocatedBuffer::Descriptor> descriptors = {
-        {64, kBase, "tcp", endpoint}, {64, kBase + 512, "tcp", endpoint}};
-    auto restored = RestoreOffsetBufferAllocator(
-        "restore-release", kBase, kCapacity, endpoint, descriptors);
+    std::vector<LiveAllocation> allocations = {{0, 64}, {512, 64}};
+    auto restored = ImportOffsetBufferAllocator(
+        "restore-release", kBase, kCapacity, endpoint, allocations);
     ASSERT_TRUE(restored.has_value());
 
     restored->buffers[0].reset();
     auto replacement = restored->allocator->allocate(64);
     ASSERT_NE(replacement, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(replacement->data()),
-              descriptors[0].buffer_address_);
+              kBase + allocations[0].offset_from_base);
 }
 
-TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsHasNoArbitraryGapLimit) {
+TEST_F(BufferAllocatorTest, ImportOffsetAllocationsHasNoArbitraryGapLimit) {
     constexpr uintptr_t kBase = 0x1B0000000ULL;
     constexpr size_t kGapCount = 65537;
     const std::string endpoint = "restore-many-gaps";
-    std::vector<AllocatedBuffer::Descriptor> descriptors;
-    descriptors.reserve(kGapCount);
+    std::vector<LiveAllocation> allocations;
+    allocations.reserve(kGapCount);
     for (size_t i = 0; i < kGapCount; ++i) {
-        descriptors.push_back({1, kBase + 1 + i * 2, "tcp", endpoint});
+        allocations.push_back({1 + i * 2, 1});
     }
 
-    auto restored = RestoreOffsetBufferAllocator(
-        "restore-many-gaps", kBase, kGapCount * 2 + 1, endpoint, descriptors);
+    auto restored = ImportOffsetBufferAllocator(
+        "restore-many-gaps", kBase, kGapCount * 2 + 1, endpoint, allocations);
     ASSERT_TRUE(restored.has_value());
-    EXPECT_EQ(restored->buffers.size(), descriptors.size());
+    EXPECT_EQ(restored->buffers.size(), allocations.size());
     EXPECT_EQ(reinterpret_cast<uintptr_t>(restored->buffers.back()->data()),
-              descriptors.back().buffer_address_);
+              kBase + allocations.back().offset_from_base);
 }
 
-TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsAtOriginalAddresses) {
+TEST_F(BufferAllocatorTest, CachelibCreateRejectsInvalidMemoryLayout) {
+    constexpr size_t kSlabSize = facebook::cachelib::Slab::kSize;
+    constexpr uintptr_t kBase = 0x1C0000000ULL;
+
+    auto expect_invalid = [](size_t base, size_t size) {
+        auto result = CachelibBufferAllocator::Create("cachelib-invalid", base,
+                                                      size, "endpoint");
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    };
+
+    expect_invalid(kBase + 1, kSlabSize);
+    expect_invalid(kBase, kSlabSize + 1);
+    expect_invalid(std::numeric_limits<size_t>::max() - kSlabSize,
+                   2 * kSlabSize);
+    if constexpr (std::numeric_limits<size_t>::max() / kSlabSize >
+                  std::numeric_limits<unsigned int>::max()) {
+        const size_t too_many_slabs =
+            (static_cast<size_t>(std::numeric_limits<unsigned int>::max()) +
+             1) *
+            kSlabSize;
+        expect_invalid(kBase, too_many_slabs);
+    }
+}
+
+TEST_F(BufferAllocatorTest, ImportCachelibAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x1C0000000ULL;
     constexpr size_t kCapacity = 4 * facebook::cachelib::Slab::kSize;
     const std::string segment = "cachelib-restore";
     const std::string endpoint = "cachelib-restore-endpoint";
-    auto original = std::make_shared<CachelibBufferAllocator>(
-        segment, kBase, kCapacity, endpoint);
+    auto created =
+        CachelibBufferAllocator::Create(segment, kBase, kCapacity, endpoint);
+    ASSERT_TRUE(created.has_value());
+    auto original = std::move(*created);
 
     auto small_first = original->allocate(64);
     auto small_hole = original->allocate(64);
@@ -291,11 +307,16 @@ TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsAtOriginalAddresses) {
     std::vector<AllocatedBuffer::Descriptor> descriptors = {
         large_last->get_descriptor(), small_first->get_descriptor(),
         large_first->get_descriptor(), small_last->get_descriptor()};
+    std::vector<LiveAllocation> allocations;
+    allocations.reserve(descriptors.size());
+    for (const auto& descriptor : descriptors) {
+        allocations.push_back(ToLiveAllocation(kBase, descriptor));
+    }
     small_hole.reset();
     large_hole.reset();
 
-    auto restored = RestoreCachelibBufferAllocator(segment, kBase, kCapacity,
-                                                   endpoint, descriptors);
+    auto restored = ImportCachelibBufferAllocator(segment, kBase, kCapacity,
+                                                  endpoint, allocations);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), descriptors.size());
     for (size_t i = 0; i < descriptors.size(); ++i) {
@@ -317,42 +338,24 @@ TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsAtOriginalAddresses) {
     EXPECT_EQ(reinterpret_cast<uintptr_t>(replacement->data()), released);
 }
 
-TEST_F(BufferAllocatorTest, RestoreCachelibAllocationsRejectsInvalidLayouts) {
+TEST_F(BufferAllocatorTest, ImportCachelibAllocationsRejectsInvalidLayouts) {
     constexpr uintptr_t kBase = 0x1D0000000ULL;
     constexpr size_t kCapacity = 4 * facebook::cachelib::Slab::kSize;
-    constexpr size_t kSlabSize = facebook::cachelib::Slab::kSize;
     const std::string endpoint = "cachelib-invalid-endpoint";
-    auto descriptor = [&](uintptr_t address, uint64_t size) {
-        return AllocatedBuffer::Descriptor{size, address, "tcp", endpoint};
+    auto allocation = [&](uintptr_t address, uint64_t size) {
+        return LiveAllocation{address - kBase, size};
     };
-    auto restore = [&](const std::vector<AllocatedBuffer::Descriptor>& descs) {
-        return RestoreCachelibBufferAllocator("cachelib-invalid", kBase,
-                                              kCapacity, endpoint, descs);
+    auto import = [&](const std::vector<LiveAllocation>& allocations) {
+        return ImportCachelibBufferAllocator("cachelib-invalid", kBase,
+                                             kCapacity, endpoint, allocations);
     };
 
     EXPECT_FALSE(
-        restore({descriptor(kBase, 64), descriptor(kBase, 4096)}).has_value());
-    EXPECT_FALSE(restore({descriptor(kBase + 1, 64)}).has_value());
+        import({allocation(kBase, 64), allocation(kBase, 4096)}).has_value());
+    EXPECT_FALSE(import({allocation(kBase + 1, 64)}).has_value());
     EXPECT_FALSE(
-        restore({descriptor(kBase, 64), descriptor(kBase, 64)}).has_value());
-
-    auto wrong_endpoint = descriptor(kBase, 64);
-    wrong_endpoint.transport_endpoint_ = "wrong";
-    EXPECT_FALSE(restore({wrong_endpoint}).has_value());
-    EXPECT_FALSE(restore({descriptor(kBase + kCapacity, 64)}).has_value());
-    EXPECT_FALSE(RestoreCachelibBufferAllocator("cachelib-invalid", kBase + 1,
-                                                kCapacity, endpoint, {})
-                     .has_value());
-    EXPECT_FALSE(RestoreCachelibBufferAllocator(
-                     "cachelib-invalid",
-                     std::numeric_limits<size_t>::max() - kSlabSize,
-                     2 * kSlabSize, endpoint, {})
-                     .has_value());
-
-    auto valid_after_fail = restore({descriptor(kBase + kSlabSize, 4096)});
-    ASSERT_TRUE(valid_after_fail.has_value());
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(valid_after_fail->buffers[0]->data()),
-              kBase + kSlabSize);
+        import({allocation(kBase, 64), allocation(kBase, 64)}).has_value());
+    EXPECT_FALSE(import({allocation(kBase + kCapacity, 64)}).has_value());
 }
 
 TEST_F(BufferAllocatorTest, CachelibImportRejectsChunkInSlabTail) {
@@ -370,32 +373,16 @@ TEST_F(BufferAllocatorTest, CachelibImportRejectsChunkInSlabTail) {
         pool, {{reinterpret_cast<void*>(kBase + kAllocSize), kAllocSize}}));
 }
 
-TEST_F(BufferAllocatorTest, RestoreCachelibRejectsNonMemoryDescriptors) {
+TEST_F(BufferAllocatorTest, CachelibImportRejectsNonMemoryReplicaType) {
     constexpr uintptr_t kBase = 0x1F0000000ULL;
     constexpr size_t kCapacity = 2 * facebook::cachelib::Slab::kSize;
     const std::string endpoint = "cachelib-memory-only";
-    std::vector<AllocatedBuffer::Descriptor> descriptors = {
-        {64, kBase, "tcp", endpoint}};
+    std::vector<LiveAllocation> allocations = {{0, 64}};
 
-    EXPECT_FALSE(RestoreCachelibBufferAllocator(
-                     "cachelib-memory-only", kBase, kCapacity, endpoint,
-                     descriptors, ReplicaType::NOF_SSD)
+    EXPECT_FALSE(ImportCachelibBufferAllocator("cachelib-memory-only", kBase,
+                                               kCapacity, endpoint, allocations,
+                                               ReplicaType::NOF_SSD)
                      .has_value());
-
-    descriptors[0].protocol_ = "cxl";
-    EXPECT_FALSE(RestoreCachelibBufferAllocator("cachelib-memory-only", kBase,
-                                                kCapacity, endpoint,
-                                                descriptors)
-                     .has_value());
-
-    descriptors[0].protocol_ = "rdma";
-    auto rdma = RestoreCachelibBufferAllocator(
-        "cachelib-memory-only", kBase, kCapacity, endpoint, descriptors);
-    ASSERT_TRUE(rdma.has_value());
-    const auto restored = rdma->buffers[0]->get_descriptor();
-    EXPECT_EQ(restored.protocol_, descriptors[0].protocol_);
-    EXPECT_EQ(restored.buffer_address_, descriptors[0].buffer_address_);
-    EXPECT_EQ(restored.transport_endpoint_, descriptors[0].transport_endpoint_);
 }
 
 // Test allocation request larger than available space

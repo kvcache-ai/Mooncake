@@ -13,7 +13,7 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
@@ -215,6 +215,11 @@ struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
     static constexpr const char* value = "MountLocalDiskSegment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
+    static constexpr const char* value = "UnmountLocalDiskSegment";
 };
 
 template <>
@@ -950,6 +955,18 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
             client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegment(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountLocalDiskSegment");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::UnmountLocalDiskSegment, void>(
+            client_id);
     timer.LogResponseExpected(result);
     return result;
 }

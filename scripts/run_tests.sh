@@ -185,21 +185,30 @@ if [ -n "$TEST_PROMOTION_ON_HIT" ]; then
     # deterministic. --root_fs_dir is required so the master returns a non-
     # empty fsdir from GetStorageConfig, which is the trigger that initializes
     # the client's FileStorage (and therefore the offload heartbeat).
+    # promotion_max_per_heartbeat=16 raises the delivery cap so a burst of
+    # admissions (the phase-2 batch query promotes every LOCAL_DISK-only key)
+    # drains within the test's wait window instead of starving individual keys
+    # at the default 1-per-heartbeat.
     mooncake_master \
         --default_kv_lease_ttl=500 \
         --root_fs_dir=$TEST_ROOT_DIR \
         --enable_offload=true \
         --offload_on_evict=true \
         --promotion_on_hit=true \
-        --promotion_admission_threshold=1 &
+        --promotion_admission_threshold=1 \
+        --promotion_max_per_heartbeat=16 &
     MASTER_PID=$!
     sleep 1
     # Lower bucket-flush thresholds so the test workload (~64 MB) actually
     # writes to disk rather than sitting in the bucket backend's ungrouped
-    # pool until the default 500-key / 256-MB bucket fills.
+    # pool until the default 500-key / 256-MB bucket fills. The 2s offload
+    # heartbeat (default 10s) pins the master/client clock phase so offload
+    # draining and promotion delivery complete well inside the test's wait
+    # windows.
     MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
         DEFAULT_KV_LEASE_TTL=500 \
         MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=$TEST_ROOT_DIR \
+        MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=2 \
         MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=10 \
         MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES=10485760 \
         python test_promotion_on_hit.py

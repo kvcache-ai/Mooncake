@@ -25,9 +25,9 @@
 
 #include "mutex.h"
 #include "nvme_kv_backend.h"
-#include "utils.h"
+#include "common/timestamp.h"
+#include "common/file_util.h"
 #include "crc32c.h"
-#include "ascii_string.h"
 #include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
@@ -58,39 +58,6 @@ struct FdGuard {
 
 namespace mooncake {
 
-namespace {
-
-struct OffsetAllocatorBackendEnvironmentVariables {
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetEvictionPolicy{"MOONCAKE_OFFSET_EVICTION_POLICY"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetHighRatio{"MOONCAKE_OFFSET_HIGH_RATIO"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetLowRatio{"MOONCAKE_OFFSET_LOW_RATIO"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetMaxCapacityNodes{"MOONCAKE_OFFSET_MAX_CAPACITY_NODES"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetMaxEvictPerOffload{
-            "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD"};
-    inline static constexpr EnvironmentVariable<std::string>
-        kMooncakeOffsetPersistMode{"MOONCAKE_OFFSET_PERSIST_MODE"};
-    inline static constexpr EnvironmentVariable<int64_t>
-        kMooncakeOffsetPersistIntervalSeconds{
-            "MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS"};
-    inline static constexpr EnvironmentVariable<bool> kMooncakeOffsetRecordCrc{
-        "MOONCAKE_OFFSET_RECORD_CRC"};
-};
-
-}  // namespace
-
-bool FilePerKeyConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
-        return false;
-    }
-    return true;
-}
-
 bool BucketBackendConfig::Validate() const {
     if (bucket_keys_limit <= 0) {
         LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
@@ -101,18 +68,6 @@ bool BucketBackendConfig::Validate() const {
         return false;
     }
     return true;
-}
-
-FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
-    FilePerKeyConfig config;
-
-    config.fsdir = Environ::GetString("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
-
-    config.enable_eviction = Environ::GetBool(
-        "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
-        Environ::GetBool("ENABLE_EVICTION", config.enable_eviction));
-
-    return config;
 }
 
 BucketBackendConfig BucketBackendConfig::FromEnvironment() {
@@ -149,127 +104,6 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     }
 
     return config;
-}
-
-bool OffsetAllocatorBackendConfig::Validate() const {
-    if (persist_mode == OffsetPersistMode::kRelaxed) {
-        if (persist_interval_seconds < 5) {
-            LOG(ERROR) << "OffsetAllocatorBackendConfig: "
-                          "persist_interval_seconds must be >= 5 for "
-                          "kRelaxed mode";
-            return false;
-        }
-    }
-    if (high_ratio <= 0.0 || high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
-        return false;
-    }
-    if (low_ratio <= 0.0 || low_ratio >= high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: low_ratio must be in (0, "
-                      "high_ratio)";
-        return false;
-    }
-    if (keys_high_ratio <= 0.0 || keys_high_ratio > 1.0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: keys_high_ratio must be in (0,1]";
-        return false;
-    }
-    if (keys_low_ratio <= 0.0 || keys_low_ratio >= keys_high_ratio) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: keys_low_ratio must be in "
-                      "(0, keys_high_ratio)";
-        return false;
-    }
-    if (max_evict_per_offload == 0) {
-        LOG(ERROR) << "OffsetAllocatorBackendConfig: max_evict_per_offload "
-                      "must be > 0";
-        return false;
-    }
-    if (fallback_evict_batch == 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: fallback_evict_batch must be > 0";
-        return false;
-    }
-    if (max_capacity_nodes < 0) {
-        LOG(ERROR)
-            << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
-        return false;
-    }
-    return true;
-}
-
-OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
-    OffsetAllocatorBackendConfig cfg;
-    using Variables = OffsetAllocatorBackendEnvironmentVariables;
-
-    const auto policy = Environ::Read(Variables::kMooncakeOffsetEvictionPolicy);
-    if (policy.has_value()) {
-        if (AsciiCaseInsensitiveEquals(*policy, "fifo")) {
-            cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
-        }
-        // NONE is default; LRU reserved for phase 2
-    }
-
-    constexpr EnvironmentDoubleParseOptions kLegacyRatioParsing{
-        .allow_trailing_characters = true,
-        .allow_non_finite = true,
-    };
-    if (const auto value = Environ::Read(Variables::kMooncakeOffsetHighRatio)) {
-        cfg.high_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
-                             .value_or(cfg.high_ratio);
-    }
-    if (const auto value = Environ::Read(Variables::kMooncakeOffsetLowRatio)) {
-        cfg.low_ratio = TryParseEnvironmentDouble(*value, kLegacyRatioParsing)
-                            .value_or(cfg.low_ratio);
-    }
-    // Both byte and key watermarks derive from the same ratio pair.
-    cfg.keys_high_ratio = cfg.high_ratio;
-    cfg.keys_low_ratio = cfg.low_ratio;
-
-    cfg.max_capacity_nodes = Environ::ReadOr(
-        Variables::kMooncakeOffsetMaxCapacityNodes, cfg.max_capacity_nodes);
-
-    // Read eviction cap as int64_t to guard against negative env values
-    // which would wrap to SIZE_MAX with an unsigned parser.
-    auto max_evict_raw =
-        Environ::ReadOr(Variables::kMooncakeOffsetMaxEvictPerOffload,
-                        static_cast<int64_t>(cfg.max_evict_per_offload));
-    if (max_evict_raw > 0) {
-        cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
-    } else if (max_evict_raw <= 0) {
-        LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
-                     << max_evict_raw << " is non-positive; using default "
-                     << cfg.max_evict_per_offload;
-    }
-
-    // Persistence mode
-    const auto persist = Environ::Read(Variables::kMooncakeOffsetPersistMode);
-    if (persist.has_value()) {
-        const std::string& s = *persist;
-        if (AsciiCaseInsensitiveEquals(s, "disabled")) {
-            cfg.persist_mode = OffsetPersistMode::kDisabled;
-        } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
-            cfg.persist_mode = OffsetPersistMode::kRelaxed;
-        } else if (AsciiCaseInsensitiveEquals(s, "strict")) {
-            cfg.persist_mode = OffsetPersistMode::kStrict;
-        } else {
-            LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
-                         << "; using default (disabled)";
-        }
-    }
-
-    cfg.persist_interval_seconds =
-        Environ::ReadOr(Variables::kMooncakeOffsetPersistIntervalSeconds,
-                        cfg.persist_interval_seconds);
-
-    // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
-    if (const auto record_crc =
-            Environ::Read(Variables::kMooncakeOffsetRecordCrc);
-        record_crc.has_value() && !*record_crc) {
-        cfg.enable_record_crc = false;
-    }
-
-    return cfg;
 }
 
 std::string StorageBackend::GetActualFsdir() const {
@@ -684,14 +518,9 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
 void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
-    // TODO: attention: this function is not thread-safe, need to add lock if
-    // used in multi-thread environment Check if the file exists before
-    // attempting to remove it
-    // TODO: add a sleep to ensure the write thread has time to create the
-    // corresponding file it will be fixed in the next version
-    std::this_thread::sleep_for(
-        std::chrono::microseconds(50));  // sleep for 50 us
-
+    // StoreObject holds the same striped path lock across file creation, write,
+    // and queue insertion. Acquiring it here serializes deletion with those
+    // operations without relying on a timing delay.
     MutexLocker path_locker(&GetFilePathMutex(path));
 
     // Eviction disabled, use simple delete (no queue tracking)
@@ -1472,9 +1301,9 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = FileUtil::ResolvePathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
@@ -1531,8 +1360,8 @@ StorageBackendAdaptor::EvictAboveDiskWatermark(
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
-                                   file_per_key_config_.fsdir);
+    auto path = FileUtil::ResolvePathFromKey(
+        key, file_storage_config_.storage_filepath, file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
@@ -1542,9 +1371,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path =
-            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
-                               file_per_key_config_.fsdir);
+        auto path = FileUtil::ResolvePathFromKey(
+            kv.key, file_storage_config_.storage_filepath,
+            file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
@@ -1989,16 +1818,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
         auto& file = file_res.value();
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-
 #ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            struct BatchReadPlan {
+                const ReadPlan* plan;
+                size_t offset_in_buffer;
+                size_t min_required;
+            };
+
+            std::vector<UringFile::ReadDesc> read_descs;
+            std::vector<BatchReadPlan> batch_read_plans;
+            read_descs.reserve(read_plans.size());
+            batch_read_plans.reserve(read_plans.size());
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
                 int64_t aligned_offset =
                     align_down(actual_offset, kDirectIOAlignment);
                 int64_t data_end =
@@ -2007,64 +1842,72 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                     static_cast<size_t>(data_end), kDirectIOAlignment));
                 size_t aligned_size =
                     static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
+                size_t offset_in_buffer =
+                    static_cast<size_t>(actual_offset - aligned_offset);
 
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-
-                if (read_res) {
-                    // Verify the aligned read returned enough bytes
-                    // to cover the actual data region.  read_aligned
-                    // reads the full aligned range [aligned_offset,
-                    // aligned_end); the caller-visible data starts at
-                    // offset_in_buffer into that buffer and spans
-                    // plan.dest_slice.size bytes.
-                    size_t min_required =
-                        static_cast<size_t>(offset_in_buffer) +
-                        plan.dest_slice.size;
-                    if (read_res.value() < min_required) {
-                        LOG(ERROR)
-                            << "read_aligned short read for key: " << plan.key
-                            << ", bucket_id=" << plan.bucket_id
-                            << ", expected at least: " << min_required
-                            << " (aligned_size=" << aligned_size
-                            << ", data_size=" << plan.dest_slice.size << ")"
-                            << ", got: " << read_res.value();
-                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                    }
-                    // Adjust ptr to point to actual data start
-                    // (zero-copy: no memcpy, buffer was oversized by
-                    // AllocateBatch to accommodate the aligned read)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    // Normalize read_res so the common validation
-                    // below passes.  The real short-read check was
-                    // already done above (min_required).
-                    read_res = plan.dest_slice.size;
-                }
-            } else
-#endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
+                read_descs.push_back(UringFile::ReadDesc{
+                    plan.dest_slice.ptr, aligned_size, aligned_offset});
+                batch_read_plans.push_back(
+                    BatchReadPlan{&plan, offset_in_buffer,
+                                  offset_in_buffer + plan.dest_slice.size});
             }
 
-            if (!read_res) {
+            auto batch_read_result = uring_file->batch_read(
+                read_descs.data(), static_cast<int>(read_descs.size()));
+            if (!batch_read_result) {
+                for (size_t i = 0; i < read_descs.size(); ++i) {
+                    if (read_descs[i].error == ErrorCode::OK) continue;
+                    LOG(ERROR)
+                        << "batch_read failed for key: "
+                        << batch_read_plans[i].plan->key
+                        << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
+                        << ", error=" << read_descs[i].error;
+                }
+                return tl::make_unexpected(batch_read_result.error());
+            }
+
+            for (size_t i = 0; i < read_descs.size(); ++i) {
+                const auto& desc = read_descs[i];
+                const auto& batch_plan = batch_read_plans[i];
+                const auto& plan = *batch_plan.plan;
+                if (!desc.completed) {
+                    LOG(ERROR)
+                        << "batch_read did not complete for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (desc.bytes_read < batch_plan.min_required) {
+                    LOG(ERROR)
+                        << "batch_read short read for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id
+                        << ", expected at least: " << batch_plan.min_required
+                        << " (aligned_size=" << desc.len
+                        << ", data_size=" << plan.dest_slice.size
+                        << "), got: " << desc.bytes_read;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                batch_object.at(plan.key).ptr =
+                    static_cast<char*>(plan.dest_slice.ptr) +
+                    batch_plan.offset_in_buffer;
+            }
+            continue;
+        }
+#endif
+
+        for (const auto& plan : read_plans) {
+            int64_t actual_offset = plan.offset + plan.key_size;
+            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+            auto read_result = file->vector_read(&iov, 1, actual_offset);
+            if (!read_result) {
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+                           << ", error: " << read_result.error();
+                return tl::make_unexpected(read_result.error());
             }
-
-            if (read_res.value() != plan.dest_slice.size) {
+            if (read_result.value() != plan.dest_slice.size) {
                 LOG(ERROR) << "Read size mismatch for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
+                           << ", got: " << read_result.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
         }
@@ -2647,21 +2490,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     } else
 #endif
     {
@@ -2679,13 +2507,32 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-
-        // Invalidate cache for this file since content changed
-        {
-            MutexLocker cache_locker(&file_cache_mutex_);
-            file_cache_.erase(bucket_data_path);
-        }
     }
+
+    // Flush bucket data to stable storage before writing metadata.
+    // This prevents a crash from leaving valid metadata pointing at
+    // incomplete data (write-ordering durability guarantee).
+    // StorageFile declares a virtual datasync() overridden by both PosixFile
+    // (fdatasync) and UringFile, so a single call covers both write paths and
+    // the branches above only keep their own write logic.
+    auto sync_result = file->datasync();
+    // Test-only: override sync result to exercise the same !sync_result
+    // cleanup path as a real fdatasync() failure.
+    if (test_datasync_failure_.load(std::memory_order_relaxed)) {
+        sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    // Invalidate cache for this file since content changed
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(bucket_data_path);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {

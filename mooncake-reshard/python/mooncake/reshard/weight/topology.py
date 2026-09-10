@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import asdict, dataclass
+from typing import Optional
 
 from ..contracts import ParticipantId, TopologyId
 from .types import (
@@ -55,7 +56,7 @@ class ParallelTopology:
         ep_size: int,
         dp_size: int,
         participants: tuple[TopologyParticipant, ...],
-        topology_id: TopologyId | None = None,
+        topology_id: Optional[TopologyId] = None,
     ) -> None:
         for value, name in (
             (tp_size, "tp_size"),

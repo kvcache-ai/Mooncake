@@ -10,7 +10,9 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping, Sequence
 from collections.abc import Set as AbstractSet
-from typing import TypeAlias, cast
+from typing import Optional, Union, cast
+
+from .._typing import TypeAlias
 
 from ..contracts import (
     ParticipantId,
@@ -38,8 +40,8 @@ from .types import (
     TensorDescriptor,
 )
 
-JsonScalar: TypeAlias = None | bool | int | float | str
-JsonValue: TypeAlias = JsonScalar | list["JsonValue"] | dict[str, "JsonValue"]
+JsonScalar: TypeAlias = Union[None, bool, int, float, str]
+JsonValue: TypeAlias = Union[JsonScalar, list["JsonValue"], dict[str, "JsonValue"]]
 JsonObject: TypeAlias = Mapping[str, JsonValue]
 
 
@@ -324,7 +326,7 @@ def _axis_from_wire(value: object, index: int) -> ParallelAxis:
 
 
 def _fragment_to_wire(fragment: PlacementFragment) -> dict[str, JsonValue]:
-    return {
+    result: dict[str, JsonValue] = {
         "placement_fragment_id": fragment.placement_fragment_id,
         "tensor_id": fragment.tensor_id,
         "global_offset": list(fragment.global_offset),
@@ -333,22 +335,27 @@ def _fragment_to_wire(fragment: PlacementFragment) -> dict[str, JsonValue]:
         "rank": _rank_to_wire(fragment.rank),
         "aliases": list(fragment.aliases),
     }
+    if fragment.pipeline_stage_id is not None:
+        result["pipeline_stage_id"] = fragment.pipeline_stage_id
+    return result
 
 
 def _fragment_from_wire(value: object, index: int) -> PlacementFragment:
-    fragment = _require_exact_fields(
-        value,
-        {
-            "placement_fragment_id",
-            "tensor_id",
-            "global_offset",
-            "local_shape",
-            "nbytes",
-            "rank",
-            "aliases",
-        },
-        f"placement fragment {index}",
-    )
+    fragment = _require_mapping(value, f"placement fragment {index}")
+    expected_fields = {
+        "placement_fragment_id",
+        "tensor_id",
+        "global_offset",
+        "local_shape",
+        "nbytes",
+        "rank",
+        "pipeline_stage_id",
+        "aliases",
+    }
+    legacy_fields = expected_fields - {"pipeline_stage_id"}
+    fragment_fields = set(fragment)
+    if fragment_fields != expected_fields and fragment_fields != legacy_fields:
+        raise ValueError(f"placement fragment {index} has an invalid schema")
     return PlacementFragment(
         placement_fragment_id=PlacementFragmentId(
             _require_nonempty_string(
@@ -364,6 +371,11 @@ def _fragment_from_wire(value: object, index: int) -> PlacementFragment:
         local_shape=_integer_tuple(fragment["local_shape"], "local_shape", minimum=1),
         nbytes=_require_integer(fragment["nbytes"], "nbytes", minimum=1),
         rank=_rank_from_wire(fragment["rank"], f"placement rank {index}"),
+        pipeline_stage_id=_optional_integer(
+            fragment.get("pipeline_stage_id"),
+            "pipeline_stage_id",
+            minimum=0,
+        ),
         aliases=tuple(
             TensorId(_require_nonempty_string(alias, "alias"))
             for alias in _require_sequence(fragment["aliases"], "aliases")
@@ -448,7 +460,12 @@ def _require_integer(value: object, label: str, *, minimum: int) -> int:
     return value
 
 
-def _optional_integer(value: object, label: str, *, minimum: int) -> int | None:
+def _optional_integer(
+    value: object,
+    label: str,
+    *,
+    minimum: int,
+) -> Optional[int]:
     if value is None:
         return None
     return _require_integer(value, label, minimum=minimum)

@@ -327,12 +327,33 @@ TEST(OpLogBatchStorageTest, RejectsLegacyEntry) {
 
 TEST(OpLogBatchStorageTest, RejectsLegacySnapshotSidecar) {
     FakeHaKvBackend backend;
+    for (const std::string_view key :
+         {"compaction_floor", "fallback", "latest", "maintenance"}) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Put("/oplog/clusterA/snapshot/" + std::string(key),
+                              "control"));
+    }
     ASSERT_EQ(ErrorCode::OK,
               backend.Put("/oplog/clusterA/snapshot/old/sequence_id", "42"));
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
     EXPECT_NE(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, AllowsBatchSnapshotControlKeys) {
+    FakeHaKvBackend backend;
+    for (const std::string_view key :
+         {"compaction_floor", "fallback", "latest", "maintenance"}) {
+        ASSERT_EQ(ErrorCode::OK,
+                  backend.Put("/oplog/clusterA/snapshot/" + std::string(key),
+                              "control"));
+    }
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    EXPECT_EQ((DurablePrefix{.batch_id = 0, .last_seq = 0}), prefix);
 }
 
 TEST(OpLogBatchStorageTest, InitDurablePrefixFailsClosedWhenBatchesExist) {

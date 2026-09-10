@@ -81,7 +81,7 @@ The penalty is applied as a multiplier to predicted completion time, making remo
 
 ### EWMA Bandwidth Estimation
 
-Each device maintains an EWMA (Exponentially Weighted Moving Average) of its effective bandwidth:
+Each device maintains a **selection EWMA** (Exponentially Weighted Moving Average) of its effective bandwidth, the series that device selection scores with:
 
 ```
 initial_value = theoretical_bandwidth
@@ -109,6 +109,67 @@ The EWMA provides:
 - **Memory**: Recent observations have more influence than old ones
 - **Stability**: Smooths out transient fluctuations
 - **Adaptability**: Tracks gradual changes in link quality
+
+#### Transmit Estimate
+
+Each device also keeps a second series, the **transmit estimate**, for the
+deadline predictors: the admission queue's deadline-infeasible drop
+(`runtime_queue/mlu_local_threshold`, reads the sum over devices) and the RDMA
+workers' bandwidth arbitration (`transports/rdma/deadline_bw_arbitration`,
+reads the local NIC's value). Both compute the same predicted MLU from it:
+
+```
+predicted_mlu = ((bytes_ahead + length) / transmit_bandwidth) / remaining_window
+```
+
+`bytes_ahead` is what the request must wait behind before its own bytes move:
+for the admission queue, every drop-eligible owner (RDMA, not staged) already
+dispatched and not yet completed — owners on other transports share the queue
+but not the NIC. For the arbitration it is the NIC's **posted bytes**: what
+has reached the hardware and not yet completed. That is deliberately not the
+selector's `inflight_bytes`, which is charged when a slice is *allocated* and
+so would include the very slices being ordered as well as work still sitting
+in a worker queue. The order is then built one slot at a time — the slice
+that takes a slot joins `bytes_ahead` for the ones still waiting, since the
+QP posts them in that order (exactly for the first 64 slots, which is more
+than one post can take; the rest are ranked once against the bytes those
+slots accumulated).
+
+The deadline is absolute, so that wait counts against the window — as an
+additive delay over the wire rate, not as a slower bandwidth (which would
+multiply the wait by the request's slice count).
+
+It uses the same update rule and clamp as the selection EWMA, but it is fed
+from a different measurement because it answers a different question:
+
+| | Selection EWMA | Transmit estimate |
+|---|---|---|
+| Question | Which NIC should the next slice go to? | How fast does this NIC move bytes? |
+| Sample | one successful completion: bytes / (post → completion), so the NIC's own queueing behind earlier work requests is included and a backed-up NIC scores worse | one meter interval: bytes completed / time the NIC spent with work posted |
+| α | `bandwidth_learning_rate` = 0.01 (~99% latest sample) | `transmit_bandwidth_learning_rate` = 0.9 (~10 intervals, ≈100 ms, to follow a change) |
+
+Per-completion timing cannot answer the second question. Up to `max_qp_wr`
+work requests are posted in one call with timestamps that are effectively
+one, and a poll pass timestamps every completion it collects alike, so a
+slice's own "post → completion" grows with the depth of the batch it
+travelled in — deep enough and the estimate would sit on its lower clamp on
+a healthy link. Bytes over the NIC's busy time does not care how the work was
+batched.
+
+Busy time is the time the device has had at least one work request posted:
+a stretch opens when its posted bytes go from zero to non-zero and closes
+when they return to zero, so the gaps of a workload that bursts and waits are
+not charged to the link. A sample is offered only at the last completion of a
+poll pass (every completion in a pass carries the same timestamp), and one
+that spans more than `transmit_meter_max_interval_ns` of wall clock is
+dropped rather than learned from: it describes a link too far in the past. A
+posted slice that ends without moving its bytes — failed, flushed, timed
+out — makes its stretch unusable, so the meter starts its next interval
+fresh. With no usable interval the estimate keeps its last value, or the
+link-speed seed — the optimistic direction, which cannot cause a false drop.
+
+With queueing carried by `bytes_ahead`, the rate itself must exclude
+queueing or the wait would be counted twice.
 
 ### Multi-Path Allocation
 
@@ -188,7 +249,8 @@ All slice spraying parameters are configurable via the configuration file:
 {
   "transports": {
     "rdma": {
-      "numa_penalties": [1.0, 5.0, 10.0]
+      "numa_penalties": [1.0, 5.0, 10.0],
+      "strict_local_numa": false
     }
   }
 }
@@ -197,11 +259,43 @@ All slice spraying parameters are configurable via the configuration file:
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `numa_penalties` | array[float] | `[1.0, 5.0, 10.0]` | Penalty multipliers for each NUMA tier |
+| `strict_local_numa` | bool | `false` | Never select a cross-NUMA NIC instead of penalizing it |
 
 **Guidelines**:
 - Higher values = stronger preference for local devices
 - Set all to `1.0` to disable NUMA awareness
 - Increase remote penalties if cross-NUMA latency is high
+
+### Strict Local NUMA
+
+`numa_penalties` makes a remote NIC expensive but still selectable, so a busy
+local NIC eventually loses to a cross-NUMA one. Set `strict_local_numa` (or the
+`MC_STRICT_LOCAL_NUMA` environment variable, which accepts `1`/`0` and
+`true`/`false`) to remove those NICs from selection entirely.
+
+A NIC is only excluded when the memory location and the NIC **both** report a
+NUMA node and the nodes differ. If either side is unknown the NIC keeps its
+`numa_penalties` weight, because discovery reports `-1` in cases where excluding
+everything would break otherwise working hosts:
+
+- virtual machines and some GPUs, where sysfs exposes no `numa_node`
+- bonded NICs such as `mlx5_bond_0`
+- classic priority-matrix topologies (`MC_CUSTOM_TOPO_JSON`,
+  `topology/priority_matrix`), which carry no NUMA information at all
+
+On those hosts the flag has no effect; a warning is logged at startup so this is
+visible rather than silent. A second warning names any location left without a
+same-NUMA NIC, since transfers from it will fail with `DeviceNotFound`.
+
+**Trade-off**: strict mode converts a performance problem into an availability
+one. Without a local NIC an allocation fails instead of degrading, so enable it
+only where every memory location provably has a same-NUMA rail.
+
+**Scope**: the exclusion is enforced on the local NIC for both the first
+selection and the retry path. For the remote NIC it is only a preference — the
+peer publishes its own topology and may not run this policy, so failing a slice
+because another host has no local rail would turn a local setting into a
+cross-node outage.
 
 ### Bandwidth Estimation
 
@@ -210,6 +304,9 @@ All slice spraying parameters are configurable via the configuration file:
   "transports": {
     "rdma": {
       "bandwidth_learning_rate": 0.01,
+      "transmit_bandwidth_learning_rate": 0.9,
+      "transmit_meter_interval_ns": 10000000,
+      "transmit_meter_max_interval_ns": 50000000,
       "ewma_min_bandwidth_multiplier": 0.1,
       "ewma_max_bandwidth_multiplier": 10.0
     }
@@ -219,15 +316,20 @@ All slice spraying parameters are configurable via the configuration file:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `bandwidth_learning_rate` | float | `0.01` | EWMA learning rate (0.0 = full adaptation, 1.0 = no learning) |
+| `bandwidth_learning_rate` | float | `0.01` | Selection EWMA learning rate (0.0 = full adaptation, 1.0 = no learning) |
+| `transmit_bandwidth_learning_rate` | float | `0.9` | Transmit estimate learning rate, same convention; read by the deadline predictors |
+| `transmit_meter_interval_ns` | uint | `10000000` | How often a device's throughput is sampled (10 ms) |
+| `transmit_meter_max_interval_ns` | uint | `50000000` | An interval longer than this is re-baselined instead of learned from |
 | `ewma_min_bandwidth_multiplier` | float | `0.1` | Minimum bandwidth as fraction of theoretical |
 | `ewma_max_bandwidth_multiplier` | float | `10.0` | Maximum bandwidth as fraction of theoretical |
 
 **Guidelines**:
 - Lower α (e.g., 0.001) → faster adaptation, more volatile → responds quickly to changes
 - Higher α (e.g., 0.1) → slower adaptation, more stable → smooths out transient fluctuations
-- Default α = 0.01 provides balanced adaptation
-- Multipliers constrain EWMA to reasonable range [0.1×, 10.0×] of theoretical bandwidth
+- Default α = 0.01 provides balanced adaptation for device selection
+- Keep `transmit_bandwidth_learning_rate` high: it backs an irreversible
+  drop decision, so it should follow sustained change, not single samples
+- Multipliers constrain both series to [0.1×, 10.0×] of theoretical bandwidth
 
 ### Device Selection Scoring
 
@@ -263,14 +365,39 @@ All slice spraying parameters are configurable via the configuration file:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `default_bandwidth_gbps` | float | `400.0` | Default NIC bandwidth when topology info unavailable |
+| `default_bandwidth_gbps` | float | `400.0` | NIC bandwidth assumed when the port speed is unknown or out of range |
 | `min_bandwidth_gbps` | float | `10.0` | Minimum valid NIC bandwidth (Gbps) |
 | `max_bandwidth_gbps` | float | `800.0` | Maximum valid NIC bandwidth (Gbps) |
 
 **Notes**:
-- These constants define the valid range and default for device bandwidth
-- Used in EWMA calculations and theoretical bandwidth estimation
-- If a device's reported bandwidth is outside [min, max], default_bandwidth is used
+- Each device's bandwidth is read from the speed and width its port
+  negotiated (`ibv_query_port`), so a 100G and a 400G NIC in the same host
+  start from different theoretical rates. Where libibverbs provides
+  `ibv_query_port_speed()` (rdma-core >= 62) the *effective* speed it
+  reports is preferred: for a VF over LAG that is the bandwidth left after
+  a PF drops out of the bond, which the encoded link rate cannot express.
+  The verb is resolved as an optional symbol, so older libraries keep
+  working on the encoded rate. A query *error* keeps the last known
+  effective speed (falling back would briefly restore the higher encoded
+  rate on a degraded LAG); failures are counted per device and logged once
+  per episode
+- The theoretical rate seeds the EWMA and bounds it to
+  `[ewma_min_multiplier, ewma_max_multiplier]` times that rate
+- If a device's port speed cannot be read or is outside [min, max],
+  `default_bandwidth_gbps` is used and a warning is logged
+- A NIC that cannot carry traffic -- its context was never constructed,
+  `construct()` failed, or its port is down -- is marked unavailable: it is
+  excluded from device selection and from the aggregate bandwidth the
+  admission queue's deadline predictor reads. The default speed applies
+  only to a usable NIC whose speed could not be determined. `PORT_ERR`
+  marks a device unavailable and `PORT_ACTIVE` restores it; both are
+  matched against the port the context opened, since a device's async
+  events cover every port of that device
+- The link speed is re-read on `IBV_EVENT_PORT_ACTIVE`, and on
+  `IBV_EVENT_DEVICE_SPEED_CHANGE` where rdma-core (>= 62) provides it. If
+  the speed changed -- a 400G link returning at 100G, or a VF over LAG
+  losing a PF -- the device's EWMA is re-seeded and its clamp re-derived; a
+  link that returns at the same speed keeps its learned estimate
 
 ## Usage Examples
 

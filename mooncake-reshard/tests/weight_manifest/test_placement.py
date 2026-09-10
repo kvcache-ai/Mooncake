@@ -47,6 +47,19 @@ def test_placement_round_trip_is_stable_and_address_free() -> None:
         assert forbidden not in encoded
 
 
+def test_explicit_pipeline_stage_is_canonical_and_round_trips() -> None:
+    legacy = placement_manifest()
+    staged = placement_manifest(
+        fragments=(placement_fragment(pipeline_stage_id=3),),
+    )
+
+    encoded = weight_placement_to_json(staged)
+
+    assert '"pipeline_stage_id":3' in encoded
+    assert weight_placement_from_json(encoded) == staged
+    assert staged.placement_id != legacy.placement_id
+
+
 def test_placement_digest_is_independent_of_inventory_order() -> None:
     tensors = (
         descriptor(

@@ -52,9 +52,16 @@ target_link_libraries(
   batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
 
+add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)
+target_link_libraries(batch_oplog_promotion_bench PRIVATE mooncake_store
+                                                          gflags::gflags)
+
 if(STORE_USE_ETCD)
   add_executable(oplog_batch_bench oplog_batch_bench.cpp)
   target_link_libraries(
     oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
                               JsonCpp::JsonCpp)
 endif()
+
+add_executable(uring_batch_read_bench uring_batch_read_bench.cpp)
+target_link_libraries(uring_batch_read_bench PRIVATE mooncake_store)

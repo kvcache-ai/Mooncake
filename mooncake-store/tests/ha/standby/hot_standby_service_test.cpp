@@ -937,6 +937,7 @@ TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
 }
 
 TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
+    config_.batch_oplog_retry_timeout_sec = 0;
     auto batch_backend = std::make_shared<FakeHaKvBackend>();
     ASSERT_EQ(ErrorCode::OK,
               batch_backend->Put(
@@ -945,6 +946,7 @@ TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
     ASSERT_EQ(ErrorCode::OK,
               batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
                                  EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    service_ = std::make_unique<HotStandbyService>(config_);
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
     ASSERT_EQ(ErrorCode::OK,
@@ -1013,6 +1015,8 @@ TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
             batch_backend->Put(BuildBatchRecordKey(cluster_id_, id),
                                EncodeOpLogBatchRecord(MakeBatch(id, id, id))));
     }
+    config_.batch_oplog_retry_timeout_sec = 0;
+    service_ = std::make_unique<HotStandbyService>(config_);
     service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
 
     auto err = service_->Start("", oplog_endpoints_, cluster_id_);

@@ -11,7 +11,7 @@ Mooncake Transfer Engine is a high-performance, zero-copy data transfer library 
 
 As shown in the diagram, each specific client corresponds to a `TransferEngine`, which not only includes a RAM Segment but also integrates management for high-speed transfers across multiple threads and network cards. The RAM Segment, in principle, corresponds to the entire virtual address space of this `TransferEngine`, but in reality, only parts of it (known as a `Buffer`) are registered for (GPUDirect) RDMA Read/Write. Each Buffer can have separate permissions (corresponding to RDMA `rkey`, etc.) and network card affinity (e.g., preferred NICs for different types of memory).
 
-Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, and `HipTransport`.
+Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, `HipTransport`, and `ShmTransport`.
 
 (segment)=
 ### Segment
@@ -41,6 +41,7 @@ With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM rea
 | NVMe-of          | ✓    | ✓    |
 
 - Local memcpy: If the target Segment is actually in the local DRAM/VRAM, direct data copy interfaces such as memcpy, cudaMemcpy are used.
+- SHM: Same-host DRAM transfers of POSIX shm-backed buffers (`MC_FORCE_SHM=1`). With `-DENABLE_MULTI_PROTOCOL=ON` this installs SHM alongside RDMA/TCP; without it, SHM is the only transport. Objects are `0600` (same UID). Same hostname does not imply a shared `/dev/shm`. In-flight copies pin the cached mmap so prune/cap cannot unmap it.
 - TCP: Supports data transfer between local DRAM and remote DRAM.
 - RDMA: Supports data transfer between local DRAM/VRAM and remote DRAM. It supports multi-network card pooling and retry functions in implementation.
 - HIP: Supports intra-node data transfers between GPU VRAM and GPU VRAM, as well as between GPU VRAM and CPU DRAM, using IPC handles or Shareable handles for ROCm.
@@ -159,7 +160,7 @@ The following video shows a normal run as described above, with the Target on th
 ![transfer-engine-running](../../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
-Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
+Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), `HipTransport` (for AMD GPUs), and `ShmTransport` (POSIX shm for same-host DRAM).
 
 For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
@@ -446,7 +447,17 @@ To support the operational needs of P2P Store, Transfer Engine provides a Golang
 When compiling the project, enable the `-DWITH_P2P_STORE=ON` option to compile the P2P Store example program at the same time.
 
 ### Using Rust Interface
-Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
+`mooncake-transfer-engine/rust` ships `transfer_engine_rust`, a library crate
+that wraps the Transfer Engine C API (`transfer_engine_c.h`). Hot-path types
+(`TransferRequest`, `BufferEntry`, `TransferStatus`) match the C ABI so
+`submit_transfer` is a zero-copy FFI call. A throughput benchmark example
+(`examples/transfer_engine_bench.rs`) mirrors
+[transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp).
+
+To build the library and example, install a Rust toolchain and libclang, then
+configure CMake with `-DWITH_RUST_EXAMPLE=ON`. See the
+[Transfer Engine Rust API](../../api-reference/rust/transfer-engine.md) for
+signatures and the crate `README.md` for Cargo-only builds.
 
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.
@@ -487,7 +498,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
 - `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
-- `MC_MAX_CONCURRENT_REG_MR` Cap on how many buffers `registerLocalMemoryBatch` registers concurrently (EFA transport). The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
+- `MC_MAX_CONCURRENT_REG_MR` Cap how many buffers the EFA and RDMA transports process concurrently in `registerLocalMemoryBatch` and `unregisterLocalMemoryBatch`. The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
 - `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `all` (the default) registers every buffer on every NIC. `local` restricts **device** memory to the NICs the topology reports as closest to that GPU, which on p5.48xlarge is the 4 EFA devices sharing the GPU's PCIe root complex. Because EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, narrowing the NIC set cuts registration time by close to the fan-out ratio. Set it when registering many GPU buffers is a startup bottleneck; it is opt-in because fewer NICs can serve a transfer touching that buffer, so a job whose working set sits behind a single GPU is capped at that rail group's bandwidth rather than the node's. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
 - `MC_EFA_CQ_THREADS` Cap on the number of CQ polling threads in the EFA transport, default value 1 (which already reaches ~99.9% of peak throughput). Pollers busy-wait, so each extra thread costs a full core. Set 0 to lift the cap (one poller per EFA device). Values above the device count are ignored
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
@@ -497,7 +508,8 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MUSA_IPC_OPEN_DEVICE` (`musa` transport only) Select the device context used to open imported IPC memory. The default `current` preserves the caller's context; `metadata` is an opt-in that uses the runtime-visible logical ordinal advertised by the remote buffer. With `metadata`, every peer must map each logical ordinal to the same physical GPU. `MTHREADS_VISIBLE_DEVICES` is a container-toolkit setting and is not used by Mooncake to infer this mapping.
 - `MC_MUSA_COPY_API` (`musa` transport only) Select `auto` (default), `transfer_batch`, or `default`. On MUSA SDK 5.2 or newer, `auto` uses `muMemoryTransferBatchAsync` when every copy in a batch meets `MC_MUSA_TRANSFER_BATCH_MIN_BYTES`; `default` uses per-slice CUDA-compatible copies.
 - `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` (`musa` transport only) Minimum copy size selected by `MC_MUSA_COPY_API=auto`. The default is 1048576 (1 MiB).
-- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed. Takes precedence over `MC_FORCE_SHM`.
+- `MC_FORCE_SHM` Opt in to POSIX SHM for same-host DRAM copies of buffers allocated with `allocateSharedMemory`. Default off. With `-DENABLE_MULTI_PROTOCOL=ON`, SHM is installed alongside RDMA/TCP (`rdma,shm` / `tcp,shm`). Without multi-protocol, SHM is the only transport (skip RDMA/TCP auto-install), like `MC_FORCE_TCP`. `MC_FORCE_TCP` is handled first in `init` and returns before SHM install. Alternative: `installTransport("shm")`, which logs a WARNING if it overwrites a non-empty rdma/tcp protocol. Objects are created `0600` (same UID). A peer `free`+`allocate` that reuses the same virtual address is remapped after the POSIX name disappears; a new address still needs a fresh `BufferDesc` (see `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`).
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
@@ -545,6 +557,14 @@ heterogeneous_ascend
 
 kunpeng_ub_transport
 sunrise_link_transport
+:::
+
+## FlagOS FlagCX Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+flagcx_transport
 :::
 
 ## MPComm Transport Component

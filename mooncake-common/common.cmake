@@ -87,6 +87,20 @@ option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
 option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
+option(USE_RISCV "Enable RISC-V build compatibility settings" OFF)
+if(USE_RISCV)
+  if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^riscv")
+    message(
+      WARNING
+        "USE_RISCV is enabled, but CMAKE_SYSTEM_PROCESSOR is '${CMAKE_SYSTEM_PROCESSOR}'"
+    )
+  endif()
+  # Define this before any pybind11 module is created. Otherwise pybind11 adds
+  # its default full-LTO target, which is prohibitively resource-intensive on
+  # RISC-V build hosts.
+  set(CMAKE_INTERPROCEDURAL_OPTIMIZATION OFF)
+  message(STATUS "RISC-V: IPO disabled for Mooncake Python extensions")
+endif()
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -165,7 +179,7 @@ option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)
 option(USE_REDIS "option for enable redis as metadata server" OFF)
 option(USE_HTTP "option for enable http as metadata server" ON)
 option(WITH_RUST_EXAMPLE
-       "build the Rust interface and sample code for the transfer engine" OFF)
+       "build the Transfer Engine Rust library and sample code" OFF)
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(USE_EVENT_DRIVEN_COMPLETION
@@ -666,5 +680,56 @@ if(NOT TARGET gflags::gflags)
     endif()
   endforeach()
 endif()
-find_package(yalantinglibs CONFIG REQUIRED)
-add_compile_definitions(YLT_ENABLE_IBV)
+
+set(GH_MIRROR "")
+if(DEFINED ENV{ASCEND_GITHUB_MIRROR_URLS})
+  set(GH_MIRROR $ENV{ASCEND_GITHUB_MIRROR_URLS})
+endif()
+if(GH_MIRROR)
+  message(STATUS "Using Github mirror: ${GH_MIRROR}")
+endif()
+
+include(${CMAKE_CURRENT_LIST_DIR}/FindYLT.cmake)
+
+option(USE_FLAGCX "option for using FlagCX-backed transport (cross-vendor CCL)"
+       OFF)
+if(USE_FLAGCX)
+  if(NOT FLAGCX_HOME)
+    if(DEFINED ENV{FLAGCX_HOME})
+      set(FLAGCX_HOME $ENV{FLAGCX_HOME})
+    else()
+      set(FLAGCX_HOME "$ENV{HOME}/FlagCX/build")
+    endif()
+  endif()
+  find_path(
+    FLAGCX_INCLUDE_DIR
+    NAMES flagcx_p2p.h
+    HINTS "${FLAGCX_HOME}/include")
+  find_library(
+    FLAGCX_LIBRARY
+    NAMES flagcx
+    HINTS "${FLAGCX_HOME}/lib" "${FLAGCX_HOME}/lib64")
+  if(NOT FLAGCX_INCLUDE_DIR)
+    message(
+      FATAL_ERROR
+        "USE_FLAGCX=ON but flagcx_p2p.h was not found (set -DFLAGCX_HOME=...)")
+  endif()
+  if(NOT FLAGCX_LIBRARY)
+    message(
+      FATAL_ERROR
+        "USE_FLAGCX=ON but the FlagCX library was not found (set -DFLAGCX_HOME=...)"
+    )
+  endif()
+  if(NOT TARGET FlagCX::flagcx)
+    add_library(FlagCX::flagcx UNKNOWN IMPORTED)
+    set_target_properties(
+      FlagCX::flagcx
+      PROPERTIES IMPORTED_LOCATION "${FLAGCX_LIBRARY}"
+                 INTERFACE_INCLUDE_DIRECTORIES "${FLAGCX_INCLUDE_DIR}")
+  endif()
+  add_compile_definitions(USE_FLAGCX)
+  message(
+    STATUS
+      "FlagCX transport enabled, include=${FLAGCX_INCLUDE_DIR}, library=${FLAGCX_LIBRARY}"
+  )
+endif()

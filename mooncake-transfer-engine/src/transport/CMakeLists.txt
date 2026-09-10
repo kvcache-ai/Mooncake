@@ -41,6 +41,9 @@ if(USE_CXL)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
 
+add_subdirectory(shm_transport)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
+
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
 elseif(USE_ASCEND)
@@ -114,4 +117,10 @@ if(USE_CUDA
     target_compile_definitions(device_transport PRIVATE _GNU_SOURCE)
     target_link_libraries(transport PUBLIC ${CMAKE_DL_LIBS})
   endif()
+endif()
+
+if(USE_FLAGCX)
+  add_subdirectory(flagcx_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
+  target_link_libraries(transport PRIVATE FlagCX::flagcx)
 endif()

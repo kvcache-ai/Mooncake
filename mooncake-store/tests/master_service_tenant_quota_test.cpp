@@ -248,7 +248,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void DiscardExpiredProcessingForTest(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
-        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        const size_t shard_idx = service.getShardIndex(tenant_id, key);
         MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::time_point::max());
@@ -337,7 +337,10 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         next_segment_offset_ += size + 4096;
 
         auto segment_access = service.segment_manager_.getSegmentAccess();
-        return segment_access.MountSegment(segment, generate_uuid());
+        return segment_access.MountSegment(
+            segment, generate_uuid(),
+            std::make_shared<ClientLivenessRecord>(
+                ClientLivenessRecord::Clock::now()));
     }
 
     void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {

@@ -31,6 +31,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/runtime/amd_location.h"
 namespace mooncake {
 namespace tent {
 class Platform;
@@ -79,11 +80,7 @@ class Topology {
 
     void clear();
 
-    // Preserve the original one-argument symbol for source and binary
-    // compatibility with callers that do not opt into UB discovery.
     Status discover(const std::vector<Platform*>& platforms);
-
-    Status discover(const std::vector<Platform*>& platforms, bool discover_ub);
 
     Status parse(const std::string& json_content);
 
@@ -114,6 +111,10 @@ class Topology {
     const NicEntry* getNicEntry(const std::string& name) const;
 
     const MemEntry* getMemEntry(const std::string& name) const;
+
+    // True only when both NUMA ids are known and differ. Unknown (-1) is not
+    // treated as remote; rank is ignored because probes disagree on placement.
+    bool isCrossNuma(const MemEntry& mem, NicID nic_id) const;
 
     NicID getNicId(const std::string& name) const;
 
@@ -158,6 +159,35 @@ class LocationParser {
     std::string type_;
     int index_;
 };
+
+// Canonical AMD GPU location prefix and alias handling live in
+// amd_location.h, shared with the rocm device plugin.
+
+inline std::string makeAmdGpuLocation(int device) {
+    return std::string(kAmdGpuLocationType) + ":" + std::to_string(device);
+}
+
+// Canonicalize the legacy AMD alias: "rocm:N" becomes "hip:N". All other
+// location strings (including malformed ones) are returned unchanged.
+// Applied where names enter or leave topology storage so entries stored
+// under a legacy matrix key remain reachable via canonical names.
+inline std::string canonicalizeLocation(const std::string& location) {
+    LocationParser parser(location);
+    if (isAmdGpuLocationType(parser.type()) && parser.index() >= 0) {
+        return makeAmdGpuLocation(parser.index());
+    }
+    return location;
+}
+
+inline Topology::MemType memTypeFromLocation(const std::string& location) {
+    LocationParser parser(location);
+    const auto type = parser.type();
+    if (type == "cpu") return Topology::MEM_HOST;
+    if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
+    if (isAmdGpuLocationType(type)) return Topology::MEM_ROCM;
+    if (type == "ascend") return Topology::MEM_ASCEND;
+    return Topology::MEM_UNKNOWN;
+}
 
 struct RangeLocation {
     uint64_t start;

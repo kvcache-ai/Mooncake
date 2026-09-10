@@ -236,8 +236,9 @@ TEST(TcpDataPathRoundtripTest, WriteThenReadAcrossProcesses) {
     runWriteThenReadAcrossProcesses(1);
 }
 
-// Same round trip with a multi-threaded RPC server, as used by bulk-TCP
-// deployments (MC_TENT_RPC_THREADS / rpc_server_threads).
+// Same round trip with a multi-threaded RPC server. SendData/RecvData are
+// offloaded, so this also covers concurrent bulk copies overlapping other
+// RPCs (MC_TENT_RPC_THREADS / rpc_server_threads).
 TEST(TcpDataPathRoundtripTest, WriteThenReadAcrossProcessesMultiThreadedRpc) {
     runWriteThenReadAcrossProcesses(4);
 }

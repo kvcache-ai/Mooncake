@@ -33,6 +33,7 @@
 #include "transfer_metadata.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#include "config.h"
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 #include "transport/device/device_transport.h"
@@ -262,7 +263,12 @@ class TransferEngineImpl {
     }
 
     Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
+        return multi_transports_->freeBatchID(batch_id, [this, batch_id] {
+            // BatchID is pointer-derived. Remove side-table state before the
+            // descriptor is deleted and its address can be reused.
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            notifies_to_send_.erase(batch_id);
+        });
     }
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
@@ -358,16 +364,19 @@ class TransferEngineImpl {
         }
 #endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // send notify
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            if (!notifies_to_send_.count(batch_id)) return result;
-            auto value = notifies_to_send_[batch_id];
-            auto rc = sendNotifyByID(value.first, value.second);
+            std::pair<SegmentID, TransferMetadata::NotifyDesc> value;
+            {
+                RWSpinlock::WriteGuard guard(send_notifies_lock_);
+                auto notify = notifies_to_send_.find(batch_id);
+                if (notify == notifies_to_send_.end()) return result;
+                value = std::move(notify->second);
+                notifies_to_send_.erase(notify);
+            }
+            auto rc = sendNotifyByID(value.first, std::move(value.second));
             if (rc) {
                 LOG(ERROR) << "Failed to send notify message, error code: "
                            << rc;
             }
-            notifies_to_send_.erase(batch_id);
         }
         return result;
     }
@@ -418,6 +427,10 @@ class TransferEngineImpl {
     }
 
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
+
+    void* allocateSharedMemory(size_t length);
+
+    int freeSharedMemory(void* addr);
 
     void setWhitelistFilters(std::vector<std::string>&& filters) {
         filter_ = std::move(filters);
@@ -475,6 +488,9 @@ class TransferEngineImpl {
         }
         if (auto_discover_config_.protocol == "efa") {
             return "efa";
+        }
+        if (globalConfig().use_rdma_twosided) {
+            return "rdma_twosided";
         }
         return "rdma";
     }

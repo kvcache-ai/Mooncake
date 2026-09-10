@@ -12,7 +12,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "version.h"
 
 namespace mooncake {
@@ -92,6 +92,15 @@ WrappedMasterService::WrappedMasterService(
 }
 
 WrappedMasterService::~WrappedMasterService() = default;
+
+void WrappedMasterService::SetBatchOpLogTerminalCallback(
+    OrderedOpLogWriter::TerminalCallback callback) {
+    master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
+}
+
+void WrappedMasterService::StopBatchOpLogWriter() {
+    master_service_.StopBatchOpLogWriter();
+}
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
@@ -1462,6 +1471,11 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
+    const {
+    return master_service_.GetStorageUsageSnapshot();
+}
+
 tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>
 WrappedMasterService::ListTenantQuotaSnapshots() {
     if (!master_service_.IsTenantQuotaEnabled()) {
@@ -1558,6 +1572,17 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
               << ", enable offloading is: " << enable_offloading;
     auto result =
         master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::UnmountLocalDiskSegment(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "UnmountLocalDiskSegment");
+    timer.LogRequest("action=unmount_local_disk_segment");
+    LOG(INFO) << "Unmount local disk segment with client id is : " << client_id;
+    auto result = master_service_.UnmountLocalDiskSegment(client_id);
 
     timer.LogResponseExpected(result);
     return result;
@@ -1713,6 +1738,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
         objects, initial_oplog_sequence_id, segments);
 }
 
+tl::expected<void, ErrorCode>
+WrappedMasterService::RestoreFromBatchOpLogPromotion(
+    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(std::move(handoff),
+                                                          chunk_object_count);
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -1800,6 +1832,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::UnmountLocalDiskSegment>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(

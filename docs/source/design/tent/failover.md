@@ -144,18 +144,20 @@ Real hardware faults are hard to stage, so failover is tested by driving the rea
 The harness — why a fake `Transport` is enough, how fakes are swapped in, and what this can and cannot prove — is in {ref}`TENT Testing <tent-testing>`. That page is the mechanism; this section only notes what failover uses it for:
 
 * Completion-stage `FAILED` on the primary must resubmit on the next available transport.
+* Submit-stage failure: a synchronous non-OK from `submitTransferTasks` must fail the owner task over to the remaining candidates (bounded by `max_failover_attempts`) instead of terminal-failing it.
+* Derived (merged) alias tasks must follow their owner's recovered route and must not cause a duplicate physical submission.
 * Exhausting `max_failover_attempts` (including `0` and `1`) must surface `FAILED` and must not touch a transport beyond the budget.
 * `failover_count` is per-task: one failing request must not spend another request's budget.
 * With `enable_auto_failover_on_poll=false`, status polling is observational; `progressBatch` / `waitTransferCompletion` / `transferSync` still recover.
 
-Submit-stage failures are intentionally not covered here; see Known Gaps.
+Submit-stage recovery is exercised through the same FakeTransport harness with `force_submit_fail` backends (see `SubmitStageFailureFailsOverToSecondary` and friends in `engine_failover_e2e_test.cpp`).
 
 ## Known Gaps
 
-* **Submit-stage failures do not trigger failover.** When `submitTransferTasks` returns non-OK, every task in that call is marked `UNSPEC` and surfaces as `FAILED`. A naive retry loop here is unsafe for two reasons:
-  1. **Merged requests.** When `merge_requests` is enabled (default), `task_id_list[type]` contains both the real merged task and its derived aliases. Resubmitting per task-id re-posts one logical transfer multiple times on the fallback transport, breaking the deduplication the merge pass established.
-  2. **Partial enqueue.** Some transports (for example `ShmTransport::submitTransferTasks`, `NVLinkTransport::submitTransferTasks`) enqueue or start work for earlier requests in `request_list` before returning an error on a later one. The return status alone does not tell us which tasks partially succeeded, so a blanket resubmit would duplicate already-started transfers.
-  A safe submit-stage recovery needs either (a) a transport-level "atomic submit" capability flag plus per-task skip of derived ids, or (b) per-request status returned from `submitTransferTasks`. Neither exists today.
+* **Submit-stage failure recovery is implemented** (previously a gap): a synchronous non-OK from `submitTransferTasks` fails the owner tasks over to the remaining candidate transports (bounded by `max_failover_attempts`), reusing `resubmitTransferTask`. The two hazards that originally made a naive retry unsafe are handled as follows:
+  1. **Merged requests.** Only the owner task of each merged request is resubmitted; derived aliases mirror the owner's recovered route (transport, sub-batch slot, status) instead of being resubmitted themselves, preserving the merge pass's deduplication.
+  2. **Partial enqueue.** `NVLinkTransport::submitTransferTasks` rolls back its half-appended task entries on synchronous failure (no I/O has started at that point). Transports that start per-request work inside the submit loop (e.g. `ShmTransport`, whose copies are synchronous and idempotent) may still cause a duplicate same-content transfer on the fallback; re-posting an identical request is a data-level no-op for KV-cache-style workloads.
+  A failover target whose own synchronous submit also fails is retried within the same budget; a task that exhausts all candidates surfaces `FAILED` attributed to the last attempted transport (never `unspec`).
 * `markRecovered` (and cooldown expiry in `available`) clears the exponential-backoff memory entirely. A rail that flaps repeatedly therefore does not accumulate a growing cooldown across recovery cycles. If this becomes a problem the fix is to decay rather than reset.
 * Cross-transport failover is driven purely by return status; there is no latency-based "this transport is healthy but too slow, try another" signal. That belongs to the scheduler, not this document.
 * Runtime-layer failover is covered by FakeTransport tests in the `tent-ci` `cuda-off` legs. DMA integrity, real WC errors, and staging under NVLink still need hardware runners; see {ref}`TENT Testing <tent-testing>`.

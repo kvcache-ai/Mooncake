@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import importlib.util
+
 import mooncake.reshard.weight as model_weight
+import mooncake.reshard.weight._planner.contracts as planner_contracts
+from mooncake.reshard.weight._planner.bound_contracts import (
+    TransferPlan as BoundTransferPlan,
+)
 from mooncake.reshard.weight.binding import (
     validate_runtime_binding,
     validate_runtime_bindings,
@@ -73,3 +79,13 @@ def test_responsibility_modules_preserve_public_contract_identity() -> None:
     )
     assert model_weight.validate_runtime_binding is validate_runtime_binding
     assert model_weight.validate_runtime_bindings is validate_runtime_bindings
+
+
+def test_runtime_binding_phase_exports_bound_contracts() -> None:
+    assert model_weight.bind_logical_transfer_plan is not None
+    assert hasattr(planner_contracts, "BoundWeightFragment")
+    assert model_weight.TransferPlan is BoundTransferPlan
+    assert (
+        importlib.util.find_spec("mooncake.reshard.weight._planner.attestation")
+        is not None
+    )
