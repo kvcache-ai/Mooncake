@@ -118,7 +118,8 @@ Status HighPerformanceTcpTransport::validateParams() const {
     if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
         params_.max_outstanding_tasks == 0 ||
         params_.max_outstanding_bytes == 0 || params_.max_transfer_bytes == 0 ||
-        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0) {
+        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0 ||
+        params_.idle_connection_timeout_ms == 0) {
         return Status::InvalidArgument(
             "invalid high-performance TCP limits" LOC_MARK);
     }
@@ -240,7 +241,7 @@ Status HighPerformanceTcpTransport::install(
             static_cast<size_t>(std::min<uint64_t>(kIoProgressStepBytes,
                                                    params_.max_transfer_bytes)),
             params_.connect_timeout_ms, params_.progress_timeout_ms,
-            params_.connections_per_peer},
+            params_.connections_per_peer, params_.idle_connection_timeout_ms},
         workers_.get());
 
     const uint64_t max_connections_u64 = std::max<uint64_t>(
