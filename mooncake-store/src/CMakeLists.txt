@@ -98,6 +98,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv_object_layout.cpp
     transfer_task.cpp
     posix_file.cpp
+    dax_file.cpp
     client_buffer.cpp
     aligned_client_buffer.cpp
     real_client.cpp

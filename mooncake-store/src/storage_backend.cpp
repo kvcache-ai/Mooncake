@@ -28,6 +28,7 @@
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "crc32c.h"
+#include "dax_file.h"
 #include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
@@ -3536,6 +3537,17 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
       storage_path_(file_storage_config_.storage_filepath),
       cfg_(offset_backend_config) {
     capacity_ = file_storage_config_.total_size_limit;
+    if (!cfg_.dax_device_path.empty() && cfg_.dax_alignment_bytes > 0) {
+        const auto align = static_cast<uint64_t>(cfg_.dax_alignment_bytes);
+        const uint64_t aligned = capacity_ / align * align;
+        if (aligned != capacity_) {
+            LOG(WARNING) << "OffsetAllocatorStorageBackend: rounding DAX "
+                            "arena capacity "
+                         << capacity_ << " down to " << aligned
+                         << " (multiple of " << align << " bytes)";
+            capacity_ = aligned;
+        }
+    }
 }
 
 OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
@@ -3583,6 +3595,20 @@ std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
 
 std::string OffsetAllocatorStorageBackend::GetMetaFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.meta").string();
+}
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::OpenDaxDataFile() {
+    data_file_path_ = cfg_.dax_device_path;
+    auto dax = DaxFile::Open(data_file_path_, capacity_);
+    if (!dax) {
+        LOG(ERROR) << "Failed to map DAX data arena: " << data_file_path_;
+        return tl::make_unexpected(dax.error());
+    }
+    if (file_storage_config_.use_uring) {
+        LOG(INFO) << "use_uring ignored for DAX data arena " << data_file_path_;
+    }
+    data_file_ = std::move(*dax);
+    return {};
 }
 
 //-----------------------------------------------------------------------------
@@ -3738,39 +3764,48 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             total_keys_.store(0, std::memory_order_relaxed);
         }
 
-        // Get data file path
-        data_file_path_ = GetDataFilePath();
-
-        // Open/truncate data file in read-write mode
-        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
-        if (raw_fd < 0) {
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-        }
-        FdGuard fd_guard(raw_fd);
-
-        // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
-            // Fallback to ftruncate
-            if (ftruncate(fd_guard.get(), capacity_) != 0) {
-                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
-                           << ", capacity: " << capacity_
-                           << ", error: " << strerror(errno);
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        if (!cfg_.dax_device_path.empty()) {
+            // Byte-addressable arena: map the device, no file to create.
+            auto dax = OpenDaxDataFile();
+            if (!dax) {
+                return tl::make_unexpected(dax.error());
             }
-        }
+        } else {
+            // Get data file path
+            data_file_path_ = GetDataFilePath();
 
-        // Release fd to StorageFile (takes ownership and will close it)
+            // Open/truncate data file in read-write mode
+            int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+            int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+            if (raw_fd < 0) {
+                LOG(ERROR) << "Failed to open data file: " << data_file_path_;
+                return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            }
+            FdGuard fd_guard(raw_fd);
+
+            // Use fallocate if available, otherwise ftruncate
+            if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+                // Fallback to ftruncate
+                if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                    LOG(ERROR)
+                        << "Failed to preallocate file: " << data_file_path_
+                        << ", capacity: " << capacity_
+                        << ", error: " << strerror(errno);
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+            }
+
+            // Release fd to StorageFile (takes ownership and will close it)
 #ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
-        } else
+            if (file_storage_config_.use_uring) {
+                data_file_ = std::make_shared<UringFile>(
+                    data_file_path_, fd_guard.release(), 32, true);
+            } else
 #endif
-        {
-            data_file_ = std::make_shared<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
+            {
+                data_file_ = std::make_shared<PosixFile>(data_file_path_,
+                                                         fd_guard.release());
+            }
         }
         if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
             data_file_->SetDeleteOnWriteFail(false);
@@ -4515,49 +4550,61 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
             }
         }
 
-        // Open data file without truncation
-        data_file_path_ = GetDataFilePath();
-        int flags = O_CLOEXEC | O_RDWR;
-        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
-        if (raw_fd < 0) {
-            const int open_errno = errno;
-            LOG(ERROR) << "Failed to open data file: " << data_file_path_
-                       << ": " << strerror(open_errno);
-            // The meta references data that is genuinely gone: nothing
-            // recoverable remains, so a fresh start is appropriate.
-            if (open_errno == ENOENT) {
+        if (!cfg_.dax_device_path.empty()) {
+            // Device memory outlives the process, so the persisted
+            // allocator state still describes the arena. Chardevs report
+            // st_size == 0, so there is no file-size check to run here.
+            if (!OpenDaxDataFile()) {
+                // A device that cannot be mapped right now may come back;
+                // do not wipe the checkpoint for it.
+                fallback_guard.disarm();
+                return RecoveryResult::kTransientError;
+            }
+        } else {
+            // Open data file without truncation
+            data_file_path_ = GetDataFilePath();
+            int flags = O_CLOEXEC | O_RDWR;
+            int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+            if (raw_fd < 0) {
+                const int open_errno = errno;
+                LOG(ERROR) << "Failed to open data file: " << data_file_path_
+                           << ": " << strerror(open_errno);
+                // The meta references data that is genuinely gone: nothing
+                // recoverable remains, so a fresh start is appropriate.
+                if (open_errno == ENOENT) {
+                    return RecoveryResult::kCorrupt;
+                }
+                // Anything else (fd exhaustion, permissions, I/O error) may
+                // be transient -- do not wipe the persisted cache for it.
+                fallback_guard.disarm();
+                return RecoveryResult::kTransientError;
+            }
+            FdGuard fd_guard(raw_fd);
+
+            // Verify data file size matches capacity_
+            struct stat st;
+            if (fstat(fd_guard.get(), &st) != 0) {
+                LOG(ERROR) << "fstat failed on data file: " << strerror(errno);
+                fallback_guard.disarm();
+                return RecoveryResult::kTransientError;
+            }
+            if (static_cast<uint64_t>(st.st_size) != capacity_) {
+                LOG(WARNING) << "data file size mismatch: expected "
+                             << capacity_ << ", got " << st.st_size
+                             << " -- falling back to fresh start";
                 return RecoveryResult::kCorrupt;
             }
-            // Anything else (fd exhaustion, permissions, I/O error) may
-            // be transient -- do not wipe the persisted cache for it.
-            fallback_guard.disarm();
-            return RecoveryResult::kTransientError;
-        }
-        FdGuard fd_guard(raw_fd);
-
-        // Verify data file size matches capacity_
-        struct stat st;
-        if (fstat(fd_guard.get(), &st) != 0) {
-            LOG(ERROR) << "fstat failed on data file: " << strerror(errno);
-            fallback_guard.disarm();
-            return RecoveryResult::kTransientError;
-        }
-        if (static_cast<uint64_t>(st.st_size) != capacity_) {
-            LOG(WARNING) << "data file size mismatch: expected " << capacity_
-                         << ", got " << st.st_size
-                         << " -- falling back to fresh start";
-            return RecoveryResult::kCorrupt;
-        }
 
 #ifdef USE_URING
-        if (file_storage_config_.use_uring) {
-            data_file_ = std::make_shared<UringFile>(
-                data_file_path_, fd_guard.release(), 32, true);
-        } else
+            if (file_storage_config_.use_uring) {
+                data_file_ = std::make_shared<UringFile>(
+                    data_file_path_, fd_guard.release(), 32, true);
+            } else
 #endif
-        {
-            data_file_ = std::make_shared<PosixFile>(data_file_path_,
-                                                     fd_guard.release());
+            {
+                data_file_ = std::make_shared<PosixFile>(data_file_path_,
+                                                         fd_guard.release());
+            }
         }
         data_file_->SetDeleteOnWriteFail(false);
 
@@ -5465,7 +5512,9 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // Rebinding the shared_ptr drops our ref; any in-flight
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
-    if (!data_file_path_.empty()) {
+    // A DAX arena keeps its mapping: the allocator rebuild below already
+    // makes every old record unreachable, and there is nothing to truncate.
+    if (!data_file_path_.empty() && cfg_.dax_device_path.empty()) {
         int fd = open(data_file_path_.c_str(),
                       O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
         if (fd >= 0) {

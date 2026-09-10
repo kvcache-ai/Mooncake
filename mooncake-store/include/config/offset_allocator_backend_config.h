@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 
 namespace mooncake {
 
@@ -61,6 +62,18 @@ struct OffsetAllocatorBackendConfig {
     // the CPU (future DMA/GDS writers): unchecksummed records are then
     // validated by checkpoint ordering (seq guard) alone.
     bool enable_record_crc = true;
+
+    // ---- Device-DAX / byte-addressable arena ----
+    // When non-empty, the data arena is an mmap(MAP_SHARED) of this path (a
+    // device-DAX chardev such as /dev/dax0.0, an fsdax file, or any regular
+    // file) instead of {storage_filepath}/kv_cache.data. The metadata
+    // checkpoint still lives under storage_filepath. See DaxFile.
+    std::string dax_device_path;
+
+    // Capacity is rounded down to a multiple of this when dax_device_path is
+    // set. Device-DAX rejects mmap lengths that are not a multiple of the
+    // device alignment (2 MiB, or 1 GiB for some namespaces).
+    int64_t dax_alignment_bytes = 2 * 1024 * 1024;
 };
 
 }  // namespace mooncake
