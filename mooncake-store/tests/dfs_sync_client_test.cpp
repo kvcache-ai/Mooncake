@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -281,6 +282,40 @@ TEST_F(DfsSyncClientTest, MissingDfsBackendRevokesObject) {
     auto query = client_without_backend->Query("sync_no_backend");
     ASSERT_FALSE(query.has_value());
     EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsSyncClientTest, ExistingClientUsesOnlineExpandedDfsCapacity) {
+    const std::string old_key = "before_expansion";
+    std::string old_value(4096, 'O');
+    std::vector<Slice> old_slices{{old_value.data(), old_value.size()}};
+    ASSERT_TRUE(writer_->Put(old_key, old_slices, DfsConfig()));
+    auto old_query = QueryDfsOnly(old_key);
+    ASSERT_TRUE(old_query);
+    const auto old_path = old_query->replicas[0].get_dfs_descriptor().file_path;
+    auto expanded = master_.service()->ExpandDfsShards(4);
+    ASSERT_TRUE(expanded);
+    EXPECT_EQ(*expanded, 4);
+
+    std::string new_key;
+    for (int i = 0; i < 1000; ++i) {
+        new_key = "after_expansion_" + std::to_string(i);
+        if (std::hash<std::string>{}(new_key) % 4 == 3) break;
+    }
+    ASSERT_EQ(std::hash<std::string>{}(new_key) % 4, 3);
+    std::string value(4096, 'N');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(new_key, write_slices, DfsConfig()));
+    auto query = QueryDfsOnly(new_key);
+    ASSERT_TRUE(query);
+    EXPECT_EQ(query->replicas[0].get_dfs_descriptor().shard_idx, 3);
+    std::string output(value.size(), '\0');
+    std::vector<Slice> read_slices{{output.data(), output.size()}};
+    ASSERT_TRUE(writer_->Get(new_key, *query, read_slices));
+    EXPECT_EQ(output, value);
+    ExpectDfsValue(old_key, old_value);
+    auto after = QueryDfsOnly(old_key);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->replicas[0].get_dfs_descriptor().file_path, old_path);
 }
 
 TEST_F(DfsSyncClientTest, GetReadsDfsIntoMultipleSlices) {
