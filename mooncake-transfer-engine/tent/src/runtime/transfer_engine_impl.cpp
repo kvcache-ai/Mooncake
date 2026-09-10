@@ -2599,8 +2599,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
         << task.runtime_policy.config_generation << ")";
     VLOG(1) << "Transport failover: " << transportTypeName(prev_type) << " -> "
             << transportTypeName(type) << " (attempt " << task.failover_count
-            << "/" << task.runtime_policy.max_failover_attempts << ", generation "
-            << task.runtime_policy.config_generation << ")";
+            << "/" << task.runtime_policy.max_failover_attempts
+            << ", generation " << task.runtime_policy.config_generation << ")";
     TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     auto& transport = transport_list_[type];
