@@ -1301,7 +1301,7 @@ mod tests {
             cold_backing: None,
         }
 
-        nof_backing: None,}
+}
 
     #[test]
     fn tenant_views_isolate_runtime_segments_objects_and_handoffs() {

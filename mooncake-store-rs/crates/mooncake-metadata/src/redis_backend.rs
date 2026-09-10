@@ -3381,7 +3381,7 @@ mod tests {
             cold_backing: None,
         }
 
-        nof_backing: None,}
+}
 
     struct EnvLockGuard;
 
