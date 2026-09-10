@@ -441,6 +441,8 @@ class MasterServiceSupervisorConfig {
                 AllocationStrategyType::SSD_FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "local_first") {
             allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+        } else if (config.allocation_strategy == "best_fit") {
+            allocation_strategy_type = AllocationStrategyType::BEST_FIT;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
@@ -735,6 +737,8 @@ class WrappedMasterServiceConfig {
                 AllocationStrategyType::SSD_FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "local_first") {
             allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+        } else if (config.allocation_strategy == "best_fit") {
+            allocation_strategy_type = AllocationStrategyType::BEST_FIT;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
