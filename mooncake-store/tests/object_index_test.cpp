@@ -27,7 +27,7 @@ std::shared_ptr<ObjectEntry> MakeEntry(const std::string& key,
 
 // --- Object route ---
 
-TEST(ObjectIndexTest, InsertPinEraseContainsObjectCount) {
+TEST(ObjectIndexTest, InsertGetEraseContainsObjectCount) {
     ObjectIndex store;
     EXPECT_EQ(store.ObjectCount(), 0u);
 
@@ -36,12 +36,12 @@ TEST(ObjectIndexTest, InsertPinEraseContainsObjectCount) {
     EXPECT_TRUE(store.Contains("k1"));
     EXPECT_EQ(store.ObjectCount(), 1u);
 
-    auto pinned = store.Pin("k1");
-    ASSERT_NE(pinned, nullptr);
-    EXPECT_EQ(pinned->key(), "k1");
-    EXPECT_EQ(pinned.get(), e1.get());  // same underlying entry
+    auto entry = store.Get("k1");
+    ASSERT_NE(entry, nullptr);
+    EXPECT_EQ(entry->key(), "k1");
+    EXPECT_EQ(entry.get(), e1.get());  // same underlying entry
 
-    EXPECT_EQ(store.Pin("missing"), nullptr);
+    EXPECT_EQ(store.Get("missing"), nullptr);
     // Identity-checked erase: only the pinned entry's slot may go, and the
     // second call is a no-op (slot already gone).
     EXPECT_TRUE(store.EraseIf("k1", e1.get()));
@@ -76,8 +76,8 @@ TEST(ObjectIndexTest, DuplicateInsertIsRejected) {
     // Second insert for the same key must not clobber the original.
     EXPECT_FALSE(store.Insert("k1", MakeEntry("k1", "")));
     EXPECT_EQ(store.ObjectCount(), 1u);
-    ASSERT_NE(store.Pin("k1"), nullptr);
-    EXPECT_EQ(store.Pin("k1")->key(), "k1");
+    ASSERT_NE(store.Get("k1"), nullptr);
+    EXPECT_EQ(store.Get("k1")->key(), "k1");
 }
 
 TEST(ObjectIndexTest, SnapshotObjectsEnumeratesEveryEntry) {

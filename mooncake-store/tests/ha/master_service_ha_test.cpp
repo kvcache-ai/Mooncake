@@ -248,7 +248,7 @@ class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
 };
 
 // Self-contained arrive-gate injected into MasterService via
-// MasterServiceConfig::set_snapshot_arrive_hook. Owns all the barrier state
+// MasterService::snapshot_arrive_hook_. Owns all the barrier state
 // (armed flag, mutex, CV) that used to live on MasterService as
 // *ForTesting members; Arm/Disarm/Wait keep those semantics.
 struct SnapshotBarrierGate {
@@ -321,6 +321,13 @@ class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
         service.enable_dfs_ = true;
+    }
+
+    // Friend access applies to this fixture, not TEST_F subclasses; funnel
+    // the hook through a static member.
+    static void SetSnapshotArriveHookForTesting(MasterService& service,
+                                                std::function<void()> hook) {
+        service.snapshot_arrive_hook_ = std::move(hook);
     }
 
     static void SetUpTestSuite() {
@@ -655,7 +662,7 @@ class MasterServiceHATest : public ::testing::Test {
         // routing); create it on demand.
         auto tenant_handle = service->GetOrCreateTenantCatalogHandle(tenant);
         auto& tenant_state = *tenant_handle;
-        auto entry = tenant_state.Pin(key);
+        auto entry = tenant_state.Get(key);
         if (!entry) {
             entry = std::make_shared<mooncake::tenant::ObjectEntry>(
                 std::make_unique<ObjectMetadata>(
@@ -827,7 +834,7 @@ class MasterServiceHATest : public ::testing::Test {
         if (!tenant_handle) {
             return false;
         }
-        auto entry = tenant_handle->Pin(key);
+        auto entry = tenant_handle->Get(key);
         if (!entry) {
             return false;
         }
@@ -921,9 +928,11 @@ class MasterServiceHATest : public ::testing::Test {
         const auto wait_for_metadata = [&](bool available, auto timeout) {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
-                auto entry = tenant_handle->Pin(key);
-                const bool mutex_free =
-                    entry == nullptr || entry->TryLockUnique();
+                auto entry = tenant_handle->Get(key);
+                std::unique_lock<std::shared_mutex> probe =
+                    entry != nullptr ? entry->TryLockUnique()
+                                     : std::unique_lock<std::shared_mutex>();
+                const bool mutex_free = !probe.owns_lock();
                 if (mutex_free == available) {
                     return true;
                 }
@@ -1679,8 +1688,9 @@ TEST_F(MasterServiceHATest,
     MasterService service(
         MasterServiceConfig::builder()
             .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
-            .set_snapshot_arrive_hook([this] { snapshot_gate_.Arrive(); })
             .build());
+    SetSnapshotArriveHookForTesting(service,
+                                    [this] { snapshot_gate_.Arrive(); });
     const UUID client_id = generate_uuid();
     const std::string key = "local_first_lock_order_key";
     Segment segment = MakeSegment("local_first_lock_order_segment");

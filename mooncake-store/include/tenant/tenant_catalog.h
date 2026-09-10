@@ -155,8 +155,8 @@ class TenantCatalog {
         if (had_completed_disk) disk_object_count.fetch_sub(1);
     }
 
-    std::shared_ptr<ObjectEntry> Pin(const std::string& key) const {
-        return object_index.Pin(key);
+    std::shared_ptr<ObjectEntry> Get(const std::string& key) const {
+        return object_index.Get(key);
     }
     // Only erase when the route still resolves to `expected`; see
     // ObjectIndex::EraseIf.

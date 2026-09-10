@@ -940,10 +940,6 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
-    // Injected hook invoked when PutStart enters the snapshot section (after
-    // releasing client_mutex_, while holding snapshot_mutex_ shared). Empty in
-    // production; tests inject a gate for deterministic lock-order checks.
-    std::function<void()> snapshot_arrive_hook_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -1256,15 +1252,6 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    // Invoked by PutStart when it enters the snapshot section (after
-    // releasing client_mutex_, while holding snapshot_mutex_ shared). Empty by
-    // default: the checkpoint is a no-op unless a test injects a gate.
-    MasterServiceConfigBuilder& set_snapshot_arrive_hook(
-        std::function<void()> hook) {
-        snapshot_arrive_hook_ = std::move(hook);
-        return *this;
-    }
-
     MasterServiceConfig build() const;
 };
 
@@ -1294,8 +1281,6 @@ class MasterServiceConfig {
     // Zero denotes a directly constructed, supervisor-unmanaged service;
     // HA supervisor serving paths always inject the acquired non-zero view.
     ViewVersionId view_version = 0;
-    // See MasterServiceConfigBuilder::set_snapshot_arrive_hook.
-    std::function<void()> snapshot_arrive_hook;
     int64_t client_active_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t client_suspicion_ttl_sec = DEFAULT_CLIENT_SUSPICION_TTL_SEC;
     int64_t nof_heartbeat_interval_sec = DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
@@ -1487,7 +1472,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     }
 
     MasterServiceConfig config;
-    config.snapshot_arrive_hook = snapshot_arrive_hook_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.max_kv_soft_pin_ttl = max_kv_soft_pin_ttl_;

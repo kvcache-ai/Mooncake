@@ -768,7 +768,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         service->catalog_.Visit(
-            [&](const TenantId&, const std::shared_ptr<TenantCatalog>& handle) {
+            [&](const TenantId&,
+                const std::shared_ptr<mooncake::tenant::TenantCatalog>&
+                    handle) {
                 auto objs = handle->SnapshotObjects();
                 for (const auto& entry : objs) {
                     auto lk = entry->LockShared();

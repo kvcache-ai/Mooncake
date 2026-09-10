@@ -66,11 +66,10 @@ class ObjectEntry {
     std::shared_lock<std::shared_mutex> LockShared() const {
         return std::shared_lock<std::shared_mutex>(mutex);
     }
-    // Non-blocking probe: true when the mutex was free and is now locked for
-    // this caller (released again immediately on return).
-    bool TryLockUnique() const {
-        return std::unique_lock<std::shared_mutex>(mutex, std::try_to_lock)
-            .owns_lock();
+    // Non-blocking probe: an owning lock when the mutex was free, an empty
+    // one when it was already held.
+    [[nodiscard]] std::unique_lock<std::shared_mutex> TryLockUnique() const {
+        return std::unique_lock<std::shared_mutex>(mutex, std::try_to_lock);
     }
 
     // Owned envelope; never null (enforced by the constructor). Read under

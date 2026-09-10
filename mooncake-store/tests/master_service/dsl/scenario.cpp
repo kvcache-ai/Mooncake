@@ -1078,7 +1078,7 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
         Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;
     }
-    auto entry = tenant_handle->Pin(action.key);
+    auto entry = tenant_handle->Get(action.key);
     if (!entry) {
         Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;

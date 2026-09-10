@@ -60,7 +60,6 @@
 
 namespace mooncake {
 
-using TenantCatalog = tenant::TenantCatalog;
 
 // Forward declaration for MasterSnapshotManager
 class MasterSnapshotManager;
@@ -125,13 +124,13 @@ class MetadataScanBench;
  * 1. client_mutex_
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
- * 4. per-object ObjectEntry::mutex (via TenantCatalog::object_index Pin)
+ * 4. per-object ObjectEntry::mutex (via tenant::TenantCatalog::object_index Pin)
  * 5. tenant_quota_recompute_mutex_
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
  * The per-object lock is never held together with the object route lock
- * (TenantCatalog::object_index): acquire one at a time, releasing before the
+ * (tenant::TenantCatalog::object_index): acquire one at a time, releasing before the
  * route mutation. Strict tenant admission and policy mutation paths that need
  * both tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire the tenant
  * policy mutex first, then snapshot_mutex_.
@@ -1214,8 +1213,8 @@ class MasterService {
         const std::string& group_id, bool allow_soft_pinned,
         std::chrono::system_clock::time_point now,
         const std::function<EvictMemberOutcome(
-            const std::string&, ObjectMetadata&, TenantCatalog&,
-            TenantCatalog&)>& evict_one_member);
+            const std::string&, ObjectMetadata&, tenant::TenantCatalog&,
+            tenant::TenantCatalog&)>& evict_one_member);
 
     // Erase an object's entry + all per-key state. The entry-based form is the
     // single choke-point for stripping per-key state; the key-based overload
@@ -1232,26 +1231,26 @@ class MasterService {
     // teardown runs at most once per entry (metadata is taken under the
     // object lock).
     void EraseMetadata(
-        TenantCatalog& tenant_state,
+        tenant::TenantCatalog& tenant_state,
         const std::shared_ptr<mooncake::tenant::ObjectEntry>& entry,
         const TenantId& tenant_id,
         QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
-        TenantCatalog* tenant_accessor = nullptr,
+        tenant::TenantCatalog* tenant_accessor = nullptr,
         const std::vector<std::string>& previous_media_hint = {});
-    void EraseMetadata(TenantCatalog& tenant_state, const std::string& key,
+    void EraseMetadata(tenant::TenantCatalog& tenant_state, const std::string& key,
                        const TenantId& tenant_id,
                        QuotaEraseMode quota_mode = QuotaEraseMode::kFull,
-                       TenantCatalog* tenant_accessor = nullptr);
+                       tenant::TenantCatalog* tenant_accessor = nullptr);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
-        TenantCatalog& tenant_state, ObjectMetadata& metadata);
+        tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
-    std::shared_ptr<TenantCatalog> GetOrCreateTenantCatalogHandle(
+    std::shared_ptr<tenant::TenantCatalog> GetOrCreateTenantCatalogHandle(
         const TenantId& tenant_id);
     TenantQuotaHandle GetBoundTenantQuotaHandle(
-        const TenantCatalog& tenant_state) const;
+        const tenant::TenantCatalog& tenant_state) const;
     tl::expected<void, ErrorCode> ChargeTenantQuota(
         TenantQuotaHandle account, uint64_t bytes,
         uint64_t* deficit_bytes = nullptr);
@@ -1313,17 +1312,17 @@ class MasterService {
     // or local_disk replicas whose owner client no longer retains resources.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
-        TenantCatalog* tenant_accessor = nullptr);
+        tenant::TenantCatalog* tenant_accessor = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (quota release, promotion-task cancellation, disk-object
     // count) instead of duplicating it.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
-        TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale,
-        TenantCatalog* tenant_accessor = nullptr);
+        tenant::TenantCatalog* tenant_accessor = nullptr);
 
     // True when client_id currently has a LOCAL_DISK registration.
     // Momentarily takes the LocalSsdManager registry lock, so callers must not
@@ -1338,7 +1337,7 @@ class MasterService {
     // container, and return descriptor list.  Shared by PutStart and
     // UpsertStart.
     auto AllocateAndInsertMetadata(
-        TenantCatalog& tenant_accessor, const UUID& client_id,
+        tenant::TenantCatalog& tenant_accessor, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1353,7 +1352,7 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingReplicas(
-        TenantCatalog& tenant_accessor,
+        tenant::TenantCatalog& tenant_accessor,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
@@ -1386,7 +1385,7 @@ class MasterService {
     // and dropping the task marker along with its mirrors. Returns false
     // without touching the task if any mirror has already been drained by a
     // store worker.
-    bool CancelQueuedOffloadTask(TenantCatalog& tenant_state,
+    bool CancelQueuedOffloadTask(tenant::TenantCatalog& tenant_state,
                                  ObjectMetadata& metadata,
                                  const ObjectIdentity& object_id);
 
@@ -1444,10 +1443,10 @@ class MasterService {
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task
     // exists. Pins the entry and takes its lock; callers already holding the
     // entry mutex must use ErasePromotionTaskLocked instead.
-    void ErasePromotionTaskIfPresent(TenantCatalog& tenant_state,
+    void ErasePromotionTaskIfPresent(tenant::TenantCatalog& tenant_state,
                                      const std::string& key)
         NO_THREAD_SAFETY_ANALYSIS {
-        auto entry = tenant_state.Pin(key);
+        auto entry = tenant_state.Get(key);
         if (entry == nullptr) {
             return;
         }
@@ -1455,10 +1454,10 @@ class MasterService {
         ErasePromotionTaskLocked(tenant_state, *entry);
     }
     // Locked kernel — caller must hold the entry's mutex.
-    void ErasePromotionTaskLocked(TenantCatalog& tenant_state,
+    void ErasePromotionTaskLocked(tenant::TenantCatalog& tenant_state,
                                   mooncake::tenant::ObjectEntry& entry);
     void CancelPromotionTaskForRemovedReplicas(
-        TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1506,7 +1505,7 @@ class MasterService {
               tenant_handle_(service_->catalog_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
               entry_(tenant_state_ != nullptr
-                         ? tenant_state_->Pin(object_id_.user_key)
+                         ? tenant_state_->Get(object_id_.user_key)
                          : nullptr),
               lock_(entry_ != nullptr ? entry_->LockUnique()
                                       : std::unique_lock<std::shared_mutex>()) {
@@ -1589,7 +1588,7 @@ class MasterService {
             return entry_ != nullptr && entry_->replication_task.has_value();
         }
 
-        TenantCatalog& GetTenantCatalog() NO_THREAD_SAFETY_ANALYSIS {
+        tenant::TenantCatalog& GetTenantCatalog() NO_THREAD_SAFETY_ANALYSIS {
             EnsureTenantCatalog();
             return *tenant_state_;
         }
@@ -1654,7 +1653,7 @@ class MasterService {
                 // thread would re-lock a mutex it already holds.
                 lock_ = std::unique_lock<std::shared_mutex>();
                 entry_.reset();
-                entry_ = tenant_state_->Pin(object_id_.user_key);
+                entry_ = tenant_state_->Get(object_id_.user_key);
                 if (entry_ == nullptr) {
                     throw std::logic_error(
                         "Create(): winner entry disappeared after failed "
@@ -1682,7 +1681,7 @@ class MasterService {
             tenant_handle_ =
                 service_->GetOrCreateTenantCatalogHandle(object_id_.tenant_id);
             tenant_state_ = tenant_handle_.get();
-            entry_ = tenant_state_->Pin(object_id_.user_key);
+            entry_ = tenant_state_->Get(object_id_.user_key);
             if (entry_ != nullptr) {
                 lock_ = entry_->LockUnique();
             }
@@ -1700,8 +1699,8 @@ class MasterService {
         ObjectIdentity object_id_;
         // Strong handle keeps the TenantCatalog alive for the accessor
         // lifecycle even if the directory removes it (COW publish) mid-access.
-        std::shared_ptr<TenantCatalog> tenant_handle_;
-        TenantCatalog* tenant_state_;
+        std::shared_ptr<tenant::TenantCatalog> tenant_handle_;
+        tenant::TenantCatalog* tenant_state_;
         // Pinned ObjectEntry (keeps the object alive) whose per-object mutex is
         // held for the accessor's lifetime.
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
@@ -1734,7 +1733,7 @@ class MasterService {
 
         // Serialize a single tenant's metadata (per-tenant payload).
         tl::expected<void, SerializationError> SerializeTenant(
-            const TenantId& tenant_id, const TenantCatalog& tenant_state,
+            const TenantId& tenant_id, const tenant::TenantCatalog& tenant_state,
             MsgpackPacker& packer) const;
 
         // Deserialize a single tenant's payload into the TenantDirectory.
@@ -1760,7 +1759,7 @@ class MasterService {
               tenant_handle_(service_->catalog_.Lookup(object_id_.tenant_id)),
               tenant_state_(tenant_handle_ ? tenant_handle_.get() : nullptr),
               entry_(tenant_state_ != nullptr
-                         ? tenant_state_->Pin(object_id_.user_key)
+                         ? tenant_state_->Get(object_id_.user_key)
                          : nullptr),
               lock_(entry_ != nullptr ? entry_->LockShared()
                                       : std::shared_lock<std::shared_mutex>()) {
@@ -1781,7 +1780,7 @@ class MasterService {
             return entry_->metadata();
         }
 
-        const TenantCatalog* GetTenantCatalog() const
+        const tenant::TenantCatalog* GetTenantCatalog() const
             NO_THREAD_SAFETY_ANALYSIS {
             return tenant_state_;
         }
@@ -1794,8 +1793,8 @@ class MasterService {
        private:
         const MasterService* service_;
         const ObjectIdentity object_id_;
-        std::shared_ptr<TenantCatalog> tenant_handle_;
-        const TenantCatalog* tenant_state_;
+        std::shared_ptr<tenant::TenantCatalog> tenant_handle_;
+        const tenant::TenantCatalog* tenant_state_;
         std::shared_ptr<mooncake::tenant::ObjectEntry> entry_;
         std::shared_lock<std::shared_mutex> lock_;
     };
@@ -1965,10 +1964,10 @@ class MasterService {
     // Locked kernel — caller must hold the entry's mutex. Drops the pending
     // DR task state and erases the key's lease-table records.
     void ClearDynamicReplicationStateLocked(
-        TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry);
+        tenant::TenantCatalog& tenant_state, mooncake::tenant::ObjectEntry& entry);
     void CleanupExpiredDynamicReplicationState();
     // Caller must hold the entry's mutex.
-    bool HasDynamicReplicationPending(TenantCatalog& tenant_state,
+    bool HasDynamicReplicationPending(tenant::TenantCatalog& tenant_state,
                                       const std::string& key);
     std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
         const ObjectMetadata& metadata,
@@ -1978,13 +1977,13 @@ class MasterService {
         const ObjectIdentity& object_id, const DynamicReplicaPlan& plan,
         const UUID& lease_id, uint64_t version_epoch);
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(
-        TenantCatalog& tenant_state, const std::string& key,
+        tenant::TenantCatalog& tenant_state, const std::string& key,
         const UUID& dynamic_replication_lease_id, const UUID& client_id,
         const std::string& source_segment, uint64_t current_version_epoch,
         uint64_t dynamic_replication_version_epoch,
         const std::vector<std::string>& target_segments);
     void RegisterDynamicReplicaStart(
-        TenantCatalog& tenant_state, ObjectMetadata& metadata,
+        tenant::TenantCatalog& tenant_state, ObjectMetadata& metadata,
         const std::string& key, const std::string& source_segment,
         uint64_t version_epoch, const std::vector<std::string>& target_segments,
         const std::vector<ReplicaID>& replica_ids);
@@ -2050,11 +2049,11 @@ class MasterService {
     std::unique_ptr<ha::MasterSnapshotCodec> snapshot_codec_;
     mutable std::shared_mutex snapshot_mutex_;
 
-    // Injected via MasterServiceConfig: invoked when PutStart enters the
-    // snapshot section (client_mutex_ released, snapshot_mutex_ held shared).
-    // Empty in production; lock-order tests inject a gate so they can observe
-    // the checkpoint and resume deterministically instead of racing.
-    const std::function<void()> snapshot_arrive_hook_;
+    // Invoked when PutStart enters the snapshot section (client_mutex_
+    // released, snapshot_mutex_ held shared). Empty in production; the
+    // friended HA test assigns it (under snapshot_mutex_) to observe the
+    // checkpoint and resume deterministically instead of racing.
+    std::function<void()> snapshot_arrive_hook_ GUARDED_BY(snapshot_mutex_);
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

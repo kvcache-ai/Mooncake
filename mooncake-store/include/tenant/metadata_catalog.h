@@ -13,6 +13,7 @@
 // RAII read/write access to an object runs through MasterService's
 // MetadataAccessorRO/RW (pin + per-object lock).
 
+#include <functional>
 #include <memory>
 
 #include "tenant/tenant_catalog.h"
@@ -27,11 +28,13 @@ class MetadataCatalog {
     MetadataCatalog() = default;
 
     // Atomic tenant get-or-create: concurrent first writers for the same
-    // tenant all observe the one winning TenantCatalog.
-    template <typename Factory>
-    std::shared_ptr<TenantCatalog> GetOrCreateTenant(const TenantId& tenant_id,
-                                                     Factory&& factory) {
-        return tenants_.GetOrCreate(tenant_id, std::forward<Factory>(factory));
+    // tenant all observe the one winning TenantCatalog. The factory stays a
+    // caller parameter because publication requires service-side
+    // initialization (quota binding) before the handle escapes.
+    std::shared_ptr<TenantCatalog> GetOrCreateTenant(
+        const TenantId& tenant_id,
+        std::function<std::shared_ptr<TenantCatalog>()> factory) {
+        return tenants_.GetOrCreate(tenant_id, std::move(factory));
     }
 
     // Null handle when the tenant is absent; lock-free.

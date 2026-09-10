@@ -179,7 +179,7 @@ class DynamicReplicationTest : public ::testing::Test {
         const bool has_lease =
             tenant_state.object_index.HasDynamicReplicationLeaseForKeyForTest(
                 key);
-        auto entry = tenant_state.Pin(key);
+        auto entry = tenant_state.Get(key);
         if (!entry) {
             return has_lease;
         }
@@ -261,7 +261,7 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantCatalog();
-        auto entry = tenant_state.Pin(key);
+        auto entry = tenant_state.Get(key);
         ASSERT_TRUE(entry != nullptr && entry->dynamic_replication_pending);
         entry->dynamic_replication_pending->expire_at_ms_epoch = 1;
     }

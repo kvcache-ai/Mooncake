@@ -69,7 +69,7 @@ TEST(TenantCatalogTest, EmptyTracksRouteGroupsAndLeases) {
     // A routed object makes the aggregate non-empty.
     catalog.InsertObject("k1", MakeEntry("k1", ""));
     EXPECT_FALSE(catalog.Empty());
-    auto handle = catalog.Pin("k1");
+    auto handle = catalog.Get("k1");
     ASSERT_NE(handle, nullptr);
     ASSERT_TRUE(catalog.EraseObjectIf("k1", handle.get()));
     EXPECT_TRUE(catalog.Empty());
@@ -103,7 +103,7 @@ TEST(TenantCatalogTest,
 
     // Erasing the object does not mutate group membership in the flat model
     // (membership is a parallel structure; cleanup is the caller's concern).
-    auto member_handle = catalog.Pin("k2");
+    auto member_handle = catalog.Get("k2");
     ASSERT_NE(member_handle, nullptr);
     catalog.EraseObjectIf("k2", member_handle.get());
     EXPECT_EQ(catalog.ObjectCount(), 0u);

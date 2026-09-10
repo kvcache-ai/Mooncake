@@ -248,7 +248,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (handle == nullptr) {
             return std::nullopt;
         }
-        auto entry = handle->Pin(key);
+        auto entry = handle->Get(key);
         if (!entry) {
             return std::nullopt;
         }
@@ -273,7 +273,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (handle == nullptr) {
             return false;
         }
-        auto entry = handle->Pin(key);
+        auto entry = handle->Get(key);
         if (entry == nullptr) {
             return false;
         }

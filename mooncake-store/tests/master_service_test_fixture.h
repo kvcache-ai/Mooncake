@@ -129,7 +129,7 @@ class MasterServiceTest : public ::testing::Test {
         if (!tenant_handle) {
             return std::nullopt;
         }
-        auto entry = tenant_handle->Pin(key);
+        auto entry = tenant_handle->Get(key);
         if (!entry) {
             return std::nullopt;
         }
@@ -151,7 +151,7 @@ class MasterServiceTest : public ::testing::Test {
             service.ResolveRequestTenantId(TenantId(tenant_id));
         auto tenant_handle =
             service.GetOrCreateTenantCatalogHandle(normalized_tenant);
-        auto entry = tenant_handle->Pin(key);
+        auto entry = tenant_handle->Get(key);
         ASSERT_TRUE(entry != nullptr);
         auto entry_lock = entry->LockUnique();
         entry->metadata().SetCommittedSoftPinTimeoutForTesting(deadline);
@@ -249,7 +249,7 @@ class MasterServiceTest : public ::testing::Test {
         EXPECT_EQ(accessor.GetEntry(), winner);
         EXPECT_EQ(accessor.Get().GetAllReplicas().size(), 1u);
         // The route holds exactly one entry for the key (the winner).
-        auto pinned = tenant_handle->Pin(key);
+        auto pinned = tenant_handle->Get(key);
         ASSERT_NE(pinned, nullptr);
         EXPECT_EQ(pinned, winner);
         EXPECT_EQ(tenant_handle->ObjectCount(), 1u);

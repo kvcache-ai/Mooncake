@@ -421,8 +421,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
 }
 
-TEST_F(MasterServiceTenantQuotaTest,
-       SameTenantCatalogsAcrossMetadataShardsShareBoundHandle) {
+TEST_F(MasterServiceTenantQuotaTest, SameTenantCatalogsShareBoundHandle) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));
     MountSegment(service);

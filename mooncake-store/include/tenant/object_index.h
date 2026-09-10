@@ -37,18 +37,18 @@ class ObjectIndex {
     ObjectIndex() = default;
     ~ObjectIndex() = default;
 
-    // The object route is a flat map key -> strong ObjectEntry handle. Read
-    // pins the entry under the shared route lock (fast), releases it, then
-    // takes the per-object lock; the strong handle keeps the entry alive across
-    // that handoff.
-    std::shared_ptr<ObjectEntry> Pin(const std::string& key) const {
+    // The object route is a flat map key -> strong ObjectEntry handle. Get
+    // returns the strong handle under the shared route lock (fast), releasing
+    // the route before the caller takes the per-object lock; the strong handle
+    // keeps the entry alive across that handoff.
+    std::shared_ptr<ObjectEntry> Get(const std::string& key) const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         auto it = route_.find(key);
         return it == route_.end() ? nullptr : it->second;
     }
 
     // Insert a NEW entry under this tenant. Returns false if a key already
-    // exists (caller re-pins instead). The entry's key() must equal `key`.
+    // exists (caller re-looks-up instead). The entry's key() must equal `key`.
     // Assigns the entry's route generation (monotonic per index).
     bool Insert(std::string key, std::shared_ptr<ObjectEntry> entry) {
         std::unique_lock<std::shared_mutex> lock(route_lock_);
@@ -62,7 +62,7 @@ class ObjectIndex {
     // (identity + not torn down). Lets a pinned handle or a deferred eviction
     // candidate revalidate itself against replacements of the same key.
     bool IsCurrent(const std::string& key, const ObjectEntry* entry) const {
-        auto pinned = Pin(key);
+        auto pinned = Get(key);
         if (!pinned || pinned.get() != entry) {
             return false;
         }
@@ -122,14 +122,14 @@ class ObjectIndex {
         return entries;
     }
 
-    // Callback-scoped test/diagnostic access; production paths pin + lock
-    // explicitly. Pin the entry by key, then run `fn` against its metadata
+    // Callback-scoped test/diagnostic access; production paths get + lock
+    // explicitly. Get the entry by key, then run `fn` against its metadata
     // while the per-object `mutex` is held. The metadata reference must not
     // escape the callback. No-op when the key is absent or the entry has no
     // metadata yet.
     template <typename Fn>
     void WithObject(const std::string& key, Fn&& fn) const {
-        auto entry = Pin(key);
+        auto entry = Get(key);
         if (!entry) {
             return;
         }
@@ -178,8 +178,13 @@ class ObjectIndex {
         }
     }
 
-    // Remove every lease that has expired (expire_at_ms_epoch < now_ms).
-    void EraseExpiredDynamicReplicationLeases(int64_t now_ms) {
+    // Remove every lease whose expiry instant has passed.
+    void EraseExpiredDynamicReplicationLeases(
+        std::chrono::system_clock::time_point now) {
+        const int64_t now_ms = std::chrono::duration_cast<
+                                   std::chrono::milliseconds>(
+                                   now.time_since_epoch())
+                                   .count();
         std::unique_lock<std::shared_mutex> lock(leases_lock_);
         for (auto it = dynamic_replication_leases.begin();
              it != dynamic_replication_leases.end();) {
