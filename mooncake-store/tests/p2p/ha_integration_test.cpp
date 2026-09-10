@@ -517,9 +517,9 @@ TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
             client1_->GetClientID(), segment.id);
         ASSERT_TRUE(registered.has_value())
             << "Missing registered segment: " << segment.name;
-        EXPECT_EQ(registered.value()->name, segment.name);
-        EXPECT_EQ(registered.value()->size, segment.size);
-        EXPECT_EQ(registered.value()->memory_type, segment.memory_type);
+        EXPECT_EQ(registered->name, segment.name);
+        EXPECT_EQ(registered->size, segment.size);
+        EXPECT_EQ(registered->memory_type, segment.memory_type);
     }
 
     ForceRecover(client1_);

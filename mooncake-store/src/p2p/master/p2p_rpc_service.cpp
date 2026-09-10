@@ -5,11 +5,9 @@
 #include <csignal>
 #include <sstream>
 #include <thread>
-#include <ylt/reflection/user_reflect_macro.hpp>
-#include <ylt/struct_json/json_reader.h>
-#include <ylt/struct_json/json_writer.h>
 
 #include <glog/logging.h>
+#include <json/json.h>
 
 #include "p2p/master/p2p_master_metric_manager.h"
 #include "rpc_helper.h"
@@ -131,9 +129,37 @@ void P2PMasterRpcService::init_http_server() {
             }
             const auto results = BatchGetReadRoute(
                 P2PBatchGetReadRouteRequest{.keys = std::move(key_views)});
-            std::string response;
-            struct_json::to_json(results, response);
-            resp.set_status_and_content(status_type::ok, std::move(response));
+            // UUID is a std::pair, which YLT treats as a JSON object entry.
+            // Encode both halves explicitly as an array for the HTTP API.
+            const auto uuid_json = [](const UUID& id) {
+                Json::Value value(Json::arrayValue);
+                value.append(Json::UInt64(id.first));
+                value.append(Json::UInt64(id.second));
+                return value;
+            };
+            Json::Value response(Json::objectValue);
+            response["responses"] = Json::Value(Json::arrayValue);
+            response["error_codes"] = Json::Value(Json::arrayValue);
+            for (const auto& routes : results.responses) {
+                Json::Value entries(Json::arrayValue);
+                for (const auto& route : routes) {
+                    Json::Value entry(Json::objectValue);
+                    entry["client_id"] = uuid_json(route.client_id);
+                    entry["segment_id"] = uuid_json(route.segment_id);
+                    entry["ip_address"] = route.ip_address;
+                    entry["rpc_port"] = route.rpc_port;
+                    entry["object_size"] = Json::UInt64(route.object_size);
+                    entries.append(std::move(entry));
+                }
+                response["responses"].append(std::move(entries));
+            }
+            for (const auto error : results.error_codes) {
+                response["error_codes"].append(static_cast<int>(error));
+            }
+            Json::StreamWriterBuilder writer;
+            writer["indentation"] = "";
+            resp.set_status_and_content(status_type::ok,
+                                        Json::writeString(writer, response));
         });
 
     http_server_.async_start();

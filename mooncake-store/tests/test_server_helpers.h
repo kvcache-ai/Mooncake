@@ -105,13 +105,6 @@ class InProcMaster {
                 }
             }
 
-            if (config.client_live_ttl_sec.has_value()) {
-                wms_cfg.client_live_ttl_sec =
-                    config.client_live_ttl_sec.value();
-            } else {
-                wms_cfg.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-            }
-
             wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
             RegisterRpcService(*server_, *wrapped_);
 

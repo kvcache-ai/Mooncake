@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <functional>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 

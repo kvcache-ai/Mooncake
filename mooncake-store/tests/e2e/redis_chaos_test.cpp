@@ -607,7 +607,7 @@ class RedisChaosTest : public ::testing::Test {
     }
 
     std::vector<std::unique_ptr<MasterProcessHandler>> masters_;
-    std::unique_ptr<P2PMasterView> master_view_;
+    std::unique_ptr<P2PRedisMasterView> master_view_;
     inline static struct sigaction old_sigpipe_action_ = {};
 };
 

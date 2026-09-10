@@ -83,7 +83,7 @@ class AsyncMetadataNotifierTest : public ::testing::Test {
         auto& svc = master_.GetWrapped().GetMasterService();
         auto res = svc.GetReadRoute(key);
         if (!res.has_value()) return 0;
-        return res->replicas.size();
+        return res->size();
     }
 
     static testing::InProcP2PMaster master_;

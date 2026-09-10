@@ -420,10 +420,8 @@ TEST_F(HARecoveryManagerTest, ReconnectResyncsLocalReplicaToP2PMaster) {
     auto result = svc.GetReadRoute(key);
     ASSERT_TRUE(result.has_value())
         << "GetReadRoute failed: " << result.error();
-    ASSERT_EQ(result.value().replicas.size(), 1);
-    const auto& replica = result.value().replicas[0];
-    ASSERT_TRUE(replica.is_p2p_proxy_replica());
-    const auto& desc = replica.get_p2p_proxy_descriptor();
+    ASSERT_EQ(result->size(), 1);
+    const auto& desc = result->front();
     EXPECT_EQ(desc.client_id, client_id_);
     EXPECT_EQ(desc.segment_id, tier_id.value());
 }

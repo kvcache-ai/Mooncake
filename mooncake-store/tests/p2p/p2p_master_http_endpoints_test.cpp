@@ -10,11 +10,14 @@
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <json/json.h>
 
 #include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
+#include <initializer_list>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -26,8 +29,6 @@
 #include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
-#include <ylt/reflection/user_reflect_macro.hpp>
-#include <ylt/struct_json/json_reader.h>
 
 #include "p2p/master/p2p_rpc_service.h"
 #include "types.h"
@@ -61,19 +62,21 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         // Register one client owning two P2P segments so tests can also
         // exercise keys with replicas on multiple segments.
         P2PSegment segment_a;
-        segment_a.id = generate_uuid();
+        // JSON must preserve both zero and full-width unsigned UUID halves.
+        segment_a.id = {0, std::numeric_limits<uint64_t>::max()};
         segment_a.name = "p2p_master_http_segment_a";
         segment_a.size = kSegmentSize;
         segment_a.priority = 0;
         segment_a.memory_type = MemoryType::DRAM;
         P2PSegment segment_b = segment_a;
-        segment_b.id = generate_uuid();
+        segment_b.id = {std::numeric_limits<uint64_t>::max(), 0};
         segment_b.name = "p2p_master_http_segment_b";
         segment_id_a_ = segment_a.id;
         segment_id_b_ = segment_b.id;
 
         P2PRegisterClientRequest reg_req;
-        reg_req.client_id = generate_uuid();
+        reg_req.client_id = {std::numeric_limits<uint64_t>::max(),
+                             std::numeric_limits<uint64_t>::max()};
         reg_req.ip_address = "127.0.0.1";
         reg_req.rpc_port = 50051;
         reg_req.segments = {segment_a, segment_b};
@@ -195,16 +198,34 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
 
     // ---- JSON helpers -----------------------------------------------------
 
-    template <typename T>
-    static T ParseJson(const std::string& body, const char* what) {
-        T parsed{};
-        try {
-            struct_json::from_json(parsed, body);
-        } catch (const std::exception& e) {
-            ADD_FAILURE() << "failed to parse " << what << " JSON: " << e.what()
+    static Json::Value ParseJson(const std::string& body, const char* what) {
+        Json::Value parsed;
+        Json::CharReaderBuilder builder;
+        std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        std::string error;
+        if (!reader->parse(body.data(), body.data() + body.size(), &parsed,
+                           &error)) {
+            ADD_FAILURE() << "failed to parse " << what << " JSON: " << error
                           << ", body=" << body;
         }
         return parsed;
+    }
+
+    static void ExpectUuid(const Json::Value& value, const UUID& expected) {
+        ASSERT_TRUE(value.isArray());
+        ASSERT_EQ(value.size(), 2u);
+        ASSERT_TRUE(value[0].isUInt64());
+        ASSERT_TRUE(value[1].isUInt64());
+        EXPECT_EQ(value[0].asUInt64(), expected.first);
+        EXPECT_EQ(value[1].asUInt64(), expected.second);
+    }
+
+    static Json::Value ErrorCodes(std::initializer_list<ErrorCode> codes) {
+        Json::Value value(Json::arrayValue);
+        for (const auto code : codes) {
+            value.append(static_cast<int>(code));
+        }
+        return value;
     }
 
     static constexpr size_t kSegmentSize = 16 * 1024 * 1024;
@@ -317,24 +338,23 @@ TEST_F(P2PMasterHttpEndpointsTest,
                         "," + key1 + "," + missing_key);
     ASSERT_EQ(resp.status, 200) << "body=" << resp.resp_body;
 
-    const auto body =
-        ParseJson<P2PBatchGetReadRouteResponse>(resp.resp_body, "batch routes");
-    ASSERT_EQ(body.responses.size(), 3u);
-    ASSERT_EQ(body.error_codes.size(), 3u);
-    EXPECT_EQ(body.error_codes,
-              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK,
-                                      ErrorCode::OBJECT_NOT_FOUND}));
-    ASSERT_EQ(body.responses[0].size(), 1u);
-    ASSERT_EQ(body.responses[1].size(), 1u);
-    EXPECT_TRUE(body.responses[2].empty());
-    const auto& route = body.responses[0][0];
-    EXPECT_EQ(route.client_id, client_id_);
-    EXPECT_EQ(route.segment_id, segment_id_a_);
-    EXPECT_EQ(route.ip_address, "127.0.0.1");
-    EXPECT_EQ(route.rpc_port, 50051);
-    EXPECT_EQ(route.object_size, 1024u);
-    EXPECT_EQ(body.responses[1][0].segment_id, segment_id_b_);
-    EXPECT_EQ(body.responses[1][0].object_size, 2048u);
+    const auto body = ParseJson(resp.resp_body, "batch routes");
+    ASSERT_TRUE(body["responses"].isArray());
+    ASSERT_EQ(body["responses"].size(), 3u);
+    EXPECT_EQ(body["error_codes"],
+              ErrorCodes({ErrorCode::OK, ErrorCode::OK,
+                          ErrorCode::OBJECT_NOT_FOUND}));
+    ASSERT_EQ(body["responses"][0].size(), 1u);
+    ASSERT_EQ(body["responses"][1].size(), 1u);
+    EXPECT_EQ(body["responses"][2], Json::Value(Json::arrayValue));
+    const auto& route = body["responses"][0][0];
+    ExpectUuid(route["client_id"], client_id_);
+    ExpectUuid(route["segment_id"], segment_id_a_);
+    EXPECT_EQ(route["ip_address"].asString(), "127.0.0.1");
+    EXPECT_EQ(route["rpc_port"].asUInt(), 50051u);
+    EXPECT_EQ(route["object_size"].asUInt64(), 1024u);
+    ExpectUuid(body["responses"][1][0]["segment_id"], segment_id_b_);
+    EXPECT_EQ(body["responses"][1][0]["object_size"].asUInt64(), 2048u);
 
     RemoveKey(key0, segment_id_a_);
     RemoveKey(key1, segment_id_b_);
@@ -345,14 +365,14 @@ TEST_F(P2PMasterHttpEndpointsTest,
                 key1);
     ASSERT_EQ(resp_after_remove.status, 200)
         << "body=" << resp_after_remove.resp_body;
-    const auto removed = ParseJson<P2PBatchGetReadRouteResponse>(
-        resp_after_remove.resp_body, "removed routes");
-    ASSERT_EQ(removed.responses.size(), 2u);
-    EXPECT_TRUE(removed.responses[0].empty());
-    EXPECT_TRUE(removed.responses[1].empty());
-    EXPECT_EQ(removed.error_codes,
-              (std::vector<ErrorCode>{ErrorCode::OBJECT_NOT_FOUND,
-                                      ErrorCode::OBJECT_NOT_FOUND}));
+    const auto removed =
+        ParseJson(resp_after_remove.resp_body, "removed routes");
+    ASSERT_EQ(removed["responses"].size(), 2u);
+    EXPECT_EQ(removed["responses"][0], Json::Value(Json::arrayValue));
+    EXPECT_EQ(removed["responses"][1], Json::Value(Json::arrayValue));
+    EXPECT_EQ(removed["error_codes"],
+              ErrorCodes({ErrorCode::OBJECT_NOT_FOUND,
+                          ErrorCode::OBJECT_NOT_FOUND}));
 }
 
 TEST_F(P2PMasterHttpEndpointsTest,
@@ -362,15 +382,12 @@ TEST_F(P2PMasterHttpEndpointsTest,
     const auto response =
         HttpGet(http_base_url_ + "/batch_query_routes?keys=" + key + "," + key);
     ASSERT_EQ(response.status, 200);
-    const auto body = ParseJson<P2PBatchGetReadRouteResponse>(
-        response.resp_body, "duplicate routes");
-    ASSERT_EQ(body.responses.size(), 2u);
-    ASSERT_EQ(body.error_codes.size(), 2u);
-    EXPECT_EQ(body.error_codes,
-              (std::vector<ErrorCode>{ErrorCode::OK, ErrorCode::OK}));
-    for (const auto& routes : body.responses) {
+    const auto body = ParseJson(response.resp_body, "duplicate routes");
+    ASSERT_EQ(body["responses"].size(), 2u);
+    EXPECT_EQ(body["error_codes"], ErrorCodes({ErrorCode::OK, ErrorCode::OK}));
+    for (const auto& routes : body["responses"]) {
         ASSERT_EQ(routes.size(), 1u);
-        EXPECT_EQ(routes[0].segment_id, segment_id_a_);
+        ExpectUuid(routes[0]["segment_id"], segment_id_a_);
     }
     RemoveKey(key, segment_id_a_);
 }
