@@ -40,8 +40,12 @@ class HAMetricManager {
         std::optional<std::pair<uint64_t, uint64_t>> stuck_range;
     };
 
-    void reset_writer_runtime();
-    void update_writer_runtime(const WriterRuntimeSnapshot& snapshot);
+    // Activation replaces the observed writer and invalidates earlier owners.
+    // Snapshot retry_count is per writer on input, process cumulative on
+    // output.
+    uint64_t activate_writer_runtime(const WriterRuntimeSnapshot& snapshot);
+    void update_writer_runtime(uint64_t owner,
+                               const WriterRuntimeSnapshot& snapshot);
     WriterRuntimeSnapshot get_writer_runtime() const;
     // --- Singleton Access ---
     static HAMetricManager& instance();
@@ -269,6 +273,8 @@ class HAMetricManager {
 
     mutable std::mutex writer_runtime_mutex_;
     WriterRuntimeSnapshot writer_runtime_;
+    uint64_t writer_runtime_owner_{0};
+    uint64_t writer_retry_base_{0};
 };
 
 }  // namespace mooncake

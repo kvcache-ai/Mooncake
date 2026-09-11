@@ -14571,6 +14571,7 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     batch_oplog_kv_backend_ = std::move(backend);
     batch_oplog_storage_ = std::move(storage);
     ordered_oplog_writer_ = std::move(writer);
+    ordered_oplog_writer_->ActivateRuntimeMetrics();
     return ErrorCode::OK;
 }
 

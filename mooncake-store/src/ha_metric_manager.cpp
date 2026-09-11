@@ -13,15 +13,21 @@ HAMetricManager& HAMetricManager::instance() {
     return static_instance;
 }
 
-void HAMetricManager::reset_writer_runtime() {
+uint64_t HAMetricManager::activate_writer_runtime(
+    const WriterRuntimeSnapshot& snapshot) {
     std::lock_guard<std::mutex> lock(writer_runtime_mutex_);
-    writer_runtime_ = {};
+    writer_retry_base_ = writer_runtime_.retry_count;
+    writer_runtime_ = snapshot;
+    writer_runtime_.retry_count += writer_retry_base_;
+    return ++writer_runtime_owner_;
 }
 
 void HAMetricManager::update_writer_runtime(
-    const WriterRuntimeSnapshot& snapshot) {
+    uint64_t owner, const WriterRuntimeSnapshot& snapshot) {
     std::lock_guard<std::mutex> lock(writer_runtime_mutex_);
+    if (owner == 0 || owner != writer_runtime_owner_) return;
     writer_runtime_ = snapshot;
+    writer_runtime_.retry_count += writer_retry_base_;
 }
 
 HAMetricManager::WriterRuntimeSnapshot HAMetricManager::get_writer_runtime()
@@ -471,7 +477,19 @@ std::string HAMetricManager::serialize_metrics() {
        << "ha_writer_durable_batch_id " << writer.durable_batch_id << "\n"
        << "# HELP ha_writer_durable_sequence Last durable sequence\n"
        << "# TYPE ha_writer_durable_sequence gauge\n"
-       << "ha_writer_durable_sequence " << writer.durable_sequence << "\n";
+       << "ha_writer_durable_sequence " << writer.durable_sequence << "\n"
+       << "# HELP ha_writer_stuck_first_sequence First sequence of the "
+          "in-flight batch awaiting durability; 0 when absent, not a timeout "
+          "indicator\n"
+       << "# TYPE ha_writer_stuck_first_sequence gauge\n"
+       << "ha_writer_stuck_first_sequence "
+       << (writer.stuck_range ? writer.stuck_range->first : 0) << "\n"
+       << "# HELP ha_writer_stuck_last_sequence Last sequence of the "
+          "in-flight batch awaiting durability; 0 when absent, not a timeout "
+          "indicator\n"
+       << "# TYPE ha_writer_stuck_last_sequence gauge\n"
+       << "ha_writer_stuck_last_sequence "
+       << (writer.stuck_range ? writer.stuck_range->second : 0) << "\n";
     if (!writer.terminal_reason.empty()) {
         ss << "# HELP ha_writer_terminal_reason Current terminal reason\n"
            << "# TYPE ha_writer_terminal_reason gauge\n"

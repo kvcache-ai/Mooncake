@@ -46,7 +46,8 @@ struct OrderedOpLogWriter::Impl {
         next_sequence_id = this->config.initial_durable_prefix.last_seq + 1;
     }
 
-    void PublishRuntime() const {
+    void PublishRuntime(bool activate = false) {
+        if (!activate && runtime_owner == 0) return;
         HAMetricManager::WriterRuntimeSnapshot snapshot;
         snapshot.accepting = accepting;
         snapshot.retry_count = retry_count;
@@ -60,7 +61,13 @@ struct OrderedOpLogWriter::Impl {
         snapshot.last_error = static_cast<int64_t>(last_error);
         snapshot.terminal_reason = terminal_reason;
         snapshot.stuck_range = stuck_range;
-        HAMetricManager::instance().update_writer_runtime(snapshot);
+        if (activate) {
+            runtime_owner =
+                HAMetricManager::instance().activate_writer_runtime(snapshot);
+        } else {
+            HAMetricManager::instance().update_writer_runtime(runtime_owner,
+                                                              snapshot);
+        }
     }
 
     void SealCommittedEntriesIfIdle() {
@@ -128,6 +135,7 @@ struct OrderedOpLogWriter::Impl {
     bool callback_stop_requested{false};
     ErrorCode last_error{ErrorCode::OK};
     uint64_t retry_count{0};
+    uint64_t runtime_owner{0};
     uint64_t retry_delay_ms{0};
     std::string terminal_reason;
     std::optional<std::pair<uint64_t, uint64_t>> stuck_range;
@@ -199,10 +207,11 @@ OrderedOpLogWriter::OrderedOpLogWriter(OrderedOpLogWriterConfig config,
                                        WriteBatchFn write_batch,
                                        TerminalCallback terminal_callback)
     : impl_(std::make_unique<Impl>(std::move(config), std::move(write_batch),
-                                   std::move(terminal_callback))) {
-    HAMetricManager::instance().reset_writer_runtime();
+                                   std::move(terminal_callback))) {}
+
+void OrderedOpLogWriter::ActivateRuntimeMetrics() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->PublishRuntime();
+    if (impl_->runtime_owner == 0) impl_->PublishRuntime(true);
 }
 
 OrderedOpLogWriter::~OrderedOpLogWriter() { Stop(); }
