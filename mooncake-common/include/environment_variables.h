@@ -168,6 +168,16 @@ struct NvmeKvConnectorEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_TRANSPORT);
 };
 
+struct NvmeKvIoConcurrencyEnvironmentVariables {
+    // Keep these values as strings to preserve the existing NVMe unsigned
+    // syntax, zero fallback, and silent invalid-value behavior.
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_MAX_IO_CONCURRENCY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_IO_CONCURRENCY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_BATCH_SUBMIT_CONCURRENCY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_ROOT_SUBMIT_CONCURRENCY);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_PREPARE_CONCURRENCY);
+};
+
 #undef MC_DEFINE_ENV_VAR
 
 }  // namespace mooncake
