@@ -1,8 +1,9 @@
 use super::codec::*;
 use super::cold_tier_server::{
     handle_ack_cold_read_complete, handle_batch_read_from_cold, handle_batch_reclaim_cold_backings,
-    handle_manual_cold_tier_free, handle_manual_cold_tier_gc, handle_pin_for_read,
-    handle_probe_cold_tier_device, handle_read_from_cold, handle_trigger_cold_tier_offload,
+    handle_manage_nof_backing, handle_manual_cold_tier_free, handle_manual_cold_tier_gc,
+    handle_pin_for_read, handle_probe_cold_tier_device, handle_read_from_cold,
+    handle_transfer_nof_owner_snapshot, handle_trigger_cold_tier_offload,
 };
 use super::pb::control_plane_service_server::ControlPlaneService as _;
 use super::*;
@@ -352,6 +353,20 @@ impl pb::control_plane_service_server::ControlPlaneService for GrpcControlPlaneS
         request: Request<pb::BatchReclaimColdBackingsRequest>,
     ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
         handle_batch_reclaim_cold_backings(self.cold_tier.clone(), request).await
+    }
+
+    async fn transfer_nof_owner_snapshot(
+        &self,
+        request: Request<pb::TransferNofOwnerSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::TransferNofOwnerSnapshotReply>, Status> {
+        handle_transfer_nof_owner_snapshot(self.cold_tier.clone(), request).await
+    }
+
+    async fn manage_nof_backing(
+        &self,
+        request: Request<pb::ManageNofBackingRequest>,
+    ) -> std::result::Result<Response<pb::ManageNofBackingReply>, Status> {
+        handle_manage_nof_backing(self.cold_tier.clone(), request).await
     }
 
     async fn pin_for_read(

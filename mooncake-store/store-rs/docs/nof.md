@@ -58,10 +58,10 @@ shared catalog and then assigns one active runtime as its owner. Joining a clien
 existing target.
 
 The owner assignment is target-scoped. It uses the existing active client leases and stable
-rendezvous balancing to spread targets across clients. The assignment is coordinated through the
-existing shared route metadata authority, using the same Embedded WRH authority/CAS and
-read-repair path as other shared control metadata. Redis is not a second owner database and is
-not read on the data path.
+rendezvous balancing to spread targets across clients. The target-set fingerprint is carried in
+the lease labels, so every client derives the same assignment from the shared lease view. No
+owner record is written to route metadata, and Redis is not a second owner database or a data-path
+dependency.
 
 Every client keeps a local executor handle for every statically configured NoF target. The owner
 does not proxy reads or payload writes. For provider-owned KVCS targets, the owner is used only
@@ -277,48 +277,36 @@ not proxy data I/O:
 
 ### Owner state transitions
 
-Every target-management request carries `(target_id, owner_runtime, owner_generation)`. The
-recipient accepts it only when the assignment is still `Active` and all three values match.
-Therefore a former owner cannot allocate, publish, delete, reclaim, or update health after a
-successful handoff.
-
-Initial assignment and crash takeover use a metadata CAS:
-
-```text
-missing -> Recovering -> Active
-Active(old owner) -> Recovering(new owner, generation + 1) -> Active
-```
-
-Only the client that wins the CAS enters recovery. If another client joins, the existing owner
-record remains unchanged.
+There is no persisted owner record or owner-generation CAS. The current owner is recomputed from
+the active compatible leases whenever the cached membership view changes. A client only performs
+owner-scoped work while the derived owner for that target is its own runtime. A client joining
+does not move an existing target unless the current owner drains or its lease expires.
 
 ### Graceful drain fast path
 
-Normal shutdown must not make the replacement owner rediscover the target from scratch. The
-outgoing owner follows the existing client `Draining` lifecycle:
+Normal shutdown first uses the existing client drain order to flush accepted offloads while the
+old owner is still present. Before withdrawing its NoF lease labels, the old owner:
 
-1. change the target assignment from `Active` to `Draining`;
-2. reject new target-management mutations and wait for accepted mutations to finish;
-3. fence and flush accepted executor writes;
-4. obtain one authoritative route snapshot filtered by `target_id`;
-5. select an eligible replacement and CAS the assignment to `Recovering` with a new generation;
-6. transfer the route snapshot, handoff ID, and generation fence to the replacement;
-7. let the replacement rebuild the executor allocator from that snapshot and CAS the assignment to
-   `Active`;
-8. publish the replacement's first health/capacity heartbeat.
+1. recomputes the current target assignment;
+2. selects the next compatible runtime using the same rendezvous rule, excluding itself;
+3. lists materialized `ObjectRoute` entries filtered by that target ID;
+4. sends the route snapshot to the successor through the control plane.
 
-The route snapshot is metadata only. It does not move payloads, change locators, or grant the new
-owner data-proxy rights. The replacement calls the same executor `recover` interface used by the
-slow path, but it does not enumerate the target route index again.
+The successor accepts the snapshot only for its own runtime and keeps it in process memory. When
+the lease view changes and the target becomes locally owned, managed ExtentStore recovery consumes
+that snapshot and calls the executor's existing `recover` interface. It does not enumerate the
+route index again. The snapshot is metadata only: it does not move payloads, change locators, or
+grant the successor data-proxy rights.
 
-If the replacement is unavailable, the snapshot transfer fails, or the old owner disappears, the
-replacement falls back to the normal target-scoped route lookup and recovery path. That slow path
-is the crash/re-online path, not the normal shutdown path.
+If there is no eligible successor, the transfer fails, the process crashes, or the target comes
+back online later, recovery falls back to the normal target-scoped route lookup. That is the
+crash/re-online path, not the normal shutdown fast path. The fast path is used only by
+Mooncake-managed ExtentStore targets; provider-owned KVCS targets do not have Mooncake route
+snapshots.
 
-The executor fence is local to the outgoing process: it waits for writes accepted by that
-executor, but it is not a cross-client data-plane lock. Route states (`PendingWrite`,
-`Materialized`, and `PendingDelete`), existing publication fences, and the allocator's reuse grace
-period protect against late writes from another client.
+The local drain waits for writes already accepted by the outgoing process. It is not a
+cross-client data-plane lock. Existing route states, publication ordering, and the executor's
+reuse grace period remain the protections against late writes.
 
 ### Heartbeat health
 
@@ -759,8 +747,7 @@ that path requires live EFC and Redis.
 
 ## Compatibility
 
-Managed NoF routes are new in this change. `ObjectRoute.nof_backing` uses a fresh protobuf field
-(15; field 14 stays reserved) and the metadata capability gate rejects NoF backing routes on
-backends built before this change. Clusters upgrading to this version must not carry NoF routes
-written by pre-release development builds: their `NofBackingRoute` field numbers differ and would
-decode as empty. Clear any experimental `nof_backing` routes before upgrading.
+Managed NoF routes are stored in `ObjectRoute.nof_backing` using protobuf field 15; field 14
+remains reserved. The metadata capability gate rejects managed NoF routes on backends that do not
+advertise NoF backing support. Existing routes without `nof_backing` continue to decode normally;
+a cluster must enable the backing-route capability before it writes managed NoF placement metadata.

@@ -351,6 +351,20 @@ impl pb::control_plane_service_server::ControlPlaneService for ClosingStreamServ
         self.inner.batch_reclaim_cold_backings(request).await
     }
 
+    async fn transfer_nof_owner_snapshot(
+        &self,
+        request: Request<pb::TransferNofOwnerSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::TransferNofOwnerSnapshotReply>, Status> {
+        self.inner.transfer_nof_owner_snapshot(request).await
+    }
+
+    async fn manage_nof_backing(
+        &self,
+        request: Request<pb::ManageNofBackingRequest>,
+    ) -> std::result::Result<Response<pb::ManageNofBackingReply>, Status> {
+        self.inner.manage_nof_backing(request).await
+    }
+
     async fn pin_for_read(
         &self,
         request: Request<pb::PinForReadRequest>,
@@ -641,6 +655,20 @@ impl pb::control_plane_service_server::ControlPlaneService for DelayedUnaryServi
         request: Request<pb::BatchReclaimColdBackingsRequest>,
     ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
         self.inner.batch_reclaim_cold_backings(request).await
+    }
+
+    async fn transfer_nof_owner_snapshot(
+        &self,
+        request: Request<pb::TransferNofOwnerSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::TransferNofOwnerSnapshotReply>, Status> {
+        self.inner.transfer_nof_owner_snapshot(request).await
+    }
+
+    async fn manage_nof_backing(
+        &self,
+        request: Request<pb::ManageNofBackingRequest>,
+    ) -> std::result::Result<Response<pb::ManageNofBackingReply>, Status> {
+        self.inner.manage_nof_backing(request).await
     }
 
     async fn pin_for_read(
@@ -934,6 +962,20 @@ impl pb::control_plane_service_server::ControlPlaneService for InvalidMigrationS
         request: Request<pb::BatchReclaimColdBackingsRequest>,
     ) -> std::result::Result<Response<pb::BatchReclaimColdBackingsReply>, Status> {
         self.inner.batch_reclaim_cold_backings(request).await
+    }
+
+    async fn transfer_nof_owner_snapshot(
+        &self,
+        request: Request<pb::TransferNofOwnerSnapshotRequest>,
+    ) -> std::result::Result<Response<pb::TransferNofOwnerSnapshotReply>, Status> {
+        self.inner.transfer_nof_owner_snapshot(request).await
+    }
+
+    async fn manage_nof_backing(
+        &self,
+        request: Request<pb::ManageNofBackingRequest>,
+    ) -> std::result::Result<Response<pb::ManageNofBackingReply>, Status> {
+        self.inner.manage_nof_backing(request).await
     }
 
     async fn pin_for_read(
