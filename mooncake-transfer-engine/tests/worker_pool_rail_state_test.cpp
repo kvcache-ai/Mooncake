@@ -34,6 +34,7 @@
 #include <glog/logging.h>
 
 #include "rdma_test_peers.h"
+#include "transfer_metadata_plugin.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #include "transport/rdma_transport/worker_pool.h"
@@ -108,6 +109,18 @@ class WorkerPoolTestPeer {
         pool.workers_running_.store(false);
         pool.cond_var_.notify_all();
         for (auto &entry : pool.worker_thread_) entry.join();
+    }
+
+    static void complete(WorkerPool &pool, Transport::Slice &slice,
+                         ibv_wc_status status) {
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(&slice);
+        wc.status = status;
+        pool.processCompletions(0, {wc});
+    }
+
+    static void completeBatch(WorkerPool &pool, const std::vector<ibv_wc> &wc) {
+        pool.processCompletions(0, wc);
     }
 
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
@@ -321,6 +334,188 @@ TEST_F(WorkerPoolRailStateTest,
 
     EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       ExhaustedRemoteFailureRefreshesNextP2PSubmission) {
+    // Drive the real completion and next-submission paths without a verbs
+    // device. Only the peer metadata exchange uses a loopback TCP daemon.
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    TransferMetadata server(P2PHANDSHAKE);
+    int fd = -1;
+    const auto port = findAvailableTcpPort(fd);
+    ASSERT_GT(port, 0);
+    const std::string name = "127.0.0.1:" + std::to_string(port);
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = name;
+    desc->protocol = "rdma";
+    desc->rdma_server_name = "192.0.2.1:12345";
+    desc->devices.push_back(
+        {"mlx5_remote", 1, "00000000000000000000ffff7f000001", ""});
+    TransferMetadata::BufferDesc buffer;
+    buffer.name = "cpu:0";
+    buffer.addr = 0x10000;
+    buffer.length = 4096;
+    buffer.rkey = {11};
+    buffer.lkey = {1};
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(desc->topology.parse(R"({"cpu:0": [["mlx5_remote"], []]})"), 0);
+    ASSERT_EQ(server.addLocalSegment(
+                  LOCAL_SEGMENT_ID, name,
+                  std::make_shared<TransferMetadata::SegmentDesc>(*desc)),
+              0);
+    ASSERT_EQ(metadata_->addLocalSegment(
+                  LOCAL_SEGMENT_ID, "client",
+                  std::make_shared<TransferMetadata::SegmentDesc>(*desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc;
+    rpc.ip_or_host_name = "127.0.0.1";
+    rpc.rpc_port = port;
+    rpc.sockfd = fd;
+    ASSERT_EQ(server.addRpcMetaEntry(name, rpc), 0);
+    const auto id = metadata_->getSegmentID(name);
+    auto cached = metadata_->getSegmentDescByID(id);
+    ASSERT_TRUE(cached);
+    ASSERT_EQ(cached->buffers[0].rkey[0], 11u);
+
+    ASSERT_EQ(server.removeLocalMemoryBuffer(
+                  reinterpret_cast<void *>(buffer.addr), false),
+              0);
+    buffer.rkey = {22};
+    ASSERT_EQ(server.addLocalMemoryBuffer(buffer, false), 0);
+    ASSERT_EQ(metadata_->getSegmentDescByID(id), cached);
+
+    Transport::TransferTask task;
+    task.batch_id = transport_->allocateBatchID(1);
+    Transport::Slice failed{};
+    failed.task = &task;
+    failed.target_id = id;
+    failed.peer_nic_path = MakeNicPath(desc->rdma_server_name, "mlx5_remote");
+    failed.rdma.dest_addr = buffer.addr;
+    failed.rdma.dest_rkey = 11;
+    failed.length = 64;
+    failed.rdma.max_retry_cnt = 1;
+    WorkerPoolTestPeer::complete(*worker_pool_, failed, IBV_WC_REM_ACCESS_ERR);
+    EXPECT_EQ(failed.status, Transport::Slice::FAILED);
+    EXPECT_EQ(failed.rdma.retry_cnt, 1);
+
+    Transport::Slice next{};
+    next.task = &task;
+    next.target_id = id;
+    next.rdma.dest_addr = buffer.addr;
+    next.length = 64;
+    ASSERT_EQ(worker_pool_->submitPostSend({&next}), 0);
+    EXPECT_NE(next.status, Transport::Slice::FAILED);
+    EXPECT_EQ(next.rdma.dest_rkey, 22u);
+    // Also keep the existing redispatch path working with the default budget.
+    ASSERT_EQ(server.removeLocalMemoryBuffer(
+                  reinterpret_cast<void *>(buffer.addr), false),
+              0);
+    buffer.rkey = {33};
+    ASSERT_EQ(server.addLocalMemoryBuffer(buffer, false), 0);
+    next.rdma.max_retry_cnt = globalConfig().retry_cnt;
+    ASSERT_GT(next.rdma.max_retry_cnt, 1);
+    WorkerPoolTestPeer::complete(*worker_pool_, next, IBV_WC_REM_ACCESS_ERR);
+    EXPECT_NE(next.status, Transport::Slice::FAILED);
+    EXPECT_EQ(next.rdma.retry_cnt, 1);
+    EXPECT_EQ(next.rdma.dest_rkey, 33u);
+
+    EXPECT_EQ(metadata_->getSegmentID(name), id);
+    ASSERT_EQ(metadata_->getRpcMetaEntry(desc->rdma_server_name, rpc), 0);
+    EXPECT_EQ(rpc.ip_or_host_name, "127.0.0.1");
+    EXPECT_EQ(rpc.rpc_port, port);
+    EXPECT_TRUE(transport_->freeBatchID(task.batch_id).ok());
+}
+
+class UnavailableMetadataStorage : public MetadataStoragePlugin {
+   public:
+    int reads = 0;
+    bool get(const std::string &, Json::Value &) override {
+        ++reads;
+        return false;
+    }
+    bool set(const std::string &, const Json::Value &) override { return true; }
+    bool remove(const std::string &) override { return true; }
+};
+
+class RailTestMetadata : public TransferMetadata {
+   public:
+    explicit RailTestMetadata(std::shared_ptr<MetadataStoragePlugin> plugin)
+        : TransferMetadata(std::move(plugin)) {}
+};
+
+TEST_F(WorkerPoolRailStateTest,
+       CompletionBurstDoesNotFetchMetadataForRailSelection) {
+    auto plugin = std::make_shared<UnavailableMetadataStorage>();
+    metadata_ = std::make_shared<RailTestMetadata>(plugin);
+    RdmaTransportTestPeer::bindMetadata(*transport_, metadata_,
+                                        "rail-state-test");
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    constexpr SegmentID id = 3561;
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "10.0.0.1";
+    desc->protocol = "rdma";
+    desc->devices = {{"mlx5_bond_0", 1, "", ""}, {"mlx5_bond_1", 1, "", ""}};
+    TransferMetadata::BufferDesc buffer;
+    buffer.addr = 0x10000;
+    buffer.length = 4096;
+    buffer.rkey = {11, 22};
+    desc->buffers.push_back(buffer);
+    ASSERT_EQ(metadata_->addLocalSegment(
+                  id, desc->name,
+                  std::make_shared<TransferMetadata::SegmentDesc>(*desc)),
+              0);
+    Transport::TransferTask task;
+    task.batch_id = transport_->allocateBatchID(1);
+    Transport::Slice slices[2]{};
+    std::vector<ibv_wc> completions;
+    for (auto &slice : slices) {
+        slice.task = &task;
+        slice.target_id = id;
+        slice.peer_nic_path = kPeerA;
+        slice.rdma.dest_addr = buffer.addr;
+        slice.length = 64;
+        slice.rdma.max_retry_cnt = 1;
+        ibv_wc wc{};
+        wc.wr_id = reinterpret_cast<uint64_t>(&slice);
+        wc.status = IBV_WC_RETRY_EXC_ERR;
+        completions.push_back(wc);
+    }
+    WorkerPoolTestPeer::completeBatch(*worker_pool_, completions);
+    EXPECT_EQ(plugin->reads, 0);
+    EXPECT_TRUE(railAvailable(kPeerB));
+    EXPECT_EQ(task.failed_slice_count, 2);
+    // The burst leaves one peer-scoped request, consumed at transfer lookup.
+    EXPECT_EQ(metadata_->getSegmentDescForTransfer(id), nullptr);
+    EXPECT_EQ(plugin->reads, 1);
+    EXPECT_TRUE(transport_->freeBatchID(task.batch_id).ok());
+}
+
+TEST_F(WorkerPoolRailStateTest,
+       ExhaustedLocalAndFlushErrorsKeepRemoteMetadata) {
+    WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
+    constexpr SegmentID id = 3560;
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = "peer";
+    desc->protocol = "rdma";
+    ASSERT_EQ(
+        metadata_->addLocalSegment(
+            id, "peer", std::make_shared<TransferMetadata::SegmentDesc>(*desc)),
+        0);
+    auto cached = metadata_->getSegmentDescByID(id);
+    Transport::TransferTask task;
+    task.batch_id = transport_->allocateBatchID(1);
+    for (auto status : {IBV_WC_WR_FLUSH_ERR, IBV_WC_LOC_LEN_ERR}) {
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.target_id = id;
+        slice.peer_nic_path = kPeerA;
+        slice.rdma.max_retry_cnt = 1;
+        WorkerPoolTestPeer::complete(*worker_pool_, slice, status);
+        EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+        EXPECT_EQ(metadata_->getSegmentDescByID(id), cached);
+    }
+    EXPECT_TRUE(transport_->freeBatchID(task.batch_id).ok());
 }
 
 TEST_F(WorkerPoolRailStateTest, LocalFailuresTripContextAtThreshold) {
