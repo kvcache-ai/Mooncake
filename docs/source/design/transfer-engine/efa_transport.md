@@ -596,6 +596,8 @@ Measured with the recommended shape from [Benchmarking](#neuron-benchmarking) (1
 | All NICs (`--nic_priority_matrix` overriding the default) | 23.48 GB/s | 0.22 GB/s |
 | Ratio | 11.4× | 376× |
 
+A custom `--nic_priority_matrix` **replaces** this mapping rather than adding to it, so it has to key on `neuron:<N>`: a matrix carrying only `cpu:*` / `cuda:*` entries leaves every Neuron buffer with no preferred NIC, which is the second row of the table above. (It also restricts the transport to the NICs it names, which is how that row was measured.)
+
 trn1 is the more sensitive of the two because its groups are two NUMA nodes apart rather than one switch apart, and NIC enumeration lists the far-NUMA NICs first, so an unguided device picks a cross-NUMA NIC by default. When Mooncake cannot build the mapping at all it logs *"could not group any EFA NIC by its parent PCI bus"* or *"no device could be matched to an EFA NIC"* at `WARNING`, and throughput lands in the same 0.2 GB/s range.
 
 The affinity is also verifiable from outside the benchmark, using the NIC hardware counters under `/sys/class/infiniband/<dev>/ports/1/hw_counters/tx_bytes`. On trn2 a single-device run (`--neuron_device_count=1`) moves 19.27 GB/s and every byte of it appears on exactly two NICs — the two behind that device's switch — with the other fourteen flat at zero. The same counters also confirm the reported aggregate: a full-instance run reads 279.5 GB/s summed across all 16 NICs against 278.97 GB/s self-reported.

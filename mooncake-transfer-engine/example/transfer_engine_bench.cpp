@@ -815,12 +815,18 @@ std::string formatDeviceNames(const std::string& device_names) {
 std::string loadNicPriorityMatrix() {
     if (!FLAGS_nic_priority_matrix.empty()) {
         std::ifstream file(FLAGS_nic_priority_matrix);
-        if (file.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(file)),
-                                std::istreambuf_iterator<char>());
-            file.close();
-            return content;
+        // Falling through to the fabricated matrix below on a typo would be
+        // silent and wrong: that matrix names --device_name (mlx5_2 by
+        // default), which exists on no Trainium host, so the run comes up with
+        // no usable NIC instead of with the ones the file asked for.
+        if (!file.is_open()) {
+            LOG(FATAL) << "Cannot open --nic_priority_matrix="
+                       << FLAGS_nic_priority_matrix;
         }
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+        return content;
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
@@ -868,7 +874,11 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         if (FLAGS_nic_priority_matrix.empty()) {
             engine->getLocalTopology()->discover({});
         } else {
-            engine->getLocalTopology()->parse(loadNicPriorityMatrix());
+            int rc = engine->getLocalTopology()->parse(loadNicPriorityMatrix());
+            if (rc) {
+                LOG(FATAL) << "Cannot parse --nic_priority_matrix="
+                           << FLAGS_nic_priority_matrix << ", rc " << rc;
+            }
         }
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
@@ -1213,6 +1223,17 @@ void check_total_buffer_size() {
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     check_total_buffer_size();
+
+#ifdef USE_EFA
+    // Only the EFA transport can register Neuron HBM.  Any other protocol
+    // would take these buffers down a host path -- and since they are
+    // registered under the wildcard location, nothing downstream would stop
+    // preTouchMemory() from writing to device memory from the CPU.
+    if (FLAGS_neuron_device >= 0 && FLAGS_protocol != "efa") {
+        LOG(FATAL) << "--neuron_device requires --protocol=efa, got --protocol="
+                   << FLAGS_protocol;
+    }
+#endif
 
 #if defined(USE_UBSHMEM)
     if (FLAGS_gpu_id != -1) {
