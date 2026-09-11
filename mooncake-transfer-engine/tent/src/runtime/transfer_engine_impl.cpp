@@ -1338,6 +1338,7 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (type == "npu") return MTYPE_CUDA;
     if (isAmdGpuLocationType(type)) return MTYPE_ROCM;
     if (type == "tpu") return MTYPE_TPU;
+    if (type == "xpu") return MTYPE_XPU;
     return MTYPE_UNKNOWN;
 }
 
