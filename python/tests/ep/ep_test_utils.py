@@ -28,7 +28,10 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
 
-    group = dist.new_group(list(range(num_local_ranks * num_nodes)))
+    group_backend = os.getenv("MOONCAKE_EP_TEST_GROUP_BACKEND")
+    group = dist.new_group(
+        list(range(num_local_ranks * num_nodes)), backend=group_backend
+    )
     return dist.get_rank(), dist.get_world_size(), group
 
 
