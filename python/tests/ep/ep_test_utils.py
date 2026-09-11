@@ -20,7 +20,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend="mooncake",
+        backend=os.getenv("MOONCAKE_EP_TEST_BACKEND", "mooncake"),
         init_method=f"tcp://{ip}:{port}",
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank,
