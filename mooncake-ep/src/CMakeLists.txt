@@ -91,8 +91,9 @@ elseif(USE_MUSA)
     list(APPEND MOONCAKE_EP_SOURCES "${_ep_device_object}")
   endforeach()
 elseif(USE_MACA)
-  # MACA device kernels are compiled by mxcc outside CMake's CUDA language
-  # support, matching the PG device-worker build path.
+  # MACA legacy EP kernels use the SDK cu-bridge nvcc front-end. mxcc is used
+  # for the PG worker, but does not provide CUDA compatibility headers such as
+  # cooperative_groups.h required by these translation units.
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
   if(DEFINED MACA_ROOT AND NOT "${MACA_ROOT}" STREQUAL "")
     set(_ep_maca_root "${MACA_ROOT}")
@@ -101,10 +102,10 @@ elseif(USE_MACA)
   else()
     set(_ep_maca_root /opt/maca)
   endif()
-  find_program(_ep_maca_compiler NAMES mxcc
-               HINTS "${_ep_maca_root}/bin" "${_ep_maca_root}/mxgpu_llvm/bin")
+  find_program(_ep_maca_compiler NAMES nvcc
+               HINTS "${_ep_maca_root}/tools/cu-bridge/bin")
   if(NOT _ep_maca_compiler)
-    message(FATAL_ERROR "USE_MACA=ON requires the MACA compiler (mxcc)")
+    message(FATAL_ERROR "USE_MACA=ON requires the MACA cu-bridge compiler (nvcc)")
   endif()
   foreach(_ep_device_source IN LISTS MOONCAKE_EP_DEVICE_SOURCES)
     get_filename_component(_ep_device_name "${_ep_device_source}" NAME_WE)
@@ -113,10 +114,12 @@ elseif(USE_MACA)
     add_custom_command(
       OUTPUT "${_ep_device_object}"
       COMMAND "${_ep_maca_compiler}"
-              -std=c++20 -O3 -fPIC
+              -std=c++17 -O3 -Xcompiler=-fPIC
               -DUSE_MACA -DMOONCAKE_EP_USE_MACA=1
+              -include cuda_bf16.h
               "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
               "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
+              "-I${_ep_maca_root}/tools/cu-bridge/include"
               -c "${_ep_device_source}" -o "${_ep_device_object}"
       DEPENDS "${_ep_device_source}"
       COMMENT "Compiling Mooncake EP MACA device source ${_ep_device_name}"
