@@ -49,11 +49,13 @@ int LocalCopyEngine::Initialize(int32_t transfer_timeout) {
 void LocalCopyEngine::Finalize() {
     std::lock_guard<std::mutex> lock(streams_mu_);
     aclrtContext saved_ctx = nullptr;
-    const bool have_saved =
-        (aclrtGetCurrentContext(&saved_ctx) == ACL_ERROR_NONE &&
-         saved_ctx != nullptr);
-    MAKE_GUARD(ctx_restore, [have_saved, saved_ctx]() {
-        if (have_saved) {
+    if (aclrtGetCurrentContext(&saved_ctx) != ACL_ERROR_NONE) {
+        saved_ctx = nullptr;
+    }
+    // Capture only saved_ctx: MAKE_GUARD is a 2-arg macro, so a
+    // multi-capture lambda would be split on the comma in [].
+    MAKE_GUARD(ctx_restore, [saved_ctx]() {
+        if (saved_ctx != nullptr) {
             (void)aclrtSetCurrentContext(saved_ctx);
         }
     });
