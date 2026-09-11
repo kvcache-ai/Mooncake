@@ -2799,6 +2799,108 @@ TEST_F(RealClientTest, BatchGetBufferHealsDanglingLocalDiskReplica) {
     EXPECT_TRUE(py_client_->get_replica_desc(key).empty());
 }
 
+// fcczzz's counterexample on #3889: two disk-only keys in separate bucket
+// files on one owner, only A's file wiped. A failed batch must heal A while
+// leaving the healthy B alone — the probe used to answer "gone" for B too,
+// because it asked the raw object key against tenant-scoped storage keys and
+// never checked the physical file.
+TEST_F(RealClientTest, BatchGetBufferWipedSiblingPreservesHealthyReplica) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_mixed_heal_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kSize = 64 * 1024;
+    std::vector<char> source(kSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>((i * 31 + 7) & 0xFF);
+    }
+    const std::string key_a = "mixed_heal_missing";
+    const std::string key_b = "mixed_heal_healthy";
+    ASSERT_EQ(py_client_->put(key_a, source), 0);
+
+    auto wait_disk_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (std::chrono::steady_clock::now() < deadline) {
+            for (const auto& replica : py_client_->get_replica_desc(k)) {
+                if (replica.is_local_disk_replica()) {
+                    return true;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        return false;
+    };
+    auto clear_memory_replica = [&](const std::string& k) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (py_client_->batch_replica_clear({k}, "localhost:17813")
+                    .size() == 1) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    };
+    ASSERT_TRUE(wait_disk_replica(key_a));
+    ASSERT_TRUE(clear_memory_replica(key_a));
+
+    // Everything in the offload dir right now belongs to A's bucket. B gets
+    // its own bucket file later, so this snapshot is how we wipe only A.
+    std::vector<std::filesystem::path> files_a;
+    for (const auto& entry : std::filesystem::directory_iterator(ssd_path_)) {
+        files_a.push_back(entry.path());
+    }
+    ASSERT_FALSE(files_a.empty());
+
+    ASSERT_EQ(py_client_->put(key_b, source), 0);
+    ASSERT_TRUE(wait_disk_replica(key_b));
+    ASSERT_TRUE(clear_memory_replica(key_b));
+
+    // Both disk-only reads work before the wipe, so the later failure comes
+    // from the missing file, not from a setup mistake.
+    auto before = py_client_->batch_get_buffer({key_a, key_b});
+    ASSERT_EQ(before.size(), 2u);
+    ASSERT_NE(before[0], nullptr);
+    ASSERT_NE(before[1], nullptr);
+
+    std::error_code ec;
+    for (const auto& file : files_a) {
+        std::filesystem::remove_all(file, ec);
+        ASSERT_FALSE(ec) << ec.message();
+    }
+
+    auto after = py_client_->batch_get_buffer({key_a, key_b});
+    ASSERT_EQ(after.size(), 2u);
+    // A's backing file is proven gone: its replica is evicted and the read
+    // surfaces a real miss.
+    EXPECT_EQ(after[0], nullptr);
+    EXPECT_TRUE(py_client_->get_replica_desc(key_a).empty());
+    // B's file is byte-for-byte intact: no eviction, and the read must still
+    // return its data.
+    ASSERT_NE(after[1], nullptr);
+    EXPECT_EQ(py_client_->get_replica_desc(key_b).size(), 1u);
+}
+
 }  // namespace testing
 
 }  // namespace mooncake

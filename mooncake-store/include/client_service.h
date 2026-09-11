@@ -759,14 +759,31 @@ class Client {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    // What the dangling-replica probe established for one key. The Put path
+    // retries only on kEvicted; the batch-get path also retries on kPresent,
+    // because a batch read dies wholesale and a healthy key swept in by a
+    // sibling's wiped file must be re-read, not just left unevicted.
+    enum class DiskReplicaHealResult {
+        // Not a lone client-owned LOCAL_DISK replica; nothing to heal.
+        kNotDangling,
+        // The probe could not answer (transport/config trouble); leave
+        // everything as it was.
+        kUnknown,
+        // The backing file provably exists; nothing was evicted.
+        kPresent,
+        // The backing file is proven gone and the dangling replica was
+        // evicted, so the operation can be retried.
+        kEvicted,
+    };
+
     // When PutStart reports OBJECT_ALREADY_EXISTS, check whether every
     // completed replica is a LOCAL_DISK replica owned by this client, and ask
     // the installed probe (FileStorage::Exists over the offload files) whether
     // the backing file is gone (issue #3709). Only then evict the dangling
     // replica so the Put can be retried; any other outcome keeps the old
     // idempotent path. The batch-get path uses the same heal after a failed
-    // SSD read (#3884). Returns true only when a replica was actually evicted.
-    bool healDanglingLocalDiskReplica(const ObjectKey& key);
+    // SSD read (#3884).
+    DiskReplicaHealResult healDanglingLocalDiskReplica(const ObjectKey& key);
 
    protected:
     /**
