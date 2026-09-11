@@ -195,6 +195,8 @@ add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
 add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
+add_store_test(client_auto_discovery_config_test
+               client_auto_discovery_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
