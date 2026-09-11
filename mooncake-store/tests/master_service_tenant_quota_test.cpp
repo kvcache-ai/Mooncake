@@ -257,6 +257,13 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             *tenant_handle, std::chrono::system_clock::time_point::max());
     }
 
+    std::shared_ptr<mooncake::metadata::ObjectEntry> GetEntryForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        auto tenant_handle = service.catalog_.Lookup(tenant_id);
+        return tenant_handle ? tenant_handle->Get(key) : nullptr;
+    }
+
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
@@ -1221,6 +1228,55 @@ TEST_F(MasterServiceTenantQuotaTest,
                     .Remove("orphan-key", TenantId("tenant-b"),
                             /*force=*/true)
                     .has_value());
+}
+
+// Regression: a tenant-scoped RemoveAll holds the snapshot barrier only
+// shared, so clearing one tenant must not pause point operations of another.
+TEST_F(MasterServiceTenantQuotaTest, TenantRemoveAllDoesNotBlockOtherTenants) {
+    const std::string policy =
+        WritePolicyFile({{TenantId("tenant-a"), 100000},
+                         {TenantId("tenant-b"), 100000}});
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(policy)
+                      .build();
+    MasterService service(config);
+    UUID client = MountSegment(service, 4096, "rmall_segment");
+    auto put = [&](const std::string& key, const TenantId& tenant) {
+        auto started = service.PutStart(client, key, tenant, 64, MemoryConfig());
+        if (!started.has_value()) {
+            return false;
+        }
+        return service
+            .PutEnd(client, key, tenant, ReplicaType::MEMORY)
+            .has_value();
+    };
+    ASSERT_TRUE(put("a-1", TenantId("tenant-a")));
+    ASSERT_TRUE(put("b-1", TenantId("tenant-b")));
+
+    // Pause tenant A's cleanup inside the scan: hold its entry lock so
+    // RemoveAll blocks on the first object it tries to tear down.
+    auto gate_entry = GetEntryForTest(service, TenantId("tenant-a"), "a-1");
+    ASSERT_TRUE(gate_entry != nullptr);
+    auto gate = gate_entry->LockUnique();
+
+    std::thread remover(
+        [&] { (void)service.RemoveAll(TenantId("tenant-a"), /*force=*/true); });
+
+    // While A's cleanup is parked on the gate, a point write against tenant
+    // B must still complete.
+    std::atomic<bool> written{false};
+    auto writer = std::async(std::launch::async, [&] {
+        written = put("b-2", TenantId("tenant-b"));
+    });
+    EXPECT_EQ(writer.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::ready);
+    writer.get();
+    EXPECT_TRUE(written);
+
+    gate.unlock();
+    remover.join();
 }
 
 }  // namespace mooncake::test
