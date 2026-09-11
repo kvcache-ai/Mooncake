@@ -17,6 +17,7 @@
 #include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
+#include "weight_management.h"
 #include "master_metric_manager.h"
 #include "store_rpc_client_io_context.h"
 #include "task_manager.h"
@@ -668,6 +669,18 @@ class MasterClient {
     BatchEvictDiskReplica(const std::vector<std::string>& keys,
                           const std::string& tenant_id,
                           ReplicaType replica_type);
+
+    // RFC #4017 PR1
+    [[nodiscard]] tl::expected<BeginWeightImportResponse, ErrorCode>
+    BeginWeightImport(const BeginWeightImportRequest& request);
+    [[nodiscard]] tl::expected<CommitWeightImportResponse, ErrorCode>
+    CommitWeightImport(const CommitWeightImportRequest& request);
+    [[nodiscard]] tl::expected<GetWeightMetadataResponse, ErrorCode>
+    GetWeightMetadata(const GetWeightMetadataRequest& request);
+    [[nodiscard]] tl::expected<ListWeightRevisionsResponse, ErrorCode>
+    ListWeightRevisions(const ListWeightRevisionsRequest& request);
+    [[nodiscard]] tl::expected<UpdateWeightPolicyResponse, ErrorCode>
+    UpdateWeightPolicy(const UpdateWeightPolicyRequest& request);
 
    private:
     /**

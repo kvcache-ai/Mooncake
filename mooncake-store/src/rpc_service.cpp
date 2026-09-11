@@ -1716,6 +1716,35 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
     return master_service_.GetKvEventStats();
 }
 
+tl::expected<BeginWeightImportResponse, ErrorCode>
+WrappedMasterService::BeginWeightImport(
+    const BeginWeightImportRequest& request) {
+    return master_service_.BeginWeightImport(request);
+}
+
+tl::expected<CommitWeightImportResponse, ErrorCode>
+WrappedMasterService::CommitWeightImport(
+    const CommitWeightImportRequest& request) {
+    return master_service_.CommitWeightImport(request);
+}
+
+tl::expected<GetWeightMetadataResponse, ErrorCode>
+WrappedMasterService::GetWeightMetadata(
+    const GetWeightMetadataRequest& request) {
+    return master_service_.GetWeightMetadata(request);
+}
+
+ListWeightRevisionsResponse WrappedMasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) {
+    return master_service_.ListWeightRevisions(request);
+}
+
+tl::expected<UpdateWeightPolicyResponse, ErrorCode>
+WrappedMasterService::UpdateWeightPolicy(
+    const UpdateWeightPolicyRequest& request) {
+    return master_service_.UpdateWeightPolicy(request);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
@@ -1874,6 +1903,16 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BeginWeightImport>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CommitWeightImport>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetWeightMetadata>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::ListWeightRevisions>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::UpdateWeightPolicy>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

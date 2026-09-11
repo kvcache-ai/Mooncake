@@ -198,6 +198,9 @@ add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
 add_store_test(object_data_type_test object_data_type_test.cpp)
+add_store_test(weight_metadata_store_test weight_metadata_store_test.cpp)
+add_store_test(master_service_weight_import_test
+               master_service_weight_import_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test ha/leadership/high_availability_test.cpp)

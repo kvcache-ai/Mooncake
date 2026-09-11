@@ -79,7 +79,11 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
         {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
         {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
-        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"},
+        {ErrorCode::WEIGHT_NOT_FOUND, "WEIGHT_NOT_FOUND"},
+        {ErrorCode::WEIGHT_NOT_READY, "WEIGHT_NOT_READY"},
+        {ErrorCode::WEIGHT_STALE_GENERATION, "WEIGHT_STALE_GENERATION"},
+        {ErrorCode::WEIGHT_CONFLICT, "WEIGHT_CONFLICT"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";
