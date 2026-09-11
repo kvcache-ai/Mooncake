@@ -487,9 +487,17 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
                 }
             }
         }
-    } else {
+    } else if (config.dfs_replica_num > 0 &&
+               master_service_.UsesDfsBucketAllocator()) {
         results = master_service_.BatchPutStart(
             client_id, keys, resolved_tenant_id.value(), slice_lengths, config);
+    } else {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto key_config = config.ForSingleKey(i);
+            results.emplace_back(master_service_.PutStart(
+                client_id, keys[i], resolved_tenant_id.value(),
+                slice_lengths[i], key_config));
+        }
     }
 
     size_t failure_count = 0;

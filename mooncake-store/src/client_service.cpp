@@ -3023,6 +3023,9 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
     std::vector<size_t> op_indices;
+    const bool bucket_mode =
+        dfs_storage_backend_ != nullptr &&
+        dfs_storage_backend_->GetAllocatorType() == DfsAllocatorType::BUCKET;
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
@@ -3031,7 +3034,8 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops, bool is_upsert,
             !NonDfsTransfersSucceeded(op.transfer_summary)) {
             continue;
         }
-        if (!HasExpectedReplicaAllocation(op.ToReplicateConfig(),
+        if (bucket_mode &&
+            !HasExpectedReplicaAllocation(op.ToReplicateConfig(),
                                           op.transfer_summary)) {
             continue;
         }
