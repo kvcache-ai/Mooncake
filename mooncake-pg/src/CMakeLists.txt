@@ -60,10 +60,9 @@ elseif(USE_MUSA OR USE_MACA)
                                   --cuda-gpu-arch=mp_31)
   elseif(USE_MACA)
     set(_pg_platform_name MACA)
-    set(_pg_device_compiler_name mxcc)
-    set(_pg_device_compiler_hint "${MACA_ROOT}/bin"
-        "${MACA_ROOT}/mxgpu_llvm/bin")
-    set(_pg_platform_device_flags --compiler-options=-fPIC)
+    set(_pg_device_compiler_name nvcc)
+    set(_pg_device_compiler_hint "${MACA_ROOT}/tools/cu-bridge/bin")
+    set(_pg_platform_device_flags -Xcompiler=-fPIC -include cuda_bf16.h)
   endif()
 
   find_program(
