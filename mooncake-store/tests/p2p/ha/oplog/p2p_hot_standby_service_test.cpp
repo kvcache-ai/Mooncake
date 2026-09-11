@@ -782,8 +782,8 @@ TEST_F(P2PHotStandbyServiceTest, RestorePromotedMetadataIntoWrappedRuntime) {
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
-    auto replica_result =
-        promoted_runtime.GetReplicaListInternal("runtime-key");
+    auto replica_result = promoted_runtime.GetReadRoute(
+        P2PGetReadRouteRequest{.key = "runtime-key"});
     ASSERT_TRUE(replica_result.has_value()) << toString(replica_result.error());
     ASSERT_EQ(replica_result.value().size(), 1);
 
@@ -832,8 +832,8 @@ TEST_F(P2PHotStandbyServiceTest, PromotedRuntimeContinuesP2PMasterFlow) {
                   standby.ExportMetadata(), promoted_sequence_id),
               ErrorCode::OK);
 
-    auto restored_replica =
-        promoted_runtime.GetReplicaListInternal("flow-key-before-promotion");
+    auto restored_replica = promoted_runtime.GetReadRoute(
+        P2PGetReadRouteRequest{.key = "flow-key-before-promotion"});
     ASSERT_TRUE(restored_replica.has_value())
         << toString(restored_replica.error());
     ASSERT_EQ(restored_replica.value().size(), 1);
@@ -858,7 +858,8 @@ TEST_F(P2PHotStandbyServiceTest, PromotedRuntimeContinuesP2PMasterFlow) {
     add_req.object_size = route_req.object_size;
     ASSERT_TRUE(promoted_runtime.PublishRoute(add_req).has_value());
 
-    auto added_replica = promoted_runtime.GetReplicaListInternal(route_req.key);
+    auto added_replica = promoted_runtime.GetReadRoute(
+        P2PGetReadRouteRequest{.key = route_req.key});
     ASSERT_TRUE(added_replica.has_value()) << toString(added_replica.error());
     ASSERT_EQ(added_replica.value().size(), 1);
     const auto& p2p_desc = added_replica.value()[0];
