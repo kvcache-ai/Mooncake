@@ -90,6 +90,40 @@ elseif(USE_MUSA)
                                 PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
     list(APPEND MOONCAKE_EP_SOURCES "${_ep_device_object}")
   endforeach()
+elseif(USE_MACA)
+  # MACA device kernels are compiled by mxcc outside CMake's CUDA language
+  # support, matching the PG device-worker build path.
+  set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
+  if(DEFINED MACA_ROOT AND NOT "${MACA_ROOT}" STREQUAL "")
+    set(_ep_maca_root "${MACA_ROOT}")
+  elseif(DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
+    set(_ep_maca_root "$ENV{MACA_HOME}")
+  else()
+    set(_ep_maca_root /opt/maca)
+  endif()
+  find_program(_ep_maca_compiler NAMES mxcc HINTS "${_ep_maca_root}/bin")
+  if(NOT _ep_maca_compiler)
+    message(FATAL_ERROR "USE_MACA=ON requires the MACA compiler (mxcc)")
+  endif()
+  foreach(_ep_device_source IN LISTS MOONCAKE_EP_DEVICE_SOURCES)
+    get_filename_component(_ep_device_name "${_ep_device_source}" NAME_WE)
+    set(_ep_device_object
+        "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_maca.o")
+    add_custom_command(
+      OUTPUT "${_ep_device_object}"
+      COMMAND "${_ep_maca_compiler}"
+              -std=c++20 -O3 -fPIC
+              -DUSE_MACA -DMOONCAKE_EP_USE_MACA=1
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
+              "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
+              -c "${_ep_device_source}" -o "${_ep_device_object}"
+      DEPENDS "${_ep_device_source}"
+      COMMENT "Compiling Mooncake EP MACA device source ${_ep_device_name}"
+      VERBATIM)
+    set_source_files_properties("${_ep_device_object}"
+                                PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+    list(APPEND MOONCAKE_EP_SOURCES "${_ep_device_object}")
+  endforeach()
 else()
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
 endif()
@@ -124,4 +158,10 @@ if(USE_CUDA)
 elseif(USE_MUSA)
   set_target_properties(_ep PROPERTIES LINKER_LANGUAGE CXX)
   target_link_libraries(_ep PRIVATE musa musart rt)
+elseif(USE_MACA)
+  set_target_properties(_ep PROPERTIES LINKER_LANGUAGE CXX)
+  if(NOT DEFINED MACA_RUNTIME_LIBS)
+    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
+  endif()
+  target_link_libraries(_ep PRIVATE ${MACA_RUNTIME_LIBS})
 endif()
