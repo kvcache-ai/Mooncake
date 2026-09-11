@@ -129,9 +129,8 @@ class MetadataScanBench;
  * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
- * The per-object lock is never held together with the object route lock
- * (metadata::TenantCatalog::object_index): acquire one at a time, releasing
- * before the route mutation. Strict tenant admission and policy mutation paths
+ * Lock order with the object route lock: entry → route is allowed (create
+ * holds the entry lock across InsertObject); route → entry is forbidden. Strict tenant admission and policy mutation paths
  * that need both tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire
  * the tenant policy mutex first, then snapshot_mutex_.
  * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
@@ -1197,8 +1196,7 @@ class MasterService {
     // per-object lock; each member is re-looked-up and re-validated under its
     // own `ObjectEntry::mutex`, which is released before the member is erased.
     // Because all members live in one tenant container, there is no cross-shard
-    // lock ordering to worry about — the only ordering invariant is that
-    // `entry->mutex` and `route_lock_` are never held together.
+    // lock ordering to worry about; entry → route is the only allowed nesting.
     //
     // Each member is re-looked-up and re-validated under its own lock (lease,
     // hard/soft pin, evictable replica — all against `now`) because state may
@@ -1241,7 +1239,9 @@ class MasterService {
     // under it. Claims teardown under that lock (no-op when already torn
     // down), releases the lock and performs the identity-checked route
     // mutation. Takes ownership of the lock.
-    void EraseMetadataLocked(
+    // Returns true when this call claimed the teardown; false when the entry
+    // was already torn down (the caller must not count the erase).
+    bool EraseMetadataLocked(
         metadata::TenantCatalog& tenant_state,
         const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
         const TenantId& tenant_id,
@@ -1281,9 +1281,11 @@ class MasterService {
         const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
         const std::vector<std::string>& previous_media_hint = {});
-    void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
-                                           QuotaEraseMode quota_mode);
+    void FinalizeMetadataEraseAfterDurable(
+        std::shared_ptr<metadata::ObjectEntry> entry, const TenantId& tenant_id,
+        QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
+        std::shared_ptr<metadata::ObjectEntry> entry,
         const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
     void FinalizeExpiredReplicationTaskAfterDurable(
@@ -1690,6 +1692,12 @@ class MasterService {
                     throw std::logic_error(
                         "Create(): winner entry disappeared after failed "
                         "insert");
+                }
+                if (entry_->is_torn_down) {
+                    // The key is gone; leave the accessor empty so callers
+                    // observe !Exists().
+                    entry_.reset();
+                    return;
                 }
                 lock_ = entry_->LockUnique();
                 return;

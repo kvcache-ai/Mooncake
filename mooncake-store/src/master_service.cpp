@@ -2036,26 +2036,35 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 }
 
 void MasterService::FinalizeMetadataEraseAfterDurable(
-    const OpLogEntry& durable_entry, QuotaEraseMode quota_mode) {
+    std::shared_ptr<metadata::ObjectEntry> entry, const TenantId& tenant_id,
+    QuotaEraseMode quota_mode) {
+    // Act on the pinned entry only: a same-key recreate between append and
+    // durable must not be erased.
+    if (entry == nullptr || entry->is_torn_down) {
+        return;
+    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const TenantId tenant_id(durable_entry.tenant_id);
     auto tenant_handle = catalog_.Lookup(tenant_id);
     if (!tenant_handle) {
         return;
     }
     auto& tenant_state = *tenant_handle;
-    EraseMetadata(tenant_state, tenant_state.Get(durable_entry.object_key),
-                  tenant_id, quota_mode, &tenant_state);
+    EraseMetadata(tenant_state, std::move(entry), tenant_id, quota_mode,
+                  &tenant_state);
 }
 
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
-    const OpLogEntry& durable_entry,
+    std::shared_ptr<metadata::ObjectEntry> entry, const OpLogEntry& durable_entry,
     const std::chrono::system_clock::time_point& ttl) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     MetadataAccessorRW accessor(this, MakeObjectIdentityForRequest(
                                           durable_entry.object_key, tenant_id));
     if (!accessor.Exists()) {
+        return;
+    }
+    // Identity gate: never pop a same-key recreate's replicas.
+    if (accessor.GetEntry() != entry) {
         return;
     }
 
@@ -2358,7 +2367,7 @@ bool MasterService::TearDownEntryLocked(
     return had_completed_disk;
 }
 
-void MasterService::EraseMetadataLocked(
+bool MasterService::EraseMetadataLocked(
     metadata::TenantCatalog& tenant_state,
     const std::shared_ptr<mooncake::metadata::ObjectEntry>& entry,
     const TenantId& tenant_id, std::unique_lock<std::shared_mutex> object_lock,
@@ -2369,16 +2378,18 @@ void MasterService::EraseMetadataLocked(
     // otherwise run the whole teardown again and double-release refcounts,
     // quota charges and KV removal events. The metadata stays wired (only
     // the flag flips), so readers holding a pin never observe null metadata.
+    // Returns false when the claim was already held (the caller must not
+    // count the erase).
     if (entry->is_torn_down) {
-        return;
+        return false;
     }
     entry->is_torn_down = true;
     const std::string key = entry->key();
     const std::string group_id = entry->group_id();
     bool had_completed_disk = TearDownEntryLocked(
         tenant_state, *entry, tenant_id, quota_mode, previous_media_hint);
-    // Release the object lock BEFORE the route mutation, so the route erase
-    // (EraseObjectIf, route_lock_ unique) never runs under an entry lock.
+    // Release before the route mutation to keep the entry's critical section
+    // small (entry → route nesting would also be legal).
     object_lock.unlock();
     // Only erase the route slot if it still points at the entry we tore down;
     // a concurrent remove + re-create may have published a replacement under
@@ -2388,6 +2399,7 @@ void MasterService::EraseMetadataLocked(
         tenant_accessor->OnDiskReplicaRemoved(had_completed_disk);
     }
     tenant_state.UnregisterGroupMember(key, group_id);
+    return true;
 }
 
 // EraseMetadata deletes the object metadata and also cleans up all
@@ -2690,9 +2702,9 @@ tl::expected<void, ErrorCode> MasterService::ClearStaleHandles(
                     if (enable_oplog_) {
                         auto persist_result = AppendOpLogWithDurableFinalize(
                             OpType::REMOVE, tenant_id.value(), key, {},
-                            [this](const OpLogEntry& durable_entry) {
+                            [this, entry, tenant_id](const OpLogEntry&) {
                                 FinalizeMetadataEraseAfterDurable(
-                                    durable_entry, QuotaEraseMode::kFull);
+                                    entry, tenant_id, QuotaEraseMode::kFull);
                             });
                         if (!persist_result) {
                             LOG(WARNING)
@@ -3123,6 +3135,11 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             continue;
         }
         auto entry_lock = entry->LockShared();
+        // Torn-down entries are logically gone (durable REMOVE pending).
+        if (entry->is_torn_down) {
+            results[i] = false;
+            continue;
+        }
         const ObjectMetadata& metadata = entry->metadata();
         if (!metadata.IsValid() || !HasReadableReplica(metadata)) {
             results[i] = false;
@@ -3146,8 +3163,11 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             // Collect-then-process (route released); lock per-object while
-            // reading.
+            // reading. Torn-down entries must not surface.
             auto entry_lock = entry->LockShared();
+            if (entry->is_torn_down) {
+                continue;
+            }
             const ObjectMetadata& metadata = entry->metadata();
             if (!HasReadableReplica(metadata)) {
                 continue;
@@ -4056,6 +4076,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
             if (std::regex_search(key, pattern)) {
                 // Collect-then-process; lock per-object while reading.
                 auto entry_lock = entry->LockShared();
+                if (entry->is_torn_down) {
+                    continue;
+                }
                 auto replica_list =
                     GetReadableReplicaDescriptors(entry->metadata());
 
@@ -4239,6 +4262,12 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
             }
 
             auto entry_lock = object_entry->LockShared();
+            if (object_entry->is_torn_down) {
+                VLOG(1) << "key=" << key << ", info=object_not_found";
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
             const ObjectMetadata& metadata = object_entry->metadata();
             if (!metadata.IsValid()) {
                 VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -4365,6 +4394,11 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
             }
 
             auto entry_lock = object_entry->LockShared();
+            if (object_entry->is_torn_down) {
+                results[original_idx] =
+                    tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+                continue;
+            }
             const ObjectMetadata& metadata = object_entry->metadata();
             if (!metadata.IsValid()) {
                 results[original_idx] =
@@ -4789,8 +4823,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 // The lock moves into each EraseMetadataLocked below, which
                 // releases it before the route mutation.
                 auto entry_lock = entry->LockUnique();
-                auto cleanup_plan = BuildStaleHandleCleanupPlan(
-                    entry->metadata(), retaining_clients);
+                if (entry->is_torn_down) {
+                    // Teardown claimed: the key is gone. Fall through to a
+                    // fresh create.
+                    entry.reset();
+                }
+                auto cleanup_plan =
+                    entry
+                        ? BuildStaleHandleCleanupPlan(entry->metadata(),
+                                                      retaining_clients)
+                        : StaleHandleCleanupPlan{};
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
@@ -5084,6 +5126,11 @@ auto MasterService::AddReplicaForRetainedClient(const UUID& client_id,
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
             std::vector<Replica>{});
+        if (accessor.GetEntry() == nullptr) {
+            // Create() refused to adopt a torn-down entry. A fresh envelope
+            // reads !Exists() until registered below.
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
     }
     auto& metadata = accessor.Get();
     const auto previous_kv_media = KvMediaSnapshot(metadata);
@@ -7092,10 +7139,10 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
-    // There is no per-tenant mutex; RemoveAll must remain atomic (two
-    // concurrent RemoveAll calls must not both count/tear down the same
-    // object), so serialize it with an EXCLUSIVE snapshot lock.
-    std::unique_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // Per-object teardown claims make concurrent RemoveAlls safe, so the
+    // snapshot barrier is only held shared: a wipe must not pause unrelated
+    // tenants' metadata traffic.
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     // Tracking which tenants ended up empty costs a hash insert per visited
     // object, so it is skipped entirely when nobody is listening for `cleared`.
@@ -7185,6 +7232,10 @@ long MasterService::RemoveAll(bool force) {
                     }
                 }
 
+                if (object_entry->is_torn_down) {
+                    // Lost the teardown claim; not counted.
+                    continue;
+                }
                 total_freed_size += metadata.size * mem_rep_count;
                 ErasePromotionTaskLocked(tenant_state, *object_entry);
                 EraseMetadataLocked(tenant_state, object_entry, tenant_id,
@@ -7224,10 +7275,8 @@ long MasterService::RemoveAll(bool force) {
 long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
-    // There is no per-tenant mutex; serialize RemoveAll with an exclusive
-    // snapshot lock so concurrent RemoveAll calls do not double-count/tear
-    // down.
-    std::unique_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    // See the global RemoveAll: shared barrier, per-object teardown claims.
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     // A `cleared` event means "this tenant is now empty". Deciding that from
@@ -7309,6 +7358,10 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                         removed_count++;
                         continue;
                     }
+                }
+                if (object_entry->is_torn_down) {
+                    // Lost the teardown claim; not counted.
+                    continue;
                 }
                 total_freed_size += metadata.size * mem_rep_count;
                 ErasePromotionTaskLocked(tenant_state, *object_entry);
@@ -9875,9 +9928,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     persist_result = AppendOpLogWithDurableFinalize(
                         OpType::REMOVE, tenant_id.value(), key, {},
                         enable_oplog_
-                            ? [this, ttl](const OpLogEntry& durable_entry) {
+                            ? [this, entry, ttl](const OpLogEntry&
+                                                     durable_entry) {
                                   FinalizeExpiredProcessingReplicasAfterDurable(
-                                      durable_entry, ttl);
+                                      entry, durable_entry, ttl);
                               }
                             : DurableFinalizeCallback{});
                 } else {
@@ -9886,10 +9940,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
                         SerializeMetadataForOpLogFromReplicaDescriptors(
                             metadata, post_descriptors),
                         enable_oplog_
-                            ? [this, ttl](
-                                  const OpLogEntry& durable_entry) {
+                            ? [this, entry, ttl](const OpLogEntry&
+                                                     durable_entry) {
                                   FinalizeExpiredProcessingReplicasAfterDurable(
-                                      durable_entry, ttl);
+                                      entry, durable_entry, ttl);
                               }
                             : DurableFinalizeCallback{});
                 }

@@ -260,11 +260,13 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     void FinalizeExpiredProcessingForTest(MasterService& service,
                                           const TenantId& tenant_id,
                                           const std::string& key) {
-        OpLogEntry entry;
-        entry.tenant_id = tenant_id.value();
-        entry.object_key = key;
+        OpLogEntry durable_entry;
+        durable_entry.tenant_id = tenant_id.value();
+        durable_entry.object_key = key;
+        auto tenant_handle = service.catalog_.Lookup(tenant_id);
+        auto entry = tenant_handle ? tenant_handle->Get(key) : nullptr;
         service.FinalizeExpiredProcessingReplicasAfterDurable(
-            entry, std::chrono::system_clock::now());
+            entry, durable_entry, std::chrono::system_clock::now());
     }
 
     void FinalizeRemovedMemoryReplicasForTest(MasterService& service,

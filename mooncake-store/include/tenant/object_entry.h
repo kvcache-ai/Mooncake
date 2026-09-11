@@ -57,9 +57,8 @@ class ObjectEntry {
 
     // Per-object mutation boundary; see the lock-order note below. The
     // returned lock may be released and reacquired midway through a compound
-    // operation (this mutex and route_lock_ are never held together). Lock
-    // order: this mutex first, then ObjectMetadata's SpinLock, never the
-    // reverse.
+    // operation. Lock order: entry mutex → route lock → metadata spin lock;
+    // never the reverse for any pair.
     std::unique_lock<std::shared_mutex> LockUnique() const {
         return std::unique_lock<std::shared_mutex>(mutex);
     }
