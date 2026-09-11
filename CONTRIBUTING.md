@@ -22,6 +22,7 @@ Prefer one of the following documented prefixes:
 - ``[Bugfix]`` for bug fixes.
 - ``[CI/Build]`` for build or continuous integration improvements.
 - ``[Doc]`` for documentation fixes and improvements.
+- ``[Conductor]`` for changes in the ``mooncake-conductor``.
 - ``[Integration]`` for changes in the ``mooncake-integration``.
 - ``[P2PStore]`` for changes in the ``mooncake-p2p-store``.
 - ``[Store]`` for changes in the ``mooncake-store``.
