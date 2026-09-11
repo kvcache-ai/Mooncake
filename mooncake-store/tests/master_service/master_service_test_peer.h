@@ -77,6 +77,9 @@ class MasterServiceTestPeer {
 
     void SetNoFProbeFnForTesting(MasterService::NoFProbeFn fn);
 
+    void SetNoFNamespaceQueryFnForTesting(
+        MasterService::NoFNamespaceQueryFn fn);
+
     size_t GetMountedNoFSegmentCountForTesting();
 
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
