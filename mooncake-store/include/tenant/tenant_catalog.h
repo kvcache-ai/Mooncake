@@ -21,6 +21,8 @@ namespace metadata {
 
 class TenantCatalog {
    public:
+    TenantCatalog() { object_index.Reserve(4096); }
+
     // Publication transaction: wire the group lease and register membership
     // before publishing, rolling membership back if the publish fails — a
     // concurrently-pinned entry never observes a half-wired grouped member.
@@ -225,7 +227,7 @@ class TenantCatalog {
         return group_index.LeaseForTest(group_id);
     }
 
-    std::shared_ptr<ObjectEntry> Get(const std::string& key) const {
+    std::shared_ptr<ObjectEntry> Get(std::string_view key) const {
         return object_index.Get(key);
     }
     // Only erase when the route still resolves to `expected`; see
