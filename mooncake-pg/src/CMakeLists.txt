@@ -153,7 +153,8 @@ target_include_directories(
                      $<INSTALL_INTERFACE:include>)
 if(USE_MACA)
   target_include_directories(mooncake_pg PRIVATE
-                             "${MACA_ROOT}/tools/cu-bridge/include")
+                             "${MACA_ROOT}/tools/cu-bridge/include"
+                             "${MACA_ROOT}/include/mcr")
 endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 

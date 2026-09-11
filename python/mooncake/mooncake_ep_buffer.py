@@ -489,6 +489,12 @@ class Buffer:
                     dtype=torch.float32,
                     device=x.device,
                 ).transpose(1, 2)
+            # The MACA split path requests the native receive hook even when
+            # the caller did not.  Native EP forbids async+hook together;
+            # the wrapper owns completion through the phase-fence hook.
+            native_async_finish = async_finish and not (
+                _USE_SPLIT_SEND_RECV and runtime_return_recv_hook
+            )
             event, hook = self.runtime.dispatch(
                 x.data_ptr(),
                 topk_idx.data_ptr(),
@@ -505,7 +511,7 @@ class Buffer:
                 packed_recv_count.data_ptr(),
                 packed_recv_src_info.data_ptr(),
                 packed_recv_layout_range.data_ptr(),
-                async_finish,
+                native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
@@ -640,6 +646,9 @@ class Buffer:
                 assert out.size(0) == topk_weights.size(0)
                 assert out.size(1) == hidden
                 assert out.dtype == x.dtype
+            native_async_finish = async_finish and not (
+                _USE_SPLIT_SEND_RECV and runtime_return_recv_hook
+            )
             event, hook = self.runtime.combine(
                 x.data_ptr(),
                 topk_idx.data_ptr(),
@@ -656,7 +665,7 @@ class Buffer:
                 timeout_us,
                 zero_copy,
                 combined_x.data_ptr(),
-                async_finish,
+                native_async_finish,
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
