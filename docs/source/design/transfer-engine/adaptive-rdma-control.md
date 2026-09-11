@@ -97,6 +97,19 @@ lost. Recovery may still require transport reconnection, metadata refresh, or
 operator intervention. For TENT's existing mechanisms, see
 [failover](../tent/failover.md) and [QoS](../tent/qos.md).
 
+TENT also applies a bounded rail recovery rule independently of the adaptive
+controller mode. A new remote segment snapshot does not erase a paused rail's
+failure history. Instead, each affected worker rail may admit one slice for
+that metadata generation. Endpoint connection retries for that slice retain
+the same probe token; other slices remain blocked. Only a successful RDMA work
+completion recovers the rail. A failed connection, post, timeout, or non-flush
+completion keeps the existing cooldown and backoff.
+
+The rule is enabled by default. Set the bootstrap configuration key
+`transports/rdma/rail_recovery_probe_enabled` to `false` to retain the previous
+cooldown-only behavior. This switch does not change wire metadata or public
+completion APIs.
+
 ## Rollback and compatibility
 
 To stop enforcement, stop admitting application work, drain outstanding
