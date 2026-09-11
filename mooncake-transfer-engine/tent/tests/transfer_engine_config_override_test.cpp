@@ -376,6 +376,45 @@ TEST(TransferEngineConfigOverrideTest, CustomTopoJsonEnvLoadsPath) {
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     ExplicitRdmaWhitelistOverridesLegacyFilterEnv) {
+    EnvVarGuard guard("MC_TE_FILTERS", "mlx5_from_env_0,mlx5_from_env_1");
+
+    auto config = std::make_shared<Config>();
+    const std::vector<std::string> explicit_filter{"mlx5_requested"};
+    config->set("topology/rdma_whitelist", explicit_filter);
+    config->set("rpc_server_hostname", kInvalidHostname);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              explicit_filter);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitRdmaWhitelistOverridesMcTentConf) {
+    TempConfigFile conf_file(R"({
+        "topology": {
+            "rdma_whitelist": ["mlx5_from_env_0", "mlx5_from_env_1"]
+        }
+    })");
+    EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
+
+    auto config = std::make_shared<Config>();
+    const std::vector<std::string> explicit_filter{"mlx5_requested"};
+    config->set("topology/rdma_whitelist", explicit_filter);
+    // Stop construction before platform probing; this test only needs the
+    // constructor's config merge and remains hardware-independent.
+    config->set("rpc_server_hostname", kInvalidHostname);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              explicit_filter);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      ExplicitMetadataOverridesDriveSuccessfulHttpInitialization) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";

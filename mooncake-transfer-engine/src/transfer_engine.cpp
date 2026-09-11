@@ -93,6 +93,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     freeEngine();
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
+    tent_device_filter_ = std::move(other.tent_device_filter_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -412,7 +413,9 @@ TransferEngine::TransferEngine(bool auto_discover,
     if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
         use_tent_ = true;
     }
-    if (!use_tent_) {
+    if (use_tent_) {
+        tent_device_filter_ = filter;
+    } else {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
     }
 }
@@ -421,6 +424,7 @@ TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
       impl_tent_(std::move(other.impl_tent_)),
       shutdown_token_(nullptr),
+      tent_device_filter_(std::move(other.tent_device_filter_)),
       use_tent_(other.use_tent_) {
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -435,6 +439,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     freeEngine();
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
+    tent_device_filter_ = std::move(other.tent_device_filter_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -469,6 +474,26 @@ static std::pair<std::string, std::string> parseConnectionStringInternal(
     return result;
 }
 
+std::shared_ptr<mooncake::tent::Config> TransferEngine::buildTentConfig(
+    const std::string& metadata_conn_string,
+    const std::string& local_server_name) const {
+    auto config = std::make_shared<mooncake::tent::Config>();
+    if (!local_server_name.empty())
+        config->set("local_segment_name", local_server_name);
+    if (metadata_conn_string == P2PHANDSHAKE) {
+        config->set("metadata_type", "p2p");
+    } else {
+        auto [type, servers] =
+            parseConnectionStringInternal(metadata_conn_string);
+        if (!type.empty()) config->set("metadata_type", type);
+        if (!servers.empty()) config->set("metadata_servers", servers);
+    }
+    if (!tent_device_filter_.empty()) {
+        config->set("topology/rdma_whitelist", tent_device_filter_);
+    }
+    return config;
+}
+
 int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
@@ -477,17 +502,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         return impl_->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
     } else {
-        auto config = std::make_shared<mooncake::tent::Config>();
-        if (!local_server_name.empty())
-            config->set("local_segment_name", local_server_name);
-        if (metadata_conn_string == P2PHANDSHAKE) {
-            config->set("metadata_type", "p2p");
-        } else {
-            auto [type, servers] =
-                parseConnectionStringInternal(metadata_conn_string);
-            if (!type.empty()) config->set("metadata_type", type);
-            if (!servers.empty()) config->set("metadata_servers", servers);
-        }
+        auto config = buildTentConfig(metadata_conn_string, local_server_name);
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;
     }
@@ -884,7 +899,13 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
-    if (!use_tent_) impl_->setWhitelistFilters(std::move(filters));
+    if (!use_tent_) {
+        impl_->setWhitelistFilters(std::move(filters));
+    } else if (!impl_tent_) {
+        tent_device_filter_ = std::move(filters);
+    } else {
+        LOG(WARNING) << "Cannot change the TENT RDMA device filter after init";
+    }
 }
 
 int TransferEngine::numContexts() const {
