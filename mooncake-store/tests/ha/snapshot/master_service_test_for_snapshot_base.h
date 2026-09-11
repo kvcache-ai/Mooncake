@@ -794,6 +794,18 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
     }
 
+    // Stop the eviction worker so snapshot/restore comparisons are not racing
+    // with BatchEvict (see #3813).
+    static void FreezeEvictionWorker(MasterService* service) {
+        if (service == nullptr) {
+            return;
+        }
+        service->eviction_running_ = false;
+        if (service->eviction_thread_.joinable()) {
+            service->eviction_thread_.join();
+        }
+    }
+
     // Test snapshot and restore functionality
     void TestSnapshotAndRestore(std::unique_ptr<MasterService>& service) {
         // ========== Phase 1: Manually persist metadata ==========
@@ -808,7 +820,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
         // ========== Phase 3: Restart MasterService in Restore mode ==========
         // Inherit key configurations from original service (e.g., root_fs_dir
-        // for SSD support)
+        // for SSD support). Disable eviction triggers on the restored service:
+        // when memory is already above the watermark (e.g. EvictObject stress),
+        // its worker can BatchEvict before Phase 4/5 and invalidate the
+        // comparison (#3813 only froze the original service).
         ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
         auto restore_config =
             MasterServiceConfig::builder()
@@ -816,10 +831,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_object_store_type("local")
                 .set_root_fs_dir(service->root_fs_dir_)
+                .set_eviction_ratio(0.0)
+                .set_eviction_high_watermark_ratio(1.0)
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
         ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+        FreezeEvictionWorker(restored_service.get());
         AssertRestoredClientAffiliations(restored_service.get());
 
         // ========== Phase 4: Persist restored metadata again ==========
@@ -880,10 +898,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // eviction worker can otherwise mutate replica metadata while the
         // snapshot is being serialized, making the post-restore comparison
         // compare two different points in time.
-        service_->eviction_running_ = false;
-        if (service_->eviction_thread_.joinable()) {
-            service_->eviction_thread_.join();
-        }
+        FreezeEvictionWorker(service_.get());
 
         // Some test configs may not enable snapshot/restore, so the backend
         // is not created in the constructor. We create it here for TearDown
