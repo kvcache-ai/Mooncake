@@ -1185,8 +1185,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 [&](const TenantId& tenant_id,
                     const std::shared_ptr<metadata::TenantCatalog>& handle) {
                     (void)tenant_id;
-                    auto& tenant = *handle;
-                    auto objs = tenant.SnapshotObjects();
+                    auto& tenant_state = *handle;
+                    auto objs = tenant_state.SnapshotObjects();
                     for (const auto& object_entry : objs) {
                         auto lk = object_entry->LockUnique();
                         ObjectMetadata& metadata = object_entry->metadata();

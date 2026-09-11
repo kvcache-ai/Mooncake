@@ -433,12 +433,6 @@ TEST_F(MasterServiceTest, GroupLeaseIsSharedAndExtendsOnMemberRead) {
     EXPECT_FALSE(lease_b->IsExpired(std::chrono::system_clock::now()));
 }
 
-TEST_F(MasterServiceTest, ReRouteRestoredObjectsMovesStaleShardObjects) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    ReRouteRestoredObjectsMigrationForTest(*service_);
-}
-
 TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()

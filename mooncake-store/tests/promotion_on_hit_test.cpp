@@ -2990,7 +2990,8 @@ TEST_F(PromotionOnHitTest, RetryCandidate_CapRejectedThenQueuedOnRetry) {
     service->RemoveAll();
 }
 
-TEST_F(PromotionOnHitTest, RetryCandidate_NoCandidatesOrNoShardBudgetNoops) {
+TEST_F(PromotionOnHitTest,
+       RetryCandidate_NoCandidatesOrTransientRejectionNoops) {
     MasterServiceConfig config;
     config.enable_offload = true;
     config.promotion_on_hit = true;

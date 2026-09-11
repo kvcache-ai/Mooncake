@@ -214,7 +214,7 @@ class MasterServiceTest : public ::testing::Test {
 
     // Regression: MetadataAccessorRW::Create() used to ignore InsertObject()'s
     // return value. If a concurrent writer inserted the key first, Create()
-    // would bind to an orphan entry not in the route. It must re-Pin the
+    // would bind to an orphan entry not in the route. It must re-resolve the
     // existing entry instead. Lives on the fixture (a MasterService friend) so
     // it can reach the private MetadataAccessorRW.
     void AccessorCreateRePinsWinnerEntry(MasterService& service) {
@@ -242,7 +242,7 @@ class MasterServiceTest : public ::testing::Test {
         auto tenant_handle = service.GetOrCreateTenantCatalogHandle(normalized);
         ASSERT_TRUE(tenant_handle->InsertObject(key, winner));
 
-        // Create() must re-Pin the route winner, not bind the orphan.
+        // Create() must re-resolve the route winner, not bind the orphan.
         accessor.Create(client_id, 4096, std::vector<Replica>{});
 
         EXPECT_TRUE(accessor.Exists());
@@ -557,35 +557,6 @@ class MasterServiceTest : public ::testing::Test {
         }
         // The shared group Lease is single-sourced in the group index.
         return tenant_handle->group_index.LeaseForTest(group_id);
-    }
-
-    void ReRouteRestoredObjectsMigrationForTest(MasterService& service) {
-        const UUID client_id = generate_uuid();
-        const std::string grouped_key = "reroute_grouped_key";
-        const std::string ungrouped_key = "reroute_ungrouped_key";
-        const std::string group_id = UnrelatedGroupId(grouped_key);
-
-        ReplicateConfig grouped_config;
-        grouped_config.replica_num = 1;
-        grouped_config.group_ids = std::vector<std::string>{group_id};
-        ReplicateConfig ungrouped_config;
-        ungrouped_config.replica_num = 1;
-
-        PutCompletedObject(service, client_id, grouped_key, grouped_config);
-        PutCompletedObject(service, client_id, ungrouped_key, ungrouped_config);
-
-        const TenantId tenant = TenantId::Default();
-
-        // Objects live in the tenant container keyed by tenant_id; there is
-        // no cross-shard object routing to migrate. A grouped object is
-        // therefore reachable via the same object lookup as a singleton.
-        EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
-
-        // Object routing is decoupled from groups, so legacy snapshots need
-        // no migration step; the grouped object stays reachable as-is.
-
-        EXPECT_TRUE(service.ExistKey(grouped_key, tenant).value_or(false));
-        EXPECT_TRUE(service.ExistKey(ungrouped_key, tenant).value_or(false));
     }
 };
 
