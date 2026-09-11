@@ -19,6 +19,7 @@
 #include <ylt/coro_io/coro_io.hpp>
 
 #include "p2p/client/v1/data_manager_v1.h"
+#include "request_context.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -373,12 +374,13 @@ P2PClientService::BatchQueryIp(const std::vector<UUID>& client_ids) {
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 P2PClientService::QueryByRegex(const std::string& regex) {
+    auto att = current_request_context_attachment();
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
         return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    auto result = master_client_.GetReadRouteByRegex(regex);
+    auto result = master_client_.GetReadRouteByRegex(regex, std::move(att));
     if (!result.has_value()) {
         LOG(ERROR) << "GetReadRouteByRegex RPC failed"
                    << ", regex=" << regex
@@ -1056,6 +1058,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const WriteConfig& config) {
+    auto att = current_request_context_attachment();
     std::vector<tl::expected<void, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
     ScopedVLogTimer timer(1, "P2PClientService::BatchPut");
@@ -1090,7 +1093,8 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         for (size_t i = 0; i < keys.size(); ++i) {
             sizes[i] = ClientService::CalculateSliceSize(batched_slices[i]);
         }
-        results = InnerBatchPut(keys, batched_slices, sizes, *route_cfg_ptr);
+        results = InnerBatchPut(keys, batched_slices, sizes, *route_cfg_ptr,
+                                std::move(att));
     }
 
     // Record batch-level metric and count successes in one pass.
@@ -1171,11 +1175,13 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const std::vector<size_t>& sizes,
-    const WriteRouteRequestConfig& route_config) {
+    const WriteRouteRequestConfig& route_config,
+    std::string ctx_attachment) {
     if (IsLocalWrite(route_config)) {
         return InnerBatchPutLocalOnly(keys, batched_slices, sizes);
     }
-    return InnerBatchPutNormal(keys, batched_slices, sizes, route_config);
+    return InnerBatchPutNormal(keys, batched_slices, sizes, route_config,
+                               std::move(ctx_attachment));
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -1281,9 +1287,11 @@ P2PClientService::InnerBatchPutNormal(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const std::vector<size_t>& sizes,
-    const WriteRouteRequestConfig& route_config) {
+    const WriteRouteRequestConfig& route_config,
+    std::string ctx_attachment) {
     // Phase 1: fetch write routes from master.
-    auto batch_routes = BatchFetchWriteRoutes(keys, sizes, route_config);
+    auto batch_routes =
+        BatchFetchWriteRoutes(keys, sizes, route_config, std::move(ctx_attachment));
     if (!batch_routes) {
         LOG(ERROR) << "BatchGetWriteRoute RPC failed: " << batch_routes.error();
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -1303,13 +1311,15 @@ P2PClientService::InnerBatchPutNormal(
 tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
 P2PClientService::BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
                                         const std::vector<size_t>& sizes,
-                                        const WriteRouteRequestConfig& config) {
+                                        const WriteRouteRequestConfig& config,
+                                        std::string ctx_attachment) {
     P2PBatchGetWriteRouteRequest req;
     req.client_id = client_id_;
     req.config = ToP2PWriteRouteConfig(config);
     req.keys.assign(keys.begin(), keys.end());
     req.object_sizes.assign(sizes.begin(), sizes.end());
-    auto batch_route_result = master_client_.BatchGetWriteRoute(req);
+    auto batch_route_result =
+        master_client_.BatchGetWriteRoute(req, std::move(ctx_attachment));
     if (!batch_route_result) {
         LOG(ERROR) << "BatchGetWriteRoute RPC failed: "
                    << batch_route_result.error();
@@ -1678,6 +1688,7 @@ std::vector<tl::expected<std::shared_ptr<BufferHandle>, ErrorCode>>
 P2PClientService::BatchGet(const std::vector<std::string>& keys,
                            std::shared_ptr<ClientBufferAllocator> allocator,
                            const ReadRouteConfig& config) {
+    auto att = current_request_context_attachment();
     if (!allocator) {
         LOG(ERROR) << "Client buffer allocator is not provided";
         return std::vector<
@@ -1686,7 +1697,7 @@ P2PClientService::BatchGet(const std::vector<std::string>& keys,
     }
 
     auto create_handles = [&] {
-        return BatchCreateGetHandles(keys, allocator, config);
+        return BatchCreateGetHandles(keys, allocator, config, att);
     };
     auto extract_buf = [](ReadTaskHandle& h) { return h.read_buf; };
 
@@ -1699,6 +1710,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     const std::vector<std::vector<void*>>& all_buffers,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReadRouteConfig& config, bool /*aggregate_same_segment_task*/) {
+    auto att = current_request_context_attachment();
     if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size()) {
         LOG(ERROR) << "Input vector sizes mismatch";
         return std::vector<tl::expected<int64_t, ErrorCode>>(
@@ -1715,7 +1727,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> P2PClientService::BatchGet(
     }
 
     auto create_handles = [&] {
-        return BatchCreateGetHandles(keys, all_slices, config);
+        return BatchCreateGetHandles(keys, all_slices, config, att);
     };
     auto extract_size = [](ReadTaskHandle& h) { return h.data_size; };
 
@@ -1822,7 +1834,8 @@ std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandles(
     const std::vector<std::string>& keys,
     std::shared_ptr<ClientBufferAllocator> allocator,
-    const ReadRouteConfig& config) {
+    const ReadRouteConfig& config,
+    std::string ctx_attachment) {
     auto local_get = [&](std::string_view key,
                          size_t) -> tl::expected<ReadTaskHandle, ErrorCode> {
         if (data_manager_ == nullptr) {
@@ -1831,18 +1844,21 @@ P2PClientService::BatchCreateGetHandles(
         }
         return data_manager_->Get(key, allocator);
     };
-    auto remote_get = [&](std::string_view key, size_t,
+    auto remote_get = [&, att = ctx_attachment](std::string_view key, size_t,
                           std::vector<ResolvedRoute> routes) {
-        return CreateRemoteGetHandle(key, allocator, config, std::move(routes));
+        return CreateRemoteGetHandle(key, allocator, config,
+                                     std::move(routes), att);
     };
-    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get);
+    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get,
+                                     ctx_attachment);
 }
 
 std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandles(
     const std::vector<std::string>& keys,
     std::vector<std::vector<Slice>>& all_slices,
-    const ReadRouteConfig& config) {
+    const ReadRouteConfig& config,
+    std::string ctx_attachment) {
     auto local_get = [&](std::string_view key,
                          size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
         if (data_manager_ == nullptr) {
@@ -1851,19 +1867,21 @@ P2PClientService::BatchCreateGetHandles(
         }
         return data_manager_->Get(key, all_slices[i]);
     };
-    auto remote_get = [&](std::string_view key, size_t i,
+    auto remote_get = [&, att = ctx_attachment](std::string_view key, size_t i,
                           std::vector<ResolvedRoute> routes) {
         return CreateRemoteGetHandle(key, all_slices[i], config,
-                                     std::move(routes));
+                                     std::move(routes), att);
     };
-    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get);
+    return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get,
+                                     ctx_attachment);
 }
 
 template <typename LocalGetFn, typename RemoteGetFn>
 std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandlesImpl(
     const std::vector<std::string>& keys, const ReadRouteConfig& config,
-    LocalGetFn&& local_get, RemoteGetFn&& remote_get) {
+    LocalGetFn&& local_get, RemoteGetFn&& remote_get,
+    std::string ctx_attachment) {
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
     handles.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
@@ -1921,7 +1939,8 @@ P2PClientService::BatchCreateGetHandlesImpl(
     for (size_t i : miss_indices) {
         miss_key_views.emplace_back(keys[i]);
     }
-    auto routes = BatchFetchReadRoutes(miss_key_views, config);
+    auto routes = BatchFetchReadRoutes(miss_key_views, config,
+                                       std::move(ctx_attachment));
 
     // Phase C: remote get for each miss
     for (size_t j = 0; j < miss_indices.size(); ++j) {
@@ -1945,7 +1964,8 @@ P2PClientService::BatchCreateGetHandlesImpl(
 std::vector<
     tl::expected<std::vector<P2PClientService::ResolvedRoute>, ErrorCode>>
 P2PClientService::BatchFetchReadRoutes(
-    const std::vector<std::string_view>& keys, const ReadRouteConfig& config) {
+    const std::vector<std::string_view>& keys, const ReadRouteConfig& config,
+    std::string ctx_attachment) {
     std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>> result(
         keys.size(), std::vector<ResolvedRoute>{});
 
@@ -1969,8 +1989,8 @@ P2PClientService::BatchFetchReadRoutes(
     // Single batch RPC to master
     std::vector<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
         responses;
-    responses = master_client_.BatchGetReadRoute(miss_keys,
-                                                 ToP2PReadRouteConfig(config));
+    responses = master_client_.BatchGetReadRoute(
+        miss_keys, ToP2PReadRouteConfig(config), std::move(ctx_attachment));
     for (size_t k = 0; k < responses.size(); ++k) {
         if (!responses[k]) {
             if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -2066,8 +2086,10 @@ P2PClientService::RouteDescriptorsToRoutes(
 
 tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
     std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator,
-    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched) {
-    auto iter = BuildRouteIter(key, config, std::move(pre_fetched));
+    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched,
+    std::string ctx_attachment) {
+    auto iter = BuildRouteIter(key, config, std::move(pre_fetched),
+                               std::move(ctx_attachment));
     if (!iter) {
         LOG(ERROR) << "Failed to build route iterator, key=" << key
                    << ", error=" << iter.error();
@@ -2098,8 +2120,10 @@ tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
 
 tl::expected<ReadTaskHandle, ErrorCode> P2PClientService::CreateRemoteGetHandle(
     std::string_view key, std::vector<Slice>& slices,
-    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched) {
-    auto iter = BuildRouteIter(key, config, std::move(pre_fetched));
+    const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched,
+    std::string ctx_attachment) {
+    auto iter = BuildRouteIter(key, config, std::move(pre_fetched),
+                               std::move(ctx_attachment));
     if (!iter) {
         if (iter.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to build route iterator, key=" << key
@@ -2431,20 +2455,23 @@ void P2PClientService::RouteIterator::Evict(const ResolvedRoute& route) {
 
 tl::expected<P2PClientService::RouteIterator, ErrorCode>
 P2PClientService::BuildRouteIter(std::string_view key,
-                                 const ReadRouteConfig& config) {
-    return BuildRouteIter(key, config, LoadCachedRoutes(key));
+                                 const ReadRouteConfig& config,
+                                 std::string ctx_attachment) {
+    return BuildRouteIter(key, config, LoadCachedRoutes(key),
+                          std::move(ctx_attachment));
 }
 
 tl::expected<P2PClientService::RouteIterator, ErrorCode>
 P2PClientService::BuildRouteIter(std::string_view key,
                                  const ReadRouteConfig& config,
-                                 std::vector<ResolvedRoute> pre_fetched) {
+                                 std::vector<ResolvedRoute> pre_fetched,
+                                 std::string ctx_attachment) {
     auto routes = std::move(pre_fetched);
     uint64_t object_size = routes.empty() ? 0 : routes.front().object_size;
     RouteIterator iter(key, std::move(routes), object_size,
                        route_cache_ ? &(*route_cache_) : nullptr,
-                       [this, key, config]() {
-                           return AsyncResolveRoutesFromMaster(key, config);
+                       [this, key, config, att = std::move(ctx_attachment)]() {
+                           return AsyncResolveRoutesFromMaster(key, config, att);
                        });
     if (iter.empty()) {
         iter.Prime();
@@ -2457,9 +2484,10 @@ P2PClientService::BuildRouteIter(std::string_view key,
 
 async_simple::coro::Lazy<std::vector<P2PClientService::ResolvedRoute>>
 P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
-                                               const ReadRouteConfig& config) {
+                                               const ReadRouteConfig& config,
+                                               std::string ctx_attachment) {
     auto replica_result = co_await master_client_.AsyncGetReadRoute(
-        key, ToP2PReadRouteConfig(config));
+        key, ToP2PReadRouteConfig(config), std::move(ctx_attachment));
     if (!replica_result) {
         if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to query replica list, key=" << key
@@ -2480,6 +2508,7 @@ P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
 
 tl::expected<bool, ErrorCode> P2PClientService::IsExist(
     const std::string& key) {
+    auto att = current_request_context_attachment();
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -2497,11 +2526,12 @@ tl::expected<bool, ErrorCode> P2PClientService::IsExist(
     }
 
     // Fallback to master
-    return master_client_.ExistKey(key);
+    return master_client_.ExistKey(key, std::move(att));
 }
 
 std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
     const std::vector<std::string>& keys) {
+    auto att = current_request_context_attachment();
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -2536,7 +2566,8 @@ std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
 
     // Batch query master for misses
     if (!miss_keys.empty()) {
-        auto master_results = master_client_.BatchExistKey(miss_keys);
+        auto master_results =
+            master_client_.BatchExistKey(miss_keys, std::move(att));
         for (size_t j = 0; j < miss_indices.size(); ++j) {
             results[miss_indices[j]] = master_results[j];
         }
@@ -2551,6 +2582,7 @@ std::vector<tl::expected<bool, ErrorCode>> P2PClientService::BatchIsExist(
 
 tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     const std::string& object_key, const ReadRouteConfig& config) {
+    auto att = current_request_context_attachment();
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -2591,8 +2623,8 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // 3) Local miss + healthy: fall back to master.
-    auto result =
-        master_client_.GetReadRoute(object_key, ToP2PReadRouteConfig(config));
+    auto result = master_client_.GetReadRoute(
+        object_key, ToP2PReadRouteConfig(config), std::move(att));
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
                      << ", key=" << object_key << ", error=" << result.error();
@@ -2606,6 +2638,7 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
 std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
 P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
                              const ReadRouteConfig& config) {
+    auto att = current_request_context_attachment();
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -2633,7 +2666,7 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
     std::vector<std::string_view> key_views(object_keys.begin(),
                                             object_keys.end());
     auto responses = master_client_.BatchGetReadRoute(
-        key_views, ToP2PReadRouteConfig(config));
+        key_views, ToP2PReadRouteConfig(config), std::move(att));
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>> results;
     results.reserve(responses.size());
     for (size_t i = 0; i < responses.size(); ++i) {

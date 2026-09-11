@@ -323,7 +323,8 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const std::vector<size_t>& sizes,
-        const WriteRouteRequestConfig& route_config);
+        const WriteRouteRequestConfig& route_config,
+        std::string ctx_attachment = {});
 
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutLocalOnly(
         const std::vector<ObjectKey>& keys,
@@ -334,7 +335,8 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const std::vector<size_t>& sizes,
-        const WriteRouteRequestConfig& route_config);
+        const WriteRouteRequestConfig& route_config,
+        std::string ctx_attachment = {});
 
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
     CreatePutHandlesFromRoute(const std::vector<ObjectKey>& keys,
@@ -355,7 +357,8 @@ class P2PClientService final : public ClientService {
     tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
     BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
                           const std::vector<size_t>& sizes,
-                          const WriteRouteRequestConfig& config);
+                          const WriteRouteRequestConfig& config,
+                          std::string ctx_attachment = {});
 
     struct WriteOp {
         virtual ~WriteOp() = default;
@@ -496,11 +499,13 @@ class P2PClientService final : public ClientService {
         const std::vector<P2PRouteDescriptor>& descriptors);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
-        std::string_view key, const ReadRouteConfig& config);
+        std::string_view key, const ReadRouteConfig& config,
+        std::string ctx_attachment = {});
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
         std::string_view key, const ReadRouteConfig& config,
-        std::vector<ResolvedRoute> pre_fetched);
+        std::vector<ResolvedRoute> pre_fetched,
+        std::string ctx_attachment = {});
 
    private:
     template <typename ResultT, typename CreateHandlesFn, typename ExtractFn>
@@ -511,30 +516,36 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config);
+        const ReadRouteConfig& config,
+        std::string ctx_attachment = {});
 
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::vector<std::vector<Slice>>& all_slices,
-        const ReadRouteConfig& config);
+        const ReadRouteConfig& config,
+        std::string ctx_attachment = {});
 
     template <typename LocalGetFn, typename RemoteGetFn>
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
     BatchCreateGetHandlesImpl(const std::vector<std::string>& keys,
                               const ReadRouteConfig& config,
-                              LocalGetFn&& local_get, RemoteGetFn&& remote_get);
+                              LocalGetFn&& local_get, RemoteGetFn&& remote_get,
+                              std::string ctx_attachment = {});
 
     std::vector<tl::expected<std::vector<ResolvedRoute>, ErrorCode>>
     BatchFetchReadRoutes(const std::vector<std::string_view>& keys,
-                         const ReadRouteConfig& config);
+                         const ReadRouteConfig& config,
+                         std::string ctx_attachment = {});
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         std::string_view key, std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
+        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched,
+        std::string ctx_attachment = {});
 
     tl::expected<ReadTaskHandle, ErrorCode> CreateRemoteGetHandle(
         std::string_view key, std::vector<Slice>& slices,
-        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched);
+        const ReadRouteConfig& config, std::vector<ResolvedRoute> pre_fetched,
+        std::string ctx_attachment = {});
 
     /**
      * @brief Launch async reads driven by a RouteIterator.
@@ -560,7 +571,8 @@ class P2PClientService final : public ClientService {
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,
-                                 const ReadRouteConfig& config);
+                                 const ReadRouteConfig& config,
+                                 std::string ctx_attachment = {});
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.
