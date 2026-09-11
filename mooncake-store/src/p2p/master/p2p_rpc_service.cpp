@@ -534,8 +534,11 @@ void P2PMasterRpcService::ExistKey_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B ExistKey_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B ExistKey_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(ExistKey(key));
@@ -547,8 +550,11 @@ void P2PMasterRpcService::BatchExistKey_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchExistKey_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchExistKey_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchExistKey(keys));
@@ -560,8 +566,11 @@ void P2PMasterRpcService::GetReadRouteByRegex_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B GetReadRouteByRegex_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B GetReadRouteByRegex_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(GetReadRouteByRegex(regex));
@@ -573,8 +582,11 @@ void P2PMasterRpcService::GetReadRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B GetReadRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B GetReadRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(GetReadRoute(req));
@@ -586,8 +598,11 @@ void P2PMasterRpcService::BatchGetReadRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchGetReadRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchGetReadRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchGetReadRoute(req));
@@ -599,8 +614,11 @@ void P2PMasterRpcService::GetWriteRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B GetWriteRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B GetWriteRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(GetWriteRoute(req));
@@ -612,8 +630,11 @@ void P2PMasterRpcService::BatchGetWriteRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchGetWriteRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchGetWriteRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchGetWriteRoute(req));
@@ -625,8 +646,11 @@ void P2PMasterRpcService::PublishRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B PublishRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B PublishRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(PublishRoute(req));
@@ -638,8 +662,11 @@ void P2PMasterRpcService::WithdrawRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B WithdrawRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B WithdrawRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(WithdrawRoute(req));
@@ -651,8 +678,11 @@ void P2PMasterRpcService::BatchWithdrawRoute_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchWithdrawRoute_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchWithdrawRoute_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchWithdrawRoute(req));

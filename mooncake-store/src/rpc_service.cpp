@@ -956,8 +956,11 @@ void WrappedMasterService::ExistKey_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B ExistKey_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B ExistKey_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(ExistKey(key));
@@ -969,8 +972,11 @@ void WrappedMasterService::BatchExistKey_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchExistKey_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchExistKey_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchExistKey(keys));
@@ -982,8 +988,11 @@ void WrappedMasterService::BatchReplicaClear_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchReplicaClear_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchReplicaClear_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchReplicaClear(object_keys, client_id, segment_name));
@@ -995,8 +1004,11 @@ void WrappedMasterService::GetReplicaListByRegex_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B GetReplicaListByRegex_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B GetReplicaListByRegex_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(GetReplicaListByRegex(str));
@@ -1008,8 +1020,11 @@ void WrappedMasterService::GetReplicaList_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B GetReplicaList_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B GetReplicaList_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(GetReplicaList(key));
@@ -1021,8 +1036,11 @@ void WrappedMasterService::BatchGetReplicaList_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchGetReplicaList_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchGetReplicaList_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchGetReplicaList(keys));
@@ -1034,8 +1052,11 @@ void WrappedMasterService::PutStart_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B PutStart_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B PutStart_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(PutStart(client_id, key, slice_length, config));
@@ -1047,8 +1068,11 @@ void WrappedMasterService::PutEnd_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B PutEnd_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B PutEnd_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(PutEnd(client_id, key, replica_type));
@@ -1060,8 +1084,11 @@ void WrappedMasterService::PutRevoke_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B PutRevoke_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B PutRevoke_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(PutRevoke(client_id, key, replica_type));
@@ -1073,8 +1100,11 @@ void WrappedMasterService::BatchPutStart_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchPutStart_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchPutStart_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchPutStart(client_id, keys, slice_lengths, config));
@@ -1086,8 +1116,11 @@ void WrappedMasterService::BatchPutEnd_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchPutEnd_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchPutEnd_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchPutEnd(client_id, keys));
@@ -1099,8 +1132,11 @@ void WrappedMasterService::BatchPutRevoke_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B BatchPutRevoke_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B BatchPutRevoke_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(BatchPutRevoke(client_id, keys));
@@ -1112,8 +1148,11 @@ void WrappedMasterService::Remove_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B Remove_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B Remove_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(Remove(key, force));
@@ -1125,8 +1164,11 @@ void WrappedMasterService::RemoveByRegex_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B RemoveByRegex_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B RemoveByRegex_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(RemoveByRegex(str, force));
@@ -1138,8 +1180,11 @@ void WrappedMasterService::RemoveAll_with_context(
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B RemoveAll_with_context request_id=" << rc.request_id
-                << " trace_id=" << rc.trace_id;
+        VLOG(2) << "hop-B RemoveAll_with_context att_sz=" << att.size()
+                << " request_id=[" << rc.request_id << "]"
+                << " trace_id=[" << rc.trace_id << "]"
+                << " span_id=[" << rc.span_id << "]"
+                << " parent_span_id=[" << rc.parent_span_id << "];
     }
     CurrentCtxScope guard(std::move(rc));
     ctx.response_msg(RemoveAll(force));
