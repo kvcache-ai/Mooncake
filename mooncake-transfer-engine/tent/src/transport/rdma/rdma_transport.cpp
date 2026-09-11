@@ -957,9 +957,10 @@ int RdmaTransport::processNotifyCompletions() {
 
         // Process each completion
         for (int i = 0; i < completed; ++i) {
-            // Find endpoint by QP number before interpreting errors. A flush
-            // completion after endpoint unpublication is expected during
-            // retirement and should not flood logs.
+            // Find endpoint by QP number before interpreting errors. The QP
+            // stays published while the endpoint retires, so notifications
+            // that landed before the retirement are still handed out; the
+            // flushes that follow are told apart by the endpoint's state.
             std::shared_ptr<RdmaEndPoint> endpoint;
             {
                 RWSpinlock::ReadGuard guard(notify_endpoint_map_lock_);
@@ -969,18 +970,22 @@ int RdmaTransport::processNotifyCompletions() {
                 }
             }
 
+            // Whatever it says, this WR has left the notify QP; the
+            // endpoint's destruction waits for that count to reach zero.
+            if (endpoint) endpoint->noteNotifyCompletion();
+
             if (wc[i].status != IBV_WC_SUCCESS) {
                 // A failed completion leaves this notify QP unusable for good
                 // and only the endpoint lifecycle builds a new one, so left
                 // alone the endpoint stays EP_READY and every later
                 // sendNotification() silently flushes. Retiring it also moves
                 // the data QPs to ERR, so that is reserved for faults which may
-                // mean the peer restarted or the path died. Both acting
-                // branches re-take the notify_endpoint_map_lock_ ReadGuard
-                // released above via unregisterNotifyQp(); the locally held
-                // shared_ptr keeps the endpoint alive across the call.
+                // mean the peer restarted or the path died. A notify QP that
+                // is retiring or already disabled only flushes from here on,
+                // and those completions stay quiet.
                 const bool endpoint_ready =
-                    endpoint && endpoint->status() == RdmaEndPoint::EP_READY;
+                    endpoint && endpoint->status() == RdmaEndPoint::EP_READY &&
+                    endpoint->notifyConnected();
                 auto action = classifyNotifyCompletion(
                     wc[i].status, endpoint != nullptr, endpoint_ready);
                 if (action == NotifyCompletionAction::SkipSilently) continue;
