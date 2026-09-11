@@ -1,6 +1,7 @@
 #include "common/client_buffer_allocation.h"
 
-#include "../config/mmap_arena_config.h"
+#include "config/hugepage_config.h"
+#include "config/mmap_arena_config.h"
 #include "mmap_arena.h"
 
 #include <algorithm>
@@ -230,7 +231,7 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 
     // Traditional mmap allocation (fallback or arena disabled).
     const bool defer_direct_population =
-        defer_hugetlb_population && get_hugepage_size_from_env() > 0;
+        defer_hugetlb_population && HugepageConfig::FromEnvironment().enabled;
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (!defer_direct_population) {
         flags |= MAP_POPULATE;

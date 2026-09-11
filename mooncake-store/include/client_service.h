@@ -647,6 +647,10 @@ class Client {
         return metrics_ ? &metrics_->ssd_metric : nullptr;
     }
 
+    DfsMetric* GetDfsMetricPtr() {
+        return metrics_ ? &metrics_->dfs_metric : nullptr;
+    }
+
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
@@ -803,6 +807,8 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<std::vector<uint64_t>>& slice_lengths,
         const ReplicateConfig& config);
+
+    void EnterHaRuntimeMode();
     ErrorCode InitTransferEngine(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
