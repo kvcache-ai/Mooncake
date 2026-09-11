@@ -108,9 +108,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
     struct ShardFile {
         std::string path;
         int fd = -1;
-        // Optional direct (page-cache-bypassing) read handle for the same
-        // file; -1 when the adapter does not support direct reads.
-        int direct_fd = -1;
         std::mutex mutex;
     };
 
