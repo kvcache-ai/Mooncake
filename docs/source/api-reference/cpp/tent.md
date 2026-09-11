@@ -473,7 +473,23 @@ Retrieves information about a segment.
 
 ## Advanced APIs
 
-These APIs are optional; use them for segment export/import, notifications, or engine introspection.
+These APIs are optional; use them for connection warmup, segment export/import, notifications, or engine introspection.
+
+### Connection Warmup
+
+#### TransferEngine::warmupSegment
+
+```cpp
+Status warmupSegment(SegmentID handle);
+```
+
+Establishes connection state towards a segment ahead of the first transfer. Endpoint setup is otherwise lazy, so the first request to a freshly opened segment pays for it; on RDMA that is the endpoint and queue-pair bootstrap.
+
+Every installed transport is offered the target. RDMA pre-establishes endpoints from each enabled local context to each RDMA NIC the segment advertises, skipping pairs that are already ready; bootstrapping also brings up the notification queue pair that rides on the same endpoint. Transports that do not implement warmup, and transports that have nothing to warm towards this particular target, report that rather than an error.
+
+- `handle`: The segment to warm, as returned by `openSegment`. `LOCAL_SEGMENT_ID` is a successful no-op — local transfers take the in-process path and have no connection state.
+- Return value: `Status::OK()` when every transport either warmed the target or had nothing to warm; otherwise the first error a transport reported. A failure leaves that transport on its lazy path, so the target is still usable.
+- Typical use: Call once per peer right after `openSegment` when the first transfer is latency sensitive, so the setup cost is paid where the caller chooses. The call is idempotent.
 
 ### Segment Export and Import
 
