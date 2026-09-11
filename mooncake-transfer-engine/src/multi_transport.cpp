@@ -62,6 +62,7 @@
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
 #endif
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_UBSHMEM
 #include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #endif
@@ -106,6 +107,11 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 }
 
 Status MultiTransport::freeBatchID(BatchID batch_id) {
+    return freeBatchID(batch_id, std::function<void()>());
+}
+
+Status MultiTransport::freeBatchID(BatchID batch_id,
+                                   const std::function<void()>& before_delete) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     for (size_t task_id = 0; task_id < task_count; task_id++) {
@@ -113,6 +119,9 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
+    }
+    if (before_delete) {
+        before_delete();
     }
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
@@ -503,6 +512,9 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new CxlTransport();
     }
 #endif
+    else if (std::string(proto) == "shm") {
+        transport = new ShmTransport();
+    }
 #ifdef USE_UBSHMEM
     else if (std::string(proto) == "ubshmem") {
         transport = new UBShmemTransport();
@@ -585,6 +597,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         return Status::InvalidArgument("Invalid target segment ID " +
                                        std::to_string(entry.target_id));
     }
+
     auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL
     // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
@@ -602,6 +615,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
             if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
             if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
             if (p == "musa") return std::getenv("MC_DISABLE_MUSA") ? 0 : 4;
+            if (p == "shm") return 4;
             if (p == "cxl") return 3;
             if (p == "rdma") return 2;
             if (p == "tcp") return 1;
@@ -613,7 +627,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         // This makes the intra-node fast path (hip) and the cross-node path
         // (rdma) work automatically from a single multi-protocol segment,
         // without requiring the operator to set MC_DISABLE_HIP.
-        const bool gpu_ipc_reachable = isGpuIpcReachableTarget(
+        const bool local_ipc_reachable = isLocalIpcReachableTarget(
             target_segment_desc->name, local_server_name_);
         std::string chosen;
         int chosen_priority = -1;
@@ -626,8 +640,9 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                     : buffer.addr;
             if (entry.target_offset >= start &&
                 entry.target_offset < start + buffer.length) {
-                if ((buffer.protocol == "hip" || buffer.protocol == "musa") &&
-                    !gpu_ipc_reachable) {
+                if ((buffer.protocol == "hip" || buffer.protocol == "musa" ||
+                     buffer.protocol == "shm") &&
+                    !local_ipc_reachable) {
                     continue;
                 }
                 int priority = protocol_priority(buffer.protocol);
@@ -654,7 +669,7 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         if (globalConfig().trace) {
             LOG(INFO) << "MultiTransport::selectTransport route: target_id="
                       << entry.target_id << " segment_protocol=\"" << proto
-                      << "\" gpu_ipc_reachable=" << gpu_ipc_reachable
+                      << "\" local_ipc_reachable=" << local_ipc_reachable
                       << " chosen=" << chosen;
         }
         transport = transport_map_[chosen].get();
@@ -701,12 +716,13 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         if (!item.empty()) protos.push_back(item);
     }
 
-    // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
-    // preference to a cross-host-capable transport for a cross-host target
+    // hip GPU IPC and POSIX SHM cannot reach a remote host; downgrade an
+    // explicit intra-node preference to a cross-host-capable transport
     // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
-    if ((preferred_proto == "hip" || preferred_proto == "musa") &&
-        !isGpuIpcReachableTarget(target_segment_desc->name,
-                                 local_server_name_)) {
+    if ((preferred_proto == "hip" || preferred_proto == "musa" ||
+         preferred_proto == "shm") &&
+        !isLocalIpcReachableTarget(target_segment_desc->name,
+                                   local_server_name_)) {
         std::string fallback;
         for (const char* candidate : {"rdma", "tcp"}) {
             if (std::find(protos.begin(), protos.end(), candidate) !=
@@ -761,7 +777,11 @@ Transport* MultiTransport::getTransport(const std::string& proto) {
 }
 
 bool MultiTransport::isTcpOnly() const {
-    return transport_map_.size() == 1 && transport_map_.count("tcp") == 1;
+    // SHM is intra-node DRAM IPC, not a cross-host fabric. Ignore it so a
+    // tcp+shm engine still auto-enables Store same-process memcpy.
+    size_t n = transport_map_.size();
+    if (transport_map_.count("shm")) --n;
+    return n == 1 && transport_map_.count("tcp") == 1;
 }
 
 std::vector<Transport*> MultiTransport::listTransports() {

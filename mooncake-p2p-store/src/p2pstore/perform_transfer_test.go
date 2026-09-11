@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 var errBatchBusy = errors.New("BatchID cannot be freed until all tasks are done")
@@ -116,5 +117,91 @@ func TestPerformTransferOnceSubmitErrorFreesBatch(t *testing.T) {
 	}
 	if !fake.freed {
 		t.Fatal("batch ID leaked on submit failure")
+	}
+}
+
+// recordSleeps swaps sleepFn for a recorder so tests can assert the exact
+// backoff schedule instead of measuring wall-clock time.
+func recordSleeps(t *testing.T) *[]time.Duration {
+	t.Helper()
+	var slept []time.Duration
+	prev := sleepFn
+	sleepFn = func(d time.Duration) { slept = append(slept, d) }
+	t.Cleanup(func() { sleepFn = prev })
+	return &slept
+}
+
+// TestWaitTransferBacksOffAfterSpinBudget checks the polling schedule: within
+// the spin budget polls are back-to-back, after it every in-flight poll is
+// followed by one sleep, growing 100µs, 200µs, 400µs, 800µs, then capped at 1ms.
+func TestWaitTransferBacksOffAfterSpinBudget(t *testing.T) {
+	const extraPolls = 40
+	slept := recordSleeps(t)
+	fake := &fakeBatchTransport{pollsUntilDone: pollSpinBudget + extraPolls, finalStatus: STATUS_COMPLETED}
+	fake.submitted = true
+
+	status, err := waitTransfer(context.Background(), fake, BatchID(1))
+	if err != nil || status != STATUS_COMPLETED {
+		t.Fatalf("status=%d err=%v", status, err)
+	}
+	// The fake reports terminal state on poll number pollsUntilDone.
+	if fake.polls != pollSpinBudget+extraPolls {
+		t.Fatalf("polls = %d, want %d", fake.polls, pollSpinBudget+extraPolls)
+	}
+
+	var want []time.Duration
+	interval := pollMinInterval
+	for i := 0; i < extraPolls-1; i++ {
+		want = append(want, interval)
+		if interval < pollMaxInterval {
+			interval *= 2
+			if interval > pollMaxInterval {
+				interval = pollMaxInterval
+			}
+		}
+	}
+	if len(*slept) != len(want) {
+		t.Fatalf("sleep count = %d, want %d: %v", len(*slept), len(want), *slept)
+	}
+	for i := range want {
+		if (*slept)[i] != want[i] {
+			t.Fatalf("sleep[%d] = %v, want %v (schedule %v)", i, (*slept)[i], want[i], *slept)
+		}
+	}
+	if (*slept)[len(*slept)-1] != pollMaxInterval {
+		t.Fatalf("backoff did not reach the cap: last sleep %v", (*slept)[len(*slept)-1])
+	}
+}
+
+func TestWaitTransferWithinSpinBudgetDoesNotSleep(t *testing.T) {
+	slept := recordSleeps(t)
+	fake := &fakeBatchTransport{pollsUntilDone: pollSpinBudget / 2, finalStatus: STATUS_COMPLETED}
+	fake.submitted = true
+	if _, err := waitTransfer(context.Background(), fake, BatchID(1)); err != nil {
+		t.Fatal(err)
+	}
+	if len(*slept) != 0 {
+		t.Fatalf("spin-budget path slept %d time(s): %v", len(*slept), *slept)
+	}
+}
+
+// TestWaitTransferCancelledContextWinsOverTerminalStatus pins the edge case
+// where ctx is already cancelled and the very first poll reports a terminal
+// status: cancellation is authoritative and ctx.Err() is returned.
+func TestWaitTransferCancelledContextWinsOverTerminalStatus(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	fake := &fakeBatchTransport{pollsUntilDone: 0, finalStatus: STATUS_COMPLETED}
+	fake.submitted = true
+
+	status, err := waitTransfer(ctx, fake, BatchID(1))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	if status != STATUS_FAILED {
+		t.Fatalf("status = %d, want STATUS_FAILED", status)
+	}
+	if fake.polls != 1 {
+		t.Fatalf("polls = %d, want 1 (terminal on first poll)", fake.polls)
 	}
 }

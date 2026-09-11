@@ -1,10 +1,9 @@
 # Mooncake Reshard
 
 `mooncake-reshard` defines framework-neutral contracts, address-free N-D
-logical planning, and runtime binding for reusable runtime resources. This
-change adds the model-weight manifest, logical reshard planner, and an
-attested bound-plan contract; storage lifecycle and transfer execution remain
-separate phases.
+logical planning, runtime binding, and Store-backed snapshots for reusable
+runtime resources. Model-weight storage and Transfer Engine execution remain
+separate runtime phases.
 
 Framework-owned adapters inspect framework runtime objects, normalize
 framework-specific values, and construct typed canonical manifests. Mooncake
@@ -18,6 +17,8 @@ The public Python API is split by responsibility:
   contracts for resource-neutral identity and lifecycle;
 - `mooncake.reshard.weight` defines model-weight placement, runtime-binding
   input contracts, and address-free N-D planning.
+- `mooncake.reshard.kv_cache` defines KV-cache topology, placement, runtime
+  binding, serialization, and logical transfer planning.
 
 ## Weight Placement Model
 
@@ -67,7 +68,7 @@ contains compact N-D overlap regions but no runtime addresses, endpoints,
 allocation bounds, leases, or backend request.
 
 `plan_stored_transfer_to_target_placement` accepts a committed address-free
-`WeightManifest` as the logical source. The plan retains the manifest's
+`StoredWeightManifest` as the logical source. The plan retains the manifest's
 canonical identity and selected fragments so a later binding layer can verify
 that it is still using the intended Store snapshot.
 
@@ -91,6 +92,47 @@ underlying allocation. A Transfer Engine executor must acquire allocation
 guards and revalidate bindings atomically with the submission that consumes
 the plan.
 
+## Store Snapshots
+
+`StoredResourceManifest` is the persistent resource base. The concrete
+`StoredWeightManifest` adds revision, weight generation, tensor descriptors,
+stored fragments, and its canonical digest. It contains no GPU address or
+runtime allocation owner.
+
+`MooncakeDistributedStore.begin_weight_snapshot()` returns a
+`WeightStoreWriter` for one immutable snapshot. A framework adapter supplies
+complete placement/binding inventories, resolves each `write_tensor()` call to
+canonical fragment IDs, and provides allocation guards for Store I/O. After
+every required fragment succeeds, `commit()` publishes the single
+`StoredWeightManifest`.
+
+### Public API Migration
+
+This release removes the public `*_with_parallelism` API family and its helper
+types `ParallelAxis`, `TensorParallelism`, and `ReadTarget`. This is a breaking
+change for applications using the former multi-axis tensor API. Weight snapshot
+writers now use the explicit lifecycle:
+
+```python
+writer = WeightStore(store).begin_weight_snapshot(descriptor, adapter)
+writer.write_tensor(tensor_id, tensor)
+manifest = writer.commit()
+```
+
+The snapshot writer stores manifest-managed payload fragments and publishes one
+`StoredWeightManifest`; it does not produce an ordinary Store tensor object.
+Weight snapshot readers use `WeightStore.load_manifest()`, `plan_load()`, and
+`load()` with target placement and runtime binding manifests. The existing
+single-axis TP APIs named `*_with_tp` remain separate compatibility APIs.
+
+If `commit()` reports a manifest publication failure after the Store records
+the commit decision, the writer stays open and preserves its uploaded payloads.
+Retry `commit()` on the same writer to complete publication.
+
+`WeightStore.load_manifest()` and `WeightStore.plan_load()` use the stored
+manifest as the source of truth for restore. The target framework supplies the
+placement, runtime binding, and allocation guards required by `get_into_ranges`.
+
 ## Module Responsibilities
 
 - `types.py` defines tensor and logical-fragment contracts.
@@ -107,9 +149,32 @@ the plan.
 - `planner.py` exposes both logical planning and runtime-binding APIs.
 - `manifest.py` preserves the public import surface.
 
-`kv_cache` remains reserved as a resource discriminator. This change does not
-define a KVCache manifest; a future KVCache reshard adapter can reuse the
-resource/placement/binding boundary without changing the model-weight planner.
+## KV Cache Placement Model
+
+`KVCachePlacementManifest` describes an address-free KV-cache placement over a
+selected topology. Each participant contributes a `KVCachePlacementPart`, and
+`KVCacheRuntimeBindingManifest` supplies operation-scoped live buffers. Runtime
+bindings contain no lease or eviction state; the framework owns pinning and
+lifetime. `KVCacheSnapshotDescriptor` independently describes model and token
+semantics. Legacy logical planning permits omission for compatibility; the
+Runtime-to-Runtime executor requires an explicit snapshot and operation ID.
+
+The KV-cache implementation is split by responsibility:
+
+- `snapshot.py` defines content identity;
+- `topology.py`, `part.py`, and `placement.py` define logical placement;
+- `runtime.py` and `binding.py` define and validate live buffer bindings;
+- `planner.py` defines semantically validated logical and prepared plans;
+- `resolved.py` and `transfer.py` validate and lower bounded resolved ranges;
+- `executor.py` and `completion.py` execute TE writes and collect all participants;
+- `runtime_serde.py` serializes resolved bindings, operations, and receipts;
+- `serde.py`, `snapshot_serde.py`, and `plan_serde.py` define strict JSON
+  boundaries.
+
+KV planning is source/target-role agnostic. A placement may expose one or more
+complete DP replicas, and each local-target plan selects exactly one source DP
+replica. Callers may choose that source rank explicitly; otherwise the planner
+maps target DP ranks round-robin over the source placement's available DP ranks.
 
 `weight_placement_to_json` and `weight_placement_from_json` are the explicit
 public JSON APIs. Their wire format contains only canonical fields, and

@@ -17,6 +17,7 @@
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 #include "ha/snapshot/batch_oplog/capture.h"
+#include "ha/snapshot/batch_oplog/promotion.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
@@ -141,6 +142,10 @@ class HotStandbyService {
      */
     ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
 
+    bool IsBatchOpLogSnapshotMode() const;
+    tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
+    PromoteAndDetachBatchOpLogStore();
+
     /**
      * @brief Get the number of metadata entries in the local store
      */
@@ -202,8 +207,9 @@ class HotStandbyService {
     void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
-     * @brief Test seam: when set, promotion final catch-up first tries
-     *        batch-record durable prefix/batches from this backend.
+     * @brief Test seam: inject a HaKvBackend used for Start()/replication and
+     *        promotion catch-up. When set, Start() skips live etcd connection
+     *        (and works even when STORE_USE_ETCD is OFF).
      */
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -221,14 +227,21 @@ class HotStandbyService {
     }
 
    private:
+    enum class PromotionCatchUpPolicy {
+        kLegacyTotalDeadline,
+        kBoundedNoProgress,
+    };
+
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
-    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
-    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id,
+                                             PromotionCatchUpPolicy policy);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
+                                             PromotionCatchUpPolicy policy);
     void StopReplicationLoop();
     void HandleSnapshotCaptureRequest(
         const OpLogBatchStandbyPollResult& result);
@@ -236,11 +249,9 @@ class HotStandbyService {
     void NotifySnapshotPromotion();
     void NotifySnapshotStop();
 
-    // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
-    // promotion sequence machine transitions + gap resolution + final
-    // catch-up + post catch-up gap check + success transition. Returns
-    // ErrorCode::OK on success or any fail-closed error code.
-    ErrorCode PromoteLockedInternal(uint64_t current_applied_seq_id);
+    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id,
+                                     PromotionCatchUpPolicy policy);
+    ErrorCode CompletePromotionLocked();
 
     void NotifySyncStatus();
 
@@ -266,6 +277,7 @@ class HotStandbyService {
     std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
     std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
     std::optional<DurablePrefix> batch_snapshot_baseline_;
+    ViewVersionId batch_snapshot_producer_view_version_{0};
 
     std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
 

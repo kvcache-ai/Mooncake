@@ -1234,6 +1234,160 @@ struct MountMemoryNodeAction {
 
 MountMemoryNodeAction MountMemoryNode(std::string node);
 
+struct MountLocalDiskAction {
+    std::string actor;
+    bool enable_offloading{true};
+    std::optional<ErrorCode> expected_error{};
+
+    MountLocalDiskAction& OffloadingDisabled() {
+        enable_offloading = false;
+        return *this;
+    }
+
+    MountLocalDiskAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+MountLocalDiskAction MountLocalDisk(std::string actor);
+
+struct UnmountLocalDiskAction {
+    std::string actor;
+    std::optional<ErrorCode> expected_error{};
+
+    UnmountLocalDiskAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+UnmountLocalDiskAction UnmountLocalDisk(std::string actor);
+
+struct ReportSsdCapacityAction {
+    std::string actor;
+    int64_t capacity_bytes{0};
+    std::optional<ErrorCode> expected_error{};
+
+    ReportSsdCapacityAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+ReportSsdCapacityAction ReportSsdCapacity(std::string actor,
+                                          int64_t capacity_bytes);
+
+struct OffloadHeartbeatAction {
+    std::string actor;
+    std::string tenant{TenantId::Default().value()};
+    bool enable_offloading{true};
+    bool expect_some_tasks{false};
+    std::optional<std::vector<std::string>> expected_task_keys{};
+    int64_t expected_task_size{0};
+    std::optional<ErrorCode> expected_error{};
+
+    OffloadHeartbeatAction& Disabled() {
+        enable_offloading = false;
+        return *this;
+    }
+
+    OffloadHeartbeatAction& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    OffloadHeartbeatAction& ExpectTasks(std::vector<std::string> keys,
+                                        int64_t size_each) {
+        expected_task_keys = std::move(keys);
+        expected_task_size = size_each;
+        return *this;
+    }
+
+    OffloadHeartbeatAction& ExpectNoTasks() {
+        expected_task_keys.emplace();
+        return *this;
+    }
+
+    OffloadHeartbeatAction& ExpectSomeTasks() {
+        expect_some_tasks = true;
+        return *this;
+    }
+
+    OffloadHeartbeatAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+OffloadHeartbeatAction OffloadHeartbeat(std::string actor);
+
+struct CompleteOffloadAction {
+    std::vector<std::string> keys;
+    std::string actor{"default"};
+    std::string tenant{TenantId::Default().value()};
+    std::string node;
+    std::optional<int64_t> size{};
+    std::optional<ErrorCode> expected_error{};
+
+    CompleteOffloadAction& By(std::string value) {
+        actor = std::move(value);
+        return *this;
+    }
+
+    CompleteOffloadAction& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    CompleteOffloadAction& OnNode(std::string value) {
+        node = std::move(value);
+        return *this;
+    }
+
+    CompleteOffloadAction& OfSize(int64_t value) {
+        size = value;
+        return *this;
+    }
+
+    CompleteOffloadAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+CompleteOffloadAction CompleteOffload(std::initializer_list<std::string> keys);
+
+struct EvictDiskReplicaAction {
+    std::string key;
+    std::string actor{"default"};
+    std::string tenant{TenantId::Default().value()};
+    ReplicaType replica_type{ReplicaType::DISK};
+    std::optional<ErrorCode> expected_error{};
+
+    EvictDiskReplicaAction& By(std::string value) {
+        actor = std::move(value);
+        return *this;
+    }
+
+    EvictDiskReplicaAction& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    EvictDiskReplicaAction& OfType(ReplicaType value) {
+        replica_type = value;
+        return *this;
+    }
+
+    EvictDiskReplicaAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+EvictDiskReplicaAction EvictDiskReplica(std::string key);
+
 struct RacePutStartAction {
     std::string key;
     uint64_t size;
@@ -1277,6 +1431,133 @@ struct RacePutStartAction {
 };
 
 RacePutStartAction RacePutStart(std::string key, uint64_t size);
+
+struct RaceMountUnmountAction {
+    std::string prefix;
+    size_t node_count{4};
+    size_t iterations{100};
+    uint64_t capacity{16 * 1024 * 1024};
+    size_t expected_min_cycles{1};
+
+    RaceMountUnmountAction& Nodes(size_t value) {
+        node_count = value;
+        return *this;
+    }
+
+    RaceMountUnmountAction& Iterations(size_t value) {
+        iterations = value;
+        return *this;
+    }
+
+    RaceMountUnmountAction& EachOfCapacity(uint64_t value) {
+        capacity = value;
+        return *this;
+    }
+
+    RaceMountUnmountAction& ExpectCyclesAtLeast(size_t value) {
+        expected_min_cycles = value;
+        return *this;
+    }
+};
+
+RaceMountUnmountAction RaceMountUnmount(std::string prefix);
+
+struct RaceMountLocalDiskAction {
+    std::string prefix;
+    size_t client_count{100};
+
+    RaceMountLocalDiskAction& Clients(size_t value) {
+        client_count = value;
+        return *this;
+    }
+};
+
+RaceMountLocalDiskAction RaceMountLocalDisk(std::string prefix);
+
+struct RaceWritesWithRemoveAllAction {
+    std::string prefix;
+    size_t writer_count{4};
+    size_t objects_per_writer{100};
+    uint64_t object_size{1024};
+    std::string actor{"default"};
+    std::string tenant{TenantId::Default().value()};
+
+    RaceWritesWithRemoveAllAction& Writers(size_t value) {
+        writer_count = value;
+        return *this;
+    }
+
+    RaceWritesWithRemoveAllAction& ObjectsPerWriter(size_t value) {
+        objects_per_writer = value;
+        return *this;
+    }
+
+    RaceWritesWithRemoveAllAction& OfSize(uint64_t value) {
+        object_size = value;
+        return *this;
+    }
+
+    RaceWritesWithRemoveAllAction& By(std::string value) {
+        actor = std::move(value);
+        return *this;
+    }
+
+    RaceWritesWithRemoveAllAction& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+};
+
+RaceWritesWithRemoveAllAction RaceWritesWithRemoveAll(std::string prefix);
+
+struct RaceReadsWithRemoveAllAction {
+    std::vector<std::string> keys;
+    std::string tenant{TenantId::Default().value()};
+    size_t reader_count{4};
+    std::chrono::milliseconds final_remove_after{std::chrono::milliseconds(0)};
+    std::optional<size_t> expected_total_removed{};
+
+    RaceReadsWithRemoveAllAction& Readers(size_t value) {
+        reader_count = value;
+        return *this;
+    }
+
+    RaceReadsWithRemoveAllAction& ForTenant(std::string value) {
+        tenant = std::move(value);
+        return *this;
+    }
+
+    RaceReadsWithRemoveAllAction& FinalRemoveAfter(
+        std::chrono::milliseconds value) {
+        final_remove_after = value;
+        return *this;
+    }
+
+    RaceReadsWithRemoveAllAction& ExpectTotalRemoved(size_t value) {
+        expected_total_removed = value;
+        return *this;
+    }
+};
+
+RaceReadsWithRemoveAllAction RaceReadsWithRemoveAll(
+    std::vector<std::string> keys);
+
+struct RaceRemoveAllAction {
+    size_t caller_count{2};
+    std::optional<size_t> expected_total_removed{};
+
+    RaceRemoveAllAction& Callers(size_t value) {
+        caller_count = value;
+        return *this;
+    }
+
+    RaceRemoveAllAction& ExpectTotalRemoved(size_t value) {
+        expected_total_removed = value;
+        return *this;
+    }
+};
+
+RaceRemoveAllAction RaceRemoveAll();
 
 enum class ObjectExpectation {
     UNSPECIFIED,
@@ -1893,7 +2174,18 @@ class MasterScenario {
     MasterScenario& When(WaitForOpLogFailureAction action);
     MasterScenario& When(PingAction action);
     MasterScenario& When(MountMemoryNodeAction action);
+    MasterScenario& When(MountLocalDiskAction action);
+    MasterScenario& When(UnmountLocalDiskAction action);
+    MasterScenario& When(ReportSsdCapacityAction action);
+    MasterScenario& When(OffloadHeartbeatAction action);
+    MasterScenario& When(CompleteOffloadAction action);
+    MasterScenario& When(EvictDiskReplicaAction action);
     MasterScenario& When(RacePutStartAction action);
+    MasterScenario& When(RaceMountUnmountAction action);
+    MasterScenario& When(RaceMountLocalDiskAction action);
+    MasterScenario& When(RaceWritesWithRemoveAllAction action);
+    MasterScenario& When(RaceReadsWithRemoveAllAction action);
+    MasterScenario& When(RaceRemoveAllAction action);
 
     template <ObjectExpectation expectation>
         requires(expectation != ObjectExpectation::UNSPECIFIED)

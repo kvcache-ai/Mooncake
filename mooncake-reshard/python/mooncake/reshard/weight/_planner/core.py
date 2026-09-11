@@ -13,7 +13,7 @@ from ...contracts import (
 )
 from ...geometry import boxes_exactly_cover
 from ..placement import WeightPlacementManifest
-from ..storage_manifest import StoredFragmentSnapshot, WeightManifest
+from ..storage_manifest import StoredFragmentSnapshot, StoredWeightManifest
 from ..types import ParallelRank, PlacementFragment, TensorDescriptor
 from . import geometry
 from .contracts import (
@@ -330,7 +330,7 @@ def _logical_transfer_plan(
     source_tensors: dict[TensorId, TensorDescriptor],
     target_tensors: dict[TensorId, TensorDescriptor],
     source_placement: Optional[WeightPlacementManifest],
-    source_manifest: Optional[WeightManifest],
+    source_manifest: Optional[StoredWeightManifest],
     target_placement: WeightPlacementManifest,
     source_participant_ids: Optional[frozenset[ParticipantId]] = None,
     target_participant_ids: Optional[frozenset[ParticipantId]] = None,

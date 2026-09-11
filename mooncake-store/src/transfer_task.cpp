@@ -12,6 +12,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "config/transfer_submitter_config.h"
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -959,29 +960,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
     // When not set, auto-detect based on transport type:
     //   - TCP-only environment: enable memcpy (avoids TCP loopback overhead)
     //   - RDMA/other transports: disable memcpy (RDMA is more efficient)
-    const char* env_value = std::getenv("MC_STORE_MEMCPY");
-    if (env_value == nullptr) {
+    const auto config = TransferSubmitterConfig::FromEnvironment();
+    if (config.memcpy_enabled_override.has_value()) {
+        memcpy_enabled_ = *config.memcpy_enabled_override;
+    } else {
         memcpy_enabled_ = engine_.isTcpOnly();
         LOG(INFO) << "MC_STORE_MEMCPY not set, auto-detected: "
                   << (memcpy_enabled_ ? "TCP-only environment, memcpy enabled"
                                       : "non-TCP transport available, memcpy "
                                         "disabled");
-    } else {
-        std::string env_str(env_value);
-        // Convert to lowercase for case-insensitive comparison
-        std::transform(env_str.begin(), env_str.end(), env_str.begin(),
-                       [](unsigned char c) { return std::tolower(c); });
-        if (env_str == "false" || env_str == "0" || env_str == "no" ||
-            env_str == "off") {
-            memcpy_enabled_ = false;
-        } else if (env_str == "true" || env_str == "1" || env_str == "yes" ||
-                   env_str == "on") {
-            memcpy_enabled_ = true;
-        } else {
-            LOG(WARNING) << "Invalid value for MC_STORE_MEMCPY: " << env_str
-                         << ", defaulting to enabled";
-            memcpy_enabled_ = true;
-        }
     }
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="

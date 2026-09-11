@@ -12,7 +12,7 @@
 #include "master_service.h"
 #include "rpc_helper.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "version.h"
 
 namespace mooncake {
@@ -92,6 +92,15 @@ WrappedMasterService::WrappedMasterService(
 }
 
 WrappedMasterService::~WrappedMasterService() = default;
+
+void WrappedMasterService::SetBatchOpLogTerminalCallback(
+    OrderedOpLogWriter::TerminalCallback callback) {
+    master_service_.SetBatchOpLogTerminalCallback(std::move(callback));
+}
+
+void WrappedMasterService::StopBatchOpLogWriter() {
+    master_service_.StopBatchOpLogWriter();
+}
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 WrappedMasterService::CalcCacheStats() {
@@ -1688,6 +1697,15 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     return result;
 }
 
+tl::expected<int, ErrorCode> WrappedMasterService::GetDfsShardCount() const {
+    return master_service_.GetDfsShardCount();
+}
+
+tl::expected<int, ErrorCode> WrappedMasterService::ExpandDfsShards(
+    int shard_count) {
+    return master_service_.ExpandDfsShards(shard_count);
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     return master_service_.CreateDrainJob(request);
@@ -1727,6 +1745,13 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbySegmentInfo>& segments) {
     return master_service_.RestoreFromStandbySnapshot(
         objects, initial_oplog_sequence_id, segments);
+}
+
+tl::expected<void, ErrorCode>
+WrappedMasterService::RestoreFromBatchOpLogPromotion(
+    BatchOpLogPromotionHandoff handoff, size_t chunk_object_count) {
+    return master_service_.RestoreFromBatchOpLogPromotion(std::move(handoff),
+                                                          chunk_object_count);
 }
 
 void RegisterRpcService(

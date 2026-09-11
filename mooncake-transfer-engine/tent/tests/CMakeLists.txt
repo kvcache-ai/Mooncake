@@ -24,6 +24,16 @@ target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 
+# TENT configuration lifecycle foundation test. This target deliberately links
+# only tent_common so it remains independent of transport hardware and runtime
+# services.
+add_executable(config_lifecycle_test config_lifecycle_test.cpp)
+target_link_libraries(config_lifecycle_test PRIVATE tent_common gtest
+                                                    gtest_main)
+target_include_directories(config_lifecycle_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME config_lifecycle_test COMMAND config_lifecycle_test)
+
 # TENT Metrics HTTP server test: validates that initialize() detects a busy
 # metrics port and degrades to log-only metrics instead of falsely reporting a
 # listening endpoint.
@@ -140,6 +150,13 @@ target_include_directories(tent_qp_pool_layout_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_qp_pool_layout_test COMMAND tent_qp_pool_layout_test)
 
+add_executable(tent_ticket_lock_test ticket_lock_test.cpp)
+target_link_libraries(tent_ticket_lock_test PRIVATE tent_common gtest
+                                                    gtest_main)
+target_include_directories(tent_ticket_lock_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_ticket_lock_test COMMAND tent_ticket_lock_test)
+
 add_executable(tent_coalesce_regions_test coalesce_regions_test.cpp)
 target_link_libraries(tent_coalesce_regions_test PRIVATE tent_common gtest
                                                          gtest_main)
@@ -164,6 +181,13 @@ target_include_directories(request_merge_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
 
+add_executable(local_notification_test local_notification_test.cpp)
+target_link_libraries(local_notification_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(local_notification_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME local_notification_test COMMAND local_notification_test)
+
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
@@ -183,6 +207,16 @@ target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
+
+add_executable(tent_tcp_regression_test tcp_regression_test.cpp)
+target_link_libraries(tent_tcp_regression_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_tcp_regression_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_tcp_regression_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_tcp_regression_test COMMAND tent_tcp_regression_test)
 
 add_executable(tent_hp_tcp_transport_config_test
                hp_tcp_transport_config_test.cpp)
@@ -234,11 +268,14 @@ target_link_libraries(tent_hp_tcp_e2e_test PRIVATE gtest gtest_main
                                                    tent_link_group)
 target_include_directories(tent_hp_tcp_e2e_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-add_test(
-  NAME tent_hp_tcp_e2e_test_concurrency_16
-  COMMAND tent_hp_tcp_e2e_test
-          --gtest_filter=HighPerformanceTcpE2eTest.WriteThenReadConcurrency16)
-set_tests_properties(tent_hp_tcp_e2e_test_concurrency_16 PROPERTIES TIMEOUT 120)
+# Each fork-based case starts before earlier cases can create runtime threads.
+foreach(case WriteThenReadConcurrency16 WriteThenReadAcrossTwoRails
+             UnevenSlicedReadAcrossProcesses)
+  add_test(NAME tent_hp_tcp_e2e_${case}
+           COMMAND tent_hp_tcp_e2e_test
+                   --gtest_filter=HighPerformanceTcpE2eTest.${case})
+  set_tests_properties(tent_hp_tcp_e2e_${case} PROPERTIES TIMEOUT 120)
+endforeach()
 
 add_executable(tent_tcp_datapath_roundtrip_test tcp_datapath_roundtrip_test.cpp)
 target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
@@ -432,8 +469,8 @@ target_include_directories(tent_rail_monitor_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rail_monitor_test COMMAND tent_rail_monitor_test)
 
-# DeviceSelector inflight quota accounting: estimate->exact reconcile, fallback
-# migration, retry recharge, baseline no-underflow, EWMA gating, charge-failure.
+# DeviceSelector inflight quota accounting: per-slice charge/release balance,
+# chargeDevice, baseline no-underflow, EWMA gating, charge-failure.
 add_executable(tent_quota_accounting_test quota_accounting_test.cpp)
 target_link_libraries(tent_quota_accounting_test PRIVATE gtest gtest_main
                                                          tent_link_group)
@@ -615,10 +652,9 @@ target_include_directories(tent_runtime_queue_dispatch_test
 add_test(NAME tent_runtime_queue_dispatch_test
          COMMAND tent_runtime_queue_dispatch_test)
 
-add_executable(tent_local_memory_lifecycle_test
-               local_memory_lifecycle_test.cpp)
-target_link_libraries(tent_local_memory_lifecycle_test
-                      PRIVATE gtest gtest_main tent_link_group)
+add_executable(tent_local_memory_lifecycle_test local_memory_lifecycle_test.cpp)
+target_link_libraries(tent_local_memory_lifecycle_test PRIVATE gtest gtest_main
+                                                               tent_link_group)
 if(TARGET asio_shared)
   target_link_libraries(tent_local_memory_lifecycle_test PRIVATE asio_shared)
 endif()

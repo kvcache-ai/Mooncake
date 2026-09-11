@@ -83,6 +83,7 @@ class OrderedOpLogWriter {
     bool IsAccepting() const;
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
+    void SetTerminalCallback(TerminalCallback callback);
     void Start();
     virtual void Stop();
 
