@@ -145,9 +145,10 @@ using NecGetDevicePciBdfFn = int (*)(int, uint32_t*, uint32_t*, uint8_t*,
 // "<domain>:<bus>" of the bridge a PCI device hangs off, e.g. "0000:b9" for a
 // device behind port 0000:b9:02.1.  Empty if it cannot be determined.
 //
-// This is the grouping that expresses PCIe-switch locality: on trn2.48xlarge
-// each switch carries two Neuron devices and two EFA NICs, and every device
-// under it shares this prefix.
+// This is the grouping that expresses PCIe locality: on trn2.48xlarge each of
+// the eight switches carries two Neuron devices and two EFA NICs, and on
+// trn1.32xlarge each of the four root buses carries four Neuron devices and two
+// EFA NICs.  Every device in a group shares this prefix.
 std::string pciParentBus(const std::string& bdf) {
     char resolved[PATH_MAX];
     if (!realpath(("/sys/bus/pci/devices/" + bdf).c_str(), resolved)) {
@@ -161,11 +162,30 @@ std::string pciParentBus(const std::string& bdf) {
     if (!parent) return std::string();
     std::string port(parent + 1);
 
+    // The parent comes in one of two shapes, and both have to be handled.
+    //
+    // Behind a PCIe switch it is another PCI function, "0000:b9:02.1"
+    // (trn2.48xlarge), and the switch is named by its "<domain>:<bus>".
+    // Directly off the root complex it is the host bridge, "pci0000:10"
+    // (trn1.32xlarge), which already *is* the "<domain>:<bus>" once the "pci"
+    // is dropped.  trn1 puts two EFA NICs and four Neuron devices on each of
+    // its four root buses with no switch in between, so rejecting the second
+    // shape returns no grouping at all for every device on the host, the caller
+    // degrades to using all NICs, and a NIC on the wrong root bus turns out to
+    // be far worse there than a NIC one switch away is on trn2: measured
+    // 82.71 GB/s grouped against 0.19 GB/s ungrouped, 16 devices inter-node.
+    const bool root_complex = port.compare(0, 3, "pci") == 0;
+    if (root_complex) port.erase(0, 3);
+
     // Keep "<domain>:<bus>", dropping the ":<slot>.<func>" of the port itself.
     auto first = port.find(':');
     if (first == std::string::npos) return std::string();
     auto second = port.find(':', first + 1);
-    if (second == std::string::npos) return std::string();
+    if (second == std::string::npos) {
+        // A root bus has no ":<slot>.<func>" to drop.  Accepted only in the
+        // root-complex form so that a malformed path cannot slip through.
+        return root_complex ? port : std::string();
+    }
     return port.substr(0, second);
 }
 
@@ -300,7 +320,20 @@ std::map<int, std::vector<std::string>> neuronNicAffinity() {
     }
 
     const auto nics_by_bus = efaNicsByParentBus();
-    if (nics_by_bus.empty()) return affinity;
+    if (nics_by_bus.empty()) {
+        // Warned about here and not only at the end of the function, because
+        // this is the likelier of the two ways to end up with no affinity and
+        // it used to be entirely silent.  A pciParentBus() that could not parse
+        // the host's sysfs layout took this branch for every NIC, and the sole
+        // visible effect was the throughput: on trn1.32xlarge, 0.19 GB/s where
+        // the same run with grouping gives 82.71.
+        LOG(WARNING)
+            << "Neuron: could not group any EFA NIC by its parent PCI bus, so "
+               "no device can be matched to a nearby NIC; Neuron transfers "
+               "will use all NICs and may run orders of magnitude slower than "
+               "they could";
+        return affinity;
+    }
 
     // Scanned rather than counted, and gaps are skipped rather than treated as
     // the end: the ordinals a container sees need not start at 0 or be
