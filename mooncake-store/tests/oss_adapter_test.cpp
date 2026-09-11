@@ -74,6 +74,7 @@ class ScriptedOssServer {
     struct Response {
         long status;
         std::string body;
+        std::string raw_response{};
     };
 
     explicit ScriptedOssServer(std::vector<Response> responses)
@@ -156,17 +157,20 @@ class ScriptedOssServer {
                 return;
             }
             requests_.push_back(ReadRequest(client));
-            const std::string status_text =
-                response.status == 204   ? "No Content"
-                : response.status == 206 ? "Partial Content"
-                                         : "OK";
-            const std::string response_data =
-                "HTTP/1.1 " + std::to_string(response.status) + " " +
-                status_text +
-                "\r\nContent-Type: application/xml\r\n"
-                "Content-Length: " +
-                std::to_string(response.body.size()) +
-                "\r\nConnection: close\r\n\r\n" + response.body;
+            std::string response_data = response.raw_response;
+            if (response_data.empty()) {
+                const std::string status_text =
+                    response.status == 204   ? "No Content"
+                    : response.status == 206 ? "Partial Content"
+                                             : "OK";
+                response_data =
+                    "HTTP/1.1 " + std::to_string(response.status) + " " +
+                    status_text +
+                    "\r\nContent-Type: application/xml\r\n"
+                    "Content-Length: " +
+                    std::to_string(response.body.size()) +
+                    "\r\nConnection: close\r\n\r\n" + response.body;
+            }
             if (!SendAll(client, response_data)) error_ = "send failed";
             close(client);
             if (!error_.empty()) return;
@@ -237,6 +241,59 @@ TEST(OssObjectStorageAdapterTest, ValidatesVectorAndRangeArguments) {
     auto invalid_offset = adapter.GetRange("key", nullptr, 1, -1);
     ASSERT_FALSE(invalid_offset);
     EXPECT_EQ(invalid_offset.error(), ErrorCode::INVALID_PARAMS);
+}
+
+TEST(OssObjectStorageAdapterTest, RejectsIgnoredRangeResponse) {
+    ScriptedOssServer server({
+        {200, "abcd", ""},
+    });
+    ScopedEnvironment environment;
+    environment.Set("MOONCAKE_OSS_ENDPOINT",
+                    "http://127.0.0.1:" + std::to_string(server.port()));
+    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    environment.Set("MOONCAKE_OSS_REGION", "region");
+    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
+    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+
+    OssObjectStorageAdapter adapter("/test-prefix/");
+    ASSERT_TRUE(adapter.Init());
+    std::array<char, 4> buffer{};
+    auto result = adapter.GetRange("key", buffer.data(), buffer.size(), 2);
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_READ_FAIL);
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
+
+    ASSERT_EQ(server.requests().size(), 1U);
+    EXPECT_NE(server.requests()[0].find("Range: bytes=2-5"),
+              std::string::npos);
+    EXPECT_NE(server.requests()[0].find("x-oss-range-behavior: standard"),
+              std::string::npos);
+}
+
+TEST(OssObjectStorageAdapterTest, ClearsHeadersAtResponseBoundaries) {
+    ScriptedOssServer server({
+        {200, "",
+         "HTTP/1.1 103 Early Hints\r\n"
+         "Content-Length: 123\r\n\r\n"
+         "HTTP/1.1 200 OK\r\n"
+         "Connection: close\r\n\r\n"},
+    });
+    ScopedEnvironment environment;
+    environment.Set("MOONCAKE_OSS_ENDPOINT",
+                    "http://127.0.0.1:" + std::to_string(server.port()));
+    environment.Set("MOONCAKE_OSS_BUCKET", "bucket");
+    environment.Set("MOONCAKE_OSS_REGION", "region");
+    environment.Set("MOONCAKE_OSS_PATH_STYLE", "true");
+    environment.Set("MOONCAKE_OSS_ANONYMOUS", "true");
+
+    OssObjectStorageAdapter adapter("/test-prefix/");
+    ASSERT_TRUE(adapter.Init());
+    auto result = adapter.GetSize("key");
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_READ_FAIL);
+    server.Wait();
+    ASSERT_TRUE(server.error().empty()) << server.error();
 }
 
 TEST(OssObjectStorageAdapterTest, IgnoresDfsOnlyConfiguration) {

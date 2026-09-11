@@ -160,7 +160,12 @@ size_t BodyCallback(char* data, size_t size, size_t count, void* user_data) {
 
 size_t HeaderCallback(char* data, size_t size, size_t count, void* user_data) {
     auto* headers = static_cast<std::map<std::string, std::string>*>(user_data);
-    std::string_view line(data, size * count);
+    const size_t length = size * count;
+    std::string_view line(data, length);
+    if (line.starts_with("HTTP/")) {
+        headers->clear();
+        return length;
+    }
     const size_t colon = line.find(':');
     if (colon != std::string_view::npos) {
         std::string name(line.substr(0, colon));
@@ -169,7 +174,7 @@ size_t HeaderCallback(char* data, size_t size, size_t count, void* user_data) {
         boost::algorithm::trim(value);
         (*headers)[std::move(name)] = std::move(value);
     }
-    return size * count;
+    return length;
 }
 
 struct IovecUploadContext {
@@ -339,16 +344,15 @@ std::string OssObjectStorageAdapter::BuildUrl(
 std::string OssObjectStorageAdapter::BuildAuthorization(
     const std::string& method, const std::string& physical_key,
     const std::map<std::string, std::string>& query,
-    const std::string& timestamp) const {
+    const std::string& timestamp,
+    const std::map<std::string, std::string>& oss_headers) const {
     const std::string date = timestamp.substr(0, 8);
     const std::string canonical_uri =
         UriEncode("/" + bucket_ + "/" + physical_key, true);
-    std::string canonical_headers = "x-oss-content-sha256:UNSIGNED-PAYLOAD\n";
-    canonical_headers += "x-oss-date:" + timestamp + "\n";
-    if (!security_token_.empty()) {
-        canonical_headers += "x-oss-security-token:" +
-                             boost::algorithm::trim_copy(security_token_) +
-                             "\n";
+    std::string canonical_headers;
+    for (const auto& [name, value] : oss_headers) {
+        canonical_headers +=
+            name + ":" + boost::algorithm::trim_copy(value) + "\n";
     }
     // OSS V4 signs Content-Type, Content-MD5, and x-oss-* headers by
     // default. AdditionalHeaders is therefore empty because this request
@@ -393,13 +397,20 @@ OssObjectStorageAdapter::Request(
     };
 
     const std::string timestamp = OssTimestamp().first;
-    add_header("x-oss-content-sha256: UNSIGNED-PAYLOAD");
-    add_header("x-oss-date: " + timestamp);
+    std::map<std::string, std::string> oss_headers{
+        {"x-oss-content-sha256", "UNSIGNED-PAYLOAD"},
+        {"x-oss-date", timestamp},
+    };
     if (!security_token_.empty())
-        add_header("x-oss-security-token: " + security_token_);
+        oss_headers["x-oss-security-token"] = security_token_;
+    if (!range.empty()) oss_headers["x-oss-range-behavior"] = "standard";
+    for (const auto& [name, value] : oss_headers) {
+        add_header(name + ": " + value);
+    }
     if (!anonymous_)
         add_header("Authorization: " +
-                   BuildAuthorization(method, physical_key, query, timestamp));
+                   BuildAuthorization(method, physical_key, query, timestamp,
+                                      oss_headers));
     add_header("Expect:");
     add_header("Content-Type:");
     if (!range.empty()) add_header("Range: " + range);
@@ -498,7 +509,7 @@ tl::expected<size_t, ErrorCode> OssObjectStorageAdapter::GetRange(
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
         return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
-    if (!IsSuccess(response->status) || response->body.size() != len)
+    if (response->status != 206 || response->body.size() != len)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     if (len > 0) std::memcpy(buf, response->body.data(), len);
     return len;

@@ -68,7 +68,8 @@ class OssObjectStorageAdapter : public ObjectStorageAdapter {
     std::string BuildAuthorization(
         const std::string& method, const std::string& physical_key,
         const std::map<std::string, std::string>& query,
-        const std::string& timestamp) const;
+        const std::string& timestamp,
+        const std::map<std::string, std::string>& oss_headers) const;
 
     std::string endpoint_;
     std::string bucket_;
