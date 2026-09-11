@@ -516,17 +516,16 @@ class MasterServiceTest : public ::testing::Test {
         const std::string& tenant_id = "default") {
         const TenantId normalized_tenant =
             service.ResolveRequestTenantId(TenantId(tenant_id));
-        // Group membership is single-sourced in the tenant's own object_index,
-        // so read it there (there is no global table).
+        // Group membership is single-sourced in the tenant's group index.
         auto tenant_handle = service.catalog_.Lookup(normalized_tenant);
         if (!tenant_handle) {
             return {};
         }
-        return tenant_handle->group_index.Members(group_id);
+        return tenant_handle->GroupMembers(group_id);
     }
 
     void ClearGroupStateForTest(MasterService& service) {
-        // Drop group membership from each tenant's object_index. Removing the
+        // Drop group membership from each tenant's group index. Removing the
         // last member erases the (now-empty) group.
         service.catalog_.Visit(
             [&](const TenantId&,
@@ -535,8 +534,8 @@ class MasterServiceTest : public ::testing::Test {
                 auto& tenant_state = *handle;
                 for (const auto& entry : tenant_state.SnapshotObjects()) {
                     if (!entry->group_id().empty()) {
-                        tenant_state.group_index.RemoveMember(entry->group_id(),
-                                                              entry->key());
+                        tenant_state.UnregisterGroupMember(entry->key(),
+                                                           entry->group_id());
                     }
                 }
             });

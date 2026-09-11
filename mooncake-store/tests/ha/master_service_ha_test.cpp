@@ -903,7 +903,7 @@ class MasterServiceHATest : public ::testing::Test {
         // barrier (snapshot held, client_mutex_ released) without racing the
         // async PutStart.
         auto tenant_handle = service.GetOrCreateTenantCatalogHandle(tenant_id);
-        return tenant_handle->object_index.LockRouteForTesting();
+        return tenant_handle->LockRouteForTesting();
     }
 
     template <typename CreateTask>

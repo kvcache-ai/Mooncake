@@ -4,8 +4,10 @@
 // the tenant's ObjectIndex plus quota and eviction-census bookkeeping.
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -19,15 +21,6 @@ namespace metadata {
 
 class TenantCatalog {
    public:
-    TenantQuotaHandle quota_account{nullptr};
-
-    // Primary per-tenant object index (key -> strong ObjectEntry handle) with
-    // a per-object mutation boundary (ObjectEntry::mutex).
-    ObjectIndex object_index;
-
-    // GroupIndex: group_id -> shared Lease + member keys.
-    GroupIndex group_index;
-
     // Publication transaction: wire the group lease and register membership
     // before publishing, rolling membership back if the publish fails — a
     // concurrently-pinned entry never observes a half-wired grouped member.
@@ -112,6 +105,52 @@ class TenantCatalog {
         group_index.RemoveMember(group_id, key);
     }
 
+    // Member keys of a group (empty when the group is absent).
+    std::vector<std::string> GroupMembers(const std::string& group_id) const {
+        return group_index.Members(group_id);
+    }
+
+    // --- Dynamic-replication lease surface ----------------------------------
+    // The lease table is keyed by proposal UUID (not by object key) and lives
+    // in ObjectIndex behind its own locks; reached only through these.
+    std::optional<ReplicaActionLease> FindDynamicReplicationLease(
+        const UUID& proposal_id) const {
+        return object_index.FindDynamicReplicationLease(proposal_id);
+    }
+    bool RemoveDynamicReplicationLease(const UUID& proposal_id) {
+        return object_index.RemoveDynamicReplicationLease(proposal_id);
+    }
+    void PutDynamicReplicationLease(const UUID& proposal_id,
+                                    ReplicaActionLease lease) {
+        object_index.PutDynamicReplicationLease(proposal_id, std::move(lease));
+    }
+    void EraseDynamicReplicationLeasesForObject(const std::string& key) {
+        object_index.EraseDynamicReplicationLeasesForObject(key);
+    }
+    void EraseExpiredDynamicReplicationLeases(
+        std::chrono::system_clock::time_point now) {
+        object_index.EraseExpiredDynamicReplicationLeases(now);
+    }
+    // Test introspection: true when any lease references `key`.
+    bool HasDynamicReplicationLeaseForKeyForTest(const std::string& key) const {
+        return object_index.HasDynamicReplicationLeaseForKeyForTest(key);
+    }
+    // Test introspection: hold the route lock exclusively (HA lock-order
+    // gating).
+    std::unique_lock<std::shared_mutex> LockRouteForTesting() const {
+        return object_index.LockRouteForTesting();
+    }
+
+    // --- Quota account binding ----------------------------------------------
+    void BindQuotaAccount(TenantQuotaHandle handle) {
+        quota_account = std::move(handle);
+    }
+    TenantQuotaHandle BoundQuotaAccount() const { return quota_account; }
+
+    // Restore path: re-account a restored object carrying >=1 completed
+    // LOCAL_DISK replica.
+    void AccountRestoredDiskObject() { disk_object_count.fetch_add(1); }
+
     // Rebuild group membership and shared-lease deadlines from object metadata
     // (snapshot / standby restore). Pass 1 aggregates the maximum restored
     // lease deadline per group so a grouped object is not left with a
@@ -151,10 +190,6 @@ class TenantCatalog {
             }
         }
     }
-
-    // Count of objects with >=1 completed LOCAL_DISK replica; the eviction
-    // base is ObjectCount() - disk_object_count.
-    std::atomic<long> disk_object_count{0};
 
     // Called after adding a LOCAL_DISK replica. Increments
     // disk_object_count if this is the first completed LOCAL_DISK
@@ -208,6 +243,19 @@ class TenantCatalog {
     }
 
    private:
+    // Primary per-tenant object index (key -> strong ObjectEntry handle) with
+    // a per-object mutation boundary (ObjectEntry::mutex).
+    ObjectIndex object_index;
+
+    // GroupIndex: group_id -> shared Lease + member keys.
+    GroupIndex group_index;
+
+    // Count of objects with >=1 completed LOCAL_DISK replica; the eviction
+    // base is ObjectCount() - disk_object_count.
+    std::atomic<long> disk_object_count{0};
+
+    TenantQuotaHandle quota_account{nullptr};
+
     mutable std::mutex promotion_candidate_keys_mutex_;
     std::unordered_set<std::string> promotion_candidate_keys_;
 };

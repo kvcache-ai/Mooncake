@@ -313,7 +313,7 @@ class MetadataScanBench {
                 std::chrono::duration<double, std::micro>>(pop_end -
                                                            pop_all_begin)
                 .count();
-        RunGroupIndexContention(*tenant_handle);
+        RunGroupIndexContention();
 
         LOG(INFO) << "index: upsert_total_us=" << index_upsert_us
                   << ", pop_none=" << none_popped << " in " << pop_none_us
@@ -407,11 +407,12 @@ class MetadataScanBench {
 
     static inline std::atomic<uint64_t> sink_work_{0};
 
-    // GroupIndex contention: N threads performing AddMember on
-    // distinct groups (the per-put publication path). Reports aggregate
-    // ops/s per thread count so the single-mutex serialization is visible.
-    static void RunGroupIndexContention(
-        mooncake::metadata::TenantCatalog& tenant_state) {
+    // GroupIndex contention: N threads performing AddMember on distinct
+    // groups (the per-put publication path), on a standalone instance — the
+    // contention properties belong to GroupIndex itself. Reports aggregate
+    // ops/s per thread count.
+    static void RunGroupIndexContention() {
+        mooncake::metadata::GroupIndex group_index;
         std::cout << "group_index_threads,member_add_ops_per_s" << std::endl;
         for (int threads : {1, 4, 16, 32}) {
             std::atomic<uint64_t> total_ops{0};
@@ -425,7 +426,7 @@ class MetadataScanBench {
                     while (!stop.load(std::memory_order_relaxed)) {
                         const std::string group =
                             prefix + std::to_string(ops % 4096);
-                        auto lease = tenant_state.group_index.AddMember(
+                        auto lease = group_index.AddMember(
                             group, "member_" + std::to_string(ops));
                         if (lease) {
                             ++ops;

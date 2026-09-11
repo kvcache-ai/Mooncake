@@ -177,8 +177,7 @@ class DynamicReplicationTest : public ::testing::Test {
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantCatalog();
         const bool has_lease =
-            tenant_state.object_index.HasDynamicReplicationLeaseForKeyForTest(
-                key);
+            tenant_state.HasDynamicReplicationLeaseForKeyForTest(key);
         auto entry = tenant_state.Get(key);
         if (!entry) {
             return has_lease;

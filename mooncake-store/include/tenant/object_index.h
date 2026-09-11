@@ -209,14 +209,11 @@ class ObjectIndex {
     }
 
    private:
-    friend class ::mooncake::MasterService;
-    // The HA fixture holds the route lock EXCLUSIVELY via LockRouteForTesting
-    // to gate PutStart at its first Pin for deterministic lock-order checks.
-    friend class ::mooncake::test::MasterServiceHATest;
-
     // Test-only seam: hold the route lock EXCLUSIVELY so concurrent
-    // Pin/Insert/Erase/Contains block at that boundary. Accessed by the
-    // friended HA test fixture directly.
+    // Get/Insert/Erase/Contains block at that boundary. Reached only through
+    // TenantCatalog::LockRouteForTesting().
+    friend class TenantCatalog;
+
     std::unique_lock<std::shared_mutex> LockRouteForTesting() const {
         return std::unique_lock<std::shared_mutex>(route_lock_);
     }

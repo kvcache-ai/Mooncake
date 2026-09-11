@@ -1579,8 +1579,8 @@ MasterService::GetOrCreateTenantCatalogHandle(const TenantId& tenant_id) {
     return catalog_.GetOrCreateTenant(tenant_id, [this, &tenant_id]() {
         auto handle = std::make_shared<metadata::TenantCatalog>();
         if (enable_multi_tenants_) {
-            handle->quota_account =
-                tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
+            handle->BindQuotaAccount(
+                tenant_quota_table_.GetOrCreateTenantHandle(tenant_id));
         }
         return handle;
     });
@@ -1591,8 +1591,9 @@ TenantQuotaHandle MasterService::GetBoundTenantQuotaHandle(
     if (!enable_multi_tenants_) {
         return nullptr;
     }
-    assert(tenant_state.quota_account != nullptr);
-    return tenant_state.quota_account;
+    auto account = tenant_state.BoundQuotaAccount();
+    assert(account != nullptr);
+    return account;
 }
 
 tl::expected<void, ErrorCode> MasterService::ChargeTenantQuota(
@@ -1667,14 +1668,14 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
     catalog_.Visit([&](const TenantId& tenant_id,
                        const std::shared_ptr<metadata::TenantCatalog>& handle) {
         auto& tenant_state = *handle;
-        tenant_state.quota_account =
-            tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
+        tenant_state.BindQuotaAccount(
+            tenant_quota_table_.GetOrCreateTenantHandle(tenant_id));
         auto objs = tenant_state.SnapshotObjects();
         for (const auto& entry : objs) {
             auto lk = entry->LockUnique();
             ObjectMetadata& metadata = entry->metadata();
             auto rebuild_result = metadata.quota_ledger.Rebuild(
-                tenant_state.quota_account,
+                tenant_state.BoundQuotaAccount(),
                 CompletedMemoryQuotaCharge(metadata));
             if (!rebuild_result) {
                 throw std::runtime_error(
@@ -1726,8 +1727,7 @@ MasterService::GroupEvictionResult MasterService::EvictGroupOrObject(
     }
     auto& tenant_state = *tenant_handle;
 
-    std::vector<std::string> member_keys =
-        tenant_state.group_index.Members(group_id);
+    std::vector<std::string> member_keys = tenant_state.GroupMembers(group_id);
     if (member_keys.empty()) {
         member_keys.push_back(key);
     }
@@ -8764,8 +8764,7 @@ void MasterService::ClearDynamicReplicationStateLocked(
     entry.dynamic_replication_pending.reset();
     entry.dynamic_replication_cooldown =
         std::chrono::steady_clock::time_point{};
-    tenant_state.object_index.EraseDynamicReplicationLeasesForObject(
-        entry.key());
+    tenant_state.EraseDynamicReplicationLeasesForObject(entry.key());
 }
 
 void MasterService::CleanupExpiredDynamicReplicationState() {
@@ -8809,7 +8808,7 @@ void MasterService::CleanupExpiredDynamicReplicationState() {
             }
             ClearDynamicReplicationStateLocked(tenant_state, *object_entry);
         }
-        tenant_state.object_index.EraseExpiredDynamicReplicationLeases(
+        tenant_state.EraseExpiredDynamicReplicationLeases(
             std::chrono::system_clock::now());
     });
 }
@@ -9021,8 +9020,7 @@ MasterService::SubmitReplicaActionProposalLocked(
 
     auto& tenant_state = accessor.GetTenantCatalog();
     auto object_entry = accessor.GetEntry();
-    auto existing_lease =
-        tenant_state.object_index.FindDynamicReplicationLease(proposal_id);
+    auto existing_lease = tenant_state.FindDynamicReplicationLease(proposal_id);
     if (existing_lease.has_value()) {
         if (existing_lease->expire_at_ms_epoch >= now_ms) {
             const bool same_request =
@@ -9042,7 +9040,7 @@ MasterService::SubmitReplicaActionProposalLocked(
             }
             return *existing_lease;
         }
-        tenant_state.object_index.RemoveDynamicReplicationLease(proposal_id);
+        tenant_state.RemoveDynamicReplicationLease(proposal_id);
     }
 
     if (!DynamicReplicationHeatAdmitted(object_id)) {
@@ -9134,7 +9132,7 @@ MasterService::SubmitReplicaActionProposalLocked(
             std::chrono::steady_clock::now() +
             kDynamicReplicationActionCooldown;
     }
-    tenant_state.object_index.PutDynamicReplicationLease(proposal_id, lease);
+    tenant_state.PutDynamicReplicationLease(proposal_id, lease);
     return lease;
 }
 
@@ -12458,7 +12456,7 @@ MasterService::MetadataSerializer::DeserializeTenant(
         if (restored_metadata.HasReplica([](const Replica& r) {
                 return r.is_local_disk_replica() && r.is_completed();
             })) {
-            tenant_state.disk_object_count.fetch_add(1);
+            tenant_state.AccountRestoredDiskObject();
         }
     }
 
