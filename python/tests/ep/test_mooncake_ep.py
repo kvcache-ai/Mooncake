@@ -1,5 +1,4 @@
 import random
-import os
 import torch
 import torch.distributed as dist
 from functools import partial
@@ -13,14 +12,6 @@ from ep_test_utils import (
     hash_tensor,
     per_token_cast_back,
 )
-
-_USE_MACA = os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
-    "1",
-    "ON",
-    "TRUE",
-    "YES",
-} or bool(getattr(torch.version, "maca", None))
-
 
 def test_main(
     num_tokens: int,
@@ -69,7 +60,7 @@ def test_main(
     hash_value, num_times = 0, 0
     active_ranks = torch.ones((num_tokens,), dtype=torch.int32, device="cuda")
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in [False] if _USE_MACA else [False, True]:
+        for dispatch_use_fp8 in [False, True]:
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = buffer.dispatch(
@@ -149,37 +140,31 @@ def test_main(
                 else:
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
-            # Check combine correctness
-            for zero_copy in (False, True):
-                if zero_copy:
-                    buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
-                out = torch.empty(
-                    (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
+            # Check combine correctness using the supported regular input path.
+            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+            combined_x, event, hook = buffer.combine(
+                simulated_gemm_x,
+                topk_idx,
+                topk_weights,
+                active_ranks,
+                -1,
+                handle,
+                async_finish=not return_recv_hook,
+                return_recv_hook=return_recv_hook,
+                out=out,
+            )
+            hook() if return_recv_hook else event.current_stream_wait()
+            if do_check:
+                diff = calc_diff(
+                    x
+                    * topk_weights.masked_fill(topk_idx == -1, 0)
+                    .sum(dim=1)
+                    .view(-1, 1),
+                    combined_x,
                 )
-                combined_x, event, hook = buffer.combine(
-                    simulated_gemm_x,
-                    topk_idx,
-                    topk_weights,
-                    active_ranks,
-                    -1,
-                    handle,
-                    async_finish=not return_recv_hook,
-                    zero_copy=zero_copy,
-                    return_recv_hook=return_recv_hook,
-                    out=out,
-                )
-                hook() if return_recv_hook else event.current_stream_wait()
-                if do_check:
-                    diff = calc_diff(
-                        x
-                        * topk_weights.masked_fill(topk_idx == -1, 0)
-                        .sum(dim=1)
-                        .view(-1, 1),
-                        combined_x,
-                    )
-                    assert torch.isnan(combined_x).sum().item() == 0
-                    assert diff < 1e-5, f"Error: {diff=}, {zero_copy=}"
-                    hash_value ^= hash_tensor(combined_x)
+                assert torch.isnan(combined_x).sum().item() == 0
+                assert diff < 1e-5, f"Error: {diff=}"
+                hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -189,7 +174,7 @@ def test_main(
         hook()
 
     # noinspection PyShadowingNames
-    def test_func(zero_copy: bool, return_recv_hook: bool):
+    def test_func(return_recv_hook: bool):
         recv_x, recv_count, handle, event, hook = buffer.dispatch(
             x,
             topk_idx,
@@ -201,8 +186,6 @@ def test_main(
             return_recv_hook=return_recv_hook,
         )
         large_gemm_with_hook(hook) if return_recv_hook else None
-        if zero_copy:
-            buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
         combined_x, event, hook = buffer.combine(
             simulated_gemm_x,
             topk_idx,
@@ -210,7 +193,6 @@ def test_main(
             active_ranks,
             -1,
             handle,
-            zero_copy=zero_copy,
             return_recv_hook=return_recv_hook,
         )
         large_gemm_with_hook(hook) if return_recv_hook else None
@@ -225,7 +207,7 @@ def test_main(
 
     # Dispatch + combine testing
     avg_t, min_t, max_t = bench(
-        partial(test_func, zero_copy=False, return_recv_hook=False)
+        partial(test_func, return_recv_hook=False)
     )
     print(
         f"[rank {rank}] Dispatch + combine bandwidth: {(num_dispatch_comm_bytes + num_combine_comm_bytes) / 1e9 / avg_t:.2f} GB/s, "
@@ -239,7 +221,7 @@ def test_main(
         for return_recv_hook in (False, True):
             group.barrier()
             dispatch_t, combine_t = bench_kineto(
-                partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                partial(test_func, return_recv_hook=return_recv_hook),
                 kernel_names=("dispatch", "combine"),
                 barrier_comm_profiling=True,
                 suppress_kineto_output=True,

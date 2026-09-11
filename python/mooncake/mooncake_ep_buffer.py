@@ -406,8 +406,6 @@ class Buffer:
 
         if use_fp8 is None:
             use_fp8 = not _USE_MACA
-        elif _USE_MACA and use_fp8:
-            raise NotImplementedError("FP8 dispatch is not supported on MACA")
 
         # MUSA and MACA use split SEND/RECV launches because they do not expose
         # CUDA cooperative-grid synchronization. Only MACA adds a phase fence.

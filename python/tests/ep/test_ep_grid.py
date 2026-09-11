@@ -22,15 +22,6 @@ def using_musa_backend() -> bool:
     }
 
 
-def using_maca_backend() -> bool:
-    return os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
-        "1",
-        "ON",
-        "TRUE",
-        "YES",
-    } or bool(getattr(torch.version, "maca", None))
-
-
 def import_torchada_if_needed():
     if not using_musa_backend():
         return
@@ -59,7 +50,6 @@ def run_test_iteration(
     num_experts: int,
     top_k: int,
     use_fp8: bool,
-    zero_copy: bool,
     async_finish: bool,
     return_recv_hook: bool,
     use_fallback: bool,
@@ -175,12 +165,7 @@ def run_test_iteration(
     expert_out = expert_out.to(torch.bfloat16)
 
     # Combine
-    if zero_copy:
-        cb_buf = buf.get_next_combine_buffer(handle)
-        cb_buf.copy_(expert_out)
-        expert_to_pass = cb_buf.contiguous()
-    else:
-        expert_to_pass = expert_out.contiguous()
+    expert_to_pass = expert_out.contiguous()
 
     out_tensor = torch.zeros_like(x)
     combined_x, event, hook = buf.combine(
@@ -190,7 +175,6 @@ def run_test_iteration(
         active_ranks,
         timeout_us=timeout_us,
         handle=handle,
-        zero_copy=zero_copy,
         async_finish=async_finish,
         return_recv_hook=return_recv_hook,
         out=out_tensor,
@@ -290,7 +274,6 @@ def run_stale_data_test(
         num_experts=num_experts,
         top_k=top_k,
         use_fp8=False,
-        zero_copy=False,
         async_finish=True,
         return_recv_hook=False,
         use_fallback=False,
@@ -409,7 +392,19 @@ def stale_data_worker(rank, world_size):
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
         import_torchada_if_needed()
-        self.world_size = torch.cuda.device_count()
+        requested_world_size = os.getenv("MOONCAKE_EP_TEST_WORLD_SIZE")
+        self.world_size = (
+            int(requested_world_size)
+            if requested_world_size
+            else torch.cuda.device_count()
+        )
+        visible_devices = torch.cuda.device_count()
+        if self.world_size < 2:
+            raise unittest.SkipTest("EP tests require at least two accelerator devices")
+        if self.world_size > visible_devices:
+            raise unittest.SkipTest(
+                f"Requested world size {self.world_size} exceeds {visible_devices} visible devices"
+            )
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
@@ -438,8 +433,6 @@ def make_test_name(cfg):
     flags = []
     if cfg["use_fp8"]:
         flags.append("fp8")
-    if cfg["zero_copy"]:
-        flags.append("0copy")
     if cfg["async_finish"]:
         flags.append("async")
     if cfg["return_recv_hook"]:
@@ -469,10 +462,9 @@ def make_test_name(cfg):
 
 
 def generate_tests():
-    fp8_options = [False] if using_maca_backend() else [False, True]
+    fp8_options = [False, True]
     test_grid = {
         "use_fp8": fp8_options,
-        "zero_copy": [False],
         "async_finish": [False, True],
         "return_recv_hook": [False, True],
         "use_fallback": [False, True],
