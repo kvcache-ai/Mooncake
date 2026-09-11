@@ -9,6 +9,7 @@ gds = []
 # Opt-in dynamic link to the KVCS public C ABI. The vendor SDK stays outside Cargo's dependency
 # graph and is validated by build.rs only when this feature is enabled.
 kvcs-capi = []
+nof-spdk = []
 
 [dependencies]
 libc = "0.2"

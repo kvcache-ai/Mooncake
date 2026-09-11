@@ -3,6 +3,10 @@ name = "mooncake-store-e2e"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+nof-spdk = ["mooncake-store-client/nof-spdk"]
+
 [dependencies]
 mooncake-metadata = { path = "../mooncake-metadata" }
 mooncake-store-client = { path = "../mooncake-store-client" }

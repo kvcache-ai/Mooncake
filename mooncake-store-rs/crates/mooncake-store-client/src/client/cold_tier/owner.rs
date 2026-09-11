@@ -505,8 +505,8 @@ fn remote_unhealthy_targets(
                 return None;
             }
             match unhealthy_by_owner.get(owner) {
-                Some(Some(unhealthy)) if !unhealthy.contains(target_id) => None,
-                _ => Some(target_id.clone()),
+                Some(Some(unhealthy)) if unhealthy.contains(target_id) => Some(target_id.clone()),
+                _ => None,
             }
         })
         .collect()

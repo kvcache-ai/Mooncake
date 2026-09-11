@@ -748,6 +748,7 @@ fn execute_restore_promotion(client: &StoreClient, task: &RestorePromotionTask) 
         })
         .collect();
     next.cold_backing = task.current.cold_backing.clone();
+    next.nof_backing = task.current.nof_backing.clone();
     mooncake_store_core::apply_route_identity(&mut next, &task.object_id);
     next.qos_tier = task.qos_tier.clone();
 

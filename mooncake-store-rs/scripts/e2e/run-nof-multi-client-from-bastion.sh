@@ -36,7 +36,8 @@ RUN_UNIT_TESTS="${NOF_RUN_UNIT_TESTS:-0}"
 RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 STAGE_DIR="${NOF_STAGE_DIR:-/tmp/nof-multi-client-${RUN_TAG}}"
 BINARY_NAME="nof_multi_client"
-BINARY_RELATIVE_PATH="target/${BUILD_PROFILE}/${BINARY_NAME}"
+BUILD_TARGET_DIR="${NOF_BUILD_TARGET_DIR:-/tmp/mooncake-nof-build-${RUN_TAG}}"
+BINARY_REMOTE_PATH="${BUILD_TARGET_DIR}/${BUILD_PROFILE}/${BINARY_NAME}"
 TARGETS=()
 
 case "${BUILD_PROFILE}" in
@@ -62,7 +63,7 @@ mkdir -p "${STAGE_DIR}"
 
 echo "building on ${BUILD_HOST}:${BUILD_ROOT}"
 ssh -o BatchMode=yes -o ConnectTimeout=8 "${BUILD_HOST}" \
-  "cd '${BUILD_ROOT}' && MOONCAKE_SPDK_PREFIX='${SPDK_PREFIX}' MOONCAKE_ENABLE_CUDA=0 NOF_BUILD_PROFILE='${BUILD_PROFILE}' NOF_RUN_UNIT_TESTS='${RUN_UNIT_TESTS}' scripts/e2e/build-nof-multi-client.sh"
+  "cd '${BUILD_ROOT}' && CARGO_TARGET_DIR='${BUILD_TARGET_DIR}' MOONCAKE_SPDK_PREFIX='${SPDK_PREFIX}' MOONCAKE_ENABLE_CUDA=0 NOF_BUILD_PROFILE='${BUILD_PROFILE}' NOF_RUN_UNIT_TESTS='${RUN_UNIT_TESTS}' scripts/e2e/build-nof-multi-client.sh"
 
 echo "resetting provisioned NoF images"
 for target in "${TARGETS[@]}"; do
@@ -73,7 +74,7 @@ done
 
 echo "staging binary and runner via rsync"
 rsync -a -e 'ssh -o BatchMode=yes' \
-  "${BUILD_HOST}:${BUILD_ROOT}/${BINARY_RELATIVE_PATH}" \
+  "${BUILD_HOST}:${BINARY_REMOTE_PATH}" \
   "${STAGE_DIR}/nof_multi_client"
 rsync -a -e 'ssh -o BatchMode=yes' \
   "${BUILD_HOST}:${BUILD_ROOT}/scripts/e2e/run-nof-multi-client.sh" \

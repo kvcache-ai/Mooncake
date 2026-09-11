@@ -94,9 +94,10 @@ export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="${CARGO_TARGET_X86_64_UNKNO
 # Unit tests and the final binary use the same SPDK shared-library runtime.
 export LD_LIBRARY_PATH="${SPDK_LIB_DIR}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
 PROFILE="${NOF_BUILD_PROFILE:-debug}"
+TARGET_DIR="${CARGO_TARGET_DIR:-${ROOT_DIR}/target}"
 case "${PROFILE}" in
-  debug) PROFILE_ARGS=() ; BINARY="${ROOT_DIR}/target/debug/nof_multi_client" ;;
-  release) PROFILE_ARGS=(--release) ; BINARY="${ROOT_DIR}/target/release/nof_multi_client" ;;
+  debug) PROFILE_ARGS=() ; BINARY="${TARGET_DIR}/debug/nof_multi_client" ;;
+  release) PROFILE_ARGS=(--release) ; BINARY="${TARGET_DIR}/release/nof_multi_client" ;;
   *) echo "NOF_BUILD_PROFILE must be debug or release, got ${PROFILE}" >&2; exit 2 ;;
 esac
 

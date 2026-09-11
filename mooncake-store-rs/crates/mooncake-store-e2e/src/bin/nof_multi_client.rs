@@ -8,12 +8,12 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
-    init_tracing_from_env, ExtentStoreExecutor, ExtentStoreExecutorConfig, GetRequest,
-    LocalMemoryConfig, MooncakeCompatibilityFacade, NofBackend, NofTargetConfig, PutRequest,
-    RouteControlMode, SpdkNofBlockDevice, SpdkNofBlockDeviceConfig, StoreClientBuilder,
+    init_tracing_from_env, ColdTierOffloadMode, ExtentStoreExecutor, ExtentStoreExecutorConfig,
+    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, NofBackend, NofTargetConfig,
+    PutRequest, RouteControlMode, SpdkNofBlockDevice, SpdkNofBlockDeviceConfig, StoreClientBuilder,
     StoreTransport,
 };
-use mooncake_store_core::{ClientLifecycleState, NofBackingState, Result, StoreError};
+use mooncake_store_core::{ClientLifecycleState, ColdBackingState, Result, StoreError};
 use mooncake_transport::{
     SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
 };
@@ -440,12 +440,10 @@ fn wait_for_cold_only_routes(
             let route = client.query_route(key)?;
             let ready = route.as_ref().is_some_and(|route| {
                 route.replicas.is_empty()
-                    && route.nof_backing.as_ref().is_some_and(|backing| {
-                        backing
-                            .locations
-                            .iter()
-                            .any(|location| location.state == NofBackingState::Materialized)
-                    })
+                    && route
+                        .nof_backing
+                        .as_ref()
+                        .is_some_and(|backing| backing.state == ColdBackingState::Materialized)
             });
             if !ready {
                 pending.push(key.clone());
@@ -611,6 +609,7 @@ fn build_client(
         .local_memory(local_memory)
         .nof_targets(targets)
         .nof_replica_count(config.replica_count)
+        .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
         .route_control(config.route_control)
         .build(now_ms() + 600_000)?;
     client.register_local_memory()?;

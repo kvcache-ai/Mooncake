@@ -18,6 +18,11 @@ pub use client::cold_tier::nof::{
 };
 #[cfg(feature = "kvcs-capi")]
 pub use client::cold_tier::nof::{KvcsCapiExecutor, KvcsLowLevelClient, KvcsMode};
+
+#[cfg(feature = "nof-spdk")]
+pub use client::cold_tier::nof::extent_store::{
+    ExtentStoreExecutor, ExtentStoreExecutorConfig, SpdkNofBlockDevice, SpdkNofBlockDeviceConfig,
+};
 pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,
     ColdTierShutdownMode, ColdTierSsdEngine, ColdTierTarget, ColdTierTargetConfig,
