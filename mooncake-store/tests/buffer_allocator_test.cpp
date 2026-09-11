@@ -88,6 +88,82 @@ TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
     }
 }
 
+// Regression: a buffer must report the protocol of the segment it was
+// allocated from, not a hardcoded default. Otherwise descriptors built from
+// these buffers (e.g. /query_key) advertise "tcp" for an RDMA segment.
+TEST_F(BufferAllocatorTest, AllocatedBufferCarriesSegmentProtocol) {
+    const std::string segment_name = "protocol-segment";
+    const size_t size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
+    const size_t base = 0x100000000ULL;    // 4GB
+
+    for (const auto& allocator_type : allocator_types_) {
+        auto rdma =
+            CreateBufferAllocator(allocator_type, segment_name, base, size,
+                                  segment_name, ReplicaType::MEMORY, "rdma");
+        ASSERT_TRUE(rdma.has_value());
+        auto bufHandle = (*rdma)->allocate(1024);
+        ASSERT_NE(bufHandle, nullptr);
+        EXPECT_EQ(bufHandle->get_descriptor().protocol_, "rdma");
+
+        // Callers that do not pass a protocol keep the transfer default. A
+        // separate base keeps the two allocators off the same slabs.
+        auto legacy = CreateBufferAllocator(allocator_type, segment_name,
+                                            base + size, size, segment_name);
+        ASSERT_TRUE(legacy.has_value());
+        auto legacyHandle = (*legacy)->allocate(1024);
+        ASSERT_NE(legacyHandle, nullptr);
+        EXPECT_EQ(legacyHandle->get_descriptor().protocol_, "tcp");
+    }
+}
+
+// Regression: a segment mounted as "cxl" without CXL support on the master
+// falls through to the regular allocator. Its buffers are plain addresses
+// until change_to_cxl() runs, so they must not report "cxl": deallocate()
+// would otherwise free the CXL-encoded address instead of the real one.
+TEST_F(BufferAllocatorTest, CxlSegmentProtocolNotStampedOnFreshBuffers) {
+    const std::string segment_name = "cxl-protocol-segment";
+    const size_t size = 1024 * 1024 * 16;  // 16MB (multiple of 4MB)
+    const size_t base = 0x100000000ULL;    // 4GB
+
+    for (const auto& allocator_type : allocator_types_) {
+        auto allocator =
+            CreateBufferAllocator(allocator_type, segment_name, base, size,
+                                  segment_name, ReplicaType::MEMORY, "cxl");
+        ASSERT_TRUE(allocator.has_value());
+        auto bufHandle = (*allocator)->allocate(1024);
+        ASSERT_NE(bufHandle, nullptr);
+        EXPECT_EQ(bufHandle->get_descriptor().protocol_, "tcp");
+        bufHandle.reset();
+    }
+}
+
+// Regression: buffers rebuilt when a segment is remounted must carry the
+// mounted protocol too, otherwise a remount would silently reset it.
+TEST_F(BufferAllocatorTest, ImportedBuffersCarrySegmentProtocol) {
+    constexpr uintptr_t kBase = 0x1C0000000ULL;
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    const std::string segment = "protocol-restore";
+    const std::string endpoint = "protocol-restore-endpoint";
+
+    auto original = std::make_shared<OffsetBufferAllocator>(
+        segment, kBase, kCapacity, endpoint, ReplicaType::MEMORY, "rdma");
+    auto first = original->allocate(123);
+    ASSERT_NE(first, nullptr);
+    EXPECT_EQ(first->get_descriptor().protocol_, "rdma");
+
+    const std::vector<AllocatedBuffer::Descriptor> descriptors = {
+        first->get_descriptor()};
+    std::vector<LiveAllocation> allocations = {
+        ToLiveAllocation(kBase, descriptors[0])};
+
+    auto restored =
+        ImportOffsetBufferAllocator(segment, kBase, kCapacity, endpoint,
+                                    allocations, ReplicaType::MEMORY, "rdma");
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_EQ(restored->buffers.size(), descriptors.size());
+    EXPECT_EQ(restored->buffers[0]->get_descriptor().protocol_, "rdma");
+}
+
 // Test multiple allocations within the buffer
 TEST_F(BufferAllocatorTest, AllocateMultiple) {
     for (const auto& allocator_type : allocator_types_) {

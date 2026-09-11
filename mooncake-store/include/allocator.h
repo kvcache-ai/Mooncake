@@ -74,14 +74,11 @@ class AllocatedBuffer {
     // Forward declaration of the descriptor struct
     struct Descriptor;
 
+    // Defined in allocator.cpp, where BufferAllocatorBase is complete.
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
-                        offset_handle = std::nullopt)
-        : allocator_(std::move(allocator)),
-          buffer_ptr_(buffer_ptr),
-          size_(size),
-          offset_handle_(std::move(offset_handle)) {}
+                        offset_handle = std::nullopt);
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     const Descriptor& descriptor);
@@ -189,6 +186,14 @@ class BufferAllocatorBase {
     virtual std::string getTransportEndpoint() const = 0;
 
     /**
+     * Protocol the segment behind this allocator was mounted with ("tcp",
+     * "rdma", ...); buffers are stamped with it at construction. Not pure so
+     * that allocators serving no mounted segment (the dummy allocator,
+     * out-of-tree subclasses) keep the transfer default.
+     */
+    virtual std::string getTransferProtocol() const { return "tcp"; }
+
+    /**
      * Returns the largest free region available in this allocator.
      * For CacheLib allocators, this returns kAllocatorUnknownFreeSpace as an
      * approximation. For OffsetAllocator, this returns the actual largest free
@@ -275,10 +280,13 @@ class CachelibBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
+    // The default keeps older callers compiling; production callers must pass
+    // the mounted segment's protocol. See getTransferProtocol().
     static tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
     Create(std::string segment_name, size_t base, size_t size,
            std::string transport_endpoint,
-           ReplicaType replica_type = ReplicaType::MEMORY);
+           ReplicaType replica_type = ReplicaType::MEMORY,
+           std::string protocol = "tcp");
 
     ~CachelibBufferAllocator() override;
 
@@ -293,6 +301,7 @@ class CachelibBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    std::string getTransferProtocol() const override { return protocol_; }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -306,7 +315,7 @@ class CachelibBufferAllocator
    private:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
-                            ReplicaType replica_type);
+                            ReplicaType replica_type, std::string protocol);
 
     std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
         const LiveAllocation& allocation);
@@ -316,6 +325,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     const std::string transport_endpoint_;
     const ReplicaType replica_type_;
+    const std::string protocol_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -331,7 +341,7 @@ class CachelibBufferAllocator
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint,
         const std::vector<LiveAllocation>& allocations,
-        ReplicaType replica_type);
+        ReplicaType replica_type, std::string protocol);
 };
 
 struct RestoredCachelibBufferAllocator {
@@ -343,7 +353,8 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<LiveAllocation>& allocations,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    std::string protocol = "tcp");
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -356,7 +367,8 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
-                          ReplicaType replica_type = ReplicaType::MEMORY);
+                          ReplicaType replica_type = ReplicaType::MEMORY,
+                          std::string protocol = "tcp");
 
     ~OffsetBufferAllocator() override;
 
@@ -371,6 +383,7 @@ class OffsetBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    std::string getTransferProtocol() const override { return protocol_; }
 
     /**
      * Returns the actual largest free region from the offset allocator.
@@ -394,6 +407,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     const std::string transport_endpoint_;
     const ReplicaType replica_type_;
+    const std::string protocol_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
@@ -413,13 +427,15 @@ std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<LiveAllocation>& allocations,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    std::string protocol = "tcp");
 
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
                       std::string transport_endpoint,
-                      ReplicaType replica_type = ReplicaType::MEMORY);
+                      ReplicaType replica_type = ReplicaType::MEMORY,
+                      std::string protocol = "tcp");
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address
