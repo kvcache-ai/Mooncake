@@ -4221,9 +4221,10 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
-auto MasterService::AllocateReplicas(
-    const std::string& key, uint64_t value_length,
-    const ReplicateConfig& config, const std::string& writer_host_id)
+auto MasterService::AllocateReplicas(const std::string& key,
+                                     uint64_t value_length,
+                                     const ReplicateConfig& config,
+                                     const std::string& writer_host_id)
     -> tl::expected<std::vector<Replica>, ErrorCode> {
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
@@ -4394,8 +4395,7 @@ auto MasterService::InsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
-    const TenantId& tenant_id,
-    const std::chrono::system_clock::time_point& now,
+    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::vector<Replica>&& replicas, uint64_t pending_quota_charge,
     std::optional<std::chrono::system_clock::time_point>
@@ -4435,8 +4435,8 @@ auto MasterService::InsertMetadata(
                     << nof_desc.buffer_descriptor.transport_endpoint_;
         } else if (replica.is_dfs_replica()) {
             const auto& dfs_desc = desc.get_dfs_descriptor();
-            VLOG(1) << "Replica #" << ++i << ": dfs_file="
-                    << dfs_desc.file_path << ", offset=" << dfs_desc.offset
+            VLOG(1) << "Replica #" << ++i << ": dfs_file=" << dfs_desc.file_path
+                    << ", offset=" << dfs_desc.offset
                     << ", shard_idx=" << dfs_desc.shard_idx;
         }
     }

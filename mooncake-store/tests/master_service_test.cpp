@@ -648,15 +648,14 @@ TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     MasterService service(service_config);
 
     constexpr size_t kSegmentSize = 1024 * 1024;
-    const auto context =
-        PrepareSimpleSegment(service, "leased_upsert_segment",
-                             kDefaultSegmentBase, kSegmentSize);
+    const auto context = PrepareSimpleSegment(
+        service, "leased_upsert_segment", kDefaultSegmentBase, kSegmentSize);
     ReplicateConfig config;
     config.replica_num = 1;
 
     const std::string key = "leased_upsert_allocation_failure";
-    auto initial = service.PutStart(context.client_id, key,
-                                    TenantId::Default(), kSegmentSize, config);
+    auto initial = service.PutStart(context.client_id, key, TenantId::Default(),
+                                    kSegmentSize, config);
     ASSERT_TRUE(initial.has_value()) << toString(initial.error());
     ASSERT_TRUE(service
                     .PutEnd(context.client_id, key, TenantId::Default(),
@@ -668,21 +667,20 @@ TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     auto snapshot = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(snapshot.has_value());
 
-    auto failed = service.UpsertStart(context.client_id, key,
-                                      TenantId::Default(), kSegmentSize, config);
+    auto failed = service.UpsertStart(
+        context.client_id, key, TenantId::Default(), kSegmentSize, config);
     ASSERT_FALSE(failed.has_value());
     EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
     auto still_readable = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(still_readable.has_value());
     ASSERT_EQ(still_readable->replicas.size(), snapshot->replicas.size());
-    EXPECT_EQ(
-        still_readable->replicas[0]
-            .get_memory_descriptor()
-            .buffer_descriptor.buffer_address_,
-        snapshot->replicas[0]
-            .get_memory_descriptor()
-            .buffer_descriptor.buffer_address_);
+    EXPECT_EQ(still_readable->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              snapshot->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
 }
 
 // DFS replicas live in their own variant branch, so is_disk_replica() does not
