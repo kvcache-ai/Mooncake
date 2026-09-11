@@ -1870,6 +1870,8 @@ Status TransferEngineImpl::prepareSubmit(
     // particular, an UNSPEC request selected for RDMA/HP TCP keeps its own
     // transport's limits. Ordinary-size submissions need no extra route lookup
     // or allocation here, and a too-large single request remains independent.
+    // This bounds initial TCP selection only. A later route change/failover
+    // to TCP can still reject an oversized owner; it is not split on retry.
     if (merged.request_list.size() < request_list.size()) {
         std::vector<bool> tcp_limited;
         for (size_t i = 0; i < merged.request_list.size(); ++i) {
@@ -1877,7 +1879,7 @@ Status TransferEngineImpl::prepareSubmit(
             if (request.length <= tcpMaxTransferBytes(request.opcode)) continue;
             if (request.transport_hint == TCP ||
                 (request.transport_hint == UNSPEC &&
-                 resolveTransport(request, 0).transport == TCP)) {
+                 getTransportType(request, 0).transport == TCP)) {
                 if (tcp_limited.empty())
                     tcp_limited.resize(merged.request_list.size(), false);
                 tcp_limited[i] = true;
