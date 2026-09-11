@@ -356,6 +356,41 @@ TEST_F(RealClientTest, SessionRangesReadLocalDiskReplicasInOneBatch) {
                   sources[i].substr(kSecondOffset, kSecondSize));
     }
 
+    std::string duplicate_first(kFirstSize, '\0');
+    std::string duplicate_second(kSecondSize, '\0');
+    ASSERT_EQ(py_client_->register_buffer(duplicate_first.data(),
+                                          duplicate_first.size()),
+              0);
+    ASSERT_EQ(py_client_->register_buffer(duplicate_second.data(),
+                                          duplicate_second.size()),
+              0);
+    const auto duplicate_reads_before =
+        py_client_->get_offload_rpc_read_count();
+    EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  {keys[0], keys[0]},
+                  {{duplicate_first.data()}, {duplicate_second.data()}},
+                  {{duplicate_first.size()}, {duplicate_second.size()}},
+                  {{kFirstOffset}, {kSecondOffset}}),
+              (std::vector<int>{static_cast<int>(duplicate_first.size()),
+                                static_cast<int>(duplicate_second.size())}));
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(),
+              duplicate_reads_before + 1);
+    EXPECT_EQ(duplicate_first,
+              sources[0].substr(kFirstOffset, duplicate_first.size()));
+    EXPECT_EQ(duplicate_second,
+              sources[0].substr(kSecondOffset, duplicate_second.size()));
+
+    auto client_buffer_allocator =
+        std::move(py_client_->client_buffer_allocator_);
+    {
+        GLogMuter muter;
+        EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                      {keys[0]}, {{destinations[0].data()}}, {{kFirstSize}},
+                      {{kFirstOffset}})[0],
+                  static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
+
     const int invalid_params =
         static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
     EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
@@ -366,6 +401,8 @@ TEST_F(RealClientTest, SessionRangesReadLocalDiskReplicasInOneBatch) {
                   {{kObjectSize - 1}})[0],
               invalid_params);
     EXPECT_EQ(py_client_->batch_get_session_end(keys), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(duplicate_first.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(duplicate_second.data()), 0);
     for (auto& destination : destinations) {
         EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
     }
@@ -1597,6 +1634,9 @@ TEST_F(RealClientTest, TestPutGetSessionAbnormal) {
     EXPECT_TRUE(
         py_client_->batch_get_into_multi_buffer_ranges({}, {}, {}, {}).empty());
     EXPECT_EQ(py_client_->batch_get_session_end({}), 0);
+    EXPECT_EQ(py_client_->batch_get_into_multi_buffer_ranges(
+                  {"outer_arity_get"}, {}, {}, {}),
+              std::vector<int>{kInvalidParams});
 
     // --- Put: ranges/end/revoke without start ---
     {

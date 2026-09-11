@@ -1081,6 +1081,96 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    struct SessionRangeReadRequest {
+        std::string object_key;
+        size_t result_index;
+        Replica::Descriptor selected_replica;
+        QueryResult cached_query_result;
+        std::vector<void *> destination_buffers;
+        std::vector<size_t> range_sizes;
+        std::vector<size_t> source_offsets;
+        size_t transferred_bytes;
+        std::chrono::steady_clock::time_point lease_deadline;
+    };
+
+    using LocalDiskSessionRangeReadGroups =
+        std::unordered_map<std::string, std::vector<SessionRangeReadRequest>>;
+
+    struct SessionRangeReadPlan {
+        std::vector<SessionRangeReadRequest> memory_requests;
+        LocalDiskSessionRangeReadGroups local_disk_requests_by_endpoint;
+        std::vector<SessionRangeReadRequest> disk_requests;
+        std::vector<SessionRangeReadRequest> dfs_requests;
+    };
+
+    struct DfsSessionStagingArena {
+        std::shared_ptr<BufferHandle> staging_buffer;
+        std::unordered_map<std::string, size_t> object_offsets;
+        std::vector<std::string> object_keys;
+        std::vector<QueryResult> cached_query_results;
+        std::unordered_map<std::string, std::vector<Slice>> object_slices;
+    };
+
+    bool validate_session_range_batch_arguments(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) const;
+
+    std::vector<SessionRangeReadRequest> prepare_session_range_read_requests(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets,
+        std::vector<int> &results);
+
+    SessionRangeReadPlan classify_session_range_read_requests(
+        std::vector<SessionRangeReadRequest> requests,
+        std::vector<int> &results);
+
+    void execute_session_memory_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void execute_session_local_disk_range_reads(
+        const LocalDiskSessionRangeReadGroups &requests_by_endpoint,
+        std::vector<int> &results);
+
+    void execute_session_disk_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    DfsSessionStagingArena build_dfs_session_staging_arena(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    void execute_session_dfs_range_reads(
+        const std::vector<SessionRangeReadRequest> &requests,
+        std::vector<int> &results);
+
+    tl::expected<void, ErrorCode> scatter_session_range_read(
+        const SessionRangeReadRequest &request,
+        const void *staging_buffer) const;
+
+    void complete_staged_session_range_read(
+        const SessionRangeReadRequest &request, const void *staging_buffer,
+        std::vector<int> &results);
+
+    bool invalidate_expired_get_session(const SessionRangeReadRequest &request,
+                                        std::vector<int> &results);
+
+    void mark_get_session_lease_expired_locked(
+        const SessionRangeReadRequest &request, std::vector<int> &results);
+
+    static void fail_file_backed_requests_for_key(
+        const std::vector<SessionRangeReadRequest> &requests,
+        const std::string &object_key, ErrorCode error,
+        std::vector<int> &results);
+
+    static bool session_range_result_is_pending(
+        const SessionRangeReadRequest &request,
+        const std::vector<int> &results);
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
