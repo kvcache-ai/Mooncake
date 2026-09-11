@@ -62,7 +62,17 @@ int ResolveAscendMemType(const std::string &location, void *addr,
         return ERR_INVALID_ARGUMENT;
     }
     aclrtPtrAttributes attributes;
-    CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
+    if (aclrtPointerGetAttributes(addr, &attributes) != ACL_ERROR_NONE) {
+        // When the wildcard probe cannot identify the address (e.g. host
+        // hugepage / shm / malloc memory is not managed by ACL), fall back to
+        // host memory to match CUDA semantics instead of treating it as a hard
+        // error.
+        LOG(WARNING) << "aclrtPointerGetAttributes failed for addr:" << addr
+                     << ", fallback to host mem, err: "
+                     << aclGetRecentErrMsg();
+        mem_type = adxl::MEM_HOST;
+        return 0;
+    }
     if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
         mem_type = adxl::MEM_HOST;
     } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
