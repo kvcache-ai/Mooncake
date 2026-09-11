@@ -207,6 +207,36 @@ class MetadataScanBench {
                static_cast<double>(repeat);
     }
 
+    // What the promotion-retry tick costs after the sparse candidate index:
+    // copy the key set (size = active candidates), resolve and exclusively
+    // lock each candidate. Mirrors RunPromotionCandidateRetry's enumeration.
+    static double MeasureCandidateEnumeration(
+        mooncake::metadata::TenantCatalog& tenant_state, size_t candidates,
+        uint64_t repeat) {
+        for (size_t i = 0; i < candidates; ++i) {
+            tenant_state.IndexPromotionCandidate("scan_bench_" +
+                                                 std::to_string(i));
+        }
+        uint64_t sink = 0;
+        const auto begin = std::chrono::steady_clock::now();
+        for (uint64_t r = 0; r < repeat; ++r) {
+            for (const auto& key : tenant_state.PromotionCandidateKeys()) {
+                auto entry = tenant_state.Get(key);
+                if (!entry) {
+                    continue;
+                }
+                auto lk = entry->LockUnique();
+                sink += entry->promotion_candidate.has_value() ? 1 : 0;
+            }
+        }
+        const auto end = std::chrono::steady_clock::now();
+        LOG(INFO) << "candidate enumerate sink=" << sink;
+        return std::chrono::duration_cast<
+                   std::chrono::duration<double, std::micro>>(end - begin)
+                   .count() /
+               repeat;
+    }
+
     static double MeasureSnapshotCopy(
         const mooncake::metadata::TenantCatalog& tenant_state,
         uint64_t repeat) {
@@ -251,6 +281,8 @@ class MetadataScanBench {
             MeasureSnapshotCopy(*tenant_handle, FLAGS_scan_repeat);
         const double entry_lock_scan_us =
             MeasureEntryLockScan(entries, FLAGS_scan_repeat);
+        const double candidate_enum_us = MeasureCandidateEnumeration(
+            *tenant_handle, /*candidates=*/8, FLAGS_scan_repeat);
 
         // Deadline-index alternative: amortized upsert cost and PopExpired
         // cost in the two steady states (nothing due / everything due).
@@ -286,7 +318,7 @@ class MetadataScanBench {
         LOG(INFO) << "index: upsert_total_us=" << index_upsert_us
                   << ", pop_none=" << none_popped << " in " << pop_none_us
                   << "us, pop_all=" << all_popped << " in " << pop_all_us
-                  << "us";
+                  << "us, candidate_enum_8=" << candidate_enum_us << "us";
 
         double put_p50_baseline = 0;
         double put_p99_baseline = 0;

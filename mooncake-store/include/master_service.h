@@ -1356,7 +1356,7 @@ class MasterService {
     // container, and return descriptor list.  Shared by PutStart and
     // UpsertStart.
     auto AllocateAndInsertMetadata(
-        metadata::TenantCatalog& tenant_accessor, const UUID& client_id,
+        metadata::TenantCatalog& tenant_state, const UUID& client_id,
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& writer_host_id,
         const std::string& group_id, const TenantId& tenant_id,
@@ -1371,7 +1371,7 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingReplicas(
-        metadata::TenantCatalog& tenant_accessor,
+        metadata::TenantCatalog& tenant_state,
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
