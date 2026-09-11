@@ -165,6 +165,17 @@ struct NoFRegisterEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_NOF_TRTYPE);
 };
 
+struct SpdkControllerEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_NUM_IO_QUEUES);
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_IO_QUEUE_SIZE);
+    MC_DEFINE_ENV_VAR(uint32_t, MC_NVME_IO_QUEUE_REQUESTS);
+    MC_DEFINE_ENV_VAR(uint8_t, MC_NVME_TRANSPORT_ACK_TIMEOUT);
+    MC_DEFINE_ENV_VAR(uint16_t, MC_NVME_ADMIN_QUEUE_SIZE);
+    MC_DEFINE_ENV_VAR(uint64_t, MC_NVME_FABRICS_CONNECT_TIMEOUT_US);
+    MC_DEFINE_ENV_VAR(bool, MC_NVME_HEADER_DIGEST);
+    MC_DEFINE_ENV_VAR(bool, MC_NVME_DATA_DIGEST);
+};
+
 struct NvmeKvConnectorEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_DEVICE_PATH);
     // Keep numeric values as strings because the existing NVMe parser accepts

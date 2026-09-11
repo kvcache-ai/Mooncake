@@ -137,6 +137,7 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
+add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)
 add_test(
   NAME object_checksum_client_test

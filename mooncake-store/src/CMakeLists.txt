@@ -121,6 +121,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
+    config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
