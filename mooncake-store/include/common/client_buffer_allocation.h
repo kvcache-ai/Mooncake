@@ -2,10 +2,34 @@
 
 #include <cstddef>
 #include <cstdlib>
-#include <linux/memfd.h>
-#include <linux/mman.h>
 #include <string>
 #include <vector>
+
+#ifdef __linux__
+#include <linux/memfd.h>
+#include <linux/mman.h>
+#else
+// Hugepage flags are Linux-only; define stubs so non-Linux TUs compile.
+// These constants are never used at runtime on non-Linux platforms.
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0
+#endif
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB 0
+#endif
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB 0
+#endif
+#ifndef MFD_HUGETLB
+#define MFD_HUGETLB 0
+#endif
+#ifndef MFD_HUGE_2MB
+#define MFD_HUGE_2MB 0
+#endif
+#ifndef MFD_HUGE_1GB
+#define MFD_HUGE_1GB 0
+#endif
+#endif  // __linux__
 
 #include <Slab.h>
 #include <glog/logging.h>
@@ -64,6 +88,7 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (out_flags == nullptr) {
         return size;
     }
+#ifdef __linux__
     if (use_memfd) {
         *out_flags |= MFD_HUGETLB;
         *out_flags |= size == SZ_2MB     ? MFD_HUGE_2MB
@@ -79,6 +104,11 @@ inline size_t align_up(size_t size, size_t alignment) {
               << (size == SZ_2MB     ? "2MB"
                   : size == SZ_512MB ? "512MB"
                                      : "1GB");
+#else
+    (void)use_memfd;
+    LOG(WARNING) << "Hugepage flags are not supported on this platform; "
+                    "ignoring out_flags parameter.";
+#endif  // __linux__
     return size;
 }
 
