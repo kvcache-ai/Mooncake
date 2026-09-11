@@ -18,6 +18,8 @@ add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 if(USE_TENT)
+  # Match the compatibility shim public class definition and enable the
+  # MC_USE_TENT regression cases in transport_uint_test.cpp.
   target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
 endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)

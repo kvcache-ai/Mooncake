@@ -95,6 +95,7 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
     bool force_tcp{false};
+    std::optional<std::vector<std::string>> rdma_whitelist;
 };
 
 template <typename T>
@@ -219,6 +220,8 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     preserved.force_tcp = config.get("transports/force_tcp", false);
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
+    preserved.rdma_whitelist = captureExplicitConfigValue(
+        config, "topology/rdma_whitelist", std::vector<std::string>());
     return preserved;
 }
 
@@ -245,6 +248,8 @@ void restoreExplicitTransferEngineConfig(
     if (preserved.force_tcp) {
         ConfigHelper::forceTcp(config);
     }
+    restoreExplicitConfigValue(config, "topology/rdma_whitelist",
+                               preserved.rdma_whitelist);
 }
 
 TransferEngineImpl::TransferEngineImpl()
