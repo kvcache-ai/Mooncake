@@ -461,7 +461,10 @@ class Buffer:
             )
             # The dispatch SEND phase resets every local-expert counter before
             # the RECV phase reads it, so this output need not be pre-cleared.
-            packed_recv_count = torch.empty(
+            # The legacy kernel accumulates receive offsets with atomicAdd.
+            # Rank 1's local-expert counters are not reset by the send phase,
+            # so they must start from zero on every dispatch.
+            packed_recv_count = torch.zeros(
                 (num_local_experts,), dtype=torch.int32, device=x.device
             )
             packed_recv_src_info = torch.empty(
