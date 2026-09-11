@@ -661,7 +661,7 @@ int DummyClient::unregister_device_buffer_for_reconnect(void* buffer) {
     // INTERNAL_ERROR too (unmapped, or quarantined when the SPDK or transfer
     // engine unregister fails), and INVALID_PARAMS means the server has no such
     // mapping, so drop the local bookkeeping then; keep it on RPC_FAIL /
-    // RPC_TIMEOUT where the server may not have run.
+    // RPC_TIMEOUT where the server may not have run (see unregister_buffer).
     if (ret.has_value() ||
         (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
                               ret.error() == ErrorCode::INVALID_PARAMS))) {
@@ -791,8 +791,11 @@ int DummyClient::unregister_buffer(void* buffer) {
     // (retained, never reused for new registrations). Either way the old
     // mapping is no longer usable on the receiver, so drop the local flag for
     // INTERNAL_ERROR and for INVALID_PARAMS (server has no such mapping). Keep
-    // it on RPC_FAIL / RPC_TIMEOUT, where the RPC may never have reached the
-    // server and the mapping may still be alive.
+    // it on RPC_FAIL / RPC_TIMEOUT: the RPC may never have reached the server,
+    // or the receiver may have refused before touching anything (Ascend context
+    // setup failure in unregister_shm_buffer_internal returns RPC_FAIL for
+    // exactly that reason), so the mapping can still be alive and a retry must
+    // reach the receiver.
     if (ret.has_value() ||
         (!ret.has_value() && (ret.error() == ErrorCode::INTERNAL_ERROR ||
                               ret.error() == ErrorCode::INVALID_PARAMS))) {

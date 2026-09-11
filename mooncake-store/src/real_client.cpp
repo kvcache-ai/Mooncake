@@ -3055,7 +3055,24 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
             auto context_result = set_context_if_needed(
                 protocol, shm_it->device_id, "POSIX shm unregister");
             if (!context_result) {
-                return context_result;
+                // Nothing was torn down: the mapping, its TE region and its
+                // SPDK registration are all still live here, and shm_it stays
+                // in context.mapped_shms. Report RPC_FAIL instead of
+                // propagating INVALID_PARAMS, which the two early returns above
+                // use for "the receiver holds no such mapping": the caller must
+                // be able to tell "nothing was registered here" apart from "the
+                // teardown did not run", so that it keeps its local bookkeeping
+                // and retries instead of leaking this mapping until process
+                // exit. DummyClient::unregister_buffer() only drops its
+                // shm->registered flag for OK / INTERNAL_ERROR /
+                // INVALID_PARAMS.
+                LOG(ERROR) << "Cannot unregister shm buffer for client_id="
+                           << client_id
+                           << ": could not set the Ascend context for device "
+                           << shm_it->device_id
+                           << ", error: " << toString(context_result.error())
+                           << "; no teardown performed, mapping retained";
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
             }
 #endif
             // Unregister with the transfer engine first: TE retains its region
