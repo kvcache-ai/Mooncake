@@ -427,8 +427,14 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     if (publish_error == ErrorCode::OK) {
         BatchOpLogSnapshotGc gc(backend_, object_store_, cluster_id_,
                                 config_.snapshot_root);
-        if (gc.Run(*lease) != ErrorCode::OK)
-            LOG(WARNING) << "Batch snapshot object GC skipped or failed";
+        try {
+            if (gc.Run(*lease) != ErrorCode::OK)
+                LOG(WARNING) << "Batch snapshot object GC skipped or failed";
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Batch snapshot object GC threw: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "Batch snapshot object GC threw unknown exception";
+        }
     }
     release_lease();
     FinishAttempt(publish_error, true);
