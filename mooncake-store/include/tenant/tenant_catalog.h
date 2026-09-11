@@ -184,6 +184,12 @@ class TenantCatalog {
         if (had_completed_disk) disk_object_count.fetch_sub(1);
     }
 
+    // Test introspection: the group's shared Lease (nullptr when absent).
+    // Lives here, not on GroupIndex, so the catalog owns its boundary.
+    std::shared_ptr<Lease> LeaseForTest(const std::string& group_id) const {
+        return group_index.LeaseForTest(group_id);
+    }
+
     std::shared_ptr<ObjectEntry> Get(const std::string& key) const {
         return object_index.Get(key);
     }

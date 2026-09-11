@@ -32,9 +32,8 @@ TEST(TenantCatalogTest, InsertObjectWiresSharedLeaseAndJoinsGroup) {
     EXPECT_EQ(catalog.ObjectCount(), 1u);
     EXPECT_EQ(catalog.group_index.Members("g1").size(), 1u);
     ASSERT_NE(member->metadata().lease(), nullptr);  // shared lease wired
-    EXPECT_EQ(
-        member->metadata().lease().get(),
-        catalog.group_index.LeaseForTest("g1").get());  // single shared lease
+    EXPECT_EQ(member->metadata().lease().get(),
+              catalog.LeaseForTest("g1").get());  // single shared lease
 }
 
 TEST(TenantCatalogTest, InsertObjectDoesNotJoinForSingleton) {

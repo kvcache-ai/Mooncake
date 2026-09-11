@@ -556,7 +556,7 @@ class MasterServiceTest : public ::testing::Test {
             return nullptr;
         }
         // The shared group Lease is single-sourced in the group index.
-        return tenant_handle->group_index.LeaseForTest(group_id);
+        return tenant_handle->LeaseForTest(group_id);
     }
 };
 

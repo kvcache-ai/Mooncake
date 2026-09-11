@@ -39,14 +39,6 @@ class GroupIndex {
         return it->second.lease;
     }
 
-    // Test introspection: the group's shared Lease (nullptr when absent).
-    std::shared_ptr<Lease> LeaseForTest(const std::string& group_id) const {
-        const auto& stripe = StripeFor(group_id);
-        std::shared_lock<std::shared_mutex> lock(stripe.mutex);
-        auto it = stripe.groups.find(group_id);
-        return it == stripe.groups.end() ? nullptr : it->second.lease;
-    }
-
     bool RemoveMember(const std::string& group_id,
                       const std::string& member_key) {
         auto& stripe = StripeFor(group_id);
@@ -83,6 +75,10 @@ class GroupIndex {
     }
 
    private:
+    // The test introspection hook is reachable only through TenantCatalog,
+    // which owns the module boundary.
+    friend class TenantCatalog;
+
     struct GroupState {
         std::unordered_set<std::string> member_keys;
         std::shared_ptr<Lease> lease;
@@ -105,6 +101,14 @@ class GroupIndex {
     }
     const Stripe& StripeFor(const std::string& group_id) const {
         return stripes_[std::hash<std::string>{}(group_id) % kStripeCount];
+    }
+
+    // Test introspection: the group's shared Lease (nullptr when absent).
+    std::shared_ptr<Lease> LeaseForTest(const std::string& group_id) const {
+        const auto& stripe = StripeFor(group_id);
+        std::shared_lock<std::shared_mutex> lock(stripe.mutex);
+        auto it = stripe.groups.find(group_id);
+        return it == stripe.groups.end() ? nullptr : it->second.lease;
     }
 
     std::array<Stripe, kStripeCount> stripes_;
