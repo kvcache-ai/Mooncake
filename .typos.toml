@@ -1,6 +1,10 @@
 [default]
 extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa", "ue"]
 
+[default.extend-identifiers]
+# PyTorch's range-construction API.
+arange = "arange"
+
 [default.extend-words]
 CANN = "CANN"
 ASO = "ASO"
