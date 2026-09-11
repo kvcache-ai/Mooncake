@@ -171,6 +171,12 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             close(log_pipe[1]);
         } else if (pid == 0) {
             // Child process
+            // The master installs handlers that only update parent-process
+            // shutdown state. A forked snapshot child must remain terminable
+            // by the timeout and shutdown paths below.
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTERM, SIG_DFL);
+
             // Close read end, set write end for logging
             close(log_pipe[0]);
             g_snapshot_log_pipe_fd = log_pipe[1];
@@ -269,6 +275,12 @@ void MasterSnapshotManager::WaitForSnapshotChild(pid_t pid,
             return;
         } else if (result == 0) {
             // Child process is still running
+            if (!snapshot_running_) {
+                flush_child_logs();
+                TerminateSnapshotChild(pid, snapshot_id, "manager shutdown");
+                return;
+            }
+
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::steady_clock::now() - start_time)
                                .count();
@@ -284,8 +296,11 @@ void MasterSnapshotManager::WaitForSnapshotChild(pid_t pid,
                 return;
             }
 
-            // Brief sleep before checking again
-            std::this_thread::sleep_for(std::chrono::seconds(2));
+            // Briefly wait before checking again, but wake promptly on Stop().
+            std::unique_lock<std::mutex> lock(snapshot_thread_mutex_);
+            snapshot_thread_cv_.wait_for(lock, std::chrono::seconds(2), [this] {
+                return !snapshot_running_.load();
+            });
         } else {
             // Child process has exited
             // Flush remaining logs from child
@@ -308,40 +323,60 @@ void MasterSnapshotManager::WaitForSnapshotChild(pid_t pid,
 
 void MasterSnapshotManager::HandleChildTimeout(pid_t pid,
                                                const std::string& snapshot_id) {
-    LOG(WARNING) << "[Snapshot] Child process timeout, snapshot_id="
-                 << snapshot_id << ", child_pid=" << pid
-                 << ", killing child process";
+    TerminateSnapshotChild(pid, snapshot_id, "snapshot timeout");
+}
+
+void MasterSnapshotManager::TerminateSnapshotChild(
+    pid_t pid, const std::string& snapshot_id, const char* reason) {
+    LOG(WARNING) << "[Snapshot] Terminating child process due to " << reason
+                 << ", snapshot_id=" << snapshot_id << ", child_pid=" << pid;
 
     // Try to gracefully terminate the child process
-    if (kill(pid, SIGTERM) == 0) {
-        // Wait a few seconds to see if it exits gracefully
-        std::this_thread::sleep_for(std::chrono::seconds(5));
-
-        // Check if it has exited
-        int status;
-        if (waitpid(pid, &status, WNOHANG) == 0) {
-            // Child process still not exited, force kill
-            LOG(WARNING) << "[Snapshot] Child process still running, force "
-                            "killing, snapshot_id="
-                         << snapshot_id << ", child_pid=" << pid;
-            kill(pid, SIGKILL);
-
-            // Wait for force termination to complete
-            waitpid(pid, &status, 0);
-            LOG(WARNING)
-                << "[Snapshot] Child process force killed, snapshot_id="
-                << snapshot_id << ", child_pid=" << pid;
-        } else {
-            LOG(INFO) << "[Snapshot] Child process terminated gracefully after "
-                         "SIGTERM, snapshot_id="
-                      << snapshot_id << ", child_pid=" << pid;
-        }
-    } else {
+    if (kill(pid, SIGTERM) == -1 && errno != ESRCH) {
         LOG(ERROR) << "[Snapshot] Failed to send SIGTERM to child process, "
                       "snapshot_id="
                    << snapshot_id << ", child_pid=" << pid
                    << ", error=" << strerror(errno);
     }
+
+    constexpr auto kTerminationGracePeriod = std::chrono::seconds(5);
+    constexpr auto kReapPollInterval = std::chrono::milliseconds(50);
+    const auto deadline =
+        std::chrono::steady_clock::now() + kTerminationGracePeriod;
+    int status;
+    while (std::chrono::steady_clock::now() < deadline) {
+        const pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            LOG(INFO) << "[Snapshot] Child process terminated gracefully after "
+                         "SIGTERM, snapshot_id="
+                      << snapshot_id << ", child_pid=" << pid;
+            return;
+        }
+        if (result == -1 && errno != EINTR) {
+            if (errno != ECHILD) {
+                LOG(ERROR) << "[Snapshot] Failed to wait for child process, "
+                              "snapshot_id="
+                           << snapshot_id << ", child_pid=" << pid
+                           << ", error=" << strerror(errno);
+            }
+            return;
+        }
+        std::this_thread::sleep_for(kReapPollInterval);
+    }
+
+    LOG(WARNING) << "[Snapshot] Child process still running, force killing, "
+                    "snapshot_id="
+                 << snapshot_id << ", child_pid=" << pid;
+    if (kill(pid, SIGKILL) == -1 && errno != ESRCH) {
+        LOG(ERROR) << "[Snapshot] Failed to send SIGKILL to child process, "
+                      "snapshot_id="
+                   << snapshot_id << ", child_pid=" << pid
+                   << ", error=" << strerror(errno);
+    }
+    while (waitpid(pid, &status, 0) == -1 && errno == EINTR) {
+    }
+    LOG(WARNING) << "[Snapshot] Child process force killed, snapshot_id="
+                 << snapshot_id << ", child_pid=" << pid;
 }
 
 void MasterSnapshotManager::HandleChildExit(pid_t pid, int status,
