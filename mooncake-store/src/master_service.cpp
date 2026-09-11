@@ -4746,7 +4746,7 @@ std::vector<BatchAllocateResult> MasterService::ReserveDfsSpaceForBatch(
         reservations.push_back(
             {key, {}, false, ErrorCode::DFS_SERVICE_UNAVAILABLE});
     }
-    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+    if (bucket_allocator_ == nullptr || !bucket_allocator_->IsInitialized()) {
         return reservations;
     }
 
@@ -4762,11 +4762,11 @@ std::vector<BatchAllocateResult> MasterService::ReserveDfsSpaceForBatch(
     }
     if (requests.empty()) return reservations;
 
-    auto results = dfs_allocator_->BatchAllocate(requests);
+    auto results = bucket_allocator_->BatchAllocate(requests);
     auto release_successful = [&]() {
         for (auto& result : results) {
             if (!result.success) continue;
-            dfs_allocator_->Free(result.key, result.descriptor);
+            bucket_allocator_->Free(result.key, result.descriptor);
             result.descriptor = {};
             result.success = false;
             result.error = ErrorCode::NO_AVAILABLE_HANDLE;
@@ -4780,7 +4780,7 @@ std::vector<BatchAllocateResult> MasterService::ReserveDfsSpaceForBatch(
         release_successful();
         bucket_allocator_->FlushDirtyMetadata();
         if (TryRecoverDfsSpaceAfterAllocationFailure()) {
-            results = dfs_allocator_->BatchAllocate(requests);
+            results = bucket_allocator_->BatchAllocate(requests);
         }
     }
 
@@ -4816,6 +4816,18 @@ MasterService::BatchPutStart(const UUID& client_id,
     if (keys.size() != slice_lengths.size()) {
         results.assign(keys.size(),
                        tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    // Batch preallocation is a BUCKET-only optimization. SHARD allocation and
+    // requests without DFS replicas retain the original per-key allocation,
+    // failure, and rollback behavior of PutStart.
+    if (bucket_allocator_ == nullptr || config.dfs_replica_num == 0) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(PutStart(client_id, keys[i], tenant_id,
+                                          slice_lengths[i],
+                                          config.ForSingleKey(i)));
+        }
         return results;
     }
 
@@ -4861,9 +4873,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     const auto& key = object_meta.key;
-    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
-
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";

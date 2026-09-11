@@ -203,6 +203,7 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+    bool UsesDfsBucketAllocator() const { return bucket_allocator_ != nullptr; }
     tl::expected<int64_t, ErrorCode> SetDfsMaxBucketCount(
         int64_t new_max_bucket_count);
 
