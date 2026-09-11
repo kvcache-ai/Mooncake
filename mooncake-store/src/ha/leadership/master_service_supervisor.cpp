@@ -3,7 +3,6 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <string_view>
@@ -12,6 +11,7 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -409,8 +409,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         coro_rpc::coro_rpc_server server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
-        const char* protocol = std::getenv("MC_RPC_PROTOCOL");
-        if (protocol && std::string_view(protocol) == "rdma") {
+        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
             server.init_ibv();
         }
 

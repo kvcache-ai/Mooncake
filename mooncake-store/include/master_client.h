@@ -7,13 +7,13 @@
 #include <type_traits>
 #include <vector>
 #include <variant>
-#include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
+#include "config/rpc_protocol_config.h"
 #include "config/rpc_timeout_config.h"
 #include "replica.h"
 #include "segment.h"
@@ -74,8 +74,8 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
         config.reconnect_wait_time = std::chrono::milliseconds{0};
         config.client_config.connect_timeout_duration = std::chrono::seconds{1};
     }
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
