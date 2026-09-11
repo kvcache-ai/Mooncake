@@ -1359,6 +1359,23 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    // Drain before claiming closed_ / freeing TE so a timeout can abort and
+    // leave the client usable (#3909 review: do not tear down under flight).
+    if (client_) {
+        if (!client_op_drain_.drain_for(std::chrono::seconds(30))) {
+            LOG(ERROR)
+                << "RealClient teardown: client ops still in flight after 30s "
+                   "drain; aborting teardown (resources kept)";
+            return tl::unexpected(ErrorCode::RPC_TIMEOUT);
+        }
+        if (!client_->DrainInflightOperations()) {
+            LOG(ERROR)
+                << "RealClient teardown: Client API still in flight after "
+                   "drain; aborting teardown (resources kept)";
+            return tl::unexpected(ErrorCode::RPC_TIMEOUT);
+        }
+    }
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,
@@ -1374,13 +1391,6 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
-    if (!client_op_drain_.drain_for(std::chrono::seconds(30))) {
-        LOG(ERROR) << "RealClient teardown: client ops still in flight after "
-                      "30s drain; continuing teardown (UAF risk)";
-    }
-    // Finish Get/Put (incl. TransferEngine) before unregister / client_.reset
-    // (#3909). MasterClient drain alone does not cover TransferRead.
-    (void)client_->DrainInflightOperations();
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0 &&
         protocol != "cxl") {
         auto unregister_result = client_->unregisterLocalMemory(

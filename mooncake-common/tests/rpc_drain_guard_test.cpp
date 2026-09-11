@@ -62,5 +62,31 @@ TEST(RpcDrainGuardTest, DrainTimeoutReportsFalse) {
     worker.join();
 }
 
+
+// Timed-out drain must not reopen admission; callers that would free shared
+// state on timeout (#3909 review) would still race with the in-flight call.
+TEST(RpcDrainGuardTest, TimedOutDrainKeepsBlockingNewCalls) {
+    RpcDrainGuard guard;
+
+    std::atomic<bool> entered{false};
+    std::thread worker([&] {
+        RpcDrainGuard::ScopedCall call(guard);
+        EXPECT_TRUE(call.ok());
+        entered.store(true);
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    while (!entered.load()) {
+        std::this_thread::yield();
+    }
+
+    EXPECT_FALSE(guard.drain_for(std::chrono::milliseconds(50)));
+    {
+        RpcDrainGuard::ScopedCall late(guard);
+        EXPECT_FALSE(late.ok());
+    }
+    worker.join();
+    EXPECT_TRUE(guard.drain_for(std::chrono::milliseconds(200)));
+}
+
 }  // namespace
 }  // namespace mooncake
