@@ -1,5 +1,6 @@
 import unittest
 import os
+import ctypes
 from mooncake.engine import TransferEngine
 
 
@@ -174,6 +175,166 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
         print(
             f"[✓] {circles} rounds of batch_write_read passed, batch size {batch_size}."
         )
+
+    def test_scatter_write_read(self):
+        """Transfer allocation-bounded offset vectors through one operation."""
+
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        payloads = (b"scatter-range-a", b"scatter-range-b", b"scatter-range-c")
+        write_local_offsets = ((0, 128), (1024,))
+        remote_offsets = ((256, 512), (1536,))
+        lengths = ((len(payloads[0]), len(payloads[1])), (len(payloads[2]),))
+        for address, payload in zip(
+            (
+                base_src_addr + write_local_offsets[0][0],
+                base_src_addr + write_local_offsets[0][1],
+                base_src_addr + write_local_offsets[1][0],
+            ),
+            payloads,
+            strict=True,
+        ):
+            self.assertEqual(
+                adaptor.write_bytes_to_buffer(address, payload, len(payload)),
+                0,
+            )
+
+        write_ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr, base_src_addr],
+            [4096, 4096],
+            [base_dst_addr, base_dst_addr],
+            [4096, 4096],
+            [list(offsets) for offsets in write_local_offsets],
+            [list(offsets) for offsets in remote_offsets],
+            [list(sizes) for sizes in lengths],
+        )
+        self.assertTrue(write_ticket.drained)
+        self.assertIn("COMPLETED", str(write_ticket.status))
+
+        read_local_offsets = ((2048, 2304), (3072,))
+        read_ticket = adaptor.scatter_transfer_sync_read_with_ticket(
+            self.target_server_name,
+            [base_src_addr, base_src_addr],
+            [4096, 4096],
+            [base_dst_addr, base_dst_addr],
+            [4096, 4096],
+            [list(offsets) for offsets in read_local_offsets],
+            [list(offsets) for offsets in remote_offsets],
+            [list(sizes) for sizes in lengths],
+        )
+        self.assertTrue(read_ticket.drained)
+        self.assertIn("COMPLETED", str(read_ticket.status))
+
+        for address, payload in zip(
+            (
+                base_src_addr + read_local_offsets[0][0],
+                base_src_addr + read_local_offsets[0][1],
+                base_src_addr + read_local_offsets[1][0],
+            ),
+            payloads,
+            strict=True,
+        ):
+            self.assertEqual(
+                adaptor.read_bytes_from_buffer(address, len(payload)),
+                payload,
+            )
+
+    def test_scatter_rejects_mismatched_fragment_vectors(self):
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[0, 128]],
+            [[256]],
+            [[16, 16]],
+        )
+        self.assertTrue(ticket.drained)
+        self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_scatter_rejects_fragment_outside_allocation(self):
+        adaptor = self.adaptor
+        base_src_addr = self._ensure_buffer_available()
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+
+        ticket = adaptor.scatter_transfer_sync_write_with_ticket(
+            self.target_server_name,
+            [base_src_addr],
+            [4096],
+            [base_dst_addr],
+            [4096],
+            [[4088]],
+            [[0]],
+            [[16]],
+        )
+        self.assertTrue(ticket.drained)
+        self.assertIn("FAILED_DRAINED", str(ticket.status))
+
+    def test_scatter_rejects_local_allocation_address_overflow(self):
+        adaptor = self.adaptor
+        base_dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
+        self.assertNotEqual(base_dst_addr, 0, "Target server has no registered buffers")
+        max_address = (1 << 64) - 1
+        stderr_read, stderr_write = os.pipe()
+        saved_stderr = os.dup(2)
+        try:
+            os.dup2(stderr_write, 2)
+            for transfer in (
+                adaptor.scatter_transfer_sync_write_with_ticket,
+                adaptor.scatter_transfer_sync_read_with_ticket,
+            ):
+                ticket = transfer(
+                    self.target_server_name,
+                    [max_address],
+                    [1],
+                    [base_dst_addr],
+                    [1],
+                    [[0]],
+                    [[0]],
+                    [[1]],
+                )
+                self.assertTrue(ticket.drained)
+                self.assertIn("FAILED_DRAINED", str(ticket.status))
+        finally:
+            os.dup2(saved_stderr, 2)
+            os.close(saved_stderr)
+            os.close(stderr_write)
+        native_stderr = os.read(stderr_read, 64 * 1024)
+        os.close(stderr_read)
+        self.assertNotIn(hex(max_address).encode(), native_stderr)
+
+    def test_scatter_rejects_local_address_range_overflow(self):
+        max_local_address = (1 << (ctypes.sizeof(ctypes.c_void_p) * 8)) - 1
+
+        for direction in ("write", "read"):
+            with self.subTest(direction=direction):
+                transfer = getattr(
+                    self.adaptor,
+                    f"scatter_transfer_sync_{direction}_with_ticket",
+                )
+                ticket = transfer(
+                    self.target_server_name,
+                    [max_local_address],
+                    [2],
+                    [0],
+                    [0],
+                    [[0]],
+                    [[0]],
+                    [[0]],
+                )
+                self.assertTrue(ticket.drained)
+                self.assertIn("FAILED_DRAINED", str(ticket.status))
 
     def test_async_batch_write_read(self):
         """Test batch_transfer_async_write and batch_transfer_async_read for batch write/read consistency."""
