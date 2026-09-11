@@ -293,13 +293,17 @@ def test_loop(local_rank: int, num_local_ranks: int):
     buffer = Buffer(
         group, num_ep_buffer_bytes=num_ep_buffer_bytes, disable_p2p=disable_p2p
     )
-    # Mock a broken rank 1 to test effectiveness of EP recovery
-    if local_rank != 1:
-        buffer.update_ep_member()
-    else:
-        buffer = Buffer(
-            group, num_ep_buffer_bytes=num_ep_buffer_bytes, disable_p2p=disable_p2p
-        )
+    # Mock a broken rank 1 to test effectiveness of EP recovery.  Keep this
+    # separate from the MACA no-P2P datapath gate: member reinitialization
+    # needs its own validation and can otherwise mask first-round transport
+    # correctness.
+    if not disable_p2p:
+        if local_rank != 1:
+            buffer.update_ep_member()
+        else:
+            buffer = Buffer(
+                group, num_ep_buffer_bytes=num_ep_buffer_bytes, disable_p2p=disable_p2p
+            )
 
     test_main(
         num_tokens,
