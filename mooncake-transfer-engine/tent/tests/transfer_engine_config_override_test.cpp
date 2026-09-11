@@ -283,6 +283,42 @@ TEST(TransferEngineConfigOverrideTest,
     EXPECT_EQ(config.get("transports/rdma/bind_address", ""), "10.0.0.2");
 }
 
+TEST(TransferEngineConfigOverrideTest, LegacyForceTcpEnvOverridesTentConfig) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true}}})");
+    EnvVarGuard force_tcp_guard("MC_FORCE_TCP", "1");
+
+    Config config;
+    ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+
+    EXPECT_TRUE(config.get("transports/force_tcp", false));
+    EXPECT_TRUE(config.get("transports/tcp/enable", false));
+    EXPECT_FALSE(config.get("transports/rdma/enable", true));
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitForceTcpSurvivesMcTentConfThroughConstructor) {
+    EnvVarGuard conf_guard(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":false},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})");
+
+    auto config = std::make_shared<Config>();
+    config->set("metadata_type", "p2p");
+    config->set("local_segment_name", "force-tcp-explicit");
+    config->set("rpc_server_hostname", kLoopbackHostname);
+    config->set("rpc_server_port", 0);
+    ConfigHelper::forceTcp(*config);
+
+    {
+        TransferEngineImpl engine(config);
+        ASSERT_TRUE(engine.available());
+        EXPECT_TRUE(config->get("transports/force_tcp", false));
+        EXPECT_TRUE(config->get("transports/tcp/enable", false));
+        EXPECT_FALSE(config->get("transports/rdma/enable", true));
+    }
+}
+
 // MOONCAKE_LOCAL_HOSTNAME is the classic Transfer Engine + store env var that
 // names the local host for RPC binding and segment identity. TENT must honor
 // the same env so a single MOONCAKE_LOCAL_HOSTNAME works across both engines;

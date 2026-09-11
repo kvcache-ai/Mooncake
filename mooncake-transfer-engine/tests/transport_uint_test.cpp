@@ -36,6 +36,31 @@ using namespace mooncake;
 
 namespace mooncake {
 
+#ifdef USE_TENT
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* old_value = std::getenv(name);
+        if (old_value) old_value_ = old_value;
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_)
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        else
+            unsetenv(name_.c_str());
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+#endif
+
 class TransferEngineImplTestPeer {
    public:
     static void replaceTransports(TransferEngineImpl& engine,
@@ -114,6 +139,26 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
 }
+
+#ifdef USE_TENT
+TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":false},"shm":{"enable":false},"hp_tcp":{"enable":false},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})");
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-protocol-tcp", "", 0, "tcp"),
+              0);
+
+    std::array<char, 4096> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+#endif
 
 class BatchResultTransport : public Transport {
    public:

@@ -200,6 +200,8 @@ class TransportSelector {
      */
     bool isLegacyMode() const { return legacy_mode_; }
 
+    bool isForceTcp() const { return force_tcp_; }
+
     static std::optional<std::vector<TransportType>> reorderWithHint(
         const std::vector<TransportType>& raw, TransportType hint);
 
@@ -223,6 +225,7 @@ class TransportSelector {
     std::shared_ptr<Config> config_;
     std::shared_ptr<Topology> topology_;
     std::vector<SelectionPolicy> policies_;
+    bool force_tcp_{false};
     bool legacy_mode_{false};  // If true, skip selector and return empty result
 };
 

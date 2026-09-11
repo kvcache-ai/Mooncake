@@ -113,6 +113,15 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                        rpc_port);
 }
 
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol) {
+    (void)protocol;
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port);
+}
+
 int TransferEngine::freeEngine() {
     detachShutdownToken(shutdown_token_);
     if (impl_) {
@@ -473,6 +482,14 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
                          uint64_t rpc_port) {
+    return init(metadata_conn_string, local_server_name, ip_or_host_name,
+                rpc_port, "");
+}
+
+int TransferEngine::init(const std::string& metadata_conn_string,
+                         const std::string& local_server_name,
+                         const std::string& ip_or_host_name, uint64_t rpc_port,
+                         const std::string& protocol) {
     if (!use_tent_) {
         return impl_->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
@@ -487,6 +504,13 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                 parseConnectionStringInternal(metadata_conn_string);
             if (!type.empty()) config->set("metadata_type", type);
             if (!servers.empty()) config->set("metadata_servers", servers);
+        }
+        if (protocol == "tcp") {
+            mooncake::tent::ConfigHelper::forceTcp(*config);
+            if (!std::getenv("MC_FORCE_TCP")) {
+                LOG(INFO) << "protocol=tcp, forcing TENT memory transfers to "
+                             "use TCP";
+            }
         }
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;

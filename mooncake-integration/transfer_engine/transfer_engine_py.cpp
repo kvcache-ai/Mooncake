@@ -248,13 +248,13 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret =
-            engine_->init(conn_string, local_hostname,
-                          hostname_port.first.c_str(), hostname_port.second);
+        int ret = engine_->init(conn_string, local_hostname,
+                                hostname_port.first.c_str(),
+                                hostname_port.second, proto);
         if (ret) return -1;
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
         if (ret) return -1;
     }
 
