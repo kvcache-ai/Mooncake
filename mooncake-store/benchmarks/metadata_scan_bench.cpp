@@ -237,57 +237,6 @@ class MetadataScanBench {
                repeat;
     }
 
-    // Steady-state route lookup over existing keys, in the two shapes a
-    // caller can hold the key: an lvalue std::string (no construction either
-    // way), and a string_view slice (what a request parser hands over — the
-    // shape whose temporary-string construction this change removes).
-    static void MeasureRouteLookup(
-        mooncake::metadata::TenantCatalog& tenant_state,
-        const std::vector<std::string>& keys, uint64_t repeat) {
-        std::string joined;
-        for (const auto& key : keys) {
-            joined += key;
-            joined += '|';
-        }
-        std::vector<std::pair<size_t, size_t>> spans;
-        size_t offset = 0;
-        for (const auto& key : keys) {
-            spans.emplace_back(offset, key.size());
-            offset += key.size() + 1;
-        }
-        uint64_t sink = 0;
-        const auto view_begin = std::chrono::steady_clock::now();
-        for (uint64_t r = 0; r < repeat; ++r) {
-            for (const auto& [offset_i, length] : spans) {
-                sink += tenant_state.Get(
-                            std::string_view(joined).substr(offset_i, length))
-                            ? 1
-                            : 0;
-            }
-        }
-        const auto str_begin = std::chrono::steady_clock::now();
-        for (uint64_t r = 0; r < repeat; ++r) {
-            for (const auto& key : keys) {
-                sink += tenant_state.Get(key) ? 1 : 0;
-            }
-        }
-        const auto end = std::chrono::steady_clock::now();
-        const double view_us = std::chrono::duration_cast<
-                                   std::chrono::duration<double, std::micro>>(
-                                   str_begin - view_begin)
-                                   .count() /
-                               repeat;
-        const double str_us =
-            std::chrono::duration_cast<
-                std::chrono::duration<double, std::micro>>(end - str_begin)
-                .count() /
-            repeat;
-        LOG(INFO) << "route_lookup over " << keys.size() << " keys: per_pass"
-                  << " lvalue_string=" << str_us
-                  << "us, string_view=" << view_us << "us";
-        (void)sink;
-    }
-
     static double MeasureSnapshotCopy(
         const mooncake::metadata::TenantCatalog& tenant_state,
         uint64_t repeat) {
@@ -334,12 +283,6 @@ class MetadataScanBench {
             MeasureEntryLockScan(entries, FLAGS_scan_repeat);
         const double candidate_enum_us = MeasureCandidateEnumeration(
             *tenant_handle, /*candidates=*/8, FLAGS_scan_repeat);
-        std::vector<std::string> lookup_keys;
-        lookup_keys.reserve(entries.size());
-        for (const auto& entry : entries) {
-            lookup_keys.push_back(entry->key());
-        }
-        MeasureRouteLookup(*tenant_handle, lookup_keys, FLAGS_scan_repeat);
 
         // Deadline-index alternative: amortized upsert cost and PopExpired
         // cost in the two steady states (nothing due / everything due).

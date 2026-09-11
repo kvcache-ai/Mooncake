@@ -8,7 +8,6 @@
 #include <optional>
 #include <shared_mutex>
 #include <string>
-#include <string_view>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -28,16 +27,6 @@ namespace mooncake {
 class MasterService;  // friend: the service owns and operates the store
 namespace metadata {
 
-// Hash enabling heterogeneous lookup on the object route: lookups by
-// string_view skip the temporary std::string the default hash would build.
-struct StringHash {
-    using is_transparent = void;
-
-    size_t operator()(std::string_view key) const {
-        return std::hash<std::string_view>{}(key);
-    }
-};
-
 // The per-tenant ObjectIndex: the primary hash map (object key -> strong
 // ObjectEntry handle) plus the GroupIndex and the in-flight dynamic-
 // replication lease table. The group TTL is single-source (one Lease per
@@ -48,15 +37,11 @@ class ObjectIndex {
     ObjectIndex() = default;
     ~ObjectIndex() = default;
 
-    // Pre-size the route table. A hint only: rehash growth stays the
-    // standard-library default, with no cap.
-    void Reserve(size_t buckets) { route_.reserve(buckets); }
-
     // The object route is a flat map key -> strong ObjectEntry handle. Get
     // returns the strong handle under the shared route lock (fast), releasing
     // the route before the caller takes the per-object lock; the strong handle
     // keeps the entry alive across that handoff.
-    std::shared_ptr<ObjectEntry> Get(std::string_view key) const {
+    std::shared_ptr<ObjectEntry> Get(const std::string& key) const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         auto it = route_.find(key);
         return it == route_.end() ? nullptr : it->second;
@@ -76,7 +61,7 @@ class ObjectIndex {
     // True when `entry` is still the current published instance for `key`
     // (identity + not torn down). Lets a pinned handle or a deferred eviction
     // candidate revalidate itself against replacements of the same key.
-    bool IsCurrent(std::string_view key, const ObjectEntry* entry) const {
+    bool IsCurrent(const std::string& key, const ObjectEntry* entry) const {
         auto pinned = Get(key);
         if (!pinned || pinned.get() != entry) {
             return false;
@@ -100,7 +85,7 @@ class ObjectIndex {
         return true;
     }
 
-    bool Contains(std::string_view key) const {
+    bool Contains(const std::string& key) const {
         std::shared_lock<std::shared_mutex> lock(route_lock_);
         return route_.find(key) != route_.end();
     }
@@ -143,7 +128,7 @@ class ObjectIndex {
     // escape the callback. No-op when the key is absent or the entry has no
     // metadata yet.
     template <typename Fn>
-    void WithObject(std::string_view key, Fn&& fn) const {
+    void WithObject(const std::string& key, Fn&& fn) const {
         auto entry = Get(key);
         if (!entry) {
             return;
@@ -237,9 +222,7 @@ class ObjectIndex {
     // single shared_mutex. Per-object mutation is finer-grained
     // (ObjectEntry::mutex).
     mutable std::shared_mutex route_lock_;
-    std::unordered_map<std::string, std::shared_ptr<ObjectEntry>, StringHash,
-                       std::equal_to<>>
-        route_;
+    std::unordered_map<std::string, std::shared_ptr<ObjectEntry>> route_;
     // Monotonic publication counter backing ObjectEntry::generation().
     std::atomic<uint64_t> generation_counter_{0};
 
