@@ -17,6 +17,7 @@
 #include <thread>
 #include <vector>
 
+#include "client_liveness.h"
 #include "ha/snapshot/store_resource_snapshot_codec.h"
 #include "master_metric_manager.h"
 #include "segment.h"
@@ -1229,7 +1230,10 @@ TEST(SegmentPoolTest,
     SegmentManager legacy(BufferAllocatorType::OFFSET);
     const UUID client = generate_uuid();
     const auto segment = MakeSegment(0, "snapshot-handles");
-    ASSERT_EQ(legacy.getSegmentAccess().MountSegment(segment, client),
+    const auto client_liveness = std::make_shared<ClientLivenessRecord>(
+        ClientLivenessRecord::Clock::now());
+    ASSERT_EQ(legacy.getSegmentAccess().MountSegment(segment, client,
+                                                     client_liveness),
               ErrorCode::OK);
 
     // SegmentManager does not release capacity in its destructor.
