@@ -94,7 +94,10 @@ elseif(USE_MACA)
   # MACA legacy EP kernels use the SDK cu-bridge nvcc front-end. mxcc is used
   # for the PG worker, but does not provide CUDA compatibility headers such as
   # cooperative_groups.h required by these translation units.
-  set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
+  set(MOONCAKE_EP_SOURCES
+      ep_py.cpp
+      ../benchmarks/legacy_buffer_perf.cpp
+      mooncake_ep_buffer.cpp)
   # The elastic kernel contains NVIDIA PTX inline assembly and is not part of
   # the legacy Buffer API exercised on MACA.
   set(_ep_maca_device_sources

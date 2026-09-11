@@ -1,5 +1,7 @@
 #include <mooncake_ep_buffer.h>
+#if !defined(MOONCAKE_EP_USE_MACA)
 #include <elastic/mooncake_ep_elastic_buffer.h>
+#endif
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
@@ -13,9 +15,11 @@ void bind_legacy_buffer_perf(py::module_& module);
 
 PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
+#if !defined(MOONCAKE_EP_USE_MACA)
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
     m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
+#endif
     m.def("has_nccl_device_support", []() {
 #ifdef USE_NCCL_DEVICE
         return true;
@@ -53,6 +57,7 @@ PYBIND11_MODULE(_ep, m) {
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine);
 
+#if !defined(MOONCAKE_EP_USE_MACA)
     py::class_<MooncakeElasticBuffer>(m, "ElasticBuffer")
         .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
                       bool, bool, bool, int, int, int, int, std::string,
@@ -91,6 +96,7 @@ PYBIND11_MODULE(_ep, m) {
              &MooncakeElasticBuffer::sync_nvlink_ipc_handles)
         .def("dispatch", &MooncakeElasticBuffer::dispatch)
         .def("combine", &MooncakeElasticBuffer::combine);
+#endif
 }
 
 }  // namespace mooncake
