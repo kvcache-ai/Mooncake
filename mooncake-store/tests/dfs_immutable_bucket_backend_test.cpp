@@ -59,6 +59,27 @@ class BucketTempDir {
     std::string path_str_;
 };
 
+class AlignedBuffer {
+   public:
+    explicit AlignedBuffer(size_t size) : size_(size) {
+        void* ptr = nullptr;
+        if (::posix_memalign(&ptr, kAlignment, size) == 0) {
+            ptr_ = static_cast<char*>(ptr);
+        }
+    }
+    ~AlignedBuffer() { ::free(ptr_); }
+
+    AlignedBuffer(const AlignedBuffer&) = delete;
+    AlignedBuffer& operator=(const AlignedBuffer&) = delete;
+
+    char* data() { return ptr_; }
+    size_t size() const { return size_; }
+
+   private:
+    char* ptr_ = nullptr;
+    size_t size_ = 0;
+};
+
 // Injects failures on the Nth WriteAt/ReadAt, and can force short results, to
 // exercise the backend's partial-I/O and error paths.
 class FaultyPosixFsAdapter : public PosixFsAdapter {
@@ -66,6 +87,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
     void FailWriteCall(int call) { fail_write_call_.store(call); }
     void FailReadCall(int call) { fail_read_call_.store(call); }
     void FailWriteOffset(int64_t offset) { fail_write_offset_.store(offset); }
+    void DisableDirectOpen() { direct_open_disabled_.store(true); }
     // Truncates the Nth write to `bytes`, simulating a short pwritev.
     void ShortWriteCall(int call, size_t bytes) {
         short_write_call_.store(call);
@@ -78,6 +100,17 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
     void ZeroReadCall(int call) { zero_read_call_.store(call); }
     int WriteCalls() const { return write_calls_.load(); }
     int ReadCalls() const { return read_calls_.load(); }
+    int DirectReadCalls() const { return direct_read_calls_.load(); }
+    int AlignedDirectReads() const { return aligned_direct_reads_.load(); }
+    int StagedDirectReads() const { return staged_direct_reads_.load(); }
+
+    tl::expected<int, ErrorCode> OpenFileDirect(
+        const std::string& path) override {
+        if (direct_open_disabled_.load()) {
+            return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        }
+        return PosixFsAdapter::OpenFileDirect(path);
+    }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
@@ -115,6 +148,7 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
 
     tl::expected<size_t, ErrorCode> DirectReadAt(int fd, iovec* iov, int iovcnt,
                                                  int64_t offset) override {
+        ++direct_read_calls_;
         const int call = ++read_calls_;
         if (call == fail_read_call_.load()) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -135,9 +169,26 @@ class FaultyPosixFsAdapter : public PosixFsAdapter {
         return PosixFsAdapter::DirectReadAt(fd, iov, iovcnt, offset);
     }
 
+   protected:
+    tl::expected<size_t, ErrorCode> DirectReadAtAligned(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        ++aligned_direct_reads_;
+        return PosixFsAdapter::DirectReadAtAligned(fd, iov, iovcnt, offset);
+    }
+
+    tl::expected<size_t, ErrorCode> DirectReadAtStaged(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        ++staged_direct_reads_;
+        return PosixFsAdapter::DirectReadAtStaged(fd, iov, iovcnt, offset);
+    }
+
    private:
     std::atomic<int> write_calls_{0};
     std::atomic<int> read_calls_{0};
+    std::atomic<int> direct_read_calls_{0};
+    std::atomic<int> aligned_direct_reads_{0};
+    std::atomic<int> staged_direct_reads_{0};
+    std::atomic<bool> direct_open_disabled_{false};
     std::atomic<int> fail_write_call_{-1};
     std::atomic<int64_t> fail_write_offset_{-1};
     std::atomic<int> fail_read_call_{-1};
@@ -234,13 +285,13 @@ TEST_F(DfsBucketBackendTest, WriteThenReadRoundTrip) {
     EXPECT_EQ(ReadObject(key, desc), value);
 }
 
-TEST_F(DfsBucketBackendTest, WrittenEntryContainsHeaderKeyValueAndPadding) {
-    const std::string key = "header_key";
+TEST_F(DfsBucketBackendTest, WrittenEntryContainsOnlyObjectAndPadding) {
+    const std::string key = "layout_key";
     const std::string value(64, 'Z');
     auto desc = WriteObject(key, value);
 
-    const uint64_t entry_start =
-        desc.offset - BucketEntryLayout::kHeaderSize - key.size();
+    const uint64_t entry_start = desc.offset;
+    EXPECT_EQ(entry_start % kAlignment, 0u);
     const int fd = ::open(desc.file_path.c_str(), O_RDONLY);
     ASSERT_GE(fd, 0);
     std::vector<char> buffer(desc.aligned_size, '\0');
@@ -249,23 +300,8 @@ TEST_F(DfsBucketBackendTest, WrittenEntryContainsHeaderKeyValueAndPadding) {
               static_cast<ssize_t>(buffer.size()));
     ::close(fd);
 
-    uint64_t stored_key_size = 0;
-    for (size_t i = 0; i < BucketEntryLayout::kHeaderSize; ++i) {
-        stored_key_size |=
-            static_cast<uint64_t>(static_cast<unsigned char>(buffer[i]))
-            << (8 * i);
-    }
-    EXPECT_EQ(stored_key_size, key.size());
-    EXPECT_EQ(
-        std::string(buffer.data() + BucketEntryLayout::kHeaderSize, key.size()),
-        key);
-    EXPECT_EQ(
-        std::string(buffer.data() + BucketEntryLayout::kHeaderSize + key.size(),
-                    value.size()),
-        value);
-    const size_t entry_size =
-        BucketEntryLayout::kHeaderSize + key.size() + value.size();
-    EXPECT_TRUE(std::all_of(buffer.begin() + entry_size, buffer.end(),
+    EXPECT_EQ(std::string(buffer.data(), value.size()), value);
+    EXPECT_TRUE(std::all_of(buffer.begin() + value.size(), buffer.end(),
                             [](char byte) { return byte == 0; }));
 }
 
@@ -294,6 +330,60 @@ TEST_F(DfsBucketBackendTest, MultiSliceValueWriteAndRead) {
     std::string actual(out_a.begin(), out_a.end());
     actual.append(out_b.begin(), out_b.begin() + (expected.size() - 300));
     EXPECT_EQ(actual, expected);
+}
+
+TEST_F(DfsBucketBackendTest, DirectReadChoosesZeroCopyOrStagingByAlignment) {
+    const std::string aligned_key = "direct_aligned";
+    auto aligned_desc = allocator_->Allocate(aligned_key, 2 * kAlignment);
+    ASSERT_TRUE(aligned_desc.has_value());
+    AlignedBuffer source_a(kAlignment), source_b(kAlignment);
+    AlignedBuffer output_a(kAlignment), output_b(kAlignment);
+    ASSERT_NE(source_a.data(), nullptr);
+    ASSERT_NE(source_b.data(), nullptr);
+    ASSERT_NE(output_a.data(), nullptr);
+    ASSERT_NE(output_b.data(), nullptr);
+    std::memset(source_a.data(), 'A', source_a.size());
+    std::memset(source_b.data(), 'B', source_b.size());
+    auto write_results =
+        backend_->BatchWrite({{aligned_key,
+                               *aligned_desc,
+                               {{source_a.data(), source_a.size()},
+                                {source_b.data(), source_b.size()}}}});
+    ASSERT_EQ(write_results.size(), 1u);
+    ASSERT_TRUE(write_results[0].has_value());
+
+    const int aligned_before = adapter_->AlignedDirectReads();
+    const int staged_before = adapter_->StagedDirectReads();
+    auto aligned_results =
+        backend_->BatchRead({{aligned_key,
+                              *aligned_desc,
+                              {{output_a.data(), output_a.size()},
+                               {output_b.data(), output_b.size()}}}});
+    ASSERT_EQ(aligned_results.size(), 1u);
+    ASSERT_TRUE(aligned_results[0].has_value());
+    EXPECT_EQ(adapter_->AlignedDirectReads(), aligned_before + 1);
+    EXPECT_EQ(adapter_->StagedDirectReads(), staged_before);
+    EXPECT_EQ(std::memcmp(source_a.data(), output_a.data(), kAlignment), 0);
+    EXPECT_EQ(std::memcmp(source_b.data(), output_b.data(), kAlignment), 0);
+
+    const std::string unaligned_key = "direct_staged";
+    const std::string unaligned_value(1234, 'U');
+    auto unaligned_desc = WriteObject(unaligned_key, unaligned_value);
+    AlignedBuffer short_output(kAlignment);
+    ASSERT_NE(short_output.data(), nullptr);
+    short_output.data()[unaligned_value.size()] = 'G';
+    const int staged_before_unaligned = adapter_->StagedDirectReads();
+    auto staged_results = backend_->BatchRead(
+        {{unaligned_key,
+          unaligned_desc,
+          {{short_output.data(), unaligned_value.size()}}}});
+    ASSERT_EQ(staged_results.size(), 1u);
+    ASSERT_TRUE(staged_results[0].has_value());
+    EXPECT_EQ(adapter_->StagedDirectReads(), staged_before_unaligned + 1);
+    EXPECT_EQ(short_output.data()[unaligned_value.size()], 'G');
+    EXPECT_EQ(std::memcmp(short_output.data(), unaligned_value.data(),
+                          unaligned_value.size()),
+              0);
 }
 
 TEST_F(DfsBucketBackendTest, BatchWriteAndBatchReadPreserveRequestOrder) {
@@ -448,10 +538,9 @@ TEST_F(DfsBucketBackendTest, RejectsInconsistentDescriptors) {
     }
     {
         auto bad = desc;
-        // An offset smaller than the header + key cannot be a valid value
-        // offset.
+        // Bucket object offsets must stay alignment-aligned.
         bad.offset = 1;
-        cases.push_back({"offset before header", bad});
+        cases.push_back({"unaligned offset", bad});
     }
     {
         auto bad = desc;
@@ -543,6 +632,31 @@ TEST_F(DfsBucketBackendTest, ReadFailurePropagates) {
     ASSERT_EQ(results.size(), 1u);
     ASSERT_FALSE(results[0].has_value());
     EXPECT_EQ(results[0].error(), ErrorCode::FILE_READ_FAIL);
+}
+
+TEST_F(DfsBucketBackendTest, DirectOpenUnsupportedUsesBufferedReadFallback) {
+    const std::string key = "buffered_fallback";
+    const std::string value(4096, 'F');
+    auto desc = WriteObject(key, value);
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    auto adapter = std::make_unique<FaultyPosixFsAdapter>();
+    adapter->DisableDirectOpen();
+    auto* fallback_adapter = adapter.get();
+    backend_ = std::make_shared<DistributedStorageBackend>(file_config, config_,
+                                                           std::move(adapter));
+    ASSERT_TRUE(backend_->Init().has_value());
+
+    std::string out(value.size(), '\0');
+    auto results =
+        backend_->BatchRead({{key, desc, {{out.data(), out.size()}}}});
+    ASSERT_EQ(results.size(), 1u);
+    ASSERT_TRUE(results[0].has_value());
+    EXPECT_EQ(out, value);
+    EXPECT_GT(fallback_adapter->ReadCalls(), 0);
+    EXPECT_EQ(fallback_adapter->DirectReadCalls(), 0);
 }
 
 TEST_F(DfsBucketBackendTest, ShortDirectReadIsResumed) {
@@ -938,6 +1052,18 @@ TEST_F(DfsBucketBackendTest, ContiguousEntriesAreMerged) {
         values.push_back(value);
         descriptors.push_back(*desc);
     }
+
+    // Reopen with the optional merged-read path enabled so this test exercises
+    // extraction from a combined [object][padding] window.
+    config_.batch_read_merge_enabled = true;
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    auto adapter = std::make_unique<FaultyPosixFsAdapter>();
+    adapter_ = adapter.get();
+    backend_ = std::make_shared<DistributedStorageBackend>(file_config, config_,
+                                                           std::move(adapter));
+    ASSERT_TRUE(backend_->Init().has_value());
 
     // Batch read
     std::vector<std::string> outputs;

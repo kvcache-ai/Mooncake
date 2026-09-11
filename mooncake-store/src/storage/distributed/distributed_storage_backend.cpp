@@ -46,9 +46,8 @@ bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
 /**
  * @brief Validate a BUCKET-mode descriptor.
  *
- * Unlike SHARD, the *value* offset of a bucket entry is generally not
- * alignment-aligned (it sits after an 8-byte header plus the key), so the
- * alignment check applies to the entry start and reserved size instead.
+ * Bucket data files store each object at the aligned entry start, followed by
+ * padding. The key lives only in metadata.
  */
 bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
                                   const std::string& key,
@@ -56,12 +55,8 @@ bool IsBucketDescriptorRangeValid(const DistributedFSDescriptor& desc,
     if (desc.object_size == 0 || desc.shard_idx < 0) return false;
     if (key.empty()) return false;
 
-    const uint64_t header_and_key = BucketEntryLayout::kHeaderSize + key.size();
-    if (desc.offset < header_and_key) return false;
-    const uint64_t entry_start = desc.offset - header_and_key;
-
-    auto layout = RebuildBucketEntryLayout(entry_start, key.size(),
-                                           desc.object_size, config.alignment);
+    auto layout = RebuildBucketEntryLayout(desc.offset, desc.object_size,
+                                           config.alignment);
     if (!layout) return false;
     if (layout->value_offset != desc.offset) return false;
     if (layout->reserved_size != desc.aligned_size) return false;
@@ -561,21 +556,10 @@ DistributedStorageBackend::BatchWrite(
             results[i] = tl::make_unexpected(target.error());
             continue;
         }
-        const uint64_t header_size =
-            BucketEntryLayout::kHeaderSize + request.key.size();
-        if (request.descriptor.offset < header_size) continue;
-        const uint64_t entry_size =
-            header_size + request.descriptor.object_size;
-        if (request.descriptor.aligned_size < entry_size) continue;
         uint64_t value_size = 0;
         std::vector<char> payload(
             static_cast<size_t>(request.descriptor.aligned_size), 0);
-        for (size_t j = 0; j < BucketEntryLayout::kHeaderSize; ++j)
-            payload[j] =
-                static_cast<char>((request.key.size() >> (8 * j)) & 0xff);
-        std::memcpy(payload.data() + BucketEntryLayout::kHeaderSize,
-                    request.key.data(), request.key.size());
-        size_t payload_offset = static_cast<size_t>(header_size);
+        size_t payload_offset = 0;
         bool invalid = false;
         for (const auto& slice : request.slices) {
             if ((!slice.ptr && slice.size > 0) ||
@@ -591,8 +575,7 @@ DistributedStorageBackend::BatchWrite(
             }
         }
         if (invalid || value_size != request.descriptor.object_size) continue;
-        prepared.push_back({i, std::move(*target),
-                            request.descriptor.offset - header_size,
+        prepared.push_back({i, std::move(*target), request.descriptor.offset,
                             std::move(payload)});
     }
 
@@ -800,9 +783,7 @@ void DistributedStorageBackend::ExecuteMergedRead(
     }
     for (const auto* pr : io.reads) {
         const auto& request = requests[pr->request_index];
-        const uint64_t value_offset = pr->entry_start - io.entry_start +
-                                      BucketEntryLayout::kHeaderSize +
-                                      request.key.size();
+        const uint64_t value_offset = pr->entry_start - io.entry_start;
         CopyToSlices(request, staging.data() + value_offset);
         results[pr->request_index] = {};
     }
@@ -934,9 +915,16 @@ void DistributedStorageBackend::ExecuteKeyRead(
              j < iovs.size() && pending.size() < kMaxIovChunk; ++j) {
             pending.push_back(iovs[j]);
         }
-        auto read_result = fs_adapter_->DirectReadAt(
-            read.target.fd, pending.data(), static_cast<int>(pending.size()),
-            static_cast<int64_t>(read.value_offset + done));
+        auto read_result =
+            read.target.mutex == nullptr
+                ? fs_adapter_->DirectReadAt(
+                      read.target.fd, pending.data(),
+                      static_cast<int>(pending.size()),
+                      static_cast<int64_t>(read.value_offset + done))
+                : fs_adapter_->ReadAt(
+                      read.target.fd, pending.data(),
+                      static_cast<int>(pending.size()),
+                      static_cast<int64_t>(read.value_offset + done));
         if (!read_result) {
             error = read_result.error();
             break;
@@ -1147,11 +1135,7 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             continue;
         }
 
-        const uint64_t header_size =
-            BucketEntryLayout::kHeaderSize + request.key.size();
-        if (request.descriptor.offset < header_size) continue;
-        prepared.push_back({i, std::move(*target),
-                            request.descriptor.offset - header_size,
+        prepared.push_back({i, std::move(*target), request.descriptor.offset,
                             request.descriptor.aligned_size});
     }
 

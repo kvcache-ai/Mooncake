@@ -58,12 +58,24 @@ class PosixFsAdapter : public FileSystemAdapter {
 
     const char* GetName() const override { return "posix"; }
 
+   protected:
+    // Split out for focused tests and to keep the zero-copy and bounce-buffer
+    // paths explicit. DirectReadAt selects the first only when the file offset,
+    // every non-empty iovec address, and every iovec length are 4K-aligned.
+    virtual tl::expected<size_t, ErrorCode> DirectReadAtAligned(int fd,
+                                                                iovec* iov,
+                                                                int iovcnt,
+                                                                int64_t offset);
+
+    virtual tl::expected<size_t, ErrorCode> DirectReadAtStaged(int fd,
+                                                               iovec* iov,
+                                                               int iovcnt,
+                                                               int64_t offset);
+
    private:
-    // O_DIRECT reads must land in aligned, contiguous memory, so DirectReadAt
-    // stages through a bounce buffer. Allocating one bounce per key on the
-    // 128-way batch path thrashes the allocator, so bounce buffers are pooled
-    // and reused across reads. A slot is borrowed for the duration of one read
-    // and returned afterwards.
+    // Unaligned O_DIRECT reads stage through a contiguous bounce buffer.
+    // Allocating one bounce per key on the 128-way batch path thrashes the
+    // allocator, so buffers are pooled and reused across reads.
     struct DirectStaging {
         DirectStaging() = default;
         // Frees the posix_memalign'd buffer.

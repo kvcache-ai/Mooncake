@@ -27,9 +27,8 @@ struct DistributedStorageConfig;
 /**
  * @brief Persisted state of one entry inside a bucket.
  *
- * `entry_offset` is the aligned start of the entry, not the value offset; the
- * value offset is always derived via BucketEntryLayout so there is a single
- * definition of the layout.
+ * `entry_offset` is both the aligned start of the entry and the value offset;
+ * the data file stores no key header.
  */
 struct PersistedBucketEntry {
     std::string key;
@@ -57,7 +56,6 @@ struct PersistedBucketMetadata {
     uint32_t version = 0;
     uint32_t checksum = 0;
     int64_t bucket_id = 0;
-    uint64_t bucket_generation = 0;
     uint64_t capacity = 0;
     uint64_t alignment = 0;
     uint64_t append_offset = 0;
@@ -65,15 +63,15 @@ struct PersistedBucketMetadata {
     // being deleted. Recovery treats such a bucket as gone rather than live.
     bool evicting = false;
     std::vector<PersistedBucketEntry> entries;
-    YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id,
-             bucket_generation, capacity, alignment, append_offset, evicting,
-             entries);
+    YLT_REFL(PersistedBucketMetadata, version, checksum, bucket_id, capacity,
+             alignment, append_offset, evicting, entries);
 };
 
 // Bump when the layout of PersistedBucketMetadata changes incompatibly.
-// Version 5 stores only committed entries; pending reservations and tombstones
-// remain in memory but are intentionally absent from the on-disk snapshot.
-inline constexpr uint32_t kBucketMetadataVersion = 5;
+// Version 6 removes the bucket-level identity counter and describes data files
+// whose entries contain only object bytes followed by padding. It continues to
+// store only committed entries; older versions are rejected.
+inline constexpr uint32_t kBucketMetadataVersion = 6;
 
 enum class BucketEntryState : int32_t {
     PENDING = 0,
@@ -122,9 +120,9 @@ enum class BucketEntryState : int32_t {
  *
  * Slow DFS I/O (preallocation, metadata writes, deletes) is always performed
  * with `mutex_` released: the caller snapshots the state it needs under the
- * lock, does the I/O, then reacquires the lock and re-validates the bucket
- * generation before publishing the result. No RPC, callback or filesystem call
- * ever happens while `mutex_` is held.
+ * lock, does the I/O, then reacquires the lock and re-validates the captured
+ * BucketState object identity before publishing the result. No RPC, callback
+ * or filesystem call ever happens while `mutex_` is held.
  */
 class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
    public:
@@ -237,7 +235,9 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
 
         ImmutableBucketAllocator* owner_ = nullptr;
         int64_t bucket_id_ = -1;
-        uint64_t bucket_generation_ = 0;
+        // Keeps the exact BucketState captured by PrepareEviction alive. The
+        // allocator compares pointer identity before Commit/Abort can act.
+        std::shared_ptr<void> bucket_identity_;
         std::vector<EvictionCandidate> candidates_;
     };
 
@@ -324,9 +324,6 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
 
     struct BucketState {
         int64_t bucket_id = 0;
-        // Bumped whenever the bucket is (re)created so a stale transaction
-        // cannot resolve against a different bucket that reused the id.
-        uint64_t generation = 0;
         uint64_t capacity = 0;
         uint64_t append_offset = 0;
         // Bytes reserved by entries that are still live (PENDING or
@@ -372,10 +369,10 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
     // marks it for persistence. Requires `mutex_`.
     void SealActiveBucketLocked();
 
-    // Creates a fresh bucket: allocates the id under the lock, preallocates
-    // the data file outside the lock, then publishes the bucket. Rolls back
-    // id/state/files on any failure. The new bucket's `.meta` is written only
-    // when it is later sealed.
+    // Creates a fresh bucket: allocates the id under the lock, preallocates the
+    // data file outside the lock, then publishes the bucket. Bucket ids remain
+    // monotonic even when creation fails. The new bucket's `.meta` is written
+    // only when it is later sealed.
     tl::expected<BucketPtr, ErrorCode> CreateBucketUnlocked(
         std::unique_lock<std::mutex>& lock);
 
@@ -423,6 +420,11 @@ class ImmutableBucketAllocator final : public GlobalAllocatorInterface {
     std::chrono::seconds eviction_check_interval_{5};
 
     mutable std::mutex mutex_;
+    // Serializes `.meta` writes and eviction deletion. Flush and eviction both
+    // revalidate BucketState pointer identity after taking this mutex so a
+    // captured operation cannot recreate or overwrite metadata for a bucket
+    // that has since been removed.
+    std::mutex metadata_io_mutex_;
     // Serializes bucket creation. Creating a bucket releases `mutex_` for the
     // file I/O, so without this flag several threads would each reserve a
     // distinct id and race to publish, orphaning all but one and letting a

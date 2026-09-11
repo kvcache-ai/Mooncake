@@ -101,8 +101,7 @@ bool DistributedStorageConfig::ValidateForBucketAllocator() const {
         LOG(ERROR) << "DistributedStorageConfig: invalid allocator type";
         return false;
     }
-    if (bucket_capacity == 0 ||
-        bucket_capacity <= BucketEntryLayout::kHeaderSize) {
+    if (bucket_capacity == 0) {
         LOG(ERROR) << "DistributedStorageConfig: bucket_capacity is too small, "
                    << "bucket_capacity=" << bucket_capacity;
         return false;

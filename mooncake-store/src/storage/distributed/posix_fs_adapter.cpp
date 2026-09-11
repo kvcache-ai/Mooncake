@@ -8,6 +8,7 @@
 
 #include <cerrno>
 #include <algorithm>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -337,6 +338,43 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(int fd, iovec* iov,
     if (iovcnt == 0) return size_t{0};
 
     uint64_t total_length = 0;
+    bool aligned = static_cast<uint64_t>(offset) % kDirectIoAlignment == 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if (iov[i].iov_len >
+            std::numeric_limits<uint64_t>::max() - total_length) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total_length += iov[i].iov_len;
+        if (iov[i].iov_len == 0) continue;
+        aligned =
+            aligned &&
+            reinterpret_cast<uintptr_t>(iov[i].iov_base) % kDirectIoAlignment ==
+                0 &&
+            iov[i].iov_len % kDirectIoAlignment == 0;
+    }
+    if (total_length == 0) return size_t{0};
+
+    if (aligned) {
+        return DirectReadAtAligned(fd, iov, iovcnt, offset);
+    }
+    return DirectReadAtStaged(fd, iov, iovcnt, offset);
+}
+
+tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtAligned(
+    int fd, iovec* iov, int iovcnt, int64_t offset) {
+    // Every direct-I/O constraint has already been checked, so preadv can
+    // scatter straight into the caller's buffers without a bounce or memcpy.
+    ssize_t ret;
+    do {
+        ret = ::preadv(fd, iov, iovcnt, static_cast<off_t>(offset));
+    } while (ret < 0 && errno == EINTR);
+    if (ret < 0) return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    return static_cast<size_t>(ret);
+}
+
+tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAtStaged(
+    int fd, iovec* iov, int iovcnt, int64_t offset) {
+    uint64_t total_length = 0;
     for (int i = 0; i < iovcnt; ++i) {
         if (iov[i].iov_len >
             std::numeric_limits<uint64_t>::max() - total_length) {
@@ -344,7 +382,6 @@ tl::expected<size_t, ErrorCode> PosixFsAdapter::DirectReadAt(int fd, iovec* iov,
         }
         total_length += iov[i].iov_len;
     }
-    if (total_length == 0) return size_t{0};
 
     // O_DIRECT cannot take the caller's unaligned offset/buffers, so read the
     // covering aligned window into a staging buffer and copy the requested

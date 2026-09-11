@@ -117,6 +117,29 @@ class AlignedBuffer {
     size_t size_ = 0;
 };
 
+class TrackingDirectPosixFsAdapter : public PosixFsAdapter {
+   public:
+    int aligned_reads() const { return aligned_reads_; }
+    int staged_reads() const { return staged_reads_; }
+
+   protected:
+    tl::expected<size_t, ErrorCode> DirectReadAtAligned(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        ++aligned_reads_;
+        return PosixFsAdapter::DirectReadAtAligned(fd, iov, iovcnt, offset);
+    }
+
+    tl::expected<size_t, ErrorCode> DirectReadAtStaged(
+        int fd, iovec* iov, int iovcnt, int64_t offset) override {
+        ++staged_reads_;
+        return PosixFsAdapter::DirectReadAtStaged(fd, iov, iovcnt, offset);
+    }
+
+   private:
+    int aligned_reads_ = 0;
+    int staged_reads_ = 0;
+};
+
 void ConfigurePosixDfs(EnvGuard& env) {
     env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
     env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
@@ -194,6 +217,86 @@ TEST_F(FsAdapterFdTest, WriteAtReadAt) {
     EXPECT_EQ(std::memcmp(write_buf, read_buf, sizeof(write_buf)), 0);
 
     adapter_->CloseFile(*fd);
+}
+
+TEST_F(FsAdapterFdTest, DirectReadUsesCallerBufferWhenFullyAligned) {
+    const std::string path = tmp_->file("direct_aligned.data");
+    TrackingDirectPosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
+    ASSERT_TRUE(adapter.PreallocateFile(path, 2 * 4096).has_value());
+
+    auto write_fd = adapter.OpenFile(path);
+    ASSERT_TRUE(write_fd.has_value());
+    AlignedBuffer source(2 * 4096);
+    ASSERT_NE(source.data(), nullptr);
+    std::memset(source.data(), 'A', 4096);
+    std::memset(source.data() + 4096, 'B', 4096);
+    iovec write_iov{source.data(), source.size()};
+    ASSERT_EQ(adapter.WriteAt(*write_fd, &write_iov, 1, 0).value(),
+              source.size());
+    ASSERT_TRUE(adapter.CloseFile(*write_fd).has_value());
+
+    auto direct_fd = adapter.OpenFileDirect(path);
+    ASSERT_TRUE(direct_fd.has_value());
+    AlignedBuffer first(4096), second(4096);
+    ASSERT_NE(first.data(), nullptr);
+    ASSERT_NE(second.data(), nullptr);
+    iovec reads[2]{{first.data(), first.size()},
+                   {second.data(), second.size()}};
+    auto result = adapter.DirectReadAt(*direct_fd, reads, 2, 0);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, 2 * 4096u);
+    EXPECT_EQ(adapter.aligned_reads(), 1);
+    EXPECT_EQ(adapter.staged_reads(), 0);
+    EXPECT_EQ(std::memcmp(first.data(), source.data(), 4096), 0);
+    EXPECT_EQ(std::memcmp(second.data(), source.data() + 4096, 4096), 0);
+    EXPECT_TRUE(adapter.CloseFile(*direct_fd).has_value());
+}
+
+TEST_F(FsAdapterFdTest, DirectReadStagesUnalignedRequestsWithoutOverflow) {
+    const std::string path = tmp_->file("direct_staged.data");
+    TrackingDirectPosixFsAdapter adapter;
+    ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
+    ASSERT_TRUE(adapter.PreallocateFile(path, 4096).has_value());
+
+    auto write_fd = adapter.OpenFile(path);
+    ASSERT_TRUE(write_fd.has_value());
+    std::vector<char> source(4096, 'S');
+    iovec write_iov{source.data(), source.size()};
+    ASSERT_EQ(adapter.WriteAt(*write_fd, &write_iov, 1, 0).value(),
+              source.size());
+    ASSERT_TRUE(adapter.CloseFile(*write_fd).has_value());
+
+    auto direct_fd = adapter.OpenFileDirect(path);
+    ASSERT_TRUE(direct_fd.has_value());
+
+    AlignedBuffer storage(4098);
+    ASSERT_NE(storage.data(), nullptr);
+    storage.data()[0] = 'L';
+    storage.data()[4097] = 'R';
+    iovec unaligned_address{storage.data() + 1, 4096};
+    auto address_result =
+        adapter.DirectReadAt(*direct_fd, &unaligned_address, 1, 0);
+    ASSERT_TRUE(address_result.has_value());
+    EXPECT_EQ(*address_result, 4096u);
+    EXPECT_EQ(storage.data()[0], 'L');
+    EXPECT_EQ(storage.data()[4097], 'R');
+
+    AlignedBuffer short_target(4096);
+    ASSERT_NE(short_target.data(), nullptr);
+    short_target.data()[1234] = 'G';
+    iovec unaligned_length{short_target.data(), 1234};
+    auto length_result =
+        adapter.DirectReadAt(*direct_fd, &unaligned_length, 1, 0);
+    ASSERT_TRUE(length_result.has_value());
+    EXPECT_EQ(*length_result, 1234u);
+    EXPECT_EQ(short_target.data()[1234], 'G');
+
+    EXPECT_EQ(adapter.aligned_reads(), 0);
+    EXPECT_EQ(adapter.staged_reads(), 2);
+    EXPECT_EQ(std::memcmp(storage.data() + 1, source.data(), 4096), 0);
+    EXPECT_EQ(std::memcmp(short_target.data(), source.data(), 1234), 0);
+    EXPECT_TRUE(adapter.CloseFile(*direct_fd).has_value());
 }
 
 TEST_F(FsAdapterFdTest, MultiIovWriteRead) {
