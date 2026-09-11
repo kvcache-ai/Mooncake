@@ -15,6 +15,7 @@
 #include "rpc_types.h"
 #include "master_metric_manager.h"
 #include "task_manager.h"
+#include "request_context.h"
 
 namespace mooncake {
 
@@ -417,6 +418,24 @@ class MasterClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc(size_t input_size, Args&&... args);
+    /**
+     * @brief Generic RPC invocation helper that carries the per-request
+     * RequestContext as a coro_rpc out-of-band attachment (hop B inject).
+     * Callers MUST snapshot current_request_context_attachment() at their
+     * own entry (before any co_await / syncAwait) and forward it explicitly;
+     * the ServiceMethod MUST be a *_with_attachment V3 server handler. When
+     * the attachment is empty, callers must fall back to invoke_rpc to stay
+     * backward compatible with old masters / no-attachment path.
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_attachment(
+        std::string attachment, Args&&... args);
+
+    template <auto ServiceMethod, typename ResultType, typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc_with_attachment(std::string attachment, size_t input_size,
+                                     Args&&... args);
+
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool

@@ -1,4 +1,5 @@
 #include "rpc_service.h"
+#include "request_context.h"
 #include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
@@ -944,6 +945,206 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+
+// hop B extract: per-request "_with_attachment" V3 handlers. Each reads the
+// out-of-band attachment, reinstalls it as this io thread's current request
+// context (so downstream Logging/metrics keep the id), and delegates to the
+// existing value-returning handler. Empty attachment == no per-request id.
+void WrappedMasterService::ExistKey_with_attachment(
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx, const std::string& key) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B ExistKey_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(ExistKey(key));
+}
+
+void WrappedMasterService::BatchExistKey_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx, const std::vector<std::string>& keys) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchExistKey_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchExistKey(keys));
+}
+
+void WrappedMasterService::BatchReplicaClear_with_attachment(
+    coro_rpc::context<tl::expected<std::vector<std::string>, ErrorCode>> ctx, const std::vector<std::string>& object_keys, const UUID& client_id, const std::string& segment_name) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchReplicaClear_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchReplicaClear(object_keys, client_id, segment_name));
+}
+
+void WrappedMasterService::GetReplicaListByRegex_with_attachment(
+    coro_rpc::context<tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>> ctx, const std::string& str) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B GetReplicaListByRegex_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(GetReplicaListByRegex(str));
+}
+
+void WrappedMasterService::GetReplicaList_with_attachment(
+    coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx, const std::string& key) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B GetReplicaList_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(GetReplicaList(key));
+}
+
+void WrappedMasterService::BatchGetReplicaList_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>> ctx, const std::vector<std::string>& keys) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchGetReplicaList_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchGetReplicaList(keys));
+}
+
+void WrappedMasterService::PutStart_with_attachment(
+    coro_rpc::context<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>> ctx, const UUID& client_id, const std::string& key, const uint64_t slice_length, const ReplicateConfig& config) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B PutStart_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(PutStart(client_id, key, slice_length, config));
+}
+
+void WrappedMasterService::PutEnd_with_attachment(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B PutEnd_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(PutEnd(client_id, key, replica_type));
+}
+
+void WrappedMasterService::PutRevoke_with_attachment(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B PutRevoke_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(PutRevoke(client_id, key, replica_type));
+}
+
+void WrappedMasterService::BatchPutStart_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>> ctx, const UUID& client_id, const std::vector<std::string>& keys, const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchPutStart_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchPutStart(client_id, keys, slice_lengths, config));
+}
+
+void WrappedMasterService::BatchPutEnd_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx, const UUID& client_id, const std::vector<std::string>& keys) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchPutEnd_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchPutEnd(client_id, keys));
+}
+
+void WrappedMasterService::BatchPutRevoke_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx, const UUID& client_id, const std::vector<std::string>& keys) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchPutRevoke_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchPutRevoke(client_id, keys));
+}
+
+void WrappedMasterService::Remove_with_attachment(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const std::string& key, bool force) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B Remove_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(Remove(key, force));
+}
+
+void WrappedMasterService::RemoveByRegex_with_attachment(
+    coro_rpc::context<tl::expected<long, ErrorCode>> ctx, const std::string& str, bool force) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B RemoveByRegex_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(RemoveByRegex(str, force));
+}
+
+void WrappedMasterService::RemoveAll_with_attachment(
+    coro_rpc::context<long> ctx, bool force) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B RemoveAll_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(RemoveAll(force));
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -979,6 +1180,38 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveAll>(
         &wrapped_master_service);
+    // --- register the per-request _with_attachment V3 handlers ---
+    server.register_handler<&mooncake::WrappedMasterService::ExistKey_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchExistKey_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetReplicaListByRegex_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutStart_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutEnd_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::PutRevoke_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchPutStart_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Remove_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RemoveAll_with_attachment>(
+        &wrapped_master_service);
+
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(

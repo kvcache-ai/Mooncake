@@ -7,6 +7,7 @@
 #include <thread>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_context.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
@@ -84,6 +85,42 @@ class WrappedMasterService {
                                                 bool force = false);
 
     long RemoveAll(bool force = false);
+    // --- Per-request "_with_attachment" V3 handlers (hop B extract).-
+    // Keep the value-returning handlers above for backward compat
+    // (old clients / no-attachment path route to the plain methods);
+    // these carry the per-request RequestContext via coro_rpc's
+    // out-of-band attachment and reuse the same per-handler logic.
+    void ExistKey_with_attachment(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+                               const std::string& key);
+    void BatchExistKey_with_attachment(coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+                               const std::vector<std::string>& keys);
+    void BatchReplicaClear_with_attachment(coro_rpc::context<tl::expected<std::vector<std::string>, ErrorCode>> ctx,
+                               const std::vector<std::string>& object_keys, const UUID& client_id, const std::string& segment_name);
+    void GetReplicaListByRegex_with_attachment(coro_rpc::context<tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>> ctx,
+                               const std::string& str);
+    void GetReplicaList_with_attachment(coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
+                               const std::string& key);
+    void BatchGetReplicaList_with_attachment(coro_rpc::context<std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>> ctx,
+                               const std::vector<std::string>& keys);
+    void PutStart_with_attachment(coro_rpc::context<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>> ctx,
+                               const UUID& client_id, const std::string& key, const uint64_t slice_length, const ReplicateConfig& config);
+    void PutEnd_with_attachment(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+                               const UUID& client_id, const std::string& key, ReplicaType replica_type);
+    void PutRevoke_with_attachment(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+                               const UUID& client_id, const std::string& key, ReplicaType replica_type);
+    void BatchPutStart_with_attachment(coro_rpc::context<std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>> ctx,
+                               const UUID& client_id, const std::vector<std::string>& keys, const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config);
+    void BatchPutEnd_with_attachment(coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+                               const UUID& client_id, const std::vector<std::string>& keys);
+    void BatchPutRevoke_with_attachment(coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+                               const UUID& client_id, const std::vector<std::string>& keys);
+    void Remove_with_attachment(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+                               const std::string& key, bool force);
+    void RemoveByRegex_with_attachment(coro_rpc::context<tl::expected<long, ErrorCode>> ctx,
+                               const std::string& str, bool force);
+    void RemoveAll_with_attachment(coro_rpc::context<long> ctx,
+                               bool force);
+
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
