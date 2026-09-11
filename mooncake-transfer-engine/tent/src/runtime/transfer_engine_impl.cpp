@@ -932,6 +932,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             }
         }
         if (options.internal) desc.internal = options.internal;
+        desc.permission = options.perm;
         desc_list.push_back(std::move(desc));
     }
 
@@ -1498,6 +1499,7 @@ struct TransferEngineImpl::PreparedSubmit {
     struct Task {
         size_t merged_task_index{0};
         size_t task_id{0};
+        size_t public_length{0};
     };
 
     struct Owner {
@@ -1861,6 +1863,38 @@ Status TransferEngineImpl::prepareSubmit(
     auto merged =
         mergeRequests(request_list, merge_boundaries, merge_requests_);
 
+    // Limit only oversized merges that would use standard TCP. In
+    // particular, an UNSPEC request selected for RDMA/HP TCP keeps its own
+    // transport's limits. Ordinary-size submissions need no extra route lookup
+    // or allocation here, and a too-large single request remains independent.
+    // This bounds initial TCP selection only. A later route change/failover
+    // to TCP can still reject an oversized owner; it is not split on retry.
+    if (merged.request_list.size() < request_list.size()) {
+        std::vector<bool> tcp_limited;
+        for (size_t i = 0; i < merged.request_list.size(); ++i) {
+            const auto& request = merged.request_list[i];
+            if (request.length <= tcpMaxTransferBytes(request.opcode)) continue;
+            if (request.transport_hint == TCP ||
+                (request.transport_hint == UNSPEC &&
+                 getTransportType(request, 0).transport == TCP)) {
+                if (tcp_limited.empty())
+                    tcp_limited.resize(merged.request_list.size(), false);
+                tcp_limited[i] = true;
+            }
+        }
+        if (!tcp_limited.empty()) {
+            for (const auto& [public_id, owner_id] : merged.task_lookup) {
+                if (tcp_limited[owner_id]) {
+                    auto& limit = merge_boundaries[public_id].max_merge_bytes;
+                    limit = std::min<uint64_t>(
+                        limit,
+                        tcpMaxTransferBytes(request_list[public_id].opcode));
+                }
+            }
+            merged = mergeRequests(request_list, merge_boundaries, true);
+        }
+    }
+
     prepared.owners.reserve(merged.request_list.size());
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
@@ -1885,7 +1919,8 @@ Status TransferEngineImpl::prepareSubmit(
         } else {
             owner.derived_task_ids.push_back(task_id);
         }
-        prepared.tasks.push_back({merged_task_index, task_id});
+        prepared.tasks.push_back({merged_task_index, task_id,
+                                  request_list[public_task_index].length});
     }
     return Status::OK();
 }
@@ -1928,6 +1963,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
+            task.public_length = task_plan.public_length;
             if (task.type != UNSPEC) {
                 auto owner_it =
                     owner_task_id_by_merged_task.find(merged_task_id);
@@ -1944,6 +1980,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = merged_request;
+        task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
@@ -2149,6 +2186,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = owner.request;
+        task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time = prepared.submit_time;
         task.type = UNSPEC;
@@ -2853,7 +2891,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                 task_status.s = public_status;
                 task_status.transferred_bytes =
                     public_status == COMPLETED
-                        ? batch->task_list[public_task_id].request.length
+                        ? batch->task_list[public_task_id].public_length
                         : 0;
                 return Status::OK();
             }
@@ -2883,7 +2921,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     recordTaskCompletionMetrics(batch->task_list[poll_task_id], prev_status,
                                 task_status.s);
 
-    if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
+    if (task_status.s == COMPLETED) {
+        task_status.transferred_bytes =
+            batch->task_list[public_task_id].public_length;
+        CHECK_STATUS(maybeFireSubmitHooks(batch));
+    }
     return Status::OK();
 }
 
@@ -3003,13 +3045,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         overall_status.s = worst_failure;
     }
     // else: some tasks still PENDING → overall_status.s stays PENDING
-    // Transfer-bound notifications may only be delivered once the transfer
-    // they are attached to has actually completed. The second parameter is
-    // "verify completion before sending", so passing the batch's completion
-    // into it inverted the guard: for a batch still in flight, or one that
-    // ended in failure, check was false and every hook fired anyway.
-    if (overall_status.s == COMPLETED)
-        CHECK_STATUS(maybeFireSubmitHooks(batch, /*check=*/false));
+    // A hook belongs to its own submit interval. Other intervals can still
+    // be pending or failed without withholding this interval's notification.
+    CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
 
