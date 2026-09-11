@@ -130,8 +130,9 @@ class MetadataScanBench;
  * 7. soft_pin_deadline_index_ mutex
  *
  * Lock order with the object route lock: entry → route is allowed (create
- * holds the entry lock across InsertObject); route → entry is forbidden. Strict tenant admission and policy mutation paths
- * that need both tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire
+ * holds the entry lock across InsertObject); route → entry is forbidden.
+ * Strict tenant admission and policy mutation paths that need both
+ * tenant_quota_policy_mutex_ and snapshot_mutex_ must acquire
  * the tenant policy mutex first, then snapshot_mutex_.
  * tenant_quota_recompute_mutex_ serializes the capacity snapshot and the
  * corresponding quota-table update. The segment mutex is released before
@@ -1196,7 +1197,8 @@ class MasterService {
     // per-object lock; each member is re-looked-up and re-validated under its
     // own `ObjectEntry::mutex`, which is released before the member is erased.
     // Because all members live in one tenant container, there is no cross-shard
-    // lock ordering to worry about; entry → route is the only allowed nesting.
+    // lock ordering to worry about; entry → route is the only allowed
+    // nesting.
     //
     // Each member is re-looked-up and re-validated under its own lock (lease,
     // hard/soft pin, evictable replica — all against `now`) because state may
