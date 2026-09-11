@@ -6,7 +6,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <thread>
+#include <vector>
 
 namespace mooncake::test {
 
@@ -216,6 +218,90 @@ TEST_F(NoFHeartbeatTest, OnlyFailedSegmentIsUnmounted) {
     EXPECT_FALSE(service->IsNoFSegmentMountedForTesting(bad_segment.id));
     EXPECT_GE(good_probe_calls.load(), 1);
     EXPECT_GE(bad_probe_calls.load(), 2);
+}
+
+TEST_F(NoFHeartbeatTest, UnmountReleasesNoFProbeResources) {
+    auto service = CreateService(/*heartbeat_interval_sec=*/1,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/3);
+    service->SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string*) { return true; });
+    std::mutex released_mutex;
+    std::vector<std::string> released_endpoints;
+    service->SetNoFProbeReleaseFnForTesting(
+        [&released_mutex, &released_endpoints](const std::string& endpoint) {
+            std::lock_guard<std::mutex> lock(released_mutex);
+            released_endpoints.push_back(endpoint);
+        });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_release", "nof_release");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+
+    // The heartbeat thread only allocates probe resources once it starts
+    // tracking the segment, so wait until its state exists.
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::milliseconds(2000), std::chrono::milliseconds(20), [&]() {
+            return service->GetNoFHeartbeatFailureCountForTesting(segment.id)
+                .has_value();
+        }));
+
+    ASSERT_TRUE(service->UnmountNoFSegment(segment.id, client_id).has_value());
+
+    std::vector<std::string> released;
+    {
+        std::lock_guard<std::mutex> lock(released_mutex);
+        released = released_endpoints;
+    }
+    ASSERT_FALSE(released.empty());
+    for (const auto& endpoint : released) {
+        EXPECT_EQ(endpoint, segment.te_endpoint);
+    }
+    EXPECT_FALSE(
+        service->GetNoFHeartbeatFailureCountForTesting(segment.id).has_value());
+}
+
+TEST_F(NoFHeartbeatTest, HeartbeatUnmountReleasesNoFProbeResources) {
+    auto service = CreateService(/*heartbeat_interval_sec=*/1,
+                                 /*probe_timeout_ms=*/50,
+                                 /*failure_threshold=*/2);
+    service->SetNoFProbeFnForTesting(
+        [](const std::string&, uint32_t, std::string* reason) {
+            if (reason) {
+                *reason = "submit_fail";
+            }
+            return false;
+        });
+    std::mutex released_mutex;
+    std::vector<std::string> released_endpoints;
+    service->SetNoFProbeReleaseFnForTesting(
+        [&released_mutex, &released_endpoints](const std::string& endpoint) {
+            std::lock_guard<std::mutex> lock(released_mutex);
+            released_endpoints.push_back(endpoint);
+        });
+
+    UUID client_id = generate_uuid();
+    NoFSegment segment = MakeNoFSegment("nof_seg_release_hb", "nof_release_hb");
+    ASSERT_TRUE(service->MountNoFSegment(segment, client_id).has_value());
+
+    ASSERT_TRUE(WaitForCondition(
+        std::chrono::milliseconds(5000), std::chrono::milliseconds(50),
+        [&]() { return !service->IsNoFSegmentMountedForTesting(segment.id); }));
+    ASSERT_TRUE(WaitForCondition(std::chrono::milliseconds(2000),
+                                 std::chrono::milliseconds(20), [&]() {
+                                     std::lock_guard<std::mutex> lock(
+                                         released_mutex);
+                                     return !released_endpoints.empty();
+                                 }));
+
+    std::vector<std::string> released;
+    {
+        std::lock_guard<std::mutex> lock(released_mutex);
+        released = released_endpoints;
+    }
+    for (const auto& endpoint : released) {
+        EXPECT_EQ(endpoint, segment.te_endpoint);
+    }
 }
 
 TEST_F(NoFHeartbeatTest, ClientExpiryDoesNotUnmountNoFSegment) {
