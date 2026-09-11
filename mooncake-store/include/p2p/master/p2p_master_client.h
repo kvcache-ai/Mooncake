@@ -63,27 +63,33 @@ class P2PMasterClient final {
     void SetHeartbeatRpcPort(uint16_t port) { heartbeat_rpc_port_ = port; }
 
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
-        std::string_view object_key);
+        std::string_view object_key,
+        std::string ctx_attachment = {});
 
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string_view>& object_keys);
+        const std::vector<std::string_view>& object_keys,
+        std::string ctx_attachment = {});
 
     [[nodiscard]] tl::expected<
         std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
         ErrorCode>
-    GetReadRouteByRegex(std::string_view regex);
+    GetReadRouteByRegex(std::string_view regex,
+                         std::string ctx_attachment = {});
 
     [[nodiscard]] tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>
-    GetReadRoute(std::string_view key, const P2PReadRouteConfig& config);
+    GetReadRoute(std::string_view key, const P2PReadRouteConfig& config,
+                  std::string ctx_attachment = {});
 
     [[nodiscard]] async_simple::coro::Lazy<
         tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
-    AsyncGetReadRoute(std::string_view key, const P2PReadRouteConfig& config);
+    AsyncGetReadRoute(std::string_view key, const P2PReadRouteConfig& config,
+                       std::string ctx_attachment = {});
 
     [[nodiscard]] std::vector<
         tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
     BatchGetReadRoute(const std::vector<std::string_view>& keys,
-                      const P2PReadRouteConfig& config);
+                      const P2PReadRouteConfig& config,
+                      std::string ctx_attachment = {});
 
     [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
         const UUID& segment_id);
@@ -104,31 +110,36 @@ class P2PMasterClient final {
         const UUID& client_id);
 
     [[nodiscard]] tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>
-    GetWriteRoute(const P2PGetWriteRouteRequest& req);
+    GetWriteRoute(const P2PGetWriteRouteRequest& req,
+                  std::string ctx_attachment = {});
 
     /**
      * @brief Batch gets write candidate routes for multiple keys in one RPC
      */
     [[nodiscard]] tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
-    BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req);
+    BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req,
+                       std::string ctx_attachment = {});
 
     /**
      * @brief Publishes a route to master
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PublishRoute(
-        const P2PPublishRouteRequest& req);
+        const P2PPublishRouteRequest& req,
+        std::string ctx_attachment = {});
 
     /**
      * @brief Withdraws a route from master
      */
     [[nodiscard]] tl::expected<void, ErrorCode> WithdrawRoute(
-        const P2PWithdrawRouteRequest& req);
+        const P2PWithdrawRouteRequest& req,
+        std::string ctx_attachment = {});
 
     /**
      * @brief Withdraws routes from multiple segments in one call
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchWithdrawRoute(
-        const P2PBatchWithdrawRouteRequest& req);
+        const P2PBatchWithdrawRouteRequest& req,
+        std::string ctx_attachment = {});
 
     /**
      * @brief Batch sync routes with mixed publish and withdraw operations
@@ -228,6 +239,110 @@ class P2PMasterClient final {
                         << "Batch RPC call failed: " << result.error().msg;
                     std::vector<tl::expected<ResultType, ErrorCode>>
                         error_results;
+                    error_results.reserve(input_size);
+                    for (size_t i = 0; i < input_size; ++i) {
+                        error_results.emplace_back(
+                            tl::make_unexpected(ErrorCode::RPC_FAIL));
+                    }
+                    co_return error_results;
+                }
+                if (metrics_) {
+                    auto end_time = std::chrono::steady_clock::now();
+                    auto latency =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            end_time - start_time);
+                    metrics_->rpc_latency.observe(
+                        {RpcNameTraits<ServiceMethod>::value}, latency.count());
+                }
+                co_return result->result();
+            }());
+    }
+
+
+    // hop B inject (with attachment). Snapshot at the synchronous caller and
+    // forward ctx_attachment explicitly -- do NOT read g_current_ctx here: P2P
+    // async methods resume on arbitrary worker threads, so a thread_local read
+    // after an await would be polluted (the AsyncGetReadRoute pollution case).
+    // Empty attachment => callers must use the plain invoke path instead.
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
+    invoke_rpc_async_with_attachment(std::string attachment, Args&&... args) {
+        return invoke_rpc_async_with_attachment_with_pool<ServiceMethod, ReturnType>(
+            client_accessor_.GetClientPool(), std::move(attachment),
+            std::forward<Args>(args)...);
+    }
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
+    invoke_rpc_async_with_attachment_with_pool(
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> pool,
+        std::string attachment, Args&&... args) {
+        if (metrics_) {
+            metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+        }
+        auto start_time = std::chrono::steady_clock::now();
+        auto ret = co_await pool->send_request(
+            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
+                return client.send_request_with_attachment<ServiceMethod>(
+                    std::string_view(attachment.data(), attachment.size()),
+                    std::forward<Args>(args)...);
+            });
+        if (!ret.has_value()) {
+            LOG(ERROR) << "Client not available";
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        auto result = co_await std::move(ret.value());
+        if (!result) {
+            LOG(ERROR) << "RPC call failed: " << result.error().msg;
+            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+        if (metrics_) {
+            auto end_time = std::chrono::steady_clock::now();
+            auto latency =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    end_time - start_time);
+            metrics_->rpc_latency.observe(
+                {RpcNameTraits<ServiceMethod>::value}, latency.count());
+        }
+        co_return result->result();
+    }
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_attachment(
+        std::string attachment, Args&&... args) {
+        return async_simple::coro::syncAwait(
+            invoke_rpc_async_with_attachment<ServiceMethod, ReturnType>(
+                std::move(attachment), std::forward<Args>(args)...));
+    }
+
+    template <auto ServiceMethod, typename ResultType, typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc_with_attachment(std::string attachment, size_t input_size,
+                                     Args&&... args) {
+        auto pool = client_accessor_.GetClientPool();
+        if (metrics_) {
+            metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
+        }
+        auto start_time = std::chrono::steady_clock::now();
+        return async_simple::coro::syncAwait(
+            [&]() -> async_simple::coro::Lazy<
+                      std::vector<tl::expected<ResultType, ErrorCode>>> {
+                auto ret = co_await pool->send_request(
+                    [&](coro_io::client_reuse_hint,
+                        coro_rpc::coro_rpc_client& client) {
+                        return client.send_request_with_attachment<ServiceMethod>(
+                            std::string_view(attachment.data(), attachment.size()),
+                            std::forward<Args>(args)...);
+                    });
+                if (!ret.has_value()) {
+                    LOG(ERROR) << "Client not available";
+                    co_return std::vector<tl::expected<ResultType, ErrorCode>>(
+                        input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+                }
+                auto result = co_await std::move(ret.value());
+                if (!result) {
+                    LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
+                    std::vector<tl::expected<ResultType, ErrorCode>> error_results;
                     error_results.reserve(input_size);
                     for (size_t i = 0; i < input_size; ++i) {
                         error_results.emplace_back(

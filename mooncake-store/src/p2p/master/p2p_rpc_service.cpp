@@ -1,4 +1,5 @@
 #include "p2p/master/p2p_rpc_service.h"
+#include "request_context.h"
 
 #include <algorithm>
 #include <chrono>
@@ -523,6 +524,140 @@ tl::expected<void, ErrorCode> P2PMasterRpcService::CompleteRouteSync(
     return result;
 }
 
+
+// hop B extract: per-request "_with_attachment" V3 handlers. Each reads the
+// out-of-band attachment, reinstalls it with a CurrentCtxScope, and delegates
+// to the existing value-returning handler. Empty attachment == no per-request id.
+void P2PMasterRpcService::ExistKey_with_attachment(
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx, std::string_view key) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B ExistKey_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(ExistKey(key));
+}
+
+void P2PMasterRpcService::BatchExistKey_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx, const std::vector<std::string_view>& keys) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchExistKey_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchExistKey(keys));
+}
+
+void P2PMasterRpcService::GetReadRouteByRegex_with_attachment(
+    coro_rpc::context<tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>, ErrorCode>> ctx, std::string_view regex) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B GetReadRouteByRegex_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(GetReadRouteByRegex(regex));
+}
+
+void P2PMasterRpcService::GetReadRoute_with_attachment(
+    coro_rpc::context<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>> ctx, const P2PGetReadRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B GetReadRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(GetReadRoute(req));
+}
+
+void P2PMasterRpcService::BatchGetReadRoute_with_attachment(
+    coro_rpc::context<P2PBatchGetReadRouteResponse> ctx, const P2PBatchGetReadRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchGetReadRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchGetReadRoute(req));
+}
+
+void P2PMasterRpcService::GetWriteRoute_with_attachment(
+    coro_rpc::context<tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>> ctx, const P2PGetWriteRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B GetWriteRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(GetWriteRoute(req));
+}
+
+void P2PMasterRpcService::BatchGetWriteRoute_with_attachment(
+    coro_rpc::context<P2PBatchGetWriteRouteResponse> ctx, const P2PBatchGetWriteRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchGetWriteRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchGetWriteRoute(req));
+}
+
+void P2PMasterRpcService::PublishRoute_with_attachment(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const P2PPublishRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B PublishRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(PublishRoute(req));
+}
+
+void P2PMasterRpcService::WithdrawRoute_with_attachment(
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const P2PWithdrawRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B WithdrawRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(WithdrawRoute(req));
+}
+
+void P2PMasterRpcService::BatchWithdrawRoute_with_attachment(
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx, const P2PBatchWithdrawRouteRequest& req) {
+    auto att = ctx.get_context_info()->release_request_attachment();
+    RequestContext rc;
+    if (!att.empty()) {
+        rc = deserialize_request_context(att);
+        VLOG(2) << "hop-B BatchWithdrawRoute_with_attachment request_id=" << rc.request_id
+                << " trace_id=" << rc.trace_id;
+    }
+    CurrentCtxScope guard(std::move(rc));
+    ctx.response_msg(BatchWithdrawRoute(req));
+}
+
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::P2PMasterRpcService& wrapped_master_service,
@@ -566,6 +701,28 @@ void RegisterP2PRpcService(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::BatchWithdrawRoute>(
         &wrapped_master_service);
+    // --- register the per-request _with_attachment V3 handlers ---
+    server.register_handler<&P2PMasterRpcService::ExistKey_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::BatchExistKey_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::GetReadRouteByRegex_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::GetReadRoute_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::BatchGetReadRoute_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::GetWriteRoute_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::BatchGetWriteRoute_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::PublishRoute_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::WithdrawRoute_with_attachment>(
+        &wrapped_master_service);
+    server.register_handler<&P2PMasterRpcService::BatchWithdrawRoute_with_attachment>(
+        &wrapped_master_service);
+
     server.register_handler<&P2PMasterRpcService::BatchSyncRoutes>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::CompleteRouteSync>(
