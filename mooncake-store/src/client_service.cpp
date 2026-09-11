@@ -41,6 +41,7 @@
 #include "common/network.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "config/client_auto_discovery_config.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
@@ -66,6 +67,7 @@ std::optional<size_t> GetTransportRegistrationLimit(
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
+constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
 class ScopedObjectChecksumBuffer {
    public:
@@ -520,46 +522,6 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     return client_cfg;
 }
 
-static std::optional<bool> get_auto_discover() {
-    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
-    if (ev_ad) {
-        try {
-            int iv = std::stoi(ev_ad);
-            if (iv == 1) {
-                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-                return true;
-            } else if (iv == 0) {
-                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-                return false;
-            }
-        } catch (const std::exception&) {
-            // A non-numeric or out-of-range value makes std::stoi throw; fall
-            // through to the warning below and use the default instead of
-            // letting the exception abort client initialization.
-        }
-        LOG(WARNING)
-            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-            << ", should be 0 or 1, using default: auto discovery not set";
-    }
-    return std::nullopt;
-}
-
-static std::vector<std::string> get_auto_discover_filters() {
-    const char* raw_filters = std::getenv("MC_MS_FILTERS");
-    if (raw_filters == nullptr) {
-        return {};
-    }
-
-    LOG(INFO) << "whitelist filters: " << raw_filters;
-    std::vector<std::string> filters;
-    boost::split(filters, std::string(raw_filters), boost::is_any_of(","),
-                 boost::token_compress_off);
-    for (auto& filter : filters) {
-        filter = std::string(TrimAsciiWhitespace(filter));
-    }
-    return filters;
-}
-
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     std::vector<std::string> devices;
     boost::split(devices, std::string(value), boost::is_any_of(","),
@@ -630,19 +592,22 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return coordinator.error();
         }
 
-        auto current_view = coordinator.value()->ReadCurrentView();
-        if (!current_view) {
-            LOG(ERROR) << "Failed to read current master view: "
-                       << toString(current_view.error());
-            return current_view.error();
+        auto master_view = ha::ReadCurrentViewOrWaitForReady(
+            *coordinator.value(), kInitialLeaderReadyTimeout);
+        if (!master_view) {
+            LOG(ERROR) << "Failed to discover a ready master view: "
+                       << toString(master_view.error());
+            return master_view.error();
         }
-        if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
+        if (!master_view->has_value()) {
+            // An absent ready view can mean either no elected leader or an
+            // elected leader whose endpoint is still hidden during recovery.
+            LOG(ERROR) << "No master became ready within "
+                       << kInitialLeaderReadyTimeout.count() << " seconds";
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
 
-        const auto& master_view = current_view.value().value();
-        auto err = SwitchLeader(master_view);
+        auto err = SwitchLeader(master_view->value());
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to master";
             return err;
@@ -650,11 +615,10 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
-
-        leader_monitor_running_ = true;
-        leader_monitor_thread_ =
-            std::thread([this]() { this->LeaderMonitorThreadMain(); });
-
+        if (!leader_monitor_running_.exchange(true)) {
+            leader_monitor_thread_ =
+                std::thread([this]() { this->LeaderMonitorThreadMain(); });
+        }
         return ErrorCode::OK;
     } else {
         auto err = master_client_.Connect(master_server_entry);
@@ -669,6 +633,17 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         last_ping_success_.store(true);
         return ErrorCode::OK;
     }
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    // Foreground RPCs keep their normal retry policy. Only the HA heartbeat
+    // and leader-readiness probes use the separately configured fast-fail
+    // control pool once initialization has completed.
+    master_client_.EnableHaConnectionPolicy();
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -728,6 +703,25 @@ void Client::LeaderMonitorThreadMain() {
         }
 
         if (!view_change->changed || !view_change->current_view.has_value()) {
+            // A warming leader owns master_view without exposing a routable
+            // endpoint. Acknowledge the empty observation so the next wait
+            // blocks on the ready-value update instead of spinning on the old
+            // view version.
+            if (view_change->changed &&
+                !view_change->current_view.has_value()) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                // Do not let a stale empty watch result erase a newer view
+                // installed concurrently by the heartbeat recovery path.
+                const bool still_on_observed_view =
+                    known_version.has_value()
+                        ? current_master_view_.has_value() &&
+                              current_master_view_->view_version ==
+                                  known_version.value()
+                        : !current_master_view_.has_value();
+                if (still_on_observed_view) {
+                    current_master_view_.reset();
+                }
+            }
             continue;
         }
 
@@ -777,20 +771,9 @@ ErrorCode Client::InitTransferEngine(
 
     bool auto_discover = false;
     if (!use_tent) {
-        // Get auto_discover and filters from env (non-TENT only)
-        std::optional<bool> env_auto_discover = get_auto_discover();
-        if (env_auto_discover.has_value()) {
-            // Use user-specified auto-discover setting
-            auto_discover = env_auto_discover.value();
-        } else {
-            // Enable auto-discover for RDMA/EFA if no devices are specified
-            if ((protocol == "rdma" || protocol == "efa") &&
-                !device_names.has_value()) {
-                LOG(INFO) << "Set auto discovery ON by default for " << protocol
-                          << " protocol, since no device names provided";
-                auto_discover = true;
-            }
-        }
+        auto config = ClientAutoDiscoveryConfig::FromEnvironment(
+            protocol, device_names.has_value());
+        auto_discover = config.enabled;
         transfer_engine_->setAutoDiscover(
             {.enabled = auto_discover, .protocol = protocol});
 
@@ -799,15 +782,11 @@ ErrorCode Client::InitTransferEngine(
             LOG(INFO)
                 << "Transfer engine auto discovery is enabled for protocol: "
                 << protocol;
-            auto filters = get_auto_discover_filters();
-            transfer_engine_->setWhitelistFilters(std::move(filters));
-        } else {
-            const char* env_filters = std::getenv("MC_MS_FILTERS");
-            if (env_filters && *env_filters != '\0') {
-                LOG(WARNING)
-                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                    << "ignoring whitelist: " << env_filters;
-            }
+        }
+
+        config.LoadFiltersFromEnvironment();
+        if (auto_discover) {
+            transfer_engine_->setWhitelistFilters(std::move(config.filters));
         }
     }
 
@@ -1086,6 +1065,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
             }
         }
     }
+
+    client->EnterHaRuntimeMode();
 
     // this only performs RPC calls
     if (protocol == "rpc_only") {
@@ -1378,6 +1359,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
                              query_result.object_checksum);
     if (!checksum_result) {
+        // add checksum err for single-key
+        auto* dfs_metric = GetDfsMetricPtr();
+        if (replica.is_dfs_replica() && dfs_metric) {
+            dfs_metric->RecordReadErrors(toString(checksum_result.error()));
+        }
         return tl::unexpected(checksum_result.error());
     }
 
@@ -1582,6 +1568,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             }
         }
     }
+    // A successful transfer is only valid while its read lease is live.
+    // Check once all segment batches have completed, as in the regular
+    // BatchGet path, and preserve errors from validation or transfer.
+    auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << object_keys[i];
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+        }
+    }
     return results;
 }
 
@@ -1667,6 +1664,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         if (replica.is_dfs_replica()) {
             if (!dfs_storage_backend_) {
                 LOG(ERROR) << "DFS backend is not initialized";
+                if (auto* dfs_metric = GetDfsMetricPtr()) {
+                    dfs_metric->RecordReadErrors(
+                        toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+                }
                 results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
                 continue;
             }
@@ -1708,7 +1709,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     if (!dfs_read_requests.empty()) {
+        auto* dfs_metric = GetDfsMetricPtr();
+        const auto dfs_read_start = std::chrono::steady_clock::now();
         auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        const auto dfs_read_latency_us = elapsed_us_since(dfs_read_start);
+        int64_t dfs_success_keys = 0;
+        uint64_t dfs_success_bytes = 0;
         if (dfs_results.size() != dfs_read_requests.size()) {
             LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
                        << dfs_read_requests.size() << ", got "
@@ -1716,24 +1722,58 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             for (size_t index : dfs_read_indices) {
                 results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
             }
+            if (dfs_metric) {
+                dfs_metric->RecordReadErrors(
+                    toString(ErrorCode::INTERNAL_ERROR),
+                    static_cast<int64_t>(dfs_read_indices.size()));
+            }
         } else {
             for (size_t i = 0; i < dfs_results.size(); ++i) {
                 const size_t index = dfs_read_indices[i];
                 const auto& request = dfs_read_requests[i];
                 if (!dfs_results[i]) {
+                    LOG(WARNING) << "DFS read failed, action=batch_read, key="
+                                 << request.key
+                                 << ", offset=" << request.descriptor.offset
+                                 << ", size=" << request.descriptor.object_size
+                                 << ", error=" << dfs_results[i].error();
+                    if (dfs_metric) {
+                        dfs_metric->RecordReadErrors(
+                            toString(dfs_results[i].error()));
+                    }
                     results[index] = tl::unexpected(dfs_results[i].error());
                     continue;
                 }
+                // The I/O itself delivered these bytes, so they count even if
+                // the checksum below rejects the payload; a checksum mismatch
+                // is additionally recorded as an error so the two are
+                // distinguishable.
+                ++dfs_success_keys;
+                dfs_success_bytes += request.descriptor.object_size;
                 auto checksum_result = VerifyObjectChecksum(
                     request.key, request.slices, request.descriptor.object_size,
                     query_results[index].object_checksum);
                 if (!checksum_result) {
+                    if (dfs_metric) {
+                        dfs_metric->RecordReadErrors(
+                            toString(checksum_result.error()));
+                    }
                     results[index] = tl::unexpected(checksum_result.error());
                     continue;
                 }
                 results[index] = {};
             }
         }
+        if (dfs_metric && dfs_success_keys > 0) {
+            dfs_metric->ObserveRead(dfs_success_keys,
+                                    static_cast<int64_t>(dfs_success_bytes),
+                                    dfs_read_latency_us);
+        }
+        VLOG(1) << "DFS batch read finished, action=batch_read, requested="
+                << dfs_read_requests.size()
+                << ", succeeded=" << dfs_success_keys
+                << ", bytes=" << dfs_success_bytes
+                << ", latency_us=" << dfs_read_latency_us;
     }
 
     // Wait for all transfers to complete
@@ -1942,6 +1982,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                 transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
             }
         }
+    } else if (transfer_summary.allocated_dfs_replicas > 0) {
+        // A DFS replica was allocated but is abandoned because a peer replica
+        // failed first. Without this counter the write simply disappears: no
+        // error is recorded against DFS and no I/O is attempted. Counted per
+        // key, matching SubmitDfsWrites.
+        VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                << ", reason=non_dfs_transfer_failed";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordSkippedWrites(1);
+        }
     }
 
     auto us_put = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2134,6 +2184,15 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             } else {
                 transfer_summary.RecordFailure(ReplicaType::DFS, dfs_result);
             }
+        }
+    } else if (transfer_summary.allocated_dfs_replicas > 0) {
+        // Same abandoned-write case as in Put: the DFS replica was allocated
+        // but a peer replica failed first, so no I/O is attempted and no DFS
+        // error is recorded. Counted per key, matching SubmitDfsWrites.
+        VLOG(1) << "Skipping DFS write, action=skip, key=" << key
+                << ", reason=non_dfs_transfer_failed";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordSkippedWrites(1);
         }
     }
 
@@ -2773,27 +2832,47 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
     }
     if (!dfs_storage_backend_) {
         LOG(ERROR) << "DFS backend is unavailable for synchronous write";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordWriteErrors(
+                toString(ErrorCode::DFS_SERVICE_UNAVAILABLE),
+                static_cast<int64_t>(keys.size()));
+        }
         return std::vector<ErrorCode>(keys.size(),
                                       ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
 
+    auto* dfs_metric = GetDfsMetricPtr();
     std::vector<ErrorCode> results(keys.size(), ErrorCode::OK);
     std::vector<DfsWriteRequest> requests;
     std::vector<size_t> request_indices;
+    // Bytes per request, so the success accounting after BatchWrite does not
+    // have to walk the slice lists a second time.
+    std::vector<uint64_t> request_bytes;
     std::vector<PinnedBufferPool::Buffer> staging_buffers;
     requests.reserve(keys.size());
     request_indices.reserve(keys.size());
+    request_bytes.reserve(keys.size());
 
+    // Staging is the device-to-host copy below; it is timed separately from the
+    // BatchWrite call so a slow put can be attributed to the right side of the
+    // boundary between them.
+    const auto staging_start = std::chrono::steady_clock::now();
+    bool staging_performed = false;
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     for (size_t i = 0; i < keys.size(); ++i) {
         if (slice_lists[i] == nullptr) {
             results[i] = ErrorCode::INVALID_PARAMS;
+            if (dfs_metric) {
+                dfs_metric->RecordWriteErrors(
+                    toString(ErrorCode::INVALID_PARAMS));
+            }
             continue;
         }
 
         std::vector<Slice> host_slices;
         host_slices.reserve(slice_lists[i]->size());
+        uint64_t key_bytes = 0;
         bool staging_succeeded = true;
         for (const auto& slice : *slice_lists[i]) {
             device::PointerInfo info{};
@@ -2802,45 +2881,88 @@ std::vector<ErrorCode> Client::WriteDfsReplicas(
                                : runtime_accelerator.FindDeviceForPointer(
                                      slice.ptr, &info);
             if (device == nullptr) {
+                key_bytes += slice.size;
                 host_slices.push_back(slice);
                 continue;
             }
 
+            staging_performed = true;
             device->SetContext(info.device_id);
             auto buffer = pinned_buffer_pool_->Acquire(slice.size);
             if (!device->Copy(buffer.data, slice.ptr, slice.size,
                               device::CopyDirection::kDeviceToHost)) {
-                LOG(ERROR) << "DFS D2H staging failed for key " << keys[i];
+                LOG(ERROR) << "DFS D2H staging failed, action=stage, key="
+                           << keys[i] << ", size=" << slice.size
+                           << ", device_id=" << info.device_id;
                 pinned_buffer_pool_->Release(std::move(buffer));
                 results[i] = ErrorCode::TRANSFER_FAIL;
                 staging_succeeded = false;
                 break;
             }
+            key_bytes += slice.size;
             host_slices.emplace_back(Slice{buffer.data, slice.size});
             staging_buffers.push_back(std::move(buffer));
         }
         if (!staging_succeeded) {
+            // Counted as a DFS write failure: the key was destined for DFS and
+            // never got there, even though the backend was never reached.
+            if (dfs_metric) {
+                dfs_metric->RecordWriteErrors(
+                    toString(ErrorCode::TRANSFER_FAIL));
+            }
             continue;
         }
 
         requests.push_back(
             DfsWriteRequest{keys[i], descriptors[i], std::move(host_slices)});
         request_indices.push_back(i);
+        request_bytes.push_back(key_bytes);
+    }
+    if (dfs_metric && staging_performed) {
+        dfs_metric->ObserveWriteStaging(elapsed_us_since(staging_start));
     }
 
+    const auto write_start = std::chrono::steady_clock::now();
     auto write_results = dfs_storage_backend_->BatchWrite(requests);
+    const auto write_latency_us = elapsed_us_since(write_start);
+    int64_t success_keys = 0;
+    uint64_t success_bytes = 0;
     if (write_results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchWrite response size mismatch: expected "
                    << requests.size() << ", got " << write_results.size();
         for (size_t index : request_indices) {
             results[index] = ErrorCode::INTERNAL_ERROR;
         }
+        if (dfs_metric && !request_indices.empty()) {
+            dfs_metric->RecordWriteErrors(
+                toString(ErrorCode::INTERNAL_ERROR),
+                static_cast<int64_t>(request_indices.size()));
+        }
     } else {
         for (size_t i = 0; i < write_results.size(); ++i) {
             results[request_indices[i]] =
                 write_results[i] ? ErrorCode::OK : write_results[i].error();
+            if (write_results[i]) {
+                ++success_keys;
+                success_bytes += request_bytes[i];
+            } else if (dfs_metric) {
+                dfs_metric->RecordWriteErrors(
+                    toString(write_results[i].error()));
+            }
         }
     }
+    // Latency is per batch, so it is only observed when the batch delivered
+    // something; a fully failed batch would otherwise pollute the histogram
+    // with error-path timings.
+    if (dfs_metric && success_keys > 0) {
+        dfs_metric->ObserveWrite(success_keys,
+                                 static_cast<int64_t>(success_bytes),
+                                 write_latency_us);
+    }
+    VLOG(1) << "DFS batch write finished, action=write, requested="
+            << requests.size() << ", succeeded=" << success_keys
+            << ", bytes=" << success_bytes
+            << ", latency_us=" << write_latency_us;
 
     for (auto& buffer : staging_buffers) {
         pinned_buffer_pool_->Release(std::move(buffer));
@@ -2853,12 +2975,22 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
     std::vector<const std::vector<Slice>*> slice_lists;
     std::vector<DistributedFSDescriptor> descriptors;
     std::vector<size_t> op_indices;
+    auto* dfs_metric = GetDfsMetricPtr();
+    int64_t skipped_writes = 0;
 
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
         if (op.IsResolved() ||
-            op.transfer_summary.allocated_dfs_replicas == 0 ||
-            !NonDfsTransfersSucceeded(op.transfer_summary)) {
+            op.transfer_summary.allocated_dfs_replicas == 0) {
+            continue;
+        }
+        // A DFS replica was allocated but is abandoned because a peer replica
+        // failed first. Without this counter the write simply disappears: no
+        // error is recorded against DFS and no I/O is attempted.
+        if (!NonDfsTransfersSucceeded(op.transfer_summary)) {
+            ++skipped_writes;
+            VLOG(1) << "Skipping DFS write, action=skip, key=" << op.key
+                    << ", reason=non_dfs_transfer_failed";
             continue;
         }
 
@@ -2870,12 +3002,19 @@ void Client::SubmitDfsWrites(std::vector<PutOperation>& ops) {
             op.transfer_summary.RecordFailure(ReplicaType::DFS,
                                               ErrorCode::INVALID_REPLICA);
             op.AppendFailureContext("Allocated DFS replica has no descriptor");
+            if (dfs_metric) {
+                dfs_metric->RecordWriteErrors(
+                    toString(ErrorCode::INVALID_REPLICA));
+            }
             continue;
         }
         keys.push_back(op.key);
         slice_lists.push_back(&op.slices);
         descriptors.push_back(dfs_it->get_dfs_descriptor());
         op_indices.push_back(i);
+    }
+    if (dfs_metric && skipped_writes > 0) {
+        dfs_metric->RecordSkippedWrites(skipped_writes);
     }
 
     auto results = WriteDfsReplicas(keys, slice_lists, descriptors);
@@ -4691,21 +4830,44 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     }
     if (!dfs_storage_backend_) {
         LOG(ERROR) << "DFS backend is not initialized";
+        if (auto* dfs_metric = GetDfsMetricPtr()) {
+            dfs_metric->RecordReadErrors(
+                toString(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        }
         return ErrorCode::DFS_SERVICE_UNAVAILABLE;
     }
 
+    auto* dfs_metric = GetDfsMetricPtr();
     const auto& desc = replica_descriptor.get_dfs_descriptor();
     std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
+    const auto read_start = std::chrono::steady_clock::now();
     auto results = dfs_storage_backend_->BatchRead(requests);
+    const auto read_latency_us = elapsed_us_since(read_start);
     if (results.size() != 1) {
         LOG(ERROR) << "DFS BatchRead response size mismatch for key " << key;
+        if (dfs_metric) {
+            dfs_metric->RecordReadErrors(toString(ErrorCode::INTERNAL_ERROR));
+        }
         return ErrorCode::INTERNAL_ERROR;
     }
     if (!results[0]) {
-        LOG(ERROR) << "DFS read failed for key " << key << ": "
-                   << results[0].error();
+        LOG(ERROR) << "DFS read failed, action=read, key=" << key
+                   << ", offset=" << desc.offset
+                   << ", size=" << desc.object_size
+                   << ", latency_us=" << read_latency_us
+                   << ", error=" << results[0].error();
+        if (dfs_metric) {
+            dfs_metric->RecordReadErrors(toString(results[0].error()));
+        }
         return results[0].error();
     }
+    if (dfs_metric) {
+        dfs_metric->ObserveRead(1, static_cast<int64_t>(desc.object_size),
+                                read_latency_us);
+    }
+    VLOG(1) << "DFS read finished, action=read, key=" << key
+            << ", offset=" << desc.offset << ", size=" << desc.object_size
+            << ", latency_us=" << read_latency_us;
     return ErrorCode::OK;
 }
 

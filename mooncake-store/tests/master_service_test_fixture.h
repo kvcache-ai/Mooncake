@@ -93,6 +93,12 @@ class MasterServiceTest : public ::testing::Test {
         return ClientOffboardingWorker::ShouldAlert(retry_count);
     }
 
+    // Runs the stale-handle sweep inline. The fixture is a friend of
+    // MasterService, the classes gtest derives from it are not.
+    void ClearInvalidHandlesForTest(MasterService& service) {
+        service.ClearInvalidHandles();
+    }
+
     void ExpectKeyHiddenFromReadApis(MasterService& service,
                                      const std::string& key) {
         auto get = service.GetReplicaList(key, TenantId::Default());

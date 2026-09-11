@@ -76,6 +76,12 @@ class DfsGlobalAllocator {
         return initialized_.load(std::memory_order_acquire);
     }
 
+    // Append shards without moving existing allocations. Equal counts are
+    // idempotent; shrinking is not supported. The returned count is ready for
+    // allocation only after every new shard has been initialized.
+    tl::expected<int, ErrorCode> ExpandShards(int target_count);
+    int GetShardCount() const;
+
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
         const std::string& key, uint64_t size);
     void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
@@ -99,6 +105,7 @@ class DfsGlobalAllocator {
     using OffsetAllocationHandle = offset_allocator::OffsetAllocationHandle;
 
     struct ShardState {
+        std::string path;
         uint64_t capacity = 0;
         std::shared_ptr<OffsetAllocator> allocator;
 
@@ -130,6 +137,12 @@ class DfsGlobalAllocator {
         uint64_t pending_free_bytes = 0;
     };
 
+    using ShardList = std::vector<std::shared_ptr<ShardState>>;
+
+    tl::expected<std::shared_ptr<ShardState>, ErrorCode> CreateShard(
+        const std::string& path, std::vector<std::string>& created_files);
+    void CleanupCreatedFiles(const std::vector<std::string>& created_files);
+
     static constexpr size_t kNumKeyStripes = 65536;
 
     std::unique_lock<std::mutex> LockKey(const std::string& key) {
@@ -137,7 +150,6 @@ class DfsGlobalAllocator {
             key_stripes_[std::hash<std::string>{}(key) % kNumKeyStripes]);
     }
 
-    void ProcessPendingFrees(int shard_idx);
     void QueuePendingFree(ShardState& shard,
                           const std::shared_ptr<OffsetAllocationHandle>& handle,
                           uint64_t bytes,
@@ -145,14 +157,17 @@ class DfsGlobalAllocator {
     void CleanupExpiredPendingFrees(ShardState& shard,
                                     std::chrono::steady_clock::time_point now);
     double EffectiveUsage(ShardState& shard);
-    void PrepareEvictionFromShard(int shard_idx, PendingEviction& pending);
-    int SelectShard(const std::string& key) const;
+    void PrepareEvictionFromShard(ShardState& shard, int shard_idx,
+                                  PendingEviction& pending);
     uint64_t AlignSize(uint64_t size) const;
 
     std::string mount_path_;
-    int shard_count_ = 0;
+    uint64_t shard_capacity_ = 0;
     uint64_t alignment_ = 4096;
-    std::vector<std::unique_ptr<ShardState>> shards_;
+    // Readers retain an immutable topology snapshot. Expansion shares existing
+    // ShardState objects and publishes the complete new topology in one step.
+    std::shared_ptr<const ShardList> shards_;
+    std::mutex expansion_mutex_;
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     bool eviction_enabled_ = true;
     double eviction_high_watermark_ = 0.9;

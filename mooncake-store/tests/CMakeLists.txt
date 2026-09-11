@@ -40,6 +40,7 @@ add_store_test(region_driver_test region_driver_test.cpp)
 add_store_test(replica_allocator_test replica_allocator_test.cpp)
 add_store_test(segment_pool_test segment_pool_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+add_store_test(batch_read_fanout_test batch_read_fanout_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(client_liveness_test client_liveness_test.cpp)
@@ -190,10 +191,13 @@ add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
+add_store_test(hugepage_config_test hugepage_config_test.cpp)
 add_store_test(hugepage_size_env_test hugepage_size_env_test.cpp)
 add_store_test(random_test random_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_auto_port_config_test client_auto_port_config_test.cpp)
+add_store_test(client_auto_discovery_config_test
+               client_auto_discovery_config_test.cpp)
 add_store_test(cxl_segment_config_test cxl_segment_config_test.cpp)
 add_store_test(client_numa_config_test client_numa_config_test.cpp)
 add_store_test(local_hot_cache_config_test local_hot_cache_config_test.cpp)
@@ -214,10 +218,13 @@ add_store_test(dfs_posix_test dfs_posix_test.cpp)
 add_store_test(distributed_storage_config_test
                distributed_storage_config_test.cpp)
 add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
-add_test(NAME dfs_batch_read_checksum_test
-         COMMAND dfs_sync_client_test
-                 --gtest_filter=DfsSyncClientTest.BatchGetVerifiesDfsChecksum)
-set_tests_properties(dfs_batch_read_checksum_test
+add_test(
+  NAME dfs_read_checksum_test
+  COMMAND
+    dfs_sync_client_test
+    "--gtest_filter=DfsSyncClientTest.BatchGetVerifiesDfsChecksum:DfsSyncClientTest.GetVerifiesDfsChecksumAndRecordsError"
+)
+set_tests_properties(dfs_read_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 if(USE_3FS)
   add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
@@ -255,8 +262,11 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv_connector_config_test.cpp)
+add_store_test(nvme_kv_io_concurrency_config_test
+               nvme_kv_io_concurrency_config_test.cpp)
 add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
 add_store_test(offset_allocator_backend_config_test
                offset_allocator_backend_config_test.cpp)

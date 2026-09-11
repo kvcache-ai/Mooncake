@@ -739,7 +739,10 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     options.internal = internal;
     if (location == kWildcardLocation ||
         LocationParser(location).type() == "cpu") {
-        if (transport_list_[SHM])
+        if (transport_list_[MNNVL] &&
+            transport_list_[MNNVL]->capabilities().dram_to_dram)
+            options.type = MNNVL;  // EGM: host memory NVLink peers can address
+        else if (transport_list_[SHM])
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
@@ -763,7 +766,13 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
     if (options.type == UNSPEC) {
-        if (transport_list_[RDMA])
+        auto location_type = LocationParser(options.location).type();
+        bool host_location =
+            options.location == kWildcardLocation || location_type == "cpu";
+        if (host_location && transport_list_[MNNVL] &&
+            transport_list_[MNNVL]->capabilities().dram_to_dram)
+            options.type = MNNVL;  // EGM: host memory NVLink peers can address
+        else if (transport_list_[RDMA])
             options.type = RDMA;
         else if (transport_list_[TCP])
             options.type = TCP;
@@ -1767,13 +1776,19 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     if (transport_list_[MNNVL] && transport_list_[NVLINK]) {
         auto& xport = transport_list_[MNNVL];
         auto& caps = xport->capabilities();
+        // A remote host buffer is directly addressable only when the peer
+        // exported it over MNNVL (EGM); plain host memory still needs the
+        // staging path even if this side advertises dram_to_dram.
+        const bool remote_mnnvl =
+            std::find(entry->transports.begin(), entry->transports.end(),
+                      MNNVL) != entry->transports.end();
         if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CPU &&
-            !caps.dram_to_dram) {
+            !(caps.dram_to_dram && remote_mnnvl)) {
             policy.push_back(server_addr);
             policy.push_back(topology_->findNearMem(local, Topology::MEM_CUDA));
             policy.push_back("");  // remote stage
         } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
-                   !caps.gpu_to_dram) {
+                   !(caps.gpu_to_dram && remote_mnnvl)) {
             policy.push_back(server_addr);
             policy.push_back("");  // no local stage
             policy.push_back(desc->getMemory().topology.findNearMem(
