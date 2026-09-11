@@ -15,6 +15,8 @@
 #ifndef TENT_RAIL_MONITOR_H
 #define TENT_RAIL_MONITOR_H
 
+#include <cstdint>
+
 #include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/runtime/topology.h"
@@ -43,6 +45,8 @@ class RailMonitor {
         "transports/rdma/rail_cooldown_secs";
     static constexpr const char *kCfgProbeIntervalSecs =
         "transports/rdma/rail_probe_interval_secs";
+    static constexpr const char *kCfgRecoveryProbeEnabled =
+        "transports/rdma/rail_recovery_probe_enabled";
 
    public:
     RailMonitor() = default;
@@ -91,7 +95,13 @@ class RailMonitor {
     // two workers arm a probe on the same rail.
     bool admit(int local_nic, int remote_nic);
 
-    void markFailed(int local_nic, int remote_nic);
+    // A paused rail may admit one slice after a newer remote metadata
+    // snapshot arrives. A zero token requests ownership; a non-zero token
+    // lets the owning slice retain that ownership across endpoint retries.
+    bool tryRecoveryProbe(int local_nic, int remote_nic, uint64_t &token);
+
+    void markFailed(int local_nic, int remote_nic,
+                    uint64_t probe_token = 0);
 
     void markRecovered(int local_nic, int remote_nic);
 
@@ -130,6 +140,8 @@ class RailMonitor {
         std::chrono::steady_clock::time_point last_probe_time{};
         bool half_open = false;
         bool probe_in_flight = false;
+        uint64_t last_probe_generation = 0;
+        uint64_t active_probe_token = 0;
 
         bool paused() const {
             return resume_time != std::chrono::steady_clock::time_point{};
@@ -139,6 +151,10 @@ class RailMonitor {
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;
     std::unordered_map<int, int> direct_rails_;  // keep static after loaded
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
+
+    uint64_t metadata_generation_ = 0;
+    uint64_t next_probe_token_ = 0;
+    bool recovery_probe_enabled_ = true;
 
     int error_threshold_ = 3;
     std::chrono::seconds error_window_{10};
