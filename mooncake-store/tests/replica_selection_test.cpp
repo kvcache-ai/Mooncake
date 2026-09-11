@@ -117,6 +117,44 @@ TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {
         "nodeB");  // locality beats protocol
 }
 
+TEST_F(ReplicaSelectionTest, LocalMemoryWinsOverEarlierLocalNoF) {
+    // Master may return replicas in any order, so a local NOF_SSD listed
+    // before a local MEMORY replica must not win: local MEMORY outranks it.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),             // local, but slower tier
+        MakeMemory("nodeA", "rdma"),  // local MEMORY -> must win
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+}
+
+TEST_F(ReplicaSelectionTest, IncompleteLocalMemoryFallsBackToLocalNoF) {
+    // The local MEMORY replica is not readable yet, so the local NOF_SSD one
+    // remains the best choice.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeA", "rdma", ReplicaStatus::PROCESSING),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
+}
+
+TEST_F(ReplicaSelectionTest, LocalNoFPrecedesRemoteMemory) {
+    // Locality still outranks tier for remote MEMORY replicas.
+    std::unordered_set<std::string> local = {"nodeA"};
+    std::vector<Replica::Descriptor> reps = {
+        MakeNoF("nodeA"),
+        MakeMemory("nodeB", "rdma"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_nof_replica());
+}
+
 TEST_F(ReplicaSelectionTest, ScoringOffKeepsFirstRemoteMemory) {
     // No scorer injected and env not set -> must return the FIRST remote
     // MEMORY.
