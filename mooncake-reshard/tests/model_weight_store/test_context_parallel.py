@@ -192,6 +192,66 @@ def test_cp_snapshot_restore_exact_bytes(source_config, target_config):
     assert not store.registered
 
 
+@pytest.mark.parametrize("owner_order", [(0, 1), (1, 0), (1, 2), (2, 1)])
+def test_cp_owner_selection_is_complete_and_order_independent(owner_order):
+    source = cp_inputs("source", cp=3, cp_semantics="ownership")
+    binding_by_participant = {
+        binding.participant_id: binding for binding in source.bindings
+    }
+    participants = []
+    for cp_rank in owner_order:
+        for part in source.placement.parts:
+            if part.rank.cp != cp_rank:
+                continue
+            binding = binding_by_participant[part.participant_id]
+            participants.append(
+                RuntimeParticipant(
+                    participant_id=part.participant_id,
+                    rank=part.rank,
+                    instance_id=binding.instance_id,
+                    placement_fragments=part.fragments,
+                    binding_fragments=binding.fragments,
+                )
+            )
+    selected_source = make_runtime_inputs(
+        resource_id=source.placement.resource_id,
+        revision=source.placement.revision,
+        placement_set_id="selected-cp-owners",
+        tensors=source.placement.tensors,
+        participants=tuple(participants),
+    )
+    targets = cp_inputs("target", cp=3, cp_semantics="ownership")
+    runtime_plan = plan_transfer(selected_source, targets)
+    assert {op.source.rank.cp for op in runtime_plan.operations} == {min(owner_order)}
+    assert {op.target.rank.cp for op in runtime_plan.operations} == {0, 1, 2}
+    _, weight_store = make_weight_store()
+    upload_plan = weight_store.plan_upload(
+        selected_source.placement, selected_source.bindings
+    )
+    assert {op.source_placement.rank.cp for op in upload_plan.operations} == {
+        min(owner_order)
+    }
+
+
+def test_cp_partial_owner_cannot_borrow_coverage_from_another_owner():
+    placement = cp_inputs("source", cp_semantics="ownership").placement
+    fragments = tuple(
+        fragment
+        for fragment in placement.fragments
+        if not (fragment.rank.cp == 1 and fragment.rank.tp == 1)
+    )
+    with pytest.raises(ValueError, match="not fully covered"):
+        WeightPlacementManifest.from_fragments(
+            resource_id=placement.resource_id,
+            revision=placement.revision,
+            weight_generation=placement.weight_generation,
+            placement_set_id=placement.placement_set_id,
+            topology=placement.topology,
+            tensors=placement.tensors,
+            fragments=fragments,
+        )
+
+
 def test_cp_json_round_trip_and_identity():
     placement = cp_inputs("source").placement
     encoded = weight_placement_to_json(placement)

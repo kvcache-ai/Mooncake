@@ -102,6 +102,14 @@ replicated across context workers, use `ReplicatedAxis("cp")` instead of a CP
 split. Store upload deduplicates identical logical regions among replicas;
 restore materializes every requested CP target.
 
+For `OwnershipAxis("cp")` on a tensor without DP ownership, each declared
+owner must independently cover the entire tensor. Within each complete source
+DP replica, planning and Store upload select the smallest canonical owner
+coordinate tuple. With other ownership coordinates fixed, CP owners 1 and 2
+therefore select CP rank 1, independently of input order. A partial owner cannot
+be combined with another owner to form a complete tensor. This is separate
+from `OwnershipAxis("dp")`, whose source contract requires a single owner.
+
 `cp_size` defaults to 1 and `cp` rank to 0. Default CP fields are omitted from
 canonical JSON and identity payloads, preserving existing CP-free topology,
 placement, and fragment IDs. Non-default values participate in identity and
@@ -189,7 +197,7 @@ This phase does not accept Store `with_parallelism` metadata or Store keys as a
 planner input. A future Store adapter must translate one committed Store
 snapshot into a complete canonical `StoredWeightManifest` or
 `WeightPlacementManifest`, including tensor identity and descriptor, every
-logical fragment's offset, shape, object range, and all TP, PP, EP, and DP
+logical fragment's offset, shape, object range, and all TP, PP, EP, DP, and CP
 semantics. If Store metadata cannot represent any required fact, the adapter
 must reject that snapshot; it must not infer a tensor layout from a key,
 parameter name, rank, or `mode="full"` reconstruction.
