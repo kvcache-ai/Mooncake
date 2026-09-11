@@ -277,6 +277,33 @@ Zero-copy operations require registered memory buffers. For repeated reads and w
 #### register_buffer()
 Register a memory buffer for direct RDMA access.
 
+For a contiguous PyTorch CPU tensor, including one created with
+`pin_memory=True`, pass its address and **byte size**:
+
+```python
+import torch
+
+# Assumes store.setup(...) or store.setup_dummy(...) has already succeeded.
+tensor = torch.empty(1024, dtype=torch.float32, pin_memory=True)
+tensor.fill_(1)
+ptr = tensor.data_ptr()
+size = tensor.numel() * tensor.element_size()
+assert store.register_buffer(ptr, size) == 0
+try:
+    assert store.put_from("pinned_tensor", ptr, size) == 0
+    tensor.zero_()
+    assert store.get_into("pinned_tensor", ptr, size) == size
+    assert torch.all(tensor == 1)
+finally:
+    assert store.unregister_buffer(ptr) == 0
+```
+
+Keep the tensor alive and its storage unchanged until all operations finish and
+the buffer is unregistered. `put_from` stores raw bytes; it does not serialize
+the tensor's shape or dtype. With `setup_dummy()`, external CPU buffers use
+shared-memory staging and read copy-back across the RealClient process boundary.
+Pinned allocation alone does not make this path zero-copy.
+
 #### unregister_buffer()
 Unregister a previously registered buffer.
 
@@ -733,13 +760,14 @@ store.put("key-a", b"value-a", config)
 
 ---
 
+(choosing-a-parallel-tensor-io-api)=
 ## Choosing a Parallel Tensor IO API
 
 Use the API that matches the object being stored. The single-axis TP methods
 and the manifest-backed weight snapshot API have different storage contracts.
 
 | Requirement | Public API | Contract |
-|---|---|---|
+| --- | --- | --- |
 | Store and retrieve a complete tensor | `put_tensor()` / `get_tensor()` | One ordinary Store tensor object. |
 | Split a full tensor and read a TP shard | `put_tensor_with_tp()` / `get_tensor_with_tp()` | Legacy single-axis TP tensor objects; batch and registered-buffer variants are also available. |
 | Save weights and restore into a different TP/DP/EP/PP/CP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
@@ -753,7 +781,7 @@ on this write does not select a single shard to persist:
 ```python
 import torch
 
-tensor = torch.arange(24, dtype=torch.float32).reshape(4, 6)
+tensor = torch.linspace(0, 23, 24, dtype=torch.float32).reshape(4, 6)
 assert store.put_tensor_with_tp("tp-example", tensor, tp_size=2, split_dim=1) == 0
 shard = store.get_tensor_with_tp("tp-example", tp_rank=1, tp_size=2, split_dim=1)
 assert torch.equal(shard, tensor[:, 3:])

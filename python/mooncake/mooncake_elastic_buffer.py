@@ -66,7 +66,7 @@ def _select_transport(
 
 
 def _resolve_transport_consensus(
-    rank_states: Sequence[Tuple[str, bool]],
+    rank_states: Sequence[Tuple[str, bool, Optional[str]]],
 ) -> str:
     """Resolve rank-local NCCL readiness into one group-wide choice."""
     if not rank_states:
@@ -74,11 +74,11 @@ def _resolve_transport_consensus(
             "cannot select an ElasticBuffer transport for an empty group"
         )
 
-    requested_modes = {requested for requested, _ in rank_states}
+    requested_modes = {requested for requested, _, _ in rank_states}
     if len(requested_modes) != 1:
         details = ", ".join(
             f"rank {rank}={requested!r}"
-            for rank, (requested, _) in enumerate(rank_states)
+            for rank, (requested, _, _) in enumerate(rank_states)
         )
         raise RuntimeError(
             "ElasticBuffer transport requests differ across process-group ranks: "
@@ -86,11 +86,32 @@ def _resolve_transport_consensus(
             "MOONCAKE_EP_TRANSPORT setting to every rank."
         )
 
+    required_modes = {
+        required for _, _, required in rank_states if required is not None
+    }
+    if len(required_modes) > 1:
+        details = ", ".join(
+            f"rank {rank}={required!r}"
+            for rank, (_, _, required) in enumerate(rank_states)
+            if required is not None
+        )
+        raise RuntimeError(
+            "ElasticBuffer transport requirements differ across process-group "
+            f"ranks: {details}"
+        )
+
     requested = rank_states[0][0]
+    required = next(iter(required_modes), None)
+    if required is not None and requested not in {"auto", required}:
+        raise RuntimeError(
+            f"ElasticBuffer transport {required!r} is required by an existing "
+            f"buffer generation, but the group requested {requested!r}"
+        )
+
     unready_ranks = [
-        rank for rank, (_, nccl_ready) in enumerate(rank_states) if not nccl_ready
+        rank for rank, (_, nccl_ready, _) in enumerate(rank_states) if not nccl_ready
     ]
-    if requested == "nccl":
+    if requested == "nccl" or required == "nccl":
         if unready_ranks:
             ranks = ", ".join(str(rank) for rank in unready_ranks)
             raise RuntimeError(
@@ -99,6 +120,8 @@ def _resolve_transport_consensus(
                 f"requirements are not met on ranks: {ranks}"
             )
         return "nccl"
+    if required == "ibgda":
+        return "ibgda"
 
     # In auto mode, a single rank that cannot use NCCL makes the whole group
     # choose IBGDA. No rank enters transport-specific bootstrap until this
@@ -106,6 +129,40 @@ def _resolve_transport_consensus(
     if requested == "auto" and not unready_ranks:
         return "nccl"
     return "ibgda"
+
+
+def _resolve_nccl_membership_masks(rank_masks: Sequence[Sequence[int]]) -> None:
+    """Require one consistent, fully restored fixed-world membership view."""
+    if not rank_masks:
+        raise RuntimeError("cannot reconfigure NCCL for an empty group")
+    num_ranks = len(rank_masks)
+    malformed_observers = [
+        rank for rank, mask in enumerate(rank_masks) if len(mask) != num_ranks
+    ]
+    inactive_slots = sorted(
+        {
+            slot
+            for mask in rank_masks
+            for slot, active in enumerate(mask[:num_ranks])
+            if int(active) != 1
+        }
+    )
+    if malformed_observers or inactive_slots:
+        details = []
+        if inactive_slots:
+            details.append(f"inactive or inconsistent logical slots: {inactive_slots}")
+        if malformed_observers:
+            details.append(f"invalid membership views on ranks: {malformed_observers}")
+        raise RuntimeError(
+            "NCCL ElasticBuffer reconfiguration requires the complete fixed "
+            "logical rank set to be restored; " + "; ".join(details)
+        )
+
+
+def _bootstrap_collective_device(group: dist.ProcessGroup) -> str:
+    """Choose metadata tensors independently of the GPU EP data path."""
+    backend = str(dist.get_backend(group)).lower()
+    return "cpu" if backend in {"gloo", "mooncake-cpu"} else "cuda"
 
 
 def _select_transport_for_group(
@@ -116,8 +173,12 @@ def _select_transport_for_group(
     num_rdma_ranks: int,
     num_nvlink_ranks: int,
     allow_hybrid_mode: bool,
+    required_transport: Optional[str] = None,
 ) -> str:
     """Agree on one transport before starting transport-specific bootstrap."""
+    if required_transport not in {None, "ibgda", "nccl"}:
+        raise ValueError(f"invalid required transport: {required_transport!r}")
+
     local_auto_choice = _select_transport(
         "auto",
         nccl_available,
@@ -126,28 +187,58 @@ def _select_transport_for_group(
         num_nvlink_ranks,
         allow_hybrid_mode,
     )
-    collective_device = (
-        "cpu" if str(dist.get_backend(group)).lower() == "gloo" else "cuda"
-    )
+    collective_device = _bootstrap_collective_device(group)
+    group_size = group.size()
     local_state = torch.tensor(
         [
             _TRANSPORT_TO_CODE[requested],
             int(local_auto_choice == "nccl"),
+            _TRANSPORT_TO_CODE[required_transport or "auto"],
+            num_ranks,
         ],
         dtype=torch.int32,
         device=collective_device,
     )
-    gathered_states = [torch.empty_like(local_state) for _ in range(group.size())]
+    gathered_states = [torch.full_like(local_state, -1) for _ in range(group_size)]
     dist.all_gather(gathered_states, local_state, group=group)
 
     rank_states = []
-    for state in gathered_states:
-        requested_code, rank_nccl_ready = state.cpu().tolist()
+    mismatched_world_sizes = []
+    for rank, state in enumerate(gathered_states):
+        values = [int(value) for value in state.cpu().tolist()]
+        if values == [-1, -1, -1, -1]:
+            rank_states.append((requested, False, None))
+            continue
+        requested_code, rank_nccl_ready, required_code, rank_world_size = values
+        if rank_world_size != group_size:
+            mismatched_world_sizes.append(f"rank {rank}={rank_world_size}")
+        if (
+            requested_code not in _CODE_TO_TRANSPORT
+            or required_code not in _CODE_TO_TRANSPORT
+        ):
+            raise RuntimeError(
+                "received an invalid ElasticBuffer transport state during "
+                "group consensus"
+            )
+        required_name = _CODE_TO_TRANSPORT[required_code]
         rank_states.append(
             (
-                _CODE_TO_TRANSPORT[int(requested_code)],
+                _CODE_TO_TRANSPORT[requested_code],
                 bool(rank_nccl_ready),
+                None if required_name == "auto" else required_name,
             )
+        )
+    # Exchange the expected world size in this fixed-width collective, before
+    # the membership exchange uses num_ranks-sized tensors. Survivors retain
+    # their original size while a new buffer sees the current PG size; a local
+    # check alone could leave replacements entering a different collective.
+    if mismatched_world_sizes:
+        raise RuntimeError(
+            "ElasticBuffer requires a fixed logical world size during bootstrap; "
+            f"the process group has {group_size} ranks, but buffers expect "
+            + ", ".join(mismatched_world_sizes)
+            + ". Restore the original logical rank set or recreate all buffers "
+            "for the new group size."
         )
     return _resolve_transport_consensus(rank_states)
 
@@ -203,6 +294,7 @@ class EPHandle:
         token_metadata_at_forward: Optional[torch.Tensor],
         channel_linked_list: Optional[torch.Tensor],
         native_handle: Optional[Tuple[Any, ...]] = None,
+        generation: Optional[Tuple[int, ...]] = None,
     ) -> None:
         assert topk_idx is not None
         self.do_expand = do_expand
@@ -221,6 +313,7 @@ class EPHandle:
         self.token_metadata_at_forward = token_metadata_at_forward
         self.channel_linked_list = channel_linked_list
         self.native_handle = native_handle
+        self._generation = generation
 
         # Same convention as DeepEP: without a CPU sync this is an inferred upper
         # bound; after CPU sync it tracks the actual received-token count.
@@ -278,6 +371,7 @@ class ElasticBuffer:
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
+        self._device_index = torch.cuda.current_device()
         self.requested_transport = _requested_transport(transport)
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
@@ -317,28 +411,27 @@ class ElasticBuffer:
         )
 
         self.backend = group
+        self._generation: Optional[Tuple[int, ...]] = None
 
         # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
         from mooncake import ep
 
-        has_nccl_device_support = getattr(ep, "has_nccl_device_support", None)
-        nccl_available = bool(
-            has_nccl_device_support is not None and has_nccl_device_support()
-        )
         self.transport = _select_transport_for_group(
             self.group,
             self.requested_transport,
-            nccl_available,
+            ep.has_nccl_device_support(),
             self.num_ranks,
             self.num_rdma_ranks,
             self.num_nvlink_ranks,
             self.allow_hybrid_mode,
         )
 
-        nccl_unique_id = (
-            self._exchange_nccl_unique_id(ep) if self.transport == "nccl" else []
-        )
+        nccl_unique_id = []
+        if self.transport == "nccl":
+            self._require_full_nccl_membership()
+            nccl_unique_id = self._exchange_nccl_unique_id(ep)
+            self._generation = tuple(nccl_unique_id)
         self.runtime = ep.ElasticBuffer(
             self.rank_idx,
             self.num_ranks,
@@ -362,14 +455,7 @@ class ElasticBuffer:
         # may differ from the CUDA-visible-device heuristic used before native
         # initialization. Keep the public topology fields in sync with the
         # exact native launch topology for both backends.
-        self.num_rdma_ranks, self.num_nvlink_ranks = (
-            self.runtime.get_physical_domain_size()
-        )
-        self.num_scaleout_ranks, self.num_scaleup_ranks = (
-            self.runtime.get_logical_domain_size()
-        )
-        self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
-        self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
+        self._refresh_topology_from_runtime()
         self._connect_native()
         # The native elastic kernels currently use fixed communicator
         # membership. Reuse this compatibility argument instead of allocating
@@ -384,15 +470,65 @@ class ElasticBuffer:
 
     def _active_ranks_mask(self) -> list:
         # `mooncake.ep.get_active_ranks` is a Mooncake PG helper and performs a
-        # native static cast to MooncakeBackend. ElasticBuffer transport
-        # bootstrap can also be driven by a regular NCCL/Gloo ProcessGroup; in
-        # that case every rank in the supplied group is active by definition.
-        if "Mooncake" not in type(self.backend).__name__:
+        # native static cast to MooncakeBackend. PyTorch exposes custom process
+        # groups through its base ProcessGroup type, so query the registered
+        # backend name instead of relying on the Python wrapper's type name.
+        if "mooncake" not in str(dist.get_backend(self.backend)).lower():
             return [1] * self.num_ranks
 
         from mooncake.ep import get_active_ranks
 
-        return get_active_ranks(self.backend).tolist()
+        # Mooncake PG refreshes this CUDA mirror on its own stream. Wait for
+        # that update before taking the host snapshot used for membership
+        # agreement, including the replacement process's initial snapshot.
+        torch.cuda.synchronize(self._device_index)
+        return get_active_ranks(self.backend).cpu().tolist()
+
+    def _require_full_nccl_membership(self) -> None:
+        """Agree that every fixed logical rank has rejoined before bootstrap."""
+        try:
+            active_mask = self._active_ranks_mask()
+        except Exception:
+            active_mask = []
+        collective_device = _bootstrap_collective_device(self.group)
+        local_mask = torch.full(
+            (self.num_ranks,), -1, dtype=torch.int32, device=collective_device
+        )
+        # Mooncake PG masks cover max_group_size (or a larger user-provided
+        # tensor), not just the logical ranks used by this fixed-world buffer.
+        if len(active_mask) >= self.num_ranks:
+            local_mask.copy_(
+                torch.tensor(
+                    active_mask[: self.num_ranks],
+                    dtype=torch.int32,
+                    device=collective_device,
+                )
+            )
+        gathered_masks = [
+            torch.full_like(local_mask, -1) for _ in range(self.num_ranks)
+        ]
+        dist.all_gather(gathered_masks, local_mask, group=self.group)
+        _resolve_nccl_membership_masks(
+            [rank_mask.cpu().tolist() for rank_mask in gathered_masks]
+        )
+
+    def _refresh_topology_from_runtime(self) -> None:
+        self.num_rdma_ranks, self.num_nvlink_ranks = (
+            self.runtime.get_physical_domain_size()
+        )
+        self.num_scaleout_ranks, self.num_scaleup_ranks = (
+            self.runtime.get_logical_domain_size()
+        )
+        self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
+        self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
+
+    def _validate_handle_generation(self, handle: EPHandle) -> None:
+        handle_generation = getattr(handle, "_generation", None)
+        if self._generation is not None and handle_generation != self._generation:
+            raise RuntimeError(
+                "EPHandle belongs to an obsolete NCCL ElasticBuffer generation; "
+                "dispatch again after update_ep_member()"
+            )
 
     def _connect_native(self, is_update: bool = False) -> None:
         from mooncake import ep
@@ -504,8 +640,7 @@ class ElasticBuffer:
 
     def _exchange_nccl_unique_id(self, ep: Any) -> List[int]:
         create_unique_id = getattr(ep, "create_nccl_unique_id", None)
-        backend = str(dist.get_backend(self.group)).lower()
-        collective_device = "cpu" if backend == "gloo" else "cuda"
+        collective_device = _bootstrap_collective_device(self.group)
         root_global_rank = dist.get_global_rank(self.group, 0)
 
         # NCCL requires ncclGetUniqueId to be called once per communicator.
@@ -567,12 +702,49 @@ class ElasticBuffer:
         return unique_id.cpu().tolist()
 
     def update_ep_member(self) -> None:
-        if self.transport == "nccl":
-            raise RuntimeError(
-                "NCCL ElasticBuffer uses fixed communicator membership; "
-                "create a new buffer to change EP members"
+        if self.transport != "nccl":
+            self._connect_native(True)
+            return
+        if self.runtime is None:
+            raise RuntimeError("ElasticBuffer has been destroyed")
+
+        # NCCL cannot patch one peer in place. Join the same bootstrap sequence
+        # used by a replacement rank's constructor and publish a complete new
+        # communicator/device/window generation at a quiescent EP boundary.
+        # Restore the device captured at construction because applications may
+        # change the thread's current CUDA device between EP calls.
+        with torch.cuda.device(self._device_index):
+            torch.cuda.synchronize()
+            from mooncake import ep
+
+            selected_transport = _select_transport_for_group(
+                self.group,
+                self.requested_transport,
+                ep.has_nccl_device_support(),
+                self.num_ranks,
+                self.num_rdma_ranks,
+                self.num_nvlink_ranks,
+                self.allow_hybrid_mode,
+                required_transport=self.transport,
             )
-        self._connect_native(True)
+            if selected_transport != "nccl":
+                raise RuntimeError(
+                    "NCCL ElasticBuffer recovery no longer has a supported NCCL "
+                    "topology; recreate the buffer with transport='ibgda'"
+                )
+            self._require_full_nccl_membership()
+            nccl_unique_id = self._exchange_nccl_unique_id(ep)
+            self.runtime.reconfigure_nccl(nccl_unique_id)
+            # The native generation changes atomically when reconfigure_nccl()
+            # returns. Publish the matching Python generation before any other
+            # fallible work so an old handle cannot be accepted afterward.
+            self._generation = tuple(nccl_unique_id)
+            self._refresh_topology_from_runtime()
+            self._active_ranks.fill_(1)
+
+            torch.cuda.synchronize()
+            _dist_barrier(self.group)
+            torch.cuda.synchronize()
 
     def destroy(self) -> None:
         runtime = self.runtime
@@ -782,6 +954,7 @@ class ElasticBuffer:
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
         if handle is not None:
+            self._validate_handle_generation(handle)
             if topk_idx is not None or topk_weights is not None:
                 raise AssertionError(
                     "topk_idx and topk_weights must be None when cached handle is provided"
@@ -1066,6 +1239,7 @@ class ElasticBuffer:
                 token_metadata_at_forward=token_metadata_at_forward,
                 channel_linked_list=channel_linked_list,
                 native_handle=True,
+                generation=self._generation,
             )
         recv_x_out = (recv_x, recv_x_scales) if recv_x_scales is not None else recv_x
         tensors_to_record = None
@@ -1114,6 +1288,7 @@ class ElasticBuffer:
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], EventOverlap]:
         if self.runtime is None:
             raise RuntimeError("ElasticBuffer has been destroyed")
+        self._validate_handle_generation(handle)
         if handle.native_handle is None:
             raise RuntimeError("Mooncake EPHandle does not contain a native handle")
         assert x.dim() == 2 and x.is_contiguous()
