@@ -267,6 +267,17 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Query NoF namespace information over NVMe-oF and mount its full
+     * range for buffer allocation, with base=0.
+     * @return Success or an error from MountNoFSegment,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_MODE if NoF is disabled,
+     *         ErrorCode::INTERNAL_ERROR if the namespace query fails.
+     */
+    auto QueryAndMountNoFSegment(const std::string& endpoint,
+                                 const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
      * to remount. This function is idempotent. Client should retry if the

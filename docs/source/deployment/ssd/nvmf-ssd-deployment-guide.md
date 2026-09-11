@@ -169,6 +169,37 @@ python3 -m mooncake.mooncake_ssd_register \
 | `--password` | SSH password used to connect to target nodes. |
 | `--key-file` | SSH private key file used to connect to target nodes. |
 
+### 4.2 Register without Target SPDK RPC
+
+Use `--nqn` and `--traddr` instead of `--spdk_target_info` to register an existing
+namespace. The script asks Master to query namespace information over NVMe-oF
+and register its full range as a NoF segment, without target-side SSH or SPDK
+management RPC:
+
+```bash
+MC_NOF_TRTYPE=TCP python3 -m mooncake.mooncake_ssd_register \
+    --master_server_address=192.168.65.81:50051 \
+    --nqn=nqn.2016-06.io.spdk:cnode1 \
+    --traddr=192.168.65.56 \
+    --trsvcid=4420 \
+    --nsid=1
+```
+
+#### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `--master_server_address` | Required. IP address and port of the Master service. |
+| `--nqn` | Required. NQN of the target subsystem. |
+| `--traddr` | Required target IPv4 address. |
+| `--trsvcid` | NVMe-oF service port. Defaults to `4420`. |
+| `--nsid` | Namespace ID within the subsystem. Defaults to `1`. |
+
+Master requires a `USE_NOF=ON` build, SPDK setup, and access to the target.
+The registration node only needs access to Master. Set `MC_NOF_TRTYPE` on that
+node to `RDMA` (default) or `TCP`.
+
+
 ## 5. Unregister the NVMe-oF SSD Pool
 
 ### 5.1 Unregister a Specific SSD

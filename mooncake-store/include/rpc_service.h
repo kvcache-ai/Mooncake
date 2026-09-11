@@ -160,6 +160,9 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountNoFSegment(const NoFSegment& segment,
                                                   const UUID& client_id);
 
+    tl::expected<void, ErrorCode> QueryAndMountNoFSegment(
+        const std::string& endpoint, const UUID& client_id);
+
     tl::expected<void, ErrorCode> ReMountSegment(
         const std::vector<Segment>& segments, const UUID& client_id);
 

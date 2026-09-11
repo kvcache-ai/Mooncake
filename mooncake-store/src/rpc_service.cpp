@@ -964,6 +964,25 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountNoFSegment(
         });
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::QueryAndMountNoFSegment(
+    const std::string& endpoint, const UUID& client_id) {
+    return execute_rpc(
+        "QueryAndMountNoFSegment",
+        [&] {
+            return master_service_.QueryAndMountNoFSegment(endpoint, client_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("NoF segment mount: ", "endpoint=", endpoint,
+                             ", client_id=", client_id);
+        },
+        [] {
+            MasterMetricManager::instance().inc_mount_nof_segment_requests();
+        },
+        [] {
+            MasterMetricManager::instance().inc_mount_nof_segment_failures();
+        });
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     return execute_rpc(
@@ -1806,6 +1825,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountNoFSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::QueryAndMountNoFSegment>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReMountSegment>(
         &wrapped_master_service);

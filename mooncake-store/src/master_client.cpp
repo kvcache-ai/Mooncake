@@ -153,6 +153,11 @@ struct RpcNameTraits<&WrappedMasterService::MountNoFSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::QueryAndMountNoFSegment> {
+    static constexpr const char* value = "QueryAndMountNoFSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ReMountSegment> {
     static constexpr const char* value = "ReMountSegment";
 };
@@ -854,6 +859,19 @@ tl::expected<void, ErrorCode> MasterClient::MountNoFSegment(
 
     auto result = invoke_rpc<&WrappedMasterService::MountNoFSegment, void>(
         segment, client_id_);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::QueryAndMountNoFSegment(
+    const std::string& endpoint) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryAndMountNoFSegment");
+    timer.LogRequest("NoF segment mount: ", "endpoint=", endpoint,
+                     ", client_id=", client_id_);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::QueryAndMountNoFSegment, void>(
+            endpoint, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
