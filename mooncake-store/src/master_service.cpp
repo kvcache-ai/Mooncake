@@ -4772,18 +4772,6 @@ std::vector<BatchAllocateResult> MasterService::ReserveDfsSpaceForBatch(
             result.error = ErrorCode::NO_AVAILABLE_HANDLE;
         }
     };
-    const bool allocation_exhausted =
-        std::any_of(results.begin(), results.end(), [](const auto& result) {
-            return result.error == ErrorCode::NO_AVAILABLE_HANDLE;
-        });
-    if (allocation_exhausted && bucket_allocator_ != nullptr) {
-        release_successful();
-        bucket_allocator_->FlushDirtyMetadata();
-        if (TryRecoverDfsSpaceAfterAllocationFailure()) {
-            results = bucket_allocator_->BatchAllocate(requests);
-        }
-    }
-
     if (results.size() != requests.size()) {
         LOG(ERROR) << "DFS BatchAllocate returned " << results.size()
                    << " results for " << requests.size() << " requests";

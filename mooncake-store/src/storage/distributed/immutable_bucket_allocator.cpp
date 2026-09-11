@@ -451,6 +451,9 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
     if (required > bucket_capacity_) {
         // Refuse rather than spill across buckets: the caller asked for one
         // contiguous region and no bucket can ever satisfy it.
+        LOG(ERROR) << "DFS EnsureActiveBucket rejected: object exceeds "
+                   << "bucket capacity, required=" << required
+                   << ", bucket_capacity=" << bucket_capacity_;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -479,10 +482,20 @@ ImmutableBucketAllocator::EnsureActiveBucket(std::unique_lock<std::mutex>& lock,
             continue;
         }
         auto created = CreateBucketUnlocked(lock);
-        if (!created) return tl::make_unexpected(created.error());
+        if (!created) {
+            LOG(ERROR) << "DFS EnsureActiveBucket create failed: "
+                       << "attempt=" << attempt << ", required=" << required
+                       << ", error=" << created.error();
+            return tl::make_unexpected(created.error());
+        }
         // Loop once more so the freshly created bucket goes through the same
         // capacity check instead of being trusted blindly.
     }
+    LOG(ERROR) << "DFS EnsureActiveBucket retries exhausted: "
+               << "required=" << required
+               << ", bucket_count=" << buckets_.size()
+               << ", max_bucket_count=" << max_bucket_count_
+               << ", active_bucket_id=" << active_bucket_id_;
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
@@ -529,6 +542,26 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     entry.generation = next_generation_++;
     entry.state = BucketEntryState::PENDING;
 
+    // A live entry for this key already sits somewhere. Assigning to
+    // bucket.entries[key] here would either drop the prior allocation in this
+    // bucket (no Free, no unreserve, no space reclaimed) or, if the prior
+    // entry is in another bucket, create an orphan that key_index_ will point
+    // away from. The per-key dedup above is meant to keep this from happening,
+    // but key_index_ and bucket.entries can disagree across an
+    // EnsureActiveBucket unlock window, so the guard must live here too.
+    auto existing_it = bucket.entries.find(key);
+    if (existing_it != bucket.entries.end() &&
+        IsLive(existing_it->second.state)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    auto existing_index_it = key_index_.find(key);
+    if (existing_index_it != key_index_.end() &&
+        existing_index_it->second != bucket.bucket_id) {
+        // The key already belongs to a different bucket. Reserving here would
+        // overwrite key_index_ and leave the prior bucket holding an orphan.
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
     bucket.entries[key] = entry;
     bucket.append_offset = layout->entry_end();
     bucket.live_bytes += layout->reserved_size;
@@ -539,8 +572,9 @@ ImmutableBucketAllocator::ReserveInBucketLocked(BucketState& bucket,
     // marking it keeps the invariant local instead of implicit.
     MarkMetaDirtyLocked(bucket);
 
-    return MakeBucketDescriptor(BucketDataPath(bucket.bucket_id), *layout, size,
-                                bucket.bucket_id);
+    auto descriptor = MakeBucketDescriptor(BucketDataPath(bucket.bucket_id),
+                                           *layout, size, bucket.bucket_id);
+    return descriptor;
 }
 
 void ImmutableBucketAllocator::UnreserveInBucketLocked(
@@ -666,9 +700,9 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     }
 
     // Validate request shape before changing allocator state. A batch may span
-    // buckets, but one object must always fit in one bucket.
-    std::vector<size_t> allocatable;
-    allocatable.reserve(requests.size());
+    // buckets, but one object must always fit in one bucket. Any failure here
+    // is terminal for the whole batch, so the reserve loop below can iterate
+    // every request that survived.
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         if (request.key.empty() || request.size == 0) {
@@ -693,38 +727,26 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
             fail_all(ErrorCode::INVALID_PARAMS);
             return results;
         }
-        allocatable.push_back(i);
     }
 
     std::unique_lock<std::mutex> lock(mutex_);
-    // Existing live keys retain their per-key OBJECT_ALREADY_EXISTS outcome;
-    // the remaining requests are packed in their original order.
-    allocatable.clear();
-    for (size_t i = 0; i < requests.size(); ++i) {
-        if (key_index_.count(requests[i].key) != 0) {
-            LOG(WARNING) << "DFS batch allocate skipped key " << requests[i].key
-                         << ": it already has a live allocation";
-            results[i].error = ErrorCode::OBJECT_ALREADY_EXISTS;
-            continue;
-        }
-        allocatable.push_back(i);
-    }
-    if (allocatable.empty()) return results;
-
     struct Reservation {
         size_t request_index = 0;
         int64_t bucket_id = -1;
         BucketPtr bucket_identity;
     };
     std::vector<Reservation> reserved;
-    reserved.reserve(allocatable.size());
+    reserved.reserve(requests.size());
+    size_t already_exists_count = 0;
 
-    auto fail_allocatable = [&]() {
-        for (const size_t index : allocatable) {
-            results[index].success = false;
-            results[index].descriptor = DistributedFSDescriptor{};
-            if (results[index].error == ErrorCode::OK) {
-                results[index].error = ErrorCode::NO_AVAILABLE_HANDLE;
+    // Mark every not-yet-resolved request as a generic failure so a later
+    // break leaves no slot at its default OK.
+    auto fail_remaining = [&](size_t from_index) {
+        for (size_t i = from_index; i < requests.size(); ++i) {
+            results[i].success = false;
+            results[i].descriptor = DistributedFSDescriptor{};
+            if (results[i].error == ErrorCode::OK) {
+                results[i].error = ErrorCode::NO_AVAILABLE_HANDLE;
             }
         }
     };
@@ -733,27 +755,70 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
     // current object's reserved size, so a partially filled active bucket is
     // used before a new bucket is created. A bucket boundary can therefore
     // occur only between two objects, never inside one object.
-    for (const size_t index : allocatable) {
+    for (size_t index = 0; index < requests.size(); ++index) {
         const auto& request = requests[index];
+        // Dedup right before the reserve, under the same lock hold. A key can
+        // be live either from a prior generation still PENDING in this bucket
+        // or from a concurrent batch that reserved it during the previous
+        // iteration's EnsureActiveBucket window; either way, skip it.
+        if (key_index_.count(request.key) != 0) {
+            results[index].success = false;
+            results[index].descriptor = DistributedFSDescriptor{};
+            results[index].error = ErrorCode::OBJECT_ALREADY_EXISTS;
+            ++already_exists_count;
+            continue;
+        }
         auto object_layout =
             ComputeBucketEntryLayout(0, request.size, alignment_);
         if (!object_layout) {
-            fail_allocatable();
+            // Per-key failure: this key's shape is invalid, but subsequent
+            // keys may still allocate successfully.
+            LOG(ERROR) << "DFS batch allocate layout failed: key="
+                       << request.key << ", size=" << request.size
+                       << ", error=invalid_layout";
+            results[index].success = false;
+            results[index].descriptor = DistributedFSDescriptor{};
+            results[index].error = ErrorCode::INVALID_PARAMS;
+            fail_remaining(index + 1);
             break;
         }
         auto bucket_result =
             EnsureActiveBucket(lock, object_layout->reserved_size);
         if (!bucket_result) {
-            fail_allocatable();
+            // Global failure: no active bucket can be created or found, so
+            // remaining keys will fail the same way. Mark them and stop.
+            LOG(ERROR) << "DFS batch allocate active bucket failed: key="
+                       << request.key << ", reserved_size="
+                       << object_layout->reserved_size
+                       << ", error=" << bucket_result.error();
+            results[index].success = false;
+            results[index].descriptor = DistributedFSDescriptor{};
             results[index].error = bucket_result.error();
+            fail_remaining(index + 1);
             break;
         }
         auto bucket = bucket_result.value();
         auto descriptor =
             ReserveInBucketLocked(*bucket, request.key, request.size);
         if (!descriptor) {
-            fail_allocatable();
+            // Per-key failure: this key does not fit in the current active
+            // bucket, but subsequent keys (which may be smaller) might.
+            // OBJECT_ALREADY_EXISTS means a concurrent batch reserved the key
+            // during this iteration's EnsureActiveBucket window; record it and
+            // keep packing the rest instead of unwinding the whole batch.
+            results[index].success = false;
+            results[index].descriptor = DistributedFSDescriptor{};
             results[index].error = descriptor.error();
+            if (descriptor.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                ++already_exists_count;
+                continue;
+            }
+            LOG(ERROR) << "DFS batch allocate reserve failed: key="
+                       << request.key << ", size=" << request.size
+                       << ", bucket_id=" << bucket->bucket_id
+                       << ", append_offset=" << bucket->append_offset
+                       << ", error=" << descriptor.error();
+            fail_remaining(index + 1);
             break;
         }
         results[index].descriptor = std::move(descriptor.value());
@@ -763,7 +828,7 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
         TouchLruLocked(bucket->bucket_id, NowNs());
     }
 
-    if (reserved.size() != allocatable.size()) {
+    if (reserved.size() + already_exists_count != requests.size()) {
         // Roll back in reverse reservation order, across every bucket touched
         // by this batch. Nothing was written to disk, so undoing the in-memory
         // state is all it takes.
@@ -775,9 +840,17 @@ std::vector<BatchAllocateResult> ImmutableBucketAllocator::BatchAllocate(
                                         requests[it->request_index].key,
                                         results[it->request_index].descriptor);
             }
+            // The reservation was rolled back, so this key did not succeed
+            // after all; surface a failure so the caller does not treat a
+            // descriptor that no longer resolves as valid.
+            results[it->request_index].success = false;
+            results[it->request_index].descriptor = DistributedFSDescriptor{};
+            if (results[it->request_index].error == ErrorCode::OK) {
+                results[it->request_index].error =
+                    ErrorCode::NO_AVAILABLE_HANDLE;
+            }
         }
         lock.unlock();
-        fail_allocatable();
         return results;
     }
 
@@ -1037,7 +1110,9 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
         }
 
         // Walk the LRU from the cold end and take the first bucket that is
-        // neither active nor already frozen.
+        // neither active, frozen, nor still waiting for an async write to
+        // finish. A PENDING entry means the client has not called PutEnd yet,
+        // so the bucket's data file must not be deleted underneath it.
         BucketPtr victim;
         for (auto it = lru_list_.rbegin(); it != lru_list_.rend(); ++it) {
             const int64_t bucket_id = *it;
@@ -1045,6 +1120,12 @@ ImmutableBucketAllocator::PrepareEvictionInternal(bool force_one) {
             auto bucket_it = buckets_.find(bucket_id);
             if (bucket_it == buckets_.end()) continue;
             if (bucket_it->second->frozen) continue;
+            const bool has_pending = std::any_of(
+                bucket_it->second->entries.begin(),
+                bucket_it->second->entries.end(), [](const auto& item) {
+                    return item.second.state == BucketEntryState::PENDING;
+                });
+            if (has_pending) continue;
             victim = bucket_it->second;
             break;
         }
@@ -1114,6 +1195,23 @@ void ImmutableBucketAllocator::CommitEviction(PendingEviction&& pending) {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = buckets_.find(bucket_id);
         if (it == buckets_.end() || it->second.get() != bucket_identity.get()) {
+            return;
+        }
+        const bool has_pending = std::any_of(
+            it->second->entries.begin(), it->second->entries.end(),
+            [](const auto& item) {
+                return item.second.state == BucketEntryState::PENDING;
+            });
+        if (has_pending) {
+            it->second->frozen = false;
+            // Restore cold LRU position so the next round can reconsider it
+            // after the pending write completes or times out.
+            if (lru_index_.find(bucket_id) == lru_index_.end()) {
+                lru_list_.push_back(bucket_id);
+                lru_index_[bucket_id] = std::prev(lru_list_.end());
+            }
+            LOG(WARNING) << "Aborted DFS bucket eviction at commit: bucket "
+                         << bucket_id << " has a PENDING entry";
             return;
         }
         marker = SnapshotLocked(*it->second, /*evicting=*/true);
