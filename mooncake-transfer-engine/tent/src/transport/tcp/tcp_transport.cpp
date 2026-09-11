@@ -119,8 +119,14 @@ Status TcpTransport::uninstall() {
 }
 
 Status TcpTransport::quiesce() {
-    shutting_down_.store(true, std::memory_order_release);
-    thread_pool_.reset();
+    std::unique_ptr<ThreadPool> thread_pool;
+    {
+        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        shutting_down_.store(true, std::memory_order_release);
+        thread_pool = std::move(thread_pool_);
+    }
+    // Join outside the admission lock so completion callbacks can return.
+    thread_pool.reset();
     return Status::OK();
 }
 
@@ -148,6 +154,7 @@ Status TcpTransport::submitTransferTasks(
     auto tcp_batch = dynamic_cast<TcpSubBatch *>(batch);
     if (!tcp_batch)
         return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+    std::lock_guard<std::mutex> guard(lifecycle_mutex_);
     if (shutting_down_.load(std::memory_order_acquire)) {
         return Status::InternalError("TCP transport is shutting down" LOC_MARK);
     }

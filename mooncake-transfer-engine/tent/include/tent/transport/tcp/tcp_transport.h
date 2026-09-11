@@ -21,6 +21,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
 
@@ -128,6 +129,7 @@ class TcpTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     TcpParams params_;
+    std::mutex lifecycle_mutex_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::atomic<bool> shutting_down_{false};
 
