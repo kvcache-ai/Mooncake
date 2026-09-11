@@ -274,7 +274,10 @@ def test_loop(local_rank: int, num_local_ranks: int):
             )
         os.environ["MOONCAKE_EP_DEVICE_FILTER"] = filters[local_rank]
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
+    num_tokens = int(os.getenv("MOONCAKE_EP_TEST_NUM_TOKENS", "128"))
+    hidden = int(os.getenv("MOONCAKE_EP_TEST_HIDDEN", "7168"))
+    num_topk = int(os.getenv("MOONCAKE_EP_TEST_TOPK", "8"))
+    num_experts = int(os.getenv("MOONCAKE_EP_TEST_NUM_EXPERTS", "288"))
 
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         num_tokens, hidden, num_ranks, num_experts
