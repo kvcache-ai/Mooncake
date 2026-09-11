@@ -10,12 +10,23 @@ use super::super::{
 use super::{
     backend_remove_cold_payload, backend_remove_pending_source, persistent_backing_contains_target,
 };
-use mooncake_store_core::ColdTierDeviceRecord;
+use mooncake_store_core::{ClientRuntimeId, ColdTierDeviceRecord};
 use std::collections::BTreeMap;
 use std::time::Instant;
 use tracing::info;
 
 impl StorageOwnerState {
+    pub(crate) fn accept_nof_owner_snapshot(
+        &self,
+        target_id: String,
+        from: ClientRuntimeId,
+        to: ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        self.cold_tier_devices
+            .accept_nof_owner_snapshot(target_id, from, to, routes)
+    }
+
     pub(in super::super) fn enqueue_pending_offload(&self, route: &ObjectRoute) {
         crate::client::cold_tier::enqueue_pending_offload(self, route)
     }
@@ -891,7 +902,11 @@ impl StorageOwnerState {
         }
     }
 
-    pub(crate) fn release_nof_ownership_on_shutdown(&self) {
-        self.cold_tier_devices.release_nof_ownership_on_shutdown();
+    pub(crate) fn release_nof_ownership_on_shutdown(
+        &self,
+        control_client: &crate::control_plane::ControlPlaneClient,
+    ) {
+        self.cold_tier_devices
+            .release_nof_ownership_on_shutdown(control_client);
     }
 }

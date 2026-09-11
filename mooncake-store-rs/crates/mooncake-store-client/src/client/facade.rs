@@ -2073,7 +2073,8 @@ impl Drop for StoreClient {
             // Complete the local NoF drain while this runtime still owns its
             // targets. Only then withdraw the owner label so a replacement
             // cannot start recovery while accepted writes are still flushing.
-            self.storage_owner.release_nof_ownership_on_shutdown();
+            self.storage_owner
+                .release_nof_ownership_on_shutdown(self.control_client.as_ref());
         }
         self.cold_tier.shutdown();
         if self.owns_local_state_lifecycle

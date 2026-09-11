@@ -1,4 +1,4 @@
-use super::codec::pb_error;
+use super::codec::{pb_error, pb_object_route, try_object_route, try_runtime_id};
 use super::cold_tier_codec::try_cold_backing_route;
 use super::*;
 
@@ -240,6 +240,98 @@ pub(super) async fn handle_batch_reclaim_cold_backings(
     .map(cold_reclaim_result_to_pb)
     .collect();
     Ok(Response::new(pb::BatchReclaimColdBackingsReply { results }))
+}
+
+pub(super) async fn handle_transfer_nof_owner_snapshot(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::TransferNofOwnerSnapshotRequest>,
+) -> std::result::Result<Response<pb::TransferNofOwnerSnapshotReply>, Status> {
+    let request = request.into_inner();
+    if request.target_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "transfer_nof_owner_snapshot requires target_id",
+        ));
+    }
+    let from = request
+        .from
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("transfer_nof_owner_snapshot requires from"))
+        .and_then(|runtime| {
+            try_runtime_id(runtime).map_err(|error| Status::invalid_argument(error.to_string()))
+        })?;
+    let to = request
+        .to
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("transfer_nof_owner_snapshot requires to"))
+        .and_then(|runtime| {
+            try_runtime_id(runtime).map_err(|error| Status::invalid_argument(error.to_string()))
+        })?;
+    let routes = request
+        .routes
+        .into_iter()
+        .map(try_object_route)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(|error| Status::invalid_argument(error.to_string()))?;
+    let target_id = request.target_id;
+    let reply = run_blocking_control("transfer_nof_owner_snapshot", move || {
+        match cold_tier.accept_nof_owner_snapshot(target_id, from, to, routes) {
+            Ok(route_count) => pb::TransferNofOwnerSnapshotReply {
+                route_count: route_count as u64,
+                error: None,
+            },
+            Err(error) => pb::TransferNofOwnerSnapshotReply {
+                route_count: 0,
+                error: Some(pb_error(error)),
+            },
+        }
+    })
+    .await?;
+    Ok(Response::new(reply))
+}
+
+pub(super) async fn handle_manage_nof_backing(
+    cold_tier: Arc<dyn ColdTierControlService>,
+    request: Request<pb::ManageNofBackingRequest>,
+) -> std::result::Result<Response<pb::ManageNofBackingReply>, Status> {
+    let request = request.into_inner();
+    if request.target_id.is_empty() {
+        return Err(Status::invalid_argument(
+            "manage_nof_backing requires target_id",
+        ));
+    }
+    let route = request
+        .route
+        .ok_or_else(|| Status::invalid_argument("manage_nof_backing requires route"))
+        .and_then(|route| {
+            try_object_route(route).map_err(|error| Status::invalid_argument(error.to_string()))
+        })?;
+    let action = match pb::ManagedNofRouteAction::try_from(request.action).unwrap_or_default() {
+        pb::ManagedNofRouteAction::Prepare => ManagedNofRouteAction::Prepare,
+        pb::ManagedNofRouteAction::Publish => ManagedNofRouteAction::Publish,
+        pb::ManagedNofRouteAction::Release => ManagedNofRouteAction::Release,
+        pb::ManagedNofRouteAction::Unspecified => {
+            return Err(Status::invalid_argument(
+                "manage_nof_backing requires a valid action",
+            ))
+        }
+    };
+    let target_id = request.target_id;
+    let length = request.length;
+    let checksum = request.checksum;
+    let reply = run_blocking_control("manage_nof_backing", move || {
+        match cold_tier.manage_nof_backing(target_id, action, route, length, checksum) {
+            Ok(route) => pb::ManageNofBackingReply {
+                route: Some(pb_object_route(&route)),
+                error: None,
+            },
+            Err(error) => pb::ManageNofBackingReply {
+                route: None,
+                error: Some(pb_error(error)),
+            },
+        }
+    })
+    .await?;
+    Ok(Response::new(reply))
 }
 
 fn cold_reclaim_result_to_pb(

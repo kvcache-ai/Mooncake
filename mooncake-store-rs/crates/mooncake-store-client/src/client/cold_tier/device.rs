@@ -148,17 +148,21 @@ impl StorageOwnerState {
             if !allow_nof {
                 return Ok(None);
             }
-            let backing = self
+            if self.cold_tier_devices.nof_targets.is_managed() {
+                return Ok(self
+                    .cold_tier_devices
+                    .nof_targets
+                    .pending_managed_backing(route, length, checksum)?
+                    .map(|pending| super::super::PendingBackingRoute::Managed {
+                        backing: pending.backing,
+                        route: pending.route,
+                    }));
+            }
+            return Ok(self
                 .cold_tier_devices
                 .nof_targets
-                .pending_backing(route, length, checksum)?;
-            return Ok(backing.map(|backing| {
-                if self.cold_tier_devices.nof_targets.is_managed() {
-                    super::super::PendingBackingRoute::Managed(backing)
-                } else {
-                    super::super::PendingBackingRoute::Nof(backing)
-                }
-            }));
+                .pending_backing(route, length, checksum)?
+                .map(super::super::PendingBackingRoute::Nof));
         }
         let select_devices = |s: &Self| -> Result<Vec<ColdTierDeviceRecord>> {
             if replica_count > 1 {
@@ -177,16 +181,23 @@ impl StorageOwnerState {
         }
         let Some(primary) = devices.first() else {
             if allow_nof {
-                if let Some(backing) = self
+                if self.cold_tier_devices.nof_targets.is_managed() {
+                    if let Some(pending) = self
+                        .cold_tier_devices
+                        .nof_targets
+                        .pending_managed_backing(route, length, checksum)?
+                    {
+                        return Ok(Some(super::super::PendingBackingRoute::Managed {
+                            backing: pending.backing,
+                            route: pending.route,
+                        }));
+                    }
+                } else if let Some(backing) = self
                     .cold_tier_devices
                     .nof_targets
                     .pending_backing(route, length, checksum)?
                 {
-                    return Ok(Some(if self.cold_tier_devices.nof_targets.is_managed() {
-                        super::super::PendingBackingRoute::Managed(backing)
-                    } else {
-                        super::super::PendingBackingRoute::Nof(backing)
-                    }));
+                    return Ok(Some(super::super::PendingBackingRoute::Nof(backing)));
                 }
             }
             tracing::debug!(

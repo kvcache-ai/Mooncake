@@ -6,7 +6,7 @@ use crate::control_plane::{
     ColdReadResponse, ColdReadTarget, ColdReclaimResult, ColdTierControlService,
     ColdTierFreeResult, ColdTierProbeResult,
 };
-use mooncake_store_core::{ObjectKey, SegmentName, StoreError};
+use mooncake_store_core::{ClientRuntimeId, ObjectKey, ObjectRoute, SegmentName, StoreError};
 use std::sync::Arc;
 
 impl ColdTierControlService for LocalAllocatorAdapter {
@@ -199,6 +199,38 @@ impl ColdTierControlService for LocalAllocatorAdapter {
                     .reclaim_cold_backing_for_route_delete(&route_key, &cold_backing)
             })
             .collect()
+    }
+
+    fn accept_nof_owner_snapshot(
+        &self,
+        target_id: String,
+        from: ClientRuntimeId,
+        to: ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> mooncake_store_core::Result<usize> {
+        self.storage_owner
+            .accept_nof_owner_snapshot(target_id, from, to, routes)
+    }
+
+    fn manage_nof_backing(
+        &self,
+        target_id: String,
+        action: crate::control_plane::ManagedNofRouteAction,
+        route: ObjectRoute,
+        length: u64,
+        checksum: Option<u64>,
+    ) -> mooncake_store_core::Result<ObjectRoute> {
+        self.storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .manage_managed_route(
+                &self.storage_owner.route_ops,
+                &target_id,
+                action,
+                route,
+                length,
+                checksum,
+            )
     }
 
     fn pin_for_read(&self, slots: &[(SegmentName, u64)]) -> u64 {

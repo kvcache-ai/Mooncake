@@ -29,6 +29,8 @@ service ControlPlaneService {
   rpc BatchReadFromCold(BatchReadFromColdRequest) returns (BatchReadFromColdReply);
   rpc AckColdReadComplete(AckColdReadCompleteRequest) returns (AckColdReadCompleteReply);
   rpc BatchReclaimColdBackings(BatchReclaimColdBackingsRequest) returns (BatchReclaimColdBackingsReply);
+  rpc TransferNofOwnerSnapshot(TransferNofOwnerSnapshotRequest) returns (TransferNofOwnerSnapshotReply);
+  rpc ManageNofBacking(ManageNofBackingRequest) returns (ManageNofBackingReply);
   rpc PinForRead(PinForReadRequest) returns (PinForReadReply);
   rpc ControlStream(stream ControlStreamRequest) returns (stream ControlStreamReply);
 }
@@ -534,6 +536,38 @@ message ReclaimColdBackingReply {
 
 message BatchReclaimColdBackingsReply {
   repeated ReclaimColdBackingReply results = 1;
+}
+
+message TransferNofOwnerSnapshotRequest {
+  string target_id = 1;
+  ClientRuntimeId from = 2;
+  ClientRuntimeId to = 3;
+  repeated ObjectRoute routes = 4;
+}
+
+message TransferNofOwnerSnapshotReply {
+  uint64 route_count = 1;
+  ErrorDetail error = 2;
+}
+
+enum ManagedNofRouteAction {
+  MANAGED_NOF_ROUTE_ACTION_UNSPECIFIED = 0;
+  MANAGED_NOF_ROUTE_ACTION_PREPARE = 1;
+  MANAGED_NOF_ROUTE_ACTION_PUBLISH = 2;
+  MANAGED_NOF_ROUTE_ACTION_RELEASE = 3;
+}
+
+message ManageNofBackingRequest {
+  string target_id = 1;
+  ObjectRoute route = 2;
+  ManagedNofRouteAction action = 3;
+  uint64 length = 4;
+  optional uint64 checksum = 5;
+}
+
+message ManageNofBackingReply {
+  ObjectRoute route = 1;
+  ErrorDetail error = 2;
 }
 
 message PinForReadRequest {

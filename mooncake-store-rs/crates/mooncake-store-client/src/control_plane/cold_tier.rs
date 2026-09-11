@@ -1,4 +1,6 @@
-use super::codec::{decode_error, ensure_batch_len};
+use super::codec::{
+    decode_error, ensure_batch_len, pb_object_route, pb_runtime_id, try_object_route,
+};
 use super::cold_tier_codec::pb_cold_backing_route;
 use super::*;
 use crate::observability::OperationTracker;
@@ -58,6 +60,13 @@ pub(crate) struct ColdReadTarget {
     pub object_set: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedNofRouteAction {
+    Prepare,
+    Publish,
+    Release,
+}
+
 pub(crate) trait ColdTierControlService: Send + Sync {
     fn trigger_offload(&self, max_tasks: usize) -> Result<usize>;
 
@@ -107,6 +116,23 @@ pub(crate) trait ColdTierControlService: Send + Sync {
         route_key: ObjectKey,
         cold_backings: Vec<mooncake_store_core::ColdBackingRoute>,
     ) -> Vec<Result<ColdReclaimResult>>;
+
+    fn accept_nof_owner_snapshot(
+        &self,
+        target_id: String,
+        from: ClientRuntimeId,
+        to: ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize>;
+
+    fn manage_nof_backing(
+        &self,
+        target_id: String,
+        action: ManagedNofRouteAction,
+        route: ObjectRoute,
+        length: u64,
+        checksum: Option<u64>,
+    ) -> Result<ObjectRoute>;
 
     fn pin_for_read(&self, _slots: &[(SegmentName, u64)]) -> u64 {
         0
@@ -174,6 +200,31 @@ impl ColdTierControlService for UnsupportedColdTierControlService {
                 ))
             })
             .collect()
+    }
+
+    fn accept_nof_owner_snapshot(
+        &self,
+        _target_id: String,
+        _from: ClientRuntimeId,
+        _to: ClientRuntimeId,
+        _routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        Err(StoreError::Unsupported(
+            "NoF owner snapshot transfer is not wired yet".to_string(),
+        ))
+    }
+
+    fn manage_nof_backing(
+        &self,
+        _target_id: String,
+        _action: ManagedNofRouteAction,
+        _route: ObjectRoute,
+        _length: u64,
+        _checksum: Option<u64>,
+    ) -> Result<ObjectRoute> {
+        Err(StoreError::Unsupported(
+            "managed NoF route control is not wired yet".to_string(),
+        ))
     }
 }
 
@@ -373,6 +424,89 @@ impl ControlPlaneClient {
                     })
                 })
                 .collect())
+        })();
+        tracker.finish(&result, 0);
+        result
+    }
+
+    pub(crate) fn transfer_nof_owner_snapshot(
+        &self,
+        lease: &ClientLease,
+        target_id: &str,
+        from: &ClientRuntimeId,
+        to: &ClientRuntimeId,
+        routes: Vec<ObjectRoute>,
+    ) -> Result<usize> {
+        let tracker = OperationTracker::new("control_transfer_nof_owner_snapshot");
+        let request = pb::TransferNofOwnerSnapshotRequest {
+            target_id: target_id.to_string(),
+            from: Some(pb_runtime_id(from)),
+            to: Some(pb_runtime_id(to)),
+            routes: routes.iter().map(pb_object_route).collect(),
+        };
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply = self.rpc(
+                move |mut client| async move {
+                    client
+                        .transfer_nof_owner_snapshot(Request::new(request))
+                        .await
+                },
+                channel,
+            )?;
+            decode_error(reply.error)?;
+            Ok(reply.route_count as usize)
+        })();
+        tracker.finish(
+            &result,
+            result
+                .as_ref()
+                .copied()
+                .unwrap_or_default()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        );
+        result
+    }
+
+    pub(crate) fn manage_nof_backing(
+        &self,
+        lease: &ClientLease,
+        target_id: &str,
+        action: ManagedNofRouteAction,
+        route: &ObjectRoute,
+        length: u64,
+        checksum: Option<u64>,
+    ) -> Result<ObjectRoute> {
+        let tracker = OperationTracker::new("control_manage_nof_backing");
+        let request = pb::ManageNofBackingRequest {
+            target_id: target_id.to_string(),
+            route: Some(pb_object_route(route)),
+            action: match action {
+                ManagedNofRouteAction::Prepare => pb::ManagedNofRouteAction::Prepare,
+                ManagedNofRouteAction::Publish => pb::ManagedNofRouteAction::Publish,
+                ManagedNofRouteAction::Release => pb::ManagedNofRouteAction::Release,
+            } as i32,
+            length,
+            checksum,
+        };
+        let result = (|| {
+            let channel = self.channel_for(lease)?;
+            let reply =
+                self.rpc(
+                    move |mut client| async move {
+                        client.manage_nof_backing(Request::new(request)).await
+                    },
+                    channel,
+                )?;
+            decode_error(reply.error)?;
+            reply
+                .route
+                .map(try_object_route)
+                .transpose()?
+                .ok_or_else(|| {
+                    StoreError::Transport("manage_nof_backing reply is missing route".to_string())
+                })
         })();
         tracker.finish(&result, 0);
         result

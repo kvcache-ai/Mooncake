@@ -96,6 +96,11 @@ fn publish_initial_write_backing(
         storage_owner.sync_route(route);
         return Ok(None);
     };
+    if let Some(managed_route) = backing.managed_route().cloned() {
+        storage_owner.sync_route(&managed_route);
+        enqueue_pending_offload(storage_owner, &managed_route);
+        return Ok(Some(managed_route));
+    }
     if backing.is_request_local() {
         enqueue_pending_offload_with_length(storage_owner, route, backing.backing().length);
         storage_owner.sync_route(route);
@@ -202,6 +207,11 @@ pub(in super::super) fn publish_pending_cold_backing_for_eviction(
         storage_owner.sync_route(route);
         return Ok(None);
     };
+    if let Some(managed_route) = backing.managed_route().cloned() {
+        storage_owner.sync_route(&managed_route);
+        enqueue_pending_offload(storage_owner, &managed_route);
+        return Ok(Some(managed_route));
+    }
     if backing.is_nof() {
         enqueue_pending_offload_with_length(storage_owner, route, backing.backing().length);
         storage_owner.sync_route(route);
@@ -534,25 +544,31 @@ pub(in super::super) fn prepare_pending_offload_entry(
     else {
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
     };
-    let managed_nof = route.nof_backing.is_some();
-    let (cold_backing, transient_nof) = match pending_persistent_backing(&route) {
-        Some(backing) => (backing, false),
+    let (cold_backing, transient_nof, route) = match pending_persistent_backing(&route) {
+        Some(backing) => (backing, false, route.clone()),
         None => {
             let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
                 storage_owner.sync_route(&route);
                 return Ok(PendingOffloadPrepareOutcome::Skipped);
             };
-            let Some(backing) = storage_owner
-                .cold_tier_devices
-                .nof_targets
-                .pending_backing(&route, replica.length, checksum)?
+            let Some(pending_backing) =
+                storage_owner.pending_backing_for_route(&route, replica.length, checksum, true)?
             else {
                 storage_owner.sync_route(&route);
                 return Ok(PendingOffloadPrepareOutcome::Skipped);
             };
-            (backing, true)
+            let pending_route = pending_backing
+                .managed_route()
+                .cloned()
+                .unwrap_or_else(|| route.clone());
+            (
+                pending_backing.backing().clone(),
+                pending_backing.is_request_local(),
+                pending_route,
+            )
         }
     };
+    let managed_nof = route.nof_backing.is_some();
     if !transient_nof && cold_backing.owner != storage_owner.runtime {
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
@@ -711,6 +727,9 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     if pending[0].transient_nof {
         return materialize_transient_nof_batch(storage_owner, pending, first_error);
     }
+    if pending[0].managed_nof {
+        return materialize_managed_nof_batch(storage_owner, pending, first_error);
+    }
     let backend = match storage_owner
         .cold_tier_devices
         .backend_for(&pending[0].cold_backing)
@@ -810,6 +829,67 @@ pub(in super::super) fn materialize_prepared_pending_offload_batch(
     Ok(outcome.materialized)
 }
 
+fn materialize_managed_nof_batch(
+    storage_owner: &StorageOwnerState,
+    pending: &[PendingOffloadMaterialization],
+    first_error: &mut Option<StoreError>,
+) -> Result<usize> {
+    let errors = write_pending_nof_targets(storage_owner, pending, "managed NoF")?;
+    let mut materialized = 0usize;
+    for (prepared, write_error) in pending.iter().zip(errors) {
+        match write_error {
+            Some(error) => {
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_error();
+                }
+                registry::record_cold_tier_operation(
+                    "offload",
+                    "error",
+                    registry::cold_tier_error_kind(&error),
+                );
+                if first_error.is_none() {
+                    *first_error = Some(error);
+                }
+                storage_owner.pending_offloads.retry(prepared.entry.clone());
+            }
+            None => match storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .publish_managed_route(prepared.route.clone())
+            {
+                Ok(route) => {
+                    if let Some(permit) = prepared.permit.as_ref() {
+                        permit.complete_ok();
+                    }
+                    storage_owner.sync_route(&route);
+                    storage_owner.pending_offloads.complete(&prepared.entry.key);
+                    registry::record_cold_tier_operation("offload", "materialized", "none");
+                    storage_owner.cold_tier_devices.pressure_decrement_pending();
+                    materialized = materialized.saturating_add(1);
+                }
+                Err(error) => {
+                    if let Some(permit) = prepared.permit.as_ref() {
+                        permit.complete_error();
+                    }
+                    registry::record_cold_tier_operation(
+                        "offload",
+                        "error",
+                        registry::cold_tier_error_kind(&error),
+                    );
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
+                    storage_owner.pending_offloads.retry(prepared.entry.clone());
+                }
+            },
+        }
+    }
+    if materialized > 0 {
+        storage_owner.eviction_ready_signal.signal();
+    }
+    Ok(materialized)
+}
+
 fn materialize_transient_nof_batch(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
@@ -821,6 +901,40 @@ fn materialize_transient_nof_batch(
             "NoF and local Cold Tier writes cannot share one backend batch".to_string(),
         ));
     }
+    let errors = write_pending_nof_targets(storage_owner, pending, "NoF")?;
+    let mut completed = 0usize;
+    for (prepared, error) in pending.iter().zip(errors) {
+        match error {
+            None => {
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_ok();
+                }
+                storage_owner.pending_offloads.complete(&prepared.entry.key);
+                storage_owner.cold_tier_devices.pressure_decrement_pending();
+                completed = completed.saturating_add(1);
+            }
+            Some(error) => {
+                if let Some(permit) = prepared.permit.as_ref() {
+                    permit.complete_error();
+                }
+                if first_error.is_none() {
+                    *first_error = Some(error);
+                }
+                storage_owner.pending_offloads.retry(prepared.entry.clone());
+            }
+        }
+    }
+    if completed > 0 {
+        storage_owner.eviction_ready_signal.signal();
+    }
+    Ok(completed)
+}
+
+fn write_pending_nof_targets(
+    storage_owner: &StorageOwnerState,
+    pending: &[PendingOffloadMaterialization],
+    operation: &str,
+) -> Result<Vec<Option<StoreError>>> {
     let mut target_writes =
         BTreeMap::<String, Vec<(usize, mooncake_store_core::ColdBackingRoute)>>::new();
     for (index, prepared) in pending.iter().enumerate() {
@@ -852,7 +966,7 @@ fn materialize_transient_nof_batch(
         };
         if results.len() != writes.len() {
             let error = StoreError::InvalidState(format!(
-                "NoF backend returned {} results for {} writes",
+                "{operation} backend returned {} results for {} writes",
                 results.len(),
                 writes.len()
             ));
@@ -867,32 +981,7 @@ fn materialize_transient_nof_batch(
             }
         }
     }
-    let mut completed = 0usize;
-    for (prepared, error) in pending.iter().zip(errors) {
-        match error {
-            None => {
-                if let Some(permit) = prepared.permit.as_ref() {
-                    permit.complete_ok();
-                }
-                storage_owner.pending_offloads.complete(&prepared.entry.key);
-                storage_owner.cold_tier_devices.pressure_decrement_pending();
-                completed = completed.saturating_add(1);
-            }
-            Some(error) => {
-                if let Some(permit) = prepared.permit.as_ref() {
-                    permit.complete_error();
-                }
-                if first_error.is_none() {
-                    *first_error = Some(error);
-                }
-                storage_owner.pending_offloads.retry(prepared.entry.clone());
-            }
-        }
-    }
-    if completed > 0 {
-        storage_owner.eviction_ready_signal.signal();
-    }
-    Ok(completed)
+    Ok(errors)
 }
 
 fn retry_pending_offload_batch(

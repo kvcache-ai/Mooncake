@@ -614,7 +614,14 @@ impl StoreClientBuilder {
             runtime_metadata.clone(),
             live_client_cache.clone(),
             nof_target_set_fingerprint.unwrap_or_default(),
-        )?;
+        )?
+        .with_route_control(
+            mooncake_store_route::RouteOperations::new(
+                route_directory.clone(),
+                provisional_lease.clone(),
+            ),
+            control_client.clone(),
+        );
         for target_id in nof_targets.target_ids() {
             if cold_tier_resolver.has_backend(target_id) {
                 return Err(StoreError::InvalidState(format!(

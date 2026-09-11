@@ -264,7 +264,8 @@ mod server;
 
 pub(crate) use cold_tier::{
     ColdReadResponse, ColdReadResult, ColdReadTarget, ColdReclaimResult, ColdTierControlService,
-    ColdTierFreeResult, ColdTierProbeResult, UnsupportedColdTierControlService,
+    ColdTierFreeResult, ColdTierProbeResult, ManagedNofRouteAction,
+    UnsupportedColdTierControlService,
 };
 pub(crate) use server::ControlPlaneHandle;
 
