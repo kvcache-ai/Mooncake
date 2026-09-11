@@ -648,11 +648,23 @@ combine(void* combined_x, int32_t* active_ranks,
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
+#ifdef MOONCAKE_EP_USE_MACA
+                // C500 executes two 32-lane sub-warps in one 64-lane hardware
+                // warp. Combine assigns both sub-warps to the same expert QP;
+                // serialize their leaders before entering the QP mutex.
+                for (int half = 0; half < 2; ++half) {
+                    if ((sub_warp_id & 1) == half) {
+#endif
                 mc_rdma_put(comm_ctx,
                             ep_qp_channel(local_expert_idx, num_qp_per_rank,
                                           active_qps_per_rank),
                             dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
                             num_bytes_per_slot, lane_id);
+#ifdef MOONCAKE_EP_USE_MACA
+                    }
+                    __syncwarp();
+                }
+#endif
             }
         }
         // Put finishing flag
