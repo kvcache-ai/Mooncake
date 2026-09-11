@@ -266,15 +266,15 @@ class P2PMasterClient final {
     // Empty attachment => callers must use the plain invoke path instead.
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
-    invoke_rpc_async_with_attachment(std::string attachment, Args&&... args) {
-        return invoke_rpc_async_with_attachment_with_pool<ServiceMethod, ReturnType>(
+    invoke_rpc_async_with_context(std::string attachment, Args&&... args) {
+        return invoke_rpc_async_with_context_with_pool<ServiceMethod, ReturnType>(
             client_accessor_.GetClientPool(), std::move(attachment),
             std::forward<Args>(args)...);
     }
 
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
-    invoke_rpc_async_with_attachment_with_pool(
+    invoke_rpc_async_with_context_with_pool(
         std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> pool,
         std::string attachment, Args&&... args) {
         if (metrics_) {
@@ -308,16 +308,16 @@ class P2PMasterClient final {
     }
 
     template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_attachment(
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_context(
         std::string attachment, Args&&... args) {
         return async_simple::coro::syncAwait(
-            invoke_rpc_async_with_attachment<ServiceMethod, ReturnType>(
+            invoke_rpc_async_with_context<ServiceMethod, ReturnType>(
                 std::move(attachment), std::forward<Args>(args)...));
     }
 
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
-    invoke_batch_rpc_with_attachment(std::string attachment, size_t input_size,
+    invoke_batch_rpc_with_context(std::string attachment, size_t input_size,
                                      Args&&... args) {
         auto pool = client_accessor_.GetClientPool();
         if (metrics_) {

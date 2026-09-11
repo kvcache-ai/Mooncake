@@ -89,29 +89,29 @@ class P2PMasterRpcService final {
         const P2PWithdrawRouteRequest& req);
     std::vector<tl::expected<void, ErrorCode>> BatchWithdrawRoute(
         const P2PBatchWithdrawRouteRequest& req);
-    // Per-request "_with_attachment" V3 handlers (hop B extract). Keep the
+    // Per-request "_with_context" V3 handlers (hop B extract). Keep the
     // value-returning handlers above for backward compat (old clients /
     // no-attachment path route to the plain methods); these carry the
     // per-request RequestContext via coro_rpc's out-of-band attachment.
-    void ExistKey_with_attachment(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+    void ExistKey_with_context(coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
                             std::string_view key);
-    void BatchExistKey_with_attachment(coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    void BatchExistKey_with_context(coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
                             const std::vector<std::string_view>& keys);
-    void GetReadRouteByRegex_with_attachment(coro_rpc::context<tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>, ErrorCode>> ctx,
+    void GetReadRouteByRegex_with_context(coro_rpc::context<tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>, ErrorCode>> ctx,
                             std::string_view regex);
-    void GetReadRoute_with_attachment(coro_rpc::context<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>> ctx,
+    void GetReadRoute_with_context(coro_rpc::context<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>> ctx,
                             const P2PGetReadRouteRequest& req);
-    void BatchGetReadRoute_with_attachment(coro_rpc::context<P2PBatchGetReadRouteResponse> ctx,
+    void BatchGetReadRoute_with_context(coro_rpc::context<P2PBatchGetReadRouteResponse> ctx,
                             const P2PBatchGetReadRouteRequest& req);
-    void GetWriteRoute_with_attachment(coro_rpc::context<tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>> ctx,
+    void GetWriteRoute_with_context(coro_rpc::context<tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>> ctx,
                             const P2PGetWriteRouteRequest& req);
-    void BatchGetWriteRoute_with_attachment(coro_rpc::context<P2PBatchGetWriteRouteResponse> ctx,
+    void BatchGetWriteRoute_with_context(coro_rpc::context<P2PBatchGetWriteRouteResponse> ctx,
                             const P2PBatchGetWriteRouteRequest& req);
-    void PublishRoute_with_attachment(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    void PublishRoute_with_context(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
                             const P2PPublishRouteRequest& req);
-    void WithdrawRoute_with_attachment(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    void WithdrawRoute_with_context(coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
                             const P2PWithdrawRouteRequest& req);
-    void BatchWithdrawRoute_with_attachment(coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+    void BatchWithdrawRoute_with_context(coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
                             const P2PBatchWithdrawRouteRequest& req);
 
     P2PBatchSyncRoutesResponse BatchSyncRoutes(

@@ -212,66 +212,66 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
     static constexpr const char* value = "MarkTaskToComplete";
 };
-// hop B: per-request _with_attachment handler metric labels aggregate
+// hop B: per-request _with_context handler metric labels aggregate
 // under the base method name so dashboards don't split the rpc.
 template <>
-struct RpcNameTraits<&WrappedMasterService::ExistKey_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::ExistKey_with_context> {
     static constexpr const char* value = "ExistKey";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchExistKey_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::BatchExistKey_with_context> {
     static constexpr const char* value = "BatchExistKey";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear_with_context> {
     static constexpr const char* value = "BatchReplicaClear";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex_with_context> {
     static constexpr const char* value = "GetReplicaListByRegex";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetReplicaList_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::GetReplicaList_with_context> {
     static constexpr const char* value = "GetReplicaList";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList_with_context> {
     static constexpr const char* value = "BatchGetReplicaList";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::PutStart_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::PutStart_with_context> {
     static constexpr const char* value = "PutStart";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::PutEnd_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::PutEnd_with_context> {
     static constexpr const char* value = "PutEnd";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::PutRevoke_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::PutRevoke_with_context> {
     static constexpr const char* value = "PutRevoke";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutStart_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::BatchPutStart_with_context> {
     static constexpr const char* value = "BatchPutStart";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutEnd_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::BatchPutEnd_with_context> {
     static constexpr const char* value = "BatchPutEnd";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke_with_context> {
     static constexpr const char* value = "BatchPutRevoke";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::Remove_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::Remove_with_context> {
     static constexpr const char* value = "Remove";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::RemoveByRegex_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::RemoveByRegex_with_context> {
     static constexpr const char* value = "RemoveByRegex";
 };
 template <>
-struct RpcNameTraits<&WrappedMasterService::RemoveAll_with_attachment> {
+struct RpcNameTraits<&WrappedMasterService::RemoveAll_with_context> {
     static constexpr const char* value = "RemoveAll";
 };
 
@@ -365,7 +365,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
-tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_attachment(
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_context(
     std::string attachment, Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
@@ -406,7 +406,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_attachment(
 
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>>
-MasterClient::invoke_batch_rpc_with_attachment(std::string attachment,
+MasterClient::invoke_batch_rpc_with_context(std::string attachment,
                                                size_t input_size,
                                                Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -498,7 +498,7 @@ tl::expected<bool, ErrorCode> MasterClient::ExistKey(
     std::string att = current_request_context_attachment();
     auto result = att.empty()
         ?  invoke_rpc<&WrappedMasterService::ExistKey, bool>(object_key)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::ExistKey_with_attachment, bool>(std::move(att), object_key);
+        :  invoke_rpc_with_context<&WrappedMasterService::ExistKey_with_context, bool>(std::move(att), object_key);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -512,7 +512,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     auto result = att.empty()
         ?  invoke_batch_rpc<&WrappedMasterService::BatchExistKey, bool>(
         object_keys.size(), object_keys)
-        :  invoke_batch_rpc_with_attachment<&WrappedMasterService::BatchExistKey_with_attachment, bool>(std::move(att), 
+        :  invoke_batch_rpc_with_context<&WrappedMasterService::BatchExistKey_with_context, bool>(std::move(att), 
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
@@ -553,7 +553,7 @@ MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
         ?  invoke_rpc<&WrappedMasterService::BatchReplicaClear,
                              std::vector<std::string>>(object_keys, client_id,
                                                        segment_name)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::BatchReplicaClear_with_attachment,
+        :  invoke_rpc_with_context<&WrappedMasterService::BatchReplicaClear_with_context,
                              std::vector<std::string>>(std::move(att), object_keys, client_id,
                                                        segment_name);
     timer.LogResponseExpected(result);
@@ -571,8 +571,8 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
         ?  invoke_rpc<
         &WrappedMasterService::GetReplicaListByRegex,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(str)
-        :  invoke_rpc_with_attachment<
-        &WrappedMasterService::GetReplicaListByRegex_with_attachment,
+        :  invoke_rpc_with_context<
+        &WrappedMasterService::GetReplicaListByRegex_with_context,
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(std::move(att), str);
 
     timer.LogResponseExpected(result);
@@ -588,7 +588,7 @@ tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
     auto result = att.empty()
         ?  invoke_rpc<&WrappedMasterService::GetReplicaList,
                              GetReplicaListResponse>(object_key)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::GetReplicaList_with_attachment,
+        :  invoke_rpc_with_context<&WrappedMasterService::GetReplicaList_with_context,
                              GetReplicaListResponse>(std::move(att), object_key);
     timer.LogResponseExpected(result);
     return result;
@@ -604,7 +604,7 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
         ?  invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
                                    GetReplicaListResponse>(object_keys.size(),
                                                            object_keys)
-        :  invoke_batch_rpc_with_attachment<&WrappedMasterService::BatchGetReplicaList_with_attachment,
+        :  invoke_batch_rpc_with_context<&WrappedMasterService::BatchGetReplicaList_with_context,
                                    GetReplicaListResponse>(std::move(att), object_keys.size(),
                                                            object_keys);
     timer.LogResponse("result=", result.size(), " operations");
@@ -628,7 +628,7 @@ MasterClient::PutStart(const std::string& key,
         ?  invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
         client_id_, key, total_slice_length, config)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::PutStart_with_attachment,
+        :  invoke_rpc_with_context<&WrappedMasterService::PutStart_with_context,
                              std::vector<Replica::Descriptor>>(std::move(att), 
         client_id_, key, total_slice_length, config);
     timer.LogResponseExpected(result);
@@ -658,7 +658,7 @@ MasterClient::BatchPutStart(
         ?  invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
         keys.size(), client_id_, keys, total_slice_lengths, config)
-        :  invoke_batch_rpc_with_attachment<&WrappedMasterService::BatchPutStart_with_attachment,
+        :  invoke_batch_rpc_with_context<&WrappedMasterService::BatchPutStart_with_context,
                                    std::vector<Replica::Descriptor>>(std::move(att), 
         keys.size(), client_id_, keys, total_slice_lengths, config);
     timer.LogResponse("result=", result.size(), " operations");
@@ -674,7 +674,7 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
     auto result = att.empty()
         ?  invoke_rpc<&WrappedMasterService::PutEnd, void>(
         client_id_, key, replica_type)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::PutEnd_with_attachment, void>(std::move(att), 
+        :  invoke_rpc_with_context<&WrappedMasterService::PutEnd_with_context, void>(std::move(att), 
         client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
@@ -689,7 +689,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     auto result = att.empty()
         ?  invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
         keys.size(), client_id_, keys)
-        :  invoke_batch_rpc_with_attachment<&WrappedMasterService::BatchPutEnd_with_attachment, void>(std::move(att), 
+        :  invoke_batch_rpc_with_context<&WrappedMasterService::BatchPutEnd_with_context, void>(std::move(att), 
         keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
@@ -704,7 +704,7 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     auto result = att.empty()
         ?  invoke_rpc<&WrappedMasterService::PutRevoke, void>(
         client_id_, key, replica_type)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::PutRevoke_with_attachment, void>(std::move(att), 
+        :  invoke_rpc_with_context<&WrappedMasterService::PutRevoke_with_context, void>(std::move(att), 
         client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
@@ -719,7 +719,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     auto result = att.empty()
         ?  invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
         keys.size(), client_id_, keys)
-        :  invoke_batch_rpc_with_attachment<&WrappedMasterService::BatchPutRevoke_with_attachment, void>(std::move(att), 
+        :  invoke_batch_rpc_with_context<&WrappedMasterService::BatchPutRevoke_with_context, void>(std::move(att), 
         keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
@@ -733,7 +733,7 @@ tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
     std::string att = current_request_context_attachment();
     auto result = att.empty()
         ?  invoke_rpc<&WrappedMasterService::Remove, void>(key, force)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::Remove_with_attachment, void>(std::move(att), key, force);
+        :  invoke_rpc_with_context<&WrappedMasterService::Remove_with_context, void>(std::move(att), key, force);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -748,7 +748,7 @@ tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
         ? 
         invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str, force)
         : 
-        invoke_rpc_with_attachment<&WrappedMasterService::RemoveByRegex_with_attachment, long>(std::move(att), str, force);
+        invoke_rpc_with_context<&WrappedMasterService::RemoveByRegex_with_context, long>(std::move(att), str, force);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -760,7 +760,7 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     std::string att = current_request_context_attachment();
     auto result = att.empty()
         ?  invoke_rpc<&WrappedMasterService::RemoveAll, long>(force)
-        :  invoke_rpc_with_attachment<&WrappedMasterService::RemoveAll_with_attachment, long>(std::move(att), force);
+        :  invoke_rpc_with_context<&WrappedMasterService::RemoveAll_with_context, long>(std::move(att), force);
     timer.LogResponseExpected(result);
     return result;
 }
