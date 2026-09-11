@@ -122,6 +122,8 @@ These flags control when the master asks clients to persist objects to SSD, whet
 
 Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_evict=true` when SSD writes should happen only under memory pressure. For SSD-heavy workloads where offload-on-evict is dropping too many objects, raise both `--offloading_queue_limit` and `--offload_cap_ratio`; for example, `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` allows up to `400000` objects to be queued in one eviction cycle.
 
+With `--offload_on_evict=true`, eviction is what moves objects to SSD, and read leases block eviction. If existence checks are used as speculative scans, the leases they grant can keep DRAM full and stall SSD writes; set `--exist_key_grant_lease=false` on the master in that case.
+
 ---
 
 ## SSD Offload Configuration

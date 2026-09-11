@@ -604,6 +604,7 @@ mooncake_master \
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
 | `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
+| `--exist_key_grant_lease` | `true` | Grant a read lease on `ExistKey`/`BatchExistKey` hits. Set `false` if these leases block eviction |
 
 ### Tenant Quota
 
