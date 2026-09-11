@@ -53,6 +53,12 @@ struct mlx5_wqe_atomic_add_32_seg {
 namespace mooncake {
 namespace device {
 
+enum class IbgdaPollResult {
+    Completed,
+    TimedOut,
+    Failed,
+};
+
 // ---------------------------------------------------------------------------
 // IbgdaContext
 // ---------------------------------------------------------------------------
@@ -96,23 +102,35 @@ __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
 #endif
 }
 
-__device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
-                                                 uint16_t expect) {
+__device__ __forceinline__ IbgdaPollResult mc_ibgda_poll_cq(
+    mlx5gda_qp_devctx* qp, uint16_t expect, uint64_t deadline_ticks = 0) {
     uint16_t wq_tail = qp->wq_tail;
     while (static_cast<int16_t>(wq_tail - expect) <= 0) {
         uint16_t cq_be =
             *reinterpret_cast<volatile uint16_t*>(&qp->cq->wqe_counter);
         uint8_t opcode = qp->cq->op_own >> 4;
-        if (opcode == 0xD)
+        if (opcode == 0xD) {
+#ifndef NDEBUG
             printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
                    qp->cq->timestamp >> 56);
+#endif
+            return IbgdaPollResult::Failed;
+        }
         if (!(opcode == 0x0 || opcode == 0xF)) {
-            printf("[EP IBGDA] Unexpected CQE opcode=0x%x, trapping\n", opcode);
-            __trap();
+#ifndef NDEBUG
+            printf("[EP IBGDA] Unexpected CQE opcode=0x%x\n", opcode);
+#endif
+            return IbgdaPollResult::Failed;
         }
         wq_tail = mc_bswap16(cq_be) + 1;
+        if (static_cast<int16_t>(wq_tail - expect) <= 0 &&
+            deadline_ticks != 0 && clock64() >= deadline_ticks) {
+            if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
+            return IbgdaPollResult::TimedOut;
+        }
     }
     if (wq_tail != qp->wq_tail) qp->wq_tail = wq_tail;
+    return IbgdaPollResult::Completed;
 }
 
 __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
@@ -211,6 +229,60 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     wqe->data.byte_count = mc_bswap32(static_cast<uint32_t>(4));
     wqe->data.lkey = lkey;
     wqe->data.addr = mc_bswap64(laddr);
+
+    ++qp->wq_head;
+}
+
+// Issue a regular 64-bit FETCH-AND-ADD WQE.
+__device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_64_wqe(
+    mlx5gda_qp_devctx* qp, uint64_t value, uint64_t laddr, __be32 lkey,
+    uint64_t raddr, __be32 rkey) {
+    auto* wqe = reinterpret_cast<mlx5gda_rdma_atomic_wqe*>(
+        qp->wq + (qp->wq_head & qp->wqeid_mask));
+
+    wqe->ctrl = {};
+    wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 4);
+    wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    wqe->ctrl.opmod_idx_opcode = mc_bswap32(
+        (static_cast<uint32_t>(qp->wq_head) << 8) | MLX5_OPCODE_ATOMIC_FA);
+
+    wqe->raddr.raddr = mc_bswap64(raddr);
+    wqe->raddr.rkey = rkey;
+    wqe->raddr.reserved = 0;
+
+    wqe->atomic.swap_add = mc_bswap64(value);
+    wqe->atomic.compare = 0;
+
+    wqe->data.byte_count = mc_bswap32(static_cast<uint32_t>(sizeof(uint64_t)));
+    wqe->data.lkey = lkey;
+    wqe->data.addr = mc_bswap64(laddr);
+
+    ++qp->wq_head;
+}
+
+// Issue an 8-byte inline RDMA WRITE. Inline data lives in the WQE, so the
+// scalar need not be staged in a separately registered source buffer.
+__device__ __forceinline__ void mc_ibgda_write_rdma_write_inline_u64_wqe(
+    mlx5gda_qp_devctx* qp, uint64_t value, uint64_t raddr, __be32 rkey) {
+    auto* wqe = reinterpret_cast<mlx5gda_rdma_write_wqe*>(
+        qp->wq + (qp->wq_head & qp->wqeid_mask));
+
+    wqe->ctrl = {};
+    wqe->ctrl.qpn_ds = mc_bswap32((qp->qpn << 8) | 3);
+    wqe->ctrl.fm_ce_se = MLX5_WQE_CTRL_CQ_UPDATE;
+    wqe->ctrl.opmod_idx_opcode = mc_bswap32(
+        (static_cast<uint32_t>(qp->wq_head) << 8) | MLX5_OPCODE_RDMA_WRITE);
+
+    wqe->raddr.raddr = mc_bswap64(raddr);
+    wqe->raddr.rkey = rkey;
+    wqe->raddr.reserved = 0;
+
+    auto* inline_segment = reinterpret_cast<uint32_t*>(&wqe->data);
+    inline_segment[0] =
+        mc_bswap32(MLX5_INLINE_SEG | static_cast<uint32_t>(sizeof(uint64_t)));
+    inline_segment[1] = static_cast<uint32_t>(value);
+    inline_segment[2] = static_cast<uint32_t>(value >> 32);
+    inline_segment[3] = 0;
 
     ++qp->wq_head;
 }

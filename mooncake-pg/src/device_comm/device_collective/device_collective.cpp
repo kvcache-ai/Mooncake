@@ -278,11 +278,6 @@ PGResult<void> DeviceCollectiveRuntime::attachGraphUse(
 PGResult<void> DeviceCollectiveRuntime::prepareFailureResume() {
     auto& mailbox = *control_mailbox_;
 
-    // The last channel CTA of the failed invocation remains resident while the
-    // host-proxy worker can still make progress, so drain outstanding route
-    // work before replacing protocol state.
-    PG_TRY(transfer_service_.waitUntilIdle());
-
     const auto failed_rank = mailbox.failed_rank;
     if (mailbox.failed_hint_address != 0) {
         auto* hint = reinterpret_cast<int32_t*>(mailbox.failed_hint_address);

@@ -140,9 +140,10 @@ prepareCollectiveInvocation(PlanSlot<Plan>* plan_slot,
 // Completes this channel after success or a locally detected failure. Only a
 // detecting channel supplies a failed rank; the first detector records the
 // failure metadata.
-__device__ __forceinline__ void completeChannel(
+template <typename DrainTransfers>
+__device__ __noinline__ void completeChannel(
     InvocationState* invocation, ControlMailbox* control_mailbox,
-    cooperative_groups::thread_block block,
+    DrainTransfers drain_transfers, cooperative_groups::thread_block block,
     InGroupRank detected_failed_rank = kInvalidInGroupRank,
     int32_t* failed_ranks_hint = nullptr) {
     // No thread may publish channel completion while another thread in the CTA
@@ -178,6 +179,10 @@ __device__ __forceinline__ void completeChannel(
             completion_arrival_count.fetch_add(1, cuda::memory_order_acq_rel);
         if (previous_arrival_count + 1 == gridDim.x) {
             if (failure_latched.load(cuda::memory_order_relaxed) != 0) {
+                // A failed channel may leave payload transfers outstanding.
+                // Drain before recovery can replace protocol state.
+                drain_transfers();
+
                 const uint64_t generation =
                     device::mc_ld_acquire_u64(
                         &control_mailbox->failure_generation) +

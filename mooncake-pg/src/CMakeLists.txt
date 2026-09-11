@@ -160,6 +160,7 @@ if(USE_CUDA)
       device_comm/device_transfer/routes/host_proxy_route/host_proxy_route.cpp
       device_comm/device_transfer/routes/host_proxy_route/host_transfer_proxy.cpp
       device_comm/device_transfer/routes/p2p_route/p2p_route.cpp
+      device_comm/device_transfer/routes/rdma_route/rdma_route.cpp
       device_comm/device_collective/device_collective.cpp
       device_comm/device_collective/device_collective_workspace.cpp
       device_comm/device_collective/device_collective_recovery.cpp

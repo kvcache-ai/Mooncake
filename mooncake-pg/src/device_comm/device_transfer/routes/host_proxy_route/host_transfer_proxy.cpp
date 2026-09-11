@@ -160,7 +160,6 @@ void HostTransferProxy::finishCommand(Lane& lane,
     lane.host_slot->result = result;
     std::atomic_ref(lane.host_slot->completed_sequence)
         .store(sequence, std::memory_order_release);
-    state_changed_.notify_all();
 }
 
 void HostTransferProxy::releaseBatch(Lane& lane) {
@@ -478,38 +477,25 @@ PGResult<HostProxyCommandSlot*> HostTransferProxy::initializeDevice(
     return device_slots;
 }
 
-PGResult<void> HostTransferProxy::waitUntilIdle() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(lane_set_, "host-proxy CUDA device is not initialized");
-    state_changed_.wait(
-        lock, [this] { return terminated_with_error_ || lanesIdle(); });
-    PG_VALIDATE_STATE(!terminated_with_error_,
-                      "HostTransferProxy worker has failed");
-    return {};
-}
-
-PGResult<void> HostTransferProxy::waitUntilIdle(
-    std::chrono::milliseconds timeout) {
-    std::unique_lock<std::mutex> lock(mutex_);
-    PG_VALIDATE_STATE(lane_set_, "host-proxy CUDA device is not initialized");
-    const bool ready = state_changed_.wait_for(lock, timeout, [this] {
-        return terminated_with_error_ || lanesIdle();
-    });
-    if (!ready) {
-        return makePGError(PGErrorCode::Timeout,
-                           "host-proxy device did not become idle in time");
-    }
-    PG_VALIDATE_STATE(!terminated_with_error_,
-                      "HostTransferProxy worker has failed");
-    return {};
-}
-
 PGResult<void> HostTransferProxy::shutdown() {
     {
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::unique_lock<std::mutex> lock(mutex_);
         if (shutdown_requested_) return {};
-        PG_VALIDATE_STATE(lanesIdle(),
-                          "HostTransferProxy still has in-flight commands");
+        // Keep the worker running until those commands finish before freeing
+        // its slots or unregistering any DTS memory.
+        const auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(kTransferDrainTimeoutMs);
+        while (!lanesIdle()) {
+            PG_VALIDATE_STATE(!terminated_with_error_,
+                              "HostTransferProxy worker has failed");
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return makePGError(PGErrorCode::Timeout,
+                                   "HostTransferProxy still has in-flight "
+                                   "commands at shutdown");
+            }
+            state_changed_.wait_for(lock, kWorkerPollInterval);
+        }
         shutdown_requested_ = true;
     }
     stopWorker();

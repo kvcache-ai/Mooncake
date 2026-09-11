@@ -6,18 +6,23 @@ namespace device {
 class NullRdmaTransport : public RdmaTransport {
    public:
     int initialize(const std::string&, int, int) override { return -1; }
-    int registerMemory(void*, size_t) override { return -1; }
+    int registerMemory(void*, size_t, RdmaMemoryRegion&) override { return -1; }
+    int unregisterMemory(const RdmaMemoryRegion&) override { return -1; }
     int allocateControlBuffer() override { return -1; }
     int createQueuePairs(void*) override { return -1; }
     int recreateQueuePairs(void*) override { return -1; }
-    int connectPeers(int, bool, const std::vector<int64_t>&,
+    int drainQueuePairs(void*, uint64_t) override { return -1; }
+    int resetQueuePairs(int, int, void*) override { return -1; }
+    int connectPeers(int, bool, uint32_t, const std::vector<int64_t>&,
                      const std::vector<int32_t>&, const std::vector<int32_t>&,
                      const std::vector<int32_t>&, const std::vector<int64_t>&,
                      const std::vector<int64_t>&,
                      const std::vector<int>&) override {
         return -1;
     }
-    RdmaLocalMetadata localMetadata() const override { return {}; }
+    RdmaLocalMetadata localMetadata(const RdmaMemoryRegion&) const override {
+        return {};
+    }
     void* raddrsPtr() override { return nullptr; }
     void* rkeysPtr() override { return nullptr; }
     void* qpDevCtxsPtr() override { return nullptr; }

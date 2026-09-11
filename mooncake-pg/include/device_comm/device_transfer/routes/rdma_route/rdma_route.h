@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_HOST_PROXY_ROUTE_HOST_PROXY_ROUTE_H
-#define MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_HOST_PROXY_ROUTE_HOST_PROXY_ROUTE_H
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_RDMA_ROUTE_RDMA_ROUTE_H
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_RDMA_ROUTE_RDMA_ROUTE_H
 
 #include <cstddef>
 #include <cstdint>
@@ -14,26 +14,27 @@
 
 namespace mooncake {
 
-class HostTransferProxy;
-class LinkManager;
-class TransferEngine;
-struct HostProxyCommandSlot;
-
-struct HostProxyRouteOptions {
+struct RdmaRouteOptions {
     bool enabled = true;
+
+    // Optional RDMA device names, such as mlx5_0. An empty filter delegates
+    // device selection to the RDMA implementation.
+    std::vector<std::string> device_filter;
 };
 
-class HostProxyRoute : public RouteProvider {
+class RdmaRoute : public RouteProvider {
    public:
-    static constexpr std::string_view kRouteKey = "host-proxy";
+    static constexpr std::string_view kRouteKey = "rdma";
     static constexpr uint32_t kEndpointVersion = 1;
 
-    HostProxyRoute(TransferEngine& engine, LinkManager& link_manager,
-                   uint32_t max_world_size);
-    ~HostProxyRoute() noexcept override;
+    RdmaRoute(GlobalRank self_rank, uint32_t max_world_size,
+              RdmaRouteOptions options);
+    ~RdmaRoute() noexcept override;
 
-    [[nodiscard]] PGResult<void> initialize(int device_index);
-    [[nodiscard]] DeviceHostProxyContext deviceContext() const noexcept;
+    [[nodiscard]] PGResult<void> initialize(int device_index,
+                                            cudaStream_t stream);
+
+    [[nodiscard]] DeviceRdmaContext deviceContext() const noexcept;
 
     [[nodiscard]] std::string_view routeKey() const noexcept override;
     [[nodiscard]] uint32_t routeVersion() const noexcept override;
@@ -49,15 +50,15 @@ class HostProxyRoute : public RouteProvider {
     PGResult<void> shutdown() override;
 
    private:
-    TransferEngine& engine_;
-    std::unique_ptr<HostTransferProxy> proxy_;
-    std::string device_location_;
+    struct State;
+
+    GlobalRank self_rank_ = kInvalidGlobalRank;
     uint32_t max_world_size_ = 0;
-    HostProxyCommandSlot* device_slots_ = nullptr;
-    bool initialized_ = false;
+    RdmaRouteOptions options_;
+    std::unique_ptr<State> state_;
     bool shutdown_requested_ = false;
 };
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_HOST_PROXY_ROUTE_HOST_PROXY_ROUTE_H
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_RDMA_ROUTE_RDMA_ROUTE_H
