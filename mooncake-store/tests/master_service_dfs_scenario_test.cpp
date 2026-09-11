@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <stdexcept>
 #include <vector>
 
 #include <unistd.h>
@@ -143,19 +144,16 @@ TEST(MasterServiceDfsScenarioTest, PutEndAllAndMismatchedUpsertAreAtomic) {
         .Then(Object("dfs_revoke").DoesNotExist());
 }
 
-TEST(MasterServiceDfsScenarioTest, FailedDfsPutStartDoesNotLeakTenantQuota) {
+TEST(MasterServiceDfsScenarioTest, RejectsMultiTenantDfsConfiguration) {
     const ScopedDfsEnvironment dfs("master_dfs_scenario_quota", "1048576");
-    // The DFS shard holds 1 MB, so a 4 MB dual-replica put fails admission.
-    // The follow-up memory-only put of the full 4 MB quota succeeds, which it
-    // could not if the failed attempt had leaked a quota charge.
-    MasterScenario("a DFS put that fails admission releases its quota charge")
-        .Given(MemoryNode("memory"))
-        .Given(Tenant(TenantId::Default().value()).Quota(4096_KB))
-        .When(PutStart("dfs_quota_failure", 4096_KB)
-                  .DfsReplicas(1)
-                  .ExpectError(ErrorCode::NO_AVAILABLE_HANDLE))
-        .When(PutStart("quota_after_dfs_failure", 4096_KB))
-        .When(PutRevoke("quota_after_dfs_failure").OfType(ReplicaType::ALL));
+    // Persistent DFS allocator records are keyed without a tenant namespace,
+    // so multi-tenant mode must be rejected before serving any allocations.
+    EXPECT_THROW(
+        MasterScenario("persistent DFS rejects multi-tenant configuration")
+            .Given(MemoryNode("memory"))
+            .Given(Tenant(TenantId::Default().value()).Quota(4096_KB))
+            .When(PutStart("dfs_quota_failure", 4096_KB).DfsReplicas(1)),
+        std::invalid_argument);
 }
 
 TEST(MasterServiceDfsScenarioTest, EvictionCommitsUnleasedCandidates) {

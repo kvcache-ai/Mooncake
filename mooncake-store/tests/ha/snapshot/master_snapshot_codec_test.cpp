@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <vector>
+
+#include <unistd.h>
 
 #include <msgpack.hpp>
 
@@ -10,6 +13,8 @@
 #include "master_config.h"
 #include "master_service.h"
 #include "segment.h"
+#include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "task_manager.h"
 #include "tenant_id.h"
 #include "common/zstd_util.h"
@@ -36,6 +41,60 @@ class MasterSnapshotCodecTest : public ::testing::Test {
         return MasterSnapshotStateView(
             service, service.segment_manager_, service.local_ssd_manager_,
             service.nof_segment_manager_, service.task_manager_);
+    }
+
+    static void SeedDfsReplica(MasterService& service, const std::string& key,
+                               const DistributedFSDescriptor& descriptor) {
+        const TenantId tenant = TenantId::Default();
+        const size_t shard_idx = service.getShardIndex(tenant, key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        std::vector<Replica> replicas;
+        replicas.emplace_back(descriptor, ReplicaStatus::COMPLETE);
+        auto& tenant_state = shard->tenants[tenant];
+        tenant_state.metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(key),
+            std::forward_as_tuple(
+                generate_uuid(), std::chrono::system_clock::now(),
+                descriptor.object_size, std::move(replicas), std::nullopt,
+                false, ObjectDataType::UNKNOWN, std::string{}, tenant, key));
+    }
+
+    static DistributedFSDescriptor InstallRecoveringDfsAllocator(
+        MasterService& service, const std::string& root,
+        const std::string& key) {
+        DistributedStorageConfig config;
+        config.fsdir = root;
+        config.fs_adapter_type = "posix";
+        config.shard_count = 1;
+        config.shard_capacity = 32 * 1024;
+        config.alignment = 4096;
+        config.eviction_enabled = false;
+        config.deferred_free_duration = std::chrono::seconds(0);
+
+        DistributedFSDescriptor descriptor;
+        {
+            DfsGlobalAllocator writer;
+            EXPECT_TRUE(writer.Init(config).has_value());
+            auto allocated = writer.Allocate(key, 1024);
+            EXPECT_TRUE(allocated.has_value());
+            if (allocated) descriptor = *allocated;
+        }
+
+        auto recovering = std::make_unique<DfsGlobalAllocator>();
+        EXPECT_TRUE(recovering->Init(config, true).has_value());
+        service.enable_dfs_ = true;
+        service.dfs_allocator_ = std::move(recovering);
+        return descriptor;
+    }
+
+    static tl::expected<void, ErrorCode> ReconcileDfsSnapshot(
+        MasterService& service) {
+        return service.ReconcileDfsMetadataAfterSnapshot();
+    }
+
+    static bool IsDfsRecoveryReady(const MasterService& service) {
+        return service.dfs_allocator_ &&
+               service.dfs_allocator_->IsRecoveryReady();
     }
 
     std::unique_ptr<MasterService> master_service_;
@@ -124,6 +183,80 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
     ASSERT_TRUE(get_result.has_value())
         << "GetReplicaList failed: " << static_cast<int>(get_result.error());
     EXPECT_EQ(get_result.value().replicas.size(), 1u);
+}
+
+TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithDfsReplica) {
+    const std::string key = "snapshot-dfs-key";
+    const DistributedFSDescriptor descriptor{"/mnt/dfs/dfs_shard_02.data",
+                                             12288, 777, 4096, 2};
+    SeedDfsReplica(*master_service_, key, descriptor);
+
+    MasterSnapshotCodec codec;
+    auto state_view = MakeStateView(*master_service_);
+    auto encoded = codec.Encode(state_view);
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto target = MakeMasterService();
+    auto decoded = codec.Decode(target.get(), *encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+
+    auto replicas = target->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    ASSERT_TRUE(replicas->replicas.front().is_dfs_replica());
+    const auto& restored = replicas->replicas.front().get_dfs_descriptor();
+    EXPECT_EQ(restored.file_path, descriptor.file_path);
+    EXPECT_EQ(restored.offset, descriptor.offset);
+    EXPECT_EQ(restored.object_size, descriptor.object_size);
+    EXPECT_EQ(restored.aligned_size, descriptor.aligned_size);
+    EXPECT_EQ(restored.shard_idx, descriptor.shard_idx);
+}
+
+TEST_F(MasterSnapshotCodecTest, ReconciliationPrunesStaleDfsReplica) {
+    const std::string root =
+        (std::filesystem::temp_directory_path() /
+         ("snapshot_dfs_prune_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    const std::string key = "snapshot-dfs-stale";
+    auto descriptor =
+        InstallRecoveringDfsAllocator(*master_service_, root, key);
+    descriptor.offset += 4096;
+    SeedDfsReplica(*master_service_, key, descriptor);
+
+    ASSERT_TRUE(ReconcileDfsSnapshot(*master_service_).has_value());
+    EXPECT_FALSE(
+        master_service_->GetReplicaList(key, TenantId::Default()).has_value());
+    EXPECT_TRUE(IsDfsRecoveryReady(*master_service_));
+
+    master_service_.reset();
+    std::filesystem::remove_all(root);
+}
+
+TEST_F(MasterSnapshotCodecTest, ReconciliationRetainsMatchingDfsReplica) {
+    const std::string root =
+        (std::filesystem::temp_directory_path() /
+         ("snapshot_dfs_match_" + std::to_string(::getpid())))
+            .string();
+    std::filesystem::remove_all(root);
+    std::filesystem::create_directories(root);
+
+    const std::string key = "snapshot-dfs-match";
+    const auto descriptor =
+        InstallRecoveringDfsAllocator(*master_service_, root, key);
+    SeedDfsReplica(*master_service_, key, descriptor);
+
+    ASSERT_TRUE(ReconcileDfsSnapshot(*master_service_).has_value());
+    auto replicas = master_service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(replicas.has_value());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_EQ(replicas->replicas.front().get_dfs_descriptor().offset,
+              descriptor.offset);
+    EXPECT_TRUE(IsDfsRecoveryReady(*master_service_));
+
+    master_service_.reset();
+    std::filesystem::remove_all(root);
 }
 
 TEST_F(MasterSnapshotCodecTest, DecodeWithCorruptPayloadFails) {
