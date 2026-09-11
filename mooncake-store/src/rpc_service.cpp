@@ -1905,14 +1905,17 @@ void RegisterRpcService(
             &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BeginWeightImport>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::CommitWeightImport>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::CommitWeightImport>(
+            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetWeightMetadata>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::ListWeightRevisions>(
-        &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpdateWeightPolicy>(
-        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::ListWeightRevisions>(
+            &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::UpdateWeightPolicy>(
+            &wrapped_master_service);
 }
 
 }  // namespace mooncake

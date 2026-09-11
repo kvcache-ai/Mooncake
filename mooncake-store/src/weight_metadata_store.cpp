@@ -4,8 +4,8 @@
 
 namespace mooncake {
 
-tl::expected<WeightRevisionMetadata, ErrorCode> WeightMetadataStore::BeginImport(
-    const BeginWeightImportRequest& request) {
+tl::expected<WeightRevisionMetadata, ErrorCode>
+WeightMetadataStore::BeginImport(const BeginWeightImportRequest& request) {
     if (!request.identity.IsValid() || request.payload_group_id.empty() ||
         !request.policy.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -129,11 +129,11 @@ ListWeightRevisionsResponse WeightMetadataStore::List(
         }
     }
 
-    std::sort(matched.begin(), matched.end(),
-              [](const WeightRevisionMetadata& a,
-                 const WeightRevisionMetadata& b) {
-                  return a.identity.ToKey() < b.identity.ToKey();
-              });
+    std::sort(
+        matched.begin(), matched.end(),
+        [](const WeightRevisionMetadata& a, const WeightRevisionMetadata& b) {
+            return a.identity.ToKey() < b.identity.ToKey();
+        });
 
     if (request.offset >= matched.size()) {
         response.next_offset = request.offset;
@@ -144,15 +144,16 @@ ListWeightRevisionsResponse WeightMetadataStore::List(
     const size_t start = static_cast<size_t>(request.offset);
     const size_t end =
         std::min(matched.size(), start + static_cast<size_t>(limit));
-    response.revisions.assign(matched.begin() + static_cast<std::ptrdiff_t>(start),
-                              matched.begin() + static_cast<std::ptrdiff_t>(end));
+    response.revisions.assign(
+        matched.begin() + static_cast<std::ptrdiff_t>(start),
+        matched.begin() + static_cast<std::ptrdiff_t>(end));
     response.next_offset = static_cast<uint64_t>(end);
     response.has_more = end < matched.size();
     return response;
 }
 
-tl::expected<WeightRevisionMetadata, ErrorCode> WeightMetadataStore::UpdatePolicy(
-    const UpdateWeightPolicyRequest& request) {
+tl::expected<WeightRevisionMetadata, ErrorCode>
+WeightMetadataStore::UpdatePolicy(const UpdateWeightPolicyRequest& request) {
     if (!request.identity.IsValid() || !request.policy.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }

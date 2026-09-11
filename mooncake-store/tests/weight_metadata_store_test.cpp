@@ -46,8 +46,9 @@ TEST_F(WeightMetadataStoreTest, BeginCommitGetListUpdateHappyPath) {
 
     // IMPORTING is invisible to Get/List.
     EXPECT_EQ(store_.Get(identity).error(), ErrorCode::WEIGHT_NOT_FOUND);
-    EXPECT_TRUE(store_.List(ListWeightRevisionsRequest{"default", "ns", "", 0, 10})
-                    .revisions.empty());
+    EXPECT_TRUE(
+        store_.List(ListWeightRevisionsRequest{"default", "ns", "", 0, 10})
+            .revisions.empty());
 
     CommitWeightImportRequest commit_req;
     commit_req.identity = identity;
@@ -69,8 +70,8 @@ TEST_F(WeightMetadataStoreTest, BeginCommitGetListUpdateHappyPath) {
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->manifest_key, commit_req.manifest_key);
 
-    auto listed =
-        store_.List(ListWeightRevisionsRequest{"default", "ns", "model-a", 0, 10});
+    auto listed = store_.List(
+        ListWeightRevisionsRequest{"default", "ns", "model-a", 0, 10});
     ASSERT_EQ(listed.revisions.size(), 1u);
     EXPECT_FALSE(listed.has_more);
 

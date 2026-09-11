@@ -57,9 +57,8 @@ class MasterServiceWeightImportTest : public ::testing::Test {
         auto put_start = service.PutStart(client_id, key, TenantId::Default(),
                                           slice_length, config);
         ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
-        auto put_end =
-            service.PutEnd(client_id, key, TenantId::Default(),
-                           ReplicaType::MEMORY);
+        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
+                                      ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value()) << toString(put_end.error());
     }
 
@@ -106,7 +105,8 @@ TEST_F(MasterServiceWeightImportTest, BeginCommitGetListUpdate) {
     EXPECT_EQ(begin->metadata.availability, WeightAvailabilityState::IMPORTING);
 
     // IMPORTING revisions are not visible via Get/List.
-    auto missing = service.GetWeightMetadata(GetWeightMetadataRequest{identity});
+    auto missing =
+        service.GetWeightMetadata(GetWeightMetadataRequest{identity});
     ASSERT_FALSE(missing.has_value());
     EXPECT_EQ(missing.error(), ErrorCode::WEIGHT_NOT_FOUND);
 
@@ -160,7 +160,8 @@ TEST_F(MasterServiceWeightImportTest, CommitFailsWhenPayloadMissing) {
                        ObjectDataType::METADATA, group_id);
 
     const auto identity = MakeIdentity();
-    // Use a distinct resource so it does not collide with other tests in-process.
+    // Use a distinct resource so it does not collide with other tests
+    // in-process.
     WeightRevisionIdentity id = identity;
     id.resource_id = "model-b";
 
