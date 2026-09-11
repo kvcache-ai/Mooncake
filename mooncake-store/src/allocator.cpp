@@ -10,6 +10,7 @@
 #include <stdexcept>
 
 #include "master_metric_manager.h"
+#include "serialize/serializer.h"
 
 namespace mooncake {
 namespace {
@@ -400,13 +401,26 @@ OffsetBufferAllocator::OffsetBufferAllocator(
 tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
 OffsetBufferAllocator::Restore(OffsetBufferAllocatorSnapshot snapshot) {
     const auto used_bytes = snapshot.used_bytes;
-    if (snapshot.allocation_state.base != snapshot.base ||
-        snapshot.allocation_state.capacity != snapshot.capacity ||
-        used_bytes > snapshot.capacity ||
+    const auto& state = snapshot.allocation_state;
+    if (!state.layout || state.base != snapshot.base ||
+        state.capacity != snapshot.capacity || used_bytes > snapshot.capacity ||
         used_bytes >
             static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+
+    // The persisted counters must describe the persisted layout: one used node
+    // per live allocation, and no more requested bytes than the occupied
+    // regions can hold (a node is rounded up to its bin size). Checked before
+    // the layout is installed, so a corrupt snapshot cannot reach allocate().
+    const auto usage =
+        Serializer<offset_allocator::__Allocator>::ValidateLayout(
+            *state.layout, state.multiplier_bits);
+    if (!usage || usage->used_nodes != state.allocated_num ||
+        usage->used_bytes < state.allocated_size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     auto offset_allocator = offset_allocator::OffsetAllocator::Restore(
         std::move(snapshot.allocation_state));
     if (!offset_allocator) {

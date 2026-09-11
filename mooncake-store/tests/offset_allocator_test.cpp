@@ -1,3 +1,4 @@
+#include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
 #include "mutex.h"
 #include "serializer.h"
@@ -6,6 +7,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <functional>
 #include <future>
 #include <limits>
 #include <map>
@@ -340,6 +342,126 @@ class OffsetAllocatorTest : public ::testing::Test {
         AllocationHandleWrapper& handle,
         std::shared_ptr<OffsetAllocator> new_allocator) {
         handle.getHandle().m_allocator = new_allocator;
+    }
+
+    // Corruptions used by RestoreRejectsInconsistentSnapshotLayout. TEST_F
+    // bodies live in a derived class, so the layout access stays in fixture
+    // members, which hold __Allocator's friendship.
+    enum class LayoutFault {
+        kNone,
+        kBinIndexOutOfRange,
+        kUsedNodeInBinList,
+        kFreeStorageMismatch,
+        kFreeOffsetTooLarge,
+        kFreeOffsetTooSmall,
+        kDuplicateSpareNode,
+        kSpareNodeIsLive,
+        kUnclassifiedNode,
+        kNodeOffsetShifted,
+        kNeighborChainBroken,
+        kBinBitWithoutList,
+    };
+
+    static uint32 firstUsedNode(const __Allocator& layout) {
+        for (uint32 i = 0; i < layout.m_current_capacity; ++i) {
+            if (layout.m_nodes[i].used) {
+                return i;
+            }
+        }
+        return __Allocator::Node::unused;
+    }
+
+    static void applyLayoutFault(__Allocator& layout, LayoutFault fault) {
+        const uint32 used = firstUsedNode(layout);
+        ASSERT_NE(used, __Allocator::Node::unused);
+        switch (fault) {
+            case LayoutFault::kNone:
+                break;
+            case LayoutFault::kBinIndexOutOfRange:
+                layout.m_binIndices[0] = layout.m_current_capacity;
+                break;
+            case LayoutFault::kUsedNodeInBinList: {
+                uint32 empty_bin = NUM_LEAF_BINS;
+                for (uint32 bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+                    if (layout.m_binIndices[bin] == __Allocator::Node::unused) {
+                        empty_bin = bin;
+                        break;
+                    }
+                }
+                ASSERT_NE(empty_bin, NUM_LEAF_BINS);
+                layout.m_binIndices[empty_bin] = used;
+                layout.m_nodes[used].binListNext = __Allocator::Node::unused;
+                layout.m_nodes[used].binListPrev = __Allocator::Node::unused;
+                layout.m_usedBins[empty_bin >> TOP_BINS_INDEX_SHIFT] |=
+                    uint8{1} << (empty_bin & LEAF_BINS_INDEX_MASK);
+                layout.m_usedBinsTop |= uint32{1}
+                                        << (empty_bin >> TOP_BINS_INDEX_SHIFT);
+                break;
+            }
+            case LayoutFault::kFreeStorageMismatch:
+                ++layout.m_freeStorage;
+                break;
+            case LayoutFault::kFreeOffsetTooLarge:
+                ++layout.m_freeOffset;
+                break;
+            case LayoutFault::kFreeOffsetTooSmall:
+                --layout.m_freeOffset;
+                break;
+            case LayoutFault::kDuplicateSpareNode:
+                ASSERT_LT(layout.m_freeOffset + 1, layout.m_current_capacity);
+                layout.m_freeNodes[layout.m_freeOffset + 1] =
+                    layout.m_freeNodes[layout.m_freeOffset];
+                break;
+            case LayoutFault::kSpareNodeIsLive:
+                layout.m_freeNodes[layout.m_freeOffset] = used;
+                break;
+            case LayoutFault::kUnclassifiedNode:
+                layout.m_nodes[used].used = false;
+                break;
+            case LayoutFault::kNodeOffsetShifted:
+                ++layout.m_nodes[used].dataOffset;
+                break;
+            case LayoutFault::kNeighborChainBroken:
+                layout.m_nodes[used].neighborNext = __Allocator::Node::unused;
+                break;
+            case LayoutFault::kBinBitWithoutList:
+                for (uint32 bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+                    if (layout.m_binIndices[bin] == __Allocator::Node::unused) {
+                        layout.m_usedBins[bin >> TOP_BINS_INDEX_SHIFT] |=
+                            uint8{1} << (bin & LEAF_BINS_INDEX_MASK);
+                        return;
+                    }
+                }
+                FAIL() << "no empty bin to corrupt";
+                break;
+        }
+    }
+
+    static bool layoutPassesValidation(
+        const std::shared_ptr<OffsetAllocator>& allocator, LayoutFault fault) {
+        auto snapshot = allocator->CaptureSnapshot();
+        applyLayoutFault(*snapshot.layout, fault);
+        return Serializer<__Allocator>::ValidateLayout(*snapshot.layout,
+                                                       snapshot.multiplier_bits)
+            .has_value();
+    }
+
+    // End-to-end: the store level factory must refuse to install the same
+    // broken layout the validator rejects.
+    static ErrorCode restoreBufferAllocatorAfterLayoutFault(
+        const std::shared_ptr<OffsetAllocator>& allocator, LayoutFault fault) {
+        auto state = allocator->CaptureSnapshot();
+        applyLayoutFault(*state.layout, fault);
+        OffsetBufferAllocatorSnapshot snapshot{
+            .segment_name = "segment",
+            .base = static_cast<size_t>(state.base),
+            .capacity = state.capacity,
+            .used_bytes = 0,
+            .transport_endpoint = "endpoint",
+            .allocation_state = std::move(state),
+        };
+        auto restored = OffsetBufferAllocator::Restore(std::move(snapshot));
+        return restored ? ErrorCode::OK : restored.error();
     }
 
     void assertAllocatorEQ(const std::shared_ptr<OffsetAllocator>& a,
@@ -1855,6 +1977,47 @@ TEST_F(OffsetAllocatorTest, ChainedAllocationAndDeserialization) {
             substituteWithNewAllocator(handle, new_alloc);
         }
     }
+}
+
+// A persisted layout is only installed when it is internally consistent, so a
+// corrupt layout cannot produce overlapping allocations, dangling bin links or
+// a free stack that hands the same node out twice. The layout is validated by
+// the serializer (the allocator core is vendored and left untouched).
+TEST_F(OffsetAllocatorTest, ValidateLayoutRejectsInconsistentLayout) {
+    constexpr uint64_t kBase = 0x100000000ULL;
+    constexpr size_t kSize = 16U * 1024 * 1024;
+    auto allocator = OffsetAllocator::create(kBase, kSize);
+    ASSERT_NE(allocator, nullptr);
+    auto first = allocator->allocate(4096);
+    auto second = allocator->allocate(4096);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+
+    // Sanity check: a live allocator's layout describes itself.
+    auto clean = allocator->CaptureSnapshot();
+    auto usage = Serializer<__Allocator>::ValidateLayout(*clean.layout,
+                                                         clean.multiplier_bits);
+    ASSERT_TRUE(usage.has_value());
+    EXPECT_EQ(usage->used_nodes, 2U);
+    EXPECT_EQ(usage->used_bytes, 8192U);
+
+    const std::vector<LayoutFault> faults{
+        LayoutFault::kBinIndexOutOfRange,  LayoutFault::kUsedNodeInBinList,
+        LayoutFault::kFreeStorageMismatch, LayoutFault::kFreeOffsetTooLarge,
+        LayoutFault::kFreeOffsetTooSmall,  LayoutFault::kDuplicateSpareNode,
+        LayoutFault::kSpareNodeIsLive,     LayoutFault::kUnclassifiedNode,
+        LayoutFault::kNodeOffsetShifted,   LayoutFault::kNeighborChainBroken,
+        LayoutFault::kBinBitWithoutList,
+    };
+    for (const auto fault : faults) {
+        SCOPED_TRACE(static_cast<int>(fault));
+        EXPECT_FALSE(layoutPassesValidation(allocator, fault));
+        EXPECT_EQ(restoreBufferAllocatorAfterLayoutFault(allocator, fault),
+                  ErrorCode::INVALID_PARAMS);
+    }
+
+    // Rejected layouts must not disturb the allocator they came from.
+    EXPECT_TRUE(layoutPassesValidation(allocator, LayoutFault::kNone));
 }
 
 }  // namespace mooncake::offset_allocator

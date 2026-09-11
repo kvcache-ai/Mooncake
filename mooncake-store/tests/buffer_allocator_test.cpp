@@ -317,6 +317,13 @@ TEST_F(BufferAllocatorTest, OffsetRestoreFactoryRejectsInvalidState) {
     auto overflow = snapshot();
     overflow.used_bytes = std::numeric_limits<size_t>::max();
     expect_rejected(std::move(overflow));
+    // The persisted counters must describe the persisted layout.
+    auto wrong_alloc_num = snapshot();
+    ++wrong_alloc_num.allocation_state.allocated_num;
+    expect_rejected(std::move(wrong_alloc_num));
+    auto wrong_alloc_size = snapshot();
+    wrong_alloc_size.allocation_state.allocated_size = kCapacity;
+    expect_rejected(std::move(wrong_alloc_size));
     EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
 
     {

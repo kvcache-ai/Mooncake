@@ -593,4 +593,40 @@ TEST(StoreResourceSnapshotCodecTest,
     }
 }
 
+// Capacities from the payload drive node storage allocation, so they must be
+// bounded and validated before the allocator is materialized.
+TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorCapacityIsRejected) {
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-capacity");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value());
+
+    // Element 1 of the __Allocator payload is current_capacity and element 2
+    // is max_capacity.
+    const std::vector<std::pair<uint64_t, uint64_t>> corruptions{
+        {2, (uint64_t{1} << 24) + 1},
+        {2, std::numeric_limits<uint32_t>::max()},
+        {1, std::numeric_limits<uint32_t>::max()},
+    };
+    for (const auto& [element, value] : corruptions) {
+        SCOPED_TRACE(element);
+        auto corrupted = RewriteSnapshot(*encoded, [&](auto& root, auto&) {
+            // region[7] = OffsetBufferAllocator, [5] = OffsetAllocator, [5] =
+            // __Allocator.
+            auto& region = SnapshotField(root, "ms").via.map.ptr[0].val;
+            auto& allocator = region.via.array.ptr[7];
+            auto& offset_allocator = allocator.via.array.ptr[5];
+            auto& layout = offset_allocator.via.array.ptr[5];
+            layout.via.array.ptr[element] = msgpack::object(value);
+        });
+        auto decoded = StoreResourceSnapshotCodec::Decode(corrupted);
+        ASSERT_FALSE(decoded.has_value());
+        EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
+        EXPECT_NE(decoded.error().message.find("capacity"), std::string::npos);
+        EXPECT_NE(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
+    }
+}
+
 }  // namespace mooncake::ha
