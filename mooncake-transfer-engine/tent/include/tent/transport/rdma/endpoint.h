@@ -136,7 +136,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     uint32_t generation() const { return generation_; }
-    TentRdmaCongestionControlRoute* bindCongestionRoute(TentRdmaCongestionControlRoute* route) {
+    TentRdmaCongestionControlRoute* bindCongestionRoute(
+        TentRdmaCongestionControlRoute* route) {
         TentRdmaCongestionControlRoute* expected = nullptr;
         congestion_route_.compare_exchange_strong(expected, route,
                                                   std::memory_order_release,

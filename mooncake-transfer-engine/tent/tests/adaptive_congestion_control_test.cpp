@@ -37,17 +37,19 @@ TEST(TentAdaptiveCongestionControlTest, AttemptReleasesOnce) {
     slice.length = 512;
 
     adaptive_congestion_control::PathHandle path{&device, &route->domain, 3, 1};
-    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, route.get(), path, 512, 7),
-              adaptive_congestion_control::Decision::kAllow);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(slice,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
-    EXPECT_FALSE(completeTentCongestionControlAttempt(slice,
-                                       adaptive_congestion_control::OutcomeClass::kSuccess,
-                                       adaptive_congestion_control::FailureScope::kOperation));
+    ASSERT_EQ(
+        acquireTentCongestionControlAttempt(slice, route.get(), path, 512, 7),
+        adaptive_congestion_control::Decision::kAllow);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
+    EXPECT_FALSE(completeTentCongestionControlAttempt(
+        slice, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
     EXPECT_EQ(route->completed_bytes.load(std::memory_order_relaxed), 512u);
     EXPECT_EQ(adaptive_congestion_control::snapshot(device).inflight_bytes, 0);
-    EXPECT_EQ(adaptive_congestion_control::snapshot(route->domain).inflight_bytes, 0);
+    EXPECT_EQ(
+        adaptive_congestion_control::snapshot(route->domain).inflight_bytes, 0);
 }
 
 TEST(TentAdaptiveCongestionControlTest, OldEndpointFailureIsIgnored) {
@@ -56,12 +58,15 @@ TEST(TentAdaptiveCongestionControlTest, OldEndpointFailureIsIgnored) {
     RdmaSlice slice;
 
     adaptive_congestion_control::PathHandle path{&device, &route->domain, 3, 1};
-    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, route.get(), path, 512, 7),
-              adaptive_congestion_control::Decision::kAllow);
+    ASSERT_EQ(
+        acquireTentCongestionControlAttempt(slice, route.get(), path, 512, 7),
+        adaptive_congestion_control::Decision::kAllow);
     route->endpoint_generation.store(8, std::memory_order_release);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(slice, adaptive_congestion_control::OutcomeClass::kFatal,
-                                      adaptive_congestion_control::FailureScope::kQp));
-    EXPECT_EQ(adaptive_congestion_control::snapshot(route->domain).inflight_bytes, 0);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, adaptive_congestion_control::OutcomeClass::kFatal,
+        adaptive_congestion_control::FailureScope::kQp));
+    EXPECT_EQ(
+        adaptive_congestion_control::snapshot(route->domain).inflight_bytes, 0);
 
     adaptive_congestion_control::controlTick(route->domain, 1);
     EXPECT_EQ(adaptive_congestion_control::snapshot(route->domain).state,
@@ -77,10 +82,12 @@ TEST(TentAdaptiveCongestionControlTest,
     RdmaSlice slice;
     adaptive_congestion_control::PathHandle path{&device, &route->domain, 3, 1};
 
-    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, route.get(), path, 512, 7),
-              adaptive_congestion_control::Decision::kAllow);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(slice, adaptive_congestion_control::OutcomeClass::kFatal,
-                                      adaptive_congestion_control::FailureScope::kQp));
+    ASSERT_EQ(
+        acquireTentCongestionControlAttempt(slice, route.get(), path, 512, 7),
+        adaptive_congestion_control::Decision::kAllow);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, adaptive_congestion_control::OutcomeClass::kFatal,
+        adaptive_congestion_control::FailureScope::kQp));
     adaptive_congestion_control::controlTick(route->domain, 1);
 
     EXPECT_EQ(adaptive_congestion_control::snapshot(route->domain).state,
@@ -104,13 +111,15 @@ TEST(TentAdaptiveCongestionControlTest, LargeSliceCanMakeProgressDuringProbe) {
     // A default 4 MiB write is capped at 32 slices of 128 KiB each.
     first.length = second.length = 128ULL << 10;
     adaptive_congestion_control::PathHandle path{&device, &route.domain, 1, 1};
-    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path, first.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path,
+                                                  first.length, 7),
               adaptive_congestion_control::Decision::kAllow);
-    EXPECT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+    EXPECT_EQ(acquireTentCongestionControlAttempt(second, &route, path,
+                                                  second.length, 7),
               adaptive_congestion_control::Decision::kDefer);
-    ASSERT_TRUE(completeTentCongestionControlAttempt(first,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
+    ASSERT_TRUE(completeTentCongestionControlAttempt(
+        first, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
     tickTentCongestionControlRoute(route, 3, 1);
     EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
               adaptive_congestion_control::PathState::kHealthy);
@@ -140,24 +149,28 @@ TEST(TentAdaptiveCongestionControlTest, RouteTelemetryGrowsAndShrinksWindow) {
     for (uint64_t tick = 1; tick <= 2; ++tick) {
         RdmaSlice slice;
         slice.length = 16;
-        adaptive_congestion_control::PathHandle path{&device, &route.domain,
-                                     adaptive_congestion_control::generation(device),
-                                     adaptive_congestion_control::generation(route.domain)};
-        ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path, slice.length, 7),
+        adaptive_congestion_control::PathHandle path{
+            &device, &route.domain,
+            adaptive_congestion_control::generation(device),
+            adaptive_congestion_control::generation(route.domain)};
+        ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
+                                                      slice.length, 7),
                   adaptive_congestion_control::Decision::kAllow);
-        ASSERT_TRUE(
-            completeTentCongestionControlAttempt(slice, adaptive_congestion_control::OutcomeClass::kSuccess,
-                                  adaptive_congestion_control::FailureScope::kOperation));
+        ASSERT_TRUE(completeTentCongestionControlAttempt(
+            slice, adaptive_congestion_control::OutcomeClass::kSuccess,
+            adaptive_congestion_control::FailureScope::kOperation));
         tickTentCongestionControlRoute(route, tick, 1'000'000'000);
     }
-    EXPECT_GT(adaptive_congestion_control::snapshot(route.domain).window_bytes, 64u);
+    EXPECT_GT(adaptive_congestion_control::snapshot(route.domain).window_bytes,
+              64u);
 
     RdmaSlice inflight;
     inflight.length = 64;
-    adaptive_congestion_control::PathHandle path{&device, &route.domain,
-                                 adaptive_congestion_control::generation(device),
-                                 adaptive_congestion_control::generation(route.domain)};
-    ASSERT_EQ(acquireTentCongestionControlAttempt(inflight, &route, path, inflight.length, 7),
+    adaptive_congestion_control::PathHandle path{
+        &device, &route.domain, adaptive_congestion_control::generation(device),
+        adaptive_congestion_control::generation(route.domain)};
+    ASSERT_EQ(acquireTentCongestionControlAttempt(inflight, &route, path,
+                                                  inflight.length, 7),
               adaptive_congestion_control::Decision::kAllow);
     route.completed_bytes.store(1, std::memory_order_relaxed);
     tickTentCongestionControlRoute(route, 3, 1'000'000'000);
@@ -166,10 +179,11 @@ TEST(TentAdaptiveCongestionControlTest, RouteTelemetryGrowsAndShrinksWindow) {
 
     EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
               adaptive_congestion_control::PathState::kCongested);
-    EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).window_bytes, 64u);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(inflight,
-                                      adaptive_congestion_control::OutcomeClass::kDerivedFlush,
-                                      adaptive_congestion_control::FailureScope::kOperation));
+    EXPECT_EQ(adaptive_congestion_control::snapshot(route.domain).window_bytes,
+              64u);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        inflight, adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+        adaptive_congestion_control::FailureScope::kOperation));
 }
 
 }  // namespace

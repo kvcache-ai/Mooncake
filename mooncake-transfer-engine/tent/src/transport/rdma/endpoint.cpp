@@ -917,9 +917,10 @@ void RdmaEndPoint::resetInflightSlices() {
         while (!queue.empty()) {
             auto current = queue.pop();
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-            adaptive_congestion_control::complete(current->congestion_control_permit,
-                                  adaptive_congestion_control::OutcomeClass::kDerivedFlush,
-                                  adaptive_congestion_control::FailureScope::kOperation);
+            adaptive_congestion_control::complete(
+                current->congestion_control_permit,
+                adaptive_congestion_control::OutcomeClass::kDerivedFlush,
+                adaptive_congestion_control::FailureScope::kOperation);
             current->congestion_control_route = nullptr;
 #endif
             updateSliceStatus(current, TransferStatusEnum::CANCELED);

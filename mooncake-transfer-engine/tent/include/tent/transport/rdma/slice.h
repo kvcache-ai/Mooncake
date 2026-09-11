@@ -40,7 +40,8 @@ struct RdmaSlice;
 class RailMonitor;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
 struct TentRdmaCongestionControlRoute {
-    explicit TentRdmaCongestionControlRoute(const adaptive_congestion_control::Config& config)
+    explicit TentRdmaCongestionControlRoute(
+        const adaptive_congestion_control::Config& config)
         : domain(config, 1) {}
 
     adaptive_congestion_control::DomainState domain;
