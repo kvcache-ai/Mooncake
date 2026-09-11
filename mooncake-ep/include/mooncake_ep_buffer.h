@@ -13,6 +13,7 @@
 #include <mooncake_ep_exception.cuh>
 #include <glog/logging.h>
 #include <transport/device/device_transport.h>
+#include <transport/device/nccl_device_transport.h>
 
 namespace mooncake {
 
@@ -23,7 +24,7 @@ class MooncakeElasticBuffer;
 
 struct BufferLayout {
     int* rdma_send_signal_buffer;
-    int* rdma_recv_signal_buffer;
+    device::DeviceSignal* rdma_recv_signal_buffer;
     void* rdma_send_data_buffer;
     void* rdma_recv_data_buffer;
 };
@@ -41,7 +42,8 @@ struct BufferPair {
 
     BufferPair(void* rdma_buffer, int num_max_dispatch_tokens_per_rank,
                int hidden, int num_ranks, int num_experts) {
-        size_t signaling_buffer_bytes = num_experts * sizeof(int);
+        size_t signaling_buffer_bytes =
+            num_experts * sizeof(device::DeviceSignal);
         size_t send_recv_buffer_bytes =
             num_experts * num_max_dispatch_tokens_per_rank *
             (2 * sizeof(int4) + hidden * EP_BF16_SIZE);
@@ -51,8 +53,8 @@ struct BufferPair {
                                       2 * i * send_recv_buffer_bytes;
             buffers[i] = {
                 advance<int*>(rdma_buffer, rdma_base_offset),
-                advance<int*>(rdma_buffer,
-                              rdma_base_offset + signaling_buffer_bytes),
+                advance<device::DeviceSignal*>(
+                    rdma_buffer, rdma_base_offset + signaling_buffer_bytes),
                 advance<int*>(rdma_buffer,
                               rdma_base_offset + 2 * signaling_buffer_bytes),
                 advance<int*>(rdma_buffer, rdma_base_offset +
@@ -95,9 +97,15 @@ struct MooncakeEpBuffer {
     // and these remain null.
     std::unique_ptr<device::P2pTransport> owned_p2p_transport_;
     std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
+    std::unique_ptr<device::NcclTransport> nccl_transport_;
+    device::NcclBufferRegistration nccl_registration_;
+    device::DeviceComm device_comm_;
+    void* device_comm_state_ = nullptr;
+    void prepare_device_comm();
 
     bool ibgda_disabled_ = false;
     bool p2p_enabled_ = true;
+    bool device_p2p_enabled_ = true;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
     // Active RoCE QPs per peer. The platform-specific default is selected in
@@ -116,8 +124,9 @@ struct MooncakeEpBuffer {
     // (engine owns the transports).  Otherwise EP creates its own via the
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
-                     bool disable_p2p = false,
-                     TransferEngine* engine = nullptr);
+                     bool disable_p2p = false, TransferEngine* engine = nullptr,
+                     std::string transport = "ibgda",
+                     std::vector<int32_t> unique_id = {});
 
     ~MooncakeEpBuffer() noexcept(false);
 
@@ -141,6 +150,9 @@ struct MooncakeEpBuffer {
             bool return_recv_hook, uint64_t compute_stream_ptr);
 
     bool ibgda_disabled() const { return ibgda_disabled_; }
+    bool using_nccl() const { return nccl_transport_ != nullptr; }
+    const device::DeviceComm& device_comm() const { return device_comm_; }
+    void destroy();
     bool p2p_enabled() const { return p2p_enabled_; }
 
     bool is_roce() const {
@@ -149,6 +161,7 @@ struct MooncakeEpBuffer {
 
     // Fast-path: IBGDA available, or all peers accessible via P2P.
     bool use_fast_path() {
+        if (using_nccl()) return true;
         if (!ibgda_disabled_) return true;
         bool p2p_all = p2p_transport_ && p2p_transport_->allPeersAccessible();
         if (!p2p_all) {

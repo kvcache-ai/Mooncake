@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include <cuda_alike.h>
+#include <transport/device/device_comm.h>
 
 #ifdef USE_NCCL_DEVICE
 #include <transport/device/nccl_device_transport.h>
@@ -30,6 +31,9 @@ struct NcclContext {
 #endif
 
 struct ElasticLaunchContext {
+    // The selected remote backend is bound once by the host.  Elastic kernels
+    // consume this common view; direct peer mappings remain a route within it.
+    device::DeviceComm device_comm;
     ElasticTransportBackend backend = ElasticTransportBackend::kIbgda;
     int device_id = -1;
 #ifdef USE_NCCL_DEVICE

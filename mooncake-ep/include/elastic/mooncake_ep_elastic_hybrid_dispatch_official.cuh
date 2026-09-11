@@ -232,7 +232,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     workspace_layout.get_scaleout_rank_count_ptr<true>(
                         dst_scaleout_rank_idx),
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
-                    Ops::kAggregateRequests);
+                    gin.aggregate_requests());
                 gin.template put<transport::ScaleoutTeam>(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(
                         scaleout_rank_idx),
@@ -593,7 +593,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     scaleout_send_buffer.get_token_buffer(token_idx)
                         .get_base_ptr(),
                     tma_buffer.get_num_bytes<false>(),
-                    stored_dst_scaleout_rank_idx, Ops::kAggregateRequests);
+                    stored_dst_scaleout_rank_idx, gin.aggregate_requests());
             }
             __syncwarp();
 

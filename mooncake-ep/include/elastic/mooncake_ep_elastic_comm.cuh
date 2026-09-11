@@ -116,11 +116,10 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     // the waiter issue one acquire load. IBGDA retains one slot per source rank
     // because its portable remote-atomic protocol must not rely on a shared
     // remote word.
-    constexpr bool kUseAggregateSignal =
-        Ops::kIsNccl && std::is_same_v<team_t, transport::ScaleupTeam>;
+    const bool use_aggregate_signal = gin.template uses_aggregate_signal<team_t>();
     if (thread_idx < kNumRanks) {
         auto* dst_ptr = const_cast<int*>(base_signal) +
-                        (kUseAggregateSignal ? 0 : rank_idx);
+                        (use_aggregate_signal ? 0 : rank_idx);
         gin.template red_add_rel<team_t>(dst_ptr, sign ? -1 : 1, thread_idx);
     }
     __syncthreads();
@@ -131,7 +130,7 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     timeout_while<kNumTimeoutCycles>(
         thread_idx == 0, [=](const bool& is_last_check) {
             int observed = 0;
-            if constexpr (kUseAggregateSignal) {
+            if (use_aggregate_signal) {
                 observed =
                     ptx::ld_acquire_sys<int>(const_cast<int*>(base_signal));
             } else {
@@ -153,17 +152,15 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
         });
 }
 
-#ifdef USE_NCCL_DEVICE
-
-// Use one communicator-owned signal per source rank on GIN context 0. Payload
-// contexts are flushed before this function; a single control context is enough
-// to publish barrier arrival and avoids O(team_size * context_count) signals.
+// Use one communicator-owned signal per source rank on the GIN control context.
+// The backend supplies the implementation through DeviceCommElasticOps; the
+// algorithm only sees a team barrier operation.
 template <typename team_t, int kNumTeamRanks, int kNumThreads,
           int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
-__forceinline__ __device__ void nccl_gin_barrier_wo_local_sync(
-    const transport::NcclOps& gin, const layout::WorkspaceLayout& workspace,
-    const int& team_rank_idx, const int& barrier_sm_idx,
-    const int& thread_idx) {
+__forceinline__ __device__ void gin_barrier_wo_local_sync(
+    const transport::DeviceCommOps& gin,
+    const layout::WorkspaceLayout& workspace, const int& team_rank_idx,
+    const int& barrier_sm_idx, const int& thread_idx) {
     if (barrier_sm_idx != 0) return;
     (void)workspace;
 
@@ -192,8 +189,6 @@ __forceinline__ __device__ void nccl_gin_barrier_wo_local_sync(
     }
 }
 
-#endif  // USE_NCCL_DEVICE
-
 template <typename Ops, bool kIsScaleupNVLink, int kNumScaleoutRanks,
           int kNumScaleupRanks, int kNumSMs, int kNumThreads, int kNumQPs,
           int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag,
@@ -206,13 +201,14 @@ __forceinline__ __device__ void gpu_barrier(
     bool do_scaleup = true) {
     // Complete TMA stores before publishing any remote arrival. This is also
     // required for LSA writes because TMA uses a separate async proxy.
-    if constexpr (Ops::kIsNccl && kFlushStores) {
+    const bool needs_tma_ordering = gin.needs_tma_ordering();
+    if (needs_tma_ordering && kFlushStores) {
         ptx::tma_store_commit();
         ptx::tma_store_wait();
         __syncwarp();
     }
 
-    if constexpr (!Ops::kIsNccl) {
+    if (!needs_tma_ordering) {
         // Preserve IBGDA's per-thread system fence before the leading grid
         // synchronization. Every producer must publish before block 0 can
         // announce the remote barrier.
@@ -246,15 +242,15 @@ __forceinline__ __device__ void gpu_barrier(
 
     do_scaleout &= kNumScaleoutRanks > 1;
     do_scaleup &= kNumScaleupRanks > 1;
-#ifdef USE_NCCL_DEVICE
-    if constexpr (Ops::kIsNccl) {
+    if (needs_tma_ordering) {
         if (do_scaleup && !do_scaleout) {
             mooncake_barrier_wo_local_sync<
                 Ops, transport::ScaleupTeam, kNumScaleupRanks, kNumSMs,
                 kNumThreads, kNumTimeoutCycles, kTag>(
                 gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
-        } else if (do_scaleout && !do_scaleup) {
-            nccl_gin_barrier_wo_local_sync<transport::ScaleoutTeam,
+        } else if (do_scaleout && !do_scaleup &&
+                   gin.template uses_gin_barrier<transport::ScaleoutTeam>()) {
+                gin_barrier_wo_local_sync<transport::ScaleoutTeam,
                                            kNumScaleoutRanks, kNumThreads,
                                            kNumTimeoutCycles, kTag>(
                 gin, workspace, scaleout_rank_idx, sm_idx, thread_idx);
@@ -266,10 +262,19 @@ __forceinline__ __device__ void gpu_barrier(
                     Ops, transport::ScaleupTeam, kNumScaleupRanks, kNumSMs,
                     kNumThreads, kNumTimeoutCycles, kTag>(
                     gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
-                nccl_gin_barrier_wo_local_sync<transport::ScaleoutTeam,
-                                               kNumScaleoutRanks, kNumThreads,
-                                               kNumTimeoutCycles, kTag>(
-                    gin, workspace, scaleout_rank_idx, sm_idx - 1, thread_idx);
+                if (gin.template uses_gin_barrier<transport::ScaleoutTeam>()) {
+                    gin_barrier_wo_local_sync<transport::ScaleoutTeam,
+                                                   kNumScaleoutRanks,
+                                                   kNumThreads,
+                                                   kNumTimeoutCycles, kTag>(
+                        gin, workspace, scaleout_rank_idx, sm_idx - 1,
+                        thread_idx);
+                } else {
+                    mooncake_barrier_wo_local_sync<
+                        Ops, transport::ScaleoutTeam, kNumScaleoutRanks, 1,
+                        kNumThreads, kNumTimeoutCycles, kTag>(
+                        gin, workspace, scaleout_rank_idx, 0, thread_idx);
+                }
             } else {
                 // A one-block launch cannot overlap teams safely. Complete LSA
                 // first and then the GIN rail barrier.
@@ -277,15 +282,21 @@ __forceinline__ __device__ void gpu_barrier(
                                                kNumScaleupRanks, 1, kNumThreads,
                                                kNumTimeoutCycles, kTag>(
                     gin, workspace, scaleup_rank_idx, 0, thread_idx);
-                nccl_gin_barrier_wo_local_sync<transport::ScaleoutTeam,
-                                               kNumScaleoutRanks, kNumThreads,
-                                               kNumTimeoutCycles, kTag>(
-                    gin, workspace, scaleout_rank_idx, 0, thread_idx);
+                if (gin.template uses_gin_barrier<transport::ScaleoutTeam>()) {
+                    gin_barrier_wo_local_sync<transport::ScaleoutTeam,
+                                                   kNumScaleoutRanks,
+                                                   kNumThreads,
+                                                   kNumTimeoutCycles, kTag>(
+                        gin, workspace, scaleout_rank_idx, 0, thread_idx);
+                } else {
+                    mooncake_barrier_wo_local_sync<
+                        Ops, transport::ScaleoutTeam, kNumScaleoutRanks, 1,
+                        kNumThreads, kNumTimeoutCycles, kTag>(
+                        gin, workspace, scaleout_rank_idx, 0, thread_idx);
+                }
             }
         }
-    } else
-#endif
-    {
+    } else {
         // Keep the established IBGDA barrier byte-for-byte in behavior.
         if (do_scaleup && !do_scaleout) {
             mooncake_barrier_wo_local_sync<

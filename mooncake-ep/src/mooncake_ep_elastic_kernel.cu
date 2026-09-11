@@ -91,19 +91,8 @@ inline int combine_epilogue_smem_bytes(int hidden, int num_warps) {
     return num_warps * static_cast<int>(token_layout.get_num_bytes<false>());
 }
 
-inline device::CommCtx make_comm_ctx(const ElasticLaunchContext& ctx) {
-    device::CommCtx comm_ctx{};
-    comm_ctx.rank = ctx.rank;
-    comm_ctx.p2p.available = ctx.nvlink_available;
-    comm_ctx.p2p.peer_ptrs = ctx.ipc_peer_ptrs;
-    comm_ctx.p2p.local_base = ctx.gdr_buffer;
-    comm_ctx.ibgda.qp_devctxs =
-        reinterpret_cast<mlx5gda_qp_devctx*>(ctx.qp_devctxs);
-    comm_ctx.ibgda.raddrs = reinterpret_cast<const uint64_t*>(ctx.raddrs);
-    comm_ctx.ibgda.rkeys = reinterpret_cast<const uint32_t*>(ctx.rkeys);
-    comm_ctx.ibgda.local_atomic_base = ctx.rdma_send_signal_buffer;
-    comm_ctx.ibgda.remote_atomic_base = ctx.rdma_recv_signal_buffer;
-    return comm_ctx;
+inline device::DeviceComm make_comm_ctx(const ElasticLaunchContext& ctx) {
+    return ctx.device_comm;
 }
 
 #ifdef MOONCAKE_EP_USE_MUSA
@@ -138,7 +127,7 @@ __global__ void musa_elastic_prepare_clear_barrier_kernel(
     int num_scaleup_ranks, int num_experts, int64_t timeout_cycles) {
     const auto layout = elastic::layout::WorkspaceLayout(
         workspace, 1, num_scaleup_ranks, num_experts);
-    const auto gin = elastic::transport::IbgdaOps(
+    const auto gin = elastic::transport::DeviceCommOps(
         comm_ctx, 0, 0, 1, 0, rank_idx, num_scaleup_ranks, num_scaleup_ranks);
     constexpr int kTag = elastic::comm::kDeviceBarrierTag;
     const int status =
@@ -225,7 +214,7 @@ __global__ void musa_elastic_publish_counts_kernel(
     const auto layout = elastic::layout::WorkspaceLayout(
         workspace, 1, num_scaleup_ranks, num_experts);
     const int num_experts_per_rank = num_experts / num_scaleup_ranks;
-    const auto gin = elastic::transport::IbgdaOps(
+    const auto gin = elastic::transport::DeviceCommOps(
         comm_ctx, 0, 0, 1, 0, rank_idx, num_scaleup_ranks, num_scaleup_ranks);
     const int tid = blockIdx.x * blockDim.x + threadIdx.x;
     const int stride = blockDim.x * gridDim.x;
@@ -739,26 +728,7 @@ void launch_mooncake_elastic_dispatch(
     int expert_alignment, int num_sms, int num_channels_per_sm,
     int num_smem_bytes, bool cached_mode, bool deterministic,
     bool do_cpu_sync, const ElasticLaunchContext& ctx, cudaStream_t stream) {
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        launch_mooncake_elastic_dispatch_backend<elastic::transport::NcclOps>(
-            x, sf, topk_idx, topk_weights, copied_topk_idx,
-            cumulative_local_expert_recv_stats,
-            psum_num_recv_tokens_per_scaleup_rank,
-            psum_num_recv_tokens_per_expert, dst_buffer_slot_idx,
-            token_metadata_at_forward, num_tokens, num_max_tokens_per_rank,
-            hidden, elem_size, num_sf_packs, sf_token_stride, sf_hidden_stride,
-            num_experts, num_topk, expert_alignment, num_sms,
-            num_channels_per_sm, num_smem_bytes, cached_mode, deterministic,
-            do_cpu_sync, ctx, ctx.nccl, stream);
-        return;
-    }
-#endif
-    if (ctx.backend != ElasticTransportBackend::kIbgda)
-        throw std::invalid_argument(
-            "Mooncake EP was built without NCCL device backend support");
-    const auto comm_ctx = make_comm_ctx(ctx);
-    launch_mooncake_elastic_dispatch_backend<elastic::transport::IbgdaOps>(
+    launch_mooncake_elastic_dispatch_backend<elastic::transport::DeviceCommOps>(
         x, sf, topk_idx, topk_weights, copied_topk_idx,
         cumulative_local_expert_recv_stats,
         psum_num_recv_tokens_per_scaleup_rank,
@@ -766,7 +736,8 @@ void launch_mooncake_elastic_dispatch(
         token_metadata_at_forward, num_tokens, num_max_tokens_per_rank, hidden,
         elem_size, num_sf_packs, sf_token_stride, sf_hidden_stride,
         num_experts, num_topk, expert_alignment, num_sms, num_channels_per_sm,
-        num_smem_bytes, cached_mode, deterministic, do_cpu_sync, ctx, comm_ctx,
+        num_smem_bytes, cached_mode, deterministic, do_cpu_sync, ctx,
+        ctx.device_comm,
         stream);
 }
 
@@ -928,15 +899,8 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
         num_channels,                                                          \
         do_expand, cached_mode, ctx, psum_num_recv_tokens_per_scaleup_rank,    \
         psum_num_recv_tokens_per_expert, stream)
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        CALL_DISPATCH_EPILOGUE(
-            elastic::transport::NcclOps::kNumDispatchEpilogueWarps);
-        return;
-    }
-#endif
     CALL_DISPATCH_EPILOGUE(
-        elastic::transport::IbgdaOps::kNumDispatchEpilogueWarps);
+        elastic::transport::DeviceCommOps::kNumDispatchEpilogueWarps);
 #undef CALL_DISPATCH_EPILOGUE
 }
 
@@ -1035,6 +999,7 @@ void* launch_mooncake_elastic_combine_backend(
 #else
     TRY_COMBINE(4096, 256, 8, 128, 24, 8);
     TRY_COMBINE(4096, 256, 8, 128, 24, 2);
+    TRY_COMBINE(4096, 256, 8, 128, 24, 4);
 #endif
 
 #undef TRY_COMBINE
@@ -1052,29 +1017,14 @@ void* launch_mooncake_elastic_combine(
     int num_experts, int num_topk, int num_sms, int num_smem_bytes,
     int num_channels, bool use_expanded_layout, bool allow_multiple_reduction,
     const ElasticLaunchContext& ctx, cudaStream_t stream) {
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        return launch_mooncake_elastic_combine_backend<
-            elastic::transport::NcclOps>(
-            x, topk_weights, src_metadata,
-            psum_num_recv_tokens_per_scaleup_rank, token_metadata_at_forward,
-            channel_linked_list, num_reduced_tokens,
-            num_max_tokens_per_rank, hidden, num_experts, num_topk, num_sms,
-            num_smem_bytes, num_channels, use_expanded_layout,
-            allow_multiple_reduction, ctx, ctx.nccl, stream);
-    }
-#endif
-    if (ctx.backend != ElasticTransportBackend::kIbgda)
-        throw std::invalid_argument(
-            "Mooncake EP was built without NCCL device backend support");
-    const auto comm_ctx = make_comm_ctx(ctx);
     return launch_mooncake_elastic_combine_backend<
-        elastic::transport::IbgdaOps>(
+        elastic::transport::DeviceCommOps>(
         x, topk_weights, src_metadata,
         psum_num_recv_tokens_per_scaleup_rank, token_metadata_at_forward,
         channel_linked_list, num_reduced_tokens, num_max_tokens_per_rank,
         hidden, num_experts, num_topk, num_sms, num_smem_bytes, num_channels,
-        use_expanded_layout, allow_multiple_reduction, ctx, comm_ctx, stream);
+        use_expanded_layout, allow_multiple_reduction, ctx, ctx.device_comm,
+        stream);
 }
 
 template <int kNumEpilogueWarps>
@@ -1151,15 +1101,8 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
         num_topk, reduce_buffer, bias_0, bias_1, num_sms, num_epilogue_sms,    \
         num_smem_bytes,                                                        \
         use_expanded_layout, allow_multiple_reduction, ctx, stream)
-#ifdef USE_NCCL_DEVICE
-    if (ctx.backend == ElasticTransportBackend::kNccl) {
-        CALL_COMBINE_EPILOGUE(
-            elastic::transport::NcclOps::kNumCombineEpilogueWarps);
-        return;
-    }
-#endif
     CALL_COMBINE_EPILOGUE(
-        elastic::transport::IbgdaOps::kNumCombineEpilogueWarps);
+        elastic::transport::DeviceCommOps::kNumCombineEpilogueWarps);
 #undef CALL_COMBINE_EPILOGUE
 }
 

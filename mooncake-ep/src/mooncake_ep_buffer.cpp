@@ -95,11 +95,14 @@ static bool macaHostPhaseFenceCoversPeers() {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
-                                   bool disable_p2p, TransferEngine* engine)
+                                   bool disable_p2p, TransferEngine* engine,
+                                   std::string transport,
+                                   std::vector<int32_t> unique_id)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
       p2p_enabled_(!disable_p2p),
+      device_p2p_enabled_(!disable_p2p),
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
@@ -125,6 +128,36 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaGetDevice(&device_id));
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
+
+    if (transport != "ibgda" && transport != "nccl")
+        throw std::invalid_argument("legacy transport must be ibgda or nccl");
+    if (transport == "nccl") {
+#ifdef USE_NCCL_DEVICE
+        nccl_transport_ = device::createNcclDeviceTransport();
+        device::NcclTransportConfig config;
+        config.rank = rank;
+        config.num_ranks = num_ranks;
+        config.gin_context_count = 1;
+        if (!nccl_transport_ || nccl_transport_->initialize(config, unique_id))
+            throw std::runtime_error(
+                "legacy NCCL device initialization failed");
+        if (nccl_transport_->allocateAndRegisterBuffer(
+                num_ep_buffer_bytes, &gdr_buffer, &nccl_registration_)) {
+            throw std::runtime_error("legacy NCCL window registration failed");
+        }
+        ibgda_disabled_ = true;
+        // NCCL LSA resolves the local P2P route for this VMM window. It does
+        // not use CUDA IPC handles, so Python skips the IPC bootstrap.
+        p2p_enabled_ = false;
+        CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
+        CUDA_CHECK(
+            cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+        prepare_device_comm();
+        return;
+#else
+        throw std::invalid_argument("NCCL device backend was not built");
+#endif
+    }
 
     // P2P transport owns GDR buffer allocation. Peer mappings remain disabled
     // when the EP caller selects RDMA-only operation.
@@ -181,9 +214,59 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+    prepare_device_comm();
 }
 
-MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
+void MooncakeEpBuffer::prepare_device_comm() {
+    const auto backend = using_nccl() ? device::DeviceBackend::kNccl
+                                      : device::DeviceBackend::kIbgda;
+    if (!device_comm_state_)
+        CUDA_CHECK(cudaMalloc(&device_comm_state_,
+                              device::deviceCommStateSize(backend)));
+    const int32_t* available =
+        p2p_transport_ ? p2p_transport_->availableTablePtr() : nullptr;
+    void* const* peers =
+        p2p_transport_ ? p2p_transport_->peerPtrsTablePtr() : nullptr;
+    if (using_nccl()) {
+        const auto context = nccl_transport_->deviceContext(nccl_registration_);
+        device_comm_ =
+            device::bindDeviceComm(backend, device_comm_state_, &context,
+                                   gdr_buffer, rank, available, peers);
+    } else {
+        const device::IbgdaCommBinding state{
+            rdma_transport_
+                ? static_cast<const uint64_t*>(rdma_transport_->raddrsPtr())
+                : nullptr,
+            rdma_transport_
+                ? static_cast<const uint32_t*>(rdma_transport_->rkeysPtr())
+                : nullptr,
+            rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr};
+        device_comm_ =
+            device::bindDeviceComm(backend, device_comm_state_, &state,
+                                   gdr_buffer, rank, available, peers);
+    }
+    device_comm_.enable_p2p = device_p2p_enabled_;
+    device_comm_.channel_count = using_nccl() ? 1 : USE_QP_COUNT / num_ranks;
+}
+
+MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) { destroy(); }
+
+void MooncakeEpBuffer::destroy() {
+    if (!comm_stream && !gdr_buffer && !device_comm_state_) return;
+    // Kernels may also have been launched on the caller's compute stream.
+    CUDA_CHECK(cudaDeviceSynchronize());
+    if (device_comm_state_) {
+        CUDA_CHECK(cudaFree(device_comm_state_));
+        device_comm_state_ = nullptr;
+        device_comm_ = {};
+    }
+    if (nccl_transport_) {
+        nccl_transport_->deregisterBuffer(&nccl_registration_);
+        nccl_transport_->freeBuffer(gdr_buffer);
+        nccl_transport_->shutdown();
+        nccl_transport_.reset();
+        gdr_buffer = nullptr;
+    }
     // When EP owns the rdma transport, destructor handles QP/MR/ctrl_buf
     // teardown. When engine owns it, just clear the pointer.
     owned_rdma_transport_.reset();
@@ -205,7 +288,10 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     }
     p2p_transport_ = nullptr;
 
-    if (workspace) cudaFree(workspace);
+    if (workspace) {
+        cudaFree(workspace);
+        workspace = nullptr;
+    }
     if (comm_stream) {
         cudaStreamDestroy(comm_stream);
         comm_stream = nullptr;
@@ -296,12 +382,10 @@ MooncakeEpBuffer::dispatch(
         timeout_us == -1 ? -1
                          : (int64_t)clock_rate_khz * (int64_t)timeout_us / 1000;
 
-    void* raddrs_ptr = rdma_transport_ ? rdma_transport_->raddrsPtr() : nullptr;
-    void* rkeys_ptr = rdma_transport_ ? rdma_transport_->rkeysPtr() : nullptr;
-    void* qp_devctxs_ptr =
-        rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
-    int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
-    void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    int32_t* nvlink_avail =
+        p2p_transport_ ? p2p_transport_->availableTablePtr() : nullptr;
+    void** ipc_ptrs =
+        p2p_transport_ ? p2p_transport_->peerPtrsTablePtr() : nullptr;
     int active_qps_per_rank = active_qps_per_rank_for_ep(
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
         active_qps_cap_, num_experts / num_ranks);
@@ -333,14 +417,12 @@ MooncakeEpBuffer::dispatch(
         mooncake::dispatch(
             packed_recv_x, packed_recv_x_scales, packed_recv_src_info,
             packed_recv_layout_range, packed_recv_count, active_ranks,
-            gdr_buffer, buffer.rdma_send_signal_buffer,
-            buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
-            buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs_ptr,
-            rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x, topk_idx,
-            next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
+            buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
+            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, x,
+            topk_idx, next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
-            active_qps_per_rank);
+            active_qps_per_rank, device_comm_);
     };
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
@@ -447,12 +529,10 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         timeout_us == -1 ? -1
                          : (int64_t)clock_rate_khz * (int64_t)timeout_us / 1000;
 
-    void* raddrs_ptr = rdma_transport_ ? rdma_transport_->raddrsPtr() : nullptr;
-    void* rkeys_ptr = rdma_transport_ ? rdma_transport_->rkeysPtr() : nullptr;
-    void* qp_devctxs_ptr =
-        rdma_transport_ ? rdma_transport_->qpDevCtxsPtr() : nullptr;
-    int32_t* nvlink_avail = p2p_transport_->availableTablePtr();
-    void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
+    int32_t* nvlink_avail =
+        p2p_transport_ ? p2p_transport_->availableTablePtr() : nullptr;
+    void** ipc_ptrs =
+        p2p_transport_ ? p2p_transport_->peerPtrsTablePtr() : nullptr;
     int active_qps_per_rank = active_qps_per_rank_for_ep(
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
         active_qps_cap_, num_experts / num_ranks);
@@ -486,15 +566,14 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         auto* kernel_topk_idx =
             topk_shadow(workspace, shadow_slot, num_experts);
         mooncake::combine(
-            combined_x, active_ranks, gdr_buffer,
-            buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
-            buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
-            nullptr, raddrs_ptr, rkeys_ptr, qp_devctxs_ptr, nvlink_avail,
-            ipc_ptrs, x, kernel_topk_idx, topk_weights, src_info, layout_range,
-            next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
-            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy, active_qps_per_rank);
+            combined_x, active_ranks, buffer.rdma_send_signal_buffer,
+            buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
+            buffer.rdma_recv_data_buffer, x, kernel_topk_idx, topk_weights,
+            src_info, layout_range, next_buffer.rdma_recv_signal_buffer,
+            num_combined_tokens, hidden, num_max_dispatch_tokens_per_rank,
+            num_topk, num_experts, rank, num_ranks, workspace, launch_stream,
+            timeout_ticks, phases, zero_copy, active_qps_per_rank,
+            device_comm_);
     };
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
@@ -578,6 +657,7 @@ void MooncakeEpBuffer::sync_ibgda_peers(
         LOG(WARNING)
             << "[EP] IBGDA connectPeers failed, falling back to P2P-only path";
     }
+    prepare_device_comm();
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
@@ -591,6 +671,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
     if (!p2p_enabled_) return;
     p2p_transport_->importPeerHandles(gdr_buffer, rank, num_ranks,
                                       remote_handles, active_ranks_mask);
+    prepare_device_comm();
 }
 
 }  // namespace mooncake

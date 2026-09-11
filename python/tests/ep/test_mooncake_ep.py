@@ -150,9 +150,9 @@ def test_main(
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
             # Check combine correctness
-            for zero_copy in (False, True):
-                if zero_copy:
-                    buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
+            # The current legacy Buffer API intentionally does not expose the
+            # removed zero-copy combine path. Keep the ordinary combine check.
+            for zero_copy in (False,):
                 out = torch.empty(
                     (num_tokens, hidden), dtype=torch.bfloat16, device="cuda"
                 )
@@ -239,7 +239,7 @@ def test_main(
         for return_recv_hook in (False, True):
             group.barrier()
             dispatch_t, combine_t = bench_kineto(
-                partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                partial(test_func, zero_copy=False, return_recv_hook=return_recv_hook),
                 kernel_names=("dispatch", "combine"),
                 barrier_comm_profiling=True,
                 suppress_kineto_output=True,
@@ -292,7 +292,11 @@ def test_loop(local_rank: int, num_local_ranks: int):
         print(f"Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...", flush=True)
     buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
     # Mock a broken rank 1 to test effectiveness of EP recovery
-    if local_rank != 1:
+    if buffer.transport == "nccl":
+        # NCCL has fixed membership. The same dispatch/combine checks below
+        # exercise its device ops; the recovery arm applies to IBGDA.
+        pass
+    elif local_rank != 1:
         buffer.update_ep_member()
     else:
         buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
@@ -340,6 +344,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
                 == ref_hash
             ), f"Error: seed={seed}"
 
+    buffer.destroy()
     # Cleanup with error handling (TCPStore warnings are expected in mooncake backend)
     try:
         dist.destroy_process_group()

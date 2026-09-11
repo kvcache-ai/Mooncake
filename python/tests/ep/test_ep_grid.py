@@ -214,6 +214,7 @@ def run_test_iteration(
     torch.cuda.synchronize()
     if fail_rank == -1:
         dist.barrier(group)
+        buf.destroy()
 
 
 def worker(rank, world_size, config_dict):

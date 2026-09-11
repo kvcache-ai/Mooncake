@@ -34,9 +34,17 @@ PYBIND11_MODULE(_ep, m) {
     bind_legacy_buffer_perf(m);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, bool>(), py::arg("rank"),
+        .def(py::init([](int rank, int size, int64_t bytes, bool disable_p2p,
+                         std::string transport, std::vector<int32_t> unique_id) {
+                 return std::make_unique<MooncakeEpBuffer>(
+                     rank, size, bytes, disable_p2p, nullptr,
+                     std::move(transport), std::move(unique_id));
+             }), py::arg("rank"),
              py::arg("num_ranks"), py::arg("num_ep_buffer_bytes"),
-             py::arg("disable_p2p") = false)
+             py::arg("disable_p2p") = false, py::arg("transport") = "ibgda",
+             py::arg("nccl_unique_id") = std::vector<int32_t>{})
+        .def("using_nccl", &MooncakeEpBuffer::using_nccl)
+        .def("destroy", &MooncakeEpBuffer::destroy)
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("p2p_enabled", &MooncakeEpBuffer::p2p_enabled)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)

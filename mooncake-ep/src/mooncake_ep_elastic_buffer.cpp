@@ -130,6 +130,8 @@ struct NcclElasticState {
     device::NcclDeviceContext device_context;
     device::NcclTransportProperties properties;
     device::NcclLsaTopology lsa_topology;
+    device::DeviceComm device_comm;
+    void* device_comm_state = nullptr;
     void* allocation = nullptr;
     size_t allocation_bytes = 0;
     int device_id = -1;
@@ -183,6 +185,19 @@ struct NcclElasticState {
                 "failed to create the NCCL ElasticBuffer device context on "
                 "one or more ranks");
         }
+        CUDA_CHECK(cudaMalloc(
+            &device_comm_state,
+            device::deviceCommStateSize(device::DeviceBackend::kNccl)));
+        device_comm = device::bindDeviceComm(device::DeviceBackend::kNccl,
+                                             device_comm_state, &device_context,
+                                             allocation, rank);
+        // NCCL LSA pointers are resolved by its bound table, independently of
+        // CUDA IPC.  The legacy boolean controls that local route.
+        device_comm.enable_p2p = true;
+        device_comm.channel_count = 1;
+        // NCCL GIN's aggregate-requests option is bit zero in all supported
+        // device API releases; keep the host ABI independent of nccl_device.h.
+        device_comm.aggregate_requests = 1u;
     }
 
     int release() noexcept {
@@ -194,8 +209,19 @@ struct NcclElasticState {
             cudaSetDevice(device_id) != cudaSuccess) {
             status = -1;
         }
+        // Elastic kernels use the transport communication stream, not the
+        // auxiliary stream owned by this state. Synchronize the device before
+        // deregistering the NCCL window and destroying its communicator.
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            status = -1;
+        }
         if (cudaStreamSynchronize(comm_stream.stream()) != cudaSuccess) {
             status = -1;
+        }
+        if (device_comm_state != nullptr) {
+            if (cudaFree(device_comm_state) != cudaSuccess) status = -1;
+            device_comm_state = nullptr;
+            device_comm = {};
         }
         if (registration.valid() &&
             transport->deregisterBuffer(&registration) != 0) {
@@ -238,6 +264,7 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
         local_base = static_cast<char*>(nccl_state_->allocation);
         ctx.backend = ElasticTransportBackend::kNccl;
         ctx.nccl.device = nccl_state_->device_context;
+        ctx.device_comm = nccl_state_->device_comm;
         ctx.num_qps = std::max(1, nccl_state_->properties.gin_context_count);
 #else
         throw std::logic_error(
@@ -260,6 +287,7 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
         ctx.rdma_send_signal_buffer = local_base + workspace_bytes;
         ctx.rdma_recv_signal_buffer = local_base;
         ctx.num_qps = buffer.USE_QP_COUNT;
+        ctx.device_comm = buffer.device_comm();
     }
 
     // Both backends expose one registered allocation. Keep the established
@@ -276,6 +304,12 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     ctx.num_scaleout_ranks = topology_.num_scaleout_ranks;
     ctx.num_scaleup_ranks = topology_.num_scaleup_ranks;
     ctx.is_scaleup_nvlink = topology_.scaleup_lsa;
+    ctx.device_comm.rank = topology_.rank_idx;
+    ctx.device_comm.scaleout_rank_idx = topology_.scaleout_rank_idx;
+    ctx.device_comm.scaleup_rank_idx = topology_.scaleup_rank_idx;
+    ctx.device_comm.num_scaleup_ranks = topology_.num_scaleup_ranks;
+    ctx.device_comm.elastic_atomic_source = ctx.rdma_send_signal_buffer;
+    ctx.device_comm.elastic_atomic_target = ctx.rdma_recv_signal_buffer;
     ctx.timeout_cycles = timeout_cycles;
     return ctx;
 }

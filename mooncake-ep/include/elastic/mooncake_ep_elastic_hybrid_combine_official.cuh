@@ -478,7 +478,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         token_layout.get_num_bytes<false>(),
                         last_src_scaleout_rank_idx,
                         last_is_token_last_in_chunk ? 0
-                                                    : Ops::kAggregateRequests);
+                                                    : gin.aggregate_requests());
                 }
             }
             __syncwarp();
@@ -631,7 +631,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                 src_scaleout_rank_idx,
                                 topk_valid_mask == 0 and is_token_last_in_chunk
                                     ? 0
-                                    : Ops::kAggregateRequests);
+                                    : gin.aggregate_requests());
                         }
                     }
                 }
@@ -756,7 +756,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         // Settle this channel's source buffers before publishing completion.
         // The matching remote tail signals below acknowledge every preceding
         // put on this context, so no additional grid-wide flush is needed.
-        if constexpr (Ops::kIsNccl) gin.flush_channel();
+        if (gin.needs_tma_ordering()) gin.flush_channel();
 
         // Update, wait and clean
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
@@ -766,7 +766,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             auto* remote_tail =
                 workspace_layout.get_scaleout_channel_signaled_tail_ptr(
                     channel_idx, scaleout_rank_idx);
-            if constexpr (Ops::kIsNccl) {
+            if (gin.needs_tma_ordering()) {
                 gin.template red_add_rel<transport::ScaleoutTeam>(
                     remote_tail, expected_signal, lane_idx);
             } else {
@@ -786,7 +786,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             comm::timeout_while<kNumTimeoutCycles>([=](const bool&
                                                            is_last_check) {
                 int64_t signal;
-                if constexpr (Ops::kIsNccl) {
+                if (gin.needs_tma_ordering()) {
                     signal = ptx::ld_acquire_sys<int64_t>(wait_ptr);
                 } else {
                     signal = gin.template read_completion_tail<
@@ -795,7 +795,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 }
                 if (signal == expected_signal) {
                     // Clean for next usages
-                    if constexpr (Ops::kIsNccl) {
+                    if (gin.needs_tma_ordering()) {
                         *wait_ptr = 0;
                     } else {
                         gin.template clear_completion_tail<

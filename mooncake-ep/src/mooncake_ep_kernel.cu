@@ -5,17 +5,12 @@
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
-#include <transport/device/comm_device.cuh>
+#include <transport/device/p2p_device.cuh>
+#include <transport/device/device_comm.cuh>
 #include <mooncake_ep_utils.cuh>
 
 namespace mooncake {
 
-using mooncake::device::CommCtx;
-using mooncake::device::make_comm_ctx;
-using mooncake::device::mc_route_put;
-using mooncake::device::mc_rdma_put;
-using mooncake::device::mc_signal;
-using mooncake::device::mc_red_add;
 using mooncake::device::mc_bar_sync;
 using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_nc;
@@ -28,12 +23,12 @@ using mooncake::device::mc_atomic_add_release;
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;
 
-__device__ __forceinline__ int ep_qp_channel(int expert_local_idx,
-                                             int qps_per_rank,
-                                             int active_qps_per_rank) {
-    int active_qps = active_qps_per_rank;
-    if (active_qps <= 0 || active_qps > qps_per_rank)
-        active_qps = qps_per_rank;
+__device__ __forceinline__ int ep_channel(int expert_local_idx,
+                                             int channel_count,
+                                             int active_channel_count) {
+    int active_qps = active_channel_count;
+    if (active_qps <= 0 || active_qps > channel_count)
+        active_qps = channel_count;
     return expert_local_idx % active_qps;
 }
 
@@ -42,16 +37,16 @@ __global__ void mark_phase_ack_kernel(void* mxa_buffer,
                                       void* const* ipc_peer_ptrs,
                                       int* ack_buffer, int rank,
                                       int num_ranks, int epoch) {
-    const CommCtx comm_ctx = make_comm_ctx(
-        mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
-        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
+    const device::P2PContext p2p{nvlink_available, ipc_peer_ptrs, mxa_buffer};
 
     for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
          peer += static_cast<int>(blockDim.x)) {
         if (peer == rank) {
             mc_st_release(ack_buffer + rank, epoch);
         } else {
-            void* dst = mc_route_put(comm_ctx, peer, ack_buffer + rank);
+            void* dst = nvlink_available && ipc_peer_ptrs &&
+                device::mc_p2p_available(p2p, peer)
+                ? device::mc_p2p_peer_ptr(p2p, peer, ack_buffer + rank) : nullptr;
             if (dst != nullptr)
                 mc_st_release(reinterpret_cast<int*>(dst), epoch);
         }
@@ -78,16 +73,16 @@ __global__ void mark_and_wait_phase_ack_kernel(
         void* mxa_buffer, const int32_t* nvlink_available,
         void* const* ipc_peer_ptrs, int* ack_buffer, int rank, int num_ranks,
         int epoch, int64_t timeout_ticks) {
-    const CommCtx comm_ctx = make_comm_ctx(
-        mxa_buffer, nvlink_available, ipc_peer_ptrs, nullptr, nullptr, nullptr,
-        ack_buffer, ack_buffer, rank, num_ranks, MAX_QP_COUNT);
+    const device::P2PContext p2p{nvlink_available, ipc_peer_ptrs, mxa_buffer};
 
     for (int peer = static_cast<int>(threadIdx.x); peer < num_ranks;
          peer += static_cast<int>(blockDim.x)) {
         if (peer == rank) {
             mc_st_release(ack_buffer + rank, epoch);
         } else {
-            void* dst = mc_route_put(comm_ctx, peer, ack_buffer + rank);
+            void* dst = nvlink_available && ipc_peer_ptrs &&
+                device::mc_p2p_available(p2p, peer)
+                ? device::mc_p2p_peer_ptr(p2p, peer, ack_buffer + rank) : nullptr;
             if (dst != nullptr)
                 mc_st_release(reinterpret_cast<int*>(dst), epoch);
         }
@@ -140,19 +135,15 @@ __global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
          int* packed_recv_count, int32_t* active_ranks,
-         void* mxa_buffer,
-         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+         int* rdma_send_signal_buffer, device::DeviceSignal* rdma_recv_signal_buffer,
          void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
-         void* cuda_counter_buffer, void* cuda_data_buffer,
-         void* raddrs, void* rkeys, void* qp_devctxs,
-         const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
-         int* next_clean_buffer,
+         device::DeviceSignal* next_clean_buffer,
          int num_tokens, int num_max_dispatch_tokens_per_rank,
          int num_topk, int num_experts, int rank, int num_ranks,
          int64_t timeout_ticks,
-         int phases, int active_qps_per_rank) {
+         int phases, int active_channel_count, device::DeviceComm device_comm) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
     const auto warp_id = thread_id / 32, lane_id = get_lane_id();
@@ -193,13 +184,8 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     const size_t num_int4_per_msg = num_bytes_per_msg / sizeof(int4);
     EP_DEVICE_ASSERT(num_bytes_per_msg % sizeof(int4) == 0);
 
-    // Communication context — platform dispatch is inside comm_device.cuh
-    const CommCtx comm_ctx = make_comm_ctx(
-        mxa_buffer, nvlink_available, ipc_peer_ptrs,
-        raddrs, rkeys, qp_devctxs,
-        rdma_send_signal_buffer, rdma_recv_signal_buffer,
-        rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    // Backend state and device function pointers are bound on the host.
+    const int channel_count = device_comm.channel_count;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -282,7 +268,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                     slot_idx * num_bytes_per_msg);
 
-                void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
+                void* write_dst = device::deviceResolve(device_comm, dst_rank, dst_ptr);
                 if (write_dst != nullptr) {
                     // Local or P2P path — warp-cooperative copy
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
@@ -291,12 +277,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
                     mc_fence();
                 } else {
-                    // IBGDA path — send directly from source buffer
-                    mc_rdma_put(comm_ctx,
-                                ep_qp_channel(dst_expert_local_idx,
-                                              num_qp_per_rank,
-                                              active_qps_per_rank),
-                                dst_rank, num_qp_per_rank, src_ptr, dst_ptr,
+                    // Remote backend — send from the registered staging buffer
+                    device::devicePut(device_comm,
+                                {ep_channel(dst_expert_local_idx,
+                                              channel_count,
+                                              active_channel_count),
+                                 rdma_send_signal_buffer, rdma_recv_signal_buffer},
+                                dst_rank, dst_ptr, src_ptr,
                                 num_bytes_per_msg, lane_id);
                 }
 
@@ -322,7 +309,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
             for (int i = lane_id; i < num_experts; i += 32)
-                next_clean_buffer[i] = 0;
+                device::deviceSignalReset(next_clean_buffer + i);
 
             // Notify before executing `int_p`
             __syncwarp();
@@ -365,14 +352,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         // Wait local sends issued and send expert counts
         while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
-            int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
-            mc_red_add(comm_ctx, dst_rank,
-                       ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
-                                     active_qps_per_rank),
-                       num_qp_per_rank, signal_ptr,
+            auto* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
+            device::deviceSignalAdd(device_comm,
+                       {ep_channel(dst_expert_local_idx, channel_count,
+                                     active_channel_count),
+                        rdma_send_signal_buffer, rdma_recv_signal_buffer},
+                       dst_rank, signal_ptr,
                        static_cast<int32_t>(-num_tokens_sent - 1));
         } else {
-            mc_st_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
+            device::deviceSignalAdd(device_comm, {}, rank,
+                rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
         }
 
         // Clean workspace for next use
@@ -416,7 +405,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
         if (sub_warp_id == 1 and lane_id == 0) {
             unsigned long long start_time = clock64();
-            while ((num_recv_tokens = mc_ld_acquire(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
+            while ((num_recv_tokens = device::deviceSignalRead(device_comm, rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
                 unsigned long long end_time = clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
                     active_ranks[src_rank] = 0;
@@ -472,18 +461,14 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count, int32_t* active_ranks,
-              void* mxa_buffer,
-              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+              int* rdma_send_signal_buffer, device::DeviceSignal* rdma_recv_signal_buffer,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
-              void* cuda_counter_buffer, void* cuda_data_buffer,
-              void* raddrs, void* rkeys, void* qp_devctxs,
-              const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
               const void* x, const int64_t* topk_idx,
-              int* next_clean_buffer,
+              device::DeviceSignal* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream,
-              int64_t timeout_ticks, int phases, int active_qps_per_rank) {
+              int64_t timeout_ticks, int phases, int active_channel_count, device::DeviceComm device_comm) {
     constexpr int kNumMaxTopK = 17;
     constexpr int kNumWarpsPerGroup = 4;
     int num_warp_groups = 8;
@@ -517,18 +502,14 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
               packed_recv_count, active_ranks, \
-              mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
-              cuda_counter_buffer, cuda_data_buffer, \
-              raddrs, rkeys, qp_devctxs, \
-              nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
               num_tokens, num_max_dispatch_tokens_per_rank, \
               num_topk, num_experts, rank, num_ranks, \
-              timeout_ticks, phases, active_qps_per_rank); } break
+              timeout_ticks, phases, active_channel_count, device_comm); } break
 
 #define DISPATCH_LAUNCH_CASE(hidden) { \
 switch (num_warp_groups) { \
@@ -550,21 +531,17 @@ default: EP_HOST_ASSERT(false && "Unsupported dispatch warp-group count"); \
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
 __global__ EP_LAUNCH_BOUNDS(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 combine(void* combined_x, int32_t* active_ranks,
-        void* mxa_buffer,
-        int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+        int* rdma_send_signal_buffer, device::DeviceSignal* rdma_recv_signal_buffer,
         void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
-        void* cuda_counter_buffer, void* cuda_data_buffer,
-        void* raddrs, void* rkeys, void* qp_devctxs,
-        const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
         const void* x, const int64_t* topk_idx, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
-        int* next_clean_buffer,
+        device::DeviceSignal* next_clean_buffer,
         int* atomic_clean_flag,
         int num_combined_tokens, int hidden, int num_topk,
         int num_max_dispatch_tokens_per_rank,
         int num_experts, int rank, int num_ranks,
         int64_t timeout_ticks,
-        int phases, bool zero_copy, int active_qps_per_rank) {
+        int phases, bool zero_copy, int active_channel_count, device::DeviceComm device_comm) {
     const auto sm_id = static_cast<int>(blockIdx.x);
     const auto num_sms = static_cast<int>(gridDim.x);
     const auto thread_id = static_cast<int>(threadIdx.x);
@@ -583,13 +560,8 @@ combine(void* combined_x, int32_t* active_ranks,
     constexpr size_t num_bytes_per_slot = kHidden * EP_BF16_SIZE;
     EP_STATIC_ASSERT(num_bytes_per_slot % sizeof(int4) == 0, "Invalid vectorization");
 
-    // Communication context — platform dispatch is inside comm_device.cuh
-    const CommCtx comm_ctx = make_comm_ctx(
-        mxa_buffer, nvlink_available, ipc_peer_ptrs,
-        raddrs, rkeys, qp_devctxs,
-        rdma_send_signal_buffer, rdma_recv_signal_buffer,
-        rank, num_ranks, MAX_QP_COUNT);
-    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
+    // Backend state and device function pointers are bound on the host.
+    const int channel_count = device_comm.channel_count;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -599,7 +571,7 @@ combine(void* combined_x, int32_t* active_ranks,
     if (sm_id == 0 and warp_group_id == 0 and sub_warp_id == 0) {
         #pragma unroll
         for (int i = lane_id; i < num_experts; i += 32)
-            next_clean_buffer[i] = 0;
+            device::deviceSignalReset(next_clean_buffer + i);
 
         // Notify before executing `int_p`
         __syncwarp();
@@ -607,7 +579,7 @@ combine(void* combined_x, int32_t* active_ranks,
             mc_atomic_add_release(atomic_clean_flag, num_experts);
     }
 
-    // Issue IBGDA sends
+    // Issue remote sends
     if (responsible_expert_idx < num_experts) {
         const auto dst_rank = responsible_expert_idx / num_local_experts;
         const auto local_expert_idx = responsible_expert_idx % num_local_experts;
@@ -623,7 +595,7 @@ combine(void* combined_x, int32_t* active_ranks,
         int offset, num_tokens_to_send;
         unpack2(layout, num_tokens_to_send, offset);
 
-        // Issue IBGDA send
+        // Issue remote send
         for (int token_idx = offset + sub_warp_id; token_idx < offset + num_tokens_to_send; token_idx += kNumWarpsPerGroup) {
             const auto x_int4 = local_x + token_idx * hidden_bf16_int4;
             const auto rdma_send_type_row = reinterpret_cast<int*>(rdma_send_x_vec + token_idx * num_bytes_per_slot);
@@ -636,22 +608,23 @@ combine(void* combined_x, int32_t* active_ranks,
                 reinterpret_cast<uint64_t>(rdma_recv_data_buffer) +
                 (global_expert_idx * num_max_dispatch_tokens_per_rank + src_idx) * num_bytes_per_slot);
 
-            void* write_dst = mc_route_put(comm_ctx, dst_rank, dst_ptr);
+            void* write_dst = device::deviceResolve(device_comm, dst_rank, dst_ptr);
             if (write_dst != nullptr) {
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 mc_fence();
             } else {
-                // IBGDA path — stage to send buffer then RDMA write
+                // Remote backend — stage to send buffer then issue put
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
-                mc_rdma_put(comm_ctx,
-                            ep_qp_channel(local_expert_idx, num_qp_per_rank,
-                                          active_qps_per_rank),
-                            dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
+                device::devicePut(device_comm,
+                            {ep_channel(local_expert_idx, channel_count,
+                                          active_channel_count),
+                             rdma_send_signal_buffer, rdma_recv_signal_buffer},
+                            dst_rank, dst_ptr, buf_ptr,
                             num_bytes_per_slot, lane_id);
             }
         }
@@ -661,13 +634,15 @@ combine(void* combined_x, int32_t* active_ranks,
         if (sub_warp_id == 1 and lane_id == 0) {
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
-                int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
-                mc_signal(comm_ctx, dst_rank,
-                          ep_qp_channel(local_expert_idx, num_qp_per_rank,
-                                        active_qps_per_rank),
-                          num_qp_per_rank, signal_ptr, 1);
+                auto* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
+                device::deviceSignalAdd(device_comm,
+                          {ep_channel(local_expert_idx, channel_count,
+                                        active_channel_count),
+                           rdma_send_signal_buffer, rdma_recv_signal_buffer},
+                          dst_rank, signal_ptr, 1);
             } else {
-                mc_st_release(rdma_recv_signal_buffer + global_expert_idx, 1);
+                device::deviceSignalAdd(device_comm, {}, rank,
+                    rdma_recv_signal_buffer + global_expert_idx, 1);
             }
             mc_atomic_add_release(atomic_clean_flag, -1);
         }
@@ -687,7 +662,7 @@ combine(void* combined_x, int32_t* active_ranks,
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0) {
             unsigned long long start_time = clock64();
-            while (mc_ld_acquire(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
+            while (device::deviceSignalRead(device_comm, rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
                 unsigned long long end_time = clock64();
                 if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
                     active_ranks[src_rank] = 0;
@@ -754,20 +729,16 @@ combine(void* combined_x, int32_t* active_ranks,
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
-             void* mxa_buffer,
-             int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
+             int* rdma_send_signal_buffer, device::DeviceSignal* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
-             void* cuda_counter_buffer, void* cuda_data_buffer,
-             void* raddrs, void* rkeys, void* qp_devctxs,
-             const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
              const void* x, const int64_t* topk_idx, const float* topk_weights,
              const int* src_info, const int64_t* layout_range,
-             int* next_clean_buffer,
+             device::DeviceSignal* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
              int num_topk, int num_experts, int rank, int num_ranks,
              void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy,
-             int active_qps_per_rank) {
+             int active_channel_count, device::DeviceComm device_comm) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 17;
@@ -784,19 +755,15 @@ void combine(void* combined_x, int32_t* active_ranks,
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, \
               combined_x, active_ranks, \
-              mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
-              cuda_counter_buffer, cuda_data_buffer, \
-              raddrs, rkeys, qp_devctxs, \
-              nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, topk_weights, src_info, layout_range, \
               next_clean_buffer, \
               atomic_clean_flag, \
               num_combined_tokens, hidden, num_topk, \
               num_max_dispatch_tokens_per_rank, \
               num_experts, rank, num_ranks, \
-              timeout_ticks, phases, zero_copy, active_qps_per_rank); } break
+              timeout_ticks, phases, zero_copy, active_channel_count, device_comm); } break
 
     SETUP_LAUNCH_CONFIG(num_sms, num_warps * 32, stream);
     SWITCH_HIDDEN(COMBINE_LAUNCH_CASE);

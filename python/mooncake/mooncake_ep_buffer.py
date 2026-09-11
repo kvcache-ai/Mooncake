@@ -98,6 +98,7 @@ class Buffer:
         group: dist.ProcessGroup,
         num_ep_buffer_bytes: int = 0,
         disable_p2p: bool = False,
+        transport: str = "ibgda",
     ):
         from mooncake import ep
 
@@ -107,9 +108,35 @@ class Buffer:
         self.group = group
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
         self.backend = self.group
+        self.transport = os.getenv("MOONCAKE_EP_TRANSPORT", transport).lower()
+        # All ranks select the same backend. Keep IBGDA's original bootstrap
+        # sequence so replacement ranks can pair with survivors' connect().
+        if self.transport not in ("ibgda", "nccl"):
+            raise ValueError("legacy transport must be ibgda or nccl")
+        unique_id = []
+        if self.transport == "nccl":
+            # Exchange failure together with the ID, so a root-side error
+            # cannot strand the other ranks in native initialization.
+            payload = [None]
+            if self.rank == 0:
+                try:
+                    payload[0] = (list(ep.create_nccl_unique_id()), None)
+                except Exception as exc:
+                    payload[0] = ([], str(exc))
+            dist.broadcast_object_list(
+                payload, src=dist.get_global_rank(self.group, 0), group=self.group
+            )
+            unique_id, error = payload[0]
+            if error is not None:
+                raise RuntimeError(error)
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes, disable_p2p
+            self.rank,
+            self.group_size,
+            num_ep_buffer_bytes,
+            disable_p2p,
+            self.transport,
+            unique_id,
         )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
@@ -120,6 +147,19 @@ class Buffer:
         self._maca_phase_recv_tokens: Optional[List[torch.Tensor]] = None
         self._warned_active_ranks_without_mooncake_backend = False
         self.connect()
+
+    def destroy(self) -> None:
+        """Release the buffer after all ranks finish accessing it.
+
+        NCCL callers must invoke this collectively before destroying group.
+        """
+        if self.runtime is None:
+            return
+        torch.cuda.synchronize()
+        if self.transport == "nccl":
+            dist.barrier(group=self.group)
+        self.runtime.destroy()
+        self.runtime = None
 
     def _maca_phase_fence(self, send_event: Optional[Any] = None) -> None:
         if not _USE_MACA:
@@ -183,6 +223,14 @@ class Buffer:
 
     def connect(self, is_update: bool = False):
         from mooncake import ep
+
+        if self.transport == "nccl":
+            if is_update:
+                raise NotImplementedError(
+                    "NCCL communicator membership is fixed; recreate Buffer"
+                )
+            self._use_fallback = False
+            return
 
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
@@ -536,7 +584,9 @@ class Buffer:
             (packed_recv_x, packed_recv_x_scales) if use_fp8 else packed_recv_x,
             packed_recv_count,
             handle,
-            EventOverlap(event, tensors_to_record if async_finish or return_recv_hook else None),
+            EventOverlap(
+                event, tensors_to_record if async_finish or return_recv_hook else None
+            ),
             hook,
         )
 
@@ -677,7 +727,9 @@ class Buffer:
         )
         return (
             combined_x,
-            EventOverlap(event, tensors_to_record if async_finish or return_recv_hook else None),
+            EventOverlap(
+                event, tensors_to_record if async_finish or return_recv_hook else None
+            ),
             hook,
         )
 
