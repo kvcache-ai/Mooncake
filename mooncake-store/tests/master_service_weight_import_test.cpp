@@ -191,6 +191,80 @@ TEST_F(MasterServiceWeightImportTest, CommitFailsWhenPayloadMissing) {
     auto got = service.GetWeightMetadata(GetWeightMetadataRequest{id});
     ASSERT_FALSE(got.has_value());
     EXPECT_EQ(got.error(), ErrorCode::WEIGHT_NOT_FOUND);
+
+    // Failed transfer path: abort IMPORTING and delete partial objects.
+    const std::string partial =
+        "weights/demo/model-b/v1/1/partial-payload";
+    PutCompletedObject(service, client_id, partial, segment.name,
+                       ObjectDataType::WEIGHT, group_id);
+
+    AbortWeightImportRequest abort_req;
+    abort_req.identity = id;
+    abort_req.expected_metadata_generation = 1;
+    abort_req.keys_to_remove = {partial, manifest};
+    auto aborted = service.AbortWeightImport(abort_req);
+    ASSERT_TRUE(aborted.has_value()) << toString(aborted.error());
+    EXPECT_EQ(aborted->metadata.availability, WeightAvailabilityState::DELETED);
+    EXPECT_FALSE(aborted->removed_keys.empty());
+
+    auto partial_exists = service.ExistKey(partial, TenantId::Default());
+    ASSERT_TRUE(partial_exists.has_value());
+    EXPECT_FALSE(*partial_exists);
+}
+
+TEST_F(MasterServiceWeightImportTest, RemovePublishedRevisionDeletesPayload) {
+    MasterServiceConfig config;
+    MasterService service(config);
+
+    const Segment segment = MakeSegment("weight_remove_segment");
+    const UUID client_id = MountSegment(service, segment);
+
+    const std::string group_id = "weight-group-remove";
+    const std::string payload0 = "weights/demo/model-c/v1/1/payload-0";
+    const std::string manifest = "weights/demo/model-c/v1/1/manifest";
+
+    PutCompletedObject(service, client_id, payload0, segment.name,
+                       ObjectDataType::WEIGHT, group_id);
+    PutCompletedObject(service, client_id, manifest, segment.name,
+                       ObjectDataType::METADATA, group_id);
+
+    WeightRevisionIdentity id = MakeIdentity();
+    id.resource_id = "model-c";
+
+    BeginWeightImportRequest begin_req;
+    begin_req.identity = id;
+    begin_req.payload_group_id = group_id;
+    begin_req.policy.preferred_residency = WeightResidencyState::HOT;
+    begin_req.policy.mixed_hot_ratio = 0.5;
+    begin_req.policy.migration_mode = WeightMigrationMode::MANUAL;
+    ASSERT_TRUE(service.BeginWeightImport(begin_req).has_value());
+
+    CommitWeightImportRequest commit_req;
+    commit_req.identity = id;
+    commit_req.expected_metadata_generation = 1;
+    commit_req.manifest_key = manifest;
+    commit_req.manifest_sha256 = "sha";
+    commit_req.payload_keys_digest = "digest";
+    commit_req.payload_count = 1;
+    commit_req.logical_payload_bytes = 1024;
+    commit_req.payload_keys = {payload0};
+    ASSERT_TRUE(service.CommitWeightImport(commit_req).has_value());
+
+    RemoveWeightRevisionRequest remove_req;
+    remove_req.identity = id;
+    remove_req.expected_metadata_generation = 2;
+    auto removed = service.RemoveWeightRevision(remove_req);
+    ASSERT_TRUE(removed.has_value()) << toString(removed.error());
+    EXPECT_EQ(removed->metadata.availability, WeightAvailabilityState::DELETED);
+    EXPECT_EQ(removed->removed_keys.size(), 2u);
+
+    auto got = service.GetWeightMetadata(GetWeightMetadataRequest{id});
+    ASSERT_FALSE(got.has_value());
+    EXPECT_EQ(got.error(), ErrorCode::WEIGHT_NOT_FOUND);
+
+    auto payload_exists = service.ExistKey(payload0, TenantId::Default());
+    ASSERT_TRUE(payload_exists.has_value());
+    EXPECT_FALSE(*payload_exists);
 }
 
 }  // namespace mooncake::test

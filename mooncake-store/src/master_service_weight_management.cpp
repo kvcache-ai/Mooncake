@@ -68,4 +68,61 @@ MasterService::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
     return UpdateWeightPolicyResponse{std::move(*metadata)};
 }
 
+namespace {
+
+std::vector<std::string> CollectSuccessfullyRemovedKeys(
+    const std::vector<std::string>& keys,
+    const std::vector<tl::expected<void, ErrorCode>>& results) {
+    std::vector<std::string> removed;
+    removed.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        // OBJECT_NOT_FOUND is fine during cleanup of a partial transfer.
+        if (results[i] || results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+            removed.push_back(keys[i]);
+        }
+    }
+    return removed;
+}
+
+}  // namespace
+
+tl::expected<AbortWeightImportResponse, ErrorCode>
+MasterService::AbortWeightImport(const AbortWeightImportRequest& request) {
+    auto result = weight_metadata_store_.AbortImport(request);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
+
+    auto& [metadata, keys] = *result;
+    AbortWeightImportResponse response;
+    response.metadata = std::move(metadata);
+    if (!keys.empty()) {
+        const TenantId tenant_id(request.identity.tenant_id);
+        auto remove_results = BatchRemove(keys, tenant_id, /*force=*/true);
+        response.removed_keys =
+            CollectSuccessfullyRemovedKeys(keys, remove_results);
+    }
+    return response;
+}
+
+tl::expected<RemoveWeightRevisionResponse, ErrorCode>
+MasterService::RemoveWeightRevision(
+    const RemoveWeightRevisionRequest& request) {
+    auto result = weight_metadata_store_.RemoveRevision(request);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
+
+    auto& [metadata, keys] = *result;
+    RemoveWeightRevisionResponse response;
+    response.metadata = std::move(metadata);
+    if (!keys.empty()) {
+        const TenantId tenant_id(request.identity.tenant_id);
+        auto remove_results = BatchRemove(keys, tenant_id, /*force=*/true);
+        response.removed_keys =
+            CollectSuccessfullyRemovedKeys(keys, remove_results);
+    }
+    return response;
+}
+
 }  // namespace mooncake

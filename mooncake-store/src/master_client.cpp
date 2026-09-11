@@ -360,6 +360,16 @@ struct RpcNameTraits<&WrappedMasterService::UpdateWeightPolicy> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::AbortWeightImport> {
+    static constexpr const char* value = "AbortWeightImport";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveWeightRevision> {
+    static constexpr const char* value = "RemoveWeightRevision";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
@@ -1409,6 +1419,19 @@ tl::expected<UpdateWeightPolicyResponse, ErrorCode>
 MasterClient::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
     return invoke_rpc<&WrappedMasterService::UpdateWeightPolicy,
                       UpdateWeightPolicyResponse>(request);
+}
+
+tl::expected<AbortWeightImportResponse, ErrorCode>
+MasterClient::AbortWeightImport(const AbortWeightImportRequest& request) {
+    return invoke_rpc<&WrappedMasterService::AbortWeightImport,
+                      AbortWeightImportResponse>(request);
+}
+
+tl::expected<RemoveWeightRevisionResponse, ErrorCode>
+MasterClient::RemoveWeightRevision(
+    const RemoveWeightRevisionRequest& request) {
+    return invoke_rpc<&WrappedMasterService::RemoveWeightRevision,
+                      RemoveWeightRevisionResponse>(request);
 }
 
 }  // namespace mooncake

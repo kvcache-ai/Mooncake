@@ -681,6 +681,10 @@ class MasterClient {
     ListWeightRevisions(const ListWeightRevisionsRequest& request);
     [[nodiscard]] tl::expected<UpdateWeightPolicyResponse, ErrorCode>
     UpdateWeightPolicy(const UpdateWeightPolicyRequest& request);
+    [[nodiscard]] tl::expected<AbortWeightImportResponse, ErrorCode>
+    AbortWeightImport(const AbortWeightImportRequest& request);
+    [[nodiscard]] tl::expected<RemoveWeightRevisionResponse, ErrorCode>
+    RemoveWeightRevision(const RemoveWeightRevisionRequest& request);
 
    private:
     /**

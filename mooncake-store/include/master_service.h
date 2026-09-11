@@ -186,6 +186,10 @@ class MasterService {
         const ListWeightRevisionsRequest& request) const;
     tl::expected<UpdateWeightPolicyResponse, ErrorCode> UpdateWeightPolicy(
         const UpdateWeightPolicyRequest& request);
+    tl::expected<AbortWeightImportResponse, ErrorCode> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    tl::expected<RemoveWeightRevisionResponse, ErrorCode> RemoveWeightRevision(
+        const RemoveWeightRevisionRequest& request);
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);

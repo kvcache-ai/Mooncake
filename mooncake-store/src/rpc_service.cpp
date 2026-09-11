@@ -1745,6 +1745,18 @@ WrappedMasterService::UpdateWeightPolicy(
     return master_service_.UpdateWeightPolicy(request);
 }
 
+tl::expected<AbortWeightImportResponse, ErrorCode>
+WrappedMasterService::AbortWeightImport(
+    const AbortWeightImportRequest& request) {
+    return master_service_.AbortWeightImport(request);
+}
+
+tl::expected<RemoveWeightRevisionResponse, ErrorCode>
+WrappedMasterService::RemoveWeightRevision(
+    const RemoveWeightRevisionRequest& request) {
+    return master_service_.RemoveWeightRevision(request);
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
@@ -1915,6 +1927,11 @@ void RegisterRpcService(
             &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::UpdateWeightPolicy>(
+            &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::AbortWeightImport>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::RemoveWeightRevision>(
             &wrapped_master_service);
 }
 

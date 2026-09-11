@@ -102,12 +102,13 @@ struct WeightRevisionMetadata {
     std::string payload_keys_digest;
     uint64_t payload_count = 0;
     uint64_t logical_payload_bytes = 0;
+    std::vector<std::string> payload_keys;
     std::string operation_id;  // empty = no active operation
 };
 YLT_REFL(WeightRevisionMetadata, identity, availability, observed_residency,
          policy, metadata_generation, manifest_key, manifest_sha256,
          payload_group_id, payload_keys_digest, payload_count,
-         logical_payload_bytes, operation_id);
+         logical_payload_bytes, payload_keys, operation_id);
 
 struct BeginWeightImportRequest {
     WeightRevisionIdentity identity;
@@ -178,6 +179,35 @@ struct UpdateWeightPolicyResponse {
     WeightRevisionMetadata metadata;
 };
 YLT_REFL(UpdateWeightPolicyResponse, metadata);
+
+// Abort an in-flight IMPORTING revision. Optional keys_to_remove lets the
+// caller clean up partially written objects after a failed transfer.
+struct AbortWeightImportRequest {
+    WeightRevisionIdentity identity;
+    uint64_t expected_metadata_generation = 0;
+    std::vector<std::string> keys_to_remove;
+};
+YLT_REFL(AbortWeightImportRequest, identity, expected_metadata_generation,
+         keys_to_remove);
+
+struct AbortWeightImportResponse {
+    WeightRevisionMetadata metadata;
+    std::vector<std::string> removed_keys;
+};
+YLT_REFL(AbortWeightImportResponse, metadata, removed_keys);
+
+// Explicit whole-revision delete (RFC weight_remove subset for PR1).
+struct RemoveWeightRevisionRequest {
+    WeightRevisionIdentity identity;
+    uint64_t expected_metadata_generation = 0;
+};
+YLT_REFL(RemoveWeightRevisionRequest, identity, expected_metadata_generation);
+
+struct RemoveWeightRevisionResponse {
+    WeightRevisionMetadata metadata;
+    std::vector<std::string> removed_keys;
+};
+YLT_REFL(RemoveWeightRevisionResponse, metadata, removed_keys);
 
 inline const char* ToString(WeightAvailabilityState state) {
     switch (state) {

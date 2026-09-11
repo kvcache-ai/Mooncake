@@ -65,10 +65,12 @@ TEST_F(WeightMetadataStoreTest, BeginCommitGetListUpdateHappyPath) {
     EXPECT_EQ(commit->availability, WeightAvailabilityState::READY);
     EXPECT_EQ(commit->observed_residency, WeightResidencyState::HOT);
     EXPECT_EQ(commit->metadata_generation, 2u);
+    EXPECT_EQ(commit->payload_keys, commit_req.payload_keys);
 
     auto got = store_.Get(identity);
     ASSERT_TRUE(got.has_value());
     EXPECT_EQ(got->manifest_key, commit_req.manifest_key);
+    EXPECT_EQ(got->payload_keys, commit_req.payload_keys);
 
     auto listed = store_.List(
         ListWeightRevisionsRequest{"default", "ns", "model-a", 0, 10});
@@ -144,6 +146,63 @@ TEST_F(WeightMetadataStoreTest, IdempotentBeginWhileImporting) {
     auto again = store_.BeginImport(begin_req);
     ASSERT_TRUE(again.has_value());
     EXPECT_EQ(again->availability, WeightAvailabilityState::IMPORTING);
+}
+
+TEST_F(WeightMetadataStoreTest, AbortImportingCleansUpAndAllowsRetry) {
+    const auto identity = MakeIdentity("model-abort");
+    BeginWeightImportRequest begin_req;
+    begin_req.identity = identity;
+    begin_req.policy = MakePolicy();
+    begin_req.payload_group_id = "group-abort";
+    ASSERT_TRUE(store_.BeginImport(begin_req).has_value());
+
+    AbortWeightImportRequest abort_req;
+    abort_req.identity = identity;
+    abort_req.expected_metadata_generation = 1;
+    abort_req.keys_to_remove = {"partial-0", "partial-1", "partial-0"};
+    auto aborted = store_.AbortImport(abort_req);
+    ASSERT_TRUE(aborted.has_value());
+    EXPECT_EQ(aborted->first.availability, WeightAvailabilityState::DELETED);
+    EXPECT_EQ(aborted->first.metadata_generation, 2u);
+    ASSERT_EQ(aborted->second.size(), 2u);
+
+    auto raw = store_.GetRawForTesting(identity);
+    ASSERT_TRUE(raw.has_value());
+    EXPECT_EQ(raw->availability, WeightAvailabilityState::DELETED);
+
+    // Fresh import is allowed on the DELETED tombstone.
+    auto again = store_.BeginImport(begin_req);
+    ASSERT_TRUE(again.has_value());
+    EXPECT_EQ(again->availability, WeightAvailabilityState::IMPORTING);
+    EXPECT_EQ(again->metadata_generation, 3u);
+}
+
+TEST_F(WeightMetadataStoreTest, RemoveReadyReturnsStoredPayloadKeys) {
+    const auto identity = MakeIdentity("model-remove");
+    BeginWeightImportRequest begin_req;
+    begin_req.identity = identity;
+    begin_req.policy = MakePolicy();
+    begin_req.payload_group_id = "group-remove";
+    ASSERT_TRUE(store_.BeginImport(begin_req).has_value());
+
+    CommitWeightImportRequest commit_req;
+    commit_req.identity = identity;
+    commit_req.expected_metadata_generation = 1;
+    commit_req.manifest_key = "manifest";
+    commit_req.payload_keys_digest = "d";
+    commit_req.payload_count = 2;
+    commit_req.payload_keys = {"p0", "p1"};
+    ASSERT_TRUE(store_.CommitImport(commit_req).has_value());
+
+    RemoveWeightRevisionRequest remove_req;
+    remove_req.identity = identity;
+    remove_req.expected_metadata_generation = 2;
+    auto removed = store_.RemoveRevision(remove_req);
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed->first.availability, WeightAvailabilityState::DELETED);
+    EXPECT_EQ(removed->second,
+              (std::vector<std::string>{"p0", "p1", "manifest"}));
+    EXPECT_EQ(store_.Get(identity).error(), ErrorCode::WEIGHT_NOT_FOUND);
 }
 
 }  // namespace mooncake::test

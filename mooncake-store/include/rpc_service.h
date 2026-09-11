@@ -342,6 +342,10 @@ class WrappedMasterService {
         const ListWeightRevisionsRequest& request);
     tl::expected<UpdateWeightPolicyResponse, ErrorCode> UpdateWeightPolicy(
         const UpdateWeightPolicyRequest& request);
+    tl::expected<AbortWeightImportResponse, ErrorCode> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    tl::expected<RemoveWeightRevisionResponse, ErrorCode> RemoveWeightRevision(
+        const RemoveWeightRevisionRequest& request);
 
    private:
     MasterService master_service_;

@@ -4,6 +4,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
@@ -35,8 +36,23 @@ class WeightMetadataStore {
     tl::expected<WeightRevisionMetadata, ErrorCode> UpdatePolicy(
         const UpdateWeightPolicyRequest& request);
 
+    // Abort IMPORTING (or clean up after a failed transfer). Returns the keys
+    // that MasterService should physically remove.
+    tl::expected<std::pair<WeightRevisionMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    AbortImport(const AbortWeightImportRequest& request);
+
+    // Delete a visible or importing revision and return keys to remove.
+    tl::expected<std::pair<WeightRevisionMetadata, std::vector<std::string>>,
+                 ErrorCode>
+    RemoveRevision(const RemoveWeightRevisionRequest& request);
+
     // Test helper: number of tracked revisions including IMPORTING/DELETED.
     size_t SizeForTesting() const;
+
+    // Test helper: read raw metadata including IMPORTING/DELETED.
+    std::optional<WeightRevisionMetadata> GetRawForTesting(
+        const WeightRevisionIdentity& identity) const;
 
    private:
     mutable std::mutex mutex_;

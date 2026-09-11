@@ -1,8 +1,27 @@
 #include "weight_metadata_store.h"
 
 #include <algorithm>
+#include <unordered_set>
 
 namespace mooncake {
+
+namespace {
+
+std::vector<std::string> UniqueNonEmptyKeys(
+    const std::vector<std::string>& keys) {
+    std::unordered_set<std::string> seen;
+    std::vector<std::string> out;
+    out.reserve(keys.size());
+    for (const auto& key : keys) {
+        if (key.empty() || !seen.insert(key).second) {
+            continue;
+        }
+        out.push_back(key);
+    }
+    return out;
+}
+
+}  // namespace
 
 tl::expected<WeightRevisionMetadata, ErrorCode>
 WeightMetadataStore::BeginImport(const BeginWeightImportRequest& request) {
@@ -78,6 +97,7 @@ WeightMetadataStore::CommitImport(const CommitWeightImportRequest& request) {
     metadata.payload_keys_digest = request.payload_keys_digest;
     metadata.payload_count = request.payload_count;
     metadata.logical_payload_bytes = request.logical_payload_bytes;
+    metadata.payload_keys = request.payload_keys;
     metadata.availability = WeightAvailabilityState::READY;
     metadata.observed_residency = WeightResidencyState::HOT;
     metadata.metadata_generation += 1;
@@ -176,9 +196,94 @@ WeightMetadataStore::UpdatePolicy(const UpdateWeightPolicyRequest& request) {
     return metadata;
 }
 
+tl::expected<std::pair<WeightRevisionMetadata, std::vector<std::string>>,
+             ErrorCode>
+WeightMetadataStore::AbortImport(const AbortWeightImportRequest& request) {
+    if (!request.identity.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = revisions_.find(request.identity.ToKey());
+    if (it == revisions_.end()) {
+        return tl::make_unexpected(ErrorCode::WEIGHT_NOT_FOUND);
+    }
+
+    auto& metadata = it->second;
+    if (metadata.availability == WeightAvailabilityState::DELETED) {
+        // Idempotent abort after a previous cleanup.
+        return std::make_pair(metadata, std::vector<std::string>{});
+    }
+    if (metadata.availability != WeightAvailabilityState::IMPORTING) {
+        return tl::make_unexpected(ErrorCode::WEIGHT_CONFLICT);
+    }
+    if (request.expected_metadata_generation != 0 &&
+        request.expected_metadata_generation != metadata.metadata_generation) {
+        return tl::make_unexpected(ErrorCode::WEIGHT_STALE_GENERATION);
+    }
+
+    auto keys = UniqueNonEmptyKeys(request.keys_to_remove);
+    metadata.availability = WeightAvailabilityState::DELETED;
+    metadata.observed_residency = WeightResidencyState::UNKNOWN;
+    metadata.operation_id.clear();
+    metadata.metadata_generation += 1;
+    return std::make_pair(metadata, std::move(keys));
+}
+
+tl::expected<std::pair<WeightRevisionMetadata, std::vector<std::string>>,
+             ErrorCode>
+WeightMetadataStore::RemoveRevision(
+    const RemoveWeightRevisionRequest& request) {
+    if (!request.identity.IsValid()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = revisions_.find(request.identity.ToKey());
+    if (it == revisions_.end()) {
+        return tl::make_unexpected(ErrorCode::WEIGHT_NOT_FOUND);
+    }
+
+    auto& metadata = it->second;
+    if (metadata.availability == WeightAvailabilityState::DELETED) {
+        return std::make_pair(metadata, std::vector<std::string>{});
+    }
+    if (metadata.availability != WeightAvailabilityState::READY &&
+        metadata.availability != WeightAvailabilityState::DEGRADED &&
+        metadata.availability != WeightAvailabilityState::IMPORTING) {
+        return tl::make_unexpected(ErrorCode::WEIGHT_CONFLICT);
+    }
+    if (request.expected_metadata_generation != 0 &&
+        request.expected_metadata_generation != metadata.metadata_generation) {
+        return tl::make_unexpected(ErrorCode::WEIGHT_STALE_GENERATION);
+    }
+
+    std::vector<std::string> keys = metadata.payload_keys;
+    if (!metadata.manifest_key.empty()) {
+        keys.push_back(metadata.manifest_key);
+    }
+    keys = UniqueNonEmptyKeys(keys);
+
+    metadata.availability = WeightAvailabilityState::DELETED;
+    metadata.observed_residency = WeightResidencyState::UNKNOWN;
+    metadata.operation_id.clear();
+    metadata.metadata_generation += 1;
+    return std::make_pair(metadata, std::move(keys));
+}
+
 size_t WeightMetadataStore::SizeForTesting() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return revisions_.size();
+}
+
+std::optional<WeightRevisionMetadata> WeightMetadataStore::GetRawForTesting(
+    const WeightRevisionIdentity& identity) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = revisions_.find(identity.ToKey());
+    if (it == revisions_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
 }
 
 }  // namespace mooncake
