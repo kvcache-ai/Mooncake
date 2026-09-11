@@ -1242,6 +1242,54 @@ TEST_F(DfsBucketBackendTest, BatchReadMixedContiguousAndNonContiguous) {
     }
 }
 
+TEST_F(DfsBucketBackendTest, MergedBatchReadUsesIndependentIoTasks) {
+    const std::string key1 = "merged_task_key_1";
+    const std::string key2 = "merged_task_key_2";
+    const std::string key3 = "merged_task_key_3";
+    const std::string value1(100, 'A');
+    const std::string value2(100, 'B');
+    const std::string value3(100, 'C');
+
+    auto desc1 = WriteObject(key1, value1);
+    auto desc2 = WriteObject(key2, value2);
+    // Force a gap before key3 so the merged-read path must produce more than
+    // one task for a single bucket.
+    ASSERT_TRUE(allocator_->Allocate("merged_task_spacer", 4096).has_value());
+    auto desc3 = WriteObject(key3, value3);
+
+    backend_.reset();
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+    config_.batch_read_merge_enabled = true;
+    config_.direct_read_enabled = false;
+    config_.batch_read_threads = 2;
+    auto adapter = std::make_unique<FaultyPosixFsAdapter>();
+    adapter_ = adapter.get();
+    backend_ = std::make_shared<DistributedStorageBackend>(
+        file_config, config_, std::move(adapter));
+    ASSERT_TRUE(backend_->Init().has_value());
+
+    std::string output1(value1.size(), '\0');
+    std::string output2(value2.size(), '\0');
+    std::string output3(value3.size(), '\0');
+    const std::vector<DfsReadRequest> reads{
+        {key1, desc1, {{output1.data(), output1.size()}}},
+        {key2, desc2, {{output2.data(), output2.size()}}},
+        {key3, desc3, {{output3.data(), output3.size()}}},
+    };
+
+    auto results = backend_->BatchRead(reads);
+    ASSERT_EQ(results.size(), reads.size());
+    for (const auto& result : results) EXPECT_TRUE(result.has_value());
+    EXPECT_EQ(output1, value1);
+    EXPECT_EQ(output2, value2);
+    EXPECT_EQ(output3, value3);
+    // With a single bucket, two contiguous reads merge into one task and the
+    // third read runs as an independent task.
+    EXPECT_EQ(adapter_->ReadCalls(), 2);
+}
+
 TEST(PosixFsAdapterDirectReadTest, HandlesUnalignedScatterBuffers) {
     BucketTempDir dir("dfs_direct_unaligned");
     PosixFsAdapter adapter;

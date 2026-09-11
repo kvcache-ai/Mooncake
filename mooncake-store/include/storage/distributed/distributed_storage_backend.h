@@ -152,12 +152,10 @@ class DistributedStorageBackend : public StorageBackendInterface {
      * SHARD mode validates against the fixed shard table. BUCKET mode
      * canonicalizes the descriptor path, verifies it names the expected bucket
      * data file under the configured DFS root, and then opens/caches it.
-     * When `resolved_path` is non-null, BUCKET mode stores the canonical
-     * bucket data file path there.
      */
     tl::expected<ResolvedTarget, ErrorCode> ResolveTarget(
         const DistributedFSDescriptor& descriptor, const std::string& key,
-        std::string* resolved_path = nullptr);
+        bool read_only = false);
 
     tl::expected<std::shared_ptr<OpenFileHandle>, ErrorCode> GetOrOpenBucket(
         const std::string& path);
@@ -171,96 +169,52 @@ class DistributedStorageBackend : public StorageBackendInterface {
     GetOrOpenBucketDirect(const std::string& path);
 
     /**
-     * @brief One validated BUCKET-mode read, resolved but not yet issued.
-     */
-    struct PreparedRead {
-        size_t request_index = 0;
-        ResolvedTarget target;
-        uint64_t entry_start = 0;
-        uint64_t reserved_size = 0;
-    };
-
-    /**
-     * @brief Every read of one batch that targets the same bucket data file.
+     * @brief One contiguous read scheduled as a single task.
      *
-     * Keyed on the handle's mutex rather than its fd: an fd number can be
-     * reused once a handle is closed, while the mutex address uniquely
-     * identifies the open handle for as long as a PreparedRead in the group
-     * keeps it alive through `ResolvedTarget::keepalive`.
+     * `entries` references the requests covered by this task. For direct,
+     * unmerged reads it contains one entry; for merged bucket reads it may
+     * contain several entries that share one contiguous on-disk run.
      */
-    struct BucketReadGroup {
-        std::mutex* mutex = nullptr;
-        std::vector<PreparedRead> reads;
+    struct ReadEntry {
+        size_t request_index = 0;
+        uint64_t value_offset = 0;
     };
 
-    /**
-     * @brief A run of contiguous entries collapsed into a single read.
-     */
-    struct MergedIo {
-        uint64_t entry_start = 0;
+    struct ReadTask {
+        ResolvedTarget target;
+        uint64_t io_offset = 0;
         uint64_t total_size = 0;
-        std::vector<const PreparedRead*> reads;
+        bool merged = false;
+        bool direct_read = false;
+        std::vector<ReadEntry> entries;
     };
 
     static ErrorCode ReadFully(FileSystemAdapter* fs_adapter,
                                const ResolvedTarget& target, uint64_t offset,
-                               std::span<char> output);
+                               std::span<char> output, bool direct_read);
 
-    /// Scatter `value` (object_size bytes) across the request's slices.
     static void CopyToSlices(const DfsReadRequest& request, const char* value);
 
-    /// Consumes `prepared`, bucketing its entries by open file handle.
-    static std::unordered_map<std::mutex*, BucketReadGroup> GroupReadsByBucket(
-        std::vector<PreparedRead>&& prepared);
-
-    static void SortGroupByOffset(BucketReadGroup& group);
-
-    static std::vector<MergedIo> BuildMergedIos(const BucketReadGroup& group);
-
-    static void ExecuteMergedRead(
-        const MergedIo& io, const std::vector<DfsReadRequest>& requests,
-        std::vector<tl::expected<void, ErrorCode>>& results,
-        const ResolvedTarget& target, std::mutex* mutex,
-        FileSystemAdapter* fs_adapter, std::vector<char>& staging);
-
-    static void FailGroupReads(
-        const BucketReadGroup& group,
-        std::vector<tl::expected<void, ErrorCode>>& results, ErrorCode error);
-
-    static void ProcessBucketGroup(
-        BucketReadGroup& group, const std::vector<DfsReadRequest>& requests,
-        std::vector<tl::expected<void, ErrorCode>>& results,
-        FileSystemAdapter* fs_adapter);
-
-    /**
-     * @brief One validated read for the per-key direct flow.
-     *
-     * `target` already points at the direct read handle when one is
-     * available; `mutex` is null for direct handles because read-only,
-     * offset-explicit I/O needs no serialization against other reads.
-     */
-    struct PreparedKeyRead {
-        size_t request_index = 0;
-        ResolvedTarget target;
-        uint64_t value_offset = 0;
-    };
-
-    std::vector<tl::expected<void, ErrorCode>> BatchReadDirect(
-        const std::vector<DfsReadRequest>& requests);
-
-    /**
-     * @brief Read one key's value (object_size bytes at value_offset) straight
-     * into the request's slices.
-     */
-    void ExecuteKeyRead(const PreparedKeyRead& read,
-                        const std::vector<DfsReadRequest>& requests,
-                        std::vector<tl::expected<void, ErrorCode>>& results);
-
-    static void DispatchParallelReads(
-        std::unordered_map<std::mutex*, BucketReadGroup>& groups,
+    std::vector<ReadTask> PrepareReadTasks(
         const std::vector<DfsReadRequest>& requests,
-        std::vector<tl::expected<void, ErrorCode>>& results, ThreadPool& pool,
-        FileSystemAdapter* fs_adapter);
+        std::vector<tl::expected<void, ErrorCode>>& results);
+
+    void ExecuteReadTask(const ReadTask& task,
+                         const std::vector<DfsReadRequest>& requests,
+                         std::vector<tl::expected<void, ErrorCode>>& results);
+
+    void ExecuteSingleReadTask(
+        const ReadTask& task, const std::vector<DfsReadRequest>& requests,
+        std::vector<tl::expected<void, ErrorCode>>& results);
+
+    void ExecuteMergedReadTask(
+        const ReadTask& task, const std::vector<DfsReadRequest>& requests,
+        std::vector<tl::expected<void, ErrorCode>>& results);
+
+    void ExecuteReadTasks(
+        const std::vector<ReadTask>& tasks,
+        const std::vector<DfsReadRequest>& requests,
+        std::vector<tl::expected<void, ErrorCode>>& results);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
     std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
