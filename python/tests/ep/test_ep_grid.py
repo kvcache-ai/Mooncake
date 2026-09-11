@@ -203,6 +203,18 @@ def run_test_iteration(
 def worker(rank, world_size, config_dict):
     import_torchada_if_needed()
 
+    # MACA C500 validation can require one active HCA per local GPU. Keep the
+    # existing single-filter behavior, while allowing a test-only per-rank
+    # override such as ``mlx5_10;mlx5_11``.
+    per_rank_filters = os.getenv("MOONCAKE_EP_DEVICE_FILTERS")
+    if per_rank_filters:
+        filters = per_rank_filters.split(";")
+        if rank >= len(filters) or not filters[rank]:
+            raise RuntimeError(
+                "MOONCAKE_EP_DEVICE_FILTERS must provide one filter per rank"
+            )
+        os.environ["MOONCAKE_EP_DEVICE_FILTER"] = filters[rank]
+
     # Device filter
     device_filter = [
         f
