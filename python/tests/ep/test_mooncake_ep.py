@@ -265,6 +265,14 @@ def test_main(
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
+    per_rank_filters = os.getenv("MOONCAKE_EP_DEVICE_FILTERS")
+    if per_rank_filters:
+        filters = per_rank_filters.split(";")
+        if local_rank >= len(filters) or not filters[local_rank]:
+            raise RuntimeError(
+                "MOONCAKE_EP_DEVICE_FILTERS must provide one filter per rank"
+            )
+        os.environ["MOONCAKE_EP_DEVICE_FILTER"] = filters[local_rank]
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
     num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
