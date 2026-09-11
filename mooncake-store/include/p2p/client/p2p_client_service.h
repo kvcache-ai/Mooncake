@@ -560,7 +560,8 @@ class P2PClientService final : public ClientService {
 
     async_simple::coro::Lazy<std::vector<ResolvedRoute>>
     AsyncResolveRoutesFromMaster(std::string_view key,
-                                 const ReadRouteConfig& config);
+                                 const ReadRouteConfig& config,
+                                 std::string ctx_attachment = {});
 
     /**
      * @brief Get or create a PeerClient for the given endpoint.

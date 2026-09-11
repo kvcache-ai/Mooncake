@@ -16,6 +16,7 @@
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
+#include "request_context.h"
 
 namespace mooncake {
 
@@ -354,6 +355,48 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
+}
+
+tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
+    std::string_view key, const GetReplicaListRequestConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
+    timer.LogRequest("object_key=", key);
+
+    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
+                             GetReplicaListResponse>(key, config);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+async_simple::coro::Lazy<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::AsyncGetReplicaList(std::string_view key,
+                                  const GetReplicaListRequestConfig& config,
+                                  std::string ctx_attachment) {
+    auto result =
+        co_await invoke_rpc_async<&WrappedMasterService::GetReplicaList,
+                                  GetReplicaListResponse>(
+            std::move(ctx_attachment), key, config);
+    co_return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+MasterClient::BatchGetReplicaList(const std::vector<std::string_view>& keys,
+                                  const GetReplicaListRequestConfig& config) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
+    timer.LogRequest("requests_count=", keys.size());
+
+    if (keys.empty()) {
+        return {};
+    }
+
+    auto result = invoke_rpc<
+        &WrappedMasterService::BatchGetReplicaList,
+        std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>(keys,
+                                                                      config);
+    if (result.has_value()) {
+        timer.LogResponse("result=", result.value().size(), " requests");
+    }
+    return result.value();
 }
 
 tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
