@@ -69,7 +69,7 @@ elseif(USE_MUSA OR USE_MACA)
   find_program(
     _pg_device_compiler
     NAMES "${_pg_device_compiler_name}"
-    HINTS "${_pg_device_compiler_hint}")
+    HINTS ${_pg_device_compiler_hint})
   if(NOT _pg_device_compiler)
     message(
       FATAL_ERROR "USE_${_pg_platform_name}=ON requires the "
