@@ -343,12 +343,23 @@ BatchOpLogSnapshotProvider::BatchOpLogSnapshotProvider(
 tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode>
 BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
                                             StandbySegmentRegistry& registry,
-                                            OpLogApplier* applier) {
+                                            OpLogApplier* applier,
+                                            uint64_t minimum_snapshot_batch) {
     metadata.Clear();
     registry.Clear();
     if (!NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty() ||
         snapshot_root_.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    OpLogBatchStorage storage(cluster_id_, backend_);
+    uint64_t floor = 0;
+    const auto floor_error = storage.ReadCompactionFloor(floor);
+    if (floor_error != ErrorCode::OK &&
+        floor_error != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return tl::make_unexpected(floor_error);
+    }
+    if (floor_error == ErrorCode::OK) {
+        minimum_snapshot_batch = std::max(minimum_snapshot_batch, floor);
     }
 
     for (const std::string& pointer_key :
@@ -364,6 +375,11 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             return tl::make_unexpected(pointer_error);
         }
 
+        auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
+        if (!descriptor ||
+            descriptor->last_included_batch_id < minimum_snapshot_batch) {
+            continue;
+        }
         auto attempt =
             RestorePointer(cluster_id_, backend_, object_store_, snapshot_root_,
                            pointer_bytes, metadata, registry, applier);
@@ -381,6 +397,9 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         }
     }
 
+    if (minimum_snapshot_batch != 0) {
+        return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+    }
     auto full_replay = RestoreCompleteOpLog(cluster_id_, backend_, metadata,
                                             registry, applier);
     if (full_replay.disposition != AttemptDisposition::kSuccess) {

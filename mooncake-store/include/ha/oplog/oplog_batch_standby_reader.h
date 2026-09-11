@@ -27,6 +27,7 @@ struct OpLogBatchStandbyPollResult {
     bool durable_prefix_present{false};
     size_t applied_entries{0};
     DurablePrefix durable_prefix{};
+    uint64_t compaction_floor{0};
 };
 
 class OpLogBatchStandbyReader {
@@ -46,13 +47,13 @@ class OpLogBatchStandbyReader {
     }
 
    private:
+    OpLogBatchStandbyPollResult PollBatches(size_t max_batches, uint64_t floor);
     OpLogBatchStorage storage_;
     OpLogApplier& applier_;
     bool batch_format_seen_{false};
     std::optional<DurablePrefix> last_observed_prefix_;
     std::optional<DurablePrefix> last_applied_durable_prefix_;
     std::optional<uint64_t> last_scanned_batch_last_seq_;
-    std::optional<uint64_t> compaction_floor_;
     uint64_t last_applied_batch_id_{0};
     bool require_complete_history_{false};
 };

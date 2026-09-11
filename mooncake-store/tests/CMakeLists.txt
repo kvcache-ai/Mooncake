@@ -259,6 +259,8 @@ add_ha_test(batch_oplog_snapshot_coordinator_test
             ha/snapshot/batch_oplog/coordinator_test.cpp)
 add_ha_test(batch_oplog_snapshot_promotion_test
             ha/snapshot/batch_oplog/promotion_test.cpp)
+add_ha_test(batch_oplog_snapshot_rebootstrap_test
+            ha/snapshot/batch_oplog/rebootstrap_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)

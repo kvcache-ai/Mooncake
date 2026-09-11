@@ -33,7 +33,7 @@ class BatchOpLogSnapshotProvider final {
 
     tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode> RestoreBaseline(
         StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
-        OpLogApplier* applier = nullptr);
+        OpLogApplier* applier = nullptr, uint64_t minimum_snapshot_batch = 0);
 
    private:
     std::string cluster_id_;
