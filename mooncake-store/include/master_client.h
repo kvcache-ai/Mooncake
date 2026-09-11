@@ -13,7 +13,8 @@
 #include "replica.h"
 #include "types.h"
 #include "rpc_types.h"
-#include "request_context.h"
+#include "master_metric_manager.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
@@ -64,32 +65,7 @@ class MasterClient {
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string_view>& object_keys);
-    /**
-     * @brief Gets replica list for an object
-     * @param object_key Key to query
-     * @param config Filter configuration for getting replica list
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(std::string_view key,
-                   const GetReplicaListRequestConfig& config =
-                       GetReplicaListRequestConfig());
-
-    [[nodiscard]] async_simple::coro::Lazy<
-        tl::expected<GetReplicaListResponse, ErrorCode>>
-    AsyncGetReplicaList(std::string_view key,
-                        const GetReplicaListRequestConfig& config =
-                            GetReplicaListRequestConfig(),
-                        std::string ctx_attachment = {});
-
-    /**
-     * @brief Batch query read routes
-     */
-    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string_view>& keys,
-                        const GetReplicaListRequestConfig& config =
-                            GetReplicaListRequestConfig());
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Calculate cache hit rate metrics
@@ -426,84 +402,8 @@ class MasterClient {
      * @return The result of the RPC call
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
-    invoke_rpc_async(std::string ctx_attachment, Args&&... args) {
-        return invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
-            client_accessor_.GetClientPool(), std::move(ctx_attachment),
-            std::forward<Args>(args)...);
-    }
-
-    template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
-    invoke_rpc_async_with_pool(
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> pool,
-        std::string ctx_attachment,
-        Args&&... args) {
-        // Increment RPC counter
-        if (metrics_) {
-            metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-        }
-
-        // The per-request context attachment is supplied EXPLICITLY by the
-        // caller, snapshotted once on the request's originating thread
-        // (invoke_rpc / invoke_rpc_via at the sync boundary, or the P2P
-        // BuildRouteIter closure). We deliberately do NOT read the thread_local
-        // g_current_ctx here: this coroutine body can resume on a coro-executor
-        // / IO worker thread whose thread_local belongs to a different request,
-        // so reading it would drop the id (empty) or, worse, cross-contaminate
-        // another request's id. An empty attachment is wire-identical to a
-        // plain send_request; non-reading server handlers ignore it.
-        //
-        // hop-B inject trace (VLOG(2), -v>=2 only): deserialize the explicit
-        // attachment to log request_id. One struct_pack deserialize per RPC,
-        // and only when verbose tracing is enabled.
-        if (VLOG_IS_ON(2) && !ctx_attachment.empty()) {
-            auto req_ctx = deserialize_request_context(
-                std::string_view(ctx_attachment.data(),
-                                 ctx_attachment.size()));
-            VLOG(2) << "hop-B inject request_id=" << req_ctx.request_id;
-        }
-        auto start_time = std::chrono::steady_clock::now();
-        auto ret = co_await pool->send_request(
-            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-                return client.send_request_with_attachment<ServiceMethod>(
-                    std::string_view(ctx_attachment.data(),
-                                     ctx_attachment.size()),
-                    std::forward<Args>(args)...);
-            });
-        if (!ret.has_value()) {
-            LOG(ERROR) << "Client not available";
-            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-        }
-        auto result = co_await std::move(ret.value());
-        if (!result) {
-            LOG(ERROR) << "RPC call failed: " << result.error().msg;
-            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-        }
-        if (metrics_) {
-            auto end_time = std::chrono::steady_clock::now();
-            auto latency =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    end_time - start_time);
-            metrics_->rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
-                                          latency.count());
-        }
-        co_return result->result();
-    }
-
-    template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        Args&&... args) {
-        // Synchronous path: snapshot the per-request attachment ONCE here, on
-        // the calling thread (where g_current_ctx is set for this request),
-        // and forward it explicitly. syncAwait drives the coroutine inline on
-        // this same thread, so reading g_current_ctx here is safe; the async
-        // templates above never touch the thread_local.
-        return async_simple::coro::syncAwait(
-            invoke_rpc_async<ServiceMethod, ReturnType>(
-                current_request_context_attachment(),
-                std::forward<Args>(args)...));
-    }
+        Args&&... args);
 
     /**
      * @brief Generic RPC invocation helper for batch operations
@@ -516,73 +416,7 @@ class MasterClient {
      */
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
-    invoke_batch_rpc(size_t input_size, Args&&... args) {
-        auto pool = client_accessor_.GetClientPool();
-
-        // Increment RPC counter
-        if (metrics_) {
-            metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-        }
-
-        // Bypass inject (see invoke_rpc_async_with_pool): snapshot the calling
-        // thread's per-request request_id once at entry and carry it into the
-        // pool-work closure via send_request_with_attachment, so batch master
-        // RPCs (BatchExistKey / BatchPutStart / ...) carry the id out-of-band
-        // just like single-result RPCs. An empty attachment is wire-identical
-        // to a plain send_request and is ignored by non-reading handlers
-        // (gray).
-        auto current_request_context = get_current_request_context();
-        std::string ctx_attachment = current_request_context_attachment();
-        // Real-client-side hop-B inject trace. VLOG(2): off at -v=1 (where
-        // only the master logs), on at -v>=2 for per-hop tracing. Fires on
-        // both the real path (in-proc) and the dummy path (real-client server
-        // thread) since master_client_ is shared.
-        if (current_request_context) {
-            VLOG(2) << "hop-B inject request_id="
-                    << current_request_context->request_id;
-        }
-        auto start_time = std::chrono::steady_clock::now();
-        return async_simple::coro::syncAwait(
-            [&]() -> async_simple::coro::Lazy<
-                      std::vector<tl::expected<ResultType, ErrorCode>>> {
-                auto ret = co_await pool->send_request(
-                    [&](coro_io::client_reuse_hint,
-                        coro_rpc::coro_rpc_client& client) {
-                        return client
-                            .send_request_with_attachment<ServiceMethod>(
-                                std::string_view(ctx_attachment.data(),
-                                                 ctx_attachment.size()),
-                                std::forward<Args>(args)...);
-                    });
-                if (!ret.has_value()) {
-                    LOG(ERROR) << "Client not available";
-                    co_return std::vector<tl::expected<ResultType, ErrorCode>>(
-                        input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
-                }
-                auto result = co_await std::move(ret.value());
-                if (!result) {
-                    LOG(ERROR)
-                        << "Batch RPC call failed: " << result.error().msg;
-                    std::vector<tl::expected<ResultType, ErrorCode>>
-                        error_results;
-                    error_results.reserve(input_size);
-                    for (size_t i = 0; i < input_size; ++i) {
-                        error_results.emplace_back(
-                            tl::make_unexpected(ErrorCode::RPC_FAIL));
-                    }
-                    co_return error_results;
-                }
-                if (metrics_) {
-                    auto end_time = std::chrono::steady_clock::now();
-                    auto latency =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time);
-                    metrics_->rpc_latency.observe(
-                        {RpcNameTraits<ServiceMethod>::value}, latency.count());
-                }
-                co_return result->result();
-            }());
-    }
+    invoke_batch_rpc(size_t input_size, Args&&... args);
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
@@ -609,18 +443,6 @@ class MasterClient {
         std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
             client_pool_;
     };
-    template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_via(
-        RpcClientAccessor& accessor, Args&&... args) {
-        // See invoke_rpc: snapshot the attachment here on the calling thread.
-        return async_simple::coro::syncAwait(
-            invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
-                accessor.GetClientPool(),
-                current_request_context_attachment(),
-                std::forward<Args>(args)...));
-    }
-
-   protected:
     RpcClientAccessor client_accessor_;
 
     // The client identification.
