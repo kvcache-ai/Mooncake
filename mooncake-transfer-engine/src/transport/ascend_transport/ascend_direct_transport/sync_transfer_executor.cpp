@@ -71,6 +71,16 @@ TransferExecutorBase::ExecuteResult SyncTransferExecutor::execute(
         op_descs.emplace_back(op_desc);
     }
 
+    uint64_t total_bytes = 0;
+    for (const auto& desc : op_descs) {
+        total_bytes += desc.len;
+    }
+    LOG(INFO) << "[AscendTE] before HIXL TransferSync, engine_idx=" << local_engine_idx
+              << ", target=" << target_adxl_engine_name
+              << ", op=" << (operation == adxl::READ ? "READ" : "WRITE")
+              << ", desc_count=" << op_descs.size()
+              << ", total_bytes=" << total_bytes;
+
     auto status =
         engine->TransferSync(target_adxl_engine_name.c_str(), operation,
                              op_descs, params_.transfer_timeout);
