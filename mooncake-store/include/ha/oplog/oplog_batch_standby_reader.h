@@ -16,6 +16,7 @@ class OpLogApplier;
 enum class OpLogBatchStandbyPollDisposition {
     OK,
     RETRYABLE,
+    REBOOTSTRAP_REQUIRED,
     FATAL,
 };
 
@@ -51,6 +52,7 @@ class OpLogBatchStandbyReader {
     std::optional<DurablePrefix> last_observed_prefix_;
     std::optional<DurablePrefix> last_applied_durable_prefix_;
     std::optional<uint64_t> last_scanned_batch_last_seq_;
+    std::optional<uint64_t> compaction_floor_;
     uint64_t last_applied_batch_id_{0};
     bool require_complete_history_{false};
 };

@@ -1070,6 +1070,15 @@ void HotStandbyService::ReplicationLoop() {
                 last_error_.store(result.error, std::memory_order_release);
                 const bool made_progress = expected_after > expected_before;
                 if (result.disposition ==
+                    OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
+                    LOG(ERROR) << "Batch-record history is below compaction "
+                                  "floor; stopping standby until it is "
+                                  "rebootstrapped";
+                    state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                    replication_loop_cv_.notify_all();
+                    break;
+                }
+                if (result.disposition ==
                     OpLogBatchStandbyPollDisposition::RETRYABLE) {
                     const auto now = std::chrono::steady_clock::now();
                     if (!retry_started || made_progress) {

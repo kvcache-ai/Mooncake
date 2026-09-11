@@ -68,6 +68,21 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     result.durable_prefix_present = true;
     result.durable_prefix = prefix;
 
+    uint64_t floor = 0;
+    err = storage_.ReadCompactionFloor(floor);
+    if (err == ErrorCode::OK)
+        compaction_floor_ = floor;
+    else if (err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        SetPollError(result, err, IsRetryableBackendError(err));
+        return result;
+    }
+    if (compaction_floor_ && last_applied_batch_id_ < *compaction_floor_) {
+        result.disposition =
+            OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED;
+        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        return result;
+    }
+
     if (last_observed_prefix_ &&
         (prefix.batch_id < last_observed_prefix_->batch_id ||
          prefix.last_seq < last_observed_prefix_->last_seq ||

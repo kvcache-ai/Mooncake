@@ -172,6 +172,21 @@ ErrorCode OpLogBatchStorage::ReadProducerView(
     return ErrorCode::OK;
 }
 
+ErrorCode OpLogBatchStorage::ReadCompactionFloor(uint64_t& floor) const {
+    if (!IsValidClusterId()) return ErrorCode::INVALID_PARAMS;
+    std::string value;
+    const auto err = backend_.Get(
+        "/oplog/" + cluster_id_ + "/snapshot/compaction_floor", value);
+    if (err != ErrorCode::OK) return err;
+    uint64_t parsed = 0;
+    const auto result =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size())
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    floor = parsed;
+    return ErrorCode::OK;
+}
+
 ErrorCode OpLogBatchStorage::ClaimProducerView(
     ViewVersionId producer_view_version) {
     if (!IsValidClusterId() || producer_view_version <= 0 ||

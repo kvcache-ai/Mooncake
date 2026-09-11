@@ -17,6 +17,7 @@ class OpLogBatchStorage {
     ErrorCode ClaimProducerView(ViewVersionId producer_view_version);
     ErrorCode ValidateProducerView(ViewVersionId producer_view_version) const;
     ErrorCode ReadProducerView(ViewVersionId& producer_view_version) const;
+    ErrorCode ReadCompactionFloor(uint64_t& floor) const;
     ErrorCode ReadDurablePrefix(DurablePrefix& prefix);
     ErrorCode WriteBatchAndAdvancePrefix(const OpLogBatchRecord& batch,
                                          const DurablePrefix& expected_prefix);
