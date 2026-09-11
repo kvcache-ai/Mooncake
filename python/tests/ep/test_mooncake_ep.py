@@ -41,20 +41,36 @@ def test_main(
         rank - rank_offset
     )
     x[:, -128:] = torch.arange(num_tokens, device="cuda").to(torch.bfloat16).view(-1, 1)
-    scores = (
-        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
-        + 1
-    )
-    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
+    fixed_routing = os.getenv("MOONCAKE_EP_TEST_FIXED_ROUTING", "0").lower() in {
+        "1",
+        "true",
+        "on",
+        "yes",
+    }
+    if fixed_routing:
+        topk_idx = torch.stack(
+            [
+                (torch.arange(num_tokens, device="cuda") + i) % num_experts
+                for i in range(num_topk)
+            ],
+            dim=1,
+        ).to(torch.int64)
+    else:
+        scores = (
+            torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
+            + 1
+        )
+        topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_weights = torch.randn(
         (num_tokens, num_topk), dtype=torch.float32, device="cuda"
     ).abs()
 
     # Randomly mask some positions
-    for i in range(10):
-        topk_idx[
-            random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)
-        ] = -1
+    if not fixed_routing:
+        for i in range(10):
+            topk_idx[
+                random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)
+            ] = -1
 
     # Check dispatch correctness
     do_check = True
