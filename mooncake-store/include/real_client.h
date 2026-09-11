@@ -1093,13 +1093,8 @@ class RealClient : public PyClient {
         std::chrono::steady_clock::time_point lease_deadline;
     };
 
-    using LocalDiskSessionRangeReadGroups =
-        std::unordered_map<std::string, std::vector<SessionRangeReadRequest>>;
-
     struct SessionRangeReadPlan {
         std::vector<SessionRangeReadRequest> memory_requests;
-        LocalDiskSessionRangeReadGroups local_disk_requests_by_endpoint;
-        std::vector<SessionRangeReadRequest> disk_requests;
         std::vector<SessionRangeReadRequest> dfs_requests;
     };
 
@@ -1132,14 +1127,6 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
 
-    void execute_session_local_disk_range_reads(
-        const LocalDiskSessionRangeReadGroups &requests_by_endpoint,
-        std::vector<int> &results);
-
-    void execute_session_disk_range_reads(
-        const std::vector<SessionRangeReadRequest> &requests,
-        std::vector<int> &results);
-
     DfsSessionStagingArena build_dfs_session_staging_arena(
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
@@ -1166,10 +1153,6 @@ class RealClient : public PyClient {
         const std::vector<SessionRangeReadRequest> &requests,
         const std::string &object_key, ErrorCode error,
         std::vector<int> &results);
-
-    static bool session_range_result_is_pending(
-        const SessionRangeReadRequest &request,
-        const std::vector<int> &results);
 
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;

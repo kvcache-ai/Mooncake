@@ -443,26 +443,13 @@ inline const Replica::Descriptor *SelectSessionReplica(
         return memory;
     }
 
-    auto find_complete = [&](auto predicate) -> const Replica::Descriptor * {
-        for (const auto &replica : replicas) {
-            if (replica.status == ReplicaStatus::COMPLETE &&
-                predicate(replica)) {
-                return &replica;
-            }
+    for (const auto &replica : replicas) {
+        if (replica.status == ReplicaStatus::COMPLETE &&
+            replica.is_dfs_replica()) {
+            return &replica;
         }
-        return nullptr;
-    };
-    if (const auto *local_disk = find_complete([](const auto &replica) {
-            return replica.is_local_disk_replica();
-        })) {
-        return local_disk;
     }
-    if (const auto *dfs = find_complete(
-            [](const auto &replica) { return replica.is_dfs_replica(); })) {
-        return dfs;
-    }
-    return find_complete(
-        [](const auto &replica) { return replica.is_disk_replica(); });
+    return nullptr;
 }
 
 struct SessionStagingBacking {
@@ -5724,16 +5711,8 @@ RealClient::classify_session_range_read_requests(
     for (auto &request : requests) {
         if (request.selected_replica.is_memory_replica()) {
             read_plan.memory_requests.push_back(std::move(request));
-        } else if (request.selected_replica.is_local_disk_replica()) {
-            const auto &endpoint =
-                request.selected_replica.get_local_disk_descriptor()
-                    .transport_endpoint;
-            read_plan.local_disk_requests_by_endpoint[endpoint].push_back(
-                std::move(request));
         } else if (request.selected_replica.is_dfs_replica()) {
             read_plan.dfs_requests.push_back(std::move(request));
-        } else if (request.selected_replica.is_disk_replica()) {
-            read_plan.disk_requests.push_back(std::move(request));
         } else {
             results[request.result_index] =
                 static_cast<int>(toInt(ErrorCode::INVALID_REPLICA));
@@ -5795,131 +5774,6 @@ void RealClient::execute_session_memory_range_reads(
         } else {
             results[request.result_index] =
                 static_cast<int>(transfer_results[request_index].value());
-        }
-    }
-}
-
-void RealClient::execute_session_local_disk_range_reads(
-    const LocalDiskSessionRangeReadGroups &requests_by_endpoint,
-    std::vector<int> &results) {
-    for (const auto &[endpoint, requests] : requests_by_endpoint) {
-        std::unordered_map<std::string, std::vector<Slice>> objects;
-        std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
-            staging_buffers;
-        for (const auto &request : requests) {
-            if (objects.count(request.object_key) != 0) continue;
-            if (!client_buffer_allocator_) {
-                fail_file_backed_requests_for_key(requests, request.object_key,
-                                                  ErrorCode::INVALID_PARAMS,
-                                                  results);
-                continue;
-            }
-
-            const size_t object_size = static_cast<size_t>(
-                calculate_total_size(request.selected_replica));
-            auto allocation = client_buffer_allocator_->allocate(object_size);
-            if (!allocation) {
-                fail_file_backed_requests_for_key(
-                    requests, request.object_key,
-                    ErrorCode::NO_AVAILABLE_HANDLE, results);
-                continue;
-            }
-
-            auto staging_buffer =
-                std::make_unique<BufferHandle>(std::move(*allocation));
-            objects.emplace(
-                request.object_key,
-                std::vector<Slice>{{staging_buffer->ptr(), object_size}});
-            staging_buffers.emplace(request.object_key,
-                                    std::move(staging_buffer));
-        }
-
-        if (objects.empty()) continue;
-        auto read_result =
-            batch_get_into_offload_object_internal(endpoint, objects);
-        if (!read_result) {
-            for (const auto &object : objects) {
-                fail_file_backed_requests_for_key(requests, object.first,
-                                                  read_result.error(), results);
-            }
-            continue;
-        }
-
-        for (const auto &request : requests) {
-            auto staging_buffer = staging_buffers.find(request.object_key);
-            if (staging_buffer != staging_buffers.end() &&
-                session_range_result_is_pending(request, results)) {
-                complete_staged_session_range_read(
-                    request, staging_buffer->second->ptr(), results);
-            }
-        }
-    }
-}
-
-void RealClient::execute_session_disk_range_reads(
-    const std::vector<SessionRangeReadRequest> &requests,
-    std::vector<int> &results) {
-    std::vector<std::string> object_keys;
-    std::vector<QueryResult> cached_query_results;
-    std::unordered_map<std::string, std::vector<Slice>> object_slices;
-    std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
-        staging_buffers;
-    for (const auto &request : requests) {
-        if (object_slices.count(request.object_key) != 0) continue;
-        if (!client_buffer_allocator_) {
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::INVALID_PARAMS,
-                                              results);
-            continue;
-        }
-
-        const size_t object_size =
-            static_cast<size_t>(calculate_total_size(request.selected_replica));
-        auto allocation = client_buffer_allocator_->allocate(object_size);
-        if (!allocation) {
-            fail_file_backed_requests_for_key(requests, request.object_key,
-                                              ErrorCode::NO_AVAILABLE_HANDLE,
-                                              results);
-            continue;
-        }
-
-        auto staging_buffer =
-            std::make_unique<BufferHandle>(std::move(*allocation));
-        std::vector<Slice> slices;
-        allocateSlices(slices, request.selected_replica, staging_buffer->ptr());
-        object_keys.push_back(request.object_key);
-        cached_query_results.push_back(FilterQueryResult(
-            request.cached_query_result, request.selected_replica));
-        object_slices.emplace(request.object_key, std::move(slices));
-        staging_buffers.emplace(request.object_key, std::move(staging_buffer));
-    }
-
-    if (object_keys.empty()) return;
-    auto read_results =
-        client_->BatchGet(object_keys, cached_query_results, object_slices);
-    if (!SessionBackendResultCountMatches(
-            "Session DISK BatchGet", object_keys.size(), read_results.size())) {
-        for (const auto &object_key : object_keys) {
-            fail_file_backed_requests_for_key(
-                requests, object_key, ErrorCode::INTERNAL_ERROR, results);
-        }
-        return;
-    }
-
-    for (size_t object_index = 0; object_index < object_keys.size();
-         ++object_index) {
-        const auto &object_key = object_keys[object_index];
-        if (!read_results[object_index]) {
-            fail_file_backed_requests_for_key(
-                requests, object_key, read_results[object_index].error(),
-                results);
-            continue;
-        }
-        for (const auto &request : requests) {
-            if (request.object_key == object_key) {
-                complete_staged_session_range_read(
-                    request, staging_buffers.at(object_key)->ptr(), results);
-            }
         }
     }
 }
@@ -6088,12 +5942,6 @@ void RealClient::fail_file_backed_requests_for_key(
     }
 }
 
-bool RealClient::session_range_result_is_pending(
-    const SessionRangeReadRequest &request, const std::vector<int> &results) {
-    return results[request.result_index] ==
-           static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
-}
-
 std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
@@ -6112,9 +5960,6 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
         classify_session_range_read_requests(std::move(requests), results);
 
     execute_session_memory_range_reads(read_plan.memory_requests, results);
-    execute_session_local_disk_range_reads(
-        read_plan.local_disk_requests_by_endpoint, results);
-    execute_session_disk_range_reads(read_plan.disk_requests, results);
     execute_session_dfs_range_reads(read_plan.dfs_requests, results);
     return results;
 }
