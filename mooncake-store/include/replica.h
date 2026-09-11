@@ -14,11 +14,9 @@
 
 #include "types.h"
 #include "allocator.h"
-#include "centralized_master_metric_manager.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
-
-class P2PClientMeta;
 
 /**
  * @brief Globally unique replica identification.
@@ -129,19 +127,6 @@ struct LocalDiskReplicaData {
     std::string transport_endpoint;
 };
 
-struct P2PProxyReplicaData {
-    P2PProxyReplicaData() = default;
-    P2PProxyReplicaData(std::shared_ptr<P2PClientMeta> client,
-                        std::shared_ptr<Segment> segment, uint64_t object_size)
-        : client(std::move(client)),
-          segment(std::move(segment)),
-          object_size(object_size) {}
-
-    std::shared_ptr<const P2PClientMeta> client;
-    std::shared_ptr<const Segment> segment;
-    uint64_t object_size = 0;
-};
-
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(MemoryDescriptor, buffer_descriptor);
@@ -160,6 +145,9 @@ struct LocalDiskDescriptor {
     YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
+// TODO(C4; see p2p-split-plan-v2.md): Migrate the public QueryResult and
+// route-cache facade to P2PRouteDescriptor before removing this Descriptor
+// variant. Master and HA metadata already use the P2P route model.
 struct P2PProxyDescriptor {
     UUID client_id;
     UUID segment_id;
@@ -188,8 +176,7 @@ class Replica {
           status_(status),
           refcnt_(0) {
         // Automatic update allocated_file_size via RAII
-        CentralizedMasterMetricManager::instance().inc_allocated_file_size(
-            object_size);
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
     Replica(UUID client_id, uint64_t object_size,
@@ -198,13 +185,10 @@ class Replica {
                                      std::move(transport_endpoint)}),
           status_(status) {}
 
-    Replica(P2PProxyReplicaData proxy_data, ReplicaStatus status)
-        : data_(std::move(proxy_data)), status_(status) {}
-
     ~Replica() {
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
             const auto& disk_data = std::get<DiskReplicaData>(data_);
-            CentralizedMasterMetricManager::instance().dec_allocated_file_size(
+            MasterMetricManager::instance().dec_allocated_file_size(
                 disk_data.object_size);
         }
     }
@@ -233,7 +217,7 @@ class Replica {
         // Decrement metric for the current object before overwriting.
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
             const auto& disk_data = std::get<DiskReplicaData>(data_);
-            CentralizedMasterMetricManager::instance().dec_allocated_file_size(
+            MasterMetricManager::instance().dec_allocated_file_size(
                 disk_data.object_size);
         }
 
@@ -297,10 +281,6 @@ class Replica {
         return replica.is_local_disk_replica();
     }
 
-    [[nodiscard]] bool is_p2p_proxy_replica() const {
-        return std::holds_alternative<P2PProxyReplicaData>(data_);
-    }
-
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -322,7 +302,7 @@ class Replica {
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
         const;
 
-    // only memory replica and p2p proxy replica have segment id
+    // Only memory replicas have a segment ID.
     [[nodiscard]] std::optional<UUID> get_segment_id() const;
 
     void mark_complete() {
@@ -341,43 +321,6 @@ class Replica {
 
     uint32_t get_refcnt() const { return refcnt_.load(); }
 
-    const std::vector<std::string>& get_p2p_tags() const {
-        static const std::vector<std::string> empty_tags;
-        auto segment = get_p2p_segment();
-        if (segment && segment->IsP2PSegment()) {
-            return segment->GetP2PExtra().tags;
-        }
-        return empty_tags;
-    }
-
-    std::optional<int> get_p2p_priority() const {
-        auto segment = get_p2p_segment();
-        if (segment && segment->IsP2PSegment()) {
-            return segment->GetP2PExtra().priority;
-        }
-        return std::nullopt;
-    }
-
-    std::optional<MemoryType> get_p2p_memory_type() const {
-        auto segment = get_p2p_segment();
-        if (segment && segment->IsP2PSegment()) {
-            return segment->GetP2PExtra().memory_type;
-        }
-        return std::nullopt;
-    }
-
-    std::optional<UUID> get_p2p_client_id() const;
-
-    std::shared_ptr<const Segment> get_p2p_segment() const {
-        if (!is_p2p_proxy_replica()) return nullptr;
-        return std::get<P2PProxyReplicaData>(data_).segment;
-    }
-
-    std::shared_ptr<const P2PClientMeta> get_p2p_client() const {
-        if (!is_p2p_proxy_replica()) return nullptr;
-        return std::get<P2PProxyReplicaData>(data_).client;
-    }
-
    public:
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
@@ -390,9 +333,6 @@ class Replica {
         }
         ReplicaType operator()(const LocalDiskReplicaData&) const {
             return ReplicaType::LOCAL_DISK;
-        }
-        ReplicaType operator()(const P2PProxyReplicaData&) const {
-            return ReplicaType::P2P_PROXY;
         }
     };
 
@@ -526,8 +466,7 @@ class Replica {
     inline static std::atomic<ReplicaID> next_id_{1};
 
     ReplicaID id_;
-    std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData,
-                 P2PProxyReplicaData>
+    std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
     std::atomic<uint32_t> refcnt_{0};
@@ -553,11 +492,6 @@ inline std::optional<UUID> Replica::get_segment_id() const {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         if (mem_data.buffer) {
             return mem_data.buffer->getSegmentId();
-        }
-    } else if (is_p2p_proxy_replica()) {
-        const auto& proxy_data = std::get<P2PProxyReplicaData>(data_);
-        if (proxy_data.segment) {
-            return proxy_data.segment->id;
         }
     }
     return std::nullopt;

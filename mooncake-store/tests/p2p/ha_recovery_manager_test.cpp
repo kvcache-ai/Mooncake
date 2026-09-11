@@ -76,12 +76,11 @@ class HARecoveryManagerTest : public ::testing::Test {
         segment_ = MakeSegment();
 
         // Register client + segment with master
-        RegisterClientRequest reg;
+        P2PRegisterClientRequest reg;
         reg.client_id = client_id_;
         reg.ip_address = "127.0.0.1";
         reg.rpc_port = 50099;
         reg.segments.push_back(segment_);
-        reg.deployment_mode = DeploymentMode::P2P;
         auto& svc = master_.GetWrapped().GetMasterService();
         auto res = svc.RegisterClient(reg);
         ASSERT_TRUE(res.has_value())
@@ -107,16 +106,13 @@ class HARecoveryManagerTest : public ::testing::Test {
         master_client_.reset();
     }
 
-    static Segment MakeSegment(size_t size = 16 * 1024 * 1024) {
-        Segment seg;
+    static P2PSegment MakeSegment(size_t size = 16 * 1024 * 1024) {
+        P2PSegment seg;
         seg.id = generate_uuid();
         seg.name = "test_segment";
         seg.size = size;
-        seg.extra = P2PSegmentExtraData{
-            .priority = 0,
-            .tags = {},
-            .memory_type = MemoryType::DRAM,
-        };
+        seg.priority = 0;
+        seg.memory_type = MemoryType::DRAM;
         return seg;
     }
 
@@ -201,7 +197,7 @@ class HARecoveryManagerTest : public ::testing::Test {
     }
 
     void MountLocalTierOnMaster(const UUID& tier_id) {
-        Segment local_segment = MakeSegment();
+        P2PSegment local_segment = MakeSegment();
         local_segment.id = tier_id;
         local_segment.name = "local_recovery_tier";
         auto& svc = master_.GetWrapped().GetMasterService();
@@ -226,7 +222,7 @@ class HARecoveryManagerTest : public ::testing::Test {
         auto& svc = master_.GetWrapped().GetMasterService();
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         do {
-            if (svc.GetReplicaList(key).has_value()) {
+            if (svc.GetReadRoute(key).has_value()) {
                 return true;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -238,7 +234,7 @@ class HARecoveryManagerTest : public ::testing::Test {
     static std::string master_addr_;
 
     UUID client_id_{};
-    Segment segment_;
+    P2PSegment segment_;
     std::unique_ptr<P2PMasterClient> master_client_;
     std::atomic<ViewVersionId> view_version_{0};
     std::unique_ptr<DataManager> data_manager_;
@@ -424,13 +420,11 @@ TEST_F(HARecoveryManagerTest, ReconnectResyncsLocalReplicaToP2PMaster) {
         << "Replica did not become visible on the P2P master";
 
     auto& svc = master_.GetWrapped().GetMasterService();
-    auto result = svc.GetReplicaList(key);
+    auto result = svc.GetReadRoute(key);
     ASSERT_TRUE(result.has_value())
-        << "GetReplicaList failed: " << result.error();
-    ASSERT_EQ(result.value().replicas.size(), 1);
-    const auto& replica = result.value().replicas[0];
-    ASSERT_TRUE(replica.is_p2p_proxy_replica());
-    const auto& desc = replica.get_p2p_proxy_descriptor();
+        << "GetReadRoute failed: " << result.error();
+    ASSERT_EQ(result->size(), 1);
+    const auto& desc = result->front();
     EXPECT_EQ(desc.client_id, client_id_);
     EXPECT_EQ(desc.segment_id, tier_id.value());
 }
@@ -457,7 +451,7 @@ TEST_F(HARecoveryManagerTest, RegisterOnlyRecoverySkipsLocalReplicaResync) {
     WaitUntilFull(*mgr);
 
     auto& svc = master_.GetWrapped().GetMasterService();
-    auto result = svc.GetReplicaList(key);
+    auto result = svc.GetReadRoute(key);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }

@@ -112,7 +112,7 @@ class HAIntegrationTest : public ::testing::Test {
     }
 
     // For cross-client reads immediately after a Put on another client, the
-    // async BatchSyncReplica notification may not have reached master yet.
+    // async BatchSyncRoutes notification may not have reached master yet.
     // Retry on OBJECT_NOT_FOUND until master learns about the replica.
     static tl::expected<std::string, ErrorCode> GetDataWithRetry(
         std::shared_ptr<P2PClientService>& client, const std::string& key,
@@ -180,7 +180,7 @@ class HAIntegrationTest : public ::testing::Test {
     }
 
     static void SendManualHeartbeat(std::shared_ptr<P2PClientService>& client) {
-        HeartbeatRequest req;
+        P2PHeartbeatRequest req;
         req.client_id = client->GetClientID();
         auto result = client->GetMasterClient().Heartbeat(req);
         ASSERT_TRUE(result.has_value()) << "Manual heartbeat failed";
@@ -194,7 +194,7 @@ class HAIntegrationTest : public ::testing::Test {
 
         // Start master with long TTL so it won't mark clients as
         // DISCONNECTION when heartbeat is stopped.
-        InProcMasterConfigBuilder builder;
+        InProcP2PMasterConfigBuilder builder;
         builder.set_client_live_ttl_sec(3600);
         builder.set_client_crashed_ttl_sec(7200);
         auto master_config = builder.build();
@@ -334,7 +334,7 @@ TEST_F(HAIntegrationTest, DegradedModeRemoteOpsFail) {
     ASSERT_TRUE(put.has_value());
 
     // Verify data is accessible before degradation (client1 → master →
-    // client2). Use retry: async BatchSyncReplica may not have reached master
+    // client2). Use retry: async BatchSyncRoutes may not have reached master
     // yet.
     auto get_before = GetDataWithRetry(client1_, "a3_client2_key", 10);
     ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
@@ -364,7 +364,7 @@ TEST_F(HAIntegrationTest, RecoverFromDegradedRemoteGet) {
     ASSERT_TRUE(put.has_value());
 
     // Verify data is accessible before degradation (client1 → master →
-    // client2). Use retry: async BatchSyncReplica may not have reached master
+    // client2). Use retry: async BatchSyncRoutes may not have reached master
     // yet.
     auto get_before = GetDataWithRetry(client1_, "a4_client2_key", 11);
     ASSERT_TRUE(get_before.has_value()) << "Pre-degradation get failed: "
@@ -498,10 +498,7 @@ TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
     ASSERT_FALSE(expected_segments.empty());
 
     auto& svc = master_.GetWrapped().GetMasterService();
-    UnregisterClientRequest unreg;
-    unreg.client_id = client1_->GetClientID();
-    unreg.deployment_mode = DeploymentMode::P2P;
-    auto unreg_result = svc.UnregisterClient(unreg);
+    auto unreg_result = svc.UnregisterClient(client1_->GetClientID());
     ASSERT_TRUE(unreg_result.has_value())
         << "UnregisterClient failed: " << unreg_result.error();
 
@@ -520,10 +517,9 @@ TEST_F(HAIntegrationTest, ReRegisterReportsCurrentTierSegments) {
             client1_->GetClientID(), segment.id);
         ASSERT_TRUE(registered.has_value())
             << "Missing registered segment: " << segment.name;
-        EXPECT_EQ(registered.value()->name, segment.name);
-        EXPECT_EQ(registered.value()->size, segment.size);
-        EXPECT_EQ(registered.value()->GetP2PExtra().memory_type,
-                  segment.GetP2PExtra().memory_type);
+        EXPECT_EQ(registered->name, segment.name);
+        EXPECT_EQ(registered->size, segment.size);
+        EXPECT_EQ(registered->memory_type, segment.memory_type);
     }
 
     ForceRecover(client1_);
@@ -549,7 +545,7 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
     ForceDegraded(client2_);
 
     // Restart master on the same port
-    InProcMasterConfigBuilder builder;
+    InProcP2PMasterConfigBuilder builder;
     builder.set_rpc_port(port);
     builder.set_client_live_ttl_sec(3600);
     builder.set_client_crashed_ttl_sec(7200);
@@ -603,7 +599,7 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
 TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
     // Start an independent master with short TTL
     InProcP2PMaster short_ttl_master;
-    InProcMasterConfigBuilder builder;
+    InProcP2PMasterConfigBuilder builder;
     builder.set_client_live_ttl_sec(2);
     builder.set_client_crashed_ttl_sec(20);
     ASSERT_TRUE(short_ttl_master.Start(builder.build()));
@@ -618,13 +614,11 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
 
     // Verify both are HEALTH initially
     {
-        QueryClientStatusRequest req;
-        req.client_id = tmp1->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp1->GetClientID());
         ASSERT_TRUE(res.has_value());
-        ASSERT_EQ(res.value().status, ClientStatus::HEALTH);
+        ASSERT_EQ(res.value(), P2PClientStatus::HEALTH);
     }
 
     // Simulate client1 network failure: stop its heartbeat
@@ -635,46 +629,40 @@ TEST_F(HAIntegrationTest, ClientDisconnectAndRecover) {
 
     // Verify master side: tmp1 is DISCONNECTION
     {
-        QueryClientStatusRequest req;
-        req.client_id = tmp1->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp1->GetClientID());
         ASSERT_TRUE(res.has_value());
-        EXPECT_EQ(res.value().status, ClientStatus::DISCONNECTION)
+        EXPECT_EQ(res.value(), P2PClientStatus::DISCONNECTION)
             << "Master should have marked disconnected client";
     }
 
     // Verify tmp2 is still HEALTH
     {
-        QueryClientStatusRequest req;
-        req.client_id = tmp2->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp2->GetClientID());
         ASSERT_TRUE(res.has_value());
-        EXPECT_EQ(res.value().status, ClientStatus::HEALTH);
+        EXPECT_EQ(res.value(), P2PClientStatus::HEALTH);
     }
 
     // Recover: manually send heartbeat from tmp1
     {
-        HeartbeatRequest req;
+        P2PHeartbeatRequest req;
         req.client_id = tmp1->GetClientID();
         auto hb_res = tmp1->GetMasterClient().Heartbeat(req);
         ASSERT_TRUE(hb_res.has_value()) << "Recovery heartbeat failed";
-        EXPECT_EQ(hb_res.value().status, ClientStatus::HEALTH)
+        EXPECT_EQ(hb_res.value().status, P2PClientStatus::HEALTH)
             << "Client should recover to HEALTH after heartbeat";
     }
 
     // Verify master side: tmp1 is HEALTH again
     {
-        QueryClientStatusRequest req;
-        req.client_id = tmp1->GetClientID();
         auto res =
             short_ttl_master.GetWrapped().GetMasterService().QueryClientStatus(
-                req);
+                tmp1->GetClientID());
         ASSERT_TRUE(res.has_value());
-        EXPECT_EQ(res.value().status, ClientStatus::HEALTH)
+        EXPECT_EQ(res.value(), P2PClientStatus::HEALTH)
             << "Client should be HEALTH after recovery heartbeat";
     }
 

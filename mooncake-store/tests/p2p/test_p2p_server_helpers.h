@@ -9,19 +9,58 @@
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "master_config.h"
 #include "p2p/master/p2p_rpc_service.h"
-#include "rpc_service.h"
 #include "types.h"
 #include "utils.h"
 
 namespace mooncake {
 namespace testing {
 
+struct InProcP2PMasterConfig {
+    std::optional<int> rpc_port;
+    std::optional<int64_t> client_live_ttl_sec;
+    std::optional<int64_t> client_crashed_ttl_sec;
+    std::optional<int> heartbeat_rpc_port;
+    std::optional<uint32_t> heartbeat_rpc_thread_num;
+};
+
+class InProcP2PMasterConfigBuilder {
+   public:
+    InProcP2PMasterConfigBuilder& set_rpc_port(int value) {
+        config_.rpc_port = value;
+        return *this;
+    }
+
+    InProcP2PMasterConfigBuilder& set_client_live_ttl_sec(int64_t value) {
+        config_.client_live_ttl_sec = value;
+        return *this;
+    }
+
+    InProcP2PMasterConfigBuilder& set_client_crashed_ttl_sec(int64_t value) {
+        config_.client_crashed_ttl_sec = value;
+        return *this;
+    }
+
+    InProcP2PMasterConfigBuilder& set_heartbeat_rpc_port(int value) {
+        config_.heartbeat_rpc_port = value;
+        return *this;
+    }
+
+    InProcP2PMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t value) {
+        config_.heartbeat_rpc_thread_num = value;
+        return *this;
+    }
+
+    InProcP2PMasterConfig build() const { return config_; }
+
+   private:
+    InProcP2PMasterConfig config_;
+};
+
 /**
  * @brief Lightweight in-process P2P master server for tests (non-HA).
  *
- * Mirrors InProcMaster but uses WrappedP2PMasterService and
+ * Mirrors InProcMaster but uses P2PMasterRpcService and
  * RegisterP2PRpcService so that P2P-specific RPCs (GetWriteRoute,
  * AddReplica, RemoveReplica) are registered alongside the base RPCs.
  */
@@ -30,7 +69,7 @@ class InProcP2PMaster {
     InProcP2PMaster() = default;
     ~InProcP2PMaster() { Stop(); }
 
-    bool Start(InProcMasterConfig config = {}) {
+    bool Start(InProcP2PMasterConfig config = {}) {
         try {
             rpc_port_ = config.rpc_port.has_value() ? config.rpc_port.value()
                                                     : getFreeTcpPort();
@@ -39,37 +78,28 @@ class InProcP2PMaster {
                 /*thread_num=*/4, /*port=*/rpc_port_, /*address=*/"0.0.0.0",
                 std::chrono::seconds(0), /*tcp_no_delay=*/true);
 
-            WrappedMasterServiceConfig wms_cfg;
-            wms_cfg.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
-            wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
-            wms_cfg.allow_evict_soft_pinned_objects = true;
-            wms_cfg.enable_metric_reporting = false;
-            wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
-            wms_cfg.eviction_high_watermark_ratio =
-                DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-            wms_cfg.view_version = 0;
-            wms_cfg.heartbeat_rpc_port = config.heartbeat_rpc_port.value_or(0);
-            wms_cfg.enable_ha = false;
-            wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
-            wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
-            wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
-            wms_cfg.max_client_per_key = 0;  // no limit for P2P
+            P2PMasterConfig wms_cfg;
+            wms_cfg.metrics.enable_reporting = false;
+            wms_cfg.rpc.heartbeat_port = config.heartbeat_rpc_port.value_or(0);
+            wms_cfg.routes.max_clients_per_key = 0;  // no limit for P2P
 
             if (config.client_live_ttl_sec.has_value()) {
-                wms_cfg.client_live_ttl_sec =
+                wms_cfg.client_lifecycle.live_ttl_seconds =
                     config.client_live_ttl_sec.value();
             } else {
-                wms_cfg.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+                wms_cfg.client_lifecycle.live_ttl_seconds =
+                    DEFAULT_CLIENT_LIVE_TTL_SEC;
             }
 
             if (config.client_crashed_ttl_sec.has_value()) {
-                wms_cfg.client_crashed_ttl_sec =
+                wms_cfg.client_lifecycle.crashed_ttl_seconds =
                     config.client_crashed_ttl_sec.value();
             } else {
-                wms_cfg.client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
+                wms_cfg.client_lifecycle.crashed_ttl_seconds =
+                    DEFAULT_CLIENT_CRASHED_TTL_SEC;
             }
 
-            wrapped_ = std::make_unique<WrappedP2PMasterService>(wms_cfg);
+            wrapped_ = std::make_unique<P2PMasterRpcService>(wms_cfg);
             wrapped_->init();
             const bool dedicated_heartbeat =
                 config.heartbeat_rpc_port.has_value() &&
@@ -89,7 +119,7 @@ class InProcP2PMaster {
                     /*thread_num=*/hb_threads, /*port=*/heartbeat_rpc_port_,
                     /*address=*/"0.0.0.0", std::chrono::seconds(0),
                     /*tcp_no_delay=*/true);
-                RegisterHeartbeatRpcService(*heartbeat_server_, *wrapped_);
+                RegisterP2PHeartbeatRpcService(*heartbeat_server_, *wrapped_);
             }
 
             auto ec = server_->async_start();
@@ -117,8 +147,8 @@ class InProcP2PMaster {
         if (server_) {
             server_->stop();
             server_.reset();
-            wrapped_.reset();
         }
+        wrapped_.reset();
     }
 
     int rpc_port() const { return rpc_port_; }
@@ -126,12 +156,12 @@ class InProcP2PMaster {
     std::string master_address() const {
         return std::string("127.0.0.1:") + std::to_string(rpc_port_);
     }
-    WrappedP2PMasterService& GetWrapped() { return *wrapped_; }
+    P2PMasterRpcService& GetWrapped() { return *wrapped_; }
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::unique_ptr<coro_rpc::coro_rpc_server> heartbeat_server_;
-    std::unique_ptr<WrappedP2PMasterService> wrapped_;
+    std::unique_ptr<P2PMasterRpcService> wrapped_;
     int rpc_port_ = 0;
     int heartbeat_rpc_port_ = 0;
 };

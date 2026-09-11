@@ -4,66 +4,53 @@
 
 #include "types.h"
 #include "replica.h"
-#include "p2p/client/heartbeat_type.h"
 #include "task_manager.h"
 
 namespace mooncake {
 
 /**
- * @brief P2P specific configuration for read route
+ * @brief Response structure for Ping operation
  */
-struct P2PGetReplicaListConfigExtra {
-    // exclude replicas whose segment contains any tag in tag_filters
-    std::vector<std::string> tag_filters;
-    // filter replicas whose segment priority is lower than priority_limit
-    int priority_limit = 0;
+struct PingResponse {
+    ViewVersionId view_version_id;
+    ClientStatus client_status;
+
+    PingResponse() = default;
+    PingResponse(ViewVersionId view_version, ClientStatus status)
+        : view_version_id(view_version), client_status(status) {}
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const PingResponse& response) noexcept {
+        return os << "PingResponse: { view_version_id: "
+                  << response.view_version_id
+                  << ", client_status: " << response.client_status << " }";
+    }
 };
-YLT_REFL(P2PGetReplicaListConfigExtra, tag_filters, priority_limit);
+YLT_REFL(PingResponse, view_version_id, client_status);
 
 /**
- * @brief Request config for getting replica list
+ * @brief Response structure for the DummyClient ping RPC (RealClient::ping).
  */
-struct GetReplicaListRequestConfig {
-    GetReplicaListRequestConfig() = default;
-    GetReplicaListRequestConfig(size_t max_c) : max_candidates(max_c) {}
-
-    // 0 means return all viable replica candidates;
-    // otherwise, return at most max_candidates candidates
-    static const size_t RETURN_ALL_CANDIDATES = 0;
-    size_t max_candidates = RETURN_ALL_CANDIDATES;
-    std::optional<P2PGetReplicaListConfigExtra> p2p_config;
+struct DummyHeartbeatResponse {
+    DummyClientStatus status = DummyClientStatus::HEALTH;
+    uint64_t mapped_shm_count = 0;
 };
-YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
-
-// config for filter replicas in read route
-typedef GetReplicaListRequestConfig ReadRouteConfig;
-typedef P2PGetReplicaListConfigExtra P2PReadRouteConfigExtra;
-
-/**
- * @brief Extra info for centralized read route response (Internal use)
- */
-struct CentralizedGetReplicaListResponseExtra {
-    CentralizedGetReplicaListResponseExtra() = default;
-    CentralizedGetReplicaListResponseExtra(uint64_t lease_ttl_ms_param)
-        : lease_ttl_ms(lease_ttl_ms_param) {}
-    uint64_t lease_ttl_ms = 0;
-};
-YLT_REFL(CentralizedGetReplicaListResponseExtra, lease_ttl_ms);
+YLT_REFL(DummyHeartbeatResponse, status, mapped_shm_count);
 
 /**
  * @brief Response structure for GetReplicaList operation
  */
 struct GetReplicaListResponse {
-    GetReplicaListResponse() = default;
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms;
+
+    GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
                            uint64_t lease_ttl_ms_param)
         : replicas(std::move(replicas_param)),
-          centralized_extra(lease_ttl_ms_param) {}
-
-    std::vector<Replica::Descriptor> replicas;
-    std::optional<CentralizedGetReplicaListResponseExtra> centralized_extra;
+          lease_ttl_ms(lease_ttl_ms_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, centralized_extra);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms);
 
 /**
  * @brief Response structure for GetStorageConfig operation
@@ -99,114 +86,6 @@ struct MoveStartResponse {
     std::optional<Replica::Descriptor> target;
 };
 YLT_REFL(MoveStartResponse, source, target);
-
-/**
- * @brief Request structure for Heartbeat operation.
- * Client could set HeartbeatTasks for Master to run
- */
-struct HeartbeatRequest {
-    UUID client_id;
-    std::vector<HeartbeatTask> tasks;
-};
-YLT_REFL(HeartbeatRequest, client_id, tasks);
-
-/**
- * @brief Response structure for Heartbeat operation.
- * Always returns view_version; client uses it under UNDEFINED status
- * for crash-recovery decisions, other statuses for defensive checks.
- */
-struct HeartbeatResponse {
-    ClientStatus status;
-    ViewVersionId view_version = 0;
-    std::vector<HeartbeatTaskResult> task_results;
-};
-YLT_REFL(HeartbeatResponse, status, view_version, task_results);
-
-/**
- * @brief Response for HeartbeatServiceReady.
- *
- * Reports the master's heartbeat routing so a client can detect a
- * client/master heartbeat-port mismatch at Connect time:
- *   heartbeat_rpc_port > 0 -> master serves Heartbeat on a dedicated server
- *                             (Heartbeat is NOT on the main server)
- *   heartbeat_rpc_port == 0 -> master serves Heartbeat on the main server
- *                              (legacy fallback)
- */
-struct HeartbeatServiceReadyResponse {
-    uint32_t heartbeat_rpc_port = 0;
-};
-YLT_REFL(HeartbeatServiceReadyResponse, heartbeat_rpc_port);
-
-/**
- * @brief Response structure for the DummyClient ping RPC (RealClient::ping).
- */
-struct DummyHeartbeatResponse {
-    DummyClientStatus status = DummyClientStatus::HEALTH;
-    uint64_t mapped_shm_count = 0;
-};
-YLT_REFL(DummyHeartbeatResponse, status, mapped_shm_count);
-
-/**
- * @brief Request structure for RegisterClient operation.
- * Client calls this on startup to register its UUID and local segments.
- * P2P clients additionally provide ip_address and rpc_port.
- */
-struct RegisterClientRequest {
-    UUID client_id;
-    std::vector<Segment> segments;
-    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
-
-    // P2P only: network endpoint info
-    std::optional<std::string> ip_address;
-    std::optional<uint16_t> rpc_port;
-};
-YLT_REFL(RegisterClientRequest, client_id, segments, deployment_mode,
-         ip_address, rpc_port);
-
-/**
- * @brief Response structure for RegisterClient operation.
- * Returns the master's view_version to client for crash checking.
- */
-struct RegisterClientResponse {
-    ViewVersionId view_version = 0;
-};
-YLT_REFL(RegisterClientResponse, view_version);
-
-/**
- * @brief Request structure for UnregisterClient operation.
- * Client calls this to proactively deregister itself and all its routing
- * metadata (segments/replicas) from the master
- */
-struct UnregisterClientRequest {
-    UUID client_id;
-    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
-};
-YLT_REFL(UnregisterClientRequest, client_id, deployment_mode);
-
-/**
- * @brief Response structure for UnregisterClient operation.
- * Returns the master's view_version (mirrors RegisterClientResponse).
- */
-struct UnregisterClientResponse {
-    ViewVersionId view_version = 0;
-};
-YLT_REFL(UnregisterClientResponse, view_version);
-
-/**
- * @brief Request structure for QueryClientStatus operation.
- */
-struct QueryClientStatusRequest {
-    UUID client_id;
-};
-YLT_REFL(QueryClientStatusRequest, client_id);
-
-/**
- * @brief Response structure for QueryClientStatus operation.
- */
-struct QueryClientStatusResponse {
-    ClientStatus status = ClientStatus::UNDEFINED;
-};
-YLT_REFL(QueryClientStatusResponse, status);
 
 /**
  * @brief Response structure for QueryTask operation

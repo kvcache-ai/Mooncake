@@ -20,12 +20,11 @@
 #include <random>
 #include <thread>
 #include <vector>
-#include <future>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 
-#include "centralized_master_client.h"
+#include "master_client.h"
 
 // Size units for better readability
 static constexpr size_t KiB = 1024;
@@ -57,30 +56,18 @@ class SegmentClient {
    public:
     SegmentClient(const std::string& name, const std::string& master_server,
                   uintptr_t segment_base, uint64_t segment_size)
-        : client_id_(mooncake::generate_uuid()), master_client_(client_id_) {
+        : master_client_(mooncake::generate_uuid()) {
         auto ec = master_client_.Connect(master_server);
         if (ec != mooncake::ErrorCode::OK) {
             throw std::invalid_argument("Cannot connect to master server at " +
                                         master_server + ", ec=" + toString(ec));
         }
 
-        // Register client with master before mounting segments.
-        // Required since the refactored MountSegment checks ClientManager for
-        // the client_id (commit 48d3a47c).
-        mooncake::RegisterClientRequest reg_req;
-        reg_req.client_id = client_id_;
-        reg_req.deployment_mode = mooncake::DeploymentMode::CENTRALIZATION;
-        auto reg_ec = master_client_.RegisterClient(reg_req);
-        if (!reg_ec.has_value()) {
-            throw std::runtime_error("Failed to register client " + name +
-                                     ", ec=" + toString(reg_ec.error()));
-        }
-
         segment_.id = mooncake::generate_uuid();
         segment_.name = name;
+        segment_.base = segment_base;
         segment_.size = segment_size;
-        segment_.extra = mooncake::CentralizedSegmentExtraData{
-            .base = segment_base, .te_endpoint = name};
+        segment_.te_endpoint = name;
         auto mount_ec = master_client_.MountSegment(segment_);
         if (!mount_ec.has_value()) {
             throw std::runtime_error("Failed to mount segment " + name +
@@ -99,7 +86,7 @@ class SegmentClient {
         }
     }
 
-    void Heartbeat() {
+    void Ping() {
         if (remount_future_.valid() &&
             remount_future_.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
@@ -107,31 +94,25 @@ class SegmentClient {
             remount_future_ = std::future<void>();
         }
 
-        mooncake::HeartbeatRequest req;
-        req.client_id = client_id_;
-        auto heartbeat_result = master_client_.Heartbeat(req);
-        if (!heartbeat_result.has_value()) {
-            throw std::runtime_error("Failed to heartbeat to master server");
+        auto ping_result = master_client_.Ping();
+        if (!ping_result.has_value()) {
+            throw std::runtime_error("Failed to ping master server");
         }
 
-        if (heartbeat_result.value().status ==
-                mooncake::ClientStatus::UNDEFINED &&
+        if (ping_result.value().client_status ==
+                mooncake::ClientStatus::NEED_REMOUNT &&
             !remount_future_.valid()) {
             remount_future_ = std::async(std::launch::async, [&]() {
-                mooncake::RegisterClientRequest req;
-                req.client_id = client_id_;
-                req.segments = {segment_};
-                auto reg_ec = master_client_.RegisterClient(req);
-                if (!reg_ec.has_value()) {
-                    throw std::runtime_error("Failed to register client");
+                auto remount_ec = master_client_.ReMountSegment({segment_});
+                if (!remount_ec.has_value()) {
+                    throw std::runtime_error("Failed to remount segment");
                 }
             });
         }
     }
 
    private:
-    mooncake::UUID client_id_;
-    mooncake::CentralizedMasterClient master_client_;
+    mooncake::MasterClient master_client_;
     mooncake::Segment segment_;
     std::future<void> remount_future_;
 };
@@ -255,8 +236,7 @@ class BenchClient {
 
     uint64_t BatchGet(const std::vector<std::string>& keys) {
         uint64_t success_cnt = 0;
-        std::vector<std::string_view> key_views(keys.begin(), keys.end());
-        auto get_results = master_client_.BatchGetReplicaList(key_views);
+        auto get_results = master_client_.BatchGetReplicaList(keys);
         for (auto& get_result : get_results) {
             if (get_result.has_value() ||
                 get_result.error() == mooncake::ErrorCode::OBJECT_NOT_FOUND) {
@@ -369,7 +349,7 @@ class BenchClient {
         }
     }
 
-    mooncake::CentralizedMasterClient master_client_;
+    mooncake::MasterClient master_client_;
 
     std::atomic<bool> running_;
     std::vector<std::thread> threads_;
@@ -397,7 +377,7 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> guard(segment_clients_mutex);
                 for (auto& segment_client : segment_clients) {
-                    segment_client->Heartbeat();
+                    segment_client->Ping();
                 }
             }
             time_elapsed = std::chrono::steady_clock::now() - start_time;
@@ -457,12 +437,12 @@ int main(int argc, char** argv) {
     }
     LOG(INFO) << "Clients stopped";
 
-    LOG(INFO) << "Stopping heartbeat thread...";
+    LOG(INFO) << "Stopping ping thread...";
     if (ping_thread.joinable()) {
         ping_thread.request_stop();
         ping_thread.join();
     }
-    LOG(INFO) << "Heartbeat thread stopped";
+    LOG(INFO) << "Ping thread stopped";
 
     LOG(INFO) << "Disconnecting from master...";
     bench_clients.clear();

@@ -25,10 +25,64 @@ namespace mooncake {
 
 namespace {
 
+constexpr const char* kEtcdPrefix = "etcd://";
+constexpr const char* kRedisPrefix = "redis://";
+
 // Max retries when AsyncWriteRevoke or AsyncUnPinKey fails on the forward path
 // (e.g. after TE write failure, or read cleanup). LEASE_EXPIRED is treated as
 // success; a missing owner record is already OK (idempotent).
 constexpr int kRevokeRetryMaxCnt = 3;
+
+// TODO(C4 / external interface; see p2p-split-plan-v2.md): Remove this
+// adapter after P2PClientService read APIs accept P2PReadRouteConfig directly.
+P2PReadRouteConfig ToP2PReadRouteConfig(const ReadRouteConfig& config) {
+    P2PReadRouteConfig rpc_config;
+    rpc_config.max_candidates = config.max_candidates;
+    if (config.p2p_config.has_value()) {
+        rpc_config.tag_filters = config.p2p_config->tag_filters;
+        rpc_config.priority_limit = config.p2p_config->priority_limit;
+    }
+    return rpc_config;
+}
+
+// TODO(C4 / external interface; see p2p-split-plan-v2.md): Remove this
+// adapter after the public P2P write APIs use P2PWriteRouteConfig directly.
+P2PWriteRouteConfig ToP2PWriteRouteConfig(
+    const WriteRouteRequestConfig& config) {
+    P2PWriteRouteConfig rpc_config;
+    rpc_config.max_candidates = config.max_candidates;
+    rpc_config.strategy =
+        static_cast<P2PClientSelectionStrategy>(config.strategy);
+    rpc_config.remote_weight = config.remote_weight;
+    rpc_config.local_write_waterline = config.local_write_waterline;
+    rpc_config.top_tier_only = config.top_tier_only;
+    rpc_config.early_return = config.early_return;
+    rpc_config.tag_filters = config.tag_filters;
+    rpc_config.priority_limit = config.priority_limit;
+    return rpc_config;
+}
+
+// TODO(C4 / external interface; see p2p-split-plan-v2.md): Delete this
+// conversion after QueryResult stores P2PRouteDescriptor for the P2P path.
+std::vector<Replica::Descriptor> ToFacadeReplicaDescriptors(
+    std::vector<P2PRouteDescriptor> routes) {
+    std::vector<Replica::Descriptor> replicas;
+    replicas.reserve(routes.size());
+    for (auto& route : routes) {
+        P2PProxyDescriptor proxy;
+        proxy.client_id = route.client_id;
+        proxy.segment_id = route.segment_id;
+        proxy.ip_address = std::move(route.ip_address);
+        proxy.rpc_port = route.rpc_port;
+        proxy.object_size = route.object_size;
+        Replica::Descriptor replica{};
+        replica.id = 0;
+        replica.status = ReplicaStatus::COMPLETE;
+        replica.descriptor_variant = std::move(proxy);
+        replicas.push_back(std::move(replica));
+    }
+    return replicas;
+}
 
 }  // namespace
 
@@ -47,6 +101,309 @@ P2PClientService::P2PClientService(
                      metrics_ ? &metrics_->master_client_metric : nullptr) {
     runtime_config_store_ =
         std::make_unique<RuntimeConfigStore>(DeploymentMode::P2P);
+}
+
+bool P2PClientService::IsHAMode(const std::string& master_server_entry) const {
+    return master_server_entry.rfind(kEtcdPrefix, 0) == 0 ||
+           master_server_entry.rfind(kRedisPrefix, 0) == 0;
+}
+
+void P2PClientService::SetMasterDiscoveryConfig(const P2PClientConfig& config) {
+    master_view_.reset();
+    master_view_entry_.clear();
+    master_discovery_config_.cluster_id = config.redis_cluster_id.empty()
+                                              ? DEFAULT_CLUSTER_ID
+                                              : config.redis_cluster_id;
+    master_discovery_config_.redis_username = config.redis_username;
+    master_discovery_config_.redis_password = config.redis_password;
+    master_discovery_config_.redis_db_index = config.redis_db_index;
+    master_discovery_config_.redis_master_view_ttl_sec =
+        config.redis_master_view_ttl_sec;
+    master_discovery_config_.redis_heartbeat_interval_sec =
+        config.redis_heartbeat_interval_sec;
+}
+
+ErrorCode P2PClientService::ResolveMasterAddress(
+    const std::string& master_server_entry, std::string& master_address) {
+    if (!master_view_ || master_view_entry_ != master_server_entry) {
+        std::unique_ptr<P2PMasterView> view;
+        ErrorCode connect_result = ErrorCode::INVALID_PARAMS;
+        if (master_server_entry.rfind(kEtcdPrefix, 0) == 0) {
+            auto etcd_view = std::make_unique<P2PEtcdMasterView>(
+                master_discovery_config_.cluster_id);
+            connect_result = etcd_view->Connect(
+                master_server_entry.substr(std::strlen(kEtcdPrefix)));
+            view = std::move(etcd_view);
+        } else if (master_server_entry.rfind(kRedisPrefix, 0) == 0) {
+            if (master_discovery_config_.redis_db_index < 0 ||
+                master_discovery_config_.redis_master_view_ttl_sec <= 0 ||
+                master_discovery_config_.redis_heartbeat_interval_sec <= 0 ||
+                master_discovery_config_.redis_heartbeat_interval_sec >=
+                    master_discovery_config_.redis_master_view_ttl_sec) {
+                LOG(ERROR) << "Invalid Redis master discovery config";
+                return ErrorCode::INVALID_PARAMS;
+            }
+#ifdef STORE_USE_REDIS
+            auto redis_view = std::make_unique<P2PRedisMasterView>(
+                master_discovery_config_.cluster_id,
+                master_server_entry.substr(std::strlen(kRedisPrefix)),
+                master_discovery_config_.redis_password,
+                master_discovery_config_.redis_db_index,
+                master_discovery_config_.redis_master_view_ttl_sec,
+                master_discovery_config_.redis_heartbeat_interval_sec,
+                master_discovery_config_.redis_username);
+            connect_result = redis_view->Connect();
+            view = std::move(redis_view);
+#else
+            LOG(ERROR) << "Redis discovery requires STORE_USE_REDIS";
+            return ErrorCode::INVALID_PARAMS;
+#endif
+        }
+        if (connect_result != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to create P2P master view for "
+                       << master_server_entry << ": "
+                       << toString(connect_result);
+            return connect_result;
+        }
+        master_view_ = std::move(view);
+        master_view_entry_ = master_server_entry;
+    }
+
+    ViewVersionId version = 0;
+    auto result = master_view_->GetMasterView(master_address, version);
+    if (result != ErrorCode::OK) {
+        master_view_.reset();
+        master_view_entry_.clear();
+    }
+    return result;
+}
+
+ErrorCode P2PClientService::ConnectToMaster(
+    const std::string& master_server_entry) {
+    if (IsHAMode(master_server_entry)) {
+        std::string master_address;
+        auto err = ResolveMasterAddress(master_server_entry, master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to resolve P2P master address";
+            return err;
+        }
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to P2P master";
+        }
+        return err;
+    }
+    return master_client_.Connect(master_server_entry);
+}
+
+void P2PClientService::StartHeartbeat(const std::string& master_server_entry) {
+    if (heartbeat_running_) {
+        LOG(WARNING) << "Heartbeat thread already running, skip starting";
+        return;
+    }
+
+    bool is_ha_mode = IsHAMode(master_server_entry);
+    std::string current_master_address;
+    if (is_ha_mode) {
+        auto err =
+            ResolveMasterAddress(master_server_entry, current_master_address);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "Failed to get P2P master address from HA backend, "
+                         << "starting heartbeat thread in degraded mode "
+                         << "(will retry): " << err;
+        }
+    } else {
+        current_master_address = master_server_entry;
+    }
+
+    heartbeat_running_ = true;
+    heartbeat_thread_ =
+        std::thread([this, is_ha_mode, current_master_address]() mutable {
+            HeartbeatThreadMain(is_ha_mode, std::move(current_master_address));
+        });
+}
+
+void P2PClientService::HeartbeatThreadMain(bool is_ha_mode,
+                                           std::string current_master_address) {
+    constexpr int kMaxHeartbeatFailCount = 10;
+    constexpr int kHeartbeatIntervalMs = 1000;
+    int heartbeat_fail_count = 0;
+
+    auto register_client = [this]() { HeartbeatTryRegister(); };
+    std::future<void> register_client_future;
+
+    while (heartbeat_running_) {
+        if (register_client_future.valid() &&
+            register_client_future.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+            register_client_future = std::future<void>();
+        }
+
+        auto heartbeat_result =
+            master_client_.Heartbeat(build_heartbeat_request());
+        if (heartbeat_result) {
+            heartbeat_fail_count = 0;
+            HandleHeartbeatResponse(heartbeat_result.value(),
+                                    current_master_address, register_client,
+                                    register_client_future);
+            WaitForNextHeartbeat(kHeartbeatIntervalMs);
+            continue;
+        }
+
+        ++heartbeat_fail_count;
+        if (heartbeat_fail_count < kMaxHeartbeatFailCount) {
+            LOG(ERROR) << "Failed to send heartbeat to P2P master";
+        } else {
+            if (!connection_interrupted_) {
+                OnHAEvent(HAEvent::MASTER_UNREACHABLE);
+                connection_interrupted_ = true;
+            }
+            if (ReconnectToMaster(is_ha_mode, current_master_address)) {
+                heartbeat_fail_count = 0;
+                continue;
+            }
+        }
+        WaitForNextHeartbeat(kHeartbeatIntervalMs);
+    }
+
+    if (register_client_future.valid()) {
+        register_client_future.wait();
+    }
+}
+
+void P2PClientService::HandleHeartbeatResponse(
+    const P2PHeartbeatResponse& response,
+    const std::string& current_master_address,
+    const std::function<void()>& register_client,
+    std::future<void>& register_client_future) {
+    if (response.view_version != view_version_.load()) {
+        LOG(WARNING) << "P2P master view_version changed"
+                     << ", client status in master: "
+                     << static_cast<int>(response.status)
+                     << ", master address: " << current_master_address
+                     << ", master version: " << response.view_version
+                     << ", client version: " << view_version_.load();
+    }
+    for (const auto& task_result : response.task_results) {
+        HandleHeartbeatTaskResult(task_result);
+    }
+    if (response.status == P2PClientStatus::HEALTH) {
+        if (connection_interrupted_) {
+            OnHAEvent(HAEvent::MASTER_RECONNECTED);
+            connection_interrupted_ = false;
+        }
+    } else if (response.status == P2PClientStatus::UNDEFINED &&
+               !register_client_future.valid()) {
+        register_client_future =
+            std::async(std::launch::async, register_client);
+    }
+}
+
+void P2PClientService::HandleHeartbeatTaskResult(
+    const HeartbeatTaskResult& task_result) {
+    if (task_result.error != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to process heartbeat task"
+                   << ", task_type=" << static_cast<int>(task_result.type)
+                   << ", error=" << toString(task_result.error);
+    }
+
+    if (std::holds_alternative<SyncSegmentMetaResult>(task_result.detail)) {
+        const auto& sync_res =
+            std::get<SyncSegmentMetaResult>(task_result.detail);
+        for (const auto& sub : sync_res.sub_results) {
+            if (sub.error != ErrorCode::OK) {
+                LOG(WARNING) << "Failed to sync segment usage"
+                             << ", segment_id=" << sub.segment_id
+                             << ", error=" << toString(sub.error);
+            }
+        }
+    }
+}
+
+bool P2PClientService::ReconnectToMaster(bool is_ha_mode,
+                                         std::string& current_master_address) {
+    if (is_ha_mode) {
+        LOG(ERROR) << "Heartbeat failure threshold exceeded; fetching latest "
+                      "P2P master view and reconnecting";
+        std::string master_address;
+        auto err = ResolveMasterAddress(master_server_entry_, master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get new P2P master view: "
+                       << toString(err);
+            return false;
+        }
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to P2P master " << master_address
+                       << ": " << toString(err);
+            return false;
+        }
+        current_master_address = master_address;
+        LOG(INFO) << "Reconnected to P2P master " << master_address;
+        return true;
+    }
+
+    LOG(ERROR) << "Heartbeat failure threshold exceeded (non-HA); "
+                  "reconnecting to "
+               << current_master_address;
+    auto err = master_client_.Connect(current_master_address);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Reconnect failed to " << current_master_address << ": "
+                   << toString(err);
+        return false;
+    }
+    LOG(INFO) << "Reconnected to P2P master " << current_master_address;
+    return true;
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+P2PClientService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    (void)client_ids;
+    LOG(ERROR) << "BatchQueryIp is not part of the P2P route protocol";
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+P2PClientService::QueryByRegex(const std::string& regex) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    auto result = master_client_.GetReadRouteByRegex(regex);
+    if (!result.has_value()) {
+        LOG(ERROR) << "GetReadRouteByRegex RPC failed"
+                   << ", regex=" << regex
+                   << ", error=" << toString(result.error());
+        return tl::make_unexpected(result.error());
+    }
+
+    std::unordered_map<std::string, std::vector<Replica::Descriptor>> response;
+    response.reserve(result->size());
+    for (auto& [key, routes] : *result) {
+        response.emplace(std::move(key),
+                         ToFacadeReplicaDescriptors(std::move(routes)));
+    }
+    return response;
+}
+
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+P2PClientService::CalcCacheStats() {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    LOG(ERROR) << "CalcCacheStats is not implemented for P2P client service";
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
 }
 
 void P2PClientService::Stop() {
@@ -262,6 +619,9 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
                   << ", queue_size=" << config.async_route_queue_size;
     }
 
+    // TODO(C2): Bind atomically, obtain the actual listener port, and publish
+    // it in registration after runtime ownership is split; config port 0 alone
+    // does not fix the current getFreeTcpPort-to-bind race.
     // 9. Start P2P client RPC service
     client_rpc_service_.emplace(*data_manager_, metrics_);
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
@@ -431,12 +791,12 @@ RemoveReplicaCallback P2PClientService::BuildRemoveReplicaCallback() {
 
 tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
     std::string_view key, const UUID& tier_id, size_t size) {
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = key;
-    req.size = size;
+    req.object_size = size;
     req.client_id = client_id_;
     req.segment_id = tier_id;
-    auto result = master_client_.AddReplica(req);
+    auto result = master_client_.PublishRoute(req);
     if (!result) {
         LOG(ERROR) << "Failed to add replica for key: " << key
                    << " error: " << result.error();
@@ -447,11 +807,11 @@ tl::expected<void, ErrorCode> P2PClientService::SyncAddReplica(
 
 tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
     std::string_view key, const UUID& tier_id) {
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = key;
     req.client_id = client_id_;
     req.segment_id = tier_id;
-    auto result = master_client_.RemoveReplica(req);
+    auto result = master_client_.WithdrawRoute(req);
     if (!result) {
         LOG(ERROR) << "Failed to remove replica for key: " << key
                    << " error: " << result.error();
@@ -463,11 +823,11 @@ tl::expected<void, ErrorCode> P2PClientService::SyncRemoveReplica(
 std::vector<tl::expected<void, ErrorCode>>
 P2PClientService::SyncBatchRemoveReplica(std::string_view key,
                                          std::vector<UUID> segment_ids) {
-    BatchRemoveReplicaRequest req;
+    P2PBatchWithdrawRouteRequest req;
     req.key = key;
     req.client_id = client_id_;
     req.segment_ids = std::move(segment_ids);
-    auto results = master_client_.BatchRemoveReplica(req);
+    auto results = master_client_.BatchWithdrawRoute(req);
     for (size_t i = 0; i < results.size(); i++) {
         if (!results[i]) {
             LOG(ERROR) << "Failed to remove replica for key: " << key
@@ -479,7 +839,7 @@ P2PClientService::SyncBatchRemoveReplica(std::string_view key,
 }
 
 SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
-    return [this](const Segment& segment,
+    return [this](const P2PSegment& segment,
                   bool mount) -> tl::expected<void, ErrorCode> {
         if (mount) {
             // Skip MountSegment in degraded mode (master not connected).
@@ -528,8 +888,8 @@ SegmentSyncCallback P2PClientService::BuildSegmentSyncCallback() {
 // Heartbeat & Registration
 // ============================================================================
 
-HeartbeatRequest P2PClientService::build_heartbeat_request() {
-    HeartbeatRequest req;
+P2PHeartbeatRequest P2PClientService::build_heartbeat_request() {
+    P2PHeartbeatRequest req;
     req.client_id = client_id_;
 
     if (data_manager_ != nullptr) {
@@ -556,8 +916,8 @@ HeartbeatRequest P2PClientService::build_heartbeat_request() {
     return req;
 }
 
-std::vector<Segment> P2PClientService::CollectTierSegments() const {
-    std::vector<Segment> segments;
+std::vector<P2PSegment> P2PClientService::CollectTierSegments() const {
+    std::vector<P2PSegment> segments;
     if (data_manager_ == nullptr) {
         return segments;
     }
@@ -565,35 +925,35 @@ std::vector<Segment> P2PClientService::CollectTierSegments() const {
     auto tier_views = data_manager_->GetTierViews();
     segments.reserve(tier_views.size());
     for (const auto& view : tier_views) {
-        Segment seg;
+        P2PSegment seg;
         seg.id = view.id;
         seg.name = view.GetName();
         seg.size = view.capacity;
-        auto& p2p_extra = seg.GetP2PExtra();
-        p2p_extra.priority = view.priority;
-        p2p_extra.tags = view.tags;
-        p2p_extra.memory_type = view.type;
-        p2p_extra.usage = view.usage;
+        seg.priority = view.priority;
+        seg.tags = view.tags;
+        seg.memory_type = view.type;
+        seg.usage = view.usage;
         segments.push_back(std::move(seg));
     }
     return segments;
 }
 
-tl::expected<RegisterClientResponse, ErrorCode>
-P2PClientService::InnerRegisterClient() {
-    RegisterClientRequest req;
+tl::expected<ViewVersionId, ErrorCode> P2PClientService::InnerRegisterClient() {
+    P2PRegisterClientRequest req;
     req.client_id = client_id_;
     req.segments = CollectTierSegments();
-    req.deployment_mode = DeploymentMode::P2P;
     req.ip_address = local_ip_;
+    // TODO(C2): Publish the bound listener port, not an unreserved probe
+    // result.
     req.rpc_port = client_rpc_port_;
 
     auto register_result = master_client_.RegisterClient(req);
     if (!register_result) {
         LOG(ERROR) << "Failed to register P2P client: "
                    << register_result.error() << ", client_id=" << client_id_;
+        return tl::make_unexpected(register_result.error());
     } else {
-        view_version_ = register_result.value().view_version;
+        view_version_ = register_result.value();
         registered_.store(true, std::memory_order_release);
 
         // A successful register means the master did not have us — drive HA
@@ -608,7 +968,7 @@ P2PClientService::InnerRegisterClient() {
             }
         }
     }
-    return register_result;
+    return *register_result;
 }
 
 tl::expected<void, ErrorCode> P2PClientService::UnregisterClient() {
@@ -630,10 +990,7 @@ tl::expected<void, ErrorCode> P2PClientService::InnerUnregisterClient() {
     tl::expected<void, ErrorCode> ret;  // OK unless an attempted RPC fails
     bool is_local_service = ha_manager_ && ha_manager_->IsLocalService();
     if (was_registered && !is_local_service) {
-        UnregisterClientRequest req;
-        req.client_id = client_id_;
-        req.deployment_mode = DeploymentMode::P2P;
-        auto result = master_client_.UnregisterClient(req);
+        auto result = master_client_.UnregisterClient(client_id_);
         if (!result) {
             LOG(ERROR) << "UnregisterClient RPC failed: " << result.error()
                        << ", client_id=" << client_id_
@@ -943,15 +1300,15 @@ P2PClientService::InnerBatchPutNormal(
     return CollectResults(handles, keys);
 }
 
-tl::expected<BatchGetWriteRouteResponse, ErrorCode>
+tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
 P2PClientService::BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
                                         const std::vector<size_t>& sizes,
                                         const WriteRouteRequestConfig& config) {
-    BatchGetWriteRouteRequest req;
+    P2PBatchGetWriteRouteRequest req;
     req.client_id = client_id_;
-    req.config = config;
+    req.config = ToP2PWriteRouteConfig(config);
     req.keys.assign(keys.begin(), keys.end());
-    req.sizes = sizes;
+    req.object_sizes.assign(sizes.begin(), sizes.end());
     auto batch_route_result = master_client_.BatchGetWriteRoute(req);
     if (!batch_route_result) {
         LOG(ERROR) << "BatchGetWriteRoute RPC failed: "
@@ -967,7 +1324,7 @@ P2PClientService::CreatePutHandlesFromRoute(
     std::vector<std::vector<Slice>>& batched_slices,
     const std::vector<size_t>& sizes,
     const WriteRouteRequestConfig& route_config,
-    BatchGetWriteRouteResponse& batch_resp) {
+    P2PBatchGetWriteRouteResponse& batch_resp) {
     struct WriteTask {
         std::unique_ptr<TaskHandle<void>> first_task;
         std::unique_ptr<WriteOp> first_op;
@@ -985,7 +1342,7 @@ P2PClientService::CreatePutHandlesFromRoute(
         }
         auto ops =
             BuildWriteOps(keys[i], batched_slices[i], sizes[i], route_config,
-                          std::move(batch_resp.responses[i].candidates));
+                          std::move(batch_resp.responses[i]));
         if (!ops) {
             LOG(ERROR) << "fail to build write ops"
                        << ", key=" << keys[i] << ", error=" << ops.error();
@@ -1042,7 +1399,7 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                                      std::vector<Slice>& slices,
                                      size_t object_size,
                                      const WriteRouteRequestConfig& config,
-                                     std::vector<WriteCandidate> candidates)
+                                     std::vector<P2PWriteCandidate> candidates)
     -> tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode> {
     if (candidates.empty()) {
         LOG(ERROR) << "No write candidates for key: " << key;
@@ -1610,8 +1967,10 @@ P2PClientService::BatchFetchReadRoutes(
     }
 
     // Single batch RPC to master
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> responses;
-    responses = master_client_.BatchGetReplicaList(miss_keys, config);
+    std::vector<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
+        responses;
+    responses = master_client_.BatchGetReadRoute(miss_keys,
+                                                 ToP2PReadRouteConfig(config));
     for (size_t k = 0; k < responses.size(); ++k) {
         if (!responses[k]) {
             if (responses[k].error() != ErrorCode::OBJECT_NOT_FOUND) {
@@ -1621,7 +1980,7 @@ P2PClientService::BatchFetchReadRoutes(
             result[miss_pos[k]] = tl::unexpected(responses[k].error());
             continue;
         }
-        auto routes = ReplicasToRoutes(responses[k].value().replicas);
+        auto routes = RouteDescriptorsToRoutes(responses[k].value());
         if (routes.empty()) {
             LOG(ERROR) << "invalid route, key=" << miss_keys[k];
             result[miss_pos[k]] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
@@ -1669,28 +2028,27 @@ std::vector<P2PClientService::ResolvedRoute> P2PClientService::LoadCachedRoutes(
     return routes;
 }
 
-std::vector<P2PClientService::ResolvedRoute> P2PClientService::ReplicasToRoutes(
-    const std::vector<Replica::Descriptor>& replicas) {
+std::vector<P2PClientService::ResolvedRoute>
+P2PClientService::RouteDescriptorsToRoutes(
+    const std::vector<P2PRouteDescriptor>& descriptors) {
     std::vector<ResolvedRoute> routes;
-    if (replicas.empty()) {
-        LOG(WARNING) << "replicas is empty";
+    if (descriptors.empty()) {
+        LOG(WARNING) << "routes are empty";
         return routes;
     }
-    uint64_t total_size = 0;
-    for (const auto& replica : replicas) {
-        if (!replica.is_p2p_proxy_replica()) {
-            LOG(ERROR) << "invalid replica, not p2p proxy replica";
-            return routes;
-        }
-    }
-    total_size = calculate_total_size(replicas[0]);
+    const uint64_t total_size = descriptors.front().object_size;
     if (total_size == 0) {
-        LOG(ERROR) << "invalid replica, total size is 0";
+        LOG(ERROR) << "invalid route, total size is 0";
         return routes;
     }
 
-    for (const auto& replica : replicas) {
-        auto proxy = replica.get_p2p_proxy_descriptor();
+    for (const auto& descriptor : descriptors) {
+        P2PProxyDescriptor proxy;
+        proxy.client_id = descriptor.client_id;
+        proxy.segment_id = descriptor.segment_id;
+        proxy.ip_address = descriptor.ip_address;
+        proxy.rpc_port = descriptor.rpc_port;
+        proxy.object_size = descriptor.object_size;
         if (proxy.ip_address.empty() || proxy.rpc_port == 0) {
             LOG(ERROR) << "skip invalid p2p route, empty ip or zero port"
                        << ", client_id=" << proxy.client_id << ", ip_address='"
@@ -2100,8 +2458,8 @@ P2PClientService::BuildRouteIter(std::string_view key,
 async_simple::coro::Lazy<std::vector<P2PClientService::ResolvedRoute>>
 P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
                                                const ReadRouteConfig& config) {
-    auto replica_result =
-        co_await master_client_.AsyncGetReplicaList(key, config);
+    auto replica_result = co_await master_client_.AsyncGetReadRoute(
+        key, ToP2PReadRouteConfig(config));
     if (!replica_result) {
         if (replica_result.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to query replica list, key=" << key
@@ -2109,7 +2467,7 @@ P2PClientService::AsyncResolveRoutesFromMaster(std::string_view key,
         }
         co_return std::vector<ResolvedRoute>{};
     }
-    auto routes = ReplicasToRoutes(replica_result.value().replicas);
+    auto routes = RouteDescriptorsToRoutes(replica_result.value());
     if (routes.empty()) {
         LOG(ERROR) << "Cannot determine size for key: " << key;
     }
@@ -2233,14 +2591,16 @@ tl::expected<std::unique_ptr<QueryResult>, ErrorCode> P2PClientService::Query(
     }
 
     // 3) Local miss + healthy: fall back to master.
-    auto result = master_client_.GetReplicaList(object_key, config);
+    auto result =
+        master_client_.GetReadRoute(object_key, ToP2PReadRouteConfig(config));
     if (!result) {
         LOG(WARNING) << "fail to get replica list"
                      << ", key=" << object_key << ", error=" << result.error();
         return tl::unexpected(result.error());
     }
 
-    return std::make_unique<QueryResult>(std::move(result.value().replicas));
+    return std::make_unique<QueryResult>(
+        ToFacadeReplicaDescriptors(std::move(result.value())));
 }
 
 std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
@@ -2272,13 +2632,14 @@ P2PClientService::BatchQuery(const std::vector<std::string>& object_keys,
 
     std::vector<std::string_view> key_views(object_keys.begin(),
                                             object_keys.end());
-    auto responses = master_client_.BatchGetReplicaList(key_views, config);
+    auto responses = master_client_.BatchGetReadRoute(
+        key_views, ToP2PReadRouteConfig(config));
     std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>> results;
     results.reserve(responses.size());
     for (size_t i = 0; i < responses.size(); ++i) {
         if (responses[i]) {
             results.emplace_back(std::make_unique<QueryResult>(
-                std::move(responses[i].value().replicas)));
+                ToFacadeReplicaDescriptors(std::move(responses[i].value()))));
         } else {
             results.emplace_back(tl::unexpected(responses[i].error()));
         }

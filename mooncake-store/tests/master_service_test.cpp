@@ -1,4 +1,4 @@
-#include "centralized_master_service.h"
+#include "master_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -12,7 +12,6 @@
 #include <utility>
 
 #include "types.h"
-#include "rpc_types.h"
 
 namespace mooncake::test {
 
@@ -37,74 +36,31 @@ class MasterServiceTest : public ::testing::Test {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
-        segment.extra =
-            CentralizedSegmentExtraData{.base = static_cast<uintptr_t>(base),
-                                        .te_endpoint = segment.name,
-                                        .protocol = ""};
+        segment.base = base;
         segment.size = size;
+        segment.te_endpoint = segment.name;
         return segment;
     }
 
     MountedSegmentContext PrepareSimpleSegment(
-        CentralizedMasterService& service, std::string name = "test_segment",
+        MasterService& service, std::string name = "test_segment",
         size_t base = kDefaultSegmentBase,
         size_t size = kDefaultSegmentSize) const {
         Segment segment = MakeSegment(std::move(name), base, size);
         UUID client_id = generate_uuid();
-        // Register client with its segment
-        RegisterClientRequest req;
-        req.client_id = client_id;
-        req.segments.push_back(segment);
-        auto reg_result = service.RegisterClient(req);
-        EXPECT_TRUE(reg_result.has_value());
+        auto mount_result = service.MountSegment(segment, client_id);
+        EXPECT_TRUE(mount_result.has_value());
         return {.segment_id = segment.id, .client_id = client_id};
     }
 
-    void TriggerOnClientDisconnected(CentralizedMasterService& service,
-                                     const UUID& client_id,
-                                     std::chrono::milliseconds wait_duration) {
-        auto client = service.client_manager_.GetClient(client_id);
-        if (client) {
-            // Wait for keep-alive timeout.
-            std::this_thread::sleep_for(wait_duration);
-            // Trigger health check to update status
-            auto [old_status, new_status] = client->CheckHealth();
-            if (new_status == ClientStatus::DISCONNECTION) {
-                client->OnDisconnected();
-            }
-        }
-    }
-
-    void TriggerOnClientRecovered(CentralizedMasterService& service,
-                                  const UUID& client_id) {
-        auto client = service.client_manager_.GetClient(client_id);
-        if (client) {
-            // Trigger heartbeat to recover status
-            auto [old_status, new_status] = client->Heartbeat();
-            if (new_status == ClientStatus::HEALTH) {
-                client->OnRecovered();
-            }
-        }
-    }
-
-    /// Helper: Register a client with no segments.
-    /// Tests that call MountSegment must register the client first.
-    void RegisterClient(CentralizedMasterService& service,
-                        const UUID& client_id) const {
-        RegisterClientRequest reg_req;
-        reg_req.client_id = client_id;
-        auto reg_result = service.RegisterClient(reg_req);
-        EXPECT_TRUE(reg_result.has_value());
-    }
     std::vector<Replica::Descriptor> replica_list;
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
-std::string GenerateKeyForSegment(
-    const UUID& client_id,
-    const std::unique_ptr<CentralizedMasterService>& service,
-    const std::string& segment_name) {
+std::string GenerateKeyForSegment(const UUID& client_id,
+                                  const std::unique_ptr<MasterService>& service,
+                                  const std::string& segment_name) {
     static std::atomic<uint64_t> counter(0);
 
     while (true) {
@@ -152,50 +108,48 @@ std::string GenerateKeyForSegment(
 }
 
 TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
-    // Create a CentralizedMasterService instance for testing.
+    // Create a MasterService instance for testing.
     auto service_config =
         MasterServiceConfig::builder()
             .set_memory_allocator(BufferAllocatorType::CACHELIB)
             .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
-    const auto original_base = segment.GetCentralizedExtra().base;
+    const auto original_base = segment.base;
     const auto original_size = segment.size;
 
     // Test invalid parameters.
     // Invalid buffer address (0).
-    segment.GetCentralizedExtra().base = 0;
+    segment.base = 0;
     segment.size = original_size;
     auto mount_result1 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result1.error());
 
     // Invalid segment size (0).
-    segment.GetCentralizedExtra().base = original_base;
+    segment.base = original_base;
     segment.size = 0;
     auto mount_result2 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result2.error());
 
     // Base is not aligned
-    segment.GetCentralizedExtra().base = original_base + 1;
+    segment.base = original_base + 1;
     segment.size = original_size;
     auto mount_result3 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result3.error());
 
     // Size is not aligned
-    segment.GetCentralizedExtra().base = original_base;
+    segment.base = original_base;
     segment.size = original_size + 1;
     auto mount_result4 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result4.error());
 
     // Test normal mount operation.
-    segment.GetCentralizedExtra().base = original_base;
+    segment.base = original_base;
     segment.size = original_size;
     auto mount_result5 = service_->MountSegment(segment, client_id);
     EXPECT_TRUE(mount_result5.has_value());
@@ -227,35 +181,33 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
 }
 
 TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
-    // Create a CentralizedMasterService instance for testing.
+    // Create a MasterService instance for testing.
     auto service_config = MasterServiceConfig::builder()
                               .set_memory_allocator(BufferAllocatorType::OFFSET)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
-    const auto original_base = segment.GetCentralizedExtra().base;
+    const auto original_base = segment.base;
     const auto original_size = segment.size;
 
     // Test invalid parameters.
     // Invalid buffer address (0).
-    segment.GetCentralizedExtra().base = 0;
+    segment.base = 0;
     segment.size = original_size;
     auto mount_result1 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result1.error());
 
     // Invalid segment size (0).
-    segment.GetCentralizedExtra().base = original_base;
+    segment.base = original_base;
     segment.size = 0;
     auto mount_result2 = service_->MountSegment(segment, client_id);
     EXPECT_FALSE(mount_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, mount_result2.error());
 
     // Test normal mount operation.
-    segment.GetCentralizedExtra().base = original_base;
+    segment.base = original_base;
     segment.size = original_size;
     auto mount_result5 = service_->MountSegment(segment, client_id);
     EXPECT_TRUE(mount_result5.has_value());
@@ -287,16 +239,14 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
 }
 
 TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
-    // Create a CentralizedMasterService instance for testing.
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    // Create a MasterService instance for testing.
+    std::unique_ptr<MasterService> service_(new MasterService());
     // Define a constant buffer address for the segment.
     constexpr size_t kBufferAddress = 0x300000000;
     // Define the name of the test segment.
     std::string segment_name = "test_random_segment";
     UUID segment_id = generate_uuid();
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     size_t times = 10;
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -318,8 +268,7 @@ TEST_F(MasterServiceTest, RandomMountUnmountSegment) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t num_threads = 4;
     constexpr size_t iterations = 100;
     std::vector<std::thread> threads;
@@ -332,7 +281,6 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
                 MakeSegment("segment_" + std::to_string(i),
                             0x300000000 + i * 0x10000000, 16 * 1024 * 1024);
             UUID client_id = generate_uuid();
-            RegisterClient(*service_, client_id);
 
             for (size_t j = 0; j < iterations; j++) {
                 auto mount_result = service_->MountSegment(segment, client_id);
@@ -356,8 +304,7 @@ TEST_F(MasterServiceTest, ConcurrentMountUnmount) {
 }
 
 TEST_F(MasterServiceTest, PutStartInvalidParams) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -378,8 +325,7 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
 }
 
 TEST_F(MasterServiceTest, PutStartEndFlow) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     const UUID invalid_client_id = generate_uuid();
@@ -432,8 +378,7 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
 
 TEST_F(MasterServiceTest, PutWithPreferredSegment) {
     // For backward compatibility, test the deprecated single preferred_segment
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
     // Mount 3 segments, each 16MB
@@ -471,8 +416,7 @@ TEST_F(MasterServiceTest, PutWithPreferredSegment) {
 }
 
 TEST_F(MasterServiceTest, PutWithPreferredSegments) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
     // Mount 3 segments, each 16MB
@@ -515,8 +459,7 @@ TEST_F(MasterServiceTest, PutWithPreferredSegments) {
 }
 
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
     // Mount 5 segments, each 16MB
@@ -568,8 +511,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
     auto get_result = service_->GetReplicaList(".*non_existent.*");
@@ -604,7 +546,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
 }
 
 // Helper function to put an object, making the test cleaner
-void put_object(CentralizedMasterService& service, const UUID& client_id,
+void put_object(MasterService& service, const UUID& client_id,
                 const std::string& key) {
     uint64_t value_length = 1024;
     ReplicateConfig config;
@@ -626,7 +568,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    auto service_ = std::make_unique<CentralizedMasterService>(service_config);
+    auto service_ = std::make_unique<MasterService>(service_config);
     const UUID client_id = generate_uuid();
 
     // 1. Mount segment
@@ -741,8 +683,7 @@ TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
 }
 
 TEST_F(MasterServiceTest, GetReplicaList) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
     auto get_result = service_->GetReplicaList("non_existent");
@@ -769,8 +710,7 @@ TEST_F(MasterServiceTest, GetReplicaList) {
 }
 
 TEST_F(MasterServiceTest, RemoveObject) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -800,8 +740,7 @@ TEST_F(MasterServiceTest, RemoveObject) {
 }
 
 TEST_F(MasterServiceTest, RandomRemoveObject) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -836,8 +775,7 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -874,8 +812,7 @@ TEST_F(MasterServiceTest, CopyStart) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount 4 segments (segment_1, segment_2, segment_3, segment_4) with
     // PrepareSimpleSegment
@@ -1014,8 +951,7 @@ TEST_F(MasterServiceTest, CopyStart) {
 }
 
 TEST_F(MasterServiceTest, CopyEnd) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
@@ -1126,8 +1062,7 @@ TEST_F(MasterServiceTest, CopyEnd) {
 }
 
 TEST_F(MasterServiceTest, CopyRevoke) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
@@ -1216,8 +1151,7 @@ TEST_F(MasterServiceTest, MoveStart) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
@@ -1348,8 +1282,7 @@ TEST_F(MasterServiceTest, MoveStart) {
 }
 
 TEST_F(MasterServiceTest, MoveEnd) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
@@ -1428,8 +1361,7 @@ TEST_F(MasterServiceTest, MoveEnd) {
 }
 
 TEST_F(MasterServiceTest, MoveRevoke) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment
     [[maybe_unused]] const auto context1 =
@@ -1522,8 +1454,7 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .set_client_live_ttl_sec(client_live_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment, each
     // 16 MB
@@ -1607,8 +1538,7 @@ TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
             .set_put_start_discard_timeout_sec(put_discard_timeout)
             .set_put_start_release_timeout_sec(put_release_timeout)
             .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment, each
     // 16 MB
@@ -1686,7 +1616,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    auto service_ = std::make_unique<CentralizedMasterService>(service_config);
+    auto service_ = std::make_unique<MasterService>(service_config);
     const UUID client_id = generate_uuid();
 
     // 1. Mount segment
@@ -1754,7 +1684,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<CentralizedMasterService>(service_config);
+        service_ = std::make_unique<MasterService>(service_config);
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -1778,7 +1708,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<CentralizedMasterService>(
+        service_ = std::make_unique<MasterService>(
             service_config);  // Reset the service
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
@@ -1804,8 +1734,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<CentralizedMasterService>(
-            service_config);  // Reset
+        service_ = std::make_unique<MasterService>(service_config);  // Reset
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -1830,8 +1759,7 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         auto service_config = MasterServiceConfig::builder()
                                   .set_default_kv_lease_ttl(kv_lease_ttl)
                                   .build();
-        service_ = std::make_unique<CentralizedMasterService>(
-            service_config);  // Reset
+        service_ = std::make_unique<MasterService>(service_config);  // Reset
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
         populate_store();
@@ -1864,8 +1792,7 @@ TEST_F(MasterServiceTest, RemoveAll) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     int times = 10;
@@ -1900,8 +1827,7 @@ TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
     // Mount 3 segments, each 64MB
@@ -1964,15 +1890,13 @@ TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
 }
 
 TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount a segment for testing
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;  // 16MB
     auto segment = MakeSegment("test_segment", buffer, size);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     // Mount the segment
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -2035,13 +1959,11 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result_concurrent = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result_concurrent.has_value());
 
@@ -2116,13 +2038,11 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
     auto segment = MakeSegment("concurrent_segment", buffer, size);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -2199,13 +2119,11 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
 }
 
 TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16 * 100;
     auto segment = MakeSegment("concurrent_segment", buffer, size);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -2255,8 +2173,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -2266,7 +2183,6 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     auto segment1 = MakeSegment("segment1", buffer1, size);
     auto segment2 = MakeSegment("segment2", buffer2, size);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
     auto mount_result2 = service_->MountSegment(segment2, client_id);
@@ -2313,8 +2229,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
@@ -2325,7 +2240,6 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto segment1 = MakeSegment("segment1", buffer1, segment_size);
     auto segment2 = MakeSegment("segment2", buffer2, segment_size);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
     auto mount_result2 = service_->MountSegment(segment2, client_id);
@@ -2369,14 +2283,12 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
 }
 
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
     auto segment = MakeSegment(segment_name, kBufferAddress, kSegmentSize);
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     // Mount a segment for testing
     auto mount_result = service_->MountSegment(segment, client_id);
@@ -2435,8 +2347,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -2525,8 +2436,7 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
     for (int i = 0; i < 10; ++i) {
@@ -2567,8 +2477,7 @@ TEST_F(MasterServiceTest, EvictObject) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Mount a segment that can hold about 1024 * 16 objects.
     // As the eviction is processed separately for each shard,
@@ -2610,8 +2519,7 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
@@ -2667,8 +2575,7 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
                               .set_allow_evict_soft_pinned_objects(
                                   allow_evict_soft_pinned_objects)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Mount segment and put an object
     constexpr size_t buffer = 0x300000000;
@@ -2710,8 +2617,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
                                   allow_evict_soft_pinned_objects)
                               .set_eviction_ratio(eviction_ratio)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -2784,8 +2690,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
                               .set_allow_evict_soft_pinned_objects(
                                   allow_evict_soft_pinned_objects)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -2835,8 +2740,7 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
                                   allow_evict_soft_pinned_objects)
                               .set_eviction_ratio(eviction_ratio)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -2919,8 +2823,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
                               .set_allow_evict_soft_pinned_objects(
                                   allow_evict_soft_pinned_objects)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
     // Mount segment and put an object
@@ -2958,8 +2861,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
 }
 
 TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
     // Mount 20 segments, each 16MB and slab-aligned
@@ -2999,8 +2901,7 @@ TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
 }
 
 TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
     // Mount a single 16MB segment
@@ -3032,8 +2933,7 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
     // Mount a segment
@@ -3066,9 +2966,7 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
 
     // Tets batch
     test_keys.push_back("non_existent_key");
-    std::vector<std::string_view> test_key_views(test_keys.begin(),
-                                                 test_keys.end());
-    auto exist_resp = service_->BatchExistKey(test_key_views);
+    auto exist_resp = service_->BatchExistKey(test_keys);
     for (int i = 0; i < test_object_num; ++i) {
         ASSERT_TRUE(exist_resp[i].value());
     }
@@ -3076,17 +2974,14 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
 }
 
 TEST_F(MasterServiceTest, BatchQueryIpTest) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     // Mount a segment with a specific te_endpoint (IP:Port format)
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     Segment segment = MakeSegment("test_segment", buffer, size);
-    segment.GetCentralizedExtra().te_endpoint =
-        "127.0.0.1:12345";  // Set IP:Port format for testing
+    segment.te_endpoint = "127.0.0.1:12345";  // Set IP:Port format for testing
     auto mount_result = service_->MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
 
@@ -3126,10 +3021,8 @@ TEST_F(MasterServiceTest, BatchQueryIpTest) {
 }
 
 TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsTest) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     // Mount multiple segments with different IPs for the same client
     constexpr size_t buffer1 = 0x300000000;
@@ -3137,19 +3030,17 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsTest) {
     constexpr size_t size = 1024 * 1024 * 16;
 
     Segment segment1 = MakeSegment("segment1", buffer1, size);
-    segment1.GetCentralizedExtra().te_endpoint = "127.0.0.1:12345";
+    segment1.te_endpoint = "127.0.0.1:12345";
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
 
     Segment segment2 = MakeSegment("segment2", buffer2, size);
-    segment2.GetCentralizedExtra().te_endpoint =
-        "127.0.0.1:12346";  // Same IP, different port
+    segment2.te_endpoint = "127.0.0.1:12346";  // Same IP, different port
     auto mount_result2 = service_->MountSegment(segment2, client_id);
     ASSERT_TRUE(mount_result2.has_value());
 
     Segment segment3 = MakeSegment("segment3", 0x500000000, size);
-    segment3.GetCentralizedExtra().te_endpoint =
-        "192.168.1.1:12345";  // Different IP
+    segment3.te_endpoint = "192.168.1.1:12345";  // Different IP
     auto mount_result3 = service_->MountSegment(segment3, client_id);
     ASSERT_TRUE(mount_result3.has_value());
 
@@ -3174,8 +3065,7 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsTest) {
 }
 
 TEST_F(MasterServiceTest, BatchQueryIpEmptyClientIdTest) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Test with empty client_ids list
     std::vector<UUID> empty_client_ids;
@@ -3188,10 +3078,8 @@ TEST_F(MasterServiceTest, BatchQueryIpEmptyClientIdTest) {
 }
 
 TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     // Mount multiple segments, all with empty te_endpoint
     constexpr size_t buffer1 = 0x300000000;
@@ -3199,12 +3087,12 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
     constexpr size_t size = 1024 * 1024 * 16;
 
     Segment segment1 = MakeSegment("segment1", buffer1, size);
-    segment1.GetCentralizedExtra().te_endpoint = "";  // Empty te_endpoint
+    segment1.te_endpoint = "";  // Empty te_endpoint
     auto mount_result1 = service_->MountSegment(segment1, client_id);
     ASSERT_TRUE(mount_result1.has_value());
 
     Segment segment2 = MakeSegment("segment2", buffer2, size);
-    segment2.GetCentralizedExtra().te_endpoint = "";  // Empty te_endpoint
+    segment2.te_endpoint = "";  // Empty te_endpoint
     auto mount_result2 = service_->MountSegment(segment2, client_id);
     ASSERT_TRUE(mount_result2.has_value());
 
@@ -3229,14 +3117,13 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
 
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Reset storage space metrics.
-    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
-    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 
     MasterServiceConfig master_config;
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(master_config));
+    std::unique_ptr<MasterService> service_(new MasterService(master_config));
 
     constexpr size_t kReplicaCnt = 3;
     constexpr size_t kBaseAddr = 0x300000000;
@@ -3279,9 +3166,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Wait for a while until the put-start expired.
     for (size_t i = 0; i <= master_config.put_start_discard_timeout_sec; i++) {
         for (auto& context : contexts) {
-            HeartbeatRequest hb_req;
-            hb_req.client_id = context.client_id;
-            auto result = service_->Heartbeat(hb_req);
+            auto result = service_->Ping(context.client_id);
             EXPECT_TRUE(result.has_value());
         }
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -3319,9 +3204,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
                                 master_config.put_start_discard_timeout_sec;
          i++) {
         for (auto& context : contexts) {
-            HeartbeatRequest hb_req;
-            hb_req.client_id = context.client_id;
-            auto result = service_->Heartbeat(hb_req);
+            auto result = service_->Ping(context.client_id);
             EXPECT_TRUE(result.has_value());
         }
         // Protect key_1 from eviction.
@@ -3344,9 +3227,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Wait for a while until key_2 can be discarded and released.
     for (size_t i = 0; i <= master_config.put_start_release_timeout_sec; i++) {
         for (auto& context : contexts) {
-            HeartbeatRequest hb_req;
-            hb_req.client_id = context.client_id;
-            auto result = service_->Heartbeat(hb_req);
+            auto result = service_->Ping(context.client_id);
             EXPECT_TRUE(result.has_value());
         }
         // Protect key_1 from eviction.
@@ -3384,8 +3265,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 TEST_F(MasterServiceTest, ConcurrentMountLocalDiskSegment) {
     MasterServiceConfig config;
     config.enable_offload = true;
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(config));
+    std::unique_ptr<MasterService> service_(new MasterService(config));
 
     constexpr size_t num_threads = 100;
     std::vector<std::thread> threads;
@@ -3395,13 +3275,10 @@ TEST_F(MasterServiceTest, ConcurrentMountLocalDiskSegment) {
     for (size_t i = 0; i < num_threads; i++) {
         threads.emplace_back([&service_, i, &success_count, this]() {
             UUID client_id = generate_uuid();
-            RegisterClient(*service_, client_id);
             auto mount_result =
                 service_->MountLocalDiskSegment(client_id, true);
             ASSERT_TRUE(mount_result.has_value());
-            if (mount_result.has_value()) {
-                ++success_count;
-            }
+            ++success_count;
         });
     }
 
@@ -3418,12 +3295,8 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     constexpr size_t key_cnt = 3000;
     MasterServiceConfig config;
     config.enable_offload = true;
-    config.client_live_ttl_sec = 300;
-    config.client_crashed_ttl_sec = 900;
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(config));
+    std::unique_ptr<MasterService> service_(new MasterService(config));
     UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 16;
     auto segment = MakeSegment("segment", buffer, size);
@@ -3482,8 +3355,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -3536,10 +3408,8 @@ TEST_F(MasterServiceTest, BatchReplicaClearSpecificSegment) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
-    RegisterClient(*service_, client_id);
 
     // 2. Setup: Mount segments
     Segment segment1 = MakeSegment("segment1", 0x300000000, 1024 * 1024 * 16);
@@ -3607,8 +3477,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -3648,8 +3517,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithDifferentClientId) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id1 = generate_uuid();
     const UUID client_id2 = generate_uuid();
@@ -3690,8 +3558,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithNonExistentKeys) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -3707,8 +3574,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithNonExistentKeys) {
 }
 
 TEST_F(MasterServiceTest, BatchReplicaClearWithEmptyKeys) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -3728,8 +3594,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearWithEmptyStringKeys) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -3764,8 +3629,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id1 = generate_uuid();
     const UUID client_id2 = generate_uuid();
@@ -3829,55 +3693,13 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
         << "key3 should still exist (different client_id)";
 }
 
-// --- Test Case: Client Disconnection and Recovery ---
-// Validate that client allocators are disabled during disconnection and
-// re-enabled after recovery.
-TEST_F(MasterServiceTest, DisconnectionAndRecovery) {
-    SCOPED_TRACE("Test Case: Client Disconnection and Recovery");
-    int64_t live_ttl = 1;
-    int64_t crashed_ttl = 5;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_client_live_ttl_sec(live_ttl)
-                              .set_client_crashed_ttl_sec(crashed_ttl)
-                              .build();
-    std::unique_ptr<CentralizedMasterService> service_ =
-        std::make_unique<CentralizedMasterService>(service_config);
-
-    // Register client and segment
-    auto ctx = PrepareSimpleSegment(*service_, "test_segment_disconnect");
-
-    // Verify initial allocation success
-    auto put_result = service_->PutStart(ctx.client_id, "test_key_1", 1024,
-                                         {.replica_num = 1});
-    EXPECT_TRUE(put_result.has_value());
-
-    // Simulate Disconnection
-    TriggerOnClientDisconnected(*service_, ctx.client_id,
-                                std::chrono::milliseconds(2 * live_ttl * 1000));
-
-    // Verify allocation failure (allocators hidden)
-    auto put_result_fail = service_->PutStart(ctx.client_id, "test_key_2", 1024,
-                                              {.replica_num = 1});
-    EXPECT_FALSE(put_result_fail.has_value());
-    EXPECT_EQ(put_result_fail.error(), ErrorCode::NO_AVAILABLE_HANDLE);
-
-    // Simulate Recovery
-    TriggerOnClientRecovered(*service_, ctx.client_id);
-
-    // Verify allocation success (allocators restored)
-    auto put_result_recover = service_->PutStart(ctx.client_id, "test_key_3",
-                                                 1024, {.replica_num = 1});
-    EXPECT_TRUE(put_result_recover.has_value());
-}
-
 TEST_F(MasterServiceTest, CreateCopyTaskTest) {
     // Reset storage space metrics.
-    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
-    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 
-    // Create CentralizedMasterService
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 3 segments.
     constexpr size_t kReplicaCnt = 3;
@@ -3938,12 +3760,11 @@ TEST_F(MasterServiceTest, CreateCopyTaskTest) {
 
 TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     // Reset storage space metrics.
-    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
-    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 
-    // Create CentralizedMasterService
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 3 segments.
     constexpr size_t kReplicaCnt = 3;
@@ -4017,12 +3838,11 @@ TEST_F(MasterServiceTest, CreateMoveTaskTest) {
 
 TEST_F(MasterServiceTest, QueryTaskTest) {
     // Reset storage space metrics.
-    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
-    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
 
-    // Create CentralizedMasterService
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount 3 segments.
     constexpr size_t kReplicaCnt = 3;
@@ -4069,8 +3889,7 @@ TEST_F(MasterServiceTest, QueryTaskTest) {
 }
 
 TEST_F(MasterServiceTest, FetchTasksEmptyWhenNoTasks) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
 
@@ -4080,8 +3899,7 @@ TEST_F(MasterServiceTest, FetchTasksEmptyWhenNoTasks) {
 }
 
 TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
     const auto ctx1 = PrepareSimpleSegment(*service_, "segment_1", 0x400000000,
@@ -4141,8 +3959,7 @@ TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
 }
 
 TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService());
+    std::unique_ptr<MasterService> service_(new MasterService());
 
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
@@ -4189,7 +4006,7 @@ TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
 }
 
 TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
-    auto service_ = std::make_unique<CentralizedMasterService>();
+    auto service_ = std::make_unique<MasterService>();
 
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
@@ -4247,7 +4064,7 @@ TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
 }
 
 TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
-    auto service_ = std::make_unique<CentralizedMasterService>();
+    auto service_ = std::make_unique<MasterService>();
 
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
@@ -4289,7 +4106,7 @@ TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
 }
 
 TEST_F(MasterServiceTest, UpdateTaskNotFound) {
-    auto service_ = std::make_unique<CentralizedMasterService>();
+    auto service_ = std::make_unique<MasterService>();
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
 
@@ -4310,8 +4127,7 @@ TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -4353,8 +4169,7 @@ TEST_F(MasterServiceTest, ForceRemoveByRegexLeasedObjects) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 
@@ -4413,8 +4228,7 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
                               .build();
-    std::unique_ptr<CentralizedMasterService> service_(
-        new CentralizedMasterService(service_config));
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
 

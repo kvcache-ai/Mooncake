@@ -158,7 +158,7 @@ class CachelibBufferAllocator
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
-                            const UUID& segment_id);
+                            const UUID& segment_id = UUID{});
 
     ~CachelibBufferAllocator() override;
 
@@ -212,7 +212,7 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
-                          const UUID& segment_id);
+                          const UUID& segment_id = UUID{});
 
     ~OffsetBufferAllocator() override;
 

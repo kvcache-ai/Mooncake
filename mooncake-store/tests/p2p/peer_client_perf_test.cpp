@@ -54,6 +54,10 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
 // round-trip (serialization, network, deserialization, server-side dispatch,
 // response) is exercised. This is exactly what we want to measure: RPC
 // throughput and concurrency benefits.
+// Failure-path RPC overhead: this fixture does not initialize TransferEngine.
+// TODO(C5): Add successful data-path benchmarks with error counts and byte
+// validation after data-path ownership is split; keep same-key values
+// immutable.
 class PeerClientPerfTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -478,9 +482,10 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         const char* metadata_addr = std::getenv("MC_METADATA_ADDR");
         const char* local_hostname = std::getenv("MC_LOCAL_HOSTNAME");
 
-        if (!metadata_addr || !local_hostname) {
-            skip_reason_ = "MC_METADATA_ADDR and MC_LOCAL_HOSTNAME not set";
-            return;
+        if (!metadata_addr || !*metadata_addr || !local_hostname ||
+            !*local_hostname) {
+            GTEST_SKIP()
+                << "MC_METADATA_ADDR and MC_LOCAL_HOSTNAME are required";
         }
 
         local_hostname_ = std::string(local_hostname);
@@ -497,17 +502,16 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         int init_rc = transfer_engine_->init(metadata_addr, local_hostname_, "",
                                              kRpcPort);
         if (init_rc != 0) {
-            skip_reason_ = "TransferEngine init failed (error " +
-                           std::to_string(init_rc) + ")";
+            LOG(ERROR) << "RDMA TransferEngine init failed: " << init_rc;
             transfer_engine_.reset();
-            return;
+            FAIL() << "TransferEngine init failed: " << init_rc;
         }
 
         // Allocate and register RDMA buffer
         rdma_buffer_ = allocate_buffer_allocator_memory(kRdmaBufSize);
         if (!rdma_buffer_) {
-            skip_reason_ = "Failed to allocate RDMA buffer";
-            return;
+            LOG(ERROR) << "Failed to allocate RDMA benchmark buffer";
+            FAIL() << "Failed to allocate RDMA buffer";
         }
         std::memset(rdma_buffer_, 0, kRdmaBufSize);
 
@@ -516,8 +520,8 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         if (reg_rc != 0) {
             free_memory("", rdma_buffer_);
             rdma_buffer_ = nullptr;
-            skip_reason_ = "Failed to register RDMA memory";
-            return;
+            LOG(ERROR) << "Failed to register RDMA memory: " << reg_rc;
+            FAIL() << "Failed to register RDMA memory: " << reg_rc;
         }
 
         // Create TieredBackend with TransferEngine so DRAM is RDMA-registered
@@ -564,8 +568,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
         std::string endpoint = "127.0.0.1:" + std::to_string(actual_port);
         auto connect_result = peer_client_->Connect(endpoint);
         ASSERT_TRUE(connect_result.has_value()) << "PeerClient::Connect failed";
-
-        rdma_available_ = true;
     }
 
     void TearDown() override {
@@ -586,14 +588,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
 
         transfer_engine_.reset();
         google::ShutdownGoogleLogging();
-    }
-
-    bool ShouldSkip() const {
-        if (!rdma_available_) {
-            std::cout << "[  SKIPPED ] " << skip_reason_ << "\n";
-            return true;
-        }
-        return false;
     }
 
     // ---- Helpers ----
@@ -780,8 +774,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
 
     std::string local_hostname_;
     void* rdma_buffer_ = nullptr;
-    bool rdma_available_ = false;
-    std::string skip_reason_;
     std::unique_ptr<DataManager> data_manager_;
     std::unique_ptr<TieredBackend> tiered_backend_;
     std::shared_ptr<TransferEngine> transfer_engine_;
@@ -795,8 +787,6 @@ class PeerClientRdmaPerfTest : public ::testing::Test {
 // ============================================================================
 
 TEST_F(PeerClientRdmaPerfTest, RdmaReadConcurrencyBySizeComparison) {
-    if (ShouldSkip()) return;
-
     std::cout
         << "\n============================================================\n"
         << "  RDMA Read: Async vs Sync (real data transfer)\n"
@@ -911,8 +901,6 @@ TEST_F(PeerClientRdmaPerfTest, RdmaReadConcurrencyBySizeComparison) {
 // ============================================================================
 
 TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
-    if (ShouldSkip()) return;
-
     std::cout
         << "\n============================================================\n"
         << "  RDMA Write: Async vs Sync (real data transfer)\n"
@@ -1030,8 +1018,6 @@ TEST_F(PeerClientRdmaPerfTest, RdmaWriteConcurrencyBySizeComparison) {
 // ============================================================================
 
 TEST_F(PeerClientRdmaPerfTest, RdmaWindowedConcurrency) {
-    if (ShouldSkip()) return;
-
     std::cout
         << "\n============================================================\n"
         << "  RDMA Windowed Async: Finding optimal concurrency window\n"

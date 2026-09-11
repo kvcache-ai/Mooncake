@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <optional>
 #include <vector>
 #include <memory>
@@ -21,6 +22,39 @@
 #include "file_storage.h"
 
 namespace mooncake {
+
+namespace {
+constexpr const char* kEtcdPrefix = "etcd://";
+constexpr const char* kRedisPrefix = "redis://";
+}  // namespace
+
+namespace {
+
+tl::expected<void, ErrorCode> ApplyCentralizedReadRouteConfig(
+    GetReplicaListResponse& response, const ReadRouteConfig& config) {
+    if (config.p2p_config.has_value()) {
+        LOG(ERROR) << "P2P read-route filters are invalid in centralized mode";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (config.max_candidates == ReadRouteConfig::RETURN_ALL_CANDIDATES ||
+        config.max_candidates >= response.replicas.size()) {
+        return {};
+    }
+
+    auto priority = [](ReplicaType type) {
+        if (type == ReplicaType::MEMORY) return 2;
+        if (type == ReplicaType::LOCAL_DISK) return 1;
+        return 0;
+    };
+    std::stable_sort(response.replicas.begin(), response.replicas.end(),
+                     [&](const auto& lhs, const auto& rhs) {
+                         return priority(lhs.type()) > priority(rhs.type());
+                     });
+    response.replicas.resize(config.max_candidates);
+    return {};
+}
+
+}  // namespace
 
 CentralizedClientService::CentralizedClientService(
     const std::string& metadata_connstring, const std::string& protocol,
@@ -41,6 +75,39 @@ CentralizedClientService::CentralizedClientService(
 CentralizedClientService::~CentralizedClientService() {
     Stop();
     Destroy();
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+CentralizedClientService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    return master_client_.BatchQueryIp(client_ids);
+}
+
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+             ErrorCode>
+CentralizedClientService::QueryByRegex(const std::string& regex) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    return master_client_.GetReplicaListByRegex(regex);
+}
+
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+CentralizedClientService::CalcCacheStats() {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    return master_client_.CalcCacheStats();
 }
 
 void CentralizedClientService::Stop() {
@@ -71,13 +138,8 @@ void CentralizedClientService::Destroy() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        if (!segment.IsCentralizedSegment()) {
-            LOG(ERROR) << "Segment " << segment.id << " is not centralized";
-            continue;
-        }
-        auto result = InnerUnmountSegment(
-            reinterpret_cast<void*>(segment.GetCentralizedExtra().base),
-            segment.size);
+        auto result = InnerUnmountSegment(reinterpret_cast<void*>(segment.base),
+                                          segment.size);
         if (!result) {
             LOG(ERROR) << "Failed to unmount segment: "
                        << toString(result.error());
@@ -100,11 +162,14 @@ void CentralizedClientService::Destroy() {
 
 ErrorCode CentralizedClientService::Init(
     const CentralizedClientConfig& config) {
+    if (config.heartbeat_rpc_port != 0) {
+        LOG(ERROR) << "Dedicated heartbeat RPC is not supported by the "
+                      "centralized Ping protocol"
+                   << ", heartbeat_rpc_port=" << config.heartbeat_rpc_port;
+        return ErrorCode::INVALID_PARAMS;
+    }
     auto master_server_entry = config.master_server_entry;
     master_server_entry_ = master_server_entry;
-    master_client_.SetHeartbeatRpcPort(config.heartbeat_rpc_port);
-    SetMasterDiscoveryConfig(config);
-
     ErrorCode err = ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to connect to master: " << err;
@@ -282,8 +347,8 @@ ErrorCode CentralizedClientService::Init(
 
     client_requester_ = std::make_shared<ClientRequester>();
 
-    // Start heartbeat AFTER all initialization is complete
-    StartHeartbeat(master_server_entry);
+    // Start Ping AFTER all initialization is complete.
+    StartPing(master_server_entry);
 
     StartHttpServer();
 
@@ -323,22 +388,18 @@ CentralizedClientService::Query(const std::string& object_key,
     }
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    auto result = master_client_.GetReplicaList(object_key, config);
+    auto result = master_client_.GetReplicaList(object_key);
     if (!result) {
         LOG(ERROR) << "Failed to get replica list: " << result.error();
         return tl::unexpected(result.error());
     }
-    uint64_t lease_ttl_ms = 0;
-    if (!result.value().centralized_extra) {
-        LOG(ERROR)
-            << "no_centralized_extra_found, lease_ttl_ms will be set to 0"
-            << ", key=" << object_key;
-    } else {
-        lease_ttl_ms = result.value().centralized_extra->lease_ttl_ms;
+    auto configured = ApplyCentralizedReadRouteConfig(result.value(), config);
+    if (!configured) {
+        return tl::make_unexpected(configured.error());
     }
     return std::make_unique<CentralizedQueryResult>(
         std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(lease_ttl_ms));
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
 }
 
 std::vector<tl::expected<std::unique_ptr<QueryResult>, ErrorCode>>
@@ -358,9 +419,7 @@ CentralizedClientService::BatchQuery(
     }
     std::chrono::steady_clock::time_point start_time =
         std::chrono::steady_clock::now();
-    std::vector<std::string_view> key_views(object_keys.begin(),
-                                            object_keys.end());
-    auto response = master_client_.BatchGetReplicaList(key_views, config);
+    auto response = master_client_.BatchGetReplicaList(object_keys);
 
     // Check if we got the expected number of responses
     if (response.size() != object_keys.size()) {
@@ -379,18 +438,16 @@ CentralizedClientService::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            uint64_t lease_ttl_ms = 0;
-            if (!response[i].value().centralized_extra) {
-                LOG(ERROR) << "no_centralized_extra_found, lease_ttl_ms will "
-                              "be set to 0"
-                           << ", key=" << object_keys[i];
-            } else {
-                lease_ttl_ms =
-                    response[i].value().centralized_extra->lease_ttl_ms;
+            auto configured =
+                ApplyCentralizedReadRouteConfig(response[i].value(), config);
+            if (!configured) {
+                results.emplace_back(tl::make_unexpected(configured.error()));
+                continue;
             }
             results.emplace_back(std::make_unique<CentralizedQueryResult>(
                 std::move(response[i].value().replicas),
-                start_time + std::chrono::milliseconds(lease_ttl_ms)));
+                start_time + std::chrono::milliseconds(
+                                 response[i].value().lease_ttl_ms)));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -422,8 +479,7 @@ CentralizedClientService::BatchIsExist(const std::vector<std::string>& keys) {
         return std::vector<tl::expected<bool, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::SHUTTING_DOWN));
     }
-    std::vector<std::string_view> key_views(keys.begin(), keys.end());
-    auto results = master_client_.BatchExistKey(key_views);
+    auto results = master_client_.BatchExistKey(keys);
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
             LOG(ERROR) << "Failed to query key"
@@ -1760,16 +1816,12 @@ tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
     // Check if the segment overlaps with any existing segment
     for (auto& it : mounted_segments_) {
         auto& mtseg = it.second;
-        if (!mtseg.IsCentralizedSegment()) {
-            continue;
-        }
-        auto& extra = mtseg.GetCentralizedExtra();
-        uintptr_t l1 = extra.base;
+        uintptr_t l1 = mtseg.base;
         uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
         uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
         uintptr_t r2 = reinterpret_cast<uintptr_t>(size) + l2;
         if (std::max(l1, l2) < std::min(r1, r2)) {
-            LOG(ERROR) << "segment_overlaps base1=" << extra.base
+            LOG(ERROR) << "segment_overlaps base1=" << mtseg.base
                        << " size1=" << mtseg.size << " base2=" << buffer
                        << " size2=" << size;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1789,12 +1841,9 @@ tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
     segment.id = generate_uuid();
     segment.name = local_endpoint();
     segment.size = size;
-
-    CentralizedSegmentExtraData extra;
-    extra.base = reinterpret_cast<uintptr_t>(buffer);
-    extra.protocol = protocol;
-    extra.te_endpoint = get_te_endpoint();
-    segment.extra = extra;
+    segment.base = reinterpret_cast<uintptr_t>(buffer);
+    segment.protocol = protocol;
+    segment.te_endpoint = get_te_endpoint();
 
     auto mount_result = master_client_.MountSegment(segment);
     if (!mount_result) {
@@ -1825,13 +1874,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::InnerUnmountSegment(
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
-        if (!it->second.IsCentralizedSegment()) {
-            LOG(ERROR) << "segment_not_found base=" << buffer
-                       << " size=" << size;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        if (it->second.GetCentralizedExtra().base ==
-                reinterpret_cast<uintptr_t>(buffer) &&
+        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
             it->second.size == size) {
             segment = it;
             break;
@@ -1851,7 +1894,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::InnerUnmountSegment(
     }
 
     int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(segment->second.GetCentralizedExtra().base));
+        reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -2051,13 +2094,150 @@ ErrorCode CentralizedClientService::TransferRead(
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
-HeartbeatRequest CentralizedClientService::build_heartbeat_request() {
-    HeartbeatRequest req;
-    req.client_id = client_id_;
-    return req;
+bool CentralizedClientService::IsHAMode(
+    const std::string& master_server_entry) const {
+    return master_server_entry.rfind(kEtcdPrefix, 0) == 0;
 }
 
-tl::expected<RegisterClientResponse, ErrorCode>
+ErrorCode CentralizedClientService::ResolveMasterAddress(
+    std::string& master_address) {
+    ViewVersionId version = 0;
+    return master_view_helper_.GetMasterView(master_address, version);
+}
+
+ErrorCode CentralizedClientService::ConnectToMaster(
+    const std::string& master_server_entry) {
+    if (master_server_entry.rfind(kRedisPrefix, 0) == 0) {
+        LOG(ERROR) << "Centralized master discovery does not support Redis";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (IsHAMode(master_server_entry)) {
+        const std::string etcd_endpoints =
+            master_server_entry.substr(std::strlen(kEtcdPrefix));
+        auto err = master_view_helper_.ConnectToEtcd(etcd_endpoints);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to etcd";
+            return err;
+        }
+        std::string master_address;
+        err = ResolveMasterAddress(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to resolve centralized master address";
+            return err;
+        }
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to centralized master";
+        }
+        return err;
+    }
+    return master_client_.Connect(master_server_entry);
+}
+
+bool CentralizedClientService::ReconnectToMaster(
+    bool is_ha_mode, std::string& current_master_address) {
+    if (is_ha_mode) {
+        LOG(ERROR) << "Ping failure threshold exceeded; fetching latest "
+                      "centralized master view and reconnecting";
+        std::string master_address;
+        auto err = ResolveMasterAddress(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to get new centralized master view: "
+                       << toString(err);
+            return false;
+        }
+        err = master_client_.Connect(master_address);
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect to centralized master "
+                       << master_address << ": " << toString(err);
+            return false;
+        }
+        current_master_address = master_address;
+        LOG(INFO) << "Reconnected to centralized master " << master_address;
+        return true;
+    }
+
+    LOG(ERROR) << "Ping failure threshold exceeded (non-HA); reconnecting to "
+               << current_master_address;
+    auto err = master_client_.Connect(current_master_address);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Reconnect failed to " << current_master_address << ": "
+                   << toString(err);
+        return false;
+    }
+    LOG(INFO) << "Reconnected to centralized master " << current_master_address;
+    return true;
+}
+
+void CentralizedClientService::StartPing(
+    const std::string& master_server_entry) {
+    if (heartbeat_running_) {
+        LOG(WARNING) << "Ping thread already running, skip starting";
+        return;
+    }
+
+    const bool is_ha_mode = IsHAMode(master_server_entry);
+    std::string current_master_address = master_server_entry;
+    if (is_ha_mode) {
+        auto err = ResolveMasterAddress(current_master_address);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "Failed to resolve master before starting ping; "
+                            "the ping loop will retry"
+                         << ", error=" << err;
+        }
+    }
+
+    heartbeat_running_ = true;
+    heartbeat_thread_ =
+        std::thread([this, is_ha_mode, current_master_address]() mutable {
+            PingThreadMain(is_ha_mode, std::move(current_master_address));
+        });
+}
+
+void CentralizedClientService::PingThreadMain(
+    bool is_ha_mode, std::string current_master_address) {
+    constexpr int kMaxPingFailCount = 3;
+    constexpr int kPingIntervalMs = 1000;
+    int ping_fail_count = 0;
+    std::future<void> remount_future;
+
+    auto remount = [this]() { HeartbeatTryRegister(); };
+
+    while (heartbeat_running_) {
+        if (remount_future.valid() &&
+            remount_future.wait_for(std::chrono::seconds(0)) ==
+                std::future_status::ready) {
+            remount_future = std::future<void>();
+        }
+
+        auto ping = master_client_.Ping();
+        if (ping) {
+            ping_fail_count = 0;
+            if (ping->client_status == ClientStatus::NEED_REMOUNT &&
+                !remount_future.valid()) {
+                remount_future = std::async(std::launch::async, remount);
+            }
+            WaitForNextHeartbeat(kPingIntervalMs);
+            continue;
+        }
+
+        ++ping_fail_count;
+        LOG(ERROR) << "Failed to ping centralized master"
+                   << ", consecutive_failures=" << ping_fail_count;
+        if (ping_fail_count >= kMaxPingFailCount &&
+            ReconnectToMaster(is_ha_mode, current_master_address)) {
+            ping_fail_count = 0;
+            continue;
+        }
+        WaitForNextHeartbeat(kPingIntervalMs);
+    }
+
+    if (remount_future.valid()) {
+        remount_future.wait();
+    }
+}
+
+tl::expected<ViewVersionId, ErrorCode>
 CentralizedClientService::InnerRegisterClient() {
     // Runs under registration_mutex_; mounted_segments_mutex_ nests inside it.
     // This lock must be held until the register rpc is finished,
@@ -2071,18 +2251,22 @@ CentralizedClientService::InnerRegisterClient() {
         segments.emplace_back(segment);
     }
 
-    RegisterClientRequest req;
-    req.client_id = client_id_;
-    req.segments = std::move(segments);
-    req.deployment_mode = DeploymentMode::CENTRALIZATION;
-
-    auto register_result = master_client_.RegisterClient(req);
-    if (!register_result) {
-        LOG(ERROR) << "Failed to register client: " << register_result.error();
-    } else {
-        view_version_ = register_result.value().view_version;
+    auto remount_result = master_client_.ReMountSegment(segments);
+    if (!remount_result) {
+        LOG(ERROR) << "Failed to remount centralized client segments"
+                   << ", error=" << remount_result.error();
+        return tl::make_unexpected(remount_result.error());
     }
-    return register_result;
+
+    auto ping_result = master_client_.Ping();
+    if (!ping_result) {
+        LOG(ERROR) << "Failed to read centralized master view after remount"
+                   << ", error=" << ping_result.error();
+        return tl::make_unexpected(ping_result.error());
+    }
+
+    view_version_.store(ping_result->view_version_id);
+    return ping_result->view_version_id;
 }
 
 ErrorCode CentralizedClientService::GetPreferredReplica(
@@ -2093,7 +2277,7 @@ ErrorCode CentralizedClientService::GetPreferredReplica(
         SharedMutexLocker lock(&mounted_segments_mutex_, shared_lock);
         local_endpoints.reserve(mounted_segments_.size());
         for (const auto& [uuid, seg] : mounted_segments_) {
-            local_endpoints.insert(seg.GetCentralizedExtra().te_endpoint);
+            local_endpoints.insert(seg.te_endpoint);
         }
     }
 

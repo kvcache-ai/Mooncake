@@ -2,6 +2,7 @@
 
 #include <csignal>
 #include <functional>
+#include <future>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -20,6 +21,7 @@
 #include "p2p/client/data_manager.h"
 #include "p2p/client/client_rpc_service.h"
 #include "p2p/ha/ha_recovery_manager.h"
+#include "p2p/ha/p2p_master_view.h"
 #include "p2p/client/peer_client.h"
 #include "p2p/client/p2p_client_metric.h"
 #include "p2p/master/p2p_master_client.h"
@@ -198,7 +200,24 @@ class P2PClientService final : public ClientService {
      */
     tl::expected<void, ErrorCode> RemoveLocal(const ObjectKey& key) override;
 
-    MasterClient& GetMasterClient() override { return master_client_; }
+    P2PMasterClient& GetMasterClient() { return master_client_; }
+
+    // TODO(C4 / external interface; see p2p-split-plan-v2.md): Implement the
+    // P2P BatchQueryIp facade after architecture-specific query APIs are split.
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids) override;
+
+    // TODO(C4 / external interface; see p2p-split-plan-v2.md): Return
+    // P2PRouteDescriptor directly after QueryResult is split by architecture.
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    QueryByRegex(const std::string& regex) override;
+
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() override;
 
     ClientMetric* GetMetrics() override { return metrics_.get(); }
 
@@ -257,15 +276,15 @@ class P2PClientService final : public ClientService {
     /**
      * @brief Collect tier info from DataManager and build P2P Segments.
      */
-    std::vector<Segment> CollectTierSegments() const;
+    std::vector<P2PSegment> CollectTierSegments() const;
 
     /**
      * @brief Register the P2P client with the master. On a re-registration from
      * LOCAL_ONLY (heartbeat stopped), also restarts the heartbeat and drives
      * metadata recovery back to FULL.
      */
-    tl::expected<RegisterClientResponse, ErrorCode> InnerRegisterClient()
-        override REQUIRES(registration_mutex_);
+    tl::expected<ViewVersionId, ErrorCode> InnerRegisterClient() override
+        REQUIRES(registration_mutex_);
 
     /**
      * @brief Unregister body without the in-flight guard. Used by Stop() to
@@ -275,7 +294,26 @@ class P2PClientService final : public ClientService {
     tl::expected<void, ErrorCode> InnerUnregisterClient()
         REQUIRES(registration_mutex_);
 
-    HeartbeatRequest build_heartbeat_request() override;
+   protected:
+    bool IsHAMode(const std::string& master_server_entry) const;
+    void SetMasterDiscoveryConfig(const P2PClientConfig& config);
+    ErrorCode ResolveMasterAddress(const std::string& master_server_entry,
+                                   std::string& master_address);
+
+   private:
+    ErrorCode ConnectToMaster(const std::string& master_server_entry);
+    void StartHeartbeat(const std::string& master_server_entry);
+    void HeartbeatThreadMain(bool is_ha_mode,
+                             std::string current_master_address);
+    bool ReconnectToMaster(bool is_ha_mode,
+                           std::string& current_master_address);
+    void HandleHeartbeatResponse(const P2PHeartbeatResponse& response,
+                                 const std::string& current_master_address,
+                                 const std::function<void()>& register_client,
+                                 std::future<void>& register_client_future);
+    void HandleHeartbeatTaskResult(const HeartbeatTaskResult& task_result);
+    P2PHeartbeatRequest build_heartbeat_request();
+    void OnHAEvent(HAEvent event);
 
    private:
     bool IsLocalWrite(const WriteRouteRequestConfig& cfg) const;
@@ -303,7 +341,7 @@ class P2PClientService final : public ClientService {
                               std::vector<std::vector<Slice>>& batched_slices,
                               const std::vector<size_t>& sizes,
                               const WriteRouteRequestConfig& route_config,
-                              BatchGetWriteRouteResponse& batch_resp);
+                              P2PBatchGetWriteRouteResponse& batch_resp);
 
     tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
     CreatePutHandleFromLocal(std::string_view key, std::vector<Slice>& slices);
@@ -314,9 +352,10 @@ class P2PClientService final : public ClientService {
         const std::vector<ObjectKey>& keys, P2PClientMetric* metrics = nullptr,
         const std::vector<size_t>* sizes = nullptr);
 
-    tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
-        const std::vector<ObjectKey>& keys, const std::vector<size_t>& sizes,
-        const WriteRouteRequestConfig& config);
+    tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
+    BatchFetchWriteRoutes(const std::vector<ObjectKey>& keys,
+                          const std::vector<size_t>& sizes,
+                          const WriteRouteRequestConfig& config);
 
     struct WriteOp {
         virtual ~WriteOp() = default;
@@ -403,7 +442,7 @@ class P2PClientService final : public ClientService {
     tl::expected<std::vector<std::unique_ptr<WriteOp>>, ErrorCode>
     BuildWriteOps(std::string_view key, std::vector<Slice>& slices,
                   size_t object_size, const WriteRouteRequestConfig& config,
-                  std::vector<WriteCandidate> candidates);
+                  std::vector<P2PWriteCandidate> candidates);
 
     async_simple::coro::Lazy<void> RunWriteWithRetry(
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
@@ -453,8 +492,8 @@ class P2PClientService final : public ClientService {
 
     std::vector<ResolvedRoute> LoadCachedRoutes(std::string_view key);
 
-    std::vector<ResolvedRoute> ReplicasToRoutes(
-        const std::vector<Replica::Descriptor>& replicas);
+    std::vector<ResolvedRoute> RouteDescriptorsToRoutes(
+        const std::vector<P2PRouteDescriptor>& descriptors);
 
     tl::expected<RouteIterator, ErrorCode> BuildRouteIter(
         std::string_view key, const ReadRouteConfig& config);
@@ -532,7 +571,6 @@ class P2PClientService final : public ClientService {
     async_simple::Executor* GetCoroExecutor() const;
 
    private:
-    void OnHAEvent(HAEvent event) override;
     void RegisterHttpMethods() override;
     void RecordLocalInflight(bool entering) override;
 
@@ -541,6 +579,19 @@ class P2PClientService final : public ClientService {
     tl::expected<std::vector<std::string>, ErrorCode> GetLocalKeys(
         size_t limit = 0);
 
+   protected:
+    struct MasterDiscoveryConfig {
+        std::string cluster_id = DEFAULT_CLUSTER_ID;
+        std::string redis_username;
+        std::string redis_password;
+        int redis_db_index = 0;
+        int redis_master_view_ttl_sec = 4;
+        int redis_heartbeat_interval_sec = 1;
+    };
+    std::unique_ptr<P2PMasterView> master_view_;
+    std::string master_view_entry_;
+    MasterDiscoveryConfig master_discovery_config_;
+
    private:
     std::shared_ptr<P2PClientMetric> metrics_;
     // Attach a SYNC_CLIENT_METRIC task every METRIC_SYNC_FREQ heartbeats.
@@ -548,6 +599,9 @@ class P2PClientService final : public ClientService {
     // Heartbeats since the last SYNC_CLIENT_METRIC task.
     int metric_sync_heartbeat_count_ = 0;
     P2PMasterClient master_client_;
+    // Accessed only by the P2P heartbeat thread.
+    bool connection_interrupted_ = false;
+    std::atomic<bool> registered_{false};
     uint16_t client_rpc_port_ = 12345;
 
     std::unique_ptr<coro_rpc::coro_rpc_server> client_rpc_server_;

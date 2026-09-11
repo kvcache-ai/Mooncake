@@ -25,11 +25,8 @@
 //      spuriously failing.
 //   7. The heartbeat fail-fast error codes round-trip through toString/fromInt.
 //
-// Tests 1-6 are parameterized over CENTRALIZED and P2P: both modes share
-// RegisterHeartbeatRpcService, WrappedMasterService::ServiceReady and
-// MasterClient::Connect, so the behavior is expected to be identical; the
-// parameterization guards against P2P's extra registration path
-// (RegisterP2PRpcService) breaking the dedicated-port routing.
+// Dedicated heartbeat routing is a P2P-only feature after the centralized
+// a00f757 protocol restoration.
 
 #include <gtest/gtest.h>
 
@@ -38,17 +35,14 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
-#include <variant>
+#include <vector>
 
-#include "centralized_master_client.h"
-#include "master_client.h"
-#include "master_config.h"
 #include "p2p/master/p2p_master_client.h"
 #include "rpc_types.h"
-#include "p2p/test_p2p_server_helpers.h"
-#include "test_server_helpers.h"
+#include "test_p2p_server_helpers.h"
 #include "types.h"
 #include "utils.h"
 
@@ -57,38 +51,22 @@ namespace testing {
 
 namespace {
 
-enum class TestMode { CENTRALIZED, P2P };
-
-inline std::ostream& operator<<(std::ostream& os, TestMode mode) {
-    return os << (mode == TestMode::CENTRALIZED ? "CENTRALIZED" : "P2P");
-}
-
-// Build a HeartbeatRequest for the given client id (no tasks, lightweight).
-HeartbeatRequest MakeHeartbeatRequest(const UUID& client_id) {
-    HeartbeatRequest req;
+// Build a P2PHeartbeatRequest for the given client id (no tasks, lightweight).
+P2PHeartbeatRequest MakeHeartbeatRequest(const UUID& client_id) {
+    P2PHeartbeatRequest req;
     req.client_id = client_id;
     return req;
 }
 
-// Lightweight in-process master (Centralized or P2P) that can be started with
-// or without a dedicated heartbeat port, and restarted on the same ports to
-// simulate a master restart.
+// Lightweight in-process P2P master that can be restarted on fixed ports.
 class HeartbeatTestMaster {
    public:
-    explicit HeartbeatTestMaster(TestMode mode) : mode_(mode) {
-        if (mode_ == TestMode::CENTRALIZED) {
-            master_ = std::make_unique<InProcMaster>();
-        } else {
-            master_ = std::make_unique<InProcP2PMaster>();
-        }
-    }
-
     // Start the master. When `dedicated` is true a dedicated heartbeat server
     // is opened (on a fresh free port, or `hb_port` if given). `rpc_port` and
     // `hb_port` let a restart pin the same ports the previous instance used.
     bool Start(bool dedicated, std::optional<int> rpc_port = std::nullopt,
                std::optional<int> hb_port = std::nullopt) {
-        InProcMasterConfigBuilder builder;
+        InProcP2PMasterConfigBuilder builder;
         rpc_port_ = rpc_port.value_or(getFreeTcpPort());
         builder.set_rpc_port(rpc_port_);
         if (dedicated) {
@@ -97,37 +75,53 @@ class HeartbeatTestMaster {
         } else {
             heartbeat_rpc_port_ = 0;
         }
-        return std::visit([&](auto& m) { return m->Start(builder.build()); },
-                          master_);
+        return master_.Start(builder.build());
     }
 
-    void Stop() {
-        std::visit([](auto& m) { m->Stop(); }, master_);
-    }
+    void Stop() { master_.Stop(); }
 
     int rpc_port() const { return rpc_port_; }
     int heartbeat_rpc_port() const { return heartbeat_rpc_port_; }
-    std::string master_address() const {
-        return std::visit([](const auto& m) { return m->master_address(); },
-                          master_);
-    }
+    std::string master_address() const { return master_.master_address(); }
 
    private:
-    TestMode mode_;
-    std::variant<std::unique_ptr<InProcMaster>,
-                 std::unique_ptr<InProcP2PMaster>>
-        master_;
+    InProcP2PMaster master_;
     int rpc_port_ = 0;
     int heartbeat_rpc_port_ = 0;
 };
 
-// Build the master client matching the deployment mode. Both clients inherit
-// SetHeartbeatRpcPort/Connect/Heartbeat from MasterClient.
-std::unique_ptr<MasterClient> MakeClient(TestMode mode, const UUID& client_id) {
-    if (mode == TestMode::CENTRALIZED) {
-        return std::make_unique<CentralizedMasterClient>(client_id);
+class HeartbeatTestClient {
+   public:
+    explicit HeartbeatTestClient(const UUID& client_id) : client_(client_id) {}
+
+    void SetHeartbeatRpcPort(uint16_t port) {
+        client_.SetHeartbeatRpcPort(port);
     }
-    return std::make_unique<P2PMasterClient>(client_id);
+
+    ErrorCode Connect(const std::string& address) {
+        return client_.Connect(address);
+    }
+
+    tl::expected<P2PHeartbeatResponse, ErrorCode> Heartbeat(
+        const P2PHeartbeatRequest& request) {
+        return client_.Heartbeat(request);
+    }
+
+    tl::expected<bool, ErrorCode> ExistKey(std::string_view key) {
+        return client_.ExistKey(key);
+    }
+
+    std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
+        const std::vector<std::string_view>& keys) {
+        return client_.BatchExistKey(keys);
+    }
+
+   private:
+    P2PMasterClient client_;
+};
+
+std::unique_ptr<HeartbeatTestClient> MakeClient(const UUID& client_id) {
+    return std::make_unique<HeartbeatTestClient>(client_id);
 }
 
 constexpr uint16_t PortOf(int port) { return static_cast<uint16_t>(port); }
@@ -137,17 +131,15 @@ constexpr uint16_t PortOf(int port) { return static_cast<uint16_t>(port); }
 // ---------------------------------------------------------------------------
 // Dedicated heartbeat server enabled.
 // ---------------------------------------------------------------------------
-class HeartbeatDedicatedPortTest : public ::testing::TestWithParam<TestMode> {
+class HeartbeatDedicatedPortTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        mode_ = GetParam();
-        master_ = std::make_unique<HeartbeatTestMaster>(mode_);
+        master_ = std::make_unique<HeartbeatTestMaster>();
         ASSERT_TRUE(master_->Start(/*dedicated=*/true))
             << "Failed to start InProcMaster with dedicated heartbeat port";
     }
     void TearDown() override { master_->Stop(); }
 
-    TestMode mode_;
     std::unique_ptr<HeartbeatTestMaster> master_;
 };
 
@@ -157,9 +149,9 @@ class HeartbeatDedicatedPortTest : public ::testing::TestWithParam<TestMode> {
 // main server (Connect queries it for the master's heartbeat port) and that
 // ServiceReady is registered on the dedicated server (Connect's reachability
 // probe would otherwise return HEARTBEAT_RPC_UNREACHABLE).
-TEST_P(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
+TEST_F(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);
+    auto client = MakeClient(client_id);
     client->SetHeartbeatRpcPort(PortOf(master_->heartbeat_rpc_port()));
     ASSERT_EQ(client->Connect(master_->master_address()), ErrorCode::OK);
 
@@ -173,10 +165,10 @@ TEST_P(HeartbeatDedicatedPortTest, HeartbeatRoutedToDedicatedPort) {
 // HEARTBEAT_ROUTING_MISMATCH — otherwise the client would route heartbeats to
 // the main server, which dropped the Heartbeat handler when the dedicated
 // server was enabled, and silently starve.
-TEST_P(HeartbeatDedicatedPortTest,
+TEST_F(HeartbeatDedicatedPortTest,
        LegacyClientAgainstDedicatedMasterFailsConnect) {
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);  // heartbeat_rpc_port_ == 0
+    auto client = MakeClient(client_id);  // heartbeat_rpc_port_ == 0
     EXPECT_EQ(client->Connect(master_->master_address()),
               ErrorCode::HEARTBEAT_ROUTING_MISMATCH)
         << "A legacy client must fail fast against a dedicated-port master "
@@ -188,11 +180,11 @@ TEST_P(HeartbeatDedicatedPortTest,
 // points at a different dedicated port than the master opened. This is not a
 // routing-mode mismatch (both report dedicated), so it falls through to the
 // dedicated-server reachability probe and fails with HEARTBEAT_RPC_UNREACHABLE.
-TEST_P(HeartbeatDedicatedPortTest, DedicatedPortValueMismatchFailsConnect) {
+TEST_F(HeartbeatDedicatedPortTest, DedicatedPortValueMismatchFailsConnect) {
     int wrong_port = getFreeTcpPort();
     ASSERT_NE(wrong_port, master_->heartbeat_rpc_port());
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);
+    auto client = MakeClient(client_id);
     client->SetHeartbeatRpcPort(PortOf(wrong_port));
 
     EXPECT_EQ(client->Connect(master_->master_address()),
@@ -204,40 +196,47 @@ TEST_P(HeartbeatDedicatedPortTest, DedicatedPortValueMismatchFailsConnect) {
 // 3. Non-heartbeat RPCs still reach the main port and succeed, proving the
 // main server still serves the rest of the API (Connect already exercises
 // ServiceReady internally; ExistKey covers a data-path RPC).
-TEST_P(HeartbeatDedicatedPortTest, NonHeartbeatRpcStillServedOnMainPort) {
+TEST_F(HeartbeatDedicatedPortTest, NonHeartbeatRpcStillServedOnMainPort) {
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);
+    auto client = MakeClient(client_id);
     client->SetHeartbeatRpcPort(PortOf(master_->heartbeat_rpc_port()));
     ASSERT_EQ(client->Connect(master_->master_address()), ErrorCode::OK);
 
     auto exists = client->ExistKey("nonexistent_key_for_heartbeat_test");
-    EXPECT_TRUE(exists.has_value())
+    ASSERT_TRUE(exists.has_value())
         << "ExistKey should reach the main port and succeed";
+    EXPECT_FALSE(exists.value());
+
+    const std::vector<std::string_view> keys{"missing-a", "missing-b"};
+    auto batch_exists = client->BatchExistKey(keys);
+    ASSERT_EQ(batch_exists.size(), keys.size());
+    for (const auto& result : batch_exists) {
+        ASSERT_TRUE(result.has_value());
+        EXPECT_FALSE(result.value());
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Legacy fallback (no dedicated heartbeat server).
 // ---------------------------------------------------------------------------
-class HeartbeatLegacyMasterTest : public ::testing::TestWithParam<TestMode> {
+class HeartbeatLegacyMasterTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        mode_ = GetParam();
-        master_ = std::make_unique<HeartbeatTestMaster>(mode_);
+        master_ = std::make_unique<HeartbeatTestMaster>();
         ASSERT_TRUE(master_->Start(/*dedicated=*/false))
             << "Failed to start InProcMaster (legacy, no dedicated port)";
     }
     void TearDown() override { master_->Stop(); }
 
-    TestMode mode_;
     std::unique_ptr<HeartbeatTestMaster> master_;
 };
 
 // 4. With no dedicated heartbeat server configured (port=0, default), the
 // master falls back to serving Heartbeat on the main RPC server, so a client
 // without a heartbeat port succeeds.
-TEST_P(HeartbeatLegacyMasterTest, HeartbeatServedOnMainPortWhenDisabled) {
+TEST_F(HeartbeatLegacyMasterTest, HeartbeatServedOnMainPortWhenDisabled) {
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);  // heartbeat_rpc_port_ == 0
+    auto client = MakeClient(client_id);  // heartbeat_rpc_port_ == 0
     ASSERT_EQ(client->Connect(master_->master_address()), ErrorCode::OK);
 
     auto hb = client->Heartbeat(MakeHeartbeatRequest(client_id));
@@ -250,12 +249,12 @@ TEST_P(HeartbeatLegacyMasterTest, HeartbeatServedOnMainPortWhenDisabled) {
 // port (legacy fallback), but the client is configured with a heartbeat port
 // (dedicated). Connect must fail fast with HEARTBEAT_ROUTING_MISMATCH instead
 // of appearing to succeed and then silently starving heartbeats.
-TEST_P(HeartbeatLegacyMasterTest, HeartbeatPortMismatchFailsConnect) {
+TEST_F(HeartbeatLegacyMasterTest, HeartbeatPortMismatchFailsConnect) {
     // Client believes it is dedicated; the master reports legacy (port=0) via
     // HeartbeatServiceReady, so the routing-mode comparison catches it.
     int phantom_port = getFreeTcpPort();
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);
+    auto client = MakeClient(client_id);
     client->SetHeartbeatRpcPort(PortOf(phantom_port));
 
     EXPECT_EQ(client->Connect(master_->master_address()),
@@ -267,16 +266,11 @@ TEST_P(HeartbeatLegacyMasterTest, HeartbeatPortMismatchFailsConnect) {
 // ---------------------------------------------------------------------------
 // Reconnect after master restart (stale connection pool rebuild).
 // ---------------------------------------------------------------------------
-class HeartbeatDedicatedPortReconnectTest
-    : public ::testing::TestWithParam<TestMode> {
+class HeartbeatDedicatedPortReconnectTest : public ::testing::Test {
    protected:
-    void SetUp() override {
-        mode_ = GetParam();
-        master_ = std::make_unique<HeartbeatTestMaster>(mode_);
-    }
+    void SetUp() override { master_ = std::make_unique<HeartbeatTestMaster>(); }
     void TearDown() override { master_->Stop(); }
 
-    TestMode mode_;
     std::unique_ptr<HeartbeatTestMaster> master_;
 };
 
@@ -285,7 +279,7 @@ class HeartbeatDedicatedPortReconnectTest
 // same address (is_same_addr=true) must take the one-shot stale-pool retry on
 // BOTH probes and succeed. A missing heartbeat retry would surface here as a
 // spurious HEARTBEAT_RPC_UNREACHABLE despite the heartbeat server being up.
-TEST_P(HeartbeatDedicatedPortReconnectTest,
+TEST_F(HeartbeatDedicatedPortReconnectTest,
        ReconnectAfterMasterRestartRebuildsStalePools) {
     ASSERT_TRUE(master_->Start(/*dedicated=*/true));
     int rpc_port = master_->rpc_port();
@@ -293,7 +287,7 @@ TEST_P(HeartbeatDedicatedPortReconnectTest,
     std::string addr = master_->master_address();
 
     UUID client_id = generate_uuid();
-    auto client = MakeClient(mode_, client_id);
+    auto client = MakeClient(client_id);
     client->SetHeartbeatRpcPort(PortOf(hb_port));
     ASSERT_EQ(client->Connect(addr), ErrorCode::OK);
 
@@ -313,16 +307,6 @@ TEST_P(HeartbeatDedicatedPortReconnectTest,
     EXPECT_TRUE(hb.has_value())
         << "Heartbeat should succeed via the dedicated port after reconnect";
 }
-
-INSTANTIATE_TEST_SUITE_P(AllModes, HeartbeatDedicatedPortTest,
-                         ::testing::Values(TestMode::CENTRALIZED,
-                                           TestMode::P2P));
-INSTANTIATE_TEST_SUITE_P(AllModes, HeartbeatLegacyMasterTest,
-                         ::testing::Values(TestMode::CENTRALIZED,
-                                           TestMode::P2P));
-INSTANTIATE_TEST_SUITE_P(AllModes, HeartbeatDedicatedPortReconnectTest,
-                         ::testing::Values(TestMode::CENTRALIZED,
-                                           TestMode::P2P));
 
 // ---------------------------------------------------------------------------
 // Error code serialization (mode-independent).

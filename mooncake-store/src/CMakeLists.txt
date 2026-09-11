@@ -1,43 +1,67 @@
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
 
-set(MOONCAKE_STORE_SOURCES
+set(MOONCAKE_MASTER_SUPPORT_SOURCES
+    types.cpp
+    utils.cpp
+    etcd_helper.cpp
+)
+
+set(MOONCAKE_CENTRALIZED_MASTER_SOURCES
     replica.cpp
     allocator.cpp
     master_service.cpp
-    centralized_master_service.cpp
+    master_metric_manager.cpp
+    ha_helper.cpp
+    segment.cpp
+    rpc_service.cpp
+    offset_allocator.cpp
+    http_metadata_server.cpp
+    task_manager.cpp
+)
+
+set(MOONCAKE_P2P_MASTER_SOURCES
+    p2p/master/p2p_route_table.cpp
+    p2p/master/p2p_master_service.cpp
+    p2p/master/p2p_master_metric_manager.cpp
+    p2p/master/p2p_segment_manager.cpp
+    p2p/master/p2p_rpc_service.cpp
+    p2p/master/p2p_master.cpp
+    p2p/master/p2p_client_meta.cpp
+    p2p/master/p2p_client_manager.cpp
+    p2p/client/client_metrics_aggregator.cpp
+    p2p/util/metric_util.cpp
+    p2p/ha/oplog/oplog_manager.cpp
+    p2p/ha/oplog/oplog_serializer.cpp
+    p2p/ha/oplog/localfs_oplog_store.cpp
+    p2p/ha/oplog/polling_oplog_change_notifier.cpp
+    p2p/ha/oplog/oplog_store_factory.cpp
+    p2p/ha/oplog/oplog_replicator.cpp
+    p2p/ha/oplog/p2p_oplog_types.cpp
+    p2p/ha/oplog/p2p_oplog_applier.cpp
+    p2p/ha/oplog/p2p_standby_metadata_store.cpp
+    p2p/ha/oplog/p2p_hot_standby_service.cpp
+    p2p/ha/oplog/p2p_standby_snapshot_service.cpp
+    p2p/ha/standby_state_machine.cpp
+    p2p/ha/p2p_master_view.cpp
+    p2p/ha/ha_metric_manager.cpp
+)
+
+set(MOONCAKE_STORE_SOURCES
+    ${MOONCAKE_MASTER_SUPPORT_SOURCES}
+    ${MOONCAKE_CENTRALIZED_MASTER_SOURCES}
     client_service.cpp
     centralized_client_service.cpp
     client_metric.cpp
-    types.cpp
     master_client.cpp
-    centralized_master_client.cpp
-    utils.cpp
-    master_metric_manager.cpp
-    centralized_master_metric_manager.cpp
     storage_backend.cpp
     thread_pool.cpp
-    etcd_helper.cpp
-    ha_helper.cpp
-    centralized_segment_manager.cpp
-    segment_manager.cpp
-    client_meta.cpp
-    client_manager.cpp
-    centralized_client_manager.cpp
-    centralized_client_meta.cpp
     transfer_task.cpp
-    etcd_helper.cpp
-    ha_helper.cpp
-    rpc_service.cpp
-    centralized_rpc_service.cpp
-    offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
     real_client.cpp
     dummy_client.cpp
-    http_metadata_server.cpp
     file_storage.cpp
-    task_manager.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -47,10 +71,9 @@ if(STORE_USE_REDIS)
     find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
     find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
     message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
-    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_util.cpp)
-    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_election_helper.cpp)
-    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/redis_master_view_helper.cpp)
-    list(APPEND MOONCAKE_STORE_P2P_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
+    list(APPEND MOONCAKE_P2P_MASTER_SOURCES p2p/ha/redis_util.cpp)
+    list(APPEND MOONCAKE_P2P_MASTER_SOURCES p2p/ha/redis_election_helper.cpp)
+    list(APPEND MOONCAKE_P2P_MASTER_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
     list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
 endif()
 
@@ -120,17 +143,11 @@ target_link_libraries(mooncake_store
         transfer_engine
 )
 
-# P2P architecture library (P2P split, Phase 1). Transitional state: it still
-# links the whole mooncake_store because base-class inheritance is severed only
-# in Phase 2; the leaf-only layering constraint (§3.2) is enforced in Phase 3.
+# The client aggregate still includes both architectures until C4 splits the
+# public client facade. Master executables use the isolated targets below.
 list(APPEND MOONCAKE_STORE_P2P_SOURCES
-    p2p/master/p2p_master_service.cpp
+    ${MOONCAKE_P2P_MASTER_SOURCES}
     p2p/master/p2p_master_client.cpp
-    p2p/master/p2p_master_metric_manager.cpp
-    p2p/master/p2p_segment_manager.cpp
-    p2p/master/p2p_rpc_service.cpp
-    p2p/master/p2p_client_meta.cpp
-    p2p/master/p2p_client_manager.cpp
     p2p/client/p2p_client_service.cpp
     p2p/client/p2p_client_metric.cpp
     p2p/client/peer_client.cpp
@@ -140,7 +157,6 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/client/route_cache.cpp
     p2p/client/async_memcpy_executor.cpp
     p2p/client/async_metadata_notifier.cpp
-    p2p/client/client_metrics_aggregator.cpp
     p2p/client/runtime_config_store.cpp
     p2p/client/tiered_cache/copier_registry.cpp
     p2p/client/tiered_cache/data_copier.cpp
@@ -154,20 +170,6 @@ list(APPEND MOONCAKE_STORE_P2P_SOURCES
     p2p/client/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
     p2p/client/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
     p2p/client/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
-    p2p/ha/oplog/oplog_manager.cpp
-    p2p/ha/oplog/oplog_serializer.cpp
-    p2p/ha/oplog/localfs_oplog_store.cpp
-    p2p/ha/oplog/polling_oplog_change_notifier.cpp
-    p2p/ha/oplog/oplog_store_factory.cpp
-    p2p/ha/oplog/oplog_applier.cpp
-    p2p/ha/oplog/oplog_replicator.cpp
-    p2p/ha/oplog/p2p_oplog_types.cpp
-    p2p/ha/oplog/p2p_oplog_applier.cpp
-    p2p/ha/oplog/p2p_standby_metadata_store.cpp
-    p2p/ha/oplog/p2p_hot_standby_service.cpp
-    p2p/ha/oplog/p2p_standby_snapshot_service.cpp
-    p2p/ha/standby_state_machine.cpp
-    p2p/ha/ha_metric_manager.cpp
     p2p/ha/ha_recovery_manager.cpp
 )
 
@@ -262,8 +264,47 @@ if (BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store mooncake_store_p2p DESTINATION lib)
 endif()
 
+# Master executables never link the client aggregate. Explicit STATIC libraries
+# keep this boundary intact even when the installed Store libraries are shared.
+add_library(mooncake_master_support STATIC ${MOONCAKE_MASTER_SUPPORT_SOURCES})
+target_include_directories(mooncake_master_support PUBLIC ${XXHASH_INCLUDE_DIR})
+target_link_libraries(mooncake_master_support PUBLIC
+    cachelib_memory_allocator
+    glog::glog
+    gflags::gflags
+    JsonCpp::JsonCpp
+    ${XXHASH_LIBRARY}
+    ${ETCD_WRAPPER_LIB}
+    mooncake_common
+    pthread
+    ibverbs
+    asio_shared
+)
+# utils.cpp uses the Ascend allocation primitives only in direct mode.
+if(USE_ASCEND_DIRECT)
+    target_link_libraries(mooncake_master_support PRIVATE transfer_engine)
+endif()
+if(STORE_USE_ETCD)
+    add_dependencies(mooncake_master_support build_etcd_wrapper)
+endif()
+
+add_library(mooncake_master_core STATIC ${MOONCAKE_CENTRALIZED_MASTER_SOURCES})
+target_link_libraries(mooncake_master_core PUBLIC mooncake_master_support)
+
+add_library(mooncake_p2p_master_core STATIC ${MOONCAKE_P2P_MASTER_SOURCES})
+target_link_libraries(mooncake_p2p_master_core PUBLIC mooncake_master_support)
+if(STORE_USE_ETCD)
+    add_dependencies(mooncake_master_core build_etcd_wrapper)
+    add_dependencies(mooncake_p2p_master_core build_etcd_wrapper)
+endif()
+if(STORE_USE_REDIS)
+    target_include_directories(mooncake_p2p_master_core PUBLIC ${HIREDIS_INCLUDE_DIR})
+    target_link_libraries(mooncake_p2p_master_core PUBLIC ${HIREDIS_LIB})
+endif()
+
 # Master binary
 add_executable(mooncake_master master.cpp)
+add_executable(mooncake_master_p2p p2p/master/p2p_master_main.cpp)
 
 set(MASTER_EXTRA_INCS)
 set(MASTER_EXTRA_LIBS)
@@ -276,23 +317,25 @@ if (STORE_USE_JEMALLOC)
 endif()
 
 target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
+target_include_directories(mooncake_master_p2p PRIVATE ${MASTER_EXTRA_INCS})
 target_link_libraries(mooncake_master PRIVATE
-    ${MOONCAKE_STORE_LIBS}
-    cachelib_memory_allocator
-    pthread
-    ibverbs
-    mooncake_common
-    ${ETCD_WRAPPER_LIB}
+    mooncake_master_core
     ${MASTER_EXTRA_LIBS}
-    asio_shared
+)
+target_link_libraries(mooncake_master_p2p PRIVATE
+    mooncake_p2p_master_core
+    ${MASTER_EXTRA_LIBS}
 )
 
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
+    add_dependencies(mooncake_master_p2p build_etcd_wrapper)
 endif()
 
 target_compile_options(mooncake_master PRIVATE -Os)
 target_link_options(mooncake_master PRIVATE -Os -s)
+target_compile_options(mooncake_master_p2p PRIVATE -Os)
+target_link_options(mooncake_master_p2p PRIVATE -Os -s)
 
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
@@ -301,4 +344,5 @@ target_link_libraries(mooncake_client PRIVATE ${MOONCAKE_STORE_LIBS} transfer_en
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 
-install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+install(TARGETS mooncake_master mooncake_master_p2p mooncake_client
+        DESTINATION bin)

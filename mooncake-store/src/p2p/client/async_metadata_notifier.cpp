@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <utility>
 
 namespace mooncake {
 
@@ -344,55 +345,57 @@ size_t AsyncMetadataNotifier::CollectFromList(SenderShard& shard,
 
 void AsyncMetadataNotifier::SendBatch(std::vector<PendingOp>& batch,
                                       size_t count) {
-    BatchSyncReplicaRequest req;
+    P2PBatchSyncRoutesRequest req;
     req.client_id = client_id_;
 
-    req.add_keys.reserve(count);
-    req.add_sizes.reserve(count);
-    req.add_segment_ids.reserve(count);
-    req.remove_keys.reserve(count);
-    req.remove_segment_ids.reserve(count);
+    req.publish_operations.reserve(count);
+    req.withdraw_operations.reserve(count);
 
     for (size_t i = 0; i < count; ++i) {
         auto& op = batch[i];
         if (op.type == PendingOp::ADD) {
-            req.add_keys.push_back(std::string_view(op.key));
-            req.add_sizes.push_back(op.size);
-            req.add_segment_ids.push_back(op.segment_id);
+            req.publish_operations.push_back(P2PPublishRouteOperation{
+                .key = op.key,
+                .object_size = op.size,
+                .segment_id = op.segment_id,
+            });
         } else {
-            req.remove_keys.push_back(std::string_view(op.key));
-            req.remove_segment_ids.push_back(op.segment_id);
+            req.withdraw_operations.push_back(P2PWithdrawRouteOperation{
+                .key = op.key,
+                .segment_id = op.segment_id,
+            });
         }
     }
 
     for (int attempt = 0; attempt < MaxRetryCount; ++attempt) {
-        auto result = master_client_.BatchSyncReplica(req);
+        auto result = master_client_.BatchSyncRoutes(req);
         if (result.has_value()) {
             RecordSuccess();
             auto& resp = result.value();
-            for (size_t i = 0; i < resp.add_results.size(); ++i) {
-                auto ec = resp.add_results[i];
+            for (size_t i = 0; i < resp.publish_results.size(); ++i) {
+                auto ec = resp.publish_results[i];
                 if (ec != ErrorCode::OK &&
                     ec != ErrorCode::REPLICA_ALREADY_EXISTS) {
-                    LOG(WARNING)
-                        << "BatchSyncReplica ADD key=" << req.add_keys[i]
-                        << " failed: " << toString(ec);
+                    LOG(WARNING) << "BatchSyncRoutes PUBLISH key="
+                                 << req.publish_operations[i].key
+                                 << " failed: " << toString(ec);
                     if (failure_cb_) {
-                        failure_cb_(req.add_keys[i], req.add_segment_ids[i],
-                                    ec);
+                        failure_cb_(req.publish_operations[i].key,
+                                    req.publish_operations[i].segment_id, ec);
                     }
                 }
             }
-            for (size_t i = 0; i < resp.remove_results.size(); ++i) {
-                if (resp.remove_results[i] != ErrorCode::OK) {
+            for (size_t i = 0; i < resp.withdraw_results.size(); ++i) {
+                if (resp.withdraw_results[i] != ErrorCode::OK) {
                     LOG(WARNING)
-                        << "BatchSyncReplica REMOVE key=" << req.remove_keys[i]
-                        << " failed: " << toString(resp.remove_results[i]);
+                        << "BatchSyncRoutes WITHDRAW key="
+                        << req.withdraw_operations[i].key
+                        << " failed: " << toString(resp.withdraw_results[i]);
                 }
             }
             return;
         }
-        LOG(WARNING) << "BatchSyncReplica attempt " << attempt
+        LOG(WARNING) << "BatchSyncRoutes attempt " << attempt
                      << " failed: " << toString(result.error());
         if (attempt < MaxRetryCount - 1) {
             // Use CV wait instead of sleep so Stop() can interrupt promptly
@@ -407,7 +410,7 @@ void AsyncMetadataNotifier::SendBatch(std::vector<PendingOp>& batch,
         }
     }
     RecordFailure();
-    LOG(ERROR) << "BatchSyncReplica failed after " << MaxRetryCount
+    LOG(ERROR) << "BatchSyncRoutes failed after " << MaxRetryCount
                << " attempts, dropping " << count << " metadata notifications";
     // Transport/RPC failures usually mean Master is unreachable or failing
     // over. Drop only the metadata notification; keep local replicas so HA

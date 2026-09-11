@@ -50,7 +50,7 @@ class RedisElectionHelper {
 
     /**
      * @brief Elect self as leader. Blocks until this node wins election.
-     *        Same semantics as MasterViewHelper::ElectLeader.
+     *        Same semantics as P2PMasterView::ElectLeader.
      * @param master_address The address to register as leader.
      * @param version Output: epoch (monotonic version) from INCR.
      * @param lease_id Output: opaque lease identifier (local counter).

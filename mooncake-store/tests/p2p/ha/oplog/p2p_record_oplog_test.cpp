@@ -17,8 +17,7 @@
 #include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
-#include "master_config.h"
-#include "p2p/master/p2p_rpc_types.h"
+#include "p2p/common/p2p_rpc_types.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -86,53 +85,45 @@ class P2PRecordOplogTest : public ::testing::Test {
 
     void TearDown() override { std::filesystem::remove_all(test_dir_); }
 
-    MasterServiceConfig MakeConfig(bool enable_oplog = true) const {
-        return MasterServiceConfig::builder()
-            .set_enable_ha(enable_oplog)
-            .set_enable_oplog(enable_oplog)
-            .set_cluster_id(kClusterId)
-            .set_oplog_store_type("localfs")
-            .set_oplog_data_dir(test_dir_.string())
-            .set_max_client_per_key(0)
-            .build();
+    P2PMasterConfig MakeConfig(bool enable_oplog = true) const {
+        P2PMasterConfig config;
+        config.oplog.enabled = enable_oplog;
+        config.cluster_id = kClusterId;
+        config.oplog.store_type = "localfs";
+        config.oplog.data_dir = test_dir_.string();
+        config.routes.max_clients_per_key = 0;
+        return config;
     }
 
-    Segment MakeSegment(const UUID& segment_id) const {
-        Segment segment;
+    P2PSegment MakeSegment(const UUID& segment_id) const {
+        P2PSegment segment;
         segment.id = segment_id;
         segment.name = "segment-" + std::to_string(segment_id.first) + "-" +
                        std::to_string(segment_id.second);
         segment.size = 1024 * 1024;
-        segment.extra = P2PSegmentExtraData{
-            .priority = 1,
-            .tags = {},
-            .memory_type = MemoryType::DRAM,
-        };
+        segment.priority = 1;
+        segment.memory_type = MemoryType::DRAM;
         return segment;
     }
 
     void RegisterClient(P2PMasterService& service, const UUID& client_id,
-                        const Segment& segment) const {
-        RegisterClientRequest req;
+                        const P2PSegment& segment) const {
+        P2PRegisterClientRequest req;
         req.client_id = client_id;
         req.ip_address = "127.0.0.1";
         req.rpc_port = 50051;
         req.segments = {segment};
-        req.deployment_mode = DeploymentMode::P2P;
         auto result = service.RegisterClient(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
     void UnregisterClient(P2PMasterService& service,
                           const UUID& client_id) const {
-        UnregisterClientRequest req;
-        req.client_id = client_id;
-        req.deployment_mode = DeploymentMode::P2P;
-        auto result = service.UnregisterClient(req);
+        auto result = service.UnregisterClient(client_id);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    void MountSegment(P2PMasterService& service, const Segment& segment,
+    void MountSegment(P2PMasterService& service, const P2PSegment& segment,
                       const UUID& client_id) const {
         auto result = service.MountSegment(segment, client_id);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -144,25 +135,25 @@ class P2PRecordOplogTest : public ::testing::Test {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    void AddReplica(P2PMasterService& service, const std::string& key,
-                    const UUID& client_id, const UUID& segment_id,
-                    size_t size = 4096) const {
-        AddReplicaRequest req;
+    void PublishRoute(P2PMasterService& service, const std::string& key,
+                      const UUID& client_id, const UUID& segment_id,
+                      size_t size = 4096) const {
+        P2PPublishRouteRequest req;
         req.key = key;
         req.client_id = client_id;
         req.segment_id = segment_id;
-        req.size = size;
-        auto result = service.AddReplica(req);
+        req.object_size = size;
+        auto result = service.PublishRoute(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    void RemoveReplica(P2PMasterService& service, const std::string& key,
+    void WithdrawRoute(P2PMasterService& service, const std::string& key,
                        const UUID& client_id, const UUID& segment_id) const {
-        RemoveReplicaRequest req;
+        P2PWithdrawRouteRequest req;
         req.key = key;
         req.client_id = client_id;
         req.segment_id = segment_id;
-        auto result = service.RemoveReplica(req);
+        auto result = service.WithdrawRoute(req);
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
@@ -199,7 +190,7 @@ TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{1, 1};
     const UUID segment_id{2, 2};
-    Segment segment = MakeSegment(segment_id);
+    P2PSegment segment = MakeSegment(segment_id);
     RegisterClient(service, client_id, segment);
 
     auto* manager = service.GetOpLogManager();
@@ -226,12 +217,11 @@ TEST_F(P2PRecordOplogTest, DuplicateRegisterClientDoesNotRecordOplog) {
     const UUID segment_id{2, 2};
     RegisterClient(service, client_id, MakeSegment(segment_id));
 
-    RegisterClientRequest req;
+    P2PRegisterClientRequest req;
     req.client_id = client_id;
     req.ip_address = "127.0.0.1";
     req.rpc_port = 50051;
     req.segments = {MakeSegment({3, 3})};
-    req.deployment_mode = DeploymentMode::P2P;
 
     auto duplicate_result = service.RegisterClient(req);
     ASSERT_TRUE(duplicate_result.has_value())
@@ -246,20 +236,18 @@ TEST_F(P2PRecordOplogTest, RegisterClientRejectsMissingEndpoint) {
     P2PMasterService service(MakeConfig());
     const UUID segment_id{2, 2};
 
-    RegisterClientRequest missing_ip;
+    P2PRegisterClientRequest missing_ip;
     missing_ip.client_id = {1, 1};
     missing_ip.rpc_port = 50051;
     missing_ip.segments = {MakeSegment(segment_id)};
-    missing_ip.deployment_mode = DeploymentMode::P2P;
     auto missing_ip_result = service.RegisterClient(missing_ip);
     ASSERT_FALSE(missing_ip_result.has_value());
     EXPECT_EQ(missing_ip_result.error(), ErrorCode::INVALID_PARAMS);
 
-    RegisterClientRequest missing_port;
+    P2PRegisterClientRequest missing_port;
     missing_port.client_id = {3, 3};
     missing_port.ip_address = "127.0.0.1";
     missing_port.segments = {MakeSegment(segment_id)};
-    missing_port.deployment_mode = DeploymentMode::P2P;
     auto missing_port_result = service.RegisterClient(missing_port);
     ASSERT_FALSE(missing_port_result.has_value());
     EXPECT_EQ(missing_port_result.error(), ErrorCode::INVALID_PARAMS);
@@ -276,7 +264,7 @@ TEST_F(P2PRecordOplogTest, MountAndUnmountSegmentRecordOplog) {
     const UUID extra_segment_id{5, 5};
     RegisterClient(service, client_id, MakeSegment(initial_segment_id));
 
-    Segment extra_segment = MakeSegment(extra_segment_id);
+    P2PSegment extra_segment = MakeSegment(extra_segment_id);
     MountSegment(service, extra_segment, client_id);
     UnmountSegment(service, extra_segment_id, client_id);
 
@@ -331,17 +319,17 @@ TEST_F(P2PRecordOplogTest, AddReplicaRecordsOplog) {
     const UUID segment_id{9, 9};
     RegisterClient(service, client_id, MakeSegment(segment_id));
 
-    AddReplica(service, "key-a", client_id, segment_id, 1234);
+    PublishRoute(service, "key-a", client_id, segment_id, 1234);
 
     auto* manager = service.GetOpLogManager();
     ASSERT_NE(manager, nullptr);
     EXPECT_EQ(manager->GetLastSequenceId(), 2);
 
     OpLogEntry entry = ReadEntry(2);
-    EXPECT_EQ(entry.op_type, OpType_ADD_REPLICA);
+    EXPECT_EQ(entry.op_type, OpType_PUBLISH_ROUTE);
     EXPECT_EQ(entry.object_key, "key-a");
 
-    AddReplicaPayload payload;
+    PublishRoutePayload payload;
     ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
     EXPECT_EQ(payload.object_key, "key-a");
     EXPECT_EQ(payload.client_id, client_id);
@@ -354,45 +342,49 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaRecordsOplog) {
     const UUID client_id{10, 10};
     const UUID segment_id{11, 11};
     RegisterClient(service, client_id, MakeSegment(segment_id));
-    AddReplica(service, "key-r", client_id, segment_id);
+    PublishRoute(service, "key-r", client_id, segment_id);
 
-    RemoveReplica(service, "key-r", client_id, segment_id);
+    WithdrawRoute(service, "key-r", client_id, segment_id);
 
     auto* manager = service.GetOpLogManager();
     ASSERT_NE(manager, nullptr);
     EXPECT_EQ(manager->GetLastSequenceId(), 3);
 
     OpLogEntry entry = ReadEntry(3);
-    EXPECT_EQ(entry.op_type, OpType_REMOVE_REPLICA);
+    EXPECT_EQ(entry.op_type, OpType_WITHDRAW_ROUTE);
     EXPECT_EQ(entry.object_key, "key-r");
 
-    RemoveReplicaPayload payload;
+    WithdrawRoutePayload payload;
     ASSERT_TRUE(DeserializeP2PPayload(entry.payload, payload));
     EXPECT_EQ(payload.object_key, "key-r");
     EXPECT_EQ(payload.client_id, client_id);
     EXPECT_EQ(payload.segment_id, segment_id);
 }
 
-TEST_F(P2PRecordOplogTest, BatchSyncReplicaRecordsSuccessfulOps) {
+TEST_F(P2PRecordOplogTest, BatchSyncRoutesRecordsSuccessfulOps) {
     P2PMasterService service(MakeConfig());
     const UUID client_id{12, 12};
     const UUID segment_id{13, 13};
     RegisterClient(service, client_id, MakeSegment(segment_id));
-    AddReplica(service, "old-key", client_id, segment_id);
+    PublishRoute(service, "old-key", client_id, segment_id);
 
-    BatchSyncReplicaRequest req;
+    P2PBatchSyncRoutesRequest req;
     req.client_id = client_id;
-    req.add_keys = {"new-key"};
-    req.add_segment_ids = {segment_id};
-    req.add_sizes = {2048};
-    req.remove_keys = {"old-key"};
-    req.remove_segment_ids = {segment_id};
+    req.publish_operations = {{
+        .key = "new-key",
+        .object_size = 2048,
+        .segment_id = segment_id,
+    }};
+    req.withdraw_operations = {{
+        .key = "old-key",
+        .segment_id = segment_id,
+    }};
 
-    auto response = service.BatchSyncReplica(req);
-    ASSERT_EQ(response.add_results.size(), 1);
-    ASSERT_EQ(response.remove_results.size(), 1);
-    EXPECT_EQ(response.add_results[0], ErrorCode::OK);
-    EXPECT_EQ(response.remove_results[0], ErrorCode::OK);
+    auto response = service.BatchSyncRoutes(req);
+    ASSERT_EQ(response.publish_results.size(), 1);
+    ASSERT_EQ(response.withdraw_results.size(), 1);
+    EXPECT_EQ(response.publish_results[0], ErrorCode::OK);
+    EXPECT_EQ(response.withdraw_results[0], ErrorCode::OK);
 
     auto* manager = service.GetOpLogManager();
     ASSERT_NE(manager, nullptr);
@@ -406,8 +398,44 @@ TEST_F(P2PRecordOplogTest, BatchSyncReplicaRecordsSuccessfulOps) {
             });
     };
 
-    EXPECT_TRUE(has_entry(OpType_REMOVE_REPLICA, "old-key"));
-    EXPECT_TRUE(has_entry(OpType_ADD_REPLICA, "new-key"));
+    EXPECT_TRUE(has_entry(OpType_WITHDRAW_ROUTE, "old-key"));
+    EXPECT_TRUE(has_entry(OpType_PUBLISH_ROUTE, "new-key"));
+}
+
+TEST_F(P2PRecordOplogTest,
+       BatchSyncRoutesPreservesMutationPolicyWhenPersistenceFails) {
+    P2PMasterService service(MakeConfig());
+    const UUID client_id{20, 20};
+    const UUID segment_id{21, 21};
+    RegisterClient(service, client_id, MakeSegment(segment_id));
+    PublishRoute(service, "old-key", client_id, segment_id);
+    InjectFailingOpLogStore(service);
+
+    P2PBatchSyncRoutesRequest req;
+    req.client_id = client_id;
+    req.publish_operations = {{
+        .key = "new-key",
+        .object_size = 2048,
+        .segment_id = segment_id,
+    }};
+    req.withdraw_operations = {{
+        .key = "old-key",
+        .segment_id = segment_id,
+    }};
+
+    auto response = service.BatchSyncRoutes(req);
+    ASSERT_EQ(response.publish_results.size(), 1);
+    ASSERT_EQ(response.withdraw_results.size(), 1);
+    EXPECT_EQ(response.publish_results[0], ErrorCode::OK);
+    EXPECT_EQ(response.withdraw_results[0], ErrorCode::INTERNAL_ERROR);
+
+    auto published = service.GetReadRoute("new-key");
+    ASSERT_TRUE(published.has_value());
+    EXPECT_EQ(published->size(), 1);
+
+    auto retained = service.GetReadRoute("old-key");
+    ASSERT_TRUE(retained.has_value());
+    EXPECT_EQ(retained->size(), 1);
 }
 
 TEST_F(P2PRecordOplogTest,
@@ -415,12 +443,11 @@ TEST_F(P2PRecordOplogTest,
     P2PMasterService service(MakeConfig());
     InjectFailingOpLogStore(service);
 
-    RegisterClientRequest req;
+    P2PRegisterClientRequest req;
     req.client_id = {30, 30};
     req.ip_address = "127.0.0.1";
     req.rpc_port = 50051;
     req.segments = {MakeSegment({31, 31})};
-    req.deployment_mode = DeploymentMode::P2P;
 
     auto result = service.RegisterClient(req);
     ASSERT_FALSE(result.has_value());
@@ -439,18 +466,18 @@ TEST_F(P2PRecordOplogTest, AddReplicaSucceedsWhenOplogPersistenceFails) {
     RegisterClient(service, client_id, MakeSegment(segment_id));
     InjectFailingOpLogStore(service);
 
-    AddReplicaRequest req;
+    P2PPublishRouteRequest req;
     req.key = "failed-add";
     req.client_id = client_id;
     req.segment_id = segment_id;
-    req.size = 4096;
+    req.object_size = 4096;
 
-    auto result = service.AddReplica(req);
+    auto result = service.PublishRoute(req);
     ASSERT_TRUE(result.has_value());
 
-    auto replicas = service.GetReplicaList(req.key);
+    auto replicas = service.GetReadRoute(req.key);
     ASSERT_TRUE(replicas.has_value());
-    ASSERT_EQ(1u, replicas->replicas.size());
+    ASSERT_EQ(1u, replicas.value().size());
 }
 
 TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
@@ -458,23 +485,22 @@ TEST_F(P2PRecordOplogTest, RemoveReplicaDoesNotApplyWhenOplogPersistenceFails) {
     const UUID client_id{34, 34};
     const UUID segment_id{35, 35};
     RegisterClient(service, client_id, MakeSegment(segment_id));
-    AddReplica(service, "failed-remove", client_id, segment_id);
+    PublishRoute(service, "failed-remove", client_id, segment_id);
     InjectFailingOpLogStore(service);
 
-    RemoveReplicaRequest req;
+    P2PWithdrawRouteRequest req;
     req.key = "failed-remove";
     req.client_id = client_id;
     req.segment_id = segment_id;
 
-    auto result = service.RemoveReplica(req);
+    auto result = service.WithdrawRoute(req);
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
 
-    auto replicas = service.GetReplicaList(req.key);
+    auto replicas = service.GetReadRoute(req.key);
     ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
-    ASSERT_EQ(replicas->replicas.size(), 1);
-    EXPECT_EQ(replicas->replicas[0].get_p2p_proxy_descriptor().client_id,
-              client_id);
+    ASSERT_EQ(replicas.value().size(), 1);
+    EXPECT_EQ(replicas.value()[0].client_id, client_id);
 }
 
 TEST_F(P2PRecordOplogTest, EnabledOplogFailsFastWhenStoreInitFails) {
@@ -484,7 +510,7 @@ TEST_F(P2PRecordOplogTest, EnabledOplogFailsFastWhenStoreInitFails) {
     ASSERT_TRUE(std::filesystem::is_regular_file(invalid_root));
 
     auto config = MakeConfig();
-    config.oplog_data_dir = invalid_root.string();
+    config.oplog.data_dir = invalid_root.string();
 
     EXPECT_THROW(P2PMasterService service(config), std::runtime_error);
 }
@@ -495,7 +521,7 @@ TEST_F(P2PRecordOplogTest, DisabledOplogDoesNotCreateManager) {
     const UUID segment_id{15, 15};
     RegisterClient(service, client_id, MakeSegment(segment_id));
 
-    AddReplica(service, "key-disabled", client_id, segment_id);
+    PublishRoute(service, "key-disabled", client_id, segment_id);
 
     EXPECT_EQ(service.GetOpLogManager(), nullptr);
 }

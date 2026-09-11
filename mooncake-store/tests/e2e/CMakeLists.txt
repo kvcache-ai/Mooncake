@@ -80,7 +80,7 @@ if(STORE_USE_REDIS)
     add_test(
         NAME redis_chaos_test
         COMMAND redis_chaos_test
-            --master_path=${CMAKE_BINARY_DIR}/mooncake-store/src/mooncake_master
+            --master_path=${CMAKE_BINARY_DIR}/mooncake-store/src/mooncake_master_p2p
             --clientctl_path=${CMAKE_BINARY_DIR}/mooncake-store/tests/e2e/clientctl
             --out_dir=${CMAKE_BINARY_DIR}/redis_chaos_output
     )

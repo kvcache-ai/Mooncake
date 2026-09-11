@@ -113,16 +113,14 @@ void TieredBackend::Destroy() {
     for (const auto& [id, tier] : tiers_) {
         if (!tier) continue;
         const auto& info = tier_info_.at(id);
-        Segment segment;
-        segment.extra = P2PSegmentExtraData{};
+        P2PSegment segment;
         segment.id = id;
         segment.name = MakeTierSegmentName(id);
         segment.size = tier->GetCapacity();
-        auto& p2p_extra = segment.GetP2PExtra();
-        p2p_extra.priority = info.priority;
-        p2p_extra.tags = info.tags;
-        p2p_extra.memory_type = tier->GetMemoryType();
-        p2p_extra.usage = tier->GetUsage();
+        segment.priority = info.priority;
+        segment.tags = info.tags;
+        segment.memory_type = tier->GetMemoryType();
+        segment.usage = tier->GetUsage();
 
         if (segment_sync_callback_) {
             auto result = segment_sync_callback_(segment, /*mount=*/false);
@@ -350,16 +348,13 @@ std::vector<UUID> TieredBackend::GetSortedTiers() const {
 tl::expected<void, ErrorCode> TieredBackend::MountSegment(
     UUID id, size_t capacity, int priority,
     const std::vector<std::string>& tags, MemoryType memory_type) {
-    Segment segment;
-    segment.extra = P2PSegmentExtraData{};
+    P2PSegment segment;
     segment.id = id;
     segment.name = MakeTierSegmentName(id);
     segment.size = capacity;
-    auto& p2p_extra = segment.GetP2PExtra();
-    p2p_extra.priority = priority;
-    p2p_extra.tags = tags;
-    p2p_extra.memory_type = memory_type;
-    p2p_extra.usage = 0;
+    segment.priority = priority;
+    segment.tags = tags;
+    segment.memory_type = memory_type;
 
     if (segment_sync_callback_) {
         auto mount_result = segment_sync_callback_(segment, /*mount=*/true);
