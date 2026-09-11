@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
 """RL data-plane load driver for capturing Mooncake Store allocation traces.
 
-Each process plays one data-parallel rank of an RL trainer and reproduces the
-per-step data flow of a GRPO/PPO pipeline:
+Each process plays one data-parallel rank of an RL trainer. Two workloads are
+available (``--workload``).
+
+``miles`` replays the object layout of the radixark miles trainer running with
+``--object-store-backend mooncake``: one rollout stores one bundle per data-
+parallel shard, and every Arrow buffer of that bundle is a separate whole
+object. Sizes and key names come from a captured miles trace (Qwen3-0.6B, GRPO,
+rollout batch 128 x 8 samples, 4 shards): 34 objects per bundle, of which three
+``*.data`` payload buffers hold 99.8% of the bytes and the remaining 31
+offsets/shapes/nulls buffers are 256 B to 10 KB. Everything is a function of
+the rows per shard (``global_batch_size / dp_size``) and the tokens per row.
+
+``verl`` reproduces the per-step data flow of a verl-style GRPO/PPO pipeline:
 
 1. rollout   : ``input_ids``/``attention_mask``/``position_ids``/``responses``/
                ``response_mask`` plus non-tensor ``uid``/``data_source``/
@@ -15,17 +26,22 @@ per-step data flow of a GRPO/PPO pipeline:
 5. cleanup   : steps older than ``--keep_steps`` are removed explicitly, unless
                ``--no_cleanup`` leaves reclamation to master eviction.
 
-Two write paths are available (``--api``): ``dataproto`` uses the structured
-object API (``MooncakeBundleTransfer``, chunked, ~30 keys per batch);
+For ``verl``, two write paths are available (``--api``): ``dataproto`` uses the
+structured object API (``MooncakeBundleTransfer``, chunked, ~30 keys per batch);
 ``put_parts`` stores every field as one whole object with ``put_parts``, reads
-with ``get_buffer`` and frees with a forced ``remove``, for data planes that
-use only those calls.
+with ``get_buffer`` and frees with a forced ``remove``, for data planes that use
+only those calls. ``miles`` always writes whole objects that way.
 
 Object sizes and lifetimes are exactly what the master sees for this batch
-geometry; only the tensor contents are random. Run ``mooncake_master --v=1``
+geometry; only the payload contents are random. Run ``mooncake_master --v=1``
 and extract the trace with ``mooncake-store/benchmarks/extract_alloc_trace.py``.
 
-Example (8 ranks, 16 x 4 GiB segments, stop after 3x capacity written):
+Example (miles geometry, 4 shards, 8 x 128 MiB segments, 40 rollouts):
+
+    python rl_dataproto_trace_driver.py --workload miles --ranks 4 \
+        --extra_segments 4 --segment_gib 0.125 --steps 40 --keep_steps 1
+
+Example (verl, 8 ranks, 16 x 4 GiB segments, stop after 3x capacity written):
 
     python rl_dataproto_trace_driver.py --ranks 8 --extra_segments 8 \
         --segment_gib 4 --target_multiple 3
@@ -59,6 +75,33 @@ APPEND_STAGES = (
 )
 # Fields the trainer reads back for each micro-batch.
 READ_FIELDS = ("input_ids", "responses", "old_log_probs", "advantages", "uid")
+
+# ---- miles bundle layout, measured from a captured trace ------------------
+# A shard is stored as `<bundle>/meta`, `<bundle>/manifest` and one object per
+# Arrow buffer under `<bundle>/buffer/non_tensor_batch.<column>.<buffer>`.
+MILES_BUFFER_PREFIX = "buffer/non_tensor_batch."
+# Per-token columns: one variable-length array of 4-byte elements per row.
+MILES_TOKEN_COLUMNS = ("tokens", "rollout_log_probs", "loss_masks")
+# Variable-length string column: bytes per row.
+MILES_STRING_COLUMNS = (("weight_versions", 35),)
+# Fixed-width columns: bytes per row.
+MILES_SCALAR_COLUMNS = (
+    ("rewards", 4),
+    ("response_lengths", 8),
+    ("sample_indices", 8),
+    ("rollout_ids", 8),
+    ("partition", 8),
+    ("truncated", 8),
+    ("rollout_mask_sums", 8),
+)
+MILES_META_BYTES = 2994
+MILES_MANIFEST_BYTES = 9896
+MILES_NULLS_BYTES = 256  # null bitmap, padded to a fixed floor
+# The buffers the trainer reads back: 99.8% of the bytes of a bundle.
+MILES_PAYLOAD_KEYS = tuple(
+    f"{MILES_BUFFER_PREFIX}{name}.data" for name in MILES_TOKEN_COLUMNS
+)
+
 # Errors the Mooncake client raises for failed puts/gets/removes; anything else
 # is a bug in this script and should propagate.
 STORE_ERRORS = (RuntimeError, ValueError, OSError)
@@ -73,6 +116,12 @@ class StepGeometry:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument(
+        "--workload",
+        choices=["verl", "miles"],
+        default="verl",
+        help="object layout to reproduce: verl DataProto stages, or a miles bundle",
+    )
     p.add_argument(
         "--ranks", type=int, default=8, help="data-parallel ranks (client processes)"
     )
@@ -146,6 +195,24 @@ def parse_args(argv=None):
         type=float,
         default=0.0,
         help="per-step size jitter for the big object: uniform in [1-j, 1+j] x MiB",
+    )
+    p.add_argument(
+        "--miles_rows",
+        type=int,
+        default=256,
+        help="miles: rows per shard per rollout (global_batch_size / dp_size)",
+    )
+    p.add_argument(
+        "--miles_row_tokens",
+        type=int,
+        default=11265,
+        help="miles: mean tokens per row (prompt plus response)",
+    )
+    p.add_argument(
+        "--miles_len_jitter",
+        type=float,
+        default=0.08,
+        help="miles: per-rollout token-count spread, uniform in [1-j, 1+j]",
     )
     p.add_argument(
         "--api",
@@ -250,6 +317,34 @@ def tensor_bytes(data: dict) -> int:
     return sum(a.nbytes for a in data["batch"].values())
 
 
+def miles_bundle_sizes(rows: int, tokens_per_row: int) -> dict[str, int]:
+    """Size of every object miles writes for one data-parallel shard.
+
+    Keys are relative to the bundle prefix. The trace this reproduces had
+    rows=256 (global batch 1024 over 4 shards) and ~11265 tokens per row, which
+    accounts for every observed size: offsets 2056, shapes 2048, rewards 1024.
+    """
+    offsets = (rows + 1) * 8  # int64 start offset per row, plus a terminator
+    sizes = {"meta": MILES_META_BYTES, "manifest": MILES_MANIFEST_BYTES}
+    for name in MILES_TOKEN_COLUMNS:
+        column = MILES_BUFFER_PREFIX + name
+        sizes[f"{column}.data"] = rows * tokens_per_row * 4
+        sizes[f"{column}.offsets"] = offsets
+        sizes[f"{column}.shapes"] = rows * 8  # one int64 dimension per row
+        sizes[f"{column}.ndims"] = rows * 2
+        sizes[f"{column}.nulls"] = MILES_NULLS_BYTES
+    for name, width in MILES_STRING_COLUMNS:
+        column = MILES_BUFFER_PREFIX + name
+        sizes[f"{column}.data"] = rows * width
+        sizes[f"{column}.offsets"] = offsets
+        sizes[f"{column}.nulls"] = MILES_NULLS_BYTES
+    for name, width in MILES_SCALAR_COLUMNS:
+        column = MILES_BUFFER_PREFIX + name
+        sizes[f"{column}.data"] = rows * width
+        sizes[f"{column}.nulls"] = MILES_NULLS_BYTES
+    return sizes
+
+
 # ------------------------------------------------------------- write paths --
 
 
@@ -349,6 +444,75 @@ class PutPartsStep:
         self.keys.clear()
 
 
+class MilesBundle:
+    """One miles shard: every Arrow buffer of the bundle is a whole object."""
+
+    def __init__(
+        self, store: MooncakeDistributedStore, rank: int, step: int, args
+    ) -> None:
+        self.store = store
+        self.prefix = f"miles-object-store/default/step{step}-shard{rank}"
+        self.parts = max(1, args.parts_per_object)
+        self.keys: list[str] = []
+        self.payload_keys: list[str] = []
+
+    def put_bundle(self, sizes: dict[str, int]) -> int:
+        for name, nbytes in sizes.items():
+            key = f"{self.prefix}/{name}"
+            buffer = np.empty(nbytes, dtype=np.uint8)
+            rc = self.store.put_parts(key, *np.array_split(buffer, self.parts))
+            if rc != 0:
+                raise RuntimeError(f"put_parts failed for {key}: {rc}")
+            self.keys.append(key)
+            if name in MILES_PAYLOAD_KEYS:
+                self.payload_keys.append(key)
+        return sum(sizes.values())
+
+    def read(self) -> None:
+        # The trainer streams the payload buffers back; metadata buffers are
+        # read by the shard that produced them and stay in its own memory.
+        for key in self.payload_keys:
+            if self.store.get_buffer(key) is None:
+                raise RuntimeError(f"get_buffer miss for {key}")
+
+    def cleanup(self) -> None:
+        for key in self.keys:
+            self.store.remove(key, True)
+        self.keys.clear()
+        self.payload_keys.clear()
+
+
+# ------------------------------------------------------------------- steps --
+
+
+def write_verl_step(current, g: StepGeometry, step: int, rank: int, rng, np_rng, args):
+    """Rollout, per-stage appends and the optional blob, then trainer reads."""
+    data = rollout_batch(g, step, rank, np_rng)
+    written = tensor_bytes(data)
+    current.put_stage("rollout", data)
+    for stage, names in APPEND_STAGES:
+        stage_data = float_stage(g, np_rng, *names)
+        written += tensor_bytes(stage_data)
+        current.put_stage(stage, stage_data)
+    if args.big_field_mib > 0:
+        blob = big_blob(args, rng)
+        written += tensor_bytes(blob)
+        current.put_blob(blob)
+    micro = max(1, g.rows // args.micro_batches)
+    for lo in range(0, g.rows, micro):
+        current.read(slice(lo, min(g.rows, lo + micro)))
+    return written
+
+
+def write_miles_step(current: MilesBundle, rng: random.Random, args) -> int:
+    """One rollout's bundle for this shard, then the trainer read-back."""
+    jitter = rng.uniform(1.0 - args.miles_len_jitter, 1.0 + args.miles_len_jitter)
+    tokens = max(1, int(args.miles_row_tokens * jitter))
+    written = current.put_bundle(miles_bundle_sizes(args.miles_rows, tokens))
+    current.read()
+    return written
+
+
 # --------------------------------------------------------------- processes --
 
 
@@ -361,6 +525,8 @@ def run_rank(rank: int, args, capacity_bytes: int, barrier, counters, stop_flag)
     )
 
     def new_step(step: int):
+        if args.workload == "miles":
+            return MilesBundle(store, rank, step, args)
         if args.api == "put_parts":
             return PutPartsStep(store, rank, step, args)
         return DataProtoStep(transfer, rank, step, args)
@@ -376,23 +542,14 @@ def run_rank(rank: int, args, capacity_bytes: int, barrier, counters, stop_flag)
     target = args.target_multiple * capacity_bytes
     try:
         while not stop_flag.value and not (args.steps and step >= args.steps):
-            g = step_geometry(rng, args)
             current = new_step(step)
             try:
-                data = rollout_batch(g, step, rank, np_rng)
-                written += tensor_bytes(data)
-                current.put_stage("rollout", data)
-                for stage, names in APPEND_STAGES:
-                    stage_data = float_stage(g, np_rng, *names)
-                    written += tensor_bytes(stage_data)
-                    current.put_stage(stage, stage_data)
-                if args.big_field_mib > 0:
-                    blob = big_blob(args, rng)
-                    written += tensor_bytes(blob)
-                    current.put_blob(blob)
-                mb = max(1, g.rows // args.micro_batches)
-                for lo in range(0, g.rows, mb):
-                    current.read(slice(lo, min(g.rows, lo + mb)))
+                if args.workload == "miles":
+                    written += write_miles_step(current, rng, args)
+                else:
+                    written += write_verl_step(
+                        current, step_geometry(rng, args), step, rank, rng, np_rng, args
+                    )
                 live.append((step, current))
             except STORE_ERRORS as exc:  # an allocation failure surfaces here
                 failures += 1
@@ -413,8 +570,8 @@ def run_rank(rank: int, args, capacity_bytes: int, barrier, counters, stop_flag)
                 total = sum(counters)
                 if step % 5 == 0 or total >= target:
                     print(
-                        f"[step {step}] rows={g.rows} prompt={g.prompt_len} resp={g.response_len} "
-                        f"written={total / GiB:.1f} GiB ({total / capacity_bytes:.2f}x capacity) "
+                        f"[step {step}] written={total / GiB:.1f} GiB "
+                        f"({total / capacity_bytes:.2f}x capacity) "
                         f"live_steps={len(live)} failures={failures}",
                         flush=True,
                     )
