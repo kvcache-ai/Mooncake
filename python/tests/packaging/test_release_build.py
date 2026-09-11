@@ -82,11 +82,32 @@ def test_metadata_restored_on_build_failure(tmp_path):
     path = tmp_path / "pyproject.toml"
     original = PROJECT_TEXT.encode()
     path.write_bytes(original)
-    with pytest.raises(RuntimeError):
+
+    def failing_build() -> None:
         with release.metadata_override(path, "temporary metadata"):
             assert path.read_text() == "temporary metadata"
             raise RuntimeError("build failed")
+
+    with pytest.raises(RuntimeError):
+        failing_build()
     assert path.read_bytes() == original
+
+
+@pytest.mark.parametrize("build_type", [None, "", "Debug", "Release"])
+def test_cached_build_type_preserves_backend_default(tmp_path, build_type):
+    if build_type is not None:
+        (tmp_path / "CMakeCache.txt").write_text(
+            f"CMAKE_BUILD_TYPE:STRING={build_type}\n"
+        )
+    settings = release.build_settings(tomllib.loads(PROJECT_TEXT), tmp_path, {})
+    build_type_settings = [
+        setting
+        for setting in settings
+        if setting.startswith("--config-setting=cmake.build-type=")
+    ]
+    assert build_type_settings == (
+        [f"--config-setting=cmake.build-type={build_type}"] if build_type else []
+    )
 
 
 def test_configured_native_profile_is_preserved(tmp_path):

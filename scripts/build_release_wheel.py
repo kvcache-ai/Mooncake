@@ -101,7 +101,7 @@ def build_settings(
         settings.append(f"--config-setting=cmake.define.{key}={value}")
     if "CMAKE_GENERATOR" in cache:
         settings.append(f"--config-setting=cmake.args=-G{cache['CMAKE_GENERATOR']}")
-    if "CMAKE_BUILD_TYPE" in cache:
+    if cache.get("CMAKE_BUILD_TYPE"):
         settings.append(
             f"--config-setting=cmake.build-type={cache['CMAKE_BUILD_TYPE']}"
         )
