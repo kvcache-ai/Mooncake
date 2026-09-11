@@ -63,6 +63,7 @@ elseif(USE_MUSA OR USE_MACA)
     set(_pg_device_compiler_name nvcc)
     set(_pg_device_compiler_hint "${MACA_ROOT}/tools/cu-bridge/bin")
     set(_pg_platform_device_flags -Xcompiler=-fPIC -include cuda_bf16.h)
+    list(APPEND _pg_device_flags "-I${MACA_ROOT}/tools/cu-bridge/include")
   endif()
 
   find_program(
