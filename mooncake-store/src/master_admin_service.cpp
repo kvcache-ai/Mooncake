@@ -10,7 +10,14 @@
 #include <utility>
 #include <vector>
 
+#include <asio/executor_work_guard.hpp>
 #include <glog/logging.h>
+#if __has_include(<jsoncpp/json/json.h>)
+#include <jsoncpp/json/json.h>
+#else
+#include <json/json.h>
+#endif
+#include <ylt/coro_io/coro_io.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -171,6 +178,12 @@ std::string EscapePrometheusLabel(std::string_view input) {
     }
     return escaped;
 }
+
+struct HttpDfsShardCountResponse {
+    bool success{true};
+    int shard_count{0};
+};
+YLT_REFL(HttpDfsShardCountResponse, success, shard_count);
 
 struct HttpTenantQuotaSnapshot {
     std::string tenant_id;
@@ -804,6 +817,87 @@ struct HttpCreateDrainJobResponse {
 YLT_REFL(HttpCreateDrainJobResponse, success, job_id, status, error_code,
          error_message);
 
+void MasterAdminServer::HandleGetDfsShardCount(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    WithActiveService(resp, [&](auto service) {
+        auto result = service->GetDfsShardCount();
+        if (!result) {
+            WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                               result.error());
+            return;
+        }
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpDfsShardCountResponse{true, *result});
+    });
+}
+
+async_simple::coro::Lazy<void> MasterAdminServer::HandleExpandDfsShards(
+    coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
+    Json::CharReaderBuilder builder;
+    builder["rejectDupKeys"] = true;
+    builder["failIfExtra"] = true;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    Json::Value body;
+    std::string errors;
+    const auto text = req.get_body();
+    const bool parsed =
+        reader->parse(text.data(), text.data() + text.size(), &body, &errors);
+    if (!parsed || !body.isObject() || !body.isMember("shard_count") ||
+        (body["shard_count"].type() != Json::intValue &&
+         body["shard_count"].type() != Json::uintValue) ||
+        !body["shard_count"].isInt() || body["shard_count"].asInt() <= 0) {
+        WriteErrorResponse(resp, coro_http::status_type::bad_request,
+                           ErrorCode::INVALID_PARAMS,
+                           "shard_count must be an integer in [1, INT_MAX]");
+        co_return;
+    }
+    const int shard_count = body["shard_count"].asInt();
+    auto service = GetActiveService();
+    if (!service) {
+        SetServiceUnavailable(resp, "Master service is not available");
+        co_return;
+    }
+    auto running = dfs_expansion_running_;
+    if (running->exchange(true)) {
+        WriteErrorResponse(resp, coro_http::status_type::conflict,
+                           ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
+                           "A DFS expansion is already in progress");
+        co_return;
+    }
+    struct ResetRunning {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~ResetRunning() { flag->store(false); }
+    } reset{running};
+    // Filesystem preparation can block, especially on a shared filesystem.
+    // Retain the HTTP executor until the worker finishes: server stop() drains
+    // that executor, but does not wait for the global blocking pool itself.
+    const auto io_executor =
+        req.get_conn()->get_executor()->get_asio_executor();
+    auto work = asio::make_work_guard(io_executor);
+    // Keep the owning callable and pending operation in the coroutine frame.
+    auto expand = [service, shard_count]() {
+        return service->ExpandDfsShards(shard_count);
+    };
+    auto pending = coro_io::post(expand);
+    auto completion = co_await std::move(pending);
+    // post() resumes on the worker. Response/socket handling must return to
+    // the connection's executor before releasing its outstanding work.
+    co_await coro_io::dispatch(io_executor);
+    if (completion.hasError()) {
+        WriteErrorResponse(resp, coro_http::status_type::internal_server_error,
+                           ErrorCode::INTERNAL_ERROR);
+        co_return;
+    }
+    auto result = std::move(completion).value();
+    if (!result) {
+        WriteErrorResponse(resp, ErrorCodeToHttpStatus(result.error()),
+                           result.error());
+        co_return;
+    }
+    WriteJsonResponse(resp, coro_http::status_type::ok,
+                      HttpDfsShardCountResponse{true, *result});
+}
+
 void MasterAdminServer::HandleCreateDrainJob(
     coro_http::coro_http_request& req, coro_http::coro_http_response& resp) {
     CreateDrainJobRequest request;
@@ -1278,6 +1372,16 @@ void MasterAdminServer::RegisterHandler() {
         "/query_segment",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleQuerySegment(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/api/v1/dfs/shard_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleGetDfsShardCount(req, resp);
+        });
+    http_server_.set_http_handler<PUT>(
+        "/api/v1/dfs/shard_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            return HandleExpandDfsShards(req, resp);
         });
     http_server_.set_http_handler<POST>(
         "/api/v1/drain_jobs",

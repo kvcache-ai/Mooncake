@@ -1,7 +1,7 @@
 #include "common/client_buffer_allocation.h"
 
-#include "bool_parser.h"
-#include "environ.h"
+#include "config/hugepage_config.h"
+#include "config/mmap_arena_config.h"
 #include "mmap_arena.h"
 
 #include <algorithm>
@@ -34,64 +34,17 @@ static std::atomic<uint64_t> g_arena_oom_fallback_count{0};
 static std::atomic<uint64_t> g_arena_noop_free_count{0};
 
 static void initializeGlobalArena() {
-    const std::string env_pool_size =
-        Environ::GetString("MC_MMAP_ARENA_POOL_SIZE", "");
-    // Allow env var to override the gflag (useful when loaded as .so from
-    // Python). An explicit pool-size env var is also treated as an opt-in,
-    // because pybind11 users cannot easily pass gflags.
-    const std::string env_disable =
-        Environ::GetString("MC_DISABLE_MMAP_ARENA", "");
-    const std::optional<bool> disable_override = TryParseBool(env_disable);
-    if (!env_disable.empty() && !disable_override.has_value()) {
-        LOG(WARNING) << "Ignoring invalid MC_DISABLE_MMAP_ARENA='"
-                     << env_disable
-                     << "'; accepted values: 1/0, true/false, yes/no, on/off";
-    }
-    const bool arena_requested =
-        FLAGS_use_mmap_arena_allocator || !env_pool_size.empty();
-    const bool arena_disabled = disable_override.value_or(false);
-    if (!arena_requested || arena_disabled) {
-        LOG(INFO) << "=== ARENA ALLOCATOR DISABLED ===";
-        if (arena_disabled) {
-            LOG(INFO) << "MC_DISABLE_MMAP_ARENA=" << env_disable
-                      << " forces direct mmap()";
-        } else {
-            LOG(INFO) << "Arena is opt-in; set --use_mmap_arena_allocator or "
-                         "MC_MMAP_ARENA_POOL_SIZE to enable it";
-        }
+    const MmapArenaConfig config = MmapArenaConfig::FromEnvironment(
+        FLAGS_use_mmap_arena_allocator, FLAGS_mmap_arena_pool_size);
+    if (!config.enabled) {
         return;
     }
 
     g_mmap_arena = std::make_unique<MmapArena>();
-    // Keep arena init consistent with the direct-mmap path:
-    //   MC_STORE_USE_HUGEPAGE=1  -> strict: hard fail if hugepage mmap fails
-    //   unset                    -> permissive: try hugepages, retry on
-    //                               regular pages if HugeTLB is unavailable
-    // This preserves both pre-existing contracts and avoids surprising
-    // operators with a silent hugepage downgrade.
-    const bool hugepages_explicitly_requested =
-        get_hugepage_size_from_env() > 0;
-
-    // Allow env var override since gflags cannot be set from Python (pybind11).
-    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
-    // etc.
-    uint64_t arena_pool_size = FLAGS_mmap_arena_pool_size;
-    if (!env_pool_size.empty()) {
-        const uint64_t parsed = string_to_byte_size(env_pool_size);
-        if (parsed > 0) {
-            arena_pool_size = parsed;
-            LOG(INFO) << "MC_MMAP_ARENA_POOL_SIZE override: " << env_pool_size
-                      << " (" << byte_size_to_string(arena_pool_size) << ")";
-        } else {
-            LOG(WARNING) << "Invalid MC_MMAP_ARENA_POOL_SIZE='" << env_pool_size
-                         << "', using default "
-                         << byte_size_to_string(FLAGS_mmap_arena_pool_size);
-        }
-    }
 
     bool success =
-        g_mmap_arena->initialize(arena_pool_size, MmapArena::kMinAlignment,
-                                 !hugepages_explicitly_requested);
+        g_mmap_arena->initialize(config.pool_size, MmapArena::kMinAlignment,
+                                 !config.hugepages_explicitly_requested);
 
     if (success) {
         auto stats = g_mmap_arena->getStats();
@@ -102,7 +55,7 @@ static void initializeGlobalArena() {
     } else {
         LOG(ERROR) << "=== ARENA INITIALIZATION FAILED ===";
         LOG(ERROR) << "Falling back to traditional mmap()";
-        if (hugepages_explicitly_requested) {
+        if (config.hugepages_explicitly_requested) {
             LOG(ERROR) << "MC_STORE_USE_HUGEPAGE is set, so the fallback path "
                           "will also require hugepages";
         }
@@ -278,7 +231,7 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
 
     // Traditional mmap allocation (fallback or arena disabled).
     const bool defer_direct_population =
-        defer_hugetlb_population && get_hugepage_size_from_env() > 0;
+        defer_hugetlb_population && HugepageConfig::FromEnvironment().enabled;
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
     if (!defer_direct_population) {
         flags |= MAP_POPULATE;

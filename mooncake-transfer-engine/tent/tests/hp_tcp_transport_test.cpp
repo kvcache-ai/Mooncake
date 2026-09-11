@@ -43,6 +43,11 @@ class HighPerformanceTcpTransportTestPeer {
     static Status barrier(HighPerformanceTcpTransport& transport) {
         return transport.workers_->barrier();
     }
+
+    static uint64_t activeSessions(
+        const HighPerformanceTcpTransport& transport) {
+        return transport.server_->activeSessionsForTest();
+    }
 };
 
 namespace {
@@ -799,6 +804,117 @@ TEST(HighPerformanceTcpTransportTest,
     ASSERT_TRUE(client.uninstall().ok());
     ASSERT_TRUE(server.uninstall().ok());
 }
+
+class HighPerformanceTcpLaneDistributionTest
+    : public ::testing::TestWithParam<bool> {};
+
+TEST_P(HighPerformanceTcpLaneDistributionTest,
+       InterleavedPeersUseEveryConfiguredLane) {
+    const bool sliced_read = GetParam();
+    const size_t peer_count = sliced_read ? 2 : 4;
+    const size_t length = sliced_read ? 4ULL << 20 : 4;
+    auto params = MakeParams();
+    params.bind_address.clear();
+    params.rail_addresses = {"127.0.0.1", "127.0.0.2"};
+    params.connections_per_peer = 4;
+    params.max_outstanding_bytes = 8ULL << 20;
+    params.max_transfer_bytes = 8ULL << 20;
+
+    // Each peer has its own listener, making per-peer socket counts observable.
+    // Storage outlives the transports even if an assertion ends the test.
+    std::vector<std::vector<uint8_t>> remote(peer_count,
+                                             std::vector<uint8_t>(length, 0));
+    std::vector<uint8_t> local(length, 0x5a);
+    std::vector<std::shared_ptr<ControlService>> server_metadata;
+    std::vector<std::unique_ptr<HighPerformanceTcpTransport>> servers;
+    std::vector<SegmentID> targets;
+    auto client_metadata = MakeLocalMetadata();
+    HighPerformanceTcpTransport client(params);
+    std::string client_name = "hp_lane_distribution_client";
+    ASSERT_TRUE(
+        client.install(client_name, client_metadata, nullptr, nullptr).ok());
+    for (size_t peer = 0; peer < peer_count; ++peer) {
+        if (sliced_read) {
+            std::fill(remote[peer].begin(), remote[peer].end(),
+                      static_cast<uint8_t>(peer + 1));
+        }
+        auto metadata = MakeLocalMetadata();
+        server_metadata.push_back(metadata);
+        uint16_t rpc_port = 0;
+        ASSERT_TRUE(metadata->start(rpc_port).ok());
+        std::string name = "127.0.0.1:" + std::to_string(rpc_port);
+        ASSERT_TRUE(metadata->segmentManager()
+                        .updateLocal([&](SegmentDesc& segment) -> Status {
+                            segment.name = name;
+                            segment.rpc_server_addr = name;
+                            return Status::OK();
+                        })
+                        .ok());
+        servers.push_back(
+            std::make_unique<HighPerformanceTcpTransport>(params));
+        ASSERT_TRUE(
+            servers.back()->install(name, metadata, nullptr, nullptr).ok());
+        BufferDesc buffer;
+        buffer.addr = reinterpret_cast<uint64_t>(remote[peer].data());
+        buffer.length = length;
+        buffer.location = "cpu:0";
+        MemoryOptions options;
+        options.perm = kGlobalReadWrite;
+        ASSERT_TRUE(servers.back()->addMemoryBuffer(buffer, options).ok());
+        ASSERT_TRUE(PublishBuffers(metadata, {buffer}).ok());
+        SegmentID target = 0;
+        ASSERT_TRUE(
+            client_metadata->segmentManager().openRemote(target, name).ok());
+        targets.push_back(target);
+    }
+    BufferDesc buffer;
+    buffer.addr = reinterpret_cast<uint64_t>(local.data());
+    buffer.length = length;
+    buffer.location = "cpu:0";
+    MemoryOptions options;
+    options.perm = kLocalReadWrite;
+    ASSERT_TRUE(client.addMemoryBuffer(buffer, options).ok());
+
+    // One request per peer per round, across separate submissions. The old
+    // global request ID stride used one lane per peer for the WRITE case and
+    // one lane per rail per peer for sliced READs.
+    for (size_t round = 0; round < params.connections_per_peer; ++round) {
+        for (size_t peer = 0; peer < peer_count; ++peer) {
+            if (sliced_read) std::fill(local.begin(), local.end(), 0);
+            Transport::SubBatchRef batch = nullptr;
+            ASSERT_TRUE(client.allocateSubBatch(batch, 1).ok());
+            Request request{};
+            request.opcode = sliced_read ? Request::READ : Request::WRITE;
+            request.source = local.data();
+            request.target_id = targets[peer];
+            request.target_offset =
+                reinterpret_cast<uint64_t>(remote[peer].data());
+            request.length = length;
+            ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
+            TransferStatus status{};
+            ASSERT_TRUE(WaitForTransportResult(client, batch, status).ok());
+            ASSERT_EQ(status.s, COMPLETED);
+            EXPECT_EQ(status.transferred_bytes, length);
+            EXPECT_EQ(std::memcmp(local.data(), remote[peer].data(), length),
+                      0);
+            ASSERT_TRUE(client.freeSubBatch(batch).ok());
+        }
+    }
+    for (const auto& server : servers) {
+        EXPECT_EQ(HighPerformanceTcpTransportTestPeer::activeSessions(*server),
+                  params.connections_per_peer);
+    }
+    ASSERT_TRUE(client.quiesce().ok());
+    ASSERT_TRUE(client.uninstall().ok());
+    for (const auto& server : servers) {
+        ASSERT_TRUE(server->quiesce().ok());
+        ASSERT_TRUE(server->uninstall().ok());
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(WriteAndSlicedRead,
+                         HighPerformanceTcpLaneDistributionTest,
+                         ::testing::Bool());
 
 }  // namespace
 }  // namespace mooncake::tent

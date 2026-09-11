@@ -286,6 +286,26 @@ TEST(ConfigLifecycleTest, AcceptsEmptyKnownObjects) {
     EXPECT_TRUE(bundle.diagnostics.empty());
 }
 
+TEST(ConfigLifecycleTest, MnnvlEgmDefaultsOffAndFollowsEnv) {
+    {
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_FALSE(config.get("transports/mnnvl/egm", false));
+    }
+    {
+        EnvVarGuard egm_guard("MC_MNNVL_EGM", "1");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_TRUE(config.get("transports/mnnvl/egm", false));
+    }
+    {
+        EnvVarGuard egm_guard("MC_MNNVL_EGM", "0");
+        Config config;
+        ASSERT_TRUE(ConfigHelper().loadFromEnv(config).ok());
+        EXPECT_FALSE(config.get("transports/mnnvl/egm", true));
+    }
+}
+
 TEST(ConfigLifecycleTest, PreservesLegacyEnvironmentPrecedence) {
     EnvVarGuard conf_guard(
         "MC_TENT_CONF",
