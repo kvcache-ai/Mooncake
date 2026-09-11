@@ -389,6 +389,8 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
+    void deregisterRemovedBuffer(BufferDesc& desc);
+
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 
     // Submit-stage failover: recover a task whose synchronous

@@ -935,8 +935,10 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         desc_list.push_back(std::move(desc));
     }
 
+    bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
-        desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
+        desc_list,
+        [&](std::vector<BufferDesc>& descs) -> Status {
             const bool hp_tcp_required =
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
@@ -957,11 +959,19 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 }
             }
             return Status::OK();
+        },
+        [&](BufferDesc& desc) {
+            need_sync = true;
+            deregisterRemovedBuffer(desc);
         });
-    if (!status.ok()) return status;
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
-    return metadata_->segmentManager().synchronizeLocal();
+    if (status.ok()) return metadata_->segmentManager().synchronizeLocal();
+    if (need_sync) {
+        auto sync_status = metadata_->segmentManager().synchronizeLocal();
+        if (!sync_status.ok()) LOG(WARNING) << sync_status.ToString();
+    }
+    return status;
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
@@ -971,24 +981,7 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
-            const auto registered_transports = desc.transports;
-            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                auto& transport = transport_list_[type];
-                if (!transport) continue;
-                const auto transport_type = static_cast<TransportType>(type);
-                const bool advertised =
-                    std::find(registered_transports.begin(),
-                              registered_transports.end(),
-                              transport_type) != registered_transports.end();
-                if (!advertised && !transport->tracksLocalBuffer(desc))
-                    continue;
-                auto status = transport->removeMemoryBuffer(desc);
-                if (!status.ok()) LOG(WARNING) << status.ToString();
-            }
-            for (auto type : registered_transports) {
-                TentMetrics::instance().recordRegisteredBufferBytes(
-                    type, -static_cast<int64_t>(desc.length));
-            }
+            deregisterRemovedBuffer(desc);
             return Status::OK();
         });
     if (!status.ok()) return status;
@@ -1009,26 +1002,7 @@ Status TransferEngineImpl::unregisterLocalMemory(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
-                const auto registered_transports = desc.transports;
-                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                    auto& transport = transport_list_[type];
-                    if (!transport) continue;
-                    const auto transport_type =
-                        static_cast<TransportType>(type);
-                    const bool advertised =
-                        std::find(registered_transports.begin(),
-                                  registered_transports.end(),
-                                  transport_type) !=
-                        registered_transports.end();
-                    if (!advertised && !transport->tracksLocalBuffer(desc))
-                        continue;
-                    auto s = transport->removeMemoryBuffer(desc);
-                    if (!s.ok()) LOG(WARNING) << s.ToString();
-                }
-                for (auto type : registered_transports) {
-                    TentMetrics::instance().recordRegisteredBufferBytes(
-                        type, -static_cast<int64_t>(desc.length));
-                }
+                deregisterRemovedBuffer(desc);
                 return Status::OK();
             });
         if (!status.ok()) return status;
@@ -1036,6 +1010,29 @@ Status TransferEngineImpl::unregisterLocalMemory(
     }
     if (!removed_any) return Status::OK();
     return metadata_->segmentManager().synchronizeLocal();
+}
+
+void TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
+    const BufferDesc original_desc = desc;
+    const auto& registered_transports = original_desc.transports;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto& transport = transport_list_[type];
+        if (!transport) continue;
+        const auto transport_type = static_cast<TransportType>(type);
+        const bool advertised =
+            std::find(registered_transports.begin(),
+                      registered_transports.end(),
+                      transport_type) != registered_transports.end();
+        BufferDesc transport_desc = original_desc;
+        if (!advertised && !transport->tracksLocalBuffer(transport_desc))
+            continue;
+        auto status = transport->removeMemoryBuffer(transport_desc);
+        if (!status.ok()) LOG(WARNING) << status.ToString();
+    }
+    for (auto type : registered_transports) {
+        TentMetrics::instance().recordRegisteredBufferBytes(
+            type, -static_cast<int64_t>(original_desc.length));
+    }
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
