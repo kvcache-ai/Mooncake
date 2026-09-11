@@ -20,6 +20,7 @@
 
 #include "allocator.h"
 #include "client_service.h"
+#include "real_client.h"
 #include "types.h"
 #include "common/client_buffer_allocation.h"
 #include "test_server_helpers.h"
@@ -1258,6 +1259,77 @@ TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
     auto remove_result = test_client_->Remove(key);
     // Remove might fail if the key wasn't actually put, which is fine
     ASSERT_TRUE(remove_result);
+}
+
+// Regression test for duplicate keys in a batch read (#3876): the
+// destinations used to collapse onto one buffer, returning the first
+// occurrence's unwritten memory as success. Every duplicate must come back
+// with a copy of the object bytes.
+TEST_F(ClientIntegrationTest, BatchGetDuplicateKeysFanOut) {
+    auto real_client = RealClient::create();
+    const std::string rdma_devices =
+        (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
+    ASSERT_EQ(real_client->setup_real("localhost:17913", "P2PHANDSHAKE", 0,
+                                      64 * 1024 * 1024, FLAGS_protocol,
+                                      rdma_devices, master_address_),
+              0);
+
+    const std::string key = "test_key_batch_get_duplicate_keys";
+    const size_t obj_size = 4096;
+    std::string test_data(obj_size, '\0');
+    for (size_t i = 0; i < obj_size; ++i) {
+        test_data[i] = static_cast<char>(((i * 131 + 7) & 0x7f) | 0x01);
+    }
+
+    void* put_buffer = client_buffer_allocator_->allocate(obj_size);
+    memcpy(put_buffer, test_data.data(), obj_size);
+    std::vector<Slice> put_slices{Slice{put_buffer, obj_size}};
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, put_slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(put_buffer, obj_size);
+
+    const std::vector<std::string> dup_keys = {key, key};
+
+    // Caller-buffer variant (batch_get_into): poison the first destination;
+    // it must still come back with the object bytes.
+    void* first = malloc(obj_size);
+    void* second = malloc(obj_size);
+    ASSERT_TRUE(first != nullptr && second != nullptr);
+    ASSERT_EQ(real_client->register_buffer(first, obj_size), 0);
+    ASSERT_EQ(real_client->register_buffer(second, obj_size), 0);
+    memset(first, 0xAA, obj_size);
+    memset(second, 0xBB, obj_size);
+    std::vector<void*> dst_buffers = {first, second};
+    std::vector<size_t> dst_sizes = {obj_size, obj_size};
+    auto into_results =
+        real_client->batch_get_into(dup_keys, dst_buffers, dst_sizes);
+    ASSERT_EQ(into_results.size(), 2);
+    EXPECT_EQ(into_results[0], static_cast<int64_t>(obj_size));
+    EXPECT_EQ(into_results[1], static_cast<int64_t>(obj_size));
+    EXPECT_EQ(memcmp(first, test_data.data(), obj_size), 0)
+        << "first duplicate buffer was left unwritten";
+    EXPECT_EQ(memcmp(second, test_data.data(), obj_size), 0)
+        << "second duplicate buffer was left unwritten";
+    real_client->unregister_buffer(first);
+    real_client->unregister_buffer(second);
+    free(first);
+    free(second);
+
+    // Allocated-buffer variant (batch_get_buffer, the Python get_batch
+    // entry): both handles must carry the object bytes.
+    auto handles = real_client->batch_get_buffer(dup_keys);
+    ASSERT_EQ(handles.size(), 2);
+    ASSERT_NE(handles[0], nullptr);
+    ASSERT_NE(handles[1], nullptr);
+    EXPECT_EQ(handles[0]->size(), obj_size);
+    EXPECT_EQ(handles[1]->size(), obj_size);
+    EXPECT_EQ(memcmp(handles[0]->ptr(), test_data.data(), obj_size), 0)
+        << "first duplicate handle was left unwritten";
+    EXPECT_EQ(memcmp(handles[1]->ptr(), test_data.data(), obj_size), 0)
+        << "second duplicate handle was left unwritten";
 }
 
 // Test BatchReplicaClear operations through the client
