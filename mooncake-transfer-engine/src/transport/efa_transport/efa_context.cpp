@@ -73,6 +73,37 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     setenv("FI_HMEM", neuronAvailable() ? "neuron" : "system", 0);
 #endif
 
+    // Keep libfabric's SHM sub-provider out of the way on Neuron hosts.
+    //
+    // For same-host peers the EFA provider hands the transfer to an internal
+    // shm endpoint (efa_shm_info_create() in prov/efa/src/efa_shm.c), and shm
+    // cannot move Neuron HBM.  libfabric's FI_HMEM_NEURON op table
+    // (src/hmem.c) implements copy_to_hmem only: copy_from_hmem is
+    // neuron_copy_from_dev(), whose whole body is
+    //   FI_WARN_ONCE("Copies from AWS Neuron to host memory are not
+    //                 supported."); return -FI_ENOSYS;
+    // and every IPC entry is a ofi_hmem_no_* stub, so smr_ep.c's
+    //   use_ipc = ofi_hmem_is_ipc_enabled(iface) && ...
+    // is always false and shm has no protocol left that could read out of a
+    // source Neuron buffer.  The shm provider never uses dmabuf either.
+    //
+    // Left to itself shm therefore treats the /dev/neuron mapping as ordinary
+    // host memory and memcpy()s across what is really an uncached PCIe BAR:
+    // correct bytes, 0.07 GB/s.  Disabling shm sends intra-node traffic back
+    // over the EFA device instead, measured at 19.23 GB/s -- the same as the
+    // inter-node rate for one chip, i.e. no loss at all.
+    //
+    // Declaring FI_HMEM in hints->caps, which is what the CUDA path does and
+    // what efa_shm.c keys FI_MR_HMEM off, would be worse than this: it makes
+    // shm HMEM-aware and the transfer then fails outright on that ENOSYS
+    // rather than merely crawling.
+    //
+    // Overwrite is 0, so an explicit FI_EFA_ENABLE_SHM_TRANSFER from the
+    // environment still wins.  This is process-global and also takes host
+    // memory off the shm path on Neuron hosts; that is an acceptable trade,
+    // since intra-node host transfers loop back over EFA just as well.
+    if (neuronAvailable()) setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 0);
+
     // Setup hints for EFA provider
     hints_ = fi_allocinfo();
     if (!hints_) {
@@ -112,6 +143,10 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     // matches no fi_info at all (fi_getinfo -> -FI_ENODATA) rather than merely
     // refusing the later fi_mr_regattr().  Unlike CUDA this is a runtime
     // decision -- Neuron support costs no build flag, see efa_neuron.h.
+    //
+    // Note that FI_HMEM is deliberately NOT added to caps here, unlike the
+    // CUDA path above.  See the FI_EFA_ENABLE_SHM_TRANSFER guard below for
+    // why declaring it would turn a slow intra-node path into a broken one.
     if (neuronAvailable()) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
