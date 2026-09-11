@@ -33,6 +33,7 @@ class RailMonitor {
     // Upper bound on the exponential-backoff cooldown; prevents the
     // per-rail pause from growing without bound under repeated failure.
     static constexpr std::chrono::seconds kMaxCooldown{300};
+    static constexpr size_t kSnapshotCleanupInterval = 64;
 
    public:
     // Config keys. Exposed as constants so callers (and docs) reference
@@ -154,6 +155,7 @@ class RailMonitor {
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
     std::unordered_map<uint64_t, std::weak_ptr<const Topology>>
         remote_snapshots_;
+    size_t snapshot_inserts_since_cleanup_ = 0;
 
     uint64_t metadata_generation_ = 0;
     uint64_t next_probe_token_ = 0;

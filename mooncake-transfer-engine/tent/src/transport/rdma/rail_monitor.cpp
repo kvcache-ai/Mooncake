@@ -66,6 +66,19 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
                          const Config* conf, uint64_t remote_snapshot_key) {
     const bool first_load = !ready_;
     auto snapshot = remote_snapshots_.find(remote_snapshot_key);
+    if (snapshot == remote_snapshots_.end() &&
+        ++snapshot_inserts_since_cleanup_ >= kSnapshotCleanupInterval) {
+        for (auto it = remote_snapshots_.begin();
+             it != remote_snapshots_.end();) {
+            if (it->second.expired()) {
+                it = remote_snapshots_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        snapshot_inserts_since_cleanup_ = 0;
+        snapshot = remote_snapshots_.end();
+    }
     auto previous_snapshot = snapshot == remote_snapshots_.end()
                                  ? std::shared_ptr<const Topology>{}
                                  : snapshot->second.lock();
