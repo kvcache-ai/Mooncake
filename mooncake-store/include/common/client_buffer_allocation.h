@@ -1,16 +1,12 @@
 #pragma once
 
 #include <cstddef>
-#include <cstdlib>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
 #include <vector>
 
 #include <Slab.h>
-#include <glog/logging.h>
-
-#include "common/byte_size.h"
 
 namespace mooncake {
 
@@ -43,44 +39,8 @@ inline size_t align_up(size_t size, size_t alignment) {
     return ((size + alignment - 1) / alignment) * alignment;
 }
 
-[[nodiscard]] inline size_t get_hugepage_size_from_env(
-    unsigned int* out_flags = nullptr, bool use_memfd = false) {
-    if (std::getenv("MC_STORE_USE_HUGEPAGE") == nullptr) {
-        return 0;
-    }
-
-    size_t size = SZ_2MB;
-    if (const char* size_env = std::getenv("MC_STORE_HUGEPAGE_SIZE")) {
-        const size_t parsed_size = string_to_byte_size(size_env);
-        if (parsed_size == SZ_2MB || parsed_size == SZ_512MB ||
-            parsed_size == SZ_1GB) {
-            size = parsed_size;
-        } else {
-            LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << size_env
-                         << "'. Supported: 2MB, 512MB, 1GB. Fallback to 2MB.";
-        }
-    }
-
-    if (out_flags == nullptr) {
-        return size;
-    }
-    if (use_memfd) {
-        *out_flags |= MFD_HUGETLB;
-        *out_flags |= size == SZ_2MB     ? MFD_HUGE_2MB
-                      : size == SZ_512MB ? MFD_HUGE_512MB
-                                         : MFD_HUGE_1GB;
-    } else {
-        *out_flags |= MAP_HUGETLB;
-        *out_flags |= size == SZ_2MB     ? MAP_HUGE_2MB
-                      : size == SZ_512MB ? MAP_HUGE_512MB
-                                         : MAP_HUGE_1GB;
-    }
-    LOG(INFO) << "Using hugepage size: "
-              << (size == SZ_2MB     ? "2MB"
-                  : size == SZ_512MB ? "512MB"
-                                     : "1GB");
-    return size;
-}
+[[nodiscard]] size_t get_hugepage_size_from_env(
+    unsigned int* out_flags = nullptr, bool use_memfd = false);
 
 void populate_hugetlb_mapping(void* ptr, size_t total_size);
 

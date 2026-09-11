@@ -14,6 +14,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
@@ -1570,11 +1571,9 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    std::string protocol = "tcp";
-    if (value && std::string_view(value) == "rdma") {
-        protocol = "rdma";
-    }
+    const auto rpc_protocol_config =
+        mooncake::RpcProtocolConfig::FromEnvironment();
+    const std::string protocol = rpc_protocol_config.use_rdma ? "rdma" : "tcp";
 
     // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
     // server. Two topologies are supported:
@@ -1732,8 +1731,7 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
+        if (mooncake::RpcProtocolConfig::FromEnvironment().use_rdma) {
             server.init_ibv();
         }
         auto wrapped_master_service =

@@ -25,10 +25,12 @@
 #include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
+#include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
+#include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -723,8 +725,7 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
 }
 
 RealClient::~RealClient() {
@@ -7273,8 +7274,7 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    const char *value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
