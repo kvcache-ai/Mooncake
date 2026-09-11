@@ -6,7 +6,10 @@
 #include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
+
+#include <fmt/format.h>
 
 #include "common/byte_size.h"
 #include "mutex.h"
@@ -541,6 +544,279 @@ static uint64_t calculateMultiplier(size_t size) {
     return multiplier_bits;
 }
 
+tl::expected<void, std::string> OffsetAllocatorSnapshot::ValidateNodeCapacity(
+    uint32_t size, uint32_t current_capacity, uint32_t max_capacity,
+    uint32_t free_offset) {
+    if (size == 0 || current_capacity == 0 || current_capacity > max_capacity ||
+        max_capacity > kMaxNodes || free_offset > current_capacity) {
+        return tl::make_unexpected(fmt::format(
+            "invalid layout capacity fields: size={}, current_capacity={}, "
+            "max_capacity={}, free_offset={} (node limit={})",
+            size, current_capacity, max_capacity, free_offset, kMaxNodes));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> OffsetAllocatorSnapshot::ValidateHeader()
+    const {
+    if (!layout) {
+        return tl::make_unexpected(std::string("layout is missing"));
+    }
+    if (capacity == 0 || capacity > std::numeric_limits<size_t>::max() ||
+        base > std::numeric_limits<uint64_t>::max() - capacity) {
+        return tl::make_unexpected(fmt::format(
+            "invalid allocator bounds: base={}, capacity={}", base, capacity));
+    }
+    // Every shift below, including usage accounting, is gated by this check.
+    const uint64_t expected_multiplier = calculateMultiplier(capacity);
+    if (multiplier_bits >= 64 || multiplier_bits != expected_multiplier) {
+        return tl::make_unexpected(fmt::format(
+            "invalid multiplier_bits: got {}, expected {} for capacity {}",
+            multiplier_bits, expected_multiplier, capacity));
+    }
+    if (layout->m_size != (capacity >> multiplier_bits)) {
+        return tl::make_unexpected(fmt::format(
+            "layout size {} does not match capacity {} with multiplier_bits {}",
+            layout->m_size, capacity, multiplier_bits));
+    }
+    if (auto valid =
+            ValidateNodeCapacity(layout->m_size, layout->m_current_capacity,
+                                 layout->m_max_capacity, layout->m_freeOffset);
+        !valid) {
+        return valid;
+    }
+    if (layout->m_nodes.size() != layout->m_current_capacity ||
+        layout->m_freeNodes.size() != layout->m_current_capacity) {
+        return tl::make_unexpected(fmt::format(
+            "layout storage does not match current_capacity {}: nodes={}, "
+            "free_nodes={}",
+            layout->m_current_capacity, layout->m_nodes.size(),
+            layout->m_freeNodes.size()));
+    }
+    return {};
+}
+
+tl::expected<OffsetAllocatorSnapshot::LayoutUsage, std::string>
+OffsetAllocatorSnapshot::ValidateUsedNodes(
+    std::vector<NodeState>& state) const {
+    LayoutUsage usage;
+    for (uint32_t i = 0; i < layout->m_current_capacity; ++i) {
+        const auto& node = layout->m_nodes[i];
+        if (!node.used) continue;
+        if (node.dataSize == 0 || node.dataSize > layout->m_size) {
+            return tl::make_unexpected(fmt::format(
+                "used node {} has invalid size {}", i, node.dataSize));
+        }
+        uint32_t min_units = node.dataSize;
+#ifndef OFFSET_ALLOCATOR_NOT_ROUND_UP
+        const uint32_t bin = SmallFloat::uintToFloatRoundDown(node.dataSize);
+        if (SmallFloat::floatToUint(bin) != node.dataSize) {
+            return tl::make_unexpected(
+                fmt::format("used node {} size {} is not a bin boundary", i,
+                            node.dataSize));
+        }
+        // allocate() rounds first to a unit and then up to a bin. A request
+        // landing in this bin must be greater than the preceding bin boundary.
+        min_units = SmallFloat::floatToUint(bin - 1) + 1;
+#endif
+        const uint64_t max_bytes = static_cast<uint64_t>(node.dataSize)
+                                   << multiplier_bits;
+        if (max_bytes > capacity - usage.max_used_bytes) {
+            return tl::make_unexpected(fmt::format(
+                "used node {} makes occupied bytes exceed capacity {}", i,
+                capacity));
+        }
+        usage.max_used_bytes += max_bytes;
+        usage.min_used_bytes +=
+            (static_cast<uint64_t>(min_units - 1) << multiplier_bits) + 1;
+        ++usage.used_nodes;
+        state[i] = NodeState::kUsed;
+    }
+    return usage;
+}
+
+tl::expected<uint32_t, std::string> OffsetAllocatorSnapshot::ValidateBins(
+    std::vector<NodeState>& state) const {
+    constexpr uint32_t kUnused = __Allocator::Node::unused;
+    uint8_t expected_used_bins[NUM_TOP_BINS] = {};
+    uint32_t expected_used_bins_top = 0;
+    uint32_t bin_nodes = 0;
+    uint32_t free_storage = 0;
+    // Classification rejects cycles, duplicate membership and used nodes in
+    // free bins; the previous link and size class must agree with each list.
+    for (uint32_t bin = 0; bin < NUM_LEAF_BINS; ++bin) {
+        uint32_t node_index = layout->m_binIndices[bin];
+        if (node_index == kUnused) continue;
+        const uint32_t top_bin = bin >> TOP_BINS_INDEX_SHIFT;
+        expected_used_bins[top_bin] |= uint8_t{1}
+                                       << (bin & LEAF_BINS_INDEX_MASK);
+        expected_used_bins_top |= uint32_t{1} << top_bin;
+        uint32_t previous = kUnused;
+        while (node_index != kUnused) {
+            if (node_index >= state.size() ||
+                state[node_index] != NodeState::kUnclassified) {
+                return tl::make_unexpected(fmt::format(
+                    "bin {} references out-of-range or already classified node "
+                    "{}",
+                    bin, node_index));
+            }
+            const auto& node = layout->m_nodes[node_index];
+            if (SmallFloat::uintToFloatRoundDown(node.dataSize) != bin ||
+                node.binListPrev != previous) {
+                return tl::make_unexpected(fmt::format(
+                    "bin {} node {} has inconsistent size class or previous "
+                    "link",
+                    bin, node_index));
+            }
+            if (free_storage >
+                std::numeric_limits<uint32_t>::max() - node.dataSize) {
+                return tl::make_unexpected(fmt::format(
+                    "bin {} node {} overflows free storage", bin, node_index));
+            }
+            state[node_index] = NodeState::kFree;
+            ++bin_nodes;
+            free_storage += node.dataSize;
+            previous = node_index;
+            node_index = node.binListNext;
+        }
+    }
+    if (layout->m_freeStorage != free_storage) {
+        return tl::make_unexpected(
+            fmt::format("free storage mismatch: got {}, expected {}",
+                        layout->m_freeStorage, free_storage));
+    }
+    if (layout->m_usedBinsTop != expected_used_bins_top) {
+        return tl::make_unexpected(std::string("top bin bitmap mismatch"));
+    }
+    for (uint32_t top = 0; top < NUM_TOP_BINS; ++top) {
+        if (layout->m_usedBins[top] != expected_used_bins[top]) {
+            return tl::make_unexpected(
+                fmt::format("leaf bin bitmap mismatch at top bin {}", top));
+        }
+    }
+    return bin_nodes;
+}
+
+tl::expected<void, std::string> OffsetAllocatorSnapshot::ValidateFreeStack(
+    std::vector<NodeState>& state, uint32_t live_nodes) const {
+    for (uint32_t i = layout->m_freeOffset; i < state.size(); ++i) {
+        const uint32_t node_index = layout->m_freeNodes[i];
+        if (node_index >= state.size() ||
+            state[node_index] != NodeState::kUnclassified) {
+            return tl::make_unexpected(fmt::format(
+                "free stack slot {} references out-of-range or already "
+                "classified node {}",
+                i, node_index));
+        }
+        state[node_index] = NodeState::kSpare;
+    }
+    if (layout->m_freeOffset != live_nodes) {
+        return tl::make_unexpected(
+            fmt::format("free stack offset mismatch: got {}, expected {}",
+                        layout->m_freeOffset, live_nodes));
+    }
+    for (uint32_t i = 0; i < state.size(); ++i) {
+        if (state[i] == NodeState::kUnclassified) {
+            return tl::make_unexpected(fmt::format(
+                "node {} is neither used, in a free bin, nor spare", i));
+        }
+    }
+    return {};
+}
+
+tl::expected<void, std::string> OffsetAllocatorSnapshot::ValidateNeighborChain(
+    const std::vector<NodeState>& state, uint32_t live_nodes) const {
+    constexpr uint32_t kUnused = __Allocator::Node::unused;
+    const auto is_live = [&state](uint32_t index) {
+        return index < state.size() && (state[index] == NodeState::kUsed ||
+                                        state[index] == NodeState::kFree);
+    };
+    uint32_t head = kUnused;
+    for (uint32_t i = 0; i < state.size(); ++i) {
+        if (!is_live(i) || layout->m_nodes[i].neighborPrev != kUnused) continue;
+        if (head != kUnused) {
+            return tl::make_unexpected(
+                std::string("neighbor chain has multiple heads"));
+        }
+        head = i;
+    }
+    if (head == kUnused) {
+        return tl::make_unexpected(std::string("neighbor chain has no head"));
+    }
+    std::vector<uint8_t> walked(state.size(), 0);
+    uint32_t chain_nodes = 0;
+    uint32_t offset = 0;
+    for (uint32_t i = head; i != kUnused; i = layout->m_nodes[i].neighborNext) {
+        if (!is_live(i) || walked[i]) {
+            return tl::make_unexpected(fmt::format(
+                "neighbor chain references invalid or repeated node {}", i));
+        }
+        walked[i] = 1;
+        const auto& node = layout->m_nodes[i];
+        if (node.dataOffset != offset || node.dataSize == 0 ||
+            node.dataSize > layout->m_size - offset) {
+            return tl::make_unexpected(fmt::format(
+                "neighbor node {} has invalid geometry: offset={}, size={}, "
+                "expected_offset={}",
+                i, node.dataOffset, node.dataSize, offset));
+        }
+        offset += node.dataSize;
+        ++chain_nodes;
+        if (node.neighborNext != kUnused &&
+            (!is_live(node.neighborNext) ||
+             layout->m_nodes[node.neighborNext].neighborPrev != i)) {
+            return tl::make_unexpected(fmt::format(
+                "neighbor node {} has an inconsistent next link", i));
+        }
+        if (node.neighborPrev != kUnused &&
+            (!is_live(node.neighborPrev) ||
+             layout->m_nodes[node.neighborPrev].neighborNext != i)) {
+            return tl::make_unexpected(fmt::format(
+                "neighbor node {} has an inconsistent previous link", i));
+        }
+    }
+    if (offset != layout->m_size || chain_nodes != live_nodes) {
+        return tl::make_unexpected(
+            fmt::format("neighbor chain does not cover the layout: "
+                        "bytes={}/{}, nodes={}/{}",
+                        offset, layout->m_size, chain_nodes, live_nodes));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> OffsetAllocatorSnapshot::ValidateAccounting(
+    const LayoutUsage& usage) const {
+    if (allocated_num != usage.used_nodes) {
+        return tl::make_unexpected(
+            fmt::format("allocated_num mismatch: got {}, expected {}",
+                        allocated_num, usage.used_nodes));
+    }
+    if (allocated_size < usage.min_used_bytes ||
+        allocated_size > usage.max_used_bytes) {
+        return tl::make_unexpected(fmt::format(
+            "allocated_size {} is outside layout's requested-byte range [{}, "
+            "{}]",
+            allocated_size, usage.min_used_bytes, usage.max_used_bytes));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> OffsetAllocatorSnapshot::Validate() const {
+    if (auto valid = ValidateHeader(); !valid) return valid;
+    std::vector<NodeState> state(layout->m_current_capacity,
+                                 NodeState::kUnclassified);
+    auto usage = ValidateUsedNodes(state);
+    if (!usage) return tl::make_unexpected(usage.error());
+    auto bin_nodes = ValidateBins(state);
+    if (!bin_nodes) return tl::make_unexpected(bin_nodes.error());
+    const uint32_t live_nodes =
+        static_cast<uint32_t>(usage->used_nodes) + *bin_nodes;
+    if (auto valid = ValidateFreeStack(state, live_nodes); !valid) return valid;
+    if (auto valid = ValidateNeighborChain(state, live_nodes); !valid)
+        return valid;
+    return ValidateAccounting(*usage);
+}
+
 // Thread-safe OffsetAllocator implementation
 std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
                                                          size_t size,
@@ -559,14 +835,12 @@ OffsetAllocatorSnapshot OffsetAllocator::CaptureSnapshot() const {
     return {m_base,           m_multiplier_bits, m_capacity,
             m_allocated_size, m_allocated_num,   std::move(layout)};
 }
-std::optional<std::shared_ptr<OffsetAllocator>> OffsetAllocator::Restore(
-    OffsetAllocatorSnapshot snapshot) {
-    if (!snapshot.layout || snapshot.multiplier_bits >= 64 ||
-        snapshot.multiplier_bits != calculateMultiplier(snapshot.capacity) ||
-        snapshot.layout->m_size !=
-            (snapshot.capacity >> snapshot.multiplier_bits) ||
-        snapshot.allocated_size > snapshot.capacity) {
-        return std::nullopt;
+tl::expected<std::shared_ptr<OffsetAllocator>, std::string>
+OffsetAllocator::Restore(OffsetAllocatorSnapshot snapshot) {
+    if (auto valid = snapshot.Validate(); !valid) {
+        LOG(ERROR) << "OffsetAllocator::Restore rejected snapshot: "
+                   << valid.error();
+        return tl::make_unexpected(valid.error());
     }
     auto allocator = std::shared_ptr<OffsetAllocator>(new OffsetAllocator(
         snapshot.base, snapshot.capacity, snapshot.multiplier_bits,

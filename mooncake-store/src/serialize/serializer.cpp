@@ -1,7 +1,5 @@
 #include <array>
-#include <bit>
 #include <iostream>
-#include <limits>
 #include <optional>
 #include <vector>
 
@@ -20,14 +18,6 @@ constexpr size_t OFFSET_ALLOCATOR_NODE_UINT32_COUNT = 6;
 constexpr size_t OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE =
     OFFSET_ALLOCATOR_NODE_BOOL_SIZE +
     OFFSET_ALLOCATOR_NODE_UINT32_COUNT * sizeof(uint32_t);
-
-// Node capacity accepted from serialized data must stay bounded: the allocator
-// materializes max_capacity nodes, so a corrupt-but-parseable payload could
-// otherwise request billions of nodes and trigger the OOM killer before
-// bad_alloc is thrown. 1<<24 (16.7M) stays above every legitimate
-// configuration (the storage backend clamps node capacity to about 9.6M) and
-// matches the bound the byte serializer applies.
-constexpr uint32_t kMaxSerializedAllocatorNodes = 1u << 24;
 
 // __Allocator serialize_msgpack
 tl::expected<void, SerializationError>
@@ -133,80 +123,109 @@ Serializer<offset_allocator::__Allocator>::deserialize(
     auto *array_items = obj.via.array.ptr;
     size_t index = 0;
 
-    // Parse every scalar before materializing the allocator: its constructor
-    // reserves max_capacity nodes, so corrupt capacities must be rejected here
-    // instead of allocating storage for them, and the payloads below are
-    // validated against current_capacity before they are copied into it.
-    const uint32_t size = array_items[index++].as<uint32_t>();
-    const uint32_t current_capacity = array_items[index++].as<uint32_t>();
-    const uint32_t max_capacity = array_items[index++].as<uint32_t>();
-    const uint32_t free_storage = array_items[index++].as<uint32_t>();
-    const uint32_t used_bins_top = array_items[index++].as<uint32_t>();
-    if (size == 0 || current_capacity == 0 || current_capacity > max_capacity ||
-        max_capacity > kMaxSerializedAllocatorNodes) {
+    // Parse every scalar before materializing or decompressing anything: the
+    // allocator constructor reserves max_capacity nodes, so corrupt capacities
+    // and a corrupt freeOffset must be rejected against the node bound before a
+    // payload can request large storage.
+    uint32_t size = 0;
+    uint32_t current_capacity = 0;
+    uint32_t max_capacity = 0;
+    uint32_t free_storage = 0;
+    uint32_t used_bins_top = 0;
+    uint32_t free_offset = 0;
+    try {
+        size = array_items[index++].as<uint32_t>();
+        current_capacity = array_items[index++].as<uint32_t>();
+        max_capacity = array_items[index++].as<uint32_t>();
+        free_storage = array_items[index++].as<uint32_t>();
+        used_bins_top = array_items[index++].as<uint32_t>();
+        // freeOffset is packed last; reading it here keeps the whole scalar
+        // header validated before any node payload is touched.
+        free_offset = array_items[9].as<uint32_t>();
+    } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize offset_allocator::__Allocator invalid "
-                        "capacity fields: size {}, current_capacity {}, "
-                        "max_capacity {}",
-                        size, current_capacity, max_capacity)));
+                        "scalar field: {}",
+                        e.what())));
     }
 
-    // Deserialize usedBins array
-    const auto &used_bins_array = array_items[index++];
-    if (used_bins_array.type != msgpack::type::ARRAY) {
-        return tl::unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "deserialize offset_allocator::__Allocator "
-                               "usedBins is not an array"));
-    }
-
-    if (used_bins_array.via.array.size != offset_allocator::NUM_TOP_BINS) {
+    if (auto valid =
+            offset_allocator::OffsetAllocatorSnapshot::ValidateNodeCapacity(
+                size, current_capacity, max_capacity, free_offset);
+        !valid) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize offset_allocator::__Allocator usedBins "
-                        "invalid size: expected {}, got {}",
-                        offset_allocator::NUM_TOP_BINS,
-                        used_bins_array.via.array.size)));
+            fmt::format("deserialize offset_allocator::__Allocator {}",
+                        valid.error())));
     }
 
     std::array<uint8_t, offset_allocator::NUM_TOP_BINS> used_bins{};
-    for (uint32_t i = 0; i < offset_allocator::NUM_TOP_BINS; i++) {
-        used_bins[i] = used_bins_array.via.array.ptr[i].as<uint8_t>();
-    }
-
-    // Deserialize binIndices array
-    const auto &bin_indices_array = array_items[index++];
-    if (bin_indices_array.type != msgpack::type::ARRAY) {
-        return tl::unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "deserialize offset_allocator::__Allocator "
-                               "binIndices is not an array"));
-    }
-
-    if (bin_indices_array.via.array.size != offset_allocator::NUM_LEAF_BINS) {
-        return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize offset_allocator::__Allocator binIndices "
-                        "invalid size: expected {}, got {}",
-                        offset_allocator::NUM_LEAF_BINS,
-                        bin_indices_array.via.array.size)));
-    }
-
     std::array<offset_allocator::NodeIndex, offset_allocator::NUM_LEAF_BINS>
         bin_indices{};
-    for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
-        const uint32_t bin_index =
-            bin_indices_array.via.array.ptr[i].as<uint32_t>();
-        if (bin_index != offset_allocator::__Allocator::Node::unused &&
-            bin_index >= current_capacity) {
+    try {
+        // Deserialize usedBins array
+        const auto &used_bins_array = array_items[index++];
+        if (used_bins_array.type != msgpack::type::ARRAY) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize offset_allocator::__Allocator "
+                                   "usedBins is not an array"));
+        }
+
+        if (used_bins_array.via.array.size != offset_allocator::NUM_TOP_BINS) {
             return tl::unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
-                fmt::format("deserialize offset_allocator::__Allocator bin "
-                            "index {} is out of range for capacity {}",
-                            bin_index, current_capacity)));
+                fmt::format(
+                    "deserialize offset_allocator::__Allocator usedBins "
+                    "invalid size: expected {}, got {}",
+                    offset_allocator::NUM_TOP_BINS,
+                    used_bins_array.via.array.size)));
         }
-        bin_indices[i] = bin_index;
+
+        for (uint32_t i = 0; i < offset_allocator::NUM_TOP_BINS; i++) {
+            used_bins[i] = used_bins_array.via.array.ptr[i].as<uint8_t>();
+        }
+
+        // Deserialize binIndices array
+        const auto &bin_indices_array = array_items[index++];
+        if (bin_indices_array.type != msgpack::type::ARRAY) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize offset_allocator::__Allocator "
+                                   "binIndices is not an array"));
+        }
+
+        if (bin_indices_array.via.array.size !=
+            offset_allocator::NUM_LEAF_BINS) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format(
+                    "deserialize offset_allocator::__Allocator binIndices "
+                    "invalid size: expected {}, got {}",
+                    offset_allocator::NUM_LEAF_BINS,
+                    bin_indices_array.via.array.size)));
+        }
+
+        for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
+            const uint32_t bin_index =
+                bin_indices_array.via.array.ptr[i].as<uint32_t>();
+            if (bin_index != offset_allocator::__Allocator::Node::unused &&
+                bin_index >= current_capacity) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    fmt::format("deserialize offset_allocator::__Allocator bin "
+                                "index {} is out of range for capacity {}",
+                                bin_index, current_capacity)));
+            }
+            bin_indices[i] = bin_index;
+        }
+    } catch (const std::exception &e) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format("deserialize offset_allocator::__Allocator invalid "
+                        "bitmap field: {}",
+                        e.what())));
     }
 
     std::vector<uint8_t> serialized_nodes;
@@ -220,18 +239,14 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                                    "nodes data is not binary"));
         }
 
-        // Create copy of compressed data
-        std::vector<uint8_t> compressed_data(
-            reinterpret_cast<const uint8_t *>(nodes_bin.via.bin.ptr),
-            reinterpret_cast<const uint8_t *>(nodes_bin.via.bin.ptr) +
-                nodes_bin.via.bin.size);
-
-        // Decompress data
-        serialized_nodes = zstd_decompress(compressed_data);
-
-        // The payload must describe exactly the nodes it will populate.
+        // The payload must describe exactly the nodes it will populate, so the
+        // decompression is bounded by that size: a frame header can then never
+        // request a far larger buffer.
         const size_t expected_size = static_cast<size_t>(current_capacity) *
                                      OFFSET_ALLOCATOR_NODE_SERIALIZED_SIZE;
+        serialized_nodes = zstd_decompress(
+            reinterpret_cast<const uint8_t *>(nodes_bin.via.bin.ptr),
+            nodes_bin.via.bin.size, expected_size);
         if (serialized_nodes.size() != expected_size) {
             return tl::unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
@@ -259,18 +274,11 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                                    "freeNodes data is not binary"));
         }
 
-        // Create copy of compressed data
-        std::vector<uint8_t> compressed_data(
-            reinterpret_cast<const uint8_t *>(free_nodes_bin.via.bin.ptr),
-            reinterpret_cast<const uint8_t *>(free_nodes_bin.via.bin.ptr) +
-                free_nodes_bin.via.bin.size);
-
-        // Decompress data
-        const std::vector<uint8_t> serialized_free_nodes =
-            zstd_decompress(compressed_data);
-
-        // Verify decompressed data size is reasonable
+        // Bounded like the node payload, then required to be exact.
         const size_t expected_size = static_cast<size_t>(current_capacity) * 4;
+        const std::vector<uint8_t> serialized_free_nodes = zstd_decompress(
+            reinterpret_cast<const uint8_t *>(free_nodes_bin.via.bin.ptr),
+            free_nodes_bin.via.bin.size, expected_size);
         if (serialized_free_nodes.size() != expected_size) {
             return tl::unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
@@ -282,11 +290,9 @@ Serializer<offset_allocator::__Allocator>::deserialize(
 
         // Deserialize freeNodes array in standardized format
         free_nodes.resize(current_capacity);
-        size_t offset = 0;
         for (uint32_t i = 0; i < current_capacity; i++) {
             free_nodes[i] = SerializationHelper::deserializeUint32(
-                &serialized_free_nodes[offset]);
-            offset += 4;
+                &serialized_free_nodes[static_cast<size_t>(i) * 4]);
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
@@ -296,252 +302,65 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                         e.what())));
     }
 
-    // Capacities and payload sizes are consistent, so materializing
-    // max_capacity nodes is bounded and every copy below stays in range.
-    auto allocator = std::make_unique<offset_allocator::__Allocator>(
-        size, current_capacity, max_capacity);
-    allocator->m_freeStorage = free_storage;
-    allocator->m_usedBinsTop = used_bins_top;
-    for (uint32_t i = 0; i < offset_allocator::NUM_TOP_BINS; i++) {
-        allocator->m_usedBins[i] = used_bins[i];
-    }
-    for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
-        allocator->m_binIndices[i] = bin_indices[i];
-    }
+    // Capacities and payload sizes are consistent: both the reservation and
+    // populated node storage are bounded, and every copy stays in range.
+    try {
+        auto allocator = std::make_unique<offset_allocator::__Allocator>(
+            size, current_capacity, max_capacity);
+        allocator->m_freeStorage = free_storage;
+        allocator->m_usedBinsTop = used_bins_top;
+        allocator->m_freeOffset = free_offset;
+        for (uint32_t i = 0; i < offset_allocator::NUM_TOP_BINS; i++) {
+            allocator->m_usedBins[i] = used_bins[i];
+        }
+        for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
+            allocator->m_binIndices[i] = bin_indices[i];
+        }
 
-    // Deserialize nodes array in standardized format
-    size_t offset = 0;
-    for (uint32_t i = 0; i < current_capacity; i++) {
-        // Deserialize bool field
-        allocator->m_nodes[i].used = (serialized_nodes[offset++] != 0);
+        // Deserialize nodes array in standardized format
+        size_t offset = 0;
+        for (uint32_t i = 0; i < current_capacity; i++) {
+            // Deserialize bool field
+            allocator->m_nodes[i].used = (serialized_nodes[offset++] != 0);
 
-        // Deserialize uint32_t fields
-        allocator->m_nodes[i].dataOffset =
-            SerializationHelper::deserializeUint32(&serialized_nodes[offset]);
-        offset += 4;
-        allocator->m_nodes[i].dataSize =
-            SerializationHelper::deserializeUint32(&serialized_nodes[offset]);
-        offset += 4;
-        allocator->m_nodes[i].binListPrev =
-            SerializationHelper::deserializeUint32(&serialized_nodes[offset]);
-        offset += 4;
-        allocator->m_nodes[i].binListNext =
-            SerializationHelper::deserializeUint32(&serialized_nodes[offset]);
-        offset += 4;
-        allocator->m_nodes[i].neighborPrev =
-            SerializationHelper::deserializeUint32(&serialized_nodes[offset]);
-        offset += 4;
-        allocator->m_nodes[i].neighborNext =
-            SerializationHelper::deserializeUint32(&serialized_nodes[offset]);
-        offset += 4;
-    }
-    for (uint32_t i = 0; i < current_capacity; i++) {
-        allocator->m_freeNodes[i] = free_nodes[i];
-    }
+            // Deserialize uint32_t fields
+            allocator->m_nodes[i].dataOffset =
+                SerializationHelper::deserializeUint32(
+                    &serialized_nodes[offset]);
+            offset += 4;
+            allocator->m_nodes[i].dataSize =
+                SerializationHelper::deserializeUint32(
+                    &serialized_nodes[offset]);
+            offset += 4;
+            allocator->m_nodes[i].binListPrev =
+                SerializationHelper::deserializeUint32(
+                    &serialized_nodes[offset]);
+            offset += 4;
+            allocator->m_nodes[i].binListNext =
+                SerializationHelper::deserializeUint32(
+                    &serialized_nodes[offset]);
+            offset += 4;
+            allocator->m_nodes[i].neighborPrev =
+                SerializationHelper::deserializeUint32(
+                    &serialized_nodes[offset]);
+            offset += 4;
+            allocator->m_nodes[i].neighborNext =
+                SerializationHelper::deserializeUint32(
+                    &serialized_nodes[offset]);
+            offset += 4;
+        }
+        for (uint32_t i = 0; i < current_capacity; i++) {
+            allocator->m_freeNodes[i] = free_nodes[i];
+        }
 
-    // Deserialize freeOffset
-    const uint32_t free_offset = array_items[index++].as<uint32_t>();
-    if (free_offset > current_capacity) {
+        return allocator;
+    } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize offset_allocator::__Allocator freeOffset "
-                        "{} is out of range for capacity {}",
-                        free_offset, current_capacity)));
+            fmt::format("deserialize offset_allocator::__Allocator error "
+                        "constructing layout: {}",
+                        e.what())));
     }
-    allocator->m_freeOffset = free_offset;
-
-    return allocator;
-}
-
-// Mirrors __Allocator's small-float bin encoding
-// (SmallFloat::uintToFloatRoundDown in offset_allocator.cpp). The vendored
-// mapping is not exposed through its header, and a persisted layout must be
-// checked against the same size class the live allocator derives when it
-// inserts or removes a bin node, so the few lines are duplicated here on
-// purpose.
-static uint32_t allocatorBinForUnits(uint32_t size) {
-    constexpr uint32_t kMantissaBits = 3;
-    constexpr uint32_t kMantissaValue = 1u << kMantissaBits;
-    constexpr uint32_t kMantissaMask = kMantissaValue - 1;
-    if (size < kMantissaValue) {
-        return size;
-    }
-    const uint32_t highest_set_bit =
-        static_cast<uint32_t>(std::bit_width(size)) - 1;
-    const uint32_t mantissa_start_bit = highest_set_bit - kMantissaBits;
-    const uint32_t exponent = mantissa_start_bit + 1;
-    return (exponent << kMantissaBits) |
-           ((size >> mantissa_start_bit) & kMantissaMask);
-}
-
-std::optional<Serializer<offset_allocator::__Allocator>::LayoutUsage>
-Serializer<offset_allocator::__Allocator>::ValidateLayout(
-    const offset_allocator::__Allocator &allocator, uint64_t multiplier_bits) {
-    const uint32_t capacity = allocator.m_current_capacity;
-    if (allocator.m_size == 0 || capacity == 0 ||
-        capacity > allocator.m_max_capacity ||
-        allocator.m_nodes.size() < capacity ||
-        allocator.m_freeNodes.size() < capacity ||
-        allocator.m_freeOffset > capacity) {
-        return std::nullopt;
-    }
-
-    std::vector<NodeState> state(capacity, NodeState::kUnclassified);
-    uint64_t used_nodes = 0;
-    uint64_t used_bytes = 0;
-    for (uint32_t i = 0; i < capacity; ++i) {
-        if (!allocator.m_nodes[i].used) {
-            continue;
-        }
-        state[i] = NodeState::kUsed;
-        ++used_nodes;
-        used_bytes += static_cast<uint64_t>(allocator.m_nodes[i].dataSize)
-                      << multiplier_bits;
-    }
-
-    const auto bin_nodes = ValidateBins(allocator, state);
-    if (!bin_nodes) {
-        return std::nullopt;
-    }
-    const uint32_t live_nodes = static_cast<uint32_t>(used_nodes) + *bin_nodes;
-    if (!ValidateFreeStack(allocator, state, live_nodes) ||
-        !ValidateNeighborChain(allocator, state, live_nodes)) {
-        return std::nullopt;
-    }
-    return LayoutUsage{used_bytes, used_nodes};
-}
-
-std::optional<uint32_t> Serializer<offset_allocator::__Allocator>::ValidateBins(
-    const offset_allocator::__Allocator &allocator,
-    std::vector<NodeState> &state) {
-    const uint32_t capacity = allocator.m_current_capacity;
-    // Bin lists must be acyclic, hold only free nodes of their own size class,
-    // and be linked consistently in both directions.
-    uint8_t expected_used_bins[offset_allocator::NUM_TOP_BINS] = {};
-    uint32_t expected_used_bins_top = 0;
-    uint32_t bin_nodes = 0;
-    uint32_t free_storage = 0;
-    for (uint32_t bin = 0; bin < offset_allocator::NUM_LEAF_BINS; ++bin) {
-        uint32_t node_index = allocator.m_binIndices[bin];
-        if (node_index == offset_allocator::__Allocator::Node::unused) {
-            continue;
-        }
-        const uint32_t top_bin = bin >> offset_allocator::TOP_BINS_INDEX_SHIFT;
-        expected_used_bins[top_bin] |=
-            uint8_t{1} << (bin & offset_allocator::LEAF_BINS_INDEX_MASK);
-        expected_used_bins_top |= uint32_t{1} << top_bin;
-        uint32_t previous = offset_allocator::__Allocator::Node::unused;
-        while (node_index != offset_allocator::__Allocator::Node::unused) {
-            if (node_index >= capacity ||
-                state[node_index] != NodeState::kUnclassified) {
-                return std::nullopt;
-            }
-            const auto &node = allocator.m_nodes[node_index];
-            if (node.used || allocatorBinForUnits(node.dataSize) != bin ||
-                node.binListPrev != previous ||
-                free_storage >
-                    std::numeric_limits<uint32_t>::max() - node.dataSize) {
-                return std::nullopt;
-            }
-            state[node_index] = NodeState::kFree;
-            ++bin_nodes;
-            free_storage += node.dataSize;
-            previous = node_index;
-            node_index = node.binListNext;
-        }
-    }
-    if (allocator.m_freeStorage != free_storage ||
-        allocator.m_usedBinsTop != expected_used_bins_top) {
-        return std::nullopt;
-    }
-    for (uint32_t top = 0; top < offset_allocator::NUM_TOP_BINS; ++top) {
-        if (allocator.m_usedBins[top] != expected_used_bins[top]) {
-            return std::nullopt;
-        }
-    }
-
-    return bin_nodes;
-}
-
-bool Serializer<offset_allocator::__Allocator>::ValidateFreeStack(
-    const offset_allocator::__Allocator &allocator,
-    std::vector<NodeState> &state, uint32_t live_nodes) {
-    const uint32_t capacity = allocator.m_current_capacity;
-    // The free stack holds exactly the nodes that are neither used nor in a
-    // bin, and its position matches the used/bin accounting.
-    for (uint32_t i = allocator.m_freeOffset; i < capacity; ++i) {
-        const uint32_t node_index = allocator.m_freeNodes[i];
-        if (node_index >= capacity ||
-            state[node_index] != NodeState::kUnclassified) {
-            return false;
-        }
-        state[node_index] = NodeState::kSpare;
-    }
-    if (allocator.m_freeOffset != live_nodes) {
-        return false;
-    }
-    for (uint32_t i = 0; i < capacity; ++i) {
-        if (state[i] == NodeState::kUnclassified) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool Serializer<offset_allocator::__Allocator>::ValidateNeighborChain(
-    const offset_allocator::__Allocator &allocator,
-    const std::vector<NodeState> &state, uint32_t live_nodes) {
-    const uint32_t capacity = allocator.m_current_capacity;
-    // Live nodes form one neighbor chain ordered by offset that covers
-    // [0, m_size) exactly once.
-    const auto is_live = [&state](uint32_t node_index) {
-        return state[node_index] == NodeState::kUsed ||
-               state[node_index] == NodeState::kFree;
-    };
-    constexpr uint32_t kUnused = offset_allocator::__Allocator::Node::unused;
-    uint32_t head = kUnused;
-    for (uint32_t i = 0; i < capacity; ++i) {
-        if (!is_live(i) || allocator.m_nodes[i].neighborPrev != kUnused) {
-            continue;
-        }
-        if (head != kUnused) {
-            return false;
-        }
-        head = i;
-    }
-    std::vector<uint8_t> walked(capacity, 0);
-    uint32_t chain_nodes = 0;
-    uint32_t offset = 0;
-    for (uint32_t node_index = head; node_index != kUnused;
-         node_index = allocator.m_nodes[node_index].neighborNext) {
-        if (node_index >= capacity || !is_live(node_index) ||
-            walked[node_index]) {
-            return false;
-        }
-        walked[node_index] = 1;
-        const auto &node = allocator.m_nodes[node_index];
-        if (node.dataOffset != offset || node.dataSize == 0 ||
-            node.dataSize > allocator.m_size - offset) {
-            return false;
-        }
-        offset += node.dataSize;
-        ++chain_nodes;
-        if (node.neighborNext != kUnused) {
-            const uint32_t next = node.neighborNext;
-            if (next >= capacity || !is_live(next) ||
-                allocator.m_nodes[next].neighborPrev != node_index) {
-                return false;
-            }
-        }
-        if (node.neighborPrev != kUnused) {
-            const uint32_t previous = node.neighborPrev;
-            if (previous >= capacity || !is_live(previous) ||
-                allocator.m_nodes[previous].neighborNext != node_index) {
-                return false;
-            }
-        }
-    }
-    return offset == allocator.m_size && chain_nodes == live_nodes;
 }
 
 // serialize_msgpack
@@ -594,55 +413,53 @@ auto Serializer<offset_allocator::OffsetAllocator>::deserialize(
     auto *array_items = obj.via.array.ptr;
     size_t index = 0;
 
-    // Deserialize basic properties
-    uint64_t base = array_items[index++].as<uint64_t>();
-    uint64_t multiplier_bits = array_items[index++].as<uint64_t>();
-    uint64_t capacity = array_items[index++].as<uint64_t>();
+    try {
+        // Deserialize basic properties
+        uint64_t base = array_items[index++].as<uint64_t>();
+        uint64_t multiplier_bits = array_items[index++].as<uint64_t>();
+        uint64_t capacity = array_items[index++].as<uint64_t>();
 
-    uint64_t allocated_size = array_items[index++].as<uint64_t>();
-    uint64_t allocated_num = array_items[index++].as<uint64_t>();
+        uint64_t allocated_size = array_items[index++].as<uint64_t>();
+        uint64_t allocated_num = array_items[index++].as<uint64_t>();
 
-    // Deserialize __Allocator
-    auto allocator_result =
-        Serializer<offset_allocator::__Allocator>::deserialize(
-            array_items[index++]);
-    if (!allocator_result) {
-        return tl::unexpected(allocator_result.error());
+        // Deserialize __Allocator
+        auto allocator_result =
+            Serializer<offset_allocator::__Allocator>::deserialize(
+                array_items[index++]);
+        if (!allocator_result) {
+            return tl::unexpected(allocator_result.error());
+        }
+
+        // Install through the same factory that snapshot restore uses: it runs
+        // the full layout validation exactly once and returns the detailed
+        // reason.
+        offset_allocator::OffsetAllocatorSnapshot snapshot{
+            .base = base,
+            .multiplier_bits = multiplier_bits,
+            .capacity = capacity,
+            .allocated_size = allocated_size,
+            .allocated_num = allocated_num,
+            .layout = std::move(allocator_result.value()),
+        };
+        auto offset_allocator =
+            offset_allocator::OffsetAllocator::Restore(std::move(snapshot));
+        if (!offset_allocator) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format(
+                    "deserialize offset_allocator::OffsetAllocator rejected "
+                    "its state: {}",
+                    offset_allocator.error())));
+        }
+
+        return *offset_allocator;
+    } catch (const std::exception &e) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            fmt::format(
+                "deserialize offset_allocator::OffsetAllocator failed: {}",
+                e.what())));
     }
-
-    // The persisted counters must describe the persisted layout before it is
-    // installed, the same gate OffsetBufferAllocator::Restore applies.
-    const auto usage =
-        Serializer<offset_allocator::__Allocator>::ValidateLayout(
-            *allocator_result.value(), multiplier_bits);
-    if (!usage || usage->used_nodes != allocated_num ||
-        usage->used_bytes < allocated_size) {
-        return tl::unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "deserialize offset_allocator::OffsetAllocator "
-                               "rejected its state"));
-    }
-
-    // Install through the same factory that snapshot restore uses, so the
-    // capacity relationship is re-checked as well.
-    offset_allocator::OffsetAllocatorSnapshot snapshot{
-        .base = base,
-        .multiplier_bits = multiplier_bits,
-        .capacity = capacity,
-        .allocated_size = allocated_size,
-        .allocated_num = allocated_num,
-        .layout = std::move(allocator_result.value()),
-    };
-    auto offset_allocator =
-        offset_allocator::OffsetAllocator::Restore(std::move(snapshot));
-    if (!offset_allocator) {
-        return tl::unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "deserialize offset_allocator::OffsetAllocator "
-                               "rejected its state"));
-    }
-
-    return *offset_allocator;
 }
 
 tl::expected<void, SerializationError>

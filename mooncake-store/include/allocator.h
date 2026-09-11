@@ -303,6 +303,15 @@ struct OffsetBufferAllocatorSnapshot {
     size_t used_bytes;
     std::string transport_endpoint;
     offset_allocator::OffsetAllocatorSnapshot allocation_state;
+
+    // Validate the detached snapshot without publishing resources or metrics.
+    [[nodiscard]] tl::expected<void, std::string> Validate() const;
+
+   private:
+    tl::expected<void, std::string> ValidateMetadata() const;
+    // Restore composes this cheap outer check with OffsetAllocator::Restore's
+    // mandatory layout validation, avoiding two graph scans in one factory.
+    friend class OffsetBufferAllocator;
 };
 
 /**

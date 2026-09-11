@@ -3,7 +3,6 @@
 #include <fmt/format.h>
 
 #include <exception>
-#include <limits>
 
 namespace mooncake::ha {
 
@@ -44,17 +43,8 @@ AllocatorSnapshotCodec::Decode(const msgpack::object& object) {
         std::string segment_name = array[0].as<std::string>();
         auto base = static_cast<size_t>(array[1].as<uint64_t>());
         auto total_size = static_cast<size_t>(array[2].as<uint64_t>());
-        auto current_size = static_cast<size_t>(array[3].as<uint64_t>());
+        auto used_bytes = static_cast<size_t>(array[3].as<uint64_t>());
         std::string transport_endpoint = array[4].as<std::string>();
-        // Usage is restored into signed metrics and must describe bytes within
-        // this allocator, not wrap the gauge or exceed its capacity.
-        if (current_size > total_size ||
-            current_size >
-                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "snapshot OffsetBufferAllocator has invalid usage"));
-        }
 
         if (array[5].type != msgpack::type::ARRAY ||
             array[5].via.array.size != 6) {
@@ -68,22 +58,34 @@ AllocatorSnapshotCodec::Decode(const msgpack::object& object) {
         if (!layout) {
             return tl::make_unexpected(layout.error());
         }
-        offset_allocator::OffsetAllocatorSnapshot allocation_state{
-            state[0].as<uint64_t>(), state[1].as<uint64_t>(),
-            state[2].as<uint64_t>(), state[3].as<uint64_t>(),
-            state[4].as<uint64_t>(), std::move(*layout)};
-        if (allocation_state.base != base ||
-            allocation_state.capacity != total_size) {
+
+        OffsetBufferAllocatorSnapshot snapshot{
+            .segment_name = std::move(segment_name),
+            .base = base,
+            .capacity = total_size,
+            .used_bytes = used_bytes,
+            .transport_endpoint = std::move(transport_endpoint),
+            .allocation_state =
+                offset_allocator::OffsetAllocatorSnapshot{
+                    .base = state[0].as<uint64_t>(),
+                    .multiplier_bits = state[1].as<uint64_t>(),
+                    .capacity = state[2].as<uint64_t>(),
+                    .allocated_size = state[3].as<uint64_t>(),
+                    .allocated_num = state[4].as<uint64_t>(),
+                    .layout = std::move(*layout),
+                },
+        };
+        // The snapshot owns both the outer metadata and the inner layout, so
+        // one validation pass covers the bounds/base/usage consistency and the
+        // allocator topology. Decode propagates diagnostics to its caller;
+        // direct restore factories also log validation failures.
+        if (auto valid = snapshot.Validate(); !valid) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
-                "snapshot allocator bounds are inconsistent"));
+                fmt::format("snapshot OffsetBufferAllocator {}",
+                            valid.error())));
         }
-        return OffsetBufferAllocatorSnapshot{std::move(segment_name),
-                                             base,
-                                             total_size,
-                                             current_size,
-                                             std::move(transport_endpoint),
-                                             std::move(allocation_state)};
+        return snapshot;
     } catch (const std::exception& error) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,

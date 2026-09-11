@@ -10,7 +10,6 @@
 #include <stdexcept>
 
 #include "master_metric_manager.h"
-#include "serialize/serializer.h"
 
 namespace mooncake {
 namespace {
@@ -370,7 +369,9 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         max_capacity =
             std::max(max_capacity, static_cast<uint64_t>(1024 * 1024));
         max_capacity =
-            std::min(max_capacity, static_cast<uint64_t>(64 * 1024 * 1024));
+            std::min(max_capacity,
+                     static_cast<uint64_t>(
+                         offset_allocator::OffsetAllocatorSnapshot::kMaxNodes));
         // Create the offset allocator
         offset_allocator_ = offset_allocator::OffsetAllocator::create(
             base, size, static_cast<uint32_t>(init_capacity),
@@ -398,29 +399,46 @@ OffsetBufferAllocator::OffsetBufferAllocator(
       replica_type_(ReplicaType::MEMORY),
       offset_allocator_(std::move(offset_allocator)) {}
 
+tl::expected<void, std::string>
+OffsetBufferAllocatorSnapshot::ValidateMetadata() const {
+    if (allocation_state.base != base ||
+        allocation_state.capacity != capacity) {
+        return tl::make_unexpected(fmt::format(
+            "allocator bounds mismatch: outer base={}, capacity={}; inner "
+            "base={}, capacity={}",
+            base, capacity, allocation_state.base, allocation_state.capacity));
+    }
+    if (used_bytes > capacity ||
+        used_bytes >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return tl::make_unexpected(
+            fmt::format("invalid usage {} for capacity {} or signed metrics",
+                        used_bytes, capacity));
+    }
+    if (used_bytes != allocation_state.allocated_size) {
+        return tl::make_unexpected(
+            fmt::format("used_bytes {} does not match allocated_size {}",
+                        used_bytes, allocation_state.allocated_size));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> OffsetBufferAllocatorSnapshot::Validate()
+    const {
+    if (auto valid = ValidateMetadata(); !valid) return valid;
+    return allocation_state.Validate();
+}
+
 tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
 OffsetBufferAllocator::Restore(OffsetBufferAllocatorSnapshot snapshot) {
     const auto used_bytes = snapshot.used_bytes;
-    const auto& state = snapshot.allocation_state;
-    if (!state.layout || state.base != snapshot.base ||
-        state.capacity != snapshot.capacity || used_bytes > snapshot.capacity ||
-        used_bytes >
-            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+    if (auto valid = snapshot.ValidateMetadata(); !valid) {
+        LOG(ERROR) << "OffsetBufferAllocator::Restore rejected snapshot for "
+                   << snapshot.segment_name << ": " << valid.error();
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-
-    // The persisted counters must describe the persisted layout: one used node
-    // per live allocation, and no more requested bytes than the occupied
-    // regions can hold (a node is rounded up to its bin size). Checked before
-    // the layout is installed, so a corrupt snapshot cannot reach allocate().
-    const auto usage =
-        Serializer<offset_allocator::__Allocator>::ValidateLayout(
-            *state.layout, state.multiplier_bits);
-    if (!usage || usage->used_nodes != state.allocated_num ||
-        usage->used_bytes < state.allocated_size) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
+    // The inner factory validates its complete snapshot and logs the specific
+    // failure before constructing an allocator. No metrics are published yet.
     auto offset_allocator = offset_allocator::OffsetAllocator::Restore(
         std::move(snapshot.allocation_state));
     if (!offset_allocator) {

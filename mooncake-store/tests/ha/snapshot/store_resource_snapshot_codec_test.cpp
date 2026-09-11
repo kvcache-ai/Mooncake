@@ -19,6 +19,7 @@
 #include "segment/pool_read_access.h"
 #include "segment/pool_write_access.h"
 #include "segment/snapshot.h"
+#include "serialize/serializer.h"
 
 namespace mooncake::ha {
 namespace {
@@ -482,18 +483,22 @@ TEST(StoreResourceSnapshotCodecTest,
          }},
         {"usage exceeds capacity",
          [](auto& root, auto&) {
-             SnapshotField(root, "ms")
-                 .via.map.ptr[1]
-                 .val.via.array.ptr[7]
-                 .via.array.ptr[3] = msgpack::object(uint64_t{kRegionSize + 1});
+             // Mirror the new usage onto the inner allocated_size so the
+             // outer/inner consistency check passes and the bound itself is
+             // exercised.
+             auto& allocator =
+                 SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[7];
+             auto usage = msgpack::object(uint64_t{kRegionSize + 1});
+             allocator.via.array.ptr[3] = usage;
+             allocator.via.array.ptr[5].via.array.ptr[3] = usage;
          }},
         {"usage overflows metrics",
          [](auto& root, auto&) {
              auto& allocator =
                  SnapshotField(root, "ms").via.map.ptr[1].val.via.array.ptr[7];
-             allocator.via.array.ptr[2] =
-                 msgpack::object(std::numeric_limits<uint64_t>::max());
-             allocator.via.array.ptr[3] = allocator.via.array.ptr[2];
+             auto usage = msgpack::object(std::numeric_limits<uint64_t>::max());
+             allocator.via.array.ptr[3] = usage;
+             allocator.via.array.ptr[5].via.array.ptr[3] = usage;
          }},
         {"second adoption fails",
          [&](auto& root, auto& zone) {
@@ -537,8 +542,10 @@ TEST(StoreResourceSnapshotCodecTest,
             EXPECT_EQ(result.error().message, "restore SegmentPool failed");
         } else if (name == "usage exceeds capacity" ||
                    name == "usage overflows metrics") {
-            EXPECT_EQ(result.error().message,
-                      "snapshot OffsetBufferAllocator has invalid usage");
+            // Decode propagates the detailed reason from the snapshot.
+            EXPECT_NE(result.error().message.find("invalid usage"),
+                      std::string::npos)
+                << result.error().message;
         }
 
         EXPECT_EQ(pool.AcquireReadAccess().Catalog().Regions().size(), 2U);
@@ -603,12 +610,13 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorCapacityIsRejected) {
     auto encoded = CaptureAndEncode(pool, {});
     ASSERT_TRUE(encoded.has_value());
 
-    // Element 1 of the __Allocator payload is current_capacity and element 2
-    // is max_capacity.
+    // Element 1 of the __Allocator payload is current_capacity, element 2 is
+    // max_capacity and element 9 is freeOffset.
     const std::vector<std::pair<uint64_t, uint64_t>> corruptions{
-        {2, (uint64_t{1} << 24) + 1},
+        {2, uint64_t{offset_allocator::OffsetAllocatorSnapshot::kMaxNodes} + 1},
         {2, std::numeric_limits<uint32_t>::max()},
         {1, std::numeric_limits<uint32_t>::max()},
+        {9, std::numeric_limits<uint32_t>::max()},
     };
     for (const auto& [element, value] : corruptions) {
         SCOPED_TRACE(element);
@@ -627,6 +635,247 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorCapacityIsRejected) {
         EXPECT_NE(decoded.error().message.find("capacity"), std::string::npos);
         EXPECT_NE(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
     }
+}
+
+// A detached snapshot of a multi-gigabyte segment is pure metadata: encoding,
+// decoding and restoring it must never mount or touch the described memory.
+TEST(StoreResourceSnapshotCodecTest,
+     LargeSegmentSnapshotRoundTripsWithoutPhysicalMemory) {
+    constexpr uint64_t kLargeBase = 0x200000000ULL;
+    constexpr size_t kLargeCapacity = 64ULL * 1024 * 1024 * 1024;
+    constexpr size_t kAllocation = 4096;
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline_used = metrics.get_allocated_mem_size();
+    const auto baseline_capacity = metrics.get_total_mem_capacity();
+
+    // Two live metadata nodes describe the whole 64GiB region: one 4KiB
+    // allocation and the free remainder. Use the real host-memory node ceiling
+    // (64Mi), not a small test ceiling: the former 16Mi limit must fail this
+    // round trip. reserve() is lazy; nothing is mapped at kLargeBase.
+    auto source = offset_allocator::OffsetAllocator::create(
+        kLargeBase, kLargeCapacity, /*init_capacity=*/2,
+        offset_allocator::OffsetAllocatorSnapshot::kMaxNodes);
+    ASSERT_NE(source, nullptr);
+    auto allocation = source->allocate(kAllocation);
+    ASSERT_TRUE(allocation.has_value());
+
+    auto segment = MakeSegment(3, "detached-large");
+    segment.base = kLargeBase;
+    segment.size = kLargeCapacity;
+    MountedRegion mounted;
+    mounted.segment = segment;
+    mounted.client_id = generate_uuid();
+    mounted.status = SegmentStatus::OK;
+
+    SegmentPoolSnapshot snapshot;
+    snapshot.active_names = {segment.name};
+    snapshot.regions.push_back(RegionSnapshot{
+        .mounted = mounted,
+        .allocator =
+            OffsetBufferAllocatorSnapshot{
+                .segment_name = segment.name,
+                .base = kLargeBase,
+                .capacity = kLargeCapacity,
+                .used_bytes = kAllocation,
+                .transport_endpoint = segment.te_endpoint,
+                .allocation_state = source->CaptureSnapshot(),
+            },
+    });
+    auto valid = snapshot.regions.front().allocator.Validate();
+    ASSERT_TRUE(valid.has_value()) << valid.error();
+
+    auto encoded = StoreResourceSnapshotCodec::Encode(snapshot, {});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    auto decoded = StoreResourceSnapshotCodec::Decode(*encoded);
+    ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
+    ASSERT_EQ(decoded->segment_pool.regions.size(), 1U);
+    auto& state = decoded->segment_pool.regions.front().allocator;
+    EXPECT_EQ(state.capacity, kLargeCapacity);
+    EXPECT_EQ(state.used_bytes, kAllocation);
+    EXPECT_EQ(state.allocation_state.allocated_num, 1U);
+
+    auto restored = OffsetBufferAllocator::Restore(std::move(state));
+    ASSERT_TRUE(restored.has_value());
+    auto allocator = std::move(*restored);
+    EXPECT_EQ(allocator->capacity(), kLargeCapacity);
+    EXPECT_EQ(allocator->size(), kAllocation);
+    EXPECT_EQ(allocator->base(), kLargeBase);
+    EXPECT_EQ(allocator->getSegmentName(), segment.name);
+    // The free remainder kept its size and unit multiplier across the round
+    // trip, which is only possible if the persisted nodes were restored.
+    EXPECT_EQ(allocator->getLargestFreeRegion(),
+              source->storageReport().largestFreeRegion);
+
+    allocator.reset();
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), baseline_capacity);
+}
+
+// A node payload whose zstd frame header declares far more than the expected
+// node bytes must be rejected before the decompression buffer is allocated.
+TEST(StoreResourceSnapshotCodecTest,
+     OversizedNodeFrameIsRejectedBeforeAllocation) {
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-frame-header");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    // Minimal zstd frame header: magic, a descriptor selecting the 8-byte
+    // Frame_Content_Size field in single-segment mode, then 1TiB. No content
+    // follows, so only the declared size can be examined.
+    constexpr uint64_t kDeclaredBytes = 1ULL << 40;
+    std::vector<uint8_t> frame{0x28, 0xB5, 0x2F, 0xFD, 0xE0};
+    for (uint32_t shift = 0; shift < 64; shift += 8) {
+        frame.push_back(static_cast<uint8_t>(kDeclaredBytes >> shift));
+    }
+
+    // Element 7 of the __Allocator payload is the node data and element 8 the
+    // free-node data.
+    for (const uint32_t element : {7U, 8U}) {
+        SCOPED_TRACE(element);
+        auto corrupted = RewriteSnapshot(*encoded, [&](auto& root, auto& zone) {
+            // region[7] = OffsetBufferAllocator, [5] = OffsetAllocator, [5] =
+            // __Allocator.
+            auto& layout = SnapshotField(root, "ms")
+                               .via.map.ptr[0]
+                               .val.via.array.ptr[7]
+                               .via.array.ptr[5]
+                               .via.array.ptr[5];
+            layout.via.array.ptr[element] = msgpack::object(
+                msgpack::type::raw_ref(
+                    reinterpret_cast<const char*>(frame.data()), frame.size()),
+                zone);
+        });
+        auto decoded = StoreResourceSnapshotCodec::Decode(corrupted);
+        ASSERT_FALSE(decoded.has_value());
+        EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
+        EXPECT_NE(decoded.error().message.find("exceeds maximum allowed"),
+                  std::string::npos)
+            << decoded.error().message;
+    }
+}
+
+// The inner allocator counters and unit multiplier must describe the inner
+// layout, and Decode reports the specific mismatch instead of a generic
+// rejection.
+TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorInternalsAreRejected) {
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-internals");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto buffer = allocator->allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+    const auto baseline_used =
+        MasterMetricManager::instance().get_allocated_mem_size();
+
+    struct Corruption {
+        const char* name;
+        // OffsetAllocator element: 1 = multiplier_bits, 3 = allocated_size,
+        // 4 = allocated_num.
+        uint32_t element;
+        uint64_t value;
+        const char* reason;
+        // allocate() records the requested bytes in the outer usage too, so an
+        // altered allocated_size has to be mirrored to reach the inner check.
+        bool mirror_usage;
+    };
+    const std::vector<Corruption> corruptions{
+        {"allocated_size smaller than the used nodes", 3, 0, "allocated_size",
+         true},
+        {"allocated_num mismatch", 4, 0, "allocated_num", false},
+        {"multiplier_bits beyond the shift range", 1, 64, "multiplier_bits",
+         false},
+    };
+    for (const auto& corruption : corruptions) {
+        SCOPED_TRACE(corruption.name);
+        auto corrupted = RewriteSnapshot(*encoded, [&](auto& root, auto&) {
+            // region[7] = OffsetBufferAllocator, [5] = OffsetAllocator; element
+            // 3 of the OffsetBufferAllocator is the outer used_bytes.
+            auto& allocator_field =
+                SnapshotField(root, "ms").via.map.ptr[0].val.via.array.ptr[7];
+            auto& state = allocator_field.via.array.ptr[5];
+            state.via.array.ptr[corruption.element] =
+                msgpack::object(corruption.value);
+            if (corruption.mirror_usage) {
+                allocator_field.via.array.ptr[3] =
+                    msgpack::object(corruption.value);
+            }
+        });
+        auto decoded = StoreResourceSnapshotCodec::Decode(corrupted);
+        ASSERT_FALSE(decoded.has_value());
+        EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
+        EXPECT_NE(decoded.error().message.find(corruption.reason),
+                  std::string::npos)
+            << decoded.error().message;
+    }
+
+    // Decoding is pure: the published allocator and the metrics are unchanged.
+    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
+              baseline_used);
+}
+
+// The OffsetAllocator wire deserializer installs through the snapshot factory,
+// so a rejected snapshot reports the specific reason instead of a generic
+// rejection.
+TEST(StoreResourceSnapshotCodecTest,
+     LegacyAllocatorDeserializeReportsDetailedReason) {
+    SegmentPool pool(Drivers());
+    const auto segment = MakeSegment(0, "snapshot-legacy-reason");
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+              ErrorCode::OK);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto buffer = allocator->allocate(4096);
+    ASSERT_NE(buffer, nullptr);
+    auto encoded = CaptureAndEncode(pool, {});
+    ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
+
+    auto corrupted = RewriteSnapshot(*encoded, [](auto& root, auto&) {
+        // Element 4 of the OffsetAllocator array is allocated_num; it cannot
+        // exceed the single used node.
+        auto& state = SnapshotField(root, "ms")
+                          .via.map.ptr[0]
+                          .val.via.array.ptr[7]
+                          .via.array.ptr[5];
+        state.via.array.ptr[4] = msgpack::object(uint64_t{2});
+    });
+    const auto bytes = zstd_decompress(corrupted);
+    auto unpacked = msgpack::unpack(reinterpret_cast<const char*>(bytes.data()),
+                                    bytes.size());
+    auto root = unpacked.get();
+    auto& offset_allocator_object = SnapshotField(root, "ms")
+                                        .via.map.ptr[0]
+                                        .val.via.array.ptr[7]
+                                        .via.array.ptr[5];
+    auto decoded = Serializer<offset_allocator::OffsetAllocator>::deserialize(
+        offset_allocator_object);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
+    EXPECT_NE(decoded.error().message.find("allocated_num"), std::string::npos)
+        << decoded.error().message;
+
+    // Conversion failures must use the same expected-based error boundary,
+    // rather than leaking msgpack exceptions from the legacy entry point.
+    offset_allocator_object.via.array.ptr[4] = msgpack::object();
+    decoded = Serializer<offset_allocator::OffsetAllocator>::deserialize(
+        offset_allocator_object);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
+    EXPECT_NE(decoded.error().message.find("failed"), std::string::npos);
+
+    auto& layout = offset_allocator_object.via.array.ptr[5];
+    layout.via.array.ptr[9] = msgpack::object();
+    auto decoded_layout =
+        Serializer<offset_allocator::__Allocator>::deserialize(layout);
+    ASSERT_FALSE(decoded_layout.has_value());
+    EXPECT_EQ(decoded_layout.error().code, ErrorCode::DESERIALIZE_FAIL);
+    EXPECT_NE(decoded_layout.error().message.find("invalid scalar field"),
+              std::string::npos);
 }
 
 }  // namespace mooncake::ha

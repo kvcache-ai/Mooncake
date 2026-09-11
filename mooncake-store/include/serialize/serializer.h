@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <optional>
 #include <vector>
 
 #include <ylt/util/expected.hpp>
@@ -37,45 +36,14 @@ class Serializer<offset_allocator::__Allocator> {
    public:
     using PointerType = std::unique_ptr<offset_allocator::__Allocator>;
 
-    // What a serialized layout describes: the byte size of its occupied regions
-    // and how many allocations they hold. Node sizes are stored rounded up to
-    // their bin, so used_bytes is an upper bound for the requested byte count
-    // persisted next to the layout.
-    struct LayoutUsage {
-        uint64_t used_bytes;
-        uint64_t used_nodes;
-    };
-
+    // Layout validation lives with the snapshot so every restore path shares
+    // one checker (OffsetAllocatorSnapshot::Validate); this codec only bounds
+    // the scalar capacities before decompressing node payloads.
     static tl::expected<void, SerializationError> serialize(
         const offset_allocator::__Allocator &allocator, MsgpackPacker &packer);
 
     static tl::expected<PointerType, SerializationError> deserialize(
         const msgpack::object &obj);
-
-    // Verifies the invariants a persisted layout must satisfy before it is
-    // installed: in-range node indices, an exact used / free-region / spare
-    // partition, bin and free-stack bookkeeping, node geometry that covers
-    // [0, m_size) contiguously, and a matching m_freeStorage. Returns nullopt
-    // for an inconsistent layout. `multiplier_bits` is the unit shift of the
-    // layout and is only used to report the usage in bytes.
-    static std::optional<LayoutUsage> ValidateLayout(
-        const offset_allocator::__Allocator &allocator,
-        uint64_t multiplier_bits);
-
-   private:
-    enum class NodeState : uint8_t { kUnclassified, kUsed, kFree, kSpare };
-
-    // Each stage consumes the node classification from the previous stage.
-    // Keep these as members to use the serializer's access to allocator state.
-    static std::optional<uint32_t> ValidateBins(
-        const offset_allocator::__Allocator &allocator,
-        std::vector<NodeState> &state);
-    static bool ValidateFreeStack(
-        const offset_allocator::__Allocator &allocator,
-        std::vector<NodeState> &state, uint32_t live_nodes);
-    static bool ValidateNeighborChain(
-        const offset_allocator::__Allocator &allocator,
-        const std::vector<NodeState> &state, uint32_t live_nodes);
 };
 
 // Serializer specialization for OffsetAllocator

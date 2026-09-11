@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstring>
 #include <chrono>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -336,6 +337,67 @@ TEST_F(BufferAllocatorTest, OffsetRestoreFactoryRejectsInvalidState) {
         ASSERT_NE(buffer, nullptr);
         EXPECT_EQ((*restored)->size(), 4096U);
         EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4096);
+    }
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+}
+
+TEST_F(BufferAllocatorTest,
+       SnapshotValidationReportsErrorsWithoutPublishingUsage) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto baseline = metrics.get_allocated_mem_size();
+    constexpr size_t kBase = 0x100000000ULL;
+    constexpr size_t kCapacity = 16U << 20;
+    auto state =
+        offset_allocator::OffsetAllocator::create(kBase, kCapacity, 16, 32);
+    auto allocation = state->allocate(4097);
+    ASSERT_TRUE(allocation.has_value());
+    auto snapshot = [&] {
+        return OffsetBufferAllocatorSnapshot{
+            .segment_name = "validate-snapshot",
+            .base = kBase,
+            .capacity = kCapacity,
+            .used_bytes = 4097,
+            .transport_endpoint = "endpoint",
+            .allocation_state = state->CaptureSnapshot(),
+        };
+    };
+    struct Fault {
+        const char* diagnostic;
+        std::function<void(OffsetBufferAllocatorSnapshot&)> apply;
+    };
+    const std::vector<Fault> faults{
+        {"bounds", [](auto& s) { ++s.base; }},
+        {"bounds", [](auto& s) { ++s.capacity; }},
+        {"usage", [](auto& s) { s.used_bytes = s.capacity + 1; }},
+        {"used_bytes", [](auto& s) { s.used_bytes = 0; }},
+        {"layout", [](auto& s) { s.allocation_state.layout.reset(); }},
+        {"multiplier_bits",
+         [](auto& s) { s.allocation_state.multiplier_bits = 64; }},
+        {"allocated_num", [](auto& s) { ++s.allocation_state.allocated_num; }},
+        {"allocated_size",
+         [](auto& s) { s.used_bytes = s.allocation_state.allocated_size = 0; }},
+    };
+    for (const auto& fault : faults) {
+        SCOPED_TRACE(fault.diagnostic);
+        auto candidate = snapshot();
+        fault.apply(candidate);
+        const auto valid = candidate.Validate();
+        ASSERT_FALSE(valid.has_value());
+        EXPECT_NE(valid.error().find(fault.diagnostic), std::string::npos);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+        auto restored = OffsetBufferAllocator::Restore(std::move(candidate));
+        ASSERT_FALSE(restored.has_value());
+        EXPECT_EQ(restored.error(), ErrorCode::INVALID_PARAMS);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    }
+    auto clean = snapshot();
+    ASSERT_TRUE(clean.Validate().has_value());
+    EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
+    {
+        auto restored = OffsetBufferAllocator::Restore(std::move(clean));
+        ASSERT_TRUE(restored.has_value());
+        EXPECT_EQ((*restored)->size(), 4097U);
+        EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 4097);
     }
     EXPECT_EQ(metrics.get_allocated_mem_size(), baseline);
 }
