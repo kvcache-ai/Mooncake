@@ -185,7 +185,7 @@ inline Topology::MemType memTypeFromLocation(const std::string& location) {
     if (type == "cpu") return Topology::MEM_HOST;
     if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
     if (isAmdGpuLocationType(type)) return Topology::MEM_ROCM;
-    if (type == "ascend") return Topology::MEM_ASCEND;
+    if (type == "ascend" || type == "npu") return Topology::MEM_ASCEND;
     return Topology::MEM_UNKNOWN;
 }
 

@@ -349,6 +349,9 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#include "config.h"
+#endif
 
 #include <mutex>
 #include <utility>
@@ -488,6 +491,17 @@ int TransferEngine::init(const std::string& metadata_conn_string,
             if (!type.empty()) config->set("metadata_type", type);
             if (!servers.empty()) config->set("metadata_servers", servers);
         }
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+        if (globalConfig().ascend_agent_mode) {
+            config->set("transports/ascend_direct/agent_mode", true);
+        }
+        if (globalConfig().ascend_store_te_init) {
+            config->set("transports/ascend_direct/store_te_init", true);
+            if (globalConfig().ascend_use_fabric_mem) {
+                config->set("transports/ascend_direct/fabric_mem", true);
+            }
+        }
+#endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;
     }
@@ -527,6 +541,12 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
 
 std::string TransferEngine::getLocalIpAndPort() {
     if (use_tent_) {
+        // Store handshake and openSegment must use the advertised segment
+        // name, not a reconstructed host:port that can disagree with it.
+        auto name = impl_tent_->getSegmentName();
+        if (!name.empty()) {
+            return name;
+        }
         return impl_tent_->getRpcServerAddress() + ":" +
                std::to_string(impl_tent_->getRpcServerPort());
     } else
