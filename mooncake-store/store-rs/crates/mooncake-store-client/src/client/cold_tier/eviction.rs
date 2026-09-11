@@ -3,7 +3,9 @@ use super::super::{
     DebugEvictAllResult, ObjectRoute, OperationTracker, PendingOffloadPrepareOutcome,
     RestorePromotionQueue, Result, RouteState, SegmentName, StorageOwnerState,
 };
-use super::{local_hot_replica_checksum, read_local_hot_replica_payload};
+use super::{
+    local_hot_replica_checksum, pending_persistent_backing, read_local_hot_replica_payload,
+};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar as StdCondvar, Mutex as StdMutex};
@@ -515,10 +517,17 @@ impl StorageOwnerState {
         &self,
         route: &ObjectRoute,
     ) -> Result<Option<ObjectRoute>> {
-        if route.cold_backing.is_none() && !self.cold_tier_devices.nof_targets.is_empty() {
+        if route.cold_backing.is_none()
+            && !self.cold_tier_devices.nof_targets.is_empty()
+            && !self.cold_tier_devices.nof_targets.is_managed()
+        {
             return self.ensure_request_local_nof_copy(route);
         }
-        let cold_state = route.cold_backing.as_ref().map(|backing| backing.state);
+        let cold_state = route
+            .cold_backing
+            .as_ref()
+            .map(|backing| backing.state)
+            .or_else(|| route.nof_backing.as_ref().map(|backing| backing.state));
         match cold_state {
             Some(mooncake_store_core::ColdBackingState::Materialized) => Ok(Some(route.clone())),
             Some(mooncake_store_core::ColdBackingState::PendingOffload) => {
@@ -602,20 +611,37 @@ impl StorageOwnerState {
     fn materialize_pending_offload_route_for_eviction(&self, route: &ObjectRoute) -> Result<bool> {
         let tracker = OperationTracker::new("storage_owner_eviction_forced_offload");
         let result = (|| {
-            let devices = match self.cold_tier_devices.devices.lock().snapshot() {
-                Some(devices) => devices,
-                None => refresh_cold_tier_device_cache(
-                    self.metadata.as_ref(),
-                    &self.cold_tier_devices.devices,
-                    "cold_tier_device_snapshot_eviction_offload_prepare",
-                )?,
+            let devices = if self.cold_tier_devices.has_any_local_backend() {
+                let devices = match self.cold_tier_devices.devices.lock().snapshot() {
+                    Some(devices) => devices,
+                    None => refresh_cold_tier_device_cache(
+                        self.metadata.as_ref(),
+                        &self.cold_tier_devices.devices,
+                        "cold_tier_device_snapshot_eviction_offload_prepare",
+                    )?,
+                };
+                devices
+                    .into_iter()
+                    .map(|device| (device.device_id.clone(), device))
+                    .collect::<BTreeMap<_, _>>()
+            } else {
+                BTreeMap::new()
             };
-            let devices = devices
-                .into_iter()
-                .map(|device| (device.device_id.clone(), device))
-                .collect::<BTreeMap<_, _>>();
-            let Some(entry) = self.pending_offloads.claim(&route.key, route.version) else {
-                return Ok(false);
+            let entry = match self.pending_offloads.claim(&route.key, route.version) {
+                Some(entry) => entry,
+                None => {
+                    let length_bytes =
+                        pending_persistent_backing(route).map(|backing| backing.length);
+                    self.pending_offloads.requeue_for_debug_evict_all(
+                        route.key.clone(),
+                        route.version,
+                        length_bytes,
+                    );
+                    let Some(entry) = self.pending_offloads.claim(&route.key, route.version) else {
+                        return Ok(false);
+                    };
+                    entry
+                }
             };
             let key = entry.key.clone();
             let prepare_result =

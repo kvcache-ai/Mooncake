@@ -183,12 +183,24 @@ impl StoreClient {
                         ),
                     )?
                 };
-                let target_offset = Self::storage_target_offset(
+                let target_offset = match Self::storage_target_offset(
                     &target.target_chunks,
                     &target.segment_name,
                     reservation.offset_bytes,
                     value.len() as u64,
-                )?;
+                ) {
+                    Ok(offset)
+                        if Self::segment_info_covers_target(&info, offset, value.len() as u64) =>
+                    {
+                        offset
+                    }
+                    _ => Self::segment_relative_target_offset(
+                        &info,
+                        &target.segment_name,
+                        reservation.offset_bytes,
+                        value.len() as u64,
+                    )?,
+                };
                 remote_requests.push((handle, target_offset, info));
                 absolute_offsets[index] = target_offset;
             }

@@ -569,7 +569,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
         }
     };
     let managed_nof = route.nof_backing.is_some();
-    if !transient_nof && cold_backing.owner != storage_owner.runtime {
+    if !transient_nof && !managed_nof && cold_backing.owner != storage_owner.runtime {
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }

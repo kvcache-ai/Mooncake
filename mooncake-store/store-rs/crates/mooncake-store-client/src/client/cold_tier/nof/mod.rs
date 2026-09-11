@@ -8,6 +8,7 @@ use mooncake_store_core::{Result, StoreError};
 
 mod backend;
 mod backing;
+pub mod extent_store;
 mod managed;
 mod managed_backend;
 mod object;
