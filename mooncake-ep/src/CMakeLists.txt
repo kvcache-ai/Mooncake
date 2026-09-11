@@ -95,6 +95,10 @@ elseif(USE_MACA)
   # for the PG worker, but does not provide CUDA compatibility headers such as
   # cooperative_groups.h required by these translation units.
   set(MOONCAKE_EP_SOURCES ${MOONCAKE_EP_HOST_SOURCES})
+  # The elastic kernel contains NVIDIA PTX inline assembly and is not part of
+  # the legacy Buffer API exercised on MACA.
+  set(_ep_maca_device_sources
+      "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_ep_kernel.cu")
   if(DEFINED MACA_ROOT AND NOT "${MACA_ROOT}" STREQUAL "")
     set(_ep_maca_root "${MACA_ROOT}")
   elseif(DEFINED ENV{MACA_HOME} AND NOT "$ENV{MACA_HOME}" STREQUAL "")
@@ -107,7 +111,7 @@ elseif(USE_MACA)
   if(NOT _ep_maca_compiler)
     message(FATAL_ERROR "USE_MACA=ON requires the MACA cu-bridge compiler (nvcc)")
   endif()
-  foreach(_ep_device_source IN LISTS MOONCAKE_EP_DEVICE_SOURCES)
+  foreach(_ep_device_source IN LISTS _ep_maca_device_sources)
     get_filename_component(_ep_device_name "${_ep_device_source}" NAME_WE)
     set(_ep_device_object
         "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_maca.o")
