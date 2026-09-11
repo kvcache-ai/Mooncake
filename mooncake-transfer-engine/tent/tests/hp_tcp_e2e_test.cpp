@@ -16,6 +16,7 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -26,8 +27,6 @@
 
 namespace mooncake::tent {
 namespace {
-
-constexpr size_t kDataLength = 256 * 1024;
 
 bool ReadExactly(int fd, void* buffer, size_t length) {
     auto* cursor = static_cast<uint8_t*>(buffer);
@@ -108,8 +107,9 @@ bool WaitBatchDone(TransferEngine& engine, BatchID batch) {
     return false;
 }
 
-void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
-    const size_t remote_buffer_length = task_count * kDataLength;
+void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail,
+                                     size_t data_length = 256 * 1024) {
+    const size_t remote_buffer_length = task_count * data_length;
     const size_t local_buffer_length = 2 * remote_buffer_length;
 
     int ready_pipe[2];
@@ -125,11 +125,11 @@ void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
 
         int exit_code = 0;
         {
+            std::vector<uint8_t> remote(remote_buffer_length, 0);
             TransferEngine server(MakeHpConfig(multi_rail));
             if (!server.available()) {
                 exit_code = 2;
             } else {
-                std::vector<uint8_t> remote(remote_buffer_length, 0);
                 const Status registered = server.registerLocalMemory(
                     remote.data(), remote.size(), kGlobalReadWrite);
                 if (!registered.ok()) {
@@ -183,13 +183,17 @@ void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
     }
     close(ready_pipe[0]);
 
-    TransferEngine client(MakeHpConfig(multi_rail));
-    ASSERT_TRUE(client.available());
     std::vector<uint8_t> local(local_buffer_length, 0);
+    auto client_config = MakeHpConfig(multi_rail);
+    // The remote limit (8 MiB), not just the local limit, must bound merging.
+    client_config->set("transports/hp_tcp/max_transfer_bytes", 16ULL << 20);
+    TransferEngine client(client_config);
+    ASSERT_TRUE(client.available());
+    std::mt19937 data(3834);
     for (size_t task = 0; task < task_count; ++task) {
-        uint8_t* source = local.data() + task * kDataLength;
-        for (size_t i = 0; i < kDataLength; ++i) {
-            source[i] = static_cast<uint8_t>((task * 131 + i * 7) & 0xff);
+        uint8_t* source = local.data() + task * data_length;
+        for (size_t i = 0; i < data_length; ++i) {
+            source[i] = static_cast<uint8_t>(data());
         }
     }
     ASSERT_TRUE(
@@ -216,21 +220,22 @@ void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
     for (size_t task = 0; task < task_count; ++task) {
         Request write_request{};
         write_request.opcode = Request::WRITE;
-        write_request.source = local.data() + task * kDataLength;
+        write_request.source = local.data() + task * data_length;
         write_request.target_id = segment;
-        write_request.target_offset = info.buffers[0].base + task * kDataLength;
-        write_request.length = kDataLength;
+        write_request.target_offset = info.buffers[0].base + task * data_length;
+        write_request.length = data_length;
         write_request.transport_hint = HP_TCP;
         writes.push_back(write_request);
 
         Request read_request{};
         read_request.opcode = Request::READ;
         read_request.source =
-            local.data() + remote_buffer_length + task * kDataLength;
+            local.data() + remote_buffer_length + task * data_length;
         read_request.target_id = segment;
-        read_request.target_offset = info.buffers[0].base + task * kDataLength;
-        read_request.length = kDataLength;
-        read_request.transport_hint = HP_TCP;
+        read_request.target_offset = info.buffers[0].base + task * data_length;
+        read_request.length = data_length;
+        // With only HP TCP enabled, also cover its implicit selection.
+        read_request.transport_hint = UNSPEC;
         reads.push_back(read_request);
     }
 
@@ -245,10 +250,10 @@ void RunWriteThenReadAcrossProcesses(size_t task_count, bool multi_rail) {
     ASSERT_TRUE(client.freeBatch(batch).ok());
 
     for (size_t task = 0; task < task_count; ++task) {
-        const uint8_t* written = local.data() + task * kDataLength;
+        const uint8_t* written = local.data() + task * data_length;
         const uint8_t* read_back =
-            local.data() + remote_buffer_length + task * kDataLength;
-        EXPECT_EQ(std::memcmp(written, read_back, kDataLength), 0)
+            local.data() + remote_buffer_length + task * data_length;
+        EXPECT_EQ(std::memcmp(written, read_back, data_length), 0)
             << "task " << task << " mismatch";
     }
 
@@ -266,6 +271,10 @@ TEST(HighPerformanceTcpE2eTest, WriteThenReadConcurrency16) {
 
 TEST(HighPerformanceTcpE2eTest, WriteThenReadAcrossTwoRails) {
     RunWriteThenReadAcrossProcesses(16, true);
+}
+
+TEST(HighPerformanceTcpE2eTest, UnevenSlicedReadAcrossProcesses) {
+    RunWriteThenReadAcrossProcesses(4, true, (4ULL << 20) + 3);
 }
 
 }  // namespace

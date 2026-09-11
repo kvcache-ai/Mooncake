@@ -98,11 +98,20 @@ TEST(RpcClientIoContextPoolTest, SendsToNewAddressAfterSwitch) {
     second_server.stop();
 }
 
-TEST(RpcClientIoContextPoolTest, RegistryKeepsFirstConfigForSameAddress) {
+TEST(RpcClientIoContextPoolTest, RegistrySharesPoolOnlyForIdenticalConfig) {
     const std::string address = "127.0.0.1:59998";
     RpcClientPool first(GetFirstTestRpcClientIoContextPool());
     auto first_pool = first.GetOrCreateClientPool(address);
 
+    // Identical configuration on a second holder shares the pool: that is
+    // the case the keep-alive registry exists for.
+    RpcClientPool same(GetFirstTestRpcClientIoContextPool());
+    EXPECT_EQ(first_pool.get(), same.GetOrCreateClientPool(address).get());
+
+    // A different policy on the same address gets its own pool: the
+    // foreground master pool is resilient while an HA probe on that address
+    // must fast-fail, and collapsing the two hands the probe the foreground
+    // retry budget (#3943 meets the HA policy split from #3743).
     RpcClientPool::PoolConfig different;
     different.max_connection = 7;
     different.client_config.connect_timeout_duration =
@@ -110,11 +119,7 @@ TEST(RpcClientIoContextPoolTest, RegistryKeepsFirstConfigForSameAddress) {
     different.client_config.request_timeout_duration =
         std::chrono::milliseconds(5678);
     RpcClientPool second(GetFirstTestRpcClientIoContextPool(), different);
-    auto second_pool = second.GetOrCreateClientPool(address);
-
-    // First configuration wins: the registry hands back the original pool
-    // (with a warning) instead of silently applying the second config.
-    EXPECT_EQ(first_pool.get(), second_pool.get());
+    EXPECT_NE(first_pool.get(), second.GetOrCreateClientPool(address).get());
 }
 
 TEST(RpcClientIoContextPoolTest, KeepClientPoolsAliveRetainsCollection) {

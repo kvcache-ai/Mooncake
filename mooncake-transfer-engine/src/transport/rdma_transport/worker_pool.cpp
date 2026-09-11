@@ -314,7 +314,6 @@ int WorkerPool::submitPostSend(
 
     SliceList prepared_slice_list;
     uint64_t submitted_slice_count = 0;
-    int all_rails_failed_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
     for (auto &slice : slice_list) {
         if (failed_target_ids.count(slice->target_id)) {
@@ -385,7 +384,6 @@ int WorkerPool::submitPostSend(
             }
             if (!found) {
                 slice->markFailed();  // All rails unavailable
-                all_rails_failed_count++;
                 continue;
             }
         }
@@ -410,14 +408,6 @@ int WorkerPool::submitPostSend(
     }
 
     enqueuePreparedSlices(prepared_slice_list, submitted_slice_count);
-
-    // Context-level health tracking: if all slices failed due to no available
-    // rails, increment the context failure counter. This detects catastrophic
-    // local RNIC hardware failure where all paths through the RNIC are down.
-    if (submitted_slice_count == 0 &&
-        all_rails_failed_count == (int)slice_list.size()) {
-        if (markContextFailure()) refreshPublishedLocalTopology();
-    }
 
     return 0;
 }
@@ -456,6 +446,64 @@ int WorkerPool::submitPreparedPostSend(
     return 0;
 }
 
+bool WorkerPool::markLocalContextFailure() {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    // Fatal events and an already-tripped breaker leave the context inactive.
+    // Ignore late CQEs in either state so they cannot arm a new TTL after a
+    // fatal event took ownership of recovery.
+    if (!context_.active()) return false;
+
+    int failure_count =
+        context_failure_count_.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (failure_count < kLocalCompletionFailureThreshold) return false;
+
+    context_.set_active(false);
+    breaker_reactivate_after_ns_ =
+        static_cast<uint64_t>(getCurrentTimeInNano()) +
+        static_cast<uint64_t>(globalConfig().context_pause_ttl_ms) * 1000000ull;
+    LOG(WARNING) << "Context breaker tripped: context " << context_.deviceName()
+                 << " pausing after " << failure_count
+                 << " consecutive local completion-failure batches, "
+                 << "pause_ttl_ms=" << globalConfig().context_pause_ttl_ms;
+    return true;
+}
+
+void WorkerPool::markContextSuccess() {
+    if (context_failure_count_.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    if (breaker_reactivate_after_ns_ == 0)
+        context_failure_count_.store(0, std::memory_order_relaxed);
+}
+
+bool WorkerPool::tryReactivateContext(uint64_t now_ns) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    if (breaker_reactivate_after_ns_ == 0 ||
+        now_ns < breaker_reactivate_after_ns_ ||
+        recovery_activate_after_ns_.load(std::memory_order_relaxed) != 0) {
+        return false;
+    }
+    breaker_reactivate_after_ns_ = 0;
+    context_failure_count_.store(0, std::memory_order_relaxed);
+    context_.set_active(true);
+    return true;
+}
+
+void WorkerPool::maybeReactivateContext() {
+    if (tryReactivateContext(static_cast<uint64_t>(getCurrentTimeInNano()))) {
+        refreshPublishedLocalTopology();
+        LOG(INFO) << "Context breaker pause expired: context "
+                  << context_.deviceName()
+                  << " reactivating (half-open, streak reset)";
+    }
+}
+
+void WorkerPool::resetContextBreaker(bool context_active) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    breaker_reactivate_after_ns_ = 0;
+    context_failure_count_.store(0, std::memory_order_relaxed);
+    context_.set_active(context_active);
+}
+
 void WorkerPool::trackPostedSlices(
     const std::vector<Transport::Slice *> &slice_list, size_t first,
     size_t count) {
@@ -492,7 +540,7 @@ void WorkerPool::performPostSend(int thread_id) {
     // If this local RNIC is inactive/unhealthy, the remote rail is not the
     // problem. Move queued work to another local RNIC while preserving the
     // already selected peer rail.
-    if (!context_.active() || !contextHealthy()) {
+    if (!context_.active()) {
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
         for (auto &entry : local_slice_queue_clone)
@@ -508,7 +556,7 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch_counter_.load(std::memory_order_relaxed);
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        bool handoff_to_local_worker = !context_.active() || !contextHealthy();
+        bool handoff_to_local_worker = !context_.active();
         for (auto &entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id, handoff_to_local_worker);
         return;
@@ -1204,7 +1252,10 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
         event_type == IBV_EVENT_PORT_ERR ||
         event_type == IBV_EVENT_LID_CHANGE) {
         recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
-        context_.set_active(false);
+        // The async event now owns this context's inactive state. Clear the
+        // local-WC breaker deadline so its TTL cannot resurrect a context that
+        // a DEVICE_FATAL/PORT_ERR took down.
+        resetContextBreaker(false);
         refreshPublishedLocalTopology();
 
         /**
@@ -1245,8 +1296,7 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
     } else if (event_type == IBV_EVENT_PORT_ACTIVE) {
         // PORT_ACTIVE only means the link started coming back. Real mlx5/RoCE
         // data path can still reject RTR for a while after link-up, so delay
-        // publishing this local RNIC back to metadata. Injected tests follow
-        // the same path.
+        // publishing an inactive local RNIC back to metadata.
         scheduleContextRecovery();
         if (event != nullptr) ibv_ack_async_event(event);
     } else {
@@ -1257,6 +1307,15 @@ bool WorkerPool::handleContextEvent(ibv_event_type event_type,
 }
 
 void WorkerPool::scheduleContextRecovery(uint64_t delay_ns) {
+    std::lock_guard<std::mutex> lock(context_state_lock_);
+    // A redundant PORT_ACTIVE on an in-service context is not recovery
+    // evidence: preserve its local-WC streak and do not arm a probe that
+    // could later override a new local-WC trip.
+    if (context_.active()) return;
+
+    // Event recovery owns this inactive period. Cancel only the breaker
+    // deadline; a successful GID probe below resets the failure count.
+    breaker_reactivate_after_ns_ = 0;
     uint64_t activate_after = getCurrentTimeInNano() + delay_ns;
     recovery_activate_after_ns_.store(activate_after,
                                       std::memory_order_relaxed);
@@ -1272,15 +1331,12 @@ void WorkerPool::maybeActivateRecoveredContext() {
         static_cast<uint64_t>(getCurrentTimeInNano()) < activate_after)
         return;
 
-    uint64_t expected = activate_after;
-    if (!recovery_activate_after_ns_.compare_exchange_strong(
-            expected, 0, std::memory_order_relaxed)) {
-        return;
-    }
-
+    // Recovery probes and async events run on the same monitor thread.
+    // Keep the deadline armed throughout GID I/O: event recovery still owns
+    // the inactive context, and late CQEs must not arm breaker recovery.
     auto gid_refresh_result = refreshPublishedLocalGid();
     if (gid_refresh_result == GidRefreshResult::FAILED) {
-        context_.set_active(false);
+        resetContextBreaker(false);
         refreshPublishedLocalTopology();
         scheduleContextRecovery();
         LOG(WARNING) << "Worker: Context " << context_.deviceName()
@@ -1295,9 +1351,9 @@ void WorkerPool::maybeActivateRecoveredContext() {
                   << " GID changed during recovery, disconnected all endpoints";
     }
 
-    context_.set_active(true);
+    resetContextBreaker(true);
+    recovery_activate_after_ns_.store(0, std::memory_order_relaxed);
     refreshPublishedLocalTopology();
-    context_failure_count_.store(0, std::memory_order_relaxed);
     LOG(INFO) << "Worker: Context " << context_.deviceName()
               << " is now active after recovery delay";
 }
@@ -1388,6 +1444,8 @@ void WorkerPool::monitorWorker() {
         const uint64_t current_ts =
             static_cast<uint64_t>(getCurrentTimeInNano());
         maybeActivateRecoveredContext();
+        // Check short breaker TTLs on every loop, like GID recovery.
+        maybeReactivateContext();
         if (current_ts - last_reset_ts > 1000000000ll) {
             // Drain endpoint_store_->waiting_list_ even when no new
             // insertions are happening. Without this, reclaim only runs
@@ -1595,7 +1653,10 @@ void WorkerPool::handleLocalFailure(const std::string &peer_nic_path,
     // Local completion faults can be caused by a poisoned QP/MR as well as a
     // bad RNIC. Retry this slice elsewhere, but only disable the whole context
     // after repeated local failures or an async port/device event.
-    bool context_disabled = markContextFailure();
+    // A local WC status is direct evidence about this RNIC. Submit-side
+    // all-rails-unavailable failures remain peer scoped and never contribute
+    // to this counter.
+    bool context_disabled = markLocalContextFailure();
     if (context_disabled) refreshPublishedLocalTopology();
     redispatch_counter_++;
 

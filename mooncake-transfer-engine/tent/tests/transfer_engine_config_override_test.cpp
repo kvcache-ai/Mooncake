@@ -390,6 +390,8 @@ TEST(TransferEngineConfigOverrideTest,
 
     const auto live_endpoint = buildHttpMetadataEndpoint(live_port);
     const auto dead_endpoint = buildHttpMetadataEndpoint(dead_port);
+    // The HTTP server keeps this port occupied, so automatic RPC port
+    // selection cannot legitimately choose the value from the file.
     TempConfigFile conf_file(
         "{\n"
         "  \"metadata_type\": \"p2p\",\n"
@@ -399,7 +401,9 @@ TEST(TransferEngineConfigOverrideTest,
         "  \"rpc_server_hostname\": \"" +
         std::string(kLoopbackHostname) +
         "\",\n"
-        "  \"rpc_server_port\": 15011,\n"
+        "  \"rpc_server_port\": " +
+        std::to_string(live_port) +
+        ",\n"
         "  \"log_level\": \"warning\",\n"
         "  \"merge_requests\": false\n"
         "}");
@@ -425,7 +429,7 @@ TEST(TransferEngineConfigOverrideTest,
         EXPECT_EQ(engine.getSegmentName(), kSegmentName);
         EXPECT_EQ(engine.getRpcServerAddress(), kLoopbackHostname);
         EXPECT_NE(engine.getRpcServerPort(), 0);
-        EXPECT_NE(engine.getRpcServerPort(), 15011);
+        EXPECT_NE(engine.getRpcServerPort(), live_port);
 
         EXPECT_EQ(config->get("log_level", ""), "warning");
         EXPECT_FALSE(config->get("merge_requests", true));

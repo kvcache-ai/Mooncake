@@ -129,6 +129,14 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
+    // Allocate POSIX shm that ShmTransport can export to same-host peers.
+    // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
+    // Caller must registerLocalMemory before remote access. Returns nullptr
+    // on failure.
+    void* allocateSharedMemory(size_t length);
+
+    int freeSharedMemory(void* addr);
+
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
     Status submitTransfer(BatchID batch_id,
@@ -247,10 +255,11 @@ class TransferEngine {
 #endif
 
     /**
-     * @brief Check if TCP is the only installed transport.
+     * @brief Check if TCP is the only installed host transport.
      *
-     * When only TCP transport is available (no RDMA, NVLink, etc.),
-     * local memcpy is preferred over TCP loopback for same-host transfers.
+     * When only TCP is available (no RDMA, NVLink, etc.), local memcpy is
+     * preferred over TCP loopback for same-host transfers. POSIX SHM is
+     * intra-node only and does not change this classification.
      */
     bool isTcpOnly() const;
 

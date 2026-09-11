@@ -9,11 +9,17 @@ scheduling.
 ## Architecture
 
 Each worker owns one `asio::io_context` and one thread. Each peer has a
-configured number of persistent lanes, and request IDs distribute operations
-across them. A stable hash of peer and lane selects the owner; socket state
+configured number of persistent lanes. A separate sequence for each peer
+rotates operations across them, so interleaved traffic to other peers cannot
+pin a peer to one lane. Each sequence starts at that peer's first request ID
+to preserve its initial lane choice. Request IDs remain globally unique.
+A stable hash of peer and lane selects the owner; socket state
 never moves between workers, and operations on a lane are FIFO. ASIO provides
 the event queue; process-wide task and byte admission limits bound all accepted
 work, including callbacks waiting in that queue.
+
+Both ends disable Nagle's algorithm: headers and payloads use separate writes,
+so a delayed ACK must not hold up a short payload on a persistent socket.
 
 The server uses the same worker pool. Accepted sockets are assigned to workers
 and stored in worker-owned session sets. A global connection limit bounds live
@@ -42,6 +48,17 @@ persistent lane. A READ large enough to contribute at least one internal I/O
 step per configured rail is split into one contiguous slice per rail. The
 slices reuse the persistent lanes and complete as one TENT task. `hp_tcp` does
 not rebalance traffic or fail over between rails.
+
+The current internal step is 1 MiB: with two rails, READs of at least 2 MiB
+are sliced; smaller READs and single-rail READs are not. Remainder bytes are
+assigned to the first slices, so uneven lengths still cover the request
+exactly. Multiple independent WRITEs can use different rails, but each WRITE
+stays on one lane and waits for its own remote completion ACK.
+
+`connections_per_peer` is the **total** lane budget, not a per-rail multiplier.
+For example, four lanes and two rails give two lanes per rail. Worker count is
+independent of rail count: several lanes may share an owner worker. Increasing
+lanes on a single rail does not split a single READ into multiple streams.
 
 ## Protocol and memory safety
 
@@ -76,6 +93,23 @@ deadline resumes as soon as the next header begins. A timeout cancels the
 resolver or socket; terminal completion is published only after the
 corresponding callback retires.
 
+A failed READ slice cancels its siblings; the logical task settles only after
+all slice callbacks retire. A stale-registration result can trigger the
+existing bounded metadata refresh/retry, not migration onto another rail.
+Independent peers can continue while a peer is waiting for its progress
+timeout. FIFO sharing within one peer's lanes can still delay small requests
+behind large ones; slicing is not a priority or preemption mechanism.
+
+The client separately closes a pooled socket after
+`idle_connection_timeout_ms` without active or queued work on that lane
+(default 60 seconds). New work before expiry cancels this timer and reuses the
+socket; work after expiry reconnects. This releases receiver connection slots
+held by idle updated clients. The server does not evict established idle sockets:
+it cannot know whether a client has just started another WRITE. Older clients
+that keep sockets open indefinitely still require their own pool cleanup.
+Tasks attempted while the receiver connection limit is full can still fail;
+idle cleanup is not task backpressure or an automatic retry policy.
+
 Shutdown closes admission and the listener, drains queued dispatch callbacks,
 cancels every client lane and server session on its owner, waits for operations
 and leases, then stops and joins worker threads. This makes shutdown bounded
@@ -106,10 +140,94 @@ The transport is configured under `transports.hp_tcp`:
 | `worker_count` | ASIO event-loop threads. |
 | `connections_per_peer` | Persistent lanes per peer. |
 | `max_outstanding_tasks`, `max_outstanding_bytes` | Global admission bounds. |
-| `max_transfer_bytes` | Maximum request size. I/O progress is tracked in fixed internal steps. |
+| `max_transfer_bytes` | Maximum request size. When HP TCP is enabled, coalescing of HP TCP/UNSPEC requests respects both local and advertised remote limits; an individually oversized request is still rejected. |
 | `connect_timeout_ms`, `progress_timeout_ms` | Connection and I/O deadlines. |
+| `idle_connection_timeout_ms` | Positive client idle-pool retention time; default 60000 ms. Active or queued requests are never expired by this timer. Shorter retention frees receiver slots sooner but requires more reconnections for intermittent traffic. |
 
-Tests cover wire validation, rail metadata and source binding, admission,
-buffer leases, connection reuse, session reaping, client/server timeout,
-stale-registration recovery, ambiguous WRITE completion and a two-process
-READ/WRITE smoke test.
+### Single-rail and paired-rail examples
+
+For a single rail, put this in the server's `MC_TENT_CONF` JSON file (replace
+the example address with an address assigned to the host):
+
+```json
+{
+  "transports": {
+    "tcp": {"enable": false},
+    "rdma": {"enable": false},
+    "shm": {"enable": false},
+    "hp_tcp": {
+      "enable": true,
+      "bind_address": "",
+      "rail_addresses": ["10.0.0.2"],
+      "worker_count": 4,
+      "connections_per_peer": 4
+    }
+  }
+}
+```
+
+Use the same configuration on the client with its local address `10.0.0.1`.
+For two rails, change only the lists:
+
+| Host | `rail_addresses` |
+| --- | --- |
+| Client | `["10.0.0.1", "10.1.0.1"]` |
+| Server | `["10.0.0.2", "10.1.0.2"]` |
+
+Entries pair by index, and both hosts need working source-address routes for
+those pairs. Reused sockets retain that mapping; failed sockets are closed
+before later requests reconnect.
+
+`MC_TENT_CONF` loads a complete configuration, so include the transport enable
+flags even when using tebench's `--xport_type=hp_tcp`. To check data with the
+existing benchmark, start its target, then run an initiator with its advertised
+segment name:
+
+```bash
+MC_TENT_CONF=client.json tebench --backend=tent --xport_type=hp_tcp \
+  --tent_transport_hint=hp_tcp --target_seg_name=SERVER_SEGMENT \
+  --seg_type=DRAM --op_type=mix --check_consistency=true \
+  --start_block_size=67108864 --max_block_size=67108864 --duration=3
+```
+
+Repeat with both block-size flags set to `4096` for the unsliced path.
+With `--xport_type=hp_tcp --check_consistency=true`, the CPU checker uses
+seed-reproducible, non-constant data and a full byte comparison to detect
+reordered slices. Run throughput separately without this checking overhead.
+Ordinary `mix`, other backends and `write_seed`/`read_verify` retain their
+existing data patterns.
+
+### Checking rail use
+
+Test-local socket relays record the peer/local addresses and completed slice
+ranges. Full-engine tests check payloads, guards, the slicing threshold and
+connection reuse; two-process E2Es also cover unequal transfer-size limits.
+
+On two machines, inspect connections with `ss -tnp`, source-address routes with
+`ip route get REMOTE from LOCAL`, and per-interface byte counters before/after
+a transfer. READ payload moves from server TX to client RX. Compare both
+rails' deltas with successful application bytes; account for protocol overhead
+and unrelated traffic. Two open connections alone do not prove payload use.
+
+Loopback proves routing, not physical NIC use. Check PCI devices and shared
+host/fabric limits. Compare one rail/one lane, one rail/multiple lanes, and two
+rails/the same total lanes: the last two differ in single-READ slicing as well
+as rail placement.
+
+### Measured scope
+
+On two Xeon 8457C virtual machines, with four workers and four total lanes,
+three interleaved runs (1-second warmup, 3-second measurement) gave the
+following medians:
+
+| READ workload | Metric | One rail | Two rails |
+| --- | --- | ---: | ---: |
+| 64 MiB, one concurrent task | Throughput (GB/s) | 3.22 | 6.46 |
+| 64 MiB, four concurrent tasks | Throughput (GB/s) | 11.13 | 10.96 |
+| 4 KiB, one concurrent task | Mean latency (microseconds) | 72 | 78 |
+
+Both interfaces carried payload-direction traffic, but their underlying
+resource independence is not guaranteed. Four concurrent READs showed no
+additional gain. A same-pool 4 KiB/64 MiB closed-loop mix still delayed small
+tasks behind large ones: static slicing offers neither latency isolation nor
+universal bandwidth scaling.

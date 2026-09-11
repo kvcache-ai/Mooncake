@@ -10,11 +10,12 @@
 
 #include "allocator.h"
 #include "client_metric.h"
+#include "common/network.h"
 #include "file_storage.h"
 #include "storage_backend.h"
 #include "tenant_id.h"
 #include "test_server_helpers.h"
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "utils/common.h"
 
 namespace mooncake {
@@ -737,15 +738,6 @@ TEST_F(FileStorageTest,
     }
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
-}
-
-TEST_F(FileStorageTest, ReadBucketBackendValues) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
-
-    const auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
 }
 
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {

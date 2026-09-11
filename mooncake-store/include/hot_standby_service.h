@@ -207,8 +207,9 @@ class HotStandbyService {
     void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
-     * @brief Test seam: when set, promotion final catch-up first tries
-     *        batch-record durable prefix/batches from this backend.
+     * @brief Test seam: inject a HaKvBackend used for Start()/replication and
+     *        promotion catch-up. When set, Start() skips live etcd connection
+     *        (and works even when STORE_USE_ETCD is OFF).
      */
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -226,14 +227,21 @@ class HotStandbyService {
     }
 
    private:
+    enum class PromotionCatchUpPolicy {
+        kLegacyTotalDeadline,
+        kBoundedNoProgress,
+    };
+
     ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
     ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
     void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
     uint64_t GetLocalLastAppliedSequenceIdLocked() const;
-    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
-    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id,
+                                             PromotionCatchUpPolicy policy);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
+                                             PromotionCatchUpPolicy policy);
     void StopReplicationLoop();
     void HandleSnapshotCaptureRequest(
         const OpLogBatchStandbyPollResult& result);
@@ -241,7 +249,8 @@ class HotStandbyService {
     void NotifySnapshotPromotion();
     void NotifySnapshotStop();
 
-    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id);
+    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id,
+                                     PromotionCatchUpPolicy policy);
     ErrorCode CompletePromotionLocked();
 
     void NotifySyncStatus();

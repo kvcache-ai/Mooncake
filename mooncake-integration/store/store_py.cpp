@@ -82,6 +82,71 @@ struct PyTensorInfo {
     }
 };
 
+// A serialized tensor object is laid out as [metadata][payload].  The raw
+// *_tensor_from APIs accept host, pinned-host, and device addresses.  Reading
+// metadata through a C++ pointer is invalid for device addresses, and a
+// DummyClient cannot dereference a caller's pointer in the RealClient process.
+// Keep the original addresses in the resulting parts. DummyClient and
+// RealClient each perform the appropriate staging/IPC for non-local buffers.
+struct RawTensorObjectParts {
+    uintptr_t metadata_ptr = 0;
+    size_t metadata_size = 0;
+    uintptr_t payload_ptr = 0;
+    size_t payload_size = 0;
+};
+
+std::optional<RawTensorObjectParts> make_raw_tensor_object_parts(
+    uintptr_t buffer_ptr, size_t size, const char *operation_name) {
+    if (buffer_ptr == 0 || size < sizeof(TensorMetadata) ||
+        size > std::numeric_limits<uintptr_t>::max() - buffer_ptr) {
+        LOG(ERROR) << operation_name << ": invalid tensor object buffer";
+        return std::nullopt;
+    }
+
+    const auto &runtime =
+        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+    TensorMetadata metadata{};
+    if (!runtime.CopyToHost(&metadata,
+                            reinterpret_cast<const void *>(buffer_ptr),
+                            sizeof(metadata))) {
+        LOG(ERROR) << operation_name << ": failed to read tensor metadata";
+        return std::nullopt;
+    }
+    if (metadata.header.data_offset > std::numeric_limits<size_t>::max() ||
+        metadata.header.data_bytes > std::numeric_limits<size_t>::max()) {
+        LOG(ERROR) << operation_name << ": tensor object size overflows";
+        return std::nullopt;
+    }
+    if (!ValidateTensorMetadata(metadata, size)) {
+        LOG(ERROR) << operation_name << ": invalid tensor object metadata";
+        return std::nullopt;
+    }
+    const size_t metadata_size =
+        static_cast<size_t>(metadata.header.data_offset);
+    const size_t payload_size = static_cast<size_t>(metadata.header.data_bytes);
+    if (metadata_size > size || payload_size > size - metadata_size ||
+        metadata_size > std::numeric_limits<uintptr_t>::max() - buffer_ptr) {
+        LOG(ERROR) << operation_name << ": invalid tensor object range";
+        return std::nullopt;
+    }
+
+    RawTensorObjectParts parts;
+    parts.metadata_size = metadata_size;
+    parts.payload_ptr = buffer_ptr + metadata_size;
+    parts.payload_size = payload_size;
+    if (payload_size >
+        std::numeric_limits<uintptr_t>::max() - parts.payload_ptr) {
+        LOG(ERROR) << operation_name << ": tensor payload address overflows";
+        return std::nullopt;
+    }
+    // Keep the caller's original address in the part list. DummyClient uses
+    // the registration table to validate/stage external buffers; replacing a
+    // device metadata pointer with a private host copy would make that
+    // pointer appear unregistered.
+    parts.metadata_ptr = buffer_ptr;
+    return parts;
+}
+
 TensorMetadata build_full_tensor_metadata(const py::handle &tensor,
                                           TensorDtype dtype_enum,
                                           size_t tensor_size);
@@ -299,6 +364,36 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
         return pybind11::none();
     }
+}
+
+std::optional<py::object> decode_raw_tensor_object_for_host(
+    uintptr_t buffer_ptr, size_t size, std::vector<char> &host_buffer,
+    const char *operation_name) {
+    if (!make_raw_tensor_object_parts(buffer_ptr, size, operation_name)) {
+        return std::nullopt;
+    }
+
+    char *tensor_buffer = reinterpret_cast<char *>(buffer_ptr);
+    const auto &runtime =
+        mooncake::device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (runtime.FindDeviceForPointer(reinterpret_cast<void *>(buffer_ptr))) {
+        host_buffer.resize(size);
+        if (!runtime.CopyToHost(host_buffer.data(),
+                                reinterpret_cast<void *>(buffer_ptr), size)) {
+            LOG(ERROR) << operation_name
+                       << ": failed to copy device tensor object to host";
+            return std::nullopt;
+        }
+        tensor_buffer = host_buffer.data();
+    }
+
+    py::object tensor =
+        buffer_to_tensor(nullptr, tensor_buffer, static_cast<int64_t>(size));
+    if (tensor.is_none()) {
+        LOG(ERROR) << operation_name << ": failed to decode tensor object";
+        return std::nullopt;
+    }
+    return tensor;
 }
 
 py::tuple serialize_tensor_metadata(py::object tensor) {
@@ -1157,6 +1252,15 @@ class MooncakeStorePyWrapper {
                 MakeRepeatedIndexedConfig(config, processed_indices, tp_size);
             std::vector<int> chunk_results = batch_put_tensor_infos_impl(
                 all_chunk_keys, all_chunk_infos, chunk_config);
+            if (chunk_results.size() != all_chunk_keys.size()) {
+                LOG(ERROR) << "Batch put with TP returned "
+                           << chunk_results.size() << " results, expected "
+                           << all_chunk_keys.size();
+                for (size_t index : processed_indices) {
+                    final_results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
+                return final_results;
+            }
 
             for (size_t i = 0; i < processed_indices.size(); ++i) {
                 size_t original_idx = processed_indices[i];
@@ -1201,29 +1305,26 @@ class MooncakeStorePyWrapper {
                                              tp_size, split_dim);
     }
 
-    // Zero-copy put from pre-allocated buffer (layout: [TensorMetadata][data])
+    // Put from a serialized tensor object (layout: [metadata][payload]).
+    // Split the parts so DummyClient can stage external addresses safely.
     int put_tensor_from(const std::string &key, uintptr_t buffer_ptr,
                         size_t size) {
-        if (buffer_ptr == 0) {
-            LOG(ERROR) << "Buffer pointer cannot be null";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        void *buffer = reinterpret_cast<void *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (size < sizeof(TensorMetadata)) {
-            LOG(ERROR) << "Buffer size too small for tensor metadata";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (!ParseTensorMetadata(reinterpret_cast<const char *>(buffer), size)
-                 .has_value()) {
-            LOG(ERROR) << "Invalid tensor metadata";
+        auto parts =
+            make_raw_tensor_object_parts(buffer_ptr, size, "put_tensor_from");
+        if (!parts.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
         py::gil_scoped_release release_gil;
-        return store_->put_from(key, buffer, size, ReplicateConfig{});
+        void *payload = parts->payload_size == 0
+                            ? nullptr
+                            : reinterpret_cast<void *>(parts->payload_ptr);
+        return store_->put_from_with_metadata(
+            key, payload, reinterpret_cast<void *>(parts->metadata_ptr),
+            parts->payload_size, parts->metadata_size, ReplicateConfig{});
     }
 
     std::vector<int> batch_put_tensor_from(
@@ -1244,34 +1345,34 @@ class MooncakeStorePyWrapper {
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
+        std::vector<RawTensorObjectParts> parts;
+        parts.reserve(keys.size());
         for (size_t i = 0; i < sizes.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
+            auto parsed = make_raw_tensor_object_parts(buffer_ptrs[i], sizes[i],
+                                                       "batch_put_tensor_from");
+            if (!parsed.has_value()) {
+                LOG(ERROR) << "Invalid tensor object at index " << i;
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
-            if (sizes[i] < sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            if (!ParseTensorMetadata(
-                     reinterpret_cast<const char *>(buffer_ptrs[i]), sizes[i])
-                     .has_value()) {
-                LOG(ERROR) << "Invalid tensor metadata at index " << i;
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
+            parts.emplace_back(std::move(*parsed));
         }
-        std::vector<void *> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
+        std::vector<std::vector<void *>> buffers;
+        std::vector<std::vector<size_t>> part_sizes;
+        buffers.reserve(parts.size());
+        part_sizes.reserve(parts.size());
+        for (auto &part : parts) {
+            buffers.push_back({reinterpret_cast<void *>(part.metadata_ptr)});
+            part_sizes.push_back({part.metadata_size});
+            if (part.payload_size > 0) {
+                buffers.back().push_back(
+                    reinterpret_cast<void *>(part.payload_ptr));
+                part_sizes.back().push_back(part.payload_size);
+            }
         }
         py::gil_scoped_release release_gil;
-        return store_->batch_put_from(keys, buffers, sizes, ReplicateConfig{});
+        return store_->batch_put_from_multi_buffers(keys, buffers, part_sizes,
+                                                    ReplicateConfig{});
     }
 
     int put_tensor_info_impl(const std::string &key, const PyTensorInfo &info,
@@ -1334,15 +1435,13 @@ class MooncakeStorePyWrapper {
             return put_tensor_from(key, buffer_ptr, size);
         }
 
-        pybind11::object tensor =
-            buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptr),
-                             static_cast<int64_t>(size));
-        if (tensor.is_none()) {
-            LOG(ERROR) << "Failed to decode full tensor buffer for "
-                          "put_tensor_with_tp_from";
+        std::vector<char> host_buffer;
+        auto tensor = decode_raw_tensor_object_for_host(
+            buffer_ptr, size, host_buffer, "put_tensor_with_tp_from");
+        if (!tensor.has_value()) {
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
+        return put_tensor_with_tp_impl(key, *tensor, ReplicateConfig{}, tp_rank,
                                        tp_size, split_dim);
     }
 
@@ -1372,31 +1471,17 @@ class MooncakeStorePyWrapper {
         py::list tensors_list;
         std::vector<size_t> processed_indices;
         std::vector<int> final_results(base_keys.size(), 0);
+        std::vector<std::vector<char>> host_buffers(base_keys.size());
 
         for (size_t i = 0; i < base_keys.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
+            auto tensor = decode_raw_tensor_object_for_host(
+                buffer_ptrs[i], sizes[i], host_buffers[i],
+                "batch_put_tensor_with_tp_from");
+            if (!tensor.has_value()) {
                 final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            if (sizes[i] < sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
-                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-
-            py::object tensor =
-                buffer_to_tensor(NULL, reinterpret_cast<char *>(buffer_ptrs[i]),
-                                 static_cast<int64_t>(sizes[i]));
-            if (tensor.is_none()) {
-                LOG(ERROR) << "Failed to decode full tensor buffer at index "
-                           << i;
-                final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                continue;
-            }
-            tensors_list.append(tensor);
+            tensors_list.append(*tensor);
             processed_indices.push_back(i);
         }
 
@@ -1534,6 +1619,11 @@ class MooncakeStorePyWrapper {
             }
             auto results =
                 batch_upsert_tensor_infos_impl(tp_keys, *infos, config);
+            if (results.size() != tp_keys.size()) {
+                LOG(ERROR) << "Upsert with TP returned " << results.size()
+                           << " results, expected " << tp_keys.size();
+                return to_py_ret(ErrorCode::INTERNAL_ERROR);
+            }
             for (int ret : results) {
                 if (ret != 0) return ret;
             }
@@ -1563,35 +1653,34 @@ class MooncakeStorePyWrapper {
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
+        std::vector<RawTensorObjectParts> parts;
+        parts.reserve(keys.size());
         for (size_t i = 0; i < sizes.size(); ++i) {
-            if (buffer_ptrs[i] == 0) {
-                LOG(ERROR) << "Buffer pointer at index " << i
-                           << " cannot be null";
+            auto parsed = make_raw_tensor_object_parts(
+                buffer_ptrs[i], sizes[i], "batch_upsert_tensor_from");
+            if (!parsed.has_value()) {
+                LOG(ERROR) << "Invalid tensor object at index " << i;
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
-            if (sizes[i] < sizeof(TensorMetadata)) {
-                LOG(ERROR) << "Buffer size at index " << i
-                           << " too small for tensor metadata";
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
-            if (!ParseTensorMetadata(
-                     reinterpret_cast<const char *>(buffer_ptrs[i]), sizes[i])
-                     .has_value()) {
-                LOG(ERROR) << "Invalid tensor metadata at index " << i;
-                return std::vector<int>(keys.size(),
-                                        to_py_ret(ErrorCode::INVALID_PARAMS));
-            }
+            parts.emplace_back(std::move(*parsed));
         }
-        std::vector<void *> buffers;
-        buffers.reserve(buffer_ptrs.size());
-        for (uintptr_t ptr : buffer_ptrs) {
-            buffers.push_back(reinterpret_cast<void *>(ptr));
+        std::vector<std::vector<void *>> buffers;
+        std::vector<std::vector<size_t>> part_sizes;
+        buffers.reserve(parts.size());
+        part_sizes.reserve(parts.size());
+        for (auto &part : parts) {
+            buffers.push_back({reinterpret_cast<void *>(part.metadata_ptr)});
+            part_sizes.push_back({part.metadata_size});
+            if (part.payload_size > 0) {
+                buffers.back().push_back(
+                    reinterpret_cast<void *>(part.payload_ptr));
+                part_sizes.back().push_back(part.payload_size);
+            }
         }
         py::gil_scoped_release release_gil;
-        return store_->batch_upsert_from(keys, buffers, sizes,
-                                         ReplicateConfig{});
+        return store_->batch_upsert_from_multi_buffers(
+            keys, buffers, part_sizes, ReplicateConfig{});
     }
 
     std::vector<int> batch_upsert_tensor_impl(
@@ -1627,26 +1716,16 @@ class MooncakeStorePyWrapper {
 
     int upsert_tensor_from(const std::string &key, uintptr_t buffer_ptr,
                            size_t size) {
-        if (buffer_ptr == 0) {
-            LOG(ERROR) << "Buffer pointer cannot be null";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        void *buffer = reinterpret_cast<void *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (size < sizeof(TensorMetadata)) {
-            LOG(ERROR) << "Buffer size too small for tensor metadata";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        auto results = batch_upsert_tensor_from({key}, {buffer_ptr}, {size});
+        if (results.size() != 1) {
+            LOG(ERROR) << "Tensor upsert returned unexpected result count";
+            return to_py_ret(ErrorCode::INTERNAL_ERROR);
         }
-        if (!ParseTensorMetadata(reinterpret_cast<const char *>(buffer), size)
-                 .has_value()) {
-            LOG(ERROR) << "Invalid tensor metadata";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        py::gil_scoped_release release_gil;
-        return store_->upsert_from(key, buffer, size, ReplicateConfig{});
+        return results[0];
     }
 
     int validate_replicate_config(
@@ -2194,12 +2273,17 @@ PYBIND11_MODULE(store, m) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return real_client->setup_real(
-                    local_hostname, metadata_server, global_segment_size,
-                    local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port);
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = real_client->setup_real(
+                        local_hostname, metadata_server, global_segment_size,
+                        local_buffer_size, protocol, rdma_devices,
+                        master_server_addr, transfer_engine, "",
+                        enable_ssd_offload, ssd_offload_path, tenant_id,
+                        enable_client_http_server, client_http_port);
+                }
+                return ret;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2222,9 +2306,14 @@ PYBIND11_MODULE(store, m) {
                     config[key] = value;
                 }
 
-                auto result = real_client->setup_internal(config);
-                return result.has_value() ? 0
-                                          : static_cast<int>(result.error());
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    auto result = real_client->setup_internal(config);
+                    ret = result.has_value() ? 0
+                                             : static_cast<int>(result.error());
+                }
+                return ret;
             },
             py::arg("config"),
             "Setup the store with a configuration dictionary.\n"

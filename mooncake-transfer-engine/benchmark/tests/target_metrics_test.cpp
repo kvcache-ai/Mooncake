@@ -14,8 +14,12 @@
 
 #include "target_metrics.h"
 
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include <gtest/gtest.h>
 
@@ -24,6 +28,59 @@
 namespace mooncake {
 namespace tent {
 namespace {
+
+TEST(TargetMetricsDeathTest, ReportsBufferedWriteFailure) {
+    std::string path = testing::TempDir() + "tebench-target-jsonl-XXXXXX";
+    const int fd = mkstemp(path.data());
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    // Limit only the child: opening succeeds, but even a buffered write fails
+    // when the stream is flushed or closed.
+    EXPECT_EXIT(
+        {
+            if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) std::_Exit(2);
+            struct rlimit limit{};
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) std::_Exit(3);
+            TargetMetricsReport report;
+            std::string error;
+            const bool ok = appendTargetMetricsJsonl(path, report, &error);
+            std::_Exit(!ok && error == "failed to write target JSONL output: " +
+                                           path
+                           ? 0
+                           : 1);
+        },
+        testing::ExitedWithCode(0), "");
+    std::remove(path.c_str());
+}
+
+TEST(TargetMetricsTest, ReportsOpenFailure) {
+    TargetMetricsReport report;
+    std::string error;
+    const auto path = testing::TempDir();
+    EXPECT_FALSE(appendTargetMetricsJsonl(path, report, &error));
+    EXPECT_EQ(error, "failed to open target JSONL output: " + path);
+}
+
+TEST(TargetMetricsTest, NonConstantPayloadOnlyForHpTcpConsistencyChecks) {
+    const auto saved_transport = XferBenchConfig::xport_type;
+    const bool saved_check = XferBenchConfig::check_consistency;
+    std::vector<uint8_t> data(4096);
+    for (const auto* transport : {"hp_tcp", "tcp"}) {
+        XferBenchConfig::xport_type = transport;
+        for (bool check : {false, true}) {
+            XferBenchConfig::check_consistency = check;
+            fillData(data.data(), data.size(), 37);
+            const bool constant = std::all_of(
+                data.begin(), data.end(), [](uint8_t b) { return b == 37; });
+            EXPECT_EQ(constant,
+                      !(check && XferBenchConfig::xport_type == "hp_tcp"));
+            verifyData(data.data(), data.size(), 37);
+        }
+    }
+    XferBenchConfig::xport_type = saved_transport;
+    XferBenchConfig::check_consistency = saved_check;
+}
 
 TEST(TargetMetricsTest, ReportsEachTargetAndWritesJsonl) {
     std::vector<TargetBenchStats> stats(2);
@@ -50,6 +107,9 @@ TEST(TargetMetricsTest, ReportsEachTargetAndWritesJsonl) {
     std::remove(path.c_str());
     std::string error;
     ASSERT_TRUE(appendTargetMetricsJsonl(path, report, &error)) << error;
+    auto next_report = report;
+    next_report.batch_size = 3;
+    ASSERT_TRUE(appendTargetMetricsJsonl(path, next_report, &error)) << error;
     std::ifstream input(path);
     nlohmann::json record;
     ASSERT_NO_THROW(input >> record);
@@ -58,6 +118,9 @@ TEST(TargetMetricsTest, ReportsEachTargetAndWritesJsonl) {
     ASSERT_EQ(record["targets"].size(), 2u);
     EXPECT_EQ(record["targets"][0]["segment_name"], "target-a");
     EXPECT_EQ(record["targets"][1]["operations"], 0);
+    EXPECT_EQ(record["batch_size"], 2);
+    ASSERT_NO_THROW(input >> record);
+    EXPECT_EQ(record["batch_size"], 3);
     std::remove(path.c_str());
 }
 

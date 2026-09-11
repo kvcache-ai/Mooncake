@@ -51,5 +51,25 @@ bool RuntimeAccelerator::CopyFromHost(void* dst, const void* src,
     return accelerator->Copy(dst, src, size, CopyDirection::kHostToDevice);
 }
 
+bool RuntimeAccelerator::CopyAuto(void* dst, const void* src,
+                                  size_t size) const {
+    PointerInfo src_info, dst_info;
+    auto* src_device = FindDeviceForPointer(src, &src_info);
+    auto* dst_device = FindDeviceForPointer(dst, &dst_info);
+    if (!src_device && !dst_device) {
+        std::memcpy(dst, src, size);
+        return true;
+    }
+    // Two different accelerator runtimes cannot serve the same copy (same
+    // guard the MemcpyWorkerPool worker applies to its memcpy ops).
+    if (src_device && dst_device && src_device != dst_device) {
+        return false;
+    }
+    auto* accelerator = dst_device ? dst_device : src_device;
+    const auto& info = dst_device ? dst_info : src_info;
+    accelerator->SetContext(info.device_id);
+    return accelerator->Copy(dst, src, size, CopyDirection::kAuto);
+}
+
 }  // namespace device
 }  // namespace mooncake

@@ -101,49 +101,41 @@ namespace detail {
 // flight (#3909). Pools are few in practice (one per distinct master address
 // per process), so they are deliberately kept alive for the process lifetime.
 //
-// The first configuration for an address wins; a later caller asking for the
-// same address with different knobs gets the existing pool and a loud
-// warning, never a silently ignored config.
+// The registry key is the address plus the pool's behavioral knobs. Two
+// holders for one address with identical configuration share a pool, which is
+// the case the keep-alive exists for. The same address can also legitimately
+// host different policies at once: the foreground master pool is resilient
+// while an HA probe on that address must fast-fail, and keying by address
+// alone would hand the probe the foreground retry budget.
 inline std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
 SharedPoolRegistryImpl(
     std::string_view address,
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config config,
     coro_io::io_context_pool& io_context_pool) {
     using Pool = coro_io::client_pool<coro_rpc::coro_rpc_client>;
-    struct RegistryEntry {
-        std::shared_ptr<Pool> pool;
-        uint32_t max_connection;
-        std::chrono::milliseconds connect_timeout;
-        std::chrono::milliseconds request_timeout;
-    };
     static std::mutex registry_mutex;
-    static std::unordered_map<std::string, RegistryEntry> registry;
+    static std::unordered_map<std::string, std::shared_ptr<Pool>> registry;
     std::lock_guard<std::mutex> lock(registry_mutex);
-    auto& slot = registry[std::string(address)];
-    if (!slot.pool) {
-        const auto max_connection = config.max_connection;
-        const auto connect_timeout =
-            config.client_config.connect_timeout_duration;
-        const auto request_timeout =
-            config.client_config.request_timeout_duration;
-        slot = RegistryEntry{Pool::create(std::string(address),
-                                          std::move(config), io_context_pool),
-                             max_connection, connect_timeout, request_timeout};
-        return slot.pool;
+    std::string key;
+    key.reserve(address.size() + 64);
+    key.append(address);
+    auto append_knob = [&key](auto value) {
+        key.push_back('|');
+        key.append(std::to_string(value));
+    };
+    append_knob(config.max_connection);
+    append_knob(config.connect_retry_count);
+    append_knob(config.reconnect_wait_time.count());
+    append_knob(config.client_config.connect_timeout_duration.count());
+    append_knob(config.client_config.request_timeout_duration.count());
+    append_knob(
+        static_cast<size_t>(config.client_config.socket_config.index()));
+    auto& pool = registry[key];
+    if (!pool) {
+        pool = Pool::create(std::string(address), std::move(config),
+                            io_context_pool);
     }
-    if (slot.max_connection != config.max_connection ||
-        slot.connect_timeout != config.client_config.connect_timeout_duration ||
-        slot.request_timeout != config.client_config.request_timeout_duration) {
-        // mooncake-common has no logging framework; this mismatch must stay
-        // loud because a silently ignored config is worse than noise.
-        fprintf(stderr,
-                "RpcClientPool registry: config mismatch for address %.*s "
-                "(existing max_connection=%u, requested %u); keeping the "
-                "first configuration for this address\n",
-                (int)address.size(), address.data(), slot.max_connection,
-                config.max_connection);
-    }
-    return slot.pool;
+    return pool;
 }
 
 // ClientRequester's offload pool collection has the same lifetime hazard: its
