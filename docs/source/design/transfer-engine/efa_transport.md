@@ -5,7 +5,7 @@ This document describes how to build and use Mooncake with AWS Elastic Fabric Ad
 (efa-prerequisites-driver)=
 ## Prerequisite: AWS EFA Driver and libfabric
 
-This is the one requirement that applies in *every* case, including a `pip install` of a published wheel — those deliberately do not bundle libfabric (see [Building a Distributable Wheel](#efa-distributable-wheel)). It is normally already satisfied: EFA-enabled instances (e.g., p6-b300.48xlarge, p6-b200.48xlarge, p5en.48xlarge, p5e.48xlarge, p5.48xlarge, trn2.48xlarge) ship with the driver and libfabric pre-installed.
+This is the one requirement that applies in *every* case, including a `pip install` of a published wheel — those deliberately do not bundle libfabric (see [Building a Distributable Wheel](#efa-distributable-wheel)). It is normally already satisfied: EFA-enabled instances (e.g., p6-b300.48xlarge, p6-b200.48xlarge, p5en.48xlarge, p5e.48xlarge, p5.48xlarge, trn2.48xlarge, trn1.32xlarge) ship with the driver and libfabric pre-installed.
 
 Verify installation:
 ```bash
@@ -390,6 +390,18 @@ Tested on two p5.48xlarge instances (AMD EPYC 7R13, 8× H100 80GB, 32 EFA device
 
 > **Peak: ~64 GB/s** on both write and read — far below the GPU-to-GPU number despite identical NIC count. The bottleneck is DDR4-3200 DRAM bandwidth on the EPYC 7R13 (Milan): `batch=16` consistently wins because larger in-flight queues only deepen DRAM contention without unlocking new NIC capacity. p5.48xlarge CPU-to-CPU runs around **3× slower than p5en** (DDR5 Xeon 8488C, ~213 GB/s) at the same NIC aggregate. For PD KV transfer, the GPU-to-GPU path is the relevant one.
 
+#### 5. Neuron instances: trn2.48xlarge and trn1.32xlarge
+
+Neuron HBM moved directly over EFA (these hosts have no GPU). Sweeps and flags in [AWS Neuron](#efa-neuron); headline write numbers, two hosts each:
+
+| | Neuron HBM | Host DRAM | EFA line rate |
+|---|---|---|---|
+| trn2.48xlarge (16 EFA × 200 Gbps, 16 Trainium2) | **266–271 GB/s** | 113 GB/s | 400 GB/s |
+| trn1.32xlarge (8 EFA × 100 Gbps, 16 Trainium1) | **88.15 GB/s** | 97.2 GB/s | 100 GB/s |
+
+> A run an order of magnitude below these is a NIC-affinity problem rather than a tuning problem: see [PCIe NIC affinity](#pcie-switch-nic-affinity).
+
+(single-host-loopback)=
 ### Single-host loopback
 
 EFA NICs have no hardware loopback short-circuit: when a transfer's source and destination resolve to the same host, the data does not go out on the wire as GPUDirect/device RDMA. libfabric handles the same-host case in software, and there are **two distinct provider knobs** that select how:
@@ -419,7 +431,7 @@ transfer — `__memcpy_avx_unaligned` ← `ofi_copy_to_mr_iov` ← `smr_copy_fro
   then fall back to device RDMA, which is GPU-aware and correct.
 ```
 
-For **host (DRAM) buffers** the SHM memcpy path is safe (host→host copy) and is the same-host fast path the measurements below exercise.
+For **host (DRAM) buffers** the SHM memcpy path is safe (host→host copy) and is the same-host fast path the measurements below exercise. For **Neuron HBM** it is neither safe nor fast, and Mooncake disables it automatically — see [Same-host transfers](#neuron-same-host).
 
 Measured on p5.48xlarge (1 NIC, ~1.2 GiB per `put_from` call, host DRAM buffer, same-host producer/consumer in **separate processes**):
 
@@ -525,7 +537,9 @@ submit #4:   0.09 ms
 (efa-neuron)=
 ## AWS Neuron (Trainium / Inferentia)
 
-On Neuron instances such as `trn2.48xlarge`, the EFA transport moves Neuron HBM directly, without staging through host DRAM. Nothing has to be configured for this: a registered buffer is recognised as Neuron memory from the `/dev/neuron<N>` mapping that backs it, and is then registered with `fi_mr_regattr(iface=FI_HMEM_NEURON)`. Neuron support needs no Neuron SDK at build time and no code changes in the application.
+On Neuron instances the EFA transport moves Neuron HBM directly, without staging through host DRAM. Nothing has to be configured for this: a registered buffer is recognised as Neuron memory from the `/dev/neuron<N>` mapping that backs it, and is then registered with `fi_mr_regattr(iface=FI_HMEM_NEURON)`. Neuron support needs no Neuron SDK at build time and no code changes in the application.
+
+Measured end to end on **`trn2.48xlarge`** (Trainium2) and **`trn1.32xlarge`** (Trainium1), which differ in PCIe layout — see [PCIe NIC affinity](#pcie-switch-nic-affinity).
 
 Two runtime conditions have to hold. Both are already met on a stock Neuron instance, and each has a log line that names it when it is not:
 
@@ -562,18 +576,43 @@ make -j$(nproc)
 A `0` there means the headers predate libfabric 1.15 and the build will refuse to register Neuron HBM at runtime; point `-DLIBFABRIC_INCLUDE_DIR` / `-DLIBFABRIC_LIBRARY` at a newer libfabric. To install rather than build, take the **non-CUDA** wheel (`pip install mooncake-transfer-engine-efa-non-cuda`) — the published wheels are built against a libfabric that has `FI_HMEM_NEURON`.
 
 (pcie-switch-nic-affinity)=
-### PCIe-switch NIC affinity
+### PCIe NIC affinity
 
-`trn2.48xlarge` has 8 PCIe switches, each carrying 2 Neuron devices and 2 EFA NICs, and a Neuron device can only reach the NICs behind its own switch at full speed. The topology discovery therefore maps each `/dev/neuron<N>` to its switch-local NICs and publishes them as that location's preferred HCAs, which is what makes the difference between the two rows below (both measured with the recommended shape from [Benchmarking](#neuron-benchmarking): 16 devices, 4 GB buffers, 1 MB blocks, 32 threads, batch 128):
+A Neuron device can only reach the EFA NICs that share its PCIe locality at full speed, so the topology discovery maps each `/dev/neuron<N>` to those NICs and publishes them as that location's preferred HCAs. This needs no configuration, and it is the single largest factor in Neuron throughput — larger than every tuning knob combined.
 
-| NIC selection | Throughput |
+The mapping is derived from sysfs by grouping devices under the bridge they hang off (`nec_get_device_pci_bdf()` for the Neuron side, `/sys/class/infiniband/*/device` for the NICs — the Neuron driver exposes its devices as *virtual* class devices with no link back to PCI, and the ordinals are not in BDF order). The grouping is by parent bridge rather than by switch because the two instance types are laid out differently:
+
+| | `trn2.48xlarge` | `trn1.32xlarge` |
+|---|---|---|
+| Groups | 8 PCIe switches, 2 Neuron + 2 EFA each | 4 root buses, 4 Neuron + 2 EFA each |
+| Parent in sysfs | switch port, `0000:b9:02.1` | host bridge, `pci0000:10` |
+| NIC line rate | 200 Gbps | 100 Gbps |
+
+Measured with the recommended shape from [Benchmarking](#neuron-benchmarking) (16 buffers, 4 GB each, 1 MB blocks, 32 threads, batch 128, write, two hosts; the trn1 column predates the placement fix below, so both its rows sat on 8 devices and are about 10% low):
+
+| NIC selection | `trn2.48xlarge` | `trn1.32xlarge` |
+|---|---|---|
+| Locality-aware (default) | **266.58 GB/s** | **82.71 GB/s** |
+| All NICs (`--nic_priority_matrix` overriding the default) | 23.48 GB/s | 0.22 GB/s |
+| Ratio | 11.4× | 376× |
+
+trn1 is the more sensitive of the two because its groups are two NUMA nodes apart rather than one switch apart, and NIC enumeration lists the far-NUMA NICs first, so an unguided device picks a cross-NUMA NIC by default. When Mooncake cannot build the mapping at all it logs *"could not group any EFA NIC by its parent PCI bus"* or *"no device could be matched to an EFA NIC"* at `WARNING`, and throughput lands in the same 0.2 GB/s range.
+
+The affinity is also verifiable from outside the benchmark, using the NIC hardware counters under `/sys/class/infiniband/<dev>/ports/1/hw_counters/tx_bytes`. On trn2 a single-device run (`--neuron_device_count=1`) moves 19.27 GB/s and every byte of it appears on exactly two NICs — the two behind that device's switch — with the other fourteen flat at zero. The same counters also confirm the reported aggregate: a full-instance run reads 279.5 GB/s summed across all 16 NICs against 278.97 GB/s self-reported.
+
+(neuron-same-host)=
+### Same-host transfers
+
+libfabric's EFA provider hands same-host peers to an internal `shm` sub-provider, and **that sub-provider cannot move Neuron HBM**: its `FI_HMEM_NEURON` op table implements `copy_to_hmem` but leaves `copy_from_hmem` returning `-FI_ENOSYS`, and every IPC entry is a no-op stub. The `/dev/neuron` mapping is then `memcpy`'d as if it were host memory, across an uncached PCIe BAR — bytes arrive intact, throughput collapses.
+
+Mooncake therefore turns the sub-provider off on Neuron hosts with `setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 0)` before the first `fi_getinfo`, leaving same-host transfers on the Neuron-aware device-RDMA path. Measured intra-node on one `trn1.32xlarge` (two processes splitting the NeuronCores, 1 device, 1 MB blocks, 8 threads, batch 32, write):
+
+| same-host path | Throughput |
 |---|---|
-| Switch-local NICs (default) | **266.58 GB/s** |
-| All 16 NICs (`--nic_priority_matrix` overriding the default) | 23.48 GB/s |
+| device RDMA (`FI_EFA_ENABLE_SHM_TRANSFER=0`, the default Mooncake sets) | **14.21 GB/s** |
+| `shm` sub-provider (`FI_EFA_ENABLE_SHM_TRANSFER=1`) | 0.09 GB/s |
 
-For reference, host DRAM over the same fabric tops out at 113 GB/s on this instance, so correctly routed Neuron HBM is roughly 2.4× faster than CPU-to-CPU.
-
-The affinity is verifiable from outside the benchmark, using the NIC hardware counters under `/sys/class/infiniband/<dev>/ports/1/hw_counters/tx_bytes`. A single-device run (`--neuron_device_count=1`) moves 19.27 GB/s and every byte of it appears on exactly two NICs — the two behind that device's switch — with the other fourteen flat at zero. The same counters also confirm the reported aggregate: a full-instance run reads 279.5 GB/s summed across all 16 NICs against 278.97 GB/s self-reported.
+The overwrite flag is `0`, so an explicit `FI_EFA_ENABLE_SHM_TRANSFER` in the environment still wins — which is how the second row was measured with the same binary. There is no reason to set it on a Neuron host: nothing on this path uses the `shm` memcpy fast path that [Single-host loopback](#single-host-loopback) is about, and with the sub-provider off same-host costs nothing relative to the wire — 14.21 GB/s here against 14.20 for the same single-device shape between two hosts, and 19.23 against 19.26 on trn2.
 
 (neuron-benchmarking)=
 ### Benchmarking
@@ -602,18 +641,33 @@ The flags below are the measured optimum on `trn2.48xlarge` (see [Tuning](#neuro
 | Parameter | Default | Description |
 |---|---|---|
 | `--neuron_device` | `-1` | Logical NeuronCore to allocate the first buffer on; `-1` disables the Neuron path entirely |
-| `--neuron_device_count` | `1` | How many Neuron devices to spread buffers over, starting from `--neuron_device`. Only 2 EFA NICs sit on any one device's PCIe switch, so one device cannot drive the whole fabric — use `16` on trn2.48xlarge |
-| `--neuron_core_stride` | `0` (auto) | Logical NeuronCores per physical device, i.e. how far to step between buffers; auto-detected from sysfs `core_count / 2` (LNC=2) |
+| `--neuron_device_count` | `1` | How many buffers to allocate, one per step of `--neuron_core_stride` from `--neuron_device`. Only 2 EFA NICs are local to any one device, so a single device cannot drive the whole fabric — use `16` on both trn2.48xlarge and trn1.32xlarge |
+| `--neuron_core_stride` | `0` (probe) | Logical NeuronCores to step between consecutive buffers. The default steps nothing fixed: it allocates a page on each core in turn, asks which `/dev/neuron<N>` the pointer belongs to, and puts one buffer on the first core of each distinct device. Set it only to reproduce a particular placement (see [Tuning](#neuron-tuning)) |
 | `--neuron_fill_byte` | `0xCC` | Byte prefilled into HBM. Give the two sides different values and the target reports on shutdown how much the peer actually overwrote — the only end-to-end check available, since the host cannot `memcmp()` device memory |
 
 > **Note:** `--operation` defaults to `read`. A write-path read-back check on a `read` run reports "0 bytes differ" and looks like a bug when it is simply not writing anything.
 
 > **Note:** `nrt_init` claims **all visible NeuronCores** regardless of `--neuron_device_count`. On a shared host, restrict the benchmark with a contiguous range, e.g. `NEURON_RT_VISIBLE_CORES=56-63`.
 
+`trn1.32xlarge` also has 16 Neuron devices, so the same command applies with only a smaller shape — `--neuron_device_count=16 --block_size=1048576 --threads=32 --batch_size=32`, and every alternative to it is within ±2% ([Tuning](#neuron-tuning)).
+
+Either way, confirm the placement from the target's log rather than assuming it: one *"N distinct device(s) found"* line, then one *"as `neuron:N`"* line per buffer.
+
 (neuron-tuning)=
 ### Tuning
 
-Everything below was swept on two `trn2.48xlarge` writing Neuron HBM to Neuron HBM over all 16 devices, one 4 GB buffer per device. Run-to-run spread is ±2%, so only differences larger than that mean anything.
+Both instance types were swept host-to-host, writing Neuron HBM to Neuron HBM. Run-to-run spread is ±2% on either, so only differences larger than that mean anything. They are bound by different things, which is what decides whether tuning is worth the trouble at all:
+
+| | `trn2.48xlarge` | `trn1.32xlarge` |
+|---|---|---|
+| Peak Neuron HBM write | 266–271 GB/s (67% of line rate) | 88.15 GB/s (**88%** of line rate) |
+| Host DRAM over the same fabric | 113 GB/s | 97.2 GB/s |
+| What binds | the per-device accelerator path, ~17 GB/s each | the accelerator per device (14.2 GB/s), the NICs from 4 devices up |
+| Knobs that matter | `--threads`, and `--block_size` if left small | device spread, and `--threads` ≥ 16; nothing else clears the noise |
+
+#### trn2.48xlarge
+
+Swept over all 16 devices, one 4 GB buffer per device.
 
 **`--threads` is the dominant knob**, and it peaks well before the core count — 32 threads over 16 devices is 2 per device (block 1 MB, batch sized to keep `block × batch × threads` inside the buffer):
 
@@ -633,7 +687,39 @@ Everything below was swept on two `trn2.48xlarge` writing Neuron HBM to Neuron H
 
 - Adding NICs per device cannot help; the switch only has 2 anyway.
 - Spreading buffers across all 64 logical NeuronCores instead of 16 (`--neuron_core_stride=1 --neuron_device_count=64`) is worth about +3% (279 vs 270 GB/s) for 2× the HBM footprint and a matching flag on both sides. Not worth it as a default, but it is the shape to reach for if you are chasing the last few percent.
-- Runs that fall far below these numbers are almost always a NIC-affinity problem rather than a tuning problem — see [PCIe-switch NIC affinity](#pcie-switch-nic-affinity) for the 11× cliff and how to confirm it from the NIC counters.
+- Runs that fall far below these numbers are almost always a NIC-affinity problem rather than a tuning problem — see [PCIe NIC affinity](#pcie-switch-nic-affinity) for the 11× cliff and how to confirm it from the NIC counters.
+
+#### trn1.32xlarge
+
+Swept over 16 buffers of 8 GB. These predate the placement fix below, so they sat on 8 devices rather than 16 — about 8% low, evenly across every row.
+
+**Nothing except "`--threads` ≥ 16" is worth tuning.** Past 8 threads every knob lands inside the ±2% spread:
+
+| `--threads` (block 1 MB, batch 32) | | `--block_size` (32 threads, batch 32) | | `--batch_size` (32 threads, 1 MB) | |
+|---|---|---|---|---|---|
+| 8 | 40.70 GB/s | 256 KB | 79.83 GB/s | 32 | 78.70 GB/s |
+| **16** | **80.08 GB/s** | 512 KB | 77.70 GB/s | **64** | **81.59 GB/s** |
+| 32 | 78.58 GB/s | 1 MB | 79.79 GB/s | 128 | 78.63 GB/s |
+| 64 | 79.43 GB/s | 2 MB | 80.08 GB/s | 256 | 80.20 GB/s |
+| 128 | 79.09 GB/s | 4 MB | 80.55 GB/s | | |
+
+`--block_size` flat all the way down to 256 KB is the sharpest contrast with every other instance in this document, where 1 MB is worth 2–4× over the 64 KB default. It is flat because the ceiling is not the wire.
+
+**What pays is device spread, and this instance is why the benchmark now probes for placement instead of stepping a fixed number of cores**: a step derived from trn2's core fusion comes out as `1` here, which stacks two buffers on each of half the devices and leaves the rest idle, with throughput as the only symptom (32 threads, 1 MB, batch 32, 2 GB buffers):
+
+| Buffers × devices | Flags | Throughput |
+|---|---|---|
+| **16 buffers over 16 devices** | **`--neuron_device_count=16`** (the default placement) | **86.5–88.2 GB/s** |
+| 16 buffers over 8 devices | `--neuron_device_count=16 --neuron_core_stride=1` | 80.0–80.3 GB/s |
+| 8 buffers over 8 devices | `--neuron_device_count=8 --neuron_core_stride=2` | 82.67 GB/s |
+| 4 buffers over 4 devices | `--neuron_device_count=4 --neuron_core_stride=2` | 40.24 GB/s |
+| 1 buffer, 1 device | `--neuron_device_count=1` | 14.20 GB/s |
+
+The first two rows are the fix and what it replaced, otherwise the same run. The ranges are repeats across sessions, not sweeps: 16-device runs read 86.45 / 86.92 / 87.33 / 88.15 / 89.61 GB/s.
+
+Only the last row is accelerator-limited — one device sustains 14.20 GB/s of the 25 its two local NICs could carry. Above that the NICs bind, and since affinity pins each buffer to the NICs on its own root bus, a low `--neuron_device_count` leaves whole NIC pairs idle: devices 0–3 sit on only two of the four buses, so `=4` has 50 GB/s of line rate available and takes 40.24 (80%), while `=8` reaches all four buses and takes 82.67 of 100 GB/s (83%). (The buses hold devices 0,1,12,13 / 2,3,14,15 / 4,5,8,9 / 6,7,10,11 — `--v=1` logs the mapping.)
+
+**Host DRAM over the same fabric measures 97.18–97.25 GB/s**, dead flat across threads 16–64, blocks 256 KB–1 MB and batches 32–128, i.e. 97% of the 800 Gbps line rate and the practical ceiling here; Neuron HBM reaches 91% of it. That inverts trn2, where Neuron HBM (266) is 2.4× host DRAM (113) — so on trn1 the reason to move HBM directly is not raw throughput but that the staged alternative pays `nrt_tensor_read()` into host memory first, plus its buffer and CPU time, on top of whichever number you compare against.
 
 (efa-env-vars)=
 ## Environment Variables
@@ -853,7 +939,8 @@ CQs are polled by dedicated worker threads that run independently of submission 
 - p5en.48xlarge (16 EFA devices × 200 Gbps = 3,200 Gbps, `rdmap*` naming)
 - p5e.48xlarge (32 EFA devices × 100 Gbps = 3,200 Gbps, `rdmap*` naming)
 - p5.48xlarge (32 EFA devices × 100 Gbps = 3,200 Gbps, `rdmap*` naming)
-- trn2.48xlarge (16 EFA devices × 200 Gbps = 3,200 Gbps, `rdmap*` naming; 16 Neuron devices, see [AWS Neuron](#efa-neuron))
+- trn2.48xlarge (16 EFA devices × 200 Gbps = 3,200 Gbps, `rdmap*` naming; 16 Trainium2 devices, see [AWS Neuron](#efa-neuron))
+- trn1.32xlarge (8 EFA devices × 100 Gbps = 800 Gbps, `rdmap*` naming; 16 Trainium1 devices, see [AWS Neuron](#efa-neuron))
 - Other EFA-enabled instances
 
 Use `fi_info -p efa` to list available EFA devices on your instance.

@@ -25,6 +25,7 @@
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -33,6 +34,12 @@
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+
+#ifdef USE_EFA
+// For neuronProbeAddress(), which answers which /dev/neuron<N> a pointer
+// belongs to -- the same lookup the transport uses to name a buffer's location.
+#include "transport/efa_transport/efa_neuron.h"
+#endif
 
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
@@ -140,10 +147,13 @@ DEFINE_int32(
     "the bytes landed in device memory, since the host cannot memcmp() "
     "it");
 DEFINE_int32(neuron_core_stride, 0,
-             "Logical NeuronCores per physical device, i.e. how far to step "
-             "between the buffers of --neuron_device_count. 0 auto-detects. "
-             "Check the \"Registering Neuron HBM ... as neuron:N\" lines: the "
-             "ordinals must all differ");
+             "Logical NeuronCores to step between the buffers of "
+             "--neuron_device_count. 0 (the default) does not step a fixed "
+             "amount at all: it finds one logical core per physical device by "
+             "probing, which needs no assumption about core fusion. Set it "
+             "only to reproduce a particular placement. Either way the "
+             "\"Registering Neuron HBM ... as neuron:N\" lines say where the "
+             "buffers landed");
 #endif
 
 using namespace mooncake;
@@ -223,16 +233,79 @@ const NeuronRuntime* neuronRuntime() {
     return ok ? &rt : nullptr;
 }
 
-// How far to step, in nrt_tensor_allocate() core indices, to land on the next
-// physical device.
+// The logical core index of the first core of each distinct physical device,
+// starting the scan at --neuron_device, discovered by allocating a page on each
+// core in turn and asking the transport which device the pointer came from.
 //
-// The step is not the physical core count sysfs reports: those indices are
-// *logical* cores, and trn2 fuses cores in pairs by default (LNC=2), so its 8
-// physical cores per device are 4 logical ones.  The fusion factor is a runtime
-// setting with no clean query -- nrt_get_visible_vnc_count() segfaults when
-// called with the signature its symbol suggests -- so it is inferred from the
-// two numbers that can be read reliably: how many logical cores the runtime
-// hands out in total, and how many devices exist.
+// This exists because there is no arithmetic that gets it right on every
+// instance type.  Stepping by a fixed number of cores requires knowing the
+// core-fusion factor (LNC), which is a runtime setting with no clean query --
+// nrt_get_visible_vnc_count() segfaults when called with the signature its
+// symbol suggests -- and guessing it wrong is silent: on trn1.32xlarge, where
+// Trainium1 does not fuse cores at all, a step derived from trn2's LNC=2 puts
+// two buffers on each of half the devices, leaves the other half idle, and only
+// shows up as ~10% less throughput.  Asking where a pointer actually landed
+// needs no such guess and cannot be silently wrong.
+const std::vector<int>& neuronFirstCorePerDevice() {
+    // Bounded by the largest instance today (trn2.48xlarge: 16 devices x 4
+    // logical cores), with room to spare; the scan also stops at the first core
+    // the runtime refuses, which is the usual way out.
+    constexpr int kMaxCoreScan = 128;
+    static const std::vector<int> cores = []() {
+        std::vector<int> cores;
+        const NeuronRuntime* rt = neuronRuntime();
+        if (!rt) return cores;
+
+        // Every probe is held until the scan is over, and only then freed.  The
+        // runtime hands the *same* virtual address straight back after a free,
+        // so freeing as we went made every core look like the one before it and
+        // the whole scan reported a single device.
+        std::vector<struct nrt_tensor*> probes;
+        std::set<int> seen_devices;
+        const int first = std::max(0, FLAGS_neuron_device);
+        for (int core = first; core < first + kMaxCoreScan; ++core) {
+            struct nrt_tensor* tensor = nullptr;
+            // A page is enough: the probe reads the device ordinal out of the
+            // /dev/neuron<N> mapping the allocation sits in, not out of its
+            // size.  Anything the runtime refuses ends the scan -- that is how
+            // the last visible core is found (NRT_STATUS 2, invalid, on the
+            // first core past the visible range).
+            int rc =
+                rt->tensor_allocate(0, core, 4096, "mooncake_probe", &tensor);
+            if (rc != 0) {
+                VLOG(1) << "Neuron: logical core " << core
+                        << " refused a probe allocation (NRT_STATUS " << rc
+                        << "), ending the scan";
+                break;
+            }
+            probes.push_back(tensor);
+            void* va = rt->tensor_get_va(tensor);
+            int device_index = -1;
+            const bool found =
+                va && neuronProbeAddress(va, 4096, &device_index);
+            VLOG(1) << "Neuron: logical core " << core << " at " << va
+                    << " belongs to device "
+                    << (found ? std::to_string(device_index)
+                              : std::string("(unknown)"));
+            if (found && seen_devices.insert(device_index).second) {
+                cores.push_back(core);
+            }
+        }
+        for (auto& tensor : probes) rt->tensor_free(&tensor);
+        if (!cores.empty()) {
+            LOG(INFO) << "Neuron: " << cores.size()
+                      << " distinct device(s) found among logical cores "
+                      << first << ".." << (first + kMaxCoreScan - 1)
+                      << ", one buffer will go on each";
+        }
+        return cores;
+    }();
+    return cores;
+}
+
+// How far to step, in nrt_tensor_allocate() core indices, to land on the next
+// physical device.  The fallback for when the probe above comes up short, and
+// what --neuron_core_stride overrides.
 int neuronCoresPerDevice() {
     static const int stride = []() -> int {
         if (FLAGS_neuron_core_stride > 0) return FLAGS_neuron_core_stride;
@@ -261,8 +334,27 @@ void* allocateNeuronMemory(size_t size, int buffer_id) {
     const NeuronRuntime* rt = neuronRuntime();
     if (!rt) return nullptr;
 
-    // One buffer per device, so step a whole device's worth of cores.
-    const int core = FLAGS_neuron_device + buffer_id * neuronCoresPerDevice();
+    // One buffer per device.  The probed core list is used only when it covers
+    // every buffer asked for: a probe that came up short (an old libfabric, so
+    // neuronProbeAddress() answers false for everything, or mappings the
+    // runtime had not published yet) would otherwise quietly stack the
+    // remaining buffers onto devices already in use, which is the failure this
+    // replaced.  Falling back to the arithmetic keeps such a host exactly where
+    // it was.
+    const auto& probed = neuronFirstCorePerDevice();
+    const bool use_probed = FLAGS_neuron_core_stride <= 0 && !probed.empty() &&
+                            (int)probed.size() >= FLAGS_neuron_device_count;
+    if (FLAGS_neuron_core_stride <= 0 && !use_probed && buffer_id == 0) {
+        LOG(WARNING) << "Neuron: probed " << probed.size() << " device(s) for "
+                     << FLAGS_neuron_device_count
+                     << " buffer(s), falling back to a fixed core step of "
+                     << neuronCoresPerDevice()
+                     << "; check the \"as neuron:N\" ordinals below and pass "
+                        "--neuron_core_stride if they repeat";
+    }
+    const int core =
+        use_probed ? probed[buffer_id % probed.size()]
+                   : FLAGS_neuron_device + buffer_id * neuronCoresPerDevice();
 
     struct nrt_tensor* tensor = nullptr;
     // 0 == NRT_TENSOR_PLACEMENT_DEVICE, i.e. HBM rather than pinned host
