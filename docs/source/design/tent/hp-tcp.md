@@ -100,6 +100,16 @@ Independent peers can continue while a peer is waiting for its progress
 timeout. FIFO sharing within one peer's lanes can still delay small requests
 behind large ones; slicing is not a priority or preemption mechanism.
 
+The client separately closes a pooled socket after
+`idle_connection_timeout_ms` without active or queued work on that lane
+(default 60 seconds). New work before expiry cancels this timer and reuses the
+socket; work after expiry reconnects. This releases receiver connection slots
+held by idle updated clients. The server does not evict established idle sockets:
+it cannot know whether a client has just started another WRITE. Older clients
+that keep sockets open indefinitely still require their own pool cleanup.
+Tasks attempted while the receiver connection limit is full can still fail;
+idle cleanup is not task backpressure or an automatic retry policy.
+
 Shutdown closes admission and the listener, drains queued dispatch callbacks,
 cancels every client lane and server session on its owner, waits for operations
 and leases, then stops and joins worker threads. This makes shutdown bounded
@@ -132,6 +142,7 @@ The transport is configured under `transports.hp_tcp`:
 | `max_outstanding_tasks`, `max_outstanding_bytes` | Global admission bounds. |
 | `max_transfer_bytes` | Maximum request size. When HP TCP is enabled, coalescing of HP TCP/UNSPEC requests respects both local and advertised remote limits; an individually oversized request is still rejected. |
 | `connect_timeout_ms`, `progress_timeout_ms` | Connection and I/O deadlines. |
+| `idle_connection_timeout_ms` | Positive client idle-pool retention time; default 60000 ms. Active or queued requests are never expired by this timer. Shorter retention frees receiver slots sooner but requires more reconnections for intermittent traffic. |
 
 ### Single-rail and paired-rail examples
 
