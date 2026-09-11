@@ -42,18 +42,6 @@ bool containsBuffer(const SegmentDesc& desc, uint64_t base, size_t length) {
     }
     return false;
 }
-
-Status appendContext(Status primary, const char* context,
-                     const Status& detail) {
-    if (detail.ok()) return primary;
-    if (primary.ok()) return detail;
-    std::string message(primary.message());
-    if (!message.empty()) message += "\n";
-    message += context;
-    message += ": ";
-    message += detail.ToString();
-    return Status(primary.code(), message);
-}
 }  // namespace
 
 Status SegmentTracker::add(uint64_t base, size_t length,
@@ -103,8 +91,7 @@ Status SegmentTracker::add(uint64_t base, size_t length,
 Status SegmentTracker::addInBatch(
     std::vector<BufferDesc>& desc_list,
     std::function<Status(std::vector<BufferDesc>&)> callback,
-    std::vector<BufferDesc>& rollback_removed) {
-    rollback_removed.clear();
+    std::function<void(BufferDesc&)> on_removed) {
     std::vector<BufferDesc> new_desc_list;
     // Read-only pre-scan (see add()): skip the ref-count publication when no
     // entry duplicates an already-registered range.
@@ -177,11 +164,10 @@ Status SegmentTracker::addInBatch(
                     return Status::OK();
                 });
             if (!rollback_status.ok()) {
-                return appendContext(
-                    status, "registration rollback metadata update failed",
-                    rollback_status);
+                LOG(WARNING) << rollback_status.ToString();
+            } else if (on_removed) {
+                for (auto& buffer : removed) on_removed(buffer);
             }
-            rollback_removed = std::move(removed);
         }
         return status;
     }

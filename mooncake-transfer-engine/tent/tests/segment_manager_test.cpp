@@ -135,10 +135,9 @@ TEST(SegmentTrackerTest, RefCountedAddRemove) {
 
     auto noop = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
     std::vector<BufferDesc> first{makeBuffer(0x10000, 0x1000)};
-    std::vector<BufferDesc> rollback_removed;
-    ASSERT_TRUE(tracker.addInBatch(first, noop, rollback_removed).ok());
+    ASSERT_TRUE(tracker.addInBatch(first, noop).ok());
     std::vector<BufferDesc> second{makeBuffer(0x10000, 0x1000)};
-    ASSERT_TRUE(tracker.addInBatch(second, noop, rollback_removed).ok());
+    ASSERT_TRUE(tracker.addInBatch(second, noop).ok());
 
     auto snapshot = manager->getLocal();
     ASSERT_EQ(buffersOf(snapshot).size(), 1u);
@@ -164,8 +163,7 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
 
     auto ok = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
     std::vector<BufferDesc> first{makeBuffer(0x20000, 0x1000)};
-    std::vector<BufferDesc> rollback_removed;
-    ASSERT_TRUE(tracker.addInBatch(first, ok, rollback_removed).ok());
+    ASSERT_TRUE(tracker.addInBatch(first, ok).ok());
     ASSERT_EQ(buffersOf(manager->getLocal())[0].ref_count, 1);
 
     // A duplicate registration whose transport callback fails must not leave
@@ -174,7 +172,7 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
         return Status::InternalError("injected transport failure");
     };
     std::vector<BufferDesc> dup{makeBuffer(0x20000, 0x1000)};
-    EXPECT_FALSE(tracker.addInBatch(dup, fail, rollback_removed).ok());
+    EXPECT_FALSE(tracker.addInBatch(dup, fail).ok());
     ASSERT_EQ(buffersOf(manager->getLocal()).size(), 1u);
     EXPECT_EQ(buffersOf(manager->getLocal())[0].ref_count, 1);
 
@@ -186,6 +184,60 @@ TEST(SegmentTrackerTest, AddInBatchCallbackFailureRollsBackRefCounts) {
     ASSERT_TRUE(tracker.remove(0x20000, 0x1000, on_remove).ok());
     EXPECT_EQ(remove_callbacks, 1);
     EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+}
+
+TEST(SegmentTrackerTest, FailedBatchHandsOffLastReferenceOutsideWriterLock) {
+    auto manager = makeManager();
+    SegmentTracker tracker(*manager);
+    auto buffer = makeBuffer(0x30000, 0x1000);
+    buffer.transports = {HP_TCP};
+    buffer.transport_attrs[HP_TCP] = "old-registration";
+    buffer.lkey = {7};
+    auto ok = [](std::vector<BufferDesc>&) -> Status { return Status::OK(); };
+    std::vector<BufferDesc> first{buffer};
+    ASSERT_TRUE(tracker.addInBatch(first, ok).ok());
+
+    int owner_removals = 0;
+    int rollback_removals = 0;
+    const auto failure = Status::InternalError("injected transport failure");
+    // Both duplicate pins must be released; only the last one hands off.
+    std::vector<BufferDesc> duplicates{buffer, buffer};
+    auto status = tracker.addInBatch(
+        duplicates,
+        [&](std::vector<BufferDesc>&) -> Status {
+            EXPECT_TRUE(tracker
+                            .remove(buffer.addr, buffer.length,
+                                    [&](BufferDesc&) -> Status {
+                                        owner_removals++;
+                                        return Status::OK();
+                                    })
+                            .ok());
+            EXPECT_EQ(owner_removals, 0);
+            return failure;
+        },
+        [&](BufferDesc& removed) {
+            rollback_removals++;
+            EXPECT_EQ(removed.addr, buffer.addr);
+            EXPECT_EQ(removed.length, buffer.length);
+            EXPECT_EQ(removed.location, buffer.location);
+            EXPECT_EQ(removed.transports, buffer.transports);
+            EXPECT_EQ(removed.transport_attrs, buffer.transport_attrs);
+            EXPECT_EQ(removed.lkey, buffer.lkey);
+            EXPECT_EQ(removed.ref_count, 0);
+            EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+            // A writer can publish from the callback: the lock is released.
+            EXPECT_TRUE(manager
+                            ->updateLocal([](SegmentDesc& desc) -> Status {
+                                desc.name = "cleanup_callback";
+                                return Status::OK();
+                            })
+                            .ok());
+        });
+    EXPECT_EQ(status.code(), failure.code());
+    EXPECT_EQ(status.message(), failure.message());
+    EXPECT_EQ(rollback_removals, 1);
+    EXPECT_TRUE(buffersOf(manager->getLocal()).empty());
+    EXPECT_EQ(manager->getLocal()->name, "cleanup_callback");
 }
 
 TEST(SegmentTrackerTest, AddProbesRealMemoryAndRefCounts) {
@@ -255,9 +307,7 @@ TEST(SegmentTrackerTest, ConcurrentWritersVsSnapshotReaders) {
                     batch.push_back(
                         makeBuffer(base + i * kLength * 2, kLength));
                 }
-                std::vector<BufferDesc> rollback_removed;
-                if (!tracker.addInBatch(batch, noop, rollback_removed).ok())
-                    failures++;
+                if (!tracker.addInBatch(batch, noop).ok()) failures++;
                 for (int i = 0; i < kBuffersPerBatch; ++i) {
                     auto on_remove = [](BufferDesc&) -> Status {
                         return Status::OK();

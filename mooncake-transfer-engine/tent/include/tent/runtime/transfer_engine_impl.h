@@ -389,7 +389,7 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    Status deregisterRemovedBuffer(BufferDesc& desc);
+    void deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 

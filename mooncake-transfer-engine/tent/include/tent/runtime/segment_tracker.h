@@ -48,9 +48,10 @@ class SegmentTracker {
     SegmentTracker& operator==(const SegmentTracker&) = delete;
 
    public:
+    // on_removed runs after rollback publication, outside the writer lock.
     Status addInBatch(std::vector<BufferDesc>& desc_list,
                       std::function<Status(std::vector<BufferDesc>&)> callback,
-                      std::vector<BufferDesc>& rollback_removed);
+                      std::function<void(BufferDesc&)> on_removed = {});
 
     Status add(uint64_t base, size_t length,
                std::function<Status(BufferDesc&)> callback);
