@@ -186,7 +186,10 @@ const NeuronRuntime* neuronRuntime() {
         if (!handle)
             handle = dlopen("/opt/aws/neuron/lib/libnrt.so.1", RTLD_LAZY);
         if (!handle) {
-            LOG(ERROR) << "--neuron_device requires libnrt: " << dlerror();
+            // dlerror() may return NULL; streaming a NULL const char* is UB.
+            const char* err = dlerror();
+            LOG(ERROR) << "--neuron_device requires libnrt: "
+                       << (err ? err : "no dlerror() message");
             return false;
         }
         rt.init = (decltype(rt.init))dlsym(handle, "nrt_init");

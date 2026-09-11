@@ -220,23 +220,41 @@ bool neuronAvailable() {
                         "older distro libfabric-dev packages do not).";
         return false;
 #else
-        // Deliberately still true when libnrt is missing.  The hardware is
-        // there, so calling Neuron HBM host memory would be a lie -- and an
-        // expensive one, since "cpu:N" is what opts a buffer into CPU pre-touch
-        // stores.  Better to keep the honest answer and let registration fail
-        // loudly, with this line explaining why.
+        // Deliberately still true when libnrt cannot be loaded, because this
+        // answer is cached for the lifetime of the process (see the static
+        // above) and "false" is the more dangerous of the two mistakes.
+        //
+        // Returning false makes neuronProbeAddress() report Neuron HBM as host
+        // memory, and a "cpu" location prefix is exactly what opts a buffer
+        // into EfaTransport::preTouchMemory()'s CPU-side stores -- host writes
+        // into a device VA, for every chunk of 4 GiB or more.  Since
+        // neuronAvailable() first runs during transport install, a framework
+        // that loads libnrt and allocates its tensors afterwards would be
+        // caught by that.
+        //
+        // Returning true keeps the hints and the per-buffer classification
+        // correct.  Its cost, if libfabric's own dlopen of libnrt failed too,
+        // is a loud fi_mr_regattr -> -FI_ENOSYS at registration time, which
+        // the warning below explains in advance.  Nothing downstream is
+        // undefined either way: registration either succeeds or fails with
+        // that errno.
         if (!dlopenNeuronRuntime()) {
+            // dlerror() is allowed to return NULL -- notably when the last
+            // failure was a RTLD_NOLOAD probe -- and streaming a NULL
+            // const char* into an ostream is undefined behaviour.
+            const char* err = dlerror();
             LOG(WARNING)
                 << "Neuron devices are present but libnrt.so.1 could not be "
                    "loaded ("
-                << dlerror()
+                << (err ? err : "no dlerror() message")
                 << "); libfabric will refuse to register Neuron HBM "
                    "(fi_mr_regattr -> ENOSYS). Add the Neuron SDK library "
                    "directory (usually /opt/aws/neuron/lib) to "
                    "LD_LIBRARY_PATH.";
+        } else {
+            LOG(INFO) << "Neuron device detected, EFA transport will register "
+                         "Neuron HBM with FI_HMEM_NEURON";
         }
-        LOG(INFO) << "Neuron device detected, EFA transport will register "
-                     "Neuron HBM with FI_HMEM_NEURON";
         return true;
 #endif
     }();
