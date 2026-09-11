@@ -69,7 +69,8 @@ class RailMonitor {
     Status load(std::shared_ptr<const Topology> local,
                 std::shared_ptr<const Topology> remote,
                 const std::string &rail_topo_json = "",
-                const Config *conf = nullptr);
+                const Config *conf = nullptr,
+                uint64_t remote_snapshot_key = 0);
 
     bool ready() { return ready_; }
 
@@ -151,6 +152,8 @@ class RailMonitor {
     std::unordered_map<std::pair<int, int>, RailState, PairHash> rail_states_;
     std::unordered_map<int, int> direct_rails_;  // keep static after loaded
     std::unordered_map<int, int> best_mapping_[kMaxNuma];
+    std::unordered_map<uint64_t, std::weak_ptr<const Topology>>
+        remote_snapshots_;
 
     uint64_t metadata_generation_ = 0;
     uint64_t next_probe_token_ = 0;

@@ -533,6 +533,30 @@ TEST(RailMonitorRecoveryProbeTest, LocalSnapshotDoesNotRearmProbe) {
     EXPECT_FALSE(rail.available(0, 0));
 }
 
+TEST(RailMonitorRecoveryProbeTest, ExistingSegmentSnapshotDoesNotRearmProbe) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote_first = makeSingleNicTopology("mlx5_1");
+    auto remote_second = makeSingleNicTopology("mlx5_1");
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote_first, "", nullptr,
+                          /*remote_snapshot_key=*/1)
+                    .ok());
+    ASSERT_TRUE(rail.load(local, remote_second, "", nullptr,
+                          /*remote_snapshot_key=*/2)
+                    .ok());
+    for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
+    ASSERT_FALSE(rail.available(0, 0));
+
+    // Alternating back to a snapshot that was already observed before the
+    // pause is not new recovery evidence for the peer.
+    ASSERT_TRUE(rail.load(local, remote_first, "", nullptr,
+                          /*remote_snapshot_key=*/1)
+                    .ok());
+    uint64_t probe_token = 0;
+    EXPECT_FALSE(rail.tryRecoveryProbe(0, 0, probe_token));
+    EXPECT_EQ(probe_token, 0u);
+}
+
 TEST(RailMonitorRecoveryProbeTest, DisabledProbePreservesCooldownBehavior) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote_initial = makeSingleNicTopology("mlx5_1");

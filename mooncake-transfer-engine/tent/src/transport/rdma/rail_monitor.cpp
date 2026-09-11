@@ -63,10 +63,15 @@ bool sameRailLayout(const Topology* a, const Topology* b) {
 Status RailMonitor::load(std::shared_ptr<const Topology> local,
                          std::shared_ptr<const Topology> remote,
                          const std::string& rail_topo_json,
-                         const Config* conf) {
+                         const Config* conf, uint64_t remote_snapshot_key) {
     const bool first_load = !ready_;
+    auto snapshot = remote_snapshots_.find(remote_snapshot_key);
+    auto previous_snapshot = snapshot == remote_snapshots_.end()
+                                 ? std::shared_ptr<const Topology>{}
+                                 : snapshot->second.lock();
     const bool remote_snapshot_changed =
-        ready_ && remote_.get() != remote.get();
+        !previous_snapshot || previous_snapshot.get() != remote.get();
+    remote_snapshots_[remote_snapshot_key] = remote;
     const bool same_layout = ready_ &&
                              sameRailLayout(local_.get(), local.get()) &&
                              sameRailLayout(remote_.get(), remote.get());
