@@ -77,12 +77,15 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
             conf->get(kCfgErrorWindowSecs, (int)error_window_.count()));
         cooldown_ = std::chrono::seconds(
             conf->get(kCfgCooldownSecs, (int)cooldown_.count()));
+        probe_interval_ = std::chrono::seconds(
+            conf->get(kCfgProbeIntervalSecs, (int)probe_interval_.count()));
         // Config is identical on every COW snapshot refresh. Log once per
         // monitor so PD/e2e does not reprint the banner per slice/worker.
         if (first_load) {
             LOG(INFO) << "RailMonitor: error_threshold=" << error_threshold_
                       << " error_window=" << error_window_.count() << "s"
-                      << " cooldown=" << cooldown_.count() << "s";
+                      << " cooldown=" << cooldown_.count() << "s"
+                      << " probe_interval=" << probe_interval_.count() << "s";
         }
     }
     if (same_layout) return Status::OK();
@@ -98,16 +101,51 @@ bool RailMonitor::available(int local_nic, int remote_nic) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
     auto& st = it->second;
-    if (!st.paused()) return true;
-    if (std::chrono::steady_clock::now() < st.resume_time) return false;
-    // Cooldown expired: clear all exponential-backoff memory so a fresh
-    // failure cycle starts from the initial cooldown_, not a doubled value.
-    st.resume_time = {};
+    // Closed: healthy, no pause armed, no trial in flight.
+    if (!st.paused() && !st.half_open) return true;
+    auto now = std::chrono::steady_clock::now();
+
+    // Half-Open: the cooldown expired and one trial transfer was admitted.
+    // Do NOT admit more traffic until the trial resolves (markRecovered closes,
+    // markFailed re-arms). Re-admit only after probe_interval_ so a lost
+    // callback does not strand the rail forever. probe_interval_==0 admits
+    // exactly one trial and relies on the callback.
+    if (st.half_open) {
+        if (probe_interval_.count() > 0 &&
+            now - st.last_probe_time >= probe_interval_) {
+            st.last_probe_time = now;
+            return true;
+        }
+        return false;
+    }
+
+    // Open: the cooldown timer is still running. Admit one transfer every
+    // probe_interval_ as an exploratory probe — a success closes the rail
+    // early (defect B fix); a failure is a no-op here (markFailed sees
+    // was_paused and neither escalates nor re-arms), so periodic probes never
+    // multiply the cooldown.
+    if (now < st.resume_time) {
+        if (probe_interval_.count() > 0 &&
+            now - st.last_probe_time >= probe_interval_) {
+            st.last_probe_time = now;
+            return true;
+        }
+        return false;
+    }
+
+    // Cooldown expired without markRecovered (the rail is still paused, so no
+    // probe succeeded). Transition to Half-Open: admit exactly ONE trial via
+    // this return true; the fallback path in selectFallbackDevice routes it.
+    // Escalation happens only if the trial FAILS (markFailed), not because the
+    // clock fired — elapsed time does not prove the path is healthy, so we
+    // must not reopen all traffic to a still-dead peer.
+    st.half_open = true;
     st.error_count = 0;
-    st.cooldown = std::chrono::seconds(0);
-    updateBestMapping();
-    LOG(INFO) << "Rail recovered: local_nic=" << local_nic
-              << " remote_nic=" << remote_nic << " (cooldown expired)";
+    st.last_probe_time = now;
+    LOG(INFO) << "Rail half-open: local_nic=" << local_nic
+              << " remote_nic=" << remote_nic
+              << " (cooldown=" << st.cooldown.count()
+              << "s retained, trial admitted)";
     return true;
 }
 
@@ -122,15 +160,65 @@ void RailMonitor::markFailed(int local_nic, int remote_nic) {
         st.error_count++;
     }
     st.last_error = now;
-    if (st.cooldown.count() == 0) {
-        st.cooldown = cooldown_;
-    } else {
+
+    // Half-Open trial failed: the one transfer admitted after cooldown expiry
+    // did not prove the path healthy. Escalate the cooldown and re-arm so the
+    // next trial waits longer, then return to Open. This is the ONLY escalation
+    // point for a paused rail — clock expiry alone never escalates.
+    if (st.half_open) {
+        st.half_open = false;
         st.cooldown *= 2;
         if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
-    }
-    if (st.error_count >= error_threshold_) {
+        st.error_count = 0;  // fresh cycle
         st.resume_time = now + st.cooldown;
+        st.last_probe_time = now;  // defer first probe by one interval
+        LOG(INFO) << "Rail half-open trial failed; re-paused: local_nic="
+                  << local_nic << " remote_nic=" << remote_nic
+                  << " (cooldown escalated to " << st.cooldown.count() << "s)";
         updateBestMapping();
+        return;
+    }
+
+    const bool was_paused = st.paused();
+
+    if (st.error_count >= error_threshold_) {
+        if (!was_paused) {
+            // Escalate the cooldown only when a *fresh* pause arms (the rail
+            // was healthy at this instant), never within an ongoing burst.
+            // Previously cooldown was doubled on every markFailed call, so a
+            // single outage -- N error WQEs landing in one 10s window -- pushed
+            // a 30s pause straight to the 300s cap before the outage even
+            // cleared, forcing a ~5min TCP fallback after the peer had already
+            // recovered. Now the cooldown is set once per pause cycle; errors
+            // arriving while already paused do not multiply it.
+            //
+            // cooldown == 0: the previous cycle ended with a proven-healthy
+            //   recovery (markRecovered reset it), so start from the initial
+            //   value. cooldown != 0 should not reach here while Closed (only
+            //   markRecovered clears the pause), but guard anyway.
+            if (st.cooldown.count() == 0) {
+                st.cooldown = cooldown_;
+            } else {
+                st.cooldown *= 2;
+                if (st.cooldown > kMaxCooldown) st.cooldown = kMaxCooldown;
+            }
+            LOG(INFO) << "Rail paused: local_nic=" << local_nic
+                      << " remote_nic=" << remote_nic
+                      << " (errors=" << st.error_count << " in "
+                      << error_window_.count()
+                      << "s, cooldown=" << st.cooldown.count() << "s)";
+            st.resume_time = now + st.cooldown;
+            // Defer the first probe by one probe_interval_: without this,
+            // last_probe_time defaults to epoch and available() would admit a
+            // probe the instant the pause arms, defeating the throttle.
+            st.last_probe_time = now;
+            updateBestMapping();
+        }
+        // Already paused (Open, exploratory probe failed): leave resume_time
+        // and cooldown untouched. Re-arming or escalating here would let a
+        // sustained outage extend the pause indefinitely -- the original
+        // defect. The pause runs its course so available()'s probe can test
+        // recovery, and escalation happens only when the Half-Open trial fails.
     }
 }
 
@@ -140,20 +228,25 @@ void RailMonitor::markRecovered(int local_nic, int remote_nic) {
     auto& st = it->second;
     // Fast path: a healthy rail stays healthy. 99%+ of completions land
     // here, so we must not touch best_mapping_ or write any field.
-    if (!st.paused() && st.error_count == 0 && st.cooldown.count() == 0) return;
+    if (!st.paused() && !st.half_open && st.error_count == 0 &&
+        st.cooldown.count() == 0)
+        return;
     bool was_paused = st.paused();
+    bool was_half_open = st.half_open;
     // Clear all exponential-backoff memory: the next failure cycle must
     // start from the initial cooldown_, not a doubled value left over
     // from the previous cycle.
     st.error_count = 0;
     st.resume_time = {};
     st.cooldown = std::chrono::seconds(0);
-    if (was_paused) {
+    st.half_open = false;
+    if (was_paused || was_half_open) {
         LOG(INFO) << "Rail recovered: local_nic=" << local_nic
                   << " remote_nic=" << remote_nic
                   << " (un-paused by successful transfer)";
         updateBestMapping();
     }
+    st.last_probe_time = {};
 }
 
 int RailMonitor::findBestRemoteDevice(int local_nic, int remote_numa) {

@@ -208,8 +208,11 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::COMPLETED,
                                 std::memory_order_release);
     } else {
-        LOG(WARNING) << "TCP transfer failed after " << params_.max_retry_count
-                     << " retries: " << status.ToString();
+        VLOG(1) << "TCP transfer failed after " << params_.max_retry_count
+                << " retries: " << status.ToString();
+        LOG_EVERY_N(WARNING, 100)
+            << "TCP transfer failed after " << params_.max_retry_count
+            << " retries: " << status.ToString();
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
@@ -231,9 +234,12 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
             return Status::InternalError("Transport shutting down");
 
         if (attempt > 0) {
-            LOG(INFO) << "TCP transfer retry attempt " << attempt << "/"
-                      << params_.max_retry_count << ", backoff " << delay_ms
-                      << "ms";
+            VLOG(1) << "TCP transfer retry attempt " << attempt << "/"
+                    << params_.max_retry_count << ", backoff " << delay_ms
+                    << "ms";
+            LOG_EVERY_N(INFO, 100)
+                << "TCP transfer retry attempt " << attempt << "/"
+                << params_.max_retry_count << ", backoff " << delay_ms << "ms";
             // Sleep in small increments so shutdown is not delayed
             for (uint64_t i = 0; i < delay_ms; i += 100) {
                 if (shutting_down_.load(std::memory_order_acquire))
@@ -257,8 +263,10 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         if (status.ok()) return Status::OK();
 
         last_error = status;
-        LOG(WARNING) << "TCP transfer attempt " << attempt
-                     << " failed: " << status.ToString();
+        VLOG(1) << "TCP transfer attempt " << attempt
+                << " failed: " << status.ToString();
+        LOG_EVERY_N(WARNING, 1000) << "TCP transfer attempt " << attempt
+                                   << " failed: " << status.ToString();
 
         if (!status.IsRpcServiceError() && !status.IsInternalError()) {
             return status;

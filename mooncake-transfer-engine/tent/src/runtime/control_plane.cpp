@@ -652,8 +652,11 @@ void ControlClient::subscribeSegmentUpdateAsync(
         server_addr, SubscribeSegmentUpdate, request,
         [](const Status& status, const std::string&) {
             if (!status.ok()) {
-                LOG(ERROR) << "SubscribeSegmentUpdate RPC failed with: "
-                           << status.ToString();
+                VLOG(1) << "SubscribeSegmentUpdate RPC failed with: "
+                        << status.ToString();
+                LOG_EVERY_N(ERROR, 100)
+                    << "SubscribeSegmentUpdate RPC failed with: "
+                    << status.ToString();
             }
         });
 }
