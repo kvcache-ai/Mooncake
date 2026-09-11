@@ -151,6 +151,10 @@ target_compile_features(mooncake_pg PRIVATE cxx_std_20)
 target_include_directories(
   mooncake_pg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
                      $<INSTALL_INTERFACE:include>)
+if(USE_MACA)
+  target_include_directories(mooncake_pg PRIVATE
+                             "${MACA_ROOT}/tools/cu-bridge/include")
+endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 
 set_target_properties(
