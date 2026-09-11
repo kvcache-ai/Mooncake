@@ -34,9 +34,12 @@ when they better match the change scope: ``[Bug fix]``, ``[Build]``, ``[CI]``,
 ``[Docs]``, ``[EP]``, ``[Feature]``, ``[MUSA]``, ``[PG]``, ``[TE]``,
 ``[TENT]``, and ``[Wheel]``.
 
-### RFC Discussion
+### Notes for Large Changes
 
-For major architectural changes (>500 LOC excluding tests), we would expect a GitHub issue (RFC) discussing the technical design and justification.
+Please keep changes as concise as possible. For major architectural changes
+(>500 LOC excluding kernel/data/config/test), we expect a GitHub issue (RFC)
+that discusses the technical design and justification. Otherwise, the PR may be
+tagged with `rfc-required` and might not be reviewed until an RFC is provided.
 
 
 ### Development Workflow & Pre-commit Hooks

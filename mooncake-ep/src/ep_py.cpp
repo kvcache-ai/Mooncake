@@ -78,6 +78,7 @@ PYBIND11_MODULE(_ep, m) {
              &MooncakeElasticBuffer::get_theoretical_num_sms)
         .def("ibgda_disabled", &MooncakeElasticBuffer::ibgda_disabled)
         .def("use_fast_path", &MooncakeElasticBuffer::use_fast_path)
+        .def("reconfigure_nccl", &MooncakeElasticBuffer::reconfigure_nccl)
         .def("update_local_qpns", &MooncakeElasticBuffer::update_local_qpns)
         .def("is_roce", &MooncakeElasticBuffer::is_roce)
         .def("sync_ibgda_peers", &MooncakeElasticBuffer::sync_ibgda_peers)
