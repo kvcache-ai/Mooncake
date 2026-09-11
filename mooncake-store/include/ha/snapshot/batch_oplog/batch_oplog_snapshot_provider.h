@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include <ylt/util/tl/expected.hpp>
@@ -33,7 +34,8 @@ class BatchOpLogSnapshotProvider final {
 
     tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode> RestoreBaseline(
         StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
-        OpLogApplier* applier = nullptr, uint64_t minimum_snapshot_batch = 0);
+        OpLogApplier* applier = nullptr, uint64_t minimum_snapshot_batch = 0,
+        std::function<bool()> cancelled = {});
 
    private:
     std::string cluster_id_;

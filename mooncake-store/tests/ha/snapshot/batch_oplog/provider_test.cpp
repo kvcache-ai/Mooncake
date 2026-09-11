@@ -94,6 +94,19 @@ TEST_F(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
     EXPECT_EQ(EncodeDurablePrefix({.batch_id = 0, .last_seq = 0}), prefix);
 }
 
+TEST_F(BatchOpLogSnapshotProviderTest, RestoreHonorsCancellation) {
+    EmptyBackend backend;
+    LocalFileSnapshotObjectStore object_store(root_);
+    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
+                                        "snapshots");
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+    auto result = provider.RestoreBaseline(metadata, registry, nullptr, 0,
+                                           [] { return true; });
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, result.error());
+}
+
 TEST_F(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
     EmptyBackend backend;
     ASSERT_EQ(ErrorCode::OK,

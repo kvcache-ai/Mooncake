@@ -129,8 +129,8 @@ void CopyRegistry(const StandbySegmentRegistry& source,
 }
 
 AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
-                           OpLogApplier& applier,
-                           const DurablePrefix* baseline) {
+                           OpLogApplier& applier, const DurablePrefix* baseline,
+                           const std::function<bool()>& cancelled) {
     OpLogBatchStandbyReader reader(cluster_id, backend, applier);
     const DurablePrefix start =
         baseline == nullptr ? DurablePrefix{} : *baseline;
@@ -139,6 +139,9 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
     }
 
     for (;;) {
+        if (cancelled && cancelled()) {
+            return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        }
         auto poll = reader.PollOnce();
         if (poll.error != ErrorCode::OK) {
             return IsRetryableBackendError(poll.error)
@@ -167,7 +170,9 @@ AttemptResult RestorePointer(
     const std::string& cluster_id, HaKvBackend& backend,
     SnapshotObjectStore& object_store, const std::string& snapshot_root,
     std::string_view pointer_bytes, StandbyMetadataStore& metadata,
-    StandbySegmentRegistry& registry, OpLogApplier* supplied_applier) {
+    StandbySegmentRegistry& registry, OpLogApplier* supplied_applier,
+    const std::function<bool()>& cancelled) {
+    if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     auto decoded_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
     if (!decoded_descriptor) {
@@ -240,6 +245,9 @@ AttemptResult RestorePointer(
     applier->Recover(baseline.last_seq);
 
     for (size_t i = 0; i < manifest.object_chunks.size(); ++i) {
+        if (cancelled && cancelled()) {
+            return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        }
         const auto& chunk = manifest.object_chunks[i];
         const std::string expected_key =
             ha::BuildBatchOpLogSnapshotObjectChunkKey(
@@ -260,6 +268,9 @@ AttemptResult RestorePointer(
             return Invalid();
         }
         for (const auto& entry : decoded_chunk->objects) {
+            if (cancelled && cancelled()) {
+                return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+            }
             if (entry.key.empty() || !TenantId(entry.tenant_id).IsValid()) {
                 return Invalid();
             }
@@ -276,7 +287,8 @@ AttemptResult RestorePointer(
         }
     }
 
-    auto suffix = ReplaySuffix(cluster_id, backend, *applier, &baseline);
+    auto suffix =
+        ReplaySuffix(cluster_id, backend, *applier, &baseline, cancelled);
     if (suffix.disposition != AttemptDisposition::kSuccess) {
         return suffix;
     }
@@ -299,7 +311,9 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
                                    HaKvBackend& backend,
                                    StandbyMetadataStore& metadata,
                                    StandbySegmentRegistry& registry,
-                                   OpLogApplier* supplied_applier) {
+                                   OpLogApplier* supplied_applier,
+                                   const std::function<bool()>& cancelled) {
+    if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -315,7 +329,8 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
         return IsRetryableBackendError(init_error) ? Infrastructure(init_error)
                                                    : Invalid(init_error);
     }
-    auto replay = ReplaySuffix(cluster_id, backend, *applier, nullptr);
+    auto replay =
+        ReplaySuffix(cluster_id, backend, *applier, nullptr, cancelled);
     if (replay.disposition != AttemptDisposition::kSuccess) {
         return replay;
     }
@@ -344,7 +359,8 @@ tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode>
 BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
                                             StandbySegmentRegistry& registry,
                                             OpLogApplier* applier,
-                                            uint64_t minimum_snapshot_batch) {
+                                            uint64_t minimum_snapshot_batch,
+                                            std::function<bool()> cancelled) {
     metadata.Clear();
     registry.Clear();
     if (!NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty() ||
@@ -365,6 +381,8 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     for (const std::string& pointer_key :
          {ha::BuildBatchOpLogSnapshotLatestKey(cluster_id_),
           ha::BuildBatchOpLogSnapshotFallbackKey(cluster_id_)}) {
+        if (cancelled && cancelled())
+            return tl::make_unexpected(ErrorCode::ETCD_CTX_CANCELLED);
         std::string pointer_bytes;
         const ErrorCode pointer_error =
             backend_.Get(pointer_key, pointer_bytes);
@@ -380,9 +398,9 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             descriptor->last_included_batch_id < minimum_snapshot_batch) {
             continue;
         }
-        auto attempt =
-            RestorePointer(cluster_id_, backend_, object_store_, snapshot_root_,
-                           pointer_bytes, metadata, registry, applier);
+        auto attempt = RestorePointer(cluster_id_, backend_, object_store_,
+                                      snapshot_root_, pointer_bytes, metadata,
+                                      registry, applier, cancelled);
         if (attempt.disposition == AttemptDisposition::kSuccess) {
             return attempt.value;
         }
@@ -401,7 +419,7 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
     auto full_replay = RestoreCompleteOpLog(cluster_id_, backend_, metadata,
-                                            registry, applier);
+                                            registry, applier, cancelled);
     if (full_replay.disposition != AttemptDisposition::kSuccess) {
         metadata.Clear();
         registry.Clear();

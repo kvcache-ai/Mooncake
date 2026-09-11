@@ -1051,8 +1051,10 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     auto metadata = std::make_unique<StandbyMetadataStore>();
     auto applier = std::make_unique<OpLogApplier>(metadata.get(), cluster_id_);
     StandbySegmentRegistry registry;
-    auto restored =
-        provider->RestoreBaseline(*metadata, registry, applier.get(), floor);
+    auto restored = provider->RestoreBaseline(
+        *metadata, registry, applier.get(), floor, [this] {
+            return !replication_loop_running_.load(std::memory_order_acquire);
+        });
     if (!restored) return restored.error();
     auto reader = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *applier);
