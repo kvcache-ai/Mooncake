@@ -11,9 +11,7 @@
 #include <thread>
 #include <vector>
 
-#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
-#endif
 
 namespace mooncake::test {
 namespace {
@@ -164,6 +162,25 @@ bool WaitForMetric(const std::function<bool()>& predicate) {
 #endif
 
 }  // namespace
+
+TEST(OrderedOpLogWriterMetricsTest, RuntimeSnapshotTracksAdmission) {
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [](const OpLogBatchRecord&, const DurablePrefix&) {
+            return ErrorCode::OK;
+        });
+    auto snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_TRUE(snapshot.accepting);
+    EXPECT_EQ(snapshot.waiting_slots, 0);
+
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_EQ(snapshot.waiting_slots, 1);
+    writer.Abort(std::move(*reservation));
+    snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_EQ(snapshot.waiting_slots, 0);
+}
 
 TEST(OrderedOpLogWriterAdmissionTest, AbortLeavesNoSequenceGap) {
     FakeBatchWriter storage;

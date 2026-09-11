@@ -3,7 +3,9 @@
 #include <atomic>
 #include <chrono>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <utility>
 
 #include "ylt/metric/counter.hpp"
 #include "ylt/metric/gauge.hpp"
@@ -24,6 +26,23 @@ namespace mooncake {
  */
 class HAMetricManager {
    public:
+    struct WriterRuntimeSnapshot {
+        bool accepting{false};
+        uint64_t retry_count{0};
+        uint64_t retry_delay_ms{0};
+        uint64_t waiting_slots{0};
+        uint64_t committed_queue_depth{0};
+        uint64_t callback_queue_depth{0};
+        uint64_t durable_batch_id{0};
+        uint64_t durable_sequence{0};
+        int64_t last_error{0};
+        std::string terminal_reason;
+        std::optional<std::pair<uint64_t, uint64_t>> stuck_range;
+    };
+
+    void reset_writer_runtime();
+    void update_writer_runtime(const WriterRuntimeSnapshot& snapshot);
+    WriterRuntimeSnapshot get_writer_runtime() const;
     // --- Singleton Access ---
     static HAMetricManager& instance();
 
@@ -247,6 +266,9 @@ class HAMetricManager {
     // State Machine
     ylt::metric::gauge_t standby_state_;
     ylt::metric::counter_t state_transitions_total_;
+
+    mutable std::mutex writer_runtime_mutex_;
+    WriterRuntimeSnapshot writer_runtime_;
 };
 
 }  // namespace mooncake
