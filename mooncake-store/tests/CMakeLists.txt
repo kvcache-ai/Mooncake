@@ -135,6 +135,7 @@ add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+  add_store_test(nof_namespace_query_test nof_namespace_query_test.cpp)
 endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(client_integration_test client_integration_test.cpp)

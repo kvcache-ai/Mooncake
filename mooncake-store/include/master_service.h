@@ -178,6 +178,8 @@ class MasterService {
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
+    using NoFNamespaceQueryFn = std::function<bool(
+        const std::string&, NoFNamespaceInfo&, std::string*)>;
     using DurableFinalizeCallback =
         std::function<void(const OpLogEntry& durable_entry)>;
     using BatchOpLogWriterFactory =
@@ -189,6 +191,7 @@ class MasterService {
     ~MasterService();
 
     void SetNoFProbeFnForTesting(NoFProbeFn fn);
+    void SetNoFNamespaceQueryFnForTesting(NoFNamespaceQueryFn fn);
     size_t GetMountedNoFSegmentCountForTesting();
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
@@ -264,6 +267,22 @@ class MasterService {
      *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
     auto MountNoFSegment(const NoFSegment& segment, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Query NoF namespace information over NVMe-oF and mount its full
+     * range for buffer allocation, with base=0.
+     * A mounted endpoint whose full range was already verified succeeds without
+     * querying again. Legacy mounts are queried and checked before becoming
+     * eligible for this fast path. Unmounting discards the verification.
+     * @return Success or an error from MountNoFSegment,
+     *         ErrorCode::INVALID_PARAMS if an existing endpoint has a different
+     *         range,
+     *         ErrorCode::UNAVAILABLE_IN_CURRENT_MODE if NoF is disabled,
+     *         ErrorCode::INTERNAL_ERROR if the namespace query fails.
+     */
+    auto QueryAndMountNoFSegment(const std::string& endpoint,
+                                 const UUID& client_id)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -2663,6 +2682,8 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+    std::mutex nof_namespace_query_fn_mutex_;
+    NoFNamespaceQueryFn nof_namespace_query_fn_;
 
     // if high availability features enabled
     const bool enable_ha_;

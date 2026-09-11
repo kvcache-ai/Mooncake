@@ -366,6 +366,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
         return SpdkWrapper::GetInstance().ProbeNofSegment(
             te_endpoint, timeout_ms, error_reason);
     };
+    nof_namespace_query_fn_ = [](const std::string& endpoint,
+                                 NoFNamespaceInfo& info,
+                                 std::string* error_reason) {
+        return SpdkWrapper::GetInstance().QueryNamespaceInfo(endpoint, info,
+                                                             error_reason);
+    };
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
@@ -817,6 +823,24 @@ void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #endif
 }
 
+void MasterService::SetNoFNamespaceQueryFnForTesting(NoFNamespaceQueryFn fn) {
+#ifdef USE_NOF
+    std::lock_guard<std::mutex> lock(nof_namespace_query_fn_mutex_);
+    if (fn) {
+        nof_namespace_query_fn_ = std::move(fn);
+        return;
+    }
+    nof_namespace_query_fn_ = [](const std::string& endpoint,
+                                 NoFNamespaceInfo& info,
+                                 std::string* error_reason) {
+        return SpdkWrapper::GetInstance().QueryNamespaceInfo(endpoint, info,
+                                                             error_reason);
+    };
+#else
+    (void)fn;
+#endif
+}
+
 size_t MasterService::GetMountedNoFSegmentCountForTesting() {
     std::vector<MountedNoFSegmentSnapshot> mounted_segments;
     nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
@@ -1036,6 +1060,72 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
         // Return OK because this is an idempotent operation
         return {};
     } else if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+#endif
+}
+
+auto MasterService::QueryAndMountNoFSegment(const std::string& endpoint,
+                                            const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << endpoint
+               << ", error=nof_pool_disabled";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    NoFNamespaceQueryFn query_fn;
+    {
+        std::lock_guard<std::mutex> lock(nof_namespace_query_fn_mutex_);
+        query_fn = nof_namespace_query_fn_;
+    }
+    NoFNamespaceInfo info;
+    std::string error_reason;
+    if (!query_fn(endpoint, info, &error_reason)) {
+        LOG(ERROR) << "NoF namespace query failed: client_id=" << client_id
+                   << ", endpoint=" << endpoint << ", error=" << error_reason;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = endpoint;
+    segment.te_endpoint = endpoint;
+    segment.base = 0;
+    segment.size = info.size;
+
+    auto segment_access = nof_segment_manager_.getNoFSegmentAccess();
+    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+    auto err = segment_access.GetMountedSegments(mounted_segments);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    bool already_mounted = false;
+    for (const auto& existing : mounted_segments) {
+        if (existing.segment.te_endpoint != endpoint) {
+            continue;
+        }
+        if (existing.status != SegmentStatus::OK) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        if (existing.segment.base != segment.base ||
+            existing.segment.size != segment.size) {
+            LOG(ERROR) << "NoF namespace range mismatch: client_id="
+                       << client_id << ", endpoint=" << endpoint
+                       << ", mounted_base=" << existing.segment.base
+                       << ", mounted_size=" << existing.segment.size
+                       << ", queried_base=" << segment.base
+                       << ", queried_size=" << segment.size;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        already_mounted = true;
+    }
+    if (already_mounted) {
+        return {};
+    }
+    err = segment_access.MountSegment(segment, client_id);
+    if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
     return {};
