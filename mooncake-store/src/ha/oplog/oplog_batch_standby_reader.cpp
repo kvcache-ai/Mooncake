@@ -52,8 +52,46 @@ ErrorCode OpLogBatchStandbyReader::SetBaselineCursor(
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     size_t max_batches) {
     OpLogBatchStandbyPollResult result;
+    uint64_t floor = 0;
+    ErrorCode err = storage_.ReadCompactionFloor(floor);
+    if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        SetPollError(result, err, IsRetryableBackendError(err));
+        return result;
+    }
+    if (err == ErrorCode::OK && last_applied_batch_id_ < floor) {
+        result.compaction_floor = floor;
+        result.disposition =
+            OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED;
+        result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        return result;
+    }
+    result = PollBatches(max_batches, floor);
+    if (result.disposition == OpLogBatchStandbyPollDisposition::FATAL) {
+        // Pruning may advance after the initial floor read. Classify missing
+        // history against the current floor before declaring corruption.
+        uint64_t current_floor = 0;
+        err = storage_.ReadCompactionFloor(current_floor);
+        if (err == ErrorCode::OK && last_applied_batch_id_ < current_floor) {
+            result.compaction_floor = current_floor;
+            result.disposition =
+                OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED;
+            result.error = ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+        } else if (err == ErrorCode::OK && current_floor > floor &&
+                   current_floor == last_applied_batch_id_) {
+            result = PollBatches(max_batches, current_floor);
+        } else if (err != ErrorCode::OK &&
+                   err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+            SetPollError(result, err, IsRetryableBackendError(err));
+        }
+    }
+    return result;
+}
+
+OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
+    size_t max_batches, uint64_t floor) {
+    OpLogBatchStandbyPollResult result;
     DurablePrefix prefix;
-    ErrorCode err = storage_.ReadDurablePrefix(prefix);
+    auto err = storage_.ReadDurablePrefix(prefix);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
         if (batch_format_seen_) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
@@ -86,6 +124,17 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         } else if (applier_.GetExpectedSequenceId() == 1) {
             last_applied_durable_prefix_ = prefix;
         }
+        return result;
+    }
+
+    // A proven cursor needs no historical batch read: its batch may have
+    // been pruned when the floor equals the durable prefix.
+    if (floor == prefix.batch_id && prefix.batch_id == last_applied_batch_id_ &&
+        last_scanned_batch_last_seq_ == prefix.last_seq &&
+        applier_.GetExpectedSequenceId() > 0 &&
+        applier_.GetExpectedSequenceId() - 1 == prefix.last_seq) {
+        last_observed_prefix_ = prefix;
+        last_applied_durable_prefix_ = prefix;
         return result;
     }
 
