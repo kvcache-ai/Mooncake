@@ -2054,7 +2054,8 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
 }
 
 void MasterService::FinalizeExpiredProcessingReplicasAfterDurable(
-    std::shared_ptr<metadata::ObjectEntry> entry, const OpLogEntry& durable_entry,
+    std::shared_ptr<metadata::ObjectEntry> entry,
+    const OpLogEntry& durable_entry,
     const std::chrono::system_clock::time_point& ttl) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
@@ -4829,10 +4830,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     entry.reset();
                 }
                 auto cleanup_plan =
-                    entry
-                        ? BuildStaleHandleCleanupPlan(entry->metadata(),
-                                                      retaining_clients)
-                        : StaleHandleCleanupPlan{};
+                    entry ? BuildStaleHandleCleanupPlan(entry->metadata(),
+                                                        retaining_clients)
+                          : StaleHandleCleanupPlan{};
                 if (!cleanup_plan.removed_ids.empty()) {
                     auto persist_result = PersistStaleHandleCleanupForHA(
                         "PutStart(stale cleanup)", object_id.tenant_id, key,
@@ -7139,9 +7139,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
 long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     int64_t total_freed_size = 0;
-    // Per-object teardown claims make concurrent RemoveAlls safe, so the
-    // snapshot barrier is only held shared: a wipe must not pause unrelated
-    // tenants' metadata traffic.
+    // Per-object teardown claims make concurrent RemoveAll calls safe, so
+    // the snapshot barrier is only held shared: a wipe must not pause
+    // unrelated tenants' metadata traffic.
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
     // Tracking which tenants ended up empty costs a hash insert per visited

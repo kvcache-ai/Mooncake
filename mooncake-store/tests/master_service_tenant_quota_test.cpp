@@ -1233,9 +1233,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 // Regression: a tenant-scoped RemoveAll holds the snapshot barrier only
 // shared, so clearing one tenant must not pause point operations of another.
 TEST_F(MasterServiceTenantQuotaTest, TenantRemoveAllDoesNotBlockOtherTenants) {
-    const std::string policy =
-        WritePolicyFile({{TenantId("tenant-a"), 100000},
-                         {TenantId("tenant-b"), 100000}});
+    const std::string policy = WritePolicyFile(
+        {{TenantId("tenant-a"), 100000}, {TenantId("tenant-b"), 100000}});
     auto config = MasterServiceConfig::builder()
                       .set_enable_multi_tenants(true)
                       .set_tenant_quota_connector_type("file")
@@ -1244,12 +1243,12 @@ TEST_F(MasterServiceTenantQuotaTest, TenantRemoveAllDoesNotBlockOtherTenants) {
     MasterService service(config);
     UUID client = MountSegment(service, 4096, "rmall_segment");
     auto put = [&](const std::string& key, const TenantId& tenant) {
-        auto started = service.PutStart(client, key, tenant, 64, MemoryConfig());
+        auto started =
+            service.PutStart(client, key, tenant, 64, MemoryConfig());
         if (!started.has_value()) {
             return false;
         }
-        return service
-            .PutEnd(client, key, tenant, ReplicaType::MEMORY)
+        return service.PutEnd(client, key, tenant, ReplicaType::MEMORY)
             .has_value();
     };
     ASSERT_TRUE(put("a-1", TenantId("tenant-a")));
