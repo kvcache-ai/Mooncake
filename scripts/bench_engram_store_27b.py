@@ -111,9 +111,7 @@ def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
             key = keys[head_idx]
             rc = store_obj.put_from(key, cursor, nbytes)
             if rc != 0:
-                raise RuntimeError(
-                    f"CXL put_from fallback failed for {key}, rc={rc}"
-                )
+                raise RuntimeError(f"CXL put_from fallback failed for {key}, rc={rc}")
             published_keys.append(key)
             cursor += aligned
     except Exception:
@@ -125,7 +123,9 @@ def populate_store(engram_store, store_obj):
     keys = engram_store.get_store_keys()
     embedding_buffers = []
     for vocab_size in engram_store.get_table_vocab_sizes():
-        emb = np.random.randn(vocab_size, engram_store.get_embedding_dim()).astype(np.float32)
+        emb = np.random.randn(vocab_size, engram_store.get_embedding_dim()).astype(
+            np.float32
+        )
         embedding_buffers.append(emb)
 
     t0 = time.perf_counter()
@@ -162,10 +162,10 @@ def make_row_ids(engram_store, batch_size, seq_len):
     row_ids = []
     for b in range(batch_size):
         batch = []
-        for l in range(seq_len):
+        for pos in range(seq_len):
             token_rows = []
             for head, vocab_size in enumerate(engram_store.get_table_vocab_sizes()):
-                token_rows.append((b * seq_len + l + head) % vocab_size)
+                token_rows.append((b * seq_len + pos + head) % vocab_size)
             batch.append(token_rows)
         row_ids.append(batch)
     return row_ids

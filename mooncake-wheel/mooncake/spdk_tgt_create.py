@@ -17,34 +17,34 @@ class SPDKTgtCreator:
     """
 
     DEFAULT_TRANSPORT_OPTIONS = {
-        'trtype': 'RDMA',
-        'max_queue_depth': 128,
-        'max_io_qpairs_per_ctrlr': 127,
-        'max_io_size': 4096,
-        'in_capsule_data_size': 131072,
-        'io_unit_size': 131072,
-        'max_aq_depth': 128,
-        'num_shared_buffers': 4096,
-        'buf_cache_size': 32,
+        "trtype": "RDMA",
+        "max_queue_depth": 128,
+        "max_io_qpairs_per_ctrlr": 127,
+        "max_io_size": 4096,
+        "in_capsule_data_size": 131072,
+        "io_unit_size": 131072,
+        "max_aq_depth": 128,
+        "num_shared_buffers": 4096,
+        "buf_cache_size": 32,
     }
 
     TRANSPORT_RPC_FLAGS = {
-        'trtype': '-t',
-        'max_queue_depth': '-q',
-        'max_io_qpairs_per_ctrlr': '-m',
-        'max_io_size': '-c',
-        'in_capsule_data_size': '-i',
-        'io_unit_size': '-u',
-        'max_aq_depth': '-a',
-        'num_shared_buffers': '-n',
-        'buf_cache_size': '-b',
+        "trtype": "-t",
+        "max_queue_depth": "-q",
+        "max_io_qpairs_per_ctrlr": "-m",
+        "max_io_size": "-c",
+        "in_capsule_data_size": "-i",
+        "io_unit_size": "-u",
+        "max_aq_depth": "-a",
+        "num_shared_buffers": "-n",
+        "buf_cache_size": "-b",
     }
 
     def __init__(
         self,
         spdk_targets: List[str],
         transport_options: Dict[str, Any] = None,
-        core_mask: str = '0xff',
+        core_mask: str = "0xff",
         port: int = 22,
     ):
         self.spdk_targets = spdk_targets
@@ -59,7 +59,7 @@ class SPDKTgtCreator:
     def _setup_logging(self):
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -71,11 +71,7 @@ class SPDKTgtCreator:
         target_configs = []
 
         for target_info in self.spdk_targets:
-            target = {
-                'ip': None,
-                'path': None,
-                'pci_devices': []
-            }
+            target = {"ip": None, "path": None, "pci_devices": []}
 
             # Split the target info by spaces
             parts = target_info.split()
@@ -84,53 +80,63 @@ class SPDKTgtCreator:
             state = None  # Can be 'ip', 'path', or 'pci'
 
             for part in parts:
-                if ':' in part:
+                if ":" in part:
                     # This is a key-value pair
-                    key, value = part.split(':', 1)
+                    key, value = part.split(":", 1)
                     key = key.strip()
                     value = value.strip()
 
-                    if key == 'ip':
-                        target['ip'] = value
-                        state = 'ip'
-                    elif key == 'path':
-                        target['path'] = value
-                        state = 'path'
-                    elif key == 'pci':
+                    if key == "ip":
+                        target["ip"] = value
+                        state = "ip"
+                    elif key == "path":
+                        target["path"] = value
+                        state = "path"
+                    elif key == "pci":
                         # Parse PCI devices separated by commas
                         if value:
                             # Split by commas and strip whitespace
-                            pci_list = [dev.strip() for dev in value.split(',') if dev.strip()]
-                            target['pci_devices'].extend(pci_list)
-                        state = 'pci'
-                    elif state == 'pci':
-                        pci_list = [dev.strip() for dev in part.split(',') if dev.strip()]
-                        target['pci_devices'].extend(pci_list)
+                            pci_list = [
+                                dev.strip() for dev in value.split(",") if dev.strip()
+                            ]
+                            target["pci_devices"].extend(pci_list)
+                        state = "pci"
+                    elif state == "pci":
+                        pci_list = [
+                            dev.strip() for dev in part.split(",") if dev.strip()
+                        ]
+                        target["pci_devices"].extend(pci_list)
                 else:
                     # This is a continuation of the current state
-                    if state == 'path':
+                    if state == "path":
                         # Path might contain spaces (unlikely but possible)
-                        target['path'] += ' ' + part
-                    elif state == 'pci':
-                        pci_list = [dev.strip() for dev in part.split(',') if dev.strip()]
-                        target['pci_devices'].extend(pci_list)
+                        target["path"] += " " + part
+                    elif state == "pci":
+                        pci_list = [
+                            dev.strip() for dev in part.split(",") if dev.strip()
+                        ]
+                        target["pci_devices"].extend(pci_list)
 
             # Validate required fields
-            if not target['ip']:
+            if not target["ip"]:
                 raise ValueError("Each spdk_target_info must contain 'ip' field")
-            if not target['path']:
+            if not target["path"]:
                 raise ValueError("Each spdk_target_info must contain 'path' field")
 
             target_configs.append(target)
-            pci_info = target['pci_devices'] if target['pci_devices'] else 'auto-discover'
-            self.logger.info(f"Parsed target: IP={target['ip']}, Path={target['path']}, PCI devices={pci_info}")
+            pci_info = (
+                target["pci_devices"] if target["pci_devices"] else "auto-discover"
+            )
+            self.logger.info(
+                f"Parsed target: IP={target['ip']}, Path={target['path']}, PCI devices={pci_info}"
+            )
 
         return target_configs
 
     def _ssh_connect(
         self,
         ip: str,
-        username: str = 'root',
+        username: str = "root",
         password: str = None,
         key_file: str = None,
         port: int = 22,
@@ -153,7 +159,15 @@ class SPDKTgtCreator:
             self.logger.error(f"Failed to connect to {ip}: {e}")
             raise
 
-    def _execute_command(self, ssh: paramiko.SSHClient, command: str, working_dir: str = None, sudo: bool = False, log_errors: bool = True, timeout: Optional[int] = 30) -> tuple:
+    def _execute_command(
+        self,
+        ssh: paramiko.SSHClient,
+        command: str,
+        working_dir: str = None,
+        sudo: bool = False,
+        log_errors: bool = True,
+        timeout: Optional[int] = 30,
+    ) -> tuple:
         """
         Execute a command on the remote host via SSH.
         """
@@ -167,8 +181,8 @@ class SPDKTgtCreator:
 
         stdin, stdout, stderr = ssh.exec_command(command, timeout=timeout)
         exit_status = stdout.channel.recv_exit_status()
-        output = stdout.read().decode('utf-8')
-        error = stderr.read().decode('utf-8')
+        output = stdout.read().decode("utf-8")
+        error = stderr.read().decode("utf-8")
 
         if output:
             self.logger.debug(f"Command output: {output}")
@@ -176,7 +190,9 @@ class SPDKTgtCreator:
             self.logger.debug(f"Command error: {error}")
         if exit_status != 0:
             if log_errors:
-                self.logger.error(f"Command failed with exit code {exit_status}: {command}")
+                self.logger.error(
+                    f"Command failed with exit code {exit_status}: {command}"
+                )
                 if output:
                     self.logger.error(f"Command output: {output}")
                 self.logger.error(f"Error output: {error}")
@@ -188,7 +204,9 @@ class SPDKTgtCreator:
         """
         Discover SPDK-ready or unmounted NVMe controller PCI addresses on the target host.
         """
-        self.logger.info("No PCI devices specified, discovering SPDK-ready or unmounted NVMe PCI devices")
+        self.logger.info(
+            "No PCI devices specified, discovering SPDK-ready or unmounted NVMe PCI devices"
+        )
         output, _ = self._execute_command(
             ssh,
             r"""for dev in /sys/bus/pci/devices/*; do
@@ -227,38 +245,44 @@ class SPDKTgtCreator:
   else
     echo "SKIP $pci mounted"
   fi
-done"""
+done""",
         )
 
         pci_devices = []
         pci_pattern = re.compile(
-            r'^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$'
+            r"^(?:[0-9a-fA-F]{4}:)?[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-7]$"
         )
         for line in output.splitlines():
             fields = line.split()
             if len(fields) < 2:
                 continue
             action, pci = fields[0], fields[1]
-            if action == 'USE' and pci_pattern.match(pci):
+            if action == "USE" and pci_pattern.match(pci):
                 pci_devices.append(pci)
-            elif action == 'SKIP' and pci_pattern.match(pci):
-                reason = ' '.join(fields[2:]) or 'not eligible'
+            elif action == "SKIP" and pci_pattern.match(pci):
+                reason = " ".join(fields[2:]) or "not eligible"
                 self.logger.warning(f"Skipping NVMe PCI device {pci}: {reason}")
 
         if not pci_devices:
-            raise RuntimeError("No SPDK-ready or unmounted NVMe PCI devices found on the target host")
+            raise RuntimeError(
+                "No SPDK-ready or unmounted NVMe PCI devices found on the target host"
+            )
 
-        self.logger.info(f"Selected NVMe PCI devices for SPDK setup: {', '.join(pci_devices)}")
+        self.logger.info(
+            f"Selected NVMe PCI devices for SPDK setup: {', '.join(pci_devices)}"
+        )
         return pci_devices
 
-    def _filter_spdk_ready_pci_devices(self, ssh: paramiko.SSHClient, pci_devices: List[str], strict: bool) -> List[str]:
+    def _filter_spdk_ready_pci_devices(
+        self, ssh: paramiko.SSHClient, pci_devices: List[str], strict: bool
+    ) -> List[str]:
         """
         Keep PCI devices that are bound to an SPDK-compatible userspace driver.
         """
         if not pci_devices:
             return []
 
-        pci_args = ' '.join(shlex.quote(pci) for pci in pci_devices)
+        pci_args = " ".join(shlex.quote(pci) for pci in pci_devices)
         output, _ = self._execute_command(
             ssh,
             f"""for pci in {pci_args}; do
@@ -268,7 +292,7 @@ done"""
     "") echo "NOT_READY $pci no_driver" ;;
     *) echo "NOT_READY $pci $driver" ;;
   esac
-done"""
+done""",
         )
 
         ready_devices = []
@@ -278,19 +302,23 @@ done"""
             if len(fields) < 3:
                 continue
             state, pci, driver = fields[0], fields[1], fields[2]
-            if state == 'READY':
+            if state == "READY":
                 ready_devices.append(pci)
-            elif state == 'NOT_READY':
+            elif state == "NOT_READY":
                 not_ready_devices.append((pci, driver))
 
         if not_ready_devices:
-            details = ', '.join(f"{pci} ({driver})" for pci, driver in not_ready_devices)
+            details = ", ".join(
+                f"{pci} ({driver})" for pci, driver in not_ready_devices
+            )
             if strict:
                 raise RuntimeError(
                     "Some PCI devices are not available to SPDK after setup.sh: "
                     f"{details}. Check whether they are mounted or still bound to the kernel driver."
                 )
-            self.logger.warning(f"Skipping PCI devices not available to SPDK after setup.sh: {details}")
+            self.logger.warning(
+                f"Skipping PCI devices not available to SPDK after setup.sh: {details}"
+            )
 
         if not ready_devices:
             raise RuntimeError("No PCI devices are available to SPDK after setup.sh")
@@ -318,18 +346,22 @@ done"""
         self._execute_command(
             ssh,
             f"nohup {tgt_binary} -m {shlex.quote(self.core_mask)} > {log_file} 2>&1 &",
-            timeout=None
+            timeout=None,
         )
         time.sleep(3)  # Give it time to start
 
-    def _setup_spdk(self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]) -> None:
+    def _setup_spdk(
+        self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]
+    ) -> None:
         """
         Setup SPDK with the specified PCI devices.
         """
         self.logger.info(f"Setting up SPDK with PCI devices: {', '.join(pci_devices)}")
-        pci_allowed = ' '.join(pci_devices)
+        pci_allowed = " ".join(pci_devices)
         setup_script = f"{spdk_path}/scripts/setup.sh"
-        self._execute_command(ssh, f"PCI_ALLOWED='{pci_allowed}' {setup_script}", sudo=True)
+        self._execute_command(
+            ssh, f"PCI_ALLOWED='{pci_allowed}' {setup_script}", sudo=True
+        )
 
     def _format_transport_options(self) -> str:
         """
@@ -339,7 +371,7 @@ done"""
         for option, flag in self.TRANSPORT_RPC_FLAGS.items():
             value = self.transport_options[option]
             formatted_options.extend([flag, shlex.quote(str(value))])
-        return ' '.join(formatted_options)
+        return " ".join(formatted_options)
 
     def _create_transport(self, ssh: paramiko.SSHClient, spdk_path: str) -> None:
         """
@@ -348,9 +380,13 @@ done"""
         self.logger.info(f"Creating {self.transport_options['trtype']} transport")
         rpc_script = f"{spdk_path}/scripts/rpc.py"
         transport_options = self._format_transport_options()
-        self._execute_command(ssh, f"{rpc_script} nvmf_create_transport {transport_options}")
+        self._execute_command(
+            ssh, f"{rpc_script} nvmf_create_transport {transport_options}"
+        )
 
-    def _create_bdevs(self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]) -> List[str]:
+    def _create_bdevs(
+        self, ssh: paramiko.SSHClient, spdk_path: str, pci_devices: List[str]
+    ) -> List[str]:
         """
         Create block devices for the specified PCI devices.
         """
@@ -359,7 +395,10 @@ done"""
         for i, pci in enumerate(pci_devices):
             bdev_name = f"Nvme{i}"
             self.logger.info(f"Creating bdev {bdev_name} for PCI {pci}")
-            self._execute_command(ssh, f"{rpc_script} bdev_nvme_attach_controller -b {bdev_name} -t PCIe -a {pci}")
+            self._execute_command(
+                ssh,
+                f"{rpc_script} bdev_nvme_attach_controller -b {bdev_name} -t PCIe -a {pci}",
+            )
             bdevs.append(f"{bdev_name}n1")
             self.logger.info(f"Attached PCI {pci} as bdev {bdev_name}n1")
         return bdevs
@@ -371,34 +410,50 @@ done"""
         subsystem_nqn = "nqn.2016-06.io.spdk:cnode1"
         self.logger.info(f"Creating subsystem {subsystem_nqn}")
         rpc_script = f"{spdk_path}/scripts/rpc.py"
-        self._execute_command(ssh, f"{rpc_script} nvmf_create_subsystem {subsystem_nqn} -a -s SPDK00000000000001 -m 12")
+        self._execute_command(
+            ssh,
+            f"{rpc_script} nvmf_create_subsystem {subsystem_nqn} -a -s SPDK00000000000001 -m 12",
+        )
         return subsystem_nqn
 
-    def _add_namespaces(self, ssh: paramiko.SSHClient, spdk_path: str, subsystem_nqn: str, bdevs: List[str]) -> None:
+    def _add_namespaces(
+        self,
+        ssh: paramiko.SSHClient,
+        spdk_path: str,
+        subsystem_nqn: str,
+        bdevs: List[str],
+    ) -> None:
         """
         Add namespaces to the subsystem.
         """
         rpc_script = f"{spdk_path}/scripts/rpc.py"
         for bdev in bdevs:
             self.logger.info(f"Adding namespace {bdev} to subsystem {subsystem_nqn}")
-            self._execute_command(ssh, f"{rpc_script} nvmf_subsystem_add_ns {subsystem_nqn} {bdev}")
+            self._execute_command(
+                ssh, f"{rpc_script} nvmf_subsystem_add_ns {subsystem_nqn} {bdev}"
+            )
 
-    def _add_listener(self, ssh: paramiko.SSHClient, spdk_path: str, subsystem_nqn: str, ip: str) -> None:
+    def _add_listener(
+        self, ssh: paramiko.SSHClient, spdk_path: str, subsystem_nqn: str, ip: str
+    ) -> None:
         """
         Add a listener to the subsystem.
         """
-        trtype = self.transport_options['trtype']
+        trtype = self.transport_options["trtype"]
         self.logger.info(f"Adding {trtype} listener on {ip}:4420")
         rpc_script = f"{spdk_path}/scripts/rpc.py"
-        self._execute_command(ssh, f"{rpc_script} nvmf_subsystem_add_listener {subsystem_nqn} -t {shlex.quote(str(trtype))} -a {ip} -s 4420")
+        self._execute_command(
+            ssh,
+            f"{rpc_script} nvmf_subsystem_add_listener {subsystem_nqn} -t {shlex.quote(str(trtype))} -a {ip} -s 4420",
+        )
 
     def deploy_target(self, target_config: Dict[str, Any]) -> bool:
         """
         Deploy SPDK target on a single node.
         """
-        ip = target_config['ip']
-        spdk_path = target_config['path']
-        pci_devices = target_config['pci_devices']
+        ip = target_config["ip"]
+        spdk_path = target_config["path"]
+        pci_devices = target_config["pci_devices"]
 
         self.logger.info(f"Deploying SPDK target on {ip}")
 
@@ -411,16 +466,18 @@ done"""
                 if not pci_devices:
                     pci_devices = self._discover_nvme_pci_devices(ssh)
                 else:
-                    self.logger.info(f"Using explicitly specified PCI devices for {ip}: {', '.join(pci_devices)}")
+                    self.logger.info(
+                        f"Using explicitly specified PCI devices for {ip}: {', '.join(pci_devices)}"
+                    )
 
                 # Setup SPDK
                 self._setup_spdk(ssh, spdk_path, pci_devices)
                 pci_devices = self._filter_spdk_ready_pci_devices(
-                    ssh,
-                    pci_devices,
-                    strict=not auto_discovered
+                    ssh, pci_devices, strict=not auto_discovered
                 )
-                self.logger.info(f"Target {ip} will expose PCI devices: {', '.join(pci_devices)}")
+                self.logger.info(
+                    f"Target {ip} will expose PCI devices: {', '.join(pci_devices)}"
+                )
 
                 # Start tgt service
                 self._start_spdk_tgt(ssh, spdk_path)
@@ -469,58 +526,103 @@ done"""
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='SPDK Target Creator Tool')
+    parser = argparse.ArgumentParser(description="SPDK Target Creator Tool")
     parser.add_argument(
-        '--spdk_target_info',
-        action='append',
-        help=('SPDK target information (e.g., "ip:192.168.65.56 '
-              'path:/home/spdk pci:0000:01:00.0,0000:02:00.0"). If pci is '
-              'omitted, SPDK-ready or unmounted NVMe devices on the target are used.'),
-        required=True
+        "--spdk_target_info",
+        action="append",
+        help=(
+            'SPDK target information (e.g., "ip:192.168.65.56 '
+            'path:/home/spdk pci:0000:01:00.0,0000:02:00.0"). If pci is '
+            "omitted, SPDK-ready or unmounted NVMe devices on the target are used."
+        ),
+        required=True,
     )
-    parser.add_argument('--core-mask', type=str, default='0xff',
-                        help='CPU core mask used to start nvmf_tgt with -m (default: 0xff)')
-    parser.add_argument('--transport-type', type=str, default='RDMA',
-                        help='NVMe-oF transport type for nvmf_create_transport (default: RDMA)')
-    parser.add_argument('--max-queue-depth', type=int, default=128,
-                        help='Max number of outstanding I/O per queue (default: 128)')
-    parser.add_argument('--max-io-qpairs-per-ctrlr', type=int, default=127,
-                        help='Max number of I/O qpairs per controller (default: 127)')
-    parser.add_argument('--max-io-size', type=int, default=4096,
-                        help='Max I/O size in bytes (default: 4096)')
-    parser.add_argument('--in-capsule-data-size', type=int, default=131072,
-                        help='Max in-capsule data size in bytes (default: 131072)')
-    parser.add_argument('--io-unit-size', type=int, default=131072,
-                        help='I/O unit size in bytes (default: 131072)')
-    parser.add_argument('--max-aq-depth', type=int, default=128,
-                        help='Max number of admin commands per admin queue (default: 128)')
-    parser.add_argument('--num-shared-buffers', type=int, default=4096,
-                        help='Number of pooled data buffers available to the transport (default: 4096)')
-    parser.add_argument('--buf-cache-size', type=int, default=32,
-                        help='Number of shared buffers reserved for each poll group (default: 32)')
-    parser.add_argument('--username', type=str, default='root',
-                        help='SSH username for target nodes (default: root)')
-    parser.add_argument('--port', type=int, default=22,
-                        help='SSH port for target nodes (default: 22)')
-    parser.add_argument('--password', type=str,
-                        help='SSH password for target nodes')
-    parser.add_argument('--key-file', type=str,
-                        help='SSH private key file path')
+    parser.add_argument(
+        "--core-mask",
+        type=str,
+        default="0xff",
+        help="CPU core mask used to start nvmf_tgt with -m (default: 0xff)",
+    )
+    parser.add_argument(
+        "--transport-type",
+        type=str,
+        default="RDMA",
+        help="NVMe-oF transport type for nvmf_create_transport (default: RDMA)",
+    )
+    parser.add_argument(
+        "--max-queue-depth",
+        type=int,
+        default=128,
+        help="Max number of outstanding I/O per queue (default: 128)",
+    )
+    parser.add_argument(
+        "--max-io-qpairs-per-ctrlr",
+        type=int,
+        default=127,
+        help="Max number of I/O qpairs per controller (default: 127)",
+    )
+    parser.add_argument(
+        "--max-io-size",
+        type=int,
+        default=4096,
+        help="Max I/O size in bytes (default: 4096)",
+    )
+    parser.add_argument(
+        "--in-capsule-data-size",
+        type=int,
+        default=131072,
+        help="Max in-capsule data size in bytes (default: 131072)",
+    )
+    parser.add_argument(
+        "--io-unit-size",
+        type=int,
+        default=131072,
+        help="I/O unit size in bytes (default: 131072)",
+    )
+    parser.add_argument(
+        "--max-aq-depth",
+        type=int,
+        default=128,
+        help="Max number of admin commands per admin queue (default: 128)",
+    )
+    parser.add_argument(
+        "--num-shared-buffers",
+        type=int,
+        default=4096,
+        help="Number of pooled data buffers available to the transport (default: 4096)",
+    )
+    parser.add_argument(
+        "--buf-cache-size",
+        type=int,
+        default=32,
+        help="Number of shared buffers reserved for each poll group (default: 32)",
+    )
+    parser.add_argument(
+        "--username",
+        type=str,
+        default="root",
+        help="SSH username for target nodes (default: root)",
+    )
+    parser.add_argument(
+        "--port", type=int, default=22, help="SSH port for target nodes (default: 22)"
+    )
+    parser.add_argument("--password", type=str, help="SSH password for target nodes")
+    parser.add_argument("--key-file", type=str, help="SSH private key file path")
     return parser.parse_args()
 
 
 def main():
     args = parse_arguments()
     transport_options = {
-        'trtype': args.transport_type,
-        'max_queue_depth': args.max_queue_depth,
-        'max_io_qpairs_per_ctrlr': args.max_io_qpairs_per_ctrlr,
-        'max_io_size': args.max_io_size,
-        'in_capsule_data_size': args.in_capsule_data_size,
-        'io_unit_size': args.io_unit_size,
-        'max_aq_depth': args.max_aq_depth,
-        'num_shared_buffers': args.num_shared_buffers,
-        'buf_cache_size': args.buf_cache_size,
+        "trtype": args.transport_type,
+        "max_queue_depth": args.max_queue_depth,
+        "max_io_qpairs_per_ctrlr": args.max_io_qpairs_per_ctrlr,
+        "max_io_size": args.max_io_size,
+        "in_capsule_data_size": args.in_capsule_data_size,
+        "io_unit_size": args.io_unit_size,
+        "max_aq_depth": args.max_aq_depth,
+        "num_shared_buffers": args.num_shared_buffers,
+        "buf_cache_size": args.buf_cache_size,
     }
 
     try:
@@ -537,5 +639,5 @@ def main():
         exit(1)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -5,7 +5,6 @@ logger = logging.getLogger(__name__)
 
 
 class MooncakeTransferEngine:
-
     def __init__(self, hostname: str, gpu_id: int, ib_device: Optional[str] = None):
         try:
             from mooncake.engine import TransferEngine

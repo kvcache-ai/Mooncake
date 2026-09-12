@@ -17,9 +17,10 @@ class StorageAccess:
     Represents a need to access a page. Whether to READ or WRITE is determined
     by the upper layer based on whether the page already exists.
     """
-    page_id: int             # Page ID (hash_id from trace)
+
+    page_id: int  # Page ID (hash_id from trace)
     offset_in_page: int = 0  # Offset within the page (default: 0)
-    length: int = None       # Number of bytes (default: entire page)
+    length: int = None  # Number of bytes (default: entire page)
 
     def __repr__(self):
         if self.offset_in_page == 0 and self.length is None:

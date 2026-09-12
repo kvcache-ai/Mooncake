@@ -31,9 +31,7 @@ import time
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Batch Memory Registration Benchmark"
-    )
+    parser = argparse.ArgumentParser(description="Batch Memory Registration Benchmark")
     parser.add_argument(
         "--mode",
         choices=["target", "initiator"],
@@ -110,15 +108,20 @@ def allocate_block(size_bytes):
 
     libc.mmap.restype = ctypes.c_void_p
     libc.mmap.argtypes = [
-        ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
-        ctypes.c_int, ctypes.c_int, ctypes.c_long,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_long,
     ]
 
     flags = MAP_PRIVATE | MAP_ANONYMOUS
 
     # Try hugepages first
-    ptr = libc.mmap(None, size_bytes, PROT_READ | PROT_WRITE,
-                    flags | MAP_HUGETLB, -1, 0)
+    ptr = libc.mmap(
+        None, size_bytes, PROT_READ | PROT_WRITE, flags | MAP_HUGETLB, -1, 0
+    )
     if ptr and ptr != MAP_FAILED:
         return ptr, True
 
@@ -138,7 +141,7 @@ def run_target(args):
     block_bytes = int(args.block_size_gb * 1024 * 1024 * 1024)
     total_gb = args.num_blocks * args.block_size_gb
 
-    print(f"=== Target Node ===")
+    print("=== Target Node ===")
     print(f"Blocks: {args.num_blocks} x {args.block_size_gb} GB = {total_gb} GB total")
     print(f"Protocol: {args.protocol}")
     print(f"Registration API: {'batch' if args.use_batch_api else 'per-block'}")
@@ -223,7 +226,7 @@ def run_initiator(args):
 
     transfer_bytes = int(args.transfer_size_mb * 1024 * 1024)
 
-    print(f"=== Initiator Node ===")
+    print("=== Initiator Node ===")
     print(f"Target: {args.target_server_name}")
     print(f"Blocks: {args.num_blocks} x {args.block_size_gb} GB")
     print(f"Transfer size: {args.transfer_size_mb} MB")
@@ -273,7 +276,7 @@ def run_initiator(args):
     # contiguous. We can only access the first block via get_first_buffer_address.
     # The primary goal is to validate that registration of N separate blocks works
     # and that data can be transferred from a registered block.
-    print(f"\nBenchmarking transfers from first registered block...")
+    print("\nBenchmarking transfers from first registered block...")
     print(f"  Each transfer: {args.transfer_size_mb} MB")
 
     # Warmup

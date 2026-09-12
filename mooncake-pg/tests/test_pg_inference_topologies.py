@@ -104,9 +104,7 @@ def _topology_worker(
             service_tensor = torch.tensor(
                 [ctx.rank + 1], dtype=torch.int32, device=device
             )
-            dist.all_reduce(
-                service_tensor, group=service_group, op=dist.ReduceOp.SUM
-            )
+            dist.all_reduce(service_tensor, group=service_group, op=dist.ReduceOp.SUM)
             payload["service_group"] = list(service_spec.ranks)
             payload["service_value"] = int(service_tensor.item())
 

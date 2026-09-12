@@ -543,22 +543,24 @@ class MultiProcessTestCase(unittest.TestCase):
         if not failures:
             return
 
-        succeeded_ranks = sorted(
-            r.get("rank", "?") for r in rows if r.get("ok", False)
-        )
+        succeeded_ranks = sorted(r.get("rank", "?") for r in rows if r.get("ok", False))
         failed_ranks = sorted(
             r.get("rank", "?") for r in rows if not r.get("ok", False)
         )
 
-        report = [
-            f"\n{'='*60}",
-            f"RANK ERROR REPORT ({len(failures)} failure(s))",
-            f"{'='*60}",
-            f"Succeeded ranks: {succeeded_ranks or '(none)'}",
-            f"Failed ranks: {failed_ranks or '(none)'}",
-            f"{'-'*60}",
-            "Failures:",
-        ] + failures + [f"{'='*60}"]
+        report = (
+            [
+                f"\n{'='*60}",
+                f"RANK ERROR REPORT ({len(failures)} failure(s))",
+                f"{'='*60}",
+                f"Succeeded ranks: {succeeded_ranks or '(none)'}",
+                f"Failed ranks: {failed_ranks or '(none)'}",
+                f"{'-'*60}",
+                "Failures:",
+            ]
+            + failures
+            + [f"{'='*60}"]
+        )
 
         self.fail("\n".join(report))
 
@@ -579,7 +581,11 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
                 f"{cls.__name__} must inherit a concrete Mooncake PG backend test base class"
             )
         if cls.device_type == "musa":
-            device_count = torch.musa.device_count() if hasattr(torch, "musa") and torch.musa.is_available() else 0
+            device_count = (
+                torch.musa.device_count()
+                if hasattr(torch, "musa") and torch.musa.is_available()
+                else 0
+            )
             cls.configure_for_cuda_device_count(device_count)
         if cls.device_type == "cuda":
             device_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -611,9 +617,7 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
         resolved_filters = (
             self.device_filters if device_filters is None else device_filters
         )
-        resolved_world_size = (
-            self.world_size if world_size is None else world_size
-        )
+        resolved_world_size = self.world_size if world_size is None else world_size
         master_addr = resolve_env_value(MASTER_ADDR_ENV_VAR, DEFAULT_MASTER_ADDR)
         default_master_port = find_free_local_port()
         master_port = resolve_env_value(MASTER_PORT_ENV_VAR, default_master_port)
@@ -640,7 +644,9 @@ class BackendMultiProcessTestCase(MultiProcessTestCase):
                     args,
                 )
                 # Always use non-blocking spawn with timeout to avoid hangs
-                resolved_timeout = self.spawn_timeout_s if timeout_s is None else timeout_s
+                resolved_timeout = (
+                    self.spawn_timeout_s if timeout_s is None else timeout_s
+                )
                 ctx = mp.spawn(
                     _run_backend_worker_with_finalizer,
                     args=spawn_args,

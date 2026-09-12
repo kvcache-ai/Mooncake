@@ -35,19 +35,18 @@ if __name__ == "__main__":
     server_name = socket.gethostname()
     etcd = etcd3.client(host=etcd_host, port=2379)
     value = {}
-    value['server_name'] = server_name
-    value['protocol'] = "nvmeof"
-    value['buffers'] = []
+    value["server_name"] = server_name
+    value["protocol"] = "nvmeof"
+    value["buffers"] = []
     for file in files:
-      # TODO: check file path existence
-      buffer = {}
-      buffer['length'] = os.path.getsize(file)
-      buffer['file_path'] = file
-      local_path_map = {}
-      local_path_map[server_name] = file
-      buffer['local_path_map'] = local_path_map
-      value['buffers'].append(buffer)
-    
+        # TODO: check file path existence
+        buffer = {}
+        buffer["length"] = os.path.getsize(file)
+        buffer["file_path"] = file
+        local_path_map = {}
+        local_path_map[server_name] = file
+        buffer["local_path_map"] = local_path_map
+        value["buffers"].append(buffer)
+
     print(json.dumps(value))
     etcd.put(segment_name, json.dumps(value))
-

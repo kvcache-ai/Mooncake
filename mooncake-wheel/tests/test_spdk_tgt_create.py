@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 try:
-    import paramiko
+    import paramiko  # noqa: F401 - imported to check availability.
 except ModuleNotFoundError:
     raise unittest.SkipTest("paramiko is required for SPDK target tests")
 
@@ -11,13 +11,17 @@ from mooncake.spdk_tgt_create import SPDKTgtCreator, parse_arguments
 
 
 def test_parse_arguments_accepts_ssh_port():
-    with patch.object(sys, "argv", [
-        "spdk_tgt_create",
-        "--spdk_target_info",
-        "ip:127.0.0.1 path:/home/spdk",
-        "--port",
-        "2222",
-    ]):
+    with patch.object(
+        sys,
+        "argv",
+        [
+            "spdk_tgt_create",
+            "--spdk_target_info",
+            "ip:127.0.0.1 path:/home/spdk",
+            "--port",
+            "2222",
+        ],
+    ):
         args = parse_arguments()
 
     assert args.port == 2222

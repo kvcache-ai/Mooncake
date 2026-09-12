@@ -380,7 +380,9 @@ class EPBenchmarkWorker:
 
         if self.rank == 0:
             # A step completes only when the slowest rank finishes (critical path).
-            dispatch_critical = torch.stack(all_dispatch).max(dim=0).values.cpu().tolist()
+            dispatch_critical = (
+                torch.stack(all_dispatch).max(dim=0).values.cpu().tolist()
+            )
             combine_critical = torch.stack(all_combine).max(dim=0).values.cpu().tolist()
             e2e_critical = torch.stack(all_e2e).max(dim=0).values.cpu().tolist()
 

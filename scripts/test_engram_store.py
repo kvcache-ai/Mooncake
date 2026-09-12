@@ -35,7 +35,8 @@ for path in (BUILD_STORE, WHEEL_DIR):
     if path.is_dir() and str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
-from mooncake.mooncake_config import MooncakeConfig
+# Imported after the build and wheel directories are added to sys.path above.
+from mooncake.mooncake_config import MooncakeConfig  # noqa: E402
 
 GLOBAL_STORE = None
 STORE_MODULE = None
@@ -273,12 +274,16 @@ class EngramStoreTestBase(unittest.TestCase):
 
         cfg = self.create_config()
         if store_marker is Ellipsis:
-            engram_store = self.EngramStore(layer_id=layer_id, config=cfg, store=self.store)
+            engram_store = self.EngramStore(
+                layer_id=layer_id, config=cfg, store=self.store
+            )
             self._created_engram_stores.append(engram_store)
         elif store_marker is None:
             engram_store = self.EngramStore(layer_id=layer_id, config=cfg)
         else:
-            engram_store = self.EngramStore(layer_id=layer_id, config=cfg, store=store_marker)
+            engram_store = self.EngramStore(
+                layer_id=layer_id, config=cfg, store=store_marker
+            )
             self._created_engram_stores.append(engram_store)
         return cfg, engram_store
 
@@ -308,7 +313,9 @@ class TestEngramStoreMetadata(EngramStoreTestBase):
 
     def test_creation_without_store_keeps_metadata_accessible(self):
         layer_id = self._next_layer_id
-        cfg, engram_store = self.create_engram_store(layer_id=layer_id, store_marker=None)
+        cfg, engram_store = self.create_engram_store(
+            layer_id=layer_id, store_marker=None
+        )
         self.assertEqual(engram_store.get_num_heads(), len(cfg.table_vocab_sizes))
         self.assertEqual(engram_store.get_embedding_dim(), cfg.embedding_dim)
         self.assertEqual(engram_store.get_store_keys()[0], f"engram:l{layer_id}:h0")

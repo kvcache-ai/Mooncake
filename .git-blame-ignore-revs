@@ -1,0 +1,10 @@
+# Mechanical, formatting-only commits that should be skipped by `git blame`.
+#
+# Enable locally with:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub's blame view honors this file automatically. Use `git blame
+# --ignore-revs-file .git-blame-ignore-revs` to override a local config.
+#
+# [Misc] Apply ruff-format to Python sources
+46749bef7716d136b9dcd275adc89b2a02875c8e
