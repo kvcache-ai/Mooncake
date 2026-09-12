@@ -544,7 +544,7 @@ Mooncake Store provides multiple built-in allocation strategies to control how s
 ./build/mooncake-store/src/mooncake_master --allocation_strategy=free_ratio_first
 ```
 
-Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl`, `local_first` (case-sensitive).
+Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`, `cxl`, `local_first`, `best_fit` (case-sensitive).
 
 #### How to Choose
 
@@ -555,12 +555,15 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 | `ssd_free_ratio_first` | SSD-aware memory allocation when SSD offloading is enabled | Depends on SSD usage metrics; falls back to random allocation when needed |
 | `cxl` | CXL memory hardware | CXL-specific; single-replica only |
 | `local_first` | Colocated inference workers and memory store segments | Requires stable host identity from `MOONCAKE_HOST_ID` or `local_hostname`; single memory replica only |
+| `best_fit` | Mixed object sizes with explicit removals (for example RL data-plane offload) where large objects must find contiguous space | Concentrates data in fewer segments; one largest-free-region lookup per segment per allocation |
 
 **Use `random`** (default) when your cluster is relatively stable (segments rarely join or leave) and you want the highest possible allocation throughput.
 
 **Use `free_ratio_first`** when you need better load balancing across segments, especially in scenarios where:
 - Segments have different capacities and you want even utilization ratios.
 - New segments are dynamically added at runtime and you need them to absorb load quickly. With `random`, convergence to a well-balanced state can be slow on large or dynamic clusters; `free_ratio_first` accelerates this by preferentially filling emptier segments, substantially increasing the likelihood that newly joined segments are selected for allocations (see details below).
+
+**Use `best_fit`** when object sizes span several orders of magnitude and objects are removed explicitly rather than evicted. Each request goes to the segment whose largest contiguous free region is the smallest one that still fits, so small objects fill partially used segments and large free regions stay available for large objects. Spreading strategies leave every segment with medium-sized holes and can fail a large allocation while the cluster still reports plenty of free space.
 
 **Use `ssd_free_ratio_first`** when SSD offloading is enabled and you want memory allocation to prefer segments whose backing SSD still has more free capacity.
 

@@ -4730,8 +4730,44 @@ auto MasterService::AllocateReplicas(const std::string& key,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
 
         if (!allocation_result.has_value()) {
-            VLOG(1) << "Failed to allocate replicas for key=" << key
-                    << ", error: " << allocation_result.error();
+            if (VLOG_IS_ON(1)) {
+                // Free-space summary for offline fragmentation analysis: a
+                // failure with total_free >> value_length but
+                // largest_free < value_length is a contiguity problem, not a
+                // capacity problem.
+                uint64_t total_free = 0;
+                uint64_t largest_free = 0;
+                size_t segment_count = 0;
+                for (const auto& name : allocator_snapshot.getNames()) {
+                    const auto* registrations =
+                        allocator_snapshot.getAllocators(name);
+                    if (registrations == nullptr) continue;
+                    for (const auto& registration : *registrations) {
+                        if (!registration->IsServing()) continue;
+                        const auto allocator = registration->GetAllocator();
+                        if (!allocator) continue;
+                        ++segment_count;
+                        const size_t capacity = allocator->capacity();
+                        if (capacity != kAllocatorUnknownFreeSpace &&
+                            capacity >= allocator->size()) {
+                            total_free += capacity - allocator->size();
+                        }
+                        const size_t largest =
+                            allocator->getLargestFreeRegion();
+                        if (largest != kAllocatorUnknownFreeSpace) {
+                            largest_free =
+                                std::max<uint64_t>(largest_free, largest);
+                        }
+                    }
+                }
+                VLOG(1) << "key=" << key << ", value_length=" << value_length
+                        << ", replica_num=" << config.replica_num
+                        << ", segments=" << segment_count
+                        << ", total_free=" << total_free
+                        << ", largest_free=" << largest_free
+                        << ", error=" << allocation_result.error()
+                        << ", action=put_start_alloc_failed";
+            }
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -4745,6 +4781,19 @@ auto MasterService::AllocateReplicas(const std::string& key,
         } else {
             allocated_memory_replicas = allocation_result->size();
             replicas = std::move(allocation_result.value());
+            if (VLOG_IS_ON(1)) {
+                // Placement record for offline traffic/fragmentation analysis.
+                std::string segments;
+                for (const auto& replica : replicas) {
+                    for (const auto& name : replica.get_segment_names()) {
+                        if (!segments.empty()) segments += ';';
+                        segments += name.value_or("?");
+                    }
+                }
+                VLOG(1) << "key=" << key << ", value_length=" << value_length
+                        << ", segments=" << segments
+                        << ", action=put_start_allocated";
+            }
         }
     }
 
@@ -7304,9 +7353,13 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
             if (!persist_result) {
                 return tl::make_unexpected(persist_result.error());
             }
+            VLOG(1) << "key=" << key << ", size=" << metadata.size
+                    << ", action=remove_object";
             return {};
         }
     }
+    VLOG(1) << "key=" << key << ", size=" << metadata.size
+            << ", action=remove_object";
     accessor.Erase();
     return {};
 }
@@ -7823,10 +7876,14 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             tl::make_unexpected(persist_result.error());
                         continue;
                     }
+                    VLOG(1) << "key=" << key << ", size=" << metadata.size
+                            << ", action=remove_object";
                     results[original_idx] = {};
                     continue;
                 }
             }
+            VLOG(1) << "key=" << key << ", size=" << metadata.size
+                    << ", action=remove_object";
             EraseMetadata(tenant_state, it, normalized_tenant,
                           QuotaEraseMode::kFull, &shard);
             if (tenant_state.Empty()) {
@@ -11220,11 +11277,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
         [&, this](TenantState& tenant_state, ObjectMetadata& metadata,
                   std::vector<std::vector<Replica>>& deferred_replicas) {
             if (enable_oplog_) {
-                return metadata.size *
-                       metadata.CountReplicas([](const Replica& replica) {
-                           return replica.is_memory_replica() &&
-                                  replica.status() == ReplicaStatus::REMOVED;
-                       });
+                const size_t removed_count =
+                    metadata.CountReplicas([](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               replica.status() == ReplicaStatus::REMOVED;
+                    });
+                if (removed_count > 0) {
+                    VLOG(1) << "key=" << metadata.user_key
+                            << ", size=" << metadata.size
+                            << ", replicas=" << removed_count
+                            << ", action=evict_object";
+                }
+                return metadata.size * removed_count;
             }
             const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
             auto replicas = PopReplicasWithCacheTotalAccounting(
@@ -11236,6 +11300,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             RecordDynamicReplicaRemoval(metadata, erased_ids);
             const size_t replica_count = replicas.size();
+            if (replica_count > 0) {
+                VLOG(1) << "key=" << metadata.user_key
+                        << ", size=" << metadata.size
+                        << ", replicas=" << replica_count
+                        << ", action=evict_object";
+            }
             if (!replicas.empty()) {
                 deferred_replicas.emplace_back(std::move(replicas));
             }
