@@ -1,5 +1,8 @@
 #pragma once
 
+#include <cstdint>
+#include <vector>
+
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 #include <msgpack.hpp>
@@ -33,6 +36,9 @@ class Serializer<offset_allocator::__Allocator> {
    public:
     using PointerType = std::unique_ptr<offset_allocator::__Allocator>;
 
+    // Layout validation lives with the snapshot so every restore path shares
+    // one checker (OffsetAllocatorSnapshot::Validate); this codec only bounds
+    // the scalar capacities before decompressing node payloads.
     static tl::expected<void, SerializationError> serialize(
         const offset_allocator::__Allocator &allocator, MsgpackPacker &packer);
 

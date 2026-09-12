@@ -98,10 +98,12 @@ class MasterMetricManager {
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
-    // Remove all per-segment metric labels for the given segment.
-    // Called when a segment is unmounted to prevent stale 0-value entries
-    // from persisting in Prometheus output (e.g. after snapshot restore
-    // followed by client expiry / reaper cleanup).
+
+    // Remove per-segment memory labels only when both usage and capacity are
+    // zero. Allocator destruction and capacity release retry cleanup when
+    // retained resources are released. Cleanup is best-effort: the zero check
+    // and removal are not atomic with concurrent updates, avoiding a global
+    // lock on the allocation hot path.
     void remove_segment_metrics(const std::string& segment);
 
     // NoF segment Metrics
