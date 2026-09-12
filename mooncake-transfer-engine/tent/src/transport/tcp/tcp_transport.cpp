@@ -210,8 +210,7 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::COMPLETED,
                                 std::memory_order_release);
     } else {
-        LOG(WARNING) << "TCP transfer failed after " << params_.max_retry_count
-                     << " retries: " << status.ToString();
+        LOG(WARNING) << "TCP transfer failed: " << status.ToString();
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
