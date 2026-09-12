@@ -3266,6 +3266,65 @@ TEST(TcpWriteVisibilityTest, QueuedByteCapacityRejectsOversizedTransfer) {
     reclaimBatchDescAfterEngineShutdownForTest(batch_id);
 }
 
+TEST(TcpWriteVisibilityTest,
+     QueuedByteRejectionDoesNotStrandAlreadyAcceptedWork) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "4");
+    ScopedEnvVar byte_capacity("MC_TCP_MAX_QUEUED_BYTES_PER_PEER", "1");
+    ScopedLaneHooks hooks(/*block_first_connect_handler=*/true);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    ReusingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17947", 64 * 1024);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto accepted_request = makeWriteRequest(h, 1);
+    const auto accepted_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(accepted_batch, {accepted_request}).ok());
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return lane_connect_handler_entered.load(std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+
+    // The first pump has cleared pump_scheduled, but its connect callback is
+    // paused while the accepted request remains queued. Rejecting a request at
+    // this point must not discard the replacement pump epoch.
+    const auto oversized_request = makeWriteRequest(h, 2);
+    const auto rejected_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(rejected_batch, {oversized_request}).ok());
+    TransferStatus rejected_status;
+    rejected_status.s = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(
+        h.engine->getTransferStatus(rejected_batch, 0, rejected_status).ok());
+    EXPECT_EQ(rejected_status.s, TransferStatusEnum::FAILED);
+    EXPECT_EQ(queue_full_failure_count.load(std::memory_order_acquire), 1);
+
+    releaseLaneConnectHandler();
+    ASSERT_TRUE(fake_peer.waitForRequests(1, std::chrono::seconds(10)));
+    ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), accepted_batch, 1,
+                                     std::chrono::seconds(5)));
+
+    const auto recovery_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(recovery_batch, {accepted_request}).ok());
+    ASSERT_TRUE(fake_peer.waitForRequests(2, std::chrono::seconds(10)));
+    ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), recovery_batch, 1,
+                                     std::chrono::seconds(5)));
+
+    hooks.reset();
+    (void)h.engine->freeBatchID(accepted_batch);
+    (void)h.engine->freeBatchID(rejected_batch);
+    (void)h.engine->freeBatchID(recovery_batch);
+}
+
 TEST(TcpWriteVisibilityTest, QueuedByteCapacityReleasesWhenLaneStarts) {
     ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
     ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "1");

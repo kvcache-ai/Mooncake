@@ -721,8 +721,7 @@ void TcpTransport::enqueuePooledTransfer(const std::string& logical_peer,
     if (rejected)
         failWorkItem(std::move(*rejected), rejection_reason,
                      state->failure_counters);
-    else if (pump_epoch != 0)
-        postGroupPump(group, pump_epoch);
+    if (pump_epoch != 0) postGroupPump(group, pump_epoch);
 }
 
 void TcpTransport::postGroupPump(
