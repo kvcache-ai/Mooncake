@@ -122,9 +122,9 @@ that reject `O_DIRECT` fall back to a buffered handle. Zero progress, EOF before
 the requested range, and partial failures are errors; partial data is not
 reported as success.
 
-HF3FS keeps its adapter-specific batch read path and reports unsupported direct
-handles through the common interface, allowing the backend to use the regular
-path without changing descriptor semantics.
+HF3FS does not implement direct-open support. It reports unsupported direct
+handles through the common interface, allowing the backend to fall back to the
+existing `OpenFile` and `ReadAt` path without changing descriptor semantics.
 
 ## Concurrency invariants
 
