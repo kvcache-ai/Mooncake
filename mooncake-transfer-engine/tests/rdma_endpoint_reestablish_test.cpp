@@ -845,9 +845,9 @@ class RdmaEndPointTestPeer {
                                  std::string *reply_msg,
                                  int &out_stage, int &out_sys_errno) {
         RdmaEndPoint::SetupConnectionFailureInfo failure_info = {};
-        int rc = endpoint.doSetupConnection(qp_index, peer_gid, peer_lid,
-                                            peer_qp_num, local_gid_index,
-                                            reply_msg, &failure_info);
+        int rc = endpoint.doSetupConnection(
+            qp_index, peer_gid, peer_lid, peer_qp_num, local_gid_index,
+            IBV_MTU_4096, reply_msg, &failure_info);
         out_stage = static_cast<int>(failure_info.stage);
         out_sys_errno = failure_info.sys_errno;
         return rc;
