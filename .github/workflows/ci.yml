@@ -528,7 +528,8 @@ jobs:
         fi
 
         ruff check "${python_files[@]}"
-        ruff format --check "${python_files[@]}"
+        python scripts/ci/check_changed_python_format.py \
+          "$base_ref" "${python_files[@]}"
       shell: bash
 
 
