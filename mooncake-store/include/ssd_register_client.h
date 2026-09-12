@@ -31,6 +31,19 @@ class NoFRegisterClient {
                                    const std::string &traddr, size_t trsvcid,
                                    const std::string &master_server_addr);
 
+    /**
+     * @brief Ask the master to query and register a complete NoF namespace.
+     * @param nqn Subsystem NQN.
+     * @param nsid Namespace ID.
+     * @param traddr Target transport address.
+     * @param trsvcid Target transport service ID.
+     * @param master_server_addr Master server address.
+     * @return int OPERATION_OK or OPERATION_FAILED
+     */
+    int query_and_register(const std::string &nqn, size_t nsid,
+                           const std::string &traddr, size_t trsvcid,
+                           const std::string &master_server_addr);
+
    private:
     MasterClient master_client_;
 };

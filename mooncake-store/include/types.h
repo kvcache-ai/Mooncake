@@ -470,6 +470,12 @@ struct NoFSegment {
 };
 YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
 
+struct NoFNamespaceInfo {
+    uint64_t size = 0;
+    uint64_t num_blocks = 0;
+    uint32_t block_size = 0;
+};
+
 /**
  * @brief Client status from the master's perspective
  */

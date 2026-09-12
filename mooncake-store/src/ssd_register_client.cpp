@@ -116,4 +116,32 @@ int NoFRegisterClient::set_unregister_by_endpoint(
     return all_unmounted ? OPERATION_OK : OPERATION_FAILED;
 }
 
+int NoFRegisterClient::query_and_register(
+    const std::string &nqn, size_t nsid, const std::string &traddr,
+    size_t trsvcid, const std::string &master_server_addr) {
+    LOG(INFO) << "Registering NVMe-oF namespace: nqn=" << nqn
+              << ",nsid=" << nsid << ",traddr=" << traddr
+              << ",trsvcid=" << trsvcid << ",master=" << master_server_addr;
+
+    auto err = master_client_.Connect(master_server_addr);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to master: " << static_cast<int>(err);
+        return OPERATION_FAILED;
+    }
+
+    const auto config = NoFRegisterConfig::FromEnvironment();
+
+    std::string te_endpoint =
+        "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
+        " subnqn:" + nqn + " trtype:" + config.transport_type +
+        " adrfam:IPv4 ns:" + std::to_string(nsid);
+
+    auto result = master_client_.QueryAndMountNoFSegment(te_endpoint);
+    if (!result) {
+        LOG(ERROR) << "NoF segment mount failed: " << result.error();
+        return OPERATION_FAILED;
+    }
+    return OPERATION_OK;
+}
+
 }  // namespace mooncake

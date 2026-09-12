@@ -1042,6 +1042,33 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
 #endif
 }
 
+auto MasterService::QueryAndMountNoFSegment(const std::string& endpoint,
+                                            const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id << ", segment_name=" << endpoint
+               << ", error=nof_pool_disabled";
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    NoFNamespaceInfo info;
+    std::string error_reason;
+    if (!SpdkWrapper::GetInstance().QueryNamespaceInfo(endpoint, info,
+                                                       &error_reason)) {
+        LOG(ERROR) << "NoF namespace query failed: client_id=" << client_id
+                   << ", endpoint=" << endpoint << ", error=" << error_reason;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = endpoint;
+    segment.te_endpoint = endpoint;
+    segment.base = 0;
+    segment.size = info.size;
+    return MountNoFSegment(segment, client_id);
+#endif
+}
+
 ErrorCode MasterService::ValidateStandbyRemountSegment(
     const Segment& segment) const {
     const StandbySegmentInfo* match = nullptr;

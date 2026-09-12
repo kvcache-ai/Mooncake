@@ -355,6 +355,15 @@ class MasterClient {
         const NoFSegment& segment);
 
     /**
+     * @brief Ask the master to query NoF namespace information and
+     * register its full range for allocation.
+     * @param endpoint NVMe-oF transport string.
+     * @return tl::expected<void, ErrorCode> indicating success/failure.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> QueryAndMountNoFSegment(
+        const std::string& endpoint);
+
+    /**
      * @brief Re-mount segments, invoked when the client is the first time to
      * connect to the master or the client Ping TTL is expired and need
      * to remount. This function is idempotent. Client should retry if the
