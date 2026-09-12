@@ -1549,6 +1549,34 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         if (attr.active_speed_ex) active_speed_ = attr.active_speed_ex;
 #endif
         active_width_ = attr.active_width;
+        // Divide the shared responder budget across roughly 16 active QPs.
+        // Ionic reports max_res_rd_atom=16 for the whole device: reserving 16
+        // per QP can make the second QP's RTR transition fail with EINVAL.
+        // This is a per-QP policy, not device-wide admission control; other
+        // processes and larger endpoint counts still share the same budget.
+        {
+            const uint32_t res = device_attr.max_res_rd_atom;
+            uint32_t per_qp = res == 0 ? 0 : std::max(1u, res / 16);
+            per_qp = std::min(per_qp, 16u);
+            per_qp = std::min(
+                per_qp, static_cast<uint32_t>(device_attr.max_qp_rd_atom));
+            max_dest_rd_atomic_ = static_cast<uint8_t>(per_qp);
+
+            // Use the same conservative depth for reads initiated locally,
+            // rather than retaining 16 when the responder depth is only 1.
+            max_rd_atomic_ = static_cast<uint8_t>(std::min(
+                per_qp,
+                static_cast<uint32_t>(device_attr.max_qp_init_rd_atom)));
+
+            LOG(INFO) << "RDMA " << device_name
+                      << " rd_atomic clamp: max_dest_rd_atomic="
+                      << static_cast<int>(max_dest_rd_atomic_)
+                      << ", max_rd_atomic=" << static_cast<int>(max_rd_atomic_)
+                      << " (device max_res_rd_atom=" << res
+                      << ", max_qp_rd_atom=" << device_attr.max_qp_rd_atom
+                      << ", max_qp_init_rd_atom="
+                      << device_attr.max_qp_init_rd_atom << ")";
+        }
         {
             std::lock_guard<std::mutex> guard(gid_lock_);
             gid_index_ = gid_index;

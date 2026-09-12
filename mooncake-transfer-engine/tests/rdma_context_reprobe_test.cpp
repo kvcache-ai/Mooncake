@@ -60,6 +60,9 @@ struct FakeVerbsDevice {
     uint8_t active_speed = 0;
     uint8_t active_width = 0;
     uint32_t active_speed_ex = 0;
+    int max_res_rd_atom = 2048;
+    int max_qp_rd_atom = 16;
+    int max_qp_init_rd_atom = 16;
 };
 
 FakeVerbsDevice fake_verbs;
@@ -74,6 +77,9 @@ class FakeVerbsDeviceScope {
         fake_verbs.active_speed = 0;
         fake_verbs.active_width = 0;
         fake_verbs.active_speed_ex = 0;
+        fake_verbs.max_res_rd_atom = 2048;
+        fake_verbs.max_qp_rd_atom = 16;
+        fake_verbs.max_qp_init_rd_atom = 16;
     }
 
     ~FakeVerbsDeviceScope() { fake_verbs.enabled = false; }
@@ -137,6 +143,9 @@ int ibv_query_device(ibv_context *context, ibv_device_attr *device_attr) {
     device_attr->max_sge = std::numeric_limits<int>::max();
     device_attr->max_cqe = std::numeric_limits<int>::max();
     device_attr->max_mr_size = std::numeric_limits<uint64_t>::max();
+    device_attr->max_res_rd_atom = fake_verbs.max_res_rd_atom;
+    device_attr->max_qp_rd_atom = fake_verbs.max_qp_rd_atom;
+    device_attr->max_qp_init_rd_atom = fake_verbs.max_qp_init_rd_atom;
     return 0;
 }
 
@@ -231,6 +240,42 @@ TEST_F(RdmaContextConstructionTest, RecordsNegotiatedPortSpeedAndWidth) {
     GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
 #endif
 }
+
+class RdmaAtomicLimitsTest
+    : public RdmaContextConstructionTest,
+      public ::testing::WithParamInterface<std::array<int, 5>> {};
+
+TEST_P(RdmaAtomicLimitsTest, RecordsDeviceCompatibleQpDepths) {
+#ifdef __linux__
+    FakeVerbsDeviceScope fake_device(/*num_comp_vectors=*/0);
+    const auto caps = GetParam();
+    fake_verbs.max_res_rd_atom = caps[0];
+    fake_verbs.max_qp_rd_atom = caps[1];
+    fake_verbs.max_qp_init_rd_atom = caps[2];
+
+    // Exercise openRdmaDevice(), then stop before allocating real resources.
+    EXPECT_EQ(context_->construct(1, 1, /*port=*/1, /*gid_index=*/0),
+              ERR_CONTEXT);
+    EXPECT_EQ(context_->maxDestRdAtomic(), caps[3]);
+    EXPECT_EQ(context_->maxRdAtomic(), caps[4]);
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#endif
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    DeviceCaps, RdmaAtomicLimitsTest,
+    ::testing::Values(
+        std::array<int, 5>{16, 16, 16, 1, 1},      // Ionic shared budget
+        std::array<int, 5>{2048, 16, 16, 16, 16},  // Preserve larger NIC depths
+        std::array<int, 5>{64, 16, 16, 4, 4},      // Shared responder budget
+        std::array<int, 5>{2048, 2, 16, 2, 2},     // Per-QP responder cap
+        std::array<int, 5>{2048, 16, 4, 16, 4},    // Initiator cap
+        std::array<int, 5>{8, 16, 16, 1, 1},       // Small nonzero budget
+        std::array<int, 5>{0, 16, 16, 0, 0},       // No shared read resources
+        std::array<int, 5>{2048, 0, 16, 0, 0},     // No responder support
+        std::array<int, 5>{2048, 16, 0, 16, 0}));  // No initiator support
 
 // XDR's encoding (256) does not fit ibv_port_attr::active_speed (uint8_t),
 // which reads 0; rdma-core carries it in active_speed_ex. show_links must
