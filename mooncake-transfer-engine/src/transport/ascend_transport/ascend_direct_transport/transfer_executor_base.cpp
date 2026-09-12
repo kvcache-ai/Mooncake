@@ -271,7 +271,11 @@ int TransferExecutorBase::initEngines() {
     const auto& endpoints = local_segment_desc->rank_info.endpoints;
     for (size_t idx = 0; idx < endpoints.size(); ++idx) {
         if (idx >= local_engine_contexts_.size()) {
-            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size";
+            LOG(ERROR) << "Endpoint count exceeds local_engine_contexts size, "
+                       << "idx: " << idx
+                       << ", endpoints: " << endpoints.size()
+                       << ", local_engine_contexts: "
+                       << local_engine_contexts_.size();
             return -1;
         }
         CHECK_ACL(aclrtSetCurrentContext(local_engine_contexts_[idx]));
@@ -527,6 +531,8 @@ int TransferExecutorBase::registerMem(void* addr, size_t length,
             mem_desc, mem_type, mem_handle);
         if (adxl_ret != adxl::SUCCESS) {
             LOG(ERROR) << "Register mem ret: " << adxl_ret
+                       << ", addr: " << addr << ", length: " << length
+                       << ", engine index: " << engine_idx
                        << ", errmsg: " << aclGetRecentErrMsg();
             rollbackRegisteredMem(registered_mem_handles);
             return -1;
