@@ -712,6 +712,21 @@ if(USE_TPU)
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
 
+# XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer
+# classification, VRAM<->host staging copy) against the real oneAPI SYCL
+# backend. USE_XPU is a direct-link build, so the test links libsycl (via
+# platform_xpu inside tent_link_group) and is compiled with -fsycl. It falls
+# back to the OpenCL CPU device when no Intel GPU is present, and skips itself
+# when no SYCL device is visible at all.
+if(USE_XPU)
+  add_executable(tent_xpu_platform_test xpu/xpu_platform_test.cpp)
+  target_link_libraries(tent_xpu_platform_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  target_include_directories(tent_xpu_platform_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_platform_test COMMAND tent_xpu_platform_test)
+endif()
+
 # NOT registered via add_test: the test needs a real CUDA device (it exports a
 # real CUDA IPC handle), so it must be run manually on a GPU host. Only built
 # when CUDA is enabled: the test includes CUDA headers directly.
