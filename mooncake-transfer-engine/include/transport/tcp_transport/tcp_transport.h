@@ -351,12 +351,14 @@ class TcpTransport : public Transport {
                             const asio::io_context::executor_type &executor_arg,
                             size_t queue_capacity_arg,
                             size_t pending_admission_capacity_arg,
+                            uint64_t queued_byte_capacity_arg,
                             std::chrono::milliseconds admission_timeout_arg,
                             std::shared_ptr<FailureCounters> counters_arg)
             : key(std::move(key_arg)),
               executor(executor_arg),
               queue_capacity(queue_capacity_arg),
               pending_admission_capacity(pending_admission_capacity_arg),
+              queued_byte_capacity(queued_byte_capacity_arg),
               admission_timeout(admission_timeout_arg),
               failure_counters(std::move(counters_arg)) {}
 
@@ -368,6 +370,11 @@ class TcpTransport : public Transport {
         std::deque<TcpWorkItem> queue;
         std::deque<TcpWorkItem> pending_admissions;
         size_t pending_admission_capacity;
+        // Bytes whose source buffers remain owned by the queue or pending
+        // admission. Active lanes are excluded and already bounded by
+        // lanes_per_peer.
+        uint64_t queued_byte_capacity;
+        uint64_t admitted_bytes = 0;
         std::chrono::milliseconds admission_timeout;
         std::shared_ptr<asio::steady_timer> admission_timer;
         uint64_t admission_epoch = 0;
@@ -395,6 +402,7 @@ class TcpTransport : public Transport {
         size_t lanes_per_peer = 4;
         size_t max_queued_transfers_per_peer = 1024;
         size_t max_pending_admissions_per_peer = 1024;
+        uint64_t max_queued_bytes_per_peer = 0;
         std::chrono::milliseconds admission_timeout{1000};
         std::unordered_map<ConnectionKey, std::shared_ptr<PeerConnectionGroup>,
                            ConnectionKeyHash>
@@ -409,9 +417,8 @@ class TcpTransport : public Transport {
     std::shared_ptr<ConnectionLaneRuntime> lane_runtime_;
     std::shared_ptr<ConnectionLaneState> lane_state_;
 
-    // TODO(#2930): The queue item bound does not bound queued source bytes,
-    // and a connected payload without a progress deadline can still stall a
-    // lane indefinitely. Peer-generation recovery is also a separate phase.
+    // TODO(#2930): The byte bound is opt-in. Select a workload-informed
+    // default after sustained slow/stalled-peer measurements.
 
     std::shared_ptr<asio::ip::tcp::socket> getConnection(
         const std::string &host, uint16_t port);
@@ -454,6 +461,13 @@ class TcpTransport : public Transport {
         PeerConnectionGroup &group, std::chrono::steady_clock::time_point now,
         std::deque<TcpWorkItem> &expired);
     static size_t promotePendingAdmissionsLocked(PeerConnectionGroup &group);
+    static bool hasQueuedByteCapacityLocked(const PeerConnectionGroup &group,
+                                            uint64_t length);
+    static void addAdmittedBytesLocked(PeerConnectionGroup &group,
+                                       uint64_t length);
+    static void removeAdmittedBytesLocked(PeerConnectionGroup &group,
+                                          uint64_t length);
+    static void recomputeAdmittedBytesLocked(PeerConnectionGroup &group);
     static void refreshAdmissionTimerLocked(
         const std::shared_ptr<PeerConnectionGroup> &group,
         std::deque<TcpWorkItem> &runtime_failed,
