@@ -465,6 +465,15 @@ class MasterClient {
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
     /**
+     * @brief Tells the master this client cannot reach the given NoF targets,
+     * so they are skipped by its subsequent NoF allocations.
+     * @param client_id The reporting client
+     * @param te_endpoints Transfer engine endpoints of the failed targets
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportNoFTargetUnreachable(
+        const UUID& client_id, const std::vector<std::string>& te_endpoints);
+
+    /**
      * @brief Adds multiple new objects to a specified client in batch.
      * @param keys         A list of object keys (names) that were successfully
      * offloaded.

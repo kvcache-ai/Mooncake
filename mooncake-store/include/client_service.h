@@ -839,6 +839,16 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
+
+    /**
+     * @brief Tell the master that writes to these NoF targets failed from this
+     * client, so it stops allocating on them for us until the report expires.
+     * Master-to-target heartbeats cannot see a client-to-target partition, so
+     * without this the master keeps handing back unusable NoF handles.
+     * Best effort: failures are logged and swallowed. Duplicate and empty
+     * endpoints are dropped, and an empty list issues no RPC.
+     */
+    void ReportUnreachableNoFTargets(std::vector<std::string> te_endpoints);
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);

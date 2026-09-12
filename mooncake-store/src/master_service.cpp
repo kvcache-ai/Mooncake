@@ -211,6 +211,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
           std::chrono::milliseconds(config.nof_heartbeat_probe_timeout_ms)),
       nof_heartbeat_failures_threshold_(
           config.nof_heartbeat_failures_threshold),
+      nof_unreachable_ttl_(std::chrono::seconds(std::max<int64_t>(
+          1,
+          config.nof_heartbeat_interval_sec *
+              static_cast<int64_t>(config.nof_heartbeat_failures_threshold)))),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
@@ -842,6 +846,11 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
         return std::nullopt;
     }
     return it->second.consecutive_failures;
+}
+
+std::set<std::string> MasterService::GetNoFExcludedSegmentsForTesting(
+    const UUID& client_id) {
+    return GetNoFExcludedSegments(client_id);
 }
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
@@ -3418,6 +3427,100 @@ auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
     return nof_segment_manager_.GetSegmentsByName(segment_name);
 }
 
+auto MasterService::ReportNoFTargetUnreachable(
+    const UUID& client_id, const std::vector<std::string>& te_endpoints)
+    -> tl::expected<void, ErrorCode> {
+#ifndef USE_NOF
+    LOG(ERROR) << "client_id=" << client_id << ", error=nof_pool_disabled";
+    (void)te_endpoints;
+    return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+#else
+    const auto now = std::chrono::steady_clock::now();
+    const auto expires_at = now + nof_unreachable_ttl_;
+    size_t recorded = 0;
+    {
+        std::lock_guard<std::mutex> lock(nof_unreachable_mutex_);
+        // Drop reports that already expired so a client that keeps churning
+        // through targets cannot grow the map without bound.
+        for (auto it = nof_unreachable_endpoints_.begin();
+             it != nof_unreachable_endpoints_.end();) {
+            auto& endpoints = it->second;
+            for (auto endpoint_it = endpoints.begin();
+                 endpoint_it != endpoints.end();) {
+                if (endpoint_it->second <= now) {
+                    endpoint_it = endpoints.erase(endpoint_it);
+                } else {
+                    ++endpoint_it;
+                }
+            }
+            if (endpoints.empty()) {
+                it = nof_unreachable_endpoints_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+
+        for (const auto& te_endpoint : te_endpoints) {
+            if (te_endpoint.empty()) {
+                continue;
+            }
+            nof_unreachable_endpoints_[client_id][te_endpoint] = expires_at;
+            ++recorded;
+        }
+    }
+
+    if (recorded == 0) {
+        return {};
+    }
+    LOG(WARNING) << "client_id=" << client_id
+                 << ", action=mark_nof_target_unreachable"
+                 << ", endpoints=" << recorded
+                 << ", ttl_sec=" << nof_unreachable_ttl_.count();
+    return {};
+#endif
+}
+
+std::set<std::string> MasterService::GetNoFExcludedSegments(
+    const UUID& client_id) {
+    std::unordered_set<std::string> unreachable_endpoints;
+    {
+        std::lock_guard<std::mutex> lock(nof_unreachable_mutex_);
+        auto client_it = nof_unreachable_endpoints_.find(client_id);
+        if (client_it == nof_unreachable_endpoints_.end()) {
+            return {};
+        }
+        const auto now = std::chrono::steady_clock::now();
+        auto& endpoints = client_it->second;
+        for (auto it = endpoints.begin(); it != endpoints.end();) {
+            if (it->second <= now) {
+                it = endpoints.erase(it);
+            } else {
+                unreachable_endpoints.insert(it->first);
+                ++it;
+            }
+        }
+        if (endpoints.empty()) {
+            nof_unreachable_endpoints_.erase(client_it);
+        }
+    }
+    if (unreachable_endpoints.empty()) {
+        return {};
+    }
+
+    // Reports name the transfer engine endpoint, which is the only NoF target
+    // identity a client sees in a replica descriptor. Map it back onto the
+    // segment names the allocator understands.
+    std::vector<MountedNoFSegmentSnapshot> mounted_segments;
+    nof_segment_manager_.GetMountedSegmentsSnapshot(mounted_segments);
+    std::set<std::string> excluded_segments;
+    for (const auto& snapshot : mounted_segments) {
+        if (unreachable_endpoints.contains(snapshot.segment.te_endpoint)) {
+            excluded_segments.insert(snapshot.segment.name);
+        }
+    }
+    return excluded_segments;
+}
+
 auto MasterService::GetSegmentsDetail()
     -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
@@ -4673,7 +4776,8 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
-auto MasterService::AllocateReplicas(const std::string& key,
+auto MasterService::AllocateReplicas(const UUID& client_id,
+                                     const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
                                      const std::string& writer_host_id)
@@ -4751,6 +4855,14 @@ auto MasterService::AllocateReplicas(const std::string& key,
 #ifdef USE_NOF
     if (config.nof_replica_num > 0 &&
         nof_segment_manager_.getMountedSegmentCount() > 0) {
+        // Heartbeats only prove the master can reach a target. Targets this
+        // client has just failed to write are dropped here, otherwise a
+        // client-to-target partition keeps producing handles the client
+        // cannot use. Resolved before taking the allocator guard because it
+        // reads the mounted segment map under the same segment mutex.
+        std::set<std::string> excluded_segments =
+            GetNoFExcludedSegments(client_id);
+
         ScopedAllocatorAccess allocator_access =
             nof_segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
@@ -4760,7 +4872,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
 
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.nof_replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
+            preferred_segments, excluded_segments, ReplicaType::NOF_SSD);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate nof replicas for key=" << key
@@ -4964,7 +5076,7 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     auto allocation_result =
-        AllocateReplicas(key, value_length, config, writer_host_id);
+        AllocateReplicas(client_id, key, value_length, config, writer_host_id);
     if (!allocation_result) {
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                            pending_quota_charge);
@@ -6027,8 +6139,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (!quota_result) {
                         return tl::make_unexpected(quota_result.error());
                     }
-                    auto allocation_result = AllocateReplicas(
-                        key, slice_length, merged_config, writer_host_id);
+                    auto allocation_result =
+                        AllocateReplicas(client_id, key, slice_length,
+                                         merged_config, writer_host_id);
                     if (!allocation_result) {
                         ReleaseTenantQuota(quota_account,
                                            replacement_pending_quota_charge);

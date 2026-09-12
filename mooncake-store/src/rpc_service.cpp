@@ -1608,6 +1608,17 @@ tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
     return result;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::ReportNoFTargetUnreachable(
+    const UUID& client_id, const std::vector<std::string>& te_endpoints) {
+    ScopedVLogTimer timer(1, "ReportNoFTargetUnreachable");
+    timer.LogRequest("client_id=", client_id,
+                     ", endpoints=", te_endpoints.size());
+    auto result =
+        master_service_.ReportNoFTargetUnreachable(client_id, te_endpoints);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
     const UUID& client_id, int64_t ssd_total_capacity_bytes) {
     ScopedVLogTimer timer(1, "ReportSsdCapacity");
@@ -1849,6 +1860,9 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReportNoFTargetUnreachable>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(

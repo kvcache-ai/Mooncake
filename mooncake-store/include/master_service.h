@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <queue>
+#include <set>
 #include <shared_mutex>
 #include <string>
 #include <string_view>
@@ -193,6 +194,8 @@ class MasterService {
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
+    std::set<std::string> GetNoFExcludedSegmentsForTesting(
+        const UUID& client_id);
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
@@ -359,6 +362,20 @@ class MasterService {
      */
     auto GetNoFSegmentsByName(const std::string& segment_name)
         -> tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>;
+
+    /**
+     * @brief Record that `client_id` could not reach the NoF targets behind
+     * `te_endpoints`. Heartbeat probes only exercise the master-to-target
+     * path, so a client-to-target partition is invisible to them; without
+     * this report the master keeps handing the partitioned client handles it
+     * cannot write to. Reported endpoints are excluded from that client's NoF
+     * allocations until the report expires.
+     * @param client_id The client that observed the I/O failure.
+     * @param te_endpoints Transfer engine endpoints of the failed targets.
+     */
+    auto ReportNoFTargetUnreachable(
+        const UUID& client_id, const std::vector<std::string>& te_endpoints)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Detailed information about a single segment.
@@ -2154,8 +2171,8 @@ class MasterService {
     // Allocate the physical replicas without changing object metadata.  This
     // is used by leased upserts to prove that replacement storage is available
     // before the old metadata is removed.
-    auto AllocateReplicas(const std::string& key, uint64_t value_length,
-                          const ReplicateConfig& config,
+    auto AllocateReplicas(const UUID& client_id, const std::string& key,
+                          uint64_t value_length, const ReplicateConfig& config,
                           const std::string& writer_host_id)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
@@ -2210,6 +2227,11 @@ class MasterService {
         const std::string& error_reason);
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
+
+    // Names of the mounted NoF segments `client_id` currently cannot reach.
+    // Drops expired reports as a side effect. Must not be called while
+    // holding a NoF segment or allocator access guard.
+    std::set<std::string> GetNoFExcludedSegments(const UUID& client_id);
 
     // Pushes an offload mirror for `replica` onto its host client's LocalSSD
     // mailbox. When `mirror_clients` is non-null, the destination client is
@@ -2683,6 +2705,21 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+
+    // NoF targets a client reported as unreachable, mapped to the time the
+    // report expires. Keyed by client because the partition is per client:
+    // the same target stays usable for everyone else.
+    std::mutex nof_unreachable_mutex_;
+    std::unordered_map<
+        UUID,
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point>,
+        boost::hash<UUID>>
+        nof_unreachable_endpoints_;
+    // Reports live for one heartbeat liveness window, the same span the
+    // heartbeat thread waits before unmounting an unresponsive target. After
+    // that the client is allowed to retry the target instead of being pinned
+    // to a stale verdict.
+    const std::chrono::seconds nof_unreachable_ttl_;
 
     // if high availability features enabled
     const bool enable_ha_;
