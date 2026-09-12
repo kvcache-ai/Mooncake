@@ -11,9 +11,7 @@
 #include <thread>
 #include <vector>
 
-#ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
-#endif
 
 namespace mooncake::test {
 namespace {
@@ -164,6 +162,56 @@ bool WaitForMetric(const std::function<bool()>& predicate) {
 #endif
 
 }  // namespace
+
+TEST(OrderedOpLogWriterMetricsTest, RuntimeSnapshotTracksAdmission) {
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [](const OpLogBatchRecord&, const DurablePrefix&) {
+            return ErrorCode::OK;
+        });
+    writer.ActivateRuntimeMetrics();
+    auto snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_TRUE(snapshot.accepting);
+    EXPECT_EQ(snapshot.waiting_slots, 0);
+
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_EQ(snapshot.waiting_slots, 1);
+    writer.Abort(std::move(*reservation));
+    snapshot = HAMetricManager::instance().get_writer_runtime();
+    EXPECT_EQ(snapshot.waiting_slots, 0);
+}
+
+TEST(OrderedOpLogWriterMetricsTest,
+     CandidateAndOldDestructorCannotOverwriteOwner) {
+    auto write = [](const OpLogBatchRecord&, const DurablePrefix&) {
+        return ErrorCode::OK;
+    };
+    auto old = std::make_unique<OrderedOpLogWriter>(
+        OrderedOpLogWriterConfig{
+            .initial_durable_prefix = {.batch_id = 1, .last_seq = 10}},
+        write);
+    old->ActivateRuntimeMetrics();
+    auto& metrics = HAMetricManager::instance();
+    {
+        OrderedOpLogWriter rejected({}, write);
+        EXPECT_EQ(metrics.get_writer_runtime().durable_sequence, 10);
+    }
+    EXPECT_TRUE(metrics.get_writer_runtime().accepting);
+    OrderedOpLogWriter replacement(
+        OrderedOpLogWriterConfig{
+            .initial_durable_prefix = {.batch_id = 2, .last_seq = 20}},
+        write);
+    EXPECT_EQ(metrics.get_writer_runtime().durable_sequence, 10);
+    replacement.ActivateRuntimeMetrics();
+    old->Stop();
+    old.reset();
+    EXPECT_TRUE(metrics.get_writer_runtime().accepting);
+    EXPECT_EQ(metrics.get_writer_runtime().durable_sequence, 20);
+    replacement.Stop();
+    EXPECT_FALSE(metrics.get_writer_runtime().accepting);
+}
 
 TEST(OrderedOpLogWriterAdmissionTest, AbortLeavesNoSequenceGap) {
     FakeBatchWriter storage;

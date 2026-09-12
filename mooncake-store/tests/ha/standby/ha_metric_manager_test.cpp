@@ -284,6 +284,57 @@ TEST_F(HAMetricManagerTest, TestConcurrentAccess) {
     EXPECT_EQ(before + kThreads * kIncrementsPerThread, after);
 }
 
+TEST_F(HAMetricManagerTest, WriterOwnershipAndRangeSerialization) {
+    auto& mgr = HAMetricManager::instance();
+    const auto before = mgr.get_writer_runtime().retry_count;
+    HAMetricManager::WriterRuntimeSnapshot first;
+    first.accepting = true;
+    const auto old_owner = mgr.activate_writer_runtime(first);
+    auto serialized = mgr.serialize_metrics();
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_first_sequence"),
+        0);
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_last_sequence"),
+        0);
+
+    first.retry_count = 2;
+    first.stuck_range = std::make_pair(11, 15);
+    mgr.update_writer_runtime(old_owner, first);
+    serialized = mgr.serialize_metrics();
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_first_sequence"),
+        11);
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_last_sequence"),
+        15);
+    EXPECT_EQ(mgr.get_writer_runtime().retry_count, before + 2);
+
+    first.stuck_range.reset();
+    mgr.update_writer_runtime(old_owner, first);
+    serialized = mgr.serialize_metrics();
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_first_sequence"),
+        0);
+    EXPECT_EQ(
+        FindSerializedMetricValue(serialized, "ha_writer_stuck_last_sequence"),
+        0);
+
+    HAMetricManager::WriterRuntimeSnapshot second;
+    second.accepting = true;
+    second.durable_sequence = 20;
+    const auto new_owner = mgr.activate_writer_runtime(second);
+    first.accepting = false;
+    first.terminal_reason = "fenced";
+    mgr.update_writer_runtime(old_owner, first);
+    EXPECT_TRUE(mgr.get_writer_runtime().accepting);
+    EXPECT_EQ(mgr.get_writer_runtime().durable_sequence, 20);
+    EXPECT_TRUE(mgr.get_writer_runtime().terminal_reason.empty());
+    second.retry_count = 1;
+    mgr.update_writer_runtime(new_owner, second);
+    EXPECT_EQ(mgr.get_writer_runtime().retry_count, before + 3);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

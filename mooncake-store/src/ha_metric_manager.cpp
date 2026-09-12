@@ -13,6 +13,29 @@ HAMetricManager& HAMetricManager::instance() {
     return static_instance;
 }
 
+uint64_t HAMetricManager::activate_writer_runtime(
+    const WriterRuntimeSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(writer_runtime_mutex_);
+    writer_retry_base_ = writer_runtime_.retry_count;
+    writer_runtime_ = snapshot;
+    writer_runtime_.retry_count += writer_retry_base_;
+    return ++writer_runtime_owner_;
+}
+
+void HAMetricManager::update_writer_runtime(
+    uint64_t owner, const WriterRuntimeSnapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(writer_runtime_mutex_);
+    if (owner == 0 || owner != writer_runtime_owner_) return;
+    writer_runtime_ = snapshot;
+    writer_runtime_.retry_count += writer_retry_base_;
+}
+
+HAMetricManager::WriterRuntimeSnapshot HAMetricManager::get_writer_runtime()
+    const {
+    std::lock_guard<std::mutex> lock(writer_runtime_mutex_);
+    return writer_runtime_;
+}
+
 // --- Constructor ---
 HAMetricManager::HAMetricManager()
     // OpLog Sequence Gauges
@@ -423,6 +446,57 @@ std::string HAMetricManager::serialize_metrics() {
 #endif
     serialize_metric(state_transitions_total_);
 
+    const auto writer = get_writer_runtime();
+    ss << "# HELP ha_writer_accepting Whether the batch OpLog writer accepts "
+          "new entries\n"
+       << "# TYPE ha_writer_accepting gauge\n"
+       << "ha_writer_accepting " << (writer.accepting ? 1 : 0) << "\n"
+       << "# HELP ha_writer_retry_count Total writer retries\n"
+       << "# TYPE ha_writer_retry_count counter\n"
+       << "ha_writer_retry_count " << writer.retry_count << "\n"
+       << "# HELP ha_writer_retry_delay_ms Current writer retry delay\n"
+       << "# TYPE ha_writer_retry_delay_ms gauge\n"
+       << "ha_writer_retry_delay_ms " << writer.retry_delay_ms << "\n"
+       << "# HELP ha_writer_waiting_slots Current reserved writer slots\n"
+       << "# TYPE ha_writer_waiting_slots gauge\n"
+       << "ha_writer_waiting_slots " << writer.waiting_slots << "\n"
+       << "# HELP ha_writer_committed_queue_depth Committed writer queue "
+          "depth\n"
+       << "# TYPE ha_writer_committed_queue_depth gauge\n"
+       << "ha_writer_committed_queue_depth " << writer.committed_queue_depth
+       << "\n"
+       << "# HELP ha_writer_callback_queue_depth Callback queue depth\n"
+       << "# TYPE ha_writer_callback_queue_depth gauge\n"
+       << "ha_writer_callback_queue_depth " << writer.callback_queue_depth
+       << "\n"
+       << "# HELP ha_writer_last_error Last writer error code\n"
+       << "# TYPE ha_writer_last_error gauge\n"
+       << "ha_writer_last_error " << writer.last_error << "\n"
+       << "# HELP ha_writer_durable_batch_id Last durable batch ID\n"
+       << "# TYPE ha_writer_durable_batch_id gauge\n"
+       << "ha_writer_durable_batch_id " << writer.durable_batch_id << "\n"
+       << "# HELP ha_writer_durable_sequence Last durable sequence\n"
+       << "# TYPE ha_writer_durable_sequence gauge\n"
+       << "ha_writer_durable_sequence " << writer.durable_sequence << "\n"
+       << "# HELP ha_writer_stuck_first_sequence First sequence of the "
+          "in-flight batch awaiting durability; 0 when absent, not a timeout "
+          "indicator\n"
+       << "# TYPE ha_writer_stuck_first_sequence gauge\n"
+       << "ha_writer_stuck_first_sequence "
+       << (writer.stuck_range ? writer.stuck_range->first : 0) << "\n"
+       << "# HELP ha_writer_stuck_last_sequence Last sequence of the "
+          "in-flight batch awaiting durability; 0 when absent, not a timeout "
+          "indicator\n"
+       << "# TYPE ha_writer_stuck_last_sequence gauge\n"
+       << "ha_writer_stuck_last_sequence "
+       << (writer.stuck_range ? writer.stuck_range->second : 0) << "\n";
+    if (!writer.terminal_reason.empty()) {
+        ss << "# HELP ha_writer_terminal_reason Current terminal reason\n"
+           << "# TYPE ha_writer_terminal_reason gauge\n"
+           << "ha_writer_terminal_reason{reason=\"" << writer.terminal_reason
+           << "\"} 1\n";
+    }
+
     // Histograms
     serialize_metric(oplog_etcd_write_latency_us_);
     serialize_metric(oplog_apply_latency_us_);
@@ -452,6 +526,23 @@ std::string HAMetricManager::get_summary_string() {
     ss << ", etcd_fail=" << get_oplog_etcd_write_failures_total();
     ss << ", watch_disconn=" << get_oplog_watch_disconnections_total();
     ss << ", state=" << get_standby_state();
+    const auto writer = get_writer_runtime();
+    ss << ", writer_accepting=" << (writer.accepting ? "true" : "false")
+       << ", writer_retry_count=" << writer.retry_count
+       << ", writer_retry_delay_ms=" << writer.retry_delay_ms
+       << ", writer_waiting_slots=" << writer.waiting_slots
+       << ", writer_committed_queue=" << writer.committed_queue_depth
+       << ", writer_callback_queue=" << writer.callback_queue_depth
+       << ", writer_durable_batch=" << writer.durable_batch_id
+       << ", writer_durable_seq=" << writer.durable_sequence
+       << ", writer_last_error=" << writer.last_error;
+    if (!writer.terminal_reason.empty()) {
+        ss << ", writer_terminal_reason=" << writer.terminal_reason;
+    }
+    if (writer.stuck_range) {
+        ss << ", writer_stuck_range=" << writer.stuck_range->first << "-"
+           << writer.stuck_range->second;
+    }
     return ss.str();
 }
 
