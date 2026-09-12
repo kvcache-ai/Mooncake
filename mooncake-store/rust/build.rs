@@ -95,6 +95,22 @@ fn has_library(search_dirs: &[PathBuf], candidates: &[&str]) -> bool {
     })
 }
 
+fn oss_adapter_enabled(build_dir: &std::path::Path) -> Option<bool> {
+    let cache_path = build_dir.join("CMakeCache.txt");
+    println!("cargo:rerun-if-changed={}", cache_path.display());
+    fs::read_to_string(cache_path)
+        .ok()?
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("MOONCAKE_OSS_ADAPTER_ENABLED:INTERNAL=")
+                .and_then(|value| match value {
+                    "TRUE" => Some(true),
+                    "FALSE" => Some(false),
+                    _ => None,
+                })
+        })
+}
+
 fn emit_link_searches(search_dirs: &[PathBuf]) {
     for dir in search_dirs {
         println!("cargo:rustc-link-search=native={}", dir.display());
@@ -380,6 +396,17 @@ fn main() {
         if has_library(&search_dirs, candidates) {
             println!("cargo:rustc-link-lib={link_name}");
         }
+    }
+
+    // Static C++ dependencies do not propagate from CMake into Cargo. Honor
+    // CMake's actual OSS state; installed libraries without a build cache use
+    // the same library-discovery fallback as the other optional dependencies.
+    let oss_build_dir = env::var_os("MOONCAKE_BUILD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or(build_dir);
+    if oss_adapter_enabled(&oss_build_dir).unwrap_or_else(|| has_library(&search_dirs, &["crypto"]))
+    {
+        println!("cargo:rustc-link-lib=crypto");
     }
 
     if has_gcov_runtime || has_library(&search_dirs, &["gcov"]) {
