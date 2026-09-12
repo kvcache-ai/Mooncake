@@ -4,8 +4,9 @@ Minimal CLI module for mooncake_master.
 """
 
 import os
-import stat
 import sys
+
+from mooncake._launcher import locate
 
 
 def main():
@@ -13,14 +14,7 @@ def main():
     Main entry point for the mooncake_master command.
     Simply runs the mooncake_master binary with all arguments passed through.
     """
-    # Get the path to the mooncake_master binary
-    package_dir = os.path.dirname(os.path.abspath(__file__))
-    bin_path = os.path.join(package_dir, "mooncake_master")
-
-    # Make sure the binary is executable
-    if not os.access(bin_path, os.X_OK):
-        st = os.stat(bin_path)
-        os.chmod(bin_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    bin_path = locate("mooncake_master")
 
     # Preserve the CLI process ID so callers can reliably stop the server.
     os.execv(bin_path, [bin_path] + sys.argv[1:])

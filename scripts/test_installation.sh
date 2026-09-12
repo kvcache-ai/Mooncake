@@ -33,6 +33,7 @@ sudo apt-get install -y $SYSTEM_PACKAGES
 echo "Verifying that import succeeds after installation..."
 python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
 python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succeeded after installation" || { echo "ERROR: Reshard import failed after installation!"; exit 1; }
+python -c "import mooncake.cli, mooncake.cli_bench, mooncake.cli_client, mooncake.transfer_engine_topology_dump" && echo "Success: CLI imports succeeded after installation" || { echo "ERROR: CLI imports failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
 # Run the import structure test
@@ -65,6 +66,11 @@ echo "Verifying transfer_engine_bench entry point..."
 # Check if the transfer_engine_bench entry point is installed and executable
 which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
 echo "Success: transfer_engine_bench entry point found"
+
+echo "Verifying transfer_engine_topology_dump entry point..."
+transfer_engine_topology_dump --help >/dev/null
+python -m mooncake.transfer_engine_topology_dump --help >/dev/null
+echo "Success: transfer_engine_topology_dump entry point and module execution work"
 
 cd ..
 
