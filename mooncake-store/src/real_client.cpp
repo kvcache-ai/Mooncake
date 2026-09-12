@@ -1968,7 +1968,8 @@ void RealClient::stop_http_server() {
 tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
     const ReplicateConfig &config,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    int32_t device_id) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1994,7 +1995,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(scatter_result.error());
     }
 
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
+    std::vector<Slice> slices = split_into_slices(buffer_handle, device_id);
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
@@ -2006,7 +2007,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
     const std::string &key, std::span<const char> value,
-    const ReplicateConfig &config, const UUID &client_id) {
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2015,7 +2016,8 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
     }
     auto &context = it->second;
 
-    return put_internal(key, value, config, context.client_buffer_allocator);
+    return put_internal(key, value, config, context.client_buffer_allocator,
+                        device_id);
 }
 
 int RealClient::put(const std::string &key, std::span<const char> value,
@@ -2037,7 +2039,8 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    int32_t device_id) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2076,7 +2079,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         if (!scatter_result) {
             return tl::unexpected(scatter_result.error());
         }
-        auto slices = split_into_slices(buffer_handle);
+        auto slices = split_into_slices(buffer_handle, device_id);
         buffer_handles.emplace_back(std::move(*alloc_result));
         batched_slices.emplace(key, std::move(slices));
     }
@@ -2108,7 +2111,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
 tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
-    const ReplicateConfig &config, const UUID &client_id) {
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2118,7 +2121,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
     auto &context = it->second;
 
     return put_batch_internal(keys, values, config,
-                              context.client_buffer_allocator);
+                              context.client_buffer_allocator, device_id);
 }
 
 int RealClient::put_batch(const std::vector<std::string> &keys,
@@ -2141,7 +2144,8 @@ int RealClient::put_batch(const std::vector<std::string> &keys,
 tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     const std::string &key, const std::vector<std::span<const char>> &values,
     const ReplicateConfig &config,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    int32_t device_id) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -2189,7 +2193,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     }
 
     // Split into slices
-    std::vector<Slice> slices = split_into_slices(buffer_handle);
+    std::vector<Slice> slices = split_into_slices(buffer_handle, device_id);
 
     // Perform the put operation - buffer_handle will be automatically released
     auto put_result = client_->Put(key, slices, config);
@@ -2204,7 +2208,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
 
 tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     const std::string &key, std::vector<std::span<const char>> values,
-    const ReplicateConfig &config, const UUID &client_id) {
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -2214,7 +2218,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
     auto &context = it->second;
 
     return put_parts_internal(key, values, config,
-                              context.client_buffer_allocator);
+                              context.client_buffer_allocator, device_id);
 }
 
 int RealClient::put_parts(const std::string &key,
@@ -2833,7 +2837,8 @@ tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
 // Implementation of get_buffer_internal method
 std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     const std::string &key,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    int32_t device_id) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -2930,7 +2935,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     std::vector<Slice> slices;
-    allocateSlices(slices, replica, buffer_handle->ptr());
+    allocateSlices(slices, replica, buffer_handle->ptr(), device_id);
     auto filtered_qr = FilterQueryResult(query_result.value(), replica);
     auto get_result = client_->Get(key, filtered_qr, slices);
     if (!get_result) {
@@ -2986,7 +2991,7 @@ tl::expected<void, ErrorCode> RealClient::release_hot_cache(
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::acquire_buffer_dummy(const std::string &key,
+RealClient::acquire_buffer_dummy(const std::string &key, int32_t device_id,
                                  const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
@@ -2996,7 +3001,7 @@ RealClient::acquire_buffer_dummy(const std::string &key,
     auto &context = it->second;
 
     auto buffer_handle =
-        get_buffer_internal(key, context.client_buffer_allocator);
+        get_buffer_internal(key, context.client_buffer_allocator, device_id);
     if (!buffer_handle) {
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -3108,6 +3113,7 @@ tl::expected<void, ErrorCode> RealClient::batch_release_hot_cache(
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
 RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
+                                       int32_t device_id,
                                        const UUID &client_id) {
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>> results(
         keys.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
@@ -3122,8 +3128,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 
     // Use batch_get_buffer_internal with dummy's allocator
     lock.unlock();
-    auto handles =
-        batch_get_buffer_internal(keys, ctx_it->second.client_buffer_allocator);
+    auto handles = batch_get_buffer_internal(
+        keys, ctx_it->second.client_buffer_allocator, device_id);
     lock.lock();
 
     // Re-validate context after re-lock
@@ -3165,7 +3171,8 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
 std::vector<std::shared_ptr<BufferHandle>>
 RealClient::batch_get_buffer_internal(
     const std::vector<std::string> &keys,
-    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator) {
+    const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator,
+    int32_t device_id) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -3245,7 +3252,7 @@ RealClient::batch_get_buffer_internal(
         auto buffer_handle =
             std::make_unique<BufferHandle>(std::move(*alloc_result));
         std::vector<Slice> slices;
-        allocateSlices(slices, replica, buffer_handle->ptr());
+        allocateSlices(slices, replica, buffer_handle->ptr(), device_id);
 
         if (replica.is_local_disk_replica()) {
             // LOCAL_DISK: buffer is allocated and registered via
@@ -4303,12 +4310,14 @@ RealClient::batch_put_from_dummy_helper(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(buffers_result.error()));
     }
-    return batch_put_from_internal(keys, buffers_result.value(), sizes, config);
+    return batch_put_from_internal(keys, buffers_result.value(), sizes, config,
+                                   device_id);
 }
 
 std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    int32_t device_id) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -4334,7 +4343,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         void *buffer = buffers[i];
         size_t size = sizes[i];
 
-        all_slices[key] = split_into_slices(buffer, size);
+        all_slices[key] = split_into_slices(buffer, size, device_id);
     }
 
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;

@@ -422,6 +422,8 @@ struct SerializationError {
 struct Slice {
     void* ptr{nullptr};
     size_t size{0};
+    // Physical accelerator id carried across standalone-client async work.
+    int32_t device_id{-1};
 };
 
 const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;

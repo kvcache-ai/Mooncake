@@ -123,20 +123,21 @@ size_t BufferHandle::size() const {
 }
 
 // Utility functions for buffer and slice management
-std::vector<Slice> split_into_slices(BufferHandle& handle) {
+std::vector<Slice> split_into_slices(BufferHandle& handle, int32_t device_id) {
     auto base = static_cast<uint8_t*>(handle.ptr());
     auto length = handle.size();
-    return split_into_slices(base, length);
+    return split_into_slices(base, length, device_id);
 }
 
-std::vector<Slice> split_into_slices(void* buffer, size_t length) {
+std::vector<Slice> split_into_slices(void* buffer, size_t length,
+                                     int32_t device_id) {
     std::vector<Slice> slices;
     auto base = static_cast<uint8_t*>(buffer);
     size_t offset = 0;
 
     while (offset < length) {
         size_t chunk_size = std::min(length - offset, kMaxSliceSize);
-        slices.push_back({base + offset, chunk_size});
+        slices.push_back({base + offset, chunk_size, device_id});
         offset += chunk_size;
     }
     return slices;
@@ -160,7 +161,8 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
 }
 
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica, void* buffer_ptr) {
+                   const Replica::Descriptor& replica, void* buffer_ptr,
+                   int32_t device_id) {
     if (replica.is_disk_replica()) {
         // For disk-based replica, split into slices based on file size
         uint64_t offset = 0;
@@ -168,25 +170,26 @@ int allocateSlices(std::vector<Slice>& slices,
         while (offset < total_length) {
             auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
             void* chunk_ptr = static_cast<char*>(buffer_ptr) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
+            slices.emplace_back(Slice{chunk_ptr, chunk_size, device_id});
             offset += chunk_size;
         }
     } else if (replica.is_local_disk_replica()) {
         slices.emplace_back(
-            Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
+            Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size,
+                  device_id});
     } else if (replica.is_dfs_replica()) {
-        slices.emplace_back(
-            Slice{buffer_ptr, replica.get_dfs_descriptor().object_size});
+        slices.emplace_back(Slice{
+            buffer_ptr, replica.get_dfs_descriptor().object_size, device_id});
     } else if (replica.is_nof_replica()) {
         auto& handle = replica.get_nof_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;
-        slices.emplace_back(Slice{chunk_ptr, handle.size_});
+        slices.emplace_back(Slice{chunk_ptr, handle.size_, device_id});
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors
         auto& handle = replica.get_memory_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;
-        slices.emplace_back(Slice{chunk_ptr, handle.size_});
+        slices.emplace_back(Slice{chunk_ptr, handle.size_, device_id});
     }
     return 0;
 }

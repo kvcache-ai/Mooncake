@@ -1116,7 +1116,7 @@ int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
     return invoke_observed_void_rpc<&RealClient::put_dummy_helper>(
         TransferOperationKind::kWrite, "put", value.size_bytes(), false, key,
-        value, config, client_id_);
+        value, config, device_id_, client_id_);
 }
 
 int DummyClient::put_batch(const std::vector<std::string>& keys,
@@ -1124,7 +1124,7 @@ int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const ReplicateConfig& config) {
     return invoke_observed_void_rpc<&RealClient::put_batch_dummy_helper>(
         TransferOperationKind::kWrite, "put_batch", sum_value_sizes(values),
-        true, keys, values, config, client_id_);
+        true, keys, values, config, device_id_, client_id_);
 }
 
 int DummyClient::put_parts(const std::string& key,
@@ -1132,7 +1132,7 @@ int DummyClient::put_parts(const std::string& key,
                            const ReplicateConfig& config) {
     return invoke_observed_void_rpc<&RealClient::put_parts_dummy_helper>(
         TransferOperationKind::kWrite, "put_parts", sum_value_sizes(values),
-        false, key, values, config, client_id_);
+        false, key, values, config, device_id_, client_id_);
 }
 
 int DummyClient::upsert(const std::string& key, std::span<const char> value,
@@ -1295,8 +1295,9 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     }
 
     // Fallback: allocator-backed buffer via shm
-    auto result = invoke_rpc<&RealClient::acquire_buffer_dummy,
-                             std::tuple<uint64_t, size_t>>(key, client_id_);
+    auto result =
+        invoke_rpc<&RealClient::acquire_buffer_dummy,
+                   std::tuple<uint64_t, size_t>>(key, device_id_, client_id_);
     if (!result.has_value()) {
         return nullptr;
     }
@@ -1360,8 +1361,8 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 
     auto alloc_results =
         invoke_batch_rpc<&RealClient::batch_acquire_buffer_dummy,
-                         std::tuple<uint64_t, size_t>>(miss_keys.size(),
-                                                       miss_keys, client_id_);
+                         std::tuple<uint64_t, size_t>>(
+            miss_keys.size(), miss_keys, device_id_, client_id_);
 
     for (size_t i = 0; i < miss_indices.size(); ++i) {
         if (!alloc_results[i].has_value()) continue;
