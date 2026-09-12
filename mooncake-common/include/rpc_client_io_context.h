@@ -31,59 +31,70 @@ std::shared_ptr<coro_io::io_context_pool> CreateRpcClientIoContextPool(
  * resumed coroutine touching freed connection state (the teardown segfault in
  * #3909). Entry points take a ScopedCall; a destructor calls drain_for() so
  * the pool is only released once nothing is in flight.
+ *
+ * The counters live in a shared State, not in the guard object itself. When a
+ * drain times out the owner tears down anyway, and a ScopedCall still in
+ * flight then outlives the guard; holding the state by shared_ptr keeps its
+ * leave() from touching freed memory (#3943 review).
  */
 class RpcDrainGuard {
+   private:
+    struct State {
+        std::atomic<bool> stopping{false};
+        std::atomic<int> inflight{0};
+        std::mutex mutex;
+        std::condition_variable cv;
+    };
+
    public:
     class ScopedCall {
        public:
-        explicit ScopedCall(RpcDrainGuard& guard)
-            : guard_(guard), ok_(guard.try_enter()) {}
+        explicit ScopedCall(const RpcDrainGuard& guard)
+            : state_(guard.state_), ok_(try_enter(*state_)) {}
         ~ScopedCall() {
-            if (ok_) guard_.leave();
+            if (ok_) leave(*state_);
         }
         ScopedCall(const ScopedCall&) = delete;
         ScopedCall& operator=(const ScopedCall&) = delete;
         bool ok() const { return ok_; }
 
        private:
-        RpcDrainGuard& guard_;
+        static bool try_enter(State& state) {
+            if (state.stopping.load(std::memory_order_acquire)) return false;
+            state.inflight.fetch_add(1, std::memory_order_acq_rel);
+            // a drain that started between the two reads still sees this call
+            if (state.stopping.load(std::memory_order_acquire)) {
+                leave(state);
+                return false;
+            }
+            return true;
+        }
+
+        static void leave(State& state) {
+            if (state.inflight.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                std::lock_guard lk(state.mutex);
+                state.cv.notify_all();
+            }
+        }
+
+        std::shared_ptr<State> state_;
         bool ok_;
     };
 
     // Bounded wait for in-flight calls; stops admitting new ones first.
-    // Returns false on timeout, in which case the caller must not free shared
-    // pool state without accepting the pre-existing UAF risk.
+    // Returns false on timeout: the caller must keep the shared pool alive
+    // regardless (the registry already does), and the state itself stays
+    // valid until the last ScopedCall lets go of it.
     bool drain_for(std::chrono::milliseconds timeout) {
-        stopping_.store(true, std::memory_order_release);
-        std::unique_lock lk(mutex_);
-        return cv_.wait_for(lk, timeout, [&] {
-            return inflight_.load(std::memory_order_acquire) == 0;
+        state_->stopping.store(true, std::memory_order_release);
+        std::unique_lock lk(state_->mutex);
+        return state_->cv.wait_for(lk, timeout, [&] {
+            return state_->inflight.load(std::memory_order_acquire) == 0;
         });
     }
 
    private:
-    bool try_enter() {
-        if (stopping_.load(std::memory_order_acquire)) return false;
-        inflight_.fetch_add(1, std::memory_order_acq_rel);
-        // a drain that started between the two reads still sees this call
-        if (stopping_.load(std::memory_order_acquire)) {
-            leave();
-            return false;
-        }
-        return true;
-    }
-
-    void leave() {
-        if (inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-            std::lock_guard lk(mutex_);
-            cv_.notify_all();
-        }
-    }
-
-    std::atomic<bool> stopping_{false};
-    std::atomic<int> inflight_{0};
-    std::mutex mutex_;
-    std::condition_variable cv_;
+    std::shared_ptr<State> state_ = std::make_shared<State>();
 };
 
 template <typename PoolTag>

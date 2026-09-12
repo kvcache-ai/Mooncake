@@ -276,12 +276,16 @@ DummyClient::DummyClient()
 }
 
 DummyClient::~DummyClient() {
+    // tearDownAll() runs while the guard is still open: unregister_shm() is
+    // itself an RPC, and the ping thread is only joined inside tearDownAll().
+    // Draining first would reject the unmap and spin the reconnection loop
+    // for the whole wait (#3943 review).
+    tearDownAll();
     // Never release the pool under a suspended request coroutine (#3909).
     if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
         LOG(ERROR) << "DummyClient teardown: RPCs still in flight after 30s "
                       "drain; releasing the pool regardless";
     }
-    tearDownAll();
 }
 
 void DummyClient::ObserveTransferMetric(TransferOperationKind kind,
