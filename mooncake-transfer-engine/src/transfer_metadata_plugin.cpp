@@ -69,90 +69,43 @@ static bool parseJsonString(const std::string &json_str, Json::Value &value,
 namespace mooncake {
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
+    // Match the timeouts already used by the HA leader coordinator's redis
+    // client (mooncake-store/src/ha/common/redis/redis_connection.cpp:20-21).
+    static constexpr long kConnectTimeoutSec = 3;
+    static constexpr long kCommandTimeoutSec = 3;
+
     RedisStoragePlugin(const std::string &metadata_uri)
-        : client_(nullptr), metadata_uri_(metadata_uri) {
-        auto hostname_port = parseHostNameWithPort(metadata_uri);
-        client_ =
-            redisConnect(hostname_port.first.c_str(), hostname_port.second);
-        if (!client_) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to connect "
-                       << metadata_uri_;
-            return;
-        }
-        if (client_->err) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to connect "
-                       << metadata_uri_ << ": " << client_->errstr;
-            redisFree(client_);
-            client_ = nullptr;
-            return;
-        }
-    }
+        : RedisStoragePlugin(metadata_uri, "", "", 0) {}
 
     RedisStoragePlugin(const std::string &metadata_uri,
                        const std::string &username, const std::string &password,
                        const uint8_t &db_index)
-        : RedisStoragePlugin(metadata_uri) {
-        if (!client_) {
-            return;
-        }
-
-        if (!password.empty()) {
-            redisReply *reply = nullptr;
-            if (!username.empty()) {
-                reply = static_cast<redisReply *>(redisCommand(
-                    client_, "AUTH %b %b", username.data(), username.size(),
-                    password.data(), password.size()));
-            } else {
-                reply = static_cast<redisReply *>(redisCommand(
-                    client_, "AUTH %b", password.data(), password.size()));
-            }
-            if (!reply || reply->type == REDIS_REPLY_ERROR) {
-                LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
-                           << metadata_uri_;
-                freeReplyObject(reply);
-                redisFree(client_);
-                client_ = nullptr;
-                return;
-            }
-            freeReplyObject(reply);
-        }
-
-        if (db_index != 0) {
-            auto *reply = static_cast<redisReply *>(
-                redisCommand(client_, "SELECT %d", db_index));
-            if (!reply || reply->type == REDIS_REPLY_ERROR) {
-                LOG(ERROR) << "RedisStoragePlugin: failed to select database "
-                           << (int)db_index << " for " << metadata_uri_;
-                freeReplyObject(reply);
-                redisFree(client_);
-                client_ = nullptr;
-                return;
-            }
-            freeReplyObject(reply);
-        }
+        : client_(nullptr),
+          metadata_uri_(metadata_uri),
+          username_(username),
+          password_(password),
+          db_index_(db_index) {
+        // A failure here is not fatal: every operation re-attempts the
+        // connection, so a redis that is briefly unavailable at startup no
+        // longer permanently disables metadata publishing.
+        connectLocked();
     }
 
-    virtual ~RedisStoragePlugin() {
-        if (client_) {
-            redisFree(client_);
-            client_ = nullptr;
-        }
-    }
+    virtual ~RedisStoragePlugin() { disconnectLocked(); }
 
     virtual bool get(const std::string &key, Json::Value &value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return false;
-
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "GET %s", key.c_str());
-        if (!resp) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
-            return false;
-        }
+        redisReply *resp = execLocked("GET", key, [&key](redisContext *ctx) {
+            return static_cast<redisReply *>(
+                redisCommand(ctx, "GET %s", key.c_str()));
+        });
+        if (!resp) return false;
         if (!resp->str) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
+            // A nil reply means the key is absent, which is an expected result
+            // when looking up a segment that is not registered (yet). Not an
+            // error, so it must not be logged as one.
+            LOG(WARNING) << "RedisStoragePlugin: unable to get " << key
+                         << " from " << metadata_uri_;
             freeReplyObject(resp);
             return false;
         }
@@ -201,38 +154,152 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
     virtual bool set(const std::string &key, const Json::Value &value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return false;
-
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
-        redisReply *resp = (redisReply *)redisCommand(
-            client_, "SET %s %s", key.c_str(), json_file.c_str());
-        if (!resp) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to put " << key
-                       << " from " << metadata_uri_;
-            return false;
-        }
+        redisReply *resp =
+            execLocked("SET", key, [&key, &json_file](redisContext *ctx) {
+                return static_cast<redisReply *>(redisCommand(
+                    ctx, "SET %s %s", key.c_str(), json_file.c_str()));
+            });
+        if (!resp) return false;
         freeReplyObject(resp);
         return true;
     }
 
     virtual bool remove(const std::string &key) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return false;
-
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
-        if (!resp) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to remove " << key
-                       << " from " << metadata_uri_;
-            return false;
-        }
+        redisReply *resp = execLocked("DEL", key, [&key](redisContext *ctx) {
+            return static_cast<redisReply *>(
+                redisCommand(ctx, "DEL %s", key.c_str()));
+        });
+        if (!resp) return false;
         freeReplyObject(resp);
         return true;
     }
 
+   private:
+    // The *Locked helpers below require access_client_mutex_ to be held, which
+    // get()/set()/remove() do. The constructor and destructor call them without
+    // the lock because no other thread can reach the object at that point.
+    void disconnectLocked() {
+        if (client_) {
+            redisFree(client_);
+            client_ = nullptr;
+        }
+    }
+
+    bool connectLocked() {
+        auto hostname_port = parseHostNameWithPort(metadata_uri_);
+
+        timeval connect_timeout{};
+        connect_timeout.tv_sec = kConnectTimeoutSec;
+        client_ = redisConnectWithTimeout(
+            hostname_port.first.c_str(), hostname_port.second, connect_timeout);
+        if (!client_) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to connect "
+                       << metadata_uri_;
+            return false;
+        }
+        if (client_->err) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to connect "
+                       << metadata_uri_ << ": " << client_->errstr;
+            disconnectLocked();
+            return false;
+        }
+
+        timeval command_timeout{};
+        command_timeout.tv_sec = kCommandTimeoutSec;
+        if (redisSetTimeout(client_, command_timeout) != REDIS_OK) {
+            LOG(ERROR) << "RedisStoragePlugin: unable to set command timeout "
+                          "for "
+                       << metadata_uri_;
+            disconnectLocked();
+            return false;
+        }
+
+        // This connection is only touched on segment (un)registration and on
+        // the first lookup of a given remote segment, so it can sit completely
+        // idle for hours. Without SO_KEEPALIVE it sends nothing during that
+        // time and a server-side or middlebox idle timeout closes it silently.
+        if (redisEnableKeepAlive(client_) != REDIS_OK) {
+            LOG(WARNING) << "RedisStoragePlugin: unable to enable TCP "
+                            "keepalive for "
+                         << metadata_uri_;
+        }
+
+        if (!authenticateLocked()) {
+            disconnectLocked();
+            return false;
+        }
+        return true;
+    }
+
+    bool authenticateLocked() {
+        if (!password_.empty()) {
+            redisReply *reply = nullptr;
+            if (!username_.empty()) {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b %b", username_.data(), username_.size(),
+                    password_.data(), password_.size()));
+            } else {
+                reply = static_cast<redisReply *>(redisCommand(
+                    client_, "AUTH %b", password_.data(), password_.size()));
+            }
+            if (!reply || reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
+                           << metadata_uri_;
+                freeReplyObject(reply);
+                return false;
+            }
+            freeReplyObject(reply);
+        }
+
+        if (db_index_ != 0) {
+            auto *reply = static_cast<redisReply *>(
+                redisCommand(client_, "SELECT %d", db_index_));
+            if (!reply || reply->type == REDIS_REPLY_ERROR) {
+                LOG(ERROR) << "RedisStoragePlugin: failed to select database "
+                           << (int)db_index_ << " for " << metadata_uri_;
+                freeReplyObject(reply);
+                return false;
+            }
+            freeReplyObject(reply);
+        }
+        return true;
+    }
+
+    // Issues a command, reconnecting and retrying once on connection-level
+    // failure. hiredis latches the error into the redisContext and rejects
+    // every subsequent command, so a dropped connection has to be rebuilt --
+    // otherwise a single idle timeout permanently breaks metadata publishing
+    // for the lifetime of the process.
+    //
+    // Only null replies are retried. A REDIS_REPLY_ERROR means the server
+    // answered and rejected the command, and retrying that cannot help.
+    // GET/SET/DEL are all idempotent, so the retry is safe.
+    template <typename Fn>
+    redisReply *execLocked(const char *op, const std::string &key, Fn &&issue) {
+        for (int attempt = 0; attempt < 2; ++attempt) {
+            if (!client_ && !connectLocked()) return nullptr;
+
+            redisReply *resp = issue(client_);
+            if (resp) return resp;
+
+            LOG(WARNING) << "RedisStoragePlugin: " << op << " " << key
+                         << " failed on " << metadata_uri_ << ": "
+                         << (client_ ? client_->errstr : "not connected")
+                         << (attempt == 0 ? "; reconnecting and retrying once"
+                                          : "; giving up");
+            disconnectLocked();
+        }
+        return nullptr;
+    }
+
     redisContext *client_;
     const std::string metadata_uri_;
+    const std::string username_;
+    const std::string password_;
+    const uint8_t db_index_;
     std::mutex access_client_mutex_;
 };
 #endif  // USE_REDIS
