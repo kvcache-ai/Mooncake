@@ -98,9 +98,7 @@ def test_buffer_pool_rejects_invalid_alignment() -> None:
 @pytest.mark.parametrize("size", [0, 1, 128 * 1024 + 1])
 def test_buffer_pool_supports_arbitrary_sizes(size: int) -> None:
     store = create_store()
-    pool = BufferPool(
-        store, 1024 * 1024, max_size_class=128 * 1024, alignment=4096
-    )
+    pool = BufferPool(store, 1024 * 1024, max_size_class=128 * 1024, alignment=4096)
 
     lease = pool.acquire(size)
     assert lease.size == size
