@@ -3,6 +3,7 @@
 #include <pybind11/stl.h>
 
 #include <cstring>
+#include <limits>
 
 #include "engram/engram_store.h"
 #include "engram/engram_store_config.h"
@@ -16,22 +17,6 @@ namespace {
 
 constexpr char kPyClientCapsuleName[] = "mooncake.PyClient.shared_ptr";
 constexpr char kPyClientCapsuleMethod[] = "_get_pyclient_capsule";
-
-std::vector<std::vector<std::vector<int64_t>>> py_obj_to_vec3d(py::object obj) {
-    std::vector<std::vector<std::vector<int64_t>>> result;
-    for (auto batch_item : obj) {
-        std::vector<std::vector<int64_t>> batch_vec;
-        for (auto token_item : batch_item) {
-            std::vector<int64_t> token_vec;
-            for (auto head_item : token_item) {
-                token_vec.push_back(head_item.cast<int64_t>());
-            }
-            batch_vec.push_back(std::move(token_vec));
-        }
-        result.push_back(std::move(batch_vec));
-    }
-    return result;
-}
 
 std::shared_ptr<PyClient> unwrap_pyclient_capsule(py::object capsule) {
     if (capsule.is_none()) {
@@ -87,81 +72,21 @@ std::shared_ptr<PyClient> unwrap_store(py::object store_obj) {
     }
 }
 
-py::array_t<float> require_embedding_buffer(py::handle buf,
-                                            int64_t expected_rows,
-                                            int expected_cols) {
+py::array require_embedding_buffer(py::handle buf, int64_t rows,
+                                   int row_bytes) {
     if (!py::isinstance<py::array>(buf)) {
         throw std::runtime_error("embedding_buffers must be NumPy arrays");
     }
-
-    auto arr =
-        py::array_t<float, py::array::c_style | py::array::forcecast>::ensure(
-            buf);
-    if (!arr) {
-        throw std::runtime_error("embedding_buffers must be float32 arrays");
+    auto arr = py::reinterpret_borrow<py::array>(buf);
+    if (!arr.dtype().is(py::dtype::of<uint8_t>()) ||
+        !(arr.flags() & py::array::c_style)) {
+        throw std::runtime_error("rows must be contiguous uint8 arrays");
     }
-
-    auto req = arr.request();
-    if (req.ndim != 2) {
-        throw std::runtime_error("each embedding buffer must be 2D [N_h, D]");
-    }
-    if (req.shape[0] != expected_rows || req.shape[1] != expected_cols) {
+    if (arr.ndim() != 2 || arr.shape(0) != rows || arr.shape(1) != row_bytes) {
         throw std::runtime_error(
-            "embedding buffer shape does not match "
-            "get_table_vocab_sizes()/get_embedding_dim()");
+            "embedding buffer must match per-head table shape");
     }
     return arr;
-}
-
-py::array_t<float> lookup_to_numpy(
-    EngramStore& self,
-    const std::vector<std::vector<std::vector<int64_t>>>& row_ids) {
-    if (row_ids.empty() || row_ids[0].empty()) {
-        throw std::runtime_error("row_ids must not be empty");
-    }
-
-    const int B = static_cast<int>(row_ids.size());
-    const int L = static_cast<int>(row_ids[0].size());
-    const int H = self.get_num_heads();
-    const int D = self.get_embedding_dim();
-    py::array_t<float> output({B, L, H, D});
-    auto out_buf = output.request();
-
-    int ret =
-        self.lookup_rows(row_ids, out_buf.ptr, out_buf.size * sizeof(float));
-    if (ret != 0) {
-        throw std::runtime_error("EngramStore lookup failed");
-    }
-    return output;
-}
-
-py::array_t<float> lookup_array_to_numpy(
-    EngramStore& self,
-    const py::array_t<int64_t, py::array::c_style | py::array::forcecast>&
-        row_ids) {
-    auto req = row_ids.request();
-    if (req.ndim != 3) {
-        throw std::runtime_error("row_ids array must have shape [B, L, H]");
-    }
-
-    const int B = static_cast<int>(req.shape[0]);
-    const int L = static_cast<int>(req.shape[1]);
-    const int H = static_cast<int>(req.shape[2]);
-    if (H != self.get_num_heads()) {
-        throw std::runtime_error("row_ids last dimension must match num_heads");
-    }
-
-    const int D = self.get_embedding_dim();
-    py::array_t<float> output({B, L, H, D});
-    auto out_buf = output.request();
-
-    int ret =
-        self.lookup_rows_contiguous(static_cast<const int64_t*>(req.ptr), B, L,
-                                    out_buf.ptr, out_buf.size * sizeof(float));
-    if (ret != 0) {
-        throw std::runtime_error("EngramStore lookup failed");
-    }
-    return output;
 }
 
 }  // namespace
@@ -174,64 +99,113 @@ void bind_engram_store(py::module& m) {
         .def(py::init<>())
         .def_readwrite("table_vocab_sizes",
                        &EngramStoreConfig::table_vocab_sizes)
-        .def_readwrite("embedding_dim", &EngramStoreConfig::embedding_dim);
+        .def_readwrite("row_bytes", &EngramStoreConfig::row_bytes);
 
     py::class_<EngramStore>(m, "EngramStore")
+        .def(
+            "bind_local",
+            [](EngramStore& self, int layer_id, py::list buffers) {
+                const auto rows = self.get_table_vocab_sizes(layer_id);
+                if (py::len(buffers) != rows.size())
+                    throw std::runtime_error(
+                        "Local table count must match heads");
+                std::vector<const void*> pointers;
+                std::vector<size_t> sizes;
+                for (size_t h = 0; h < rows.size(); ++h) {
+                    auto arr = require_embedding_buffer(
+                        buffers[h], rows[h], self.get_row_bytes(layer_id));
+                    pointers.push_back(arr.data());
+                    sizes.push_back(arr.nbytes());
+                }
+                if (self.bind_local(layer_id, pointers, sizes) != 0)
+                    throw std::runtime_error(
+                        "bind_local requires an unbound layer and no Store "
+                        "client");
+            },
+            py::arg("layer_id"), py::arg("embedding_buffers"),
+            py::keep_alive<1, 3>(),
+            "Bind immutable uint8 tables before lookup. Retains the arrays "
+            "without "
+            "copying; do not modify, resize or unmap them while bound.")
+        .def("get_layer_ids", &EngramStore::get_layer_ids)
         .def("get_table_vocab_sizes", &EngramStore::get_table_vocab_sizes)
         .def("get_store_keys", &EngramStore::get_store_keys)
         .def("get_num_heads", &EngramStore::get_num_heads)
-        .def("get_embedding_dim", &EngramStore::get_embedding_dim)
+        .def("get_row_bytes", &EngramStore::get_row_bytes)
         .def(
             "remove_from_store",
-            [](EngramStore& self, bool force) {
-                int ret = self.remove_from_store(force);
+            [](EngramStore& self, int layer_id, bool force) {
+                int ret = self.remove_from_store(layer_id, force);
                 if (ret < 0) {
                     throw std::runtime_error("remove_from_store failed, rc=" +
                                              std::to_string(ret));
                 }
                 return ret;
             },
-            py::arg("force") = false,
-            "Remove all Mooncake Store tables owned by this EngramStore layer. "
+            py::arg("layer_id"), py::arg("force") = false,
+            "Remove all Mooncake Store tables for the selected layer. "
             "Returns the number of removed head tables; missing keys are "
             "ignored.")
-        .def(py::init([](int layer_id, const EngramStoreConfig& cfg,
+        .def(py::init([](const std::map<int, EngramStoreConfig>& layers,
                          py::object store_obj) {
                  std::shared_ptr<PyClient> store = unwrap_store(store_obj);
-                 return new EngramStore(layer_id, cfg, store);
+                 return new EngramStore(layers, store);
              }),
-             py::arg("layer_id"), py::arg("config"),
-             py::arg("store") = py::none())
+             py::arg("layers"), py::arg("store") = py::none())
         .def(
-            "lookup",
-            [](EngramStore& self, py::object row_ids_obj) {
-                if (py::isinstance<py::array>(row_ids_obj)) {
-                    auto row_ids_array = py::array_t<
-                        int64_t, py::array::c_style |
-                                     py::array::forcecast>::ensure(row_ids_obj);
-                    if (!row_ids_array) {
-                        throw std::runtime_error(
-                            "row_ids array must be convertible to int64");
-                    }
-                    return lookup_array_to_numpy(self, row_ids_array);
+            "lookup_into",
+            [](EngramStore& self, int layer_id,
+               py::array_t<int64_t, py::array::c_style> ids, py::array output) {
+                const int width = self.get_row_bytes(layer_id);
+                if (ids.ndim() != 3 ||
+                    ids.shape(2) != self.get_num_heads(layer_id) ||
+                    ids.shape(0) > std::numeric_limits<int>::max() ||
+                    ids.shape(1) > std::numeric_limits<int>::max() ||
+                    output.ndim() != 4 || output.shape(0) != ids.shape(0) ||
+                    output.shape(1) != ids.shape(1) ||
+                    output.shape(2) != ids.shape(2) ||
+                    output.shape(3) != width || !output.writeable() ||
+                    !(output.flags() & py::array::c_style) ||
+                    !output.dtype().is(py::dtype::of<uint8_t>())) {
+                    throw std::runtime_error(
+                        "lookup_into requires contiguous IDs [B,L,H] and "
+                        "matching writable uint8 output [B,L,H,row_bytes]");
                 }
-                return lookup_to_numpy(self, py_obj_to_vec3d(row_ids_obj));
+                if (ids.size() == 0) return;
+                auto ids_buf = ids.request();
+                auto out_buf = output.request();
+                const int B = static_cast<int>(ids_buf.shape[0]);
+                const int L = static_cast<int>(ids_buf.shape[1]);
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = self.lookup_into(
+                        layer_id, static_cast<const int64_t*>(ids_buf.ptr), B,
+                        L, out_buf.ptr, out_buf.size * out_buf.itemsize);
+                }
+                if (ret != 0)
+                    throw std::runtime_error("EngramStore lookup_into failed");
             },
-            py::arg("row_ids"),
-            "Lookup embeddings by precomputed row IDs. Returns [B, L, H, D].")
+            py::arg("layer_id"), py::arg("row_ids").noconvert(),
+            py::arg("output").noconvert(),
+            "Read into caller-owned uint8 memory. The caller must keep the "
+            "output registered with this Store for Store-backed reads. "
+            "Local bound tables do not require output registration. "
+            "This method does not allocate, register, or unregister output.")
         .def(
             "populate",
-            [](EngramStore& self, py::list embedding_buffers) {
+            [](EngramStore& self, int layer_id, py::list embedding_buffers,
+               const ReplicateConfig& config) {
                 const std::vector<int64_t> vocab_sizes =
-                    self.get_table_vocab_sizes();
-                const int embed_dim = self.get_embedding_dim();
+                    self.get_table_vocab_sizes(layer_id);
+                const int row_bytes = self.get_row_bytes(layer_id);
                 if (static_cast<size_t>(py::len(embedding_buffers)) !=
                     vocab_sizes.size()) {
                     throw std::runtime_error(
                         "embedding_buffers size must match num_heads");
                 }
 
-                std::vector<py::array_t<float>> arrays;
+                std::vector<py::array> arrays;
                 std::vector<void*> bufs;
                 std::vector<size_t> sizes;
                 arrays.reserve(vocab_sizes.size());
@@ -239,18 +213,20 @@ void bind_engram_store(py::module& m) {
                 sizes.reserve(vocab_sizes.size());
                 for (size_t i = 0; i < vocab_sizes.size(); ++i) {
                     auto arr = require_embedding_buffer(
-                        embedding_buffers[i], vocab_sizes[i], embed_dim);
+                        embedding_buffers[i], vocab_sizes[i], row_bytes);
                     auto req = arr.request();
                     arrays.push_back(arr);
                     bufs.push_back(req.ptr);
-                    sizes.push_back(req.size * sizeof(float));
+                    sizes.push_back(arr.nbytes());
                 }
-                int ret = self.populate(bufs, sizes);
+                py::gil_scoped_release release;
+                int ret = self.populate(layer_id, bufs, sizes, config);
                 if (ret != 0) {
                     throw std::runtime_error("populate failed");
                 }
             },
-            py::arg("embedding_buffers"));
+            py::arg("layer_id"), py::arg("embedding_buffers"),
+            py::arg("config") = ReplicateConfig{});
 }
 
 }  // namespace engram
