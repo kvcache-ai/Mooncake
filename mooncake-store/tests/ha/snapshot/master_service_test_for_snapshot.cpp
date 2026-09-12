@@ -68,7 +68,8 @@ std::string GenerateKeyForSegment(const UUID& client_id,
             return key;
         }
         // Clean up failed attempt
-        auto remove_result = service->Remove(key, TenantId::Default());
+        auto remove_result =
+            service->Remove(key, TenantId::Default(), /*force=*/true);
         if (!remove_result.has_value()) {
             // Ignore cleanup failure
         }

@@ -99,6 +99,25 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 /**
+ * @brief Optional agent retention hint carried by ReplicateConfig.
+ *
+ * Soft contract: a "keep" hint requests soft-pin retention; the master may
+ * clamp or ignore it.
+ */
+struct AgentHints {
+    std::string reuse_hint{"neutral"};  // "keep", "discard", or "neutral"
+    int64_t cache_ttl_ms{0};
+
+    bool RequestsRetention() const noexcept { return reuse_hint == "keep"; }
+
+    bool IsValid() const noexcept {
+        return (reuse_hint == "keep" || reuse_hint == "discard" ||
+                reuse_hint == "neutral") &&
+               cache_ttl_ms >= 0;
+    }
+};
+
+/**
  * @brief Configuration for replica management
  */
 struct ReplicateConfig {
@@ -124,6 +143,7 @@ struct ReplicateConfig {
     // eviction treats the group as a unit (all-or-none). Object routing is
     // always hash(tenant, key) and is decoupled from groups.
     std::optional<std::vector<std::string>> group_ids{};
+    std::optional<AgentHints> agent_hints{};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
@@ -176,6 +196,12 @@ struct ReplicateConfig {
                 if (i + 1 < config.group_ids->size()) os << ", ";
             }
             os << "]";
+        }
+        if (config.agent_hints.has_value()) {
+            os << ", agent_hints: { reuse_hint: "
+               << config.agent_hints->reuse_hint
+               << ", cache_ttl_ms: " << config.agent_hints->cache_ttl_ms
+               << " }";
         }
         os << " }";
         return os;
