@@ -91,8 +91,13 @@ class FakeTransport : public Transport {
             fake->poll_counts.push_back(0);
             ++fake->task_count;
         }
+        last_batch_ = batch;
         if (notify_on_submit_) batch->notifyProgress();
         return Status::OK();
+    }
+
+    void notifyLastBatch() {
+        if (last_batch_) last_batch_->notifyProgress();
     }
 
     Status getTransferStatus(SubBatchRef batch, int task_id,
@@ -167,6 +172,7 @@ class FakeTransport : public Transport {
     TransportType self_type_;
     PollStatusFactory poll_status_factory_;
     bool notify_on_submit_;
+    SubBatchRef last_batch_{nullptr};
 };
 
 std::shared_ptr<Config> makeRuntimeQueueConfig(size_t max_dispatch_owners,
@@ -506,8 +512,20 @@ TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowFromTransportNotify) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
+    // Keep the first owner PENDING until after the submit-window assertion.
+    // Otherwise ProgressWorker can observe COMPLETED, refill, and bump
+    // submit_calls to 2 before EXPECT_EQ(..., 1). Same race as #3459.
+    std::atomic<bool> complete_first{false};
     auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, FakeTransport::PollStatusFactory{}, true);
+        RDMA,
+        [&complete_first](const Request& request, int) {
+            if (!complete_first.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        },
+        true);
     installFakeRdma(engine, fake_rdma);
 
     constexpr size_t kReqLen = 4096;
@@ -524,6 +542,9 @@ TEST(RuntimeQueueDispatch, ProgressWorkerRefillsWindowFromTransportNotify) {
                              makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
             .ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    complete_first.store(true);
+    fake_rdma->notifyLastBatch();
 
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
