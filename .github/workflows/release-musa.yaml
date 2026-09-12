@@ -106,51 +106,6 @@ jobs:
           echo "Go executable: ${GO_BIN}"
           "${GO_BIN}" version
 
-      - name: Configure project
-        shell: bash
-        run: |
-          set -eo pipefail
-          export PYTHONPATH="${PYTHONPATH:-}"
-          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
-          rm -rf build
-          mkdir build
-          cd build
-          cmake_args=(
-            -DUSE_MUSA=ON
-            -DUSE_HTTP=ON
-            -DUSE_ETCD=ON
-            -DSTORE_USE_ETCD=ON
-            -DBUILD_UNIT_TESTS=OFF
-            -DENABLE_DEBUG_SYMBOLS=OFF
-            -DCMAKE_BUILD_TYPE=Release
-            -DPython3_EXECUTABLE="${PYTHON_BIN}"
-          )
-          cmake -G Ninja .. "${cmake_args[@]}"
-
-      - name: Build project
-        shell: bash
-        run: |
-          set -eo pipefail
-          export PYTHONPATH="${PYTHONPATH:-}"
-          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
-          cd build
-          cmake --build . -j"$(nproc)"
-
-      - name: Build MUSA allocator
-        shell: bash
-        run: |
-          set -eo pipefail
-          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-          cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh --use-mcc ../../build/mooncake-transfer-engine/nvlink-allocator/
-
-      - name: Install project
-        shell: bash
-        run: |
-          set -eo pipefail
-          cd build
-          cmake --install .
-
       - name: Generate Python version tag
         id: generate_tag_release
         shell: bash
@@ -158,11 +113,15 @@ jobs:
           echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
 
       - name: Build Python wheel
+        env:
+          CMAKE_ARGS: >-
+            -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_DEBUG_SYMBOLS=OFF
         shell: bash
         run: |
           set -eo pipefail
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib:/usr/local/musa/lib"
-          MUSA_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-musa-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+          MUSA_BUILD=1 OUTPUT_DIR=dist-musa-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
+            python${{ matrix.python-version }} scripts/build_release_wheel.py
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4

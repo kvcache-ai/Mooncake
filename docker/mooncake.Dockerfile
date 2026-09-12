@@ -76,7 +76,7 @@ RUN mkdir -p build && \
     cd mooncake-transfer-engine/nvlink-allocator && \
     bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/ && \
     cd /workspace && \
-    OUTPUT_DIR=dist ./scripts/build_wheel.sh && \
+    OUTPUT_DIR=dist python${PYTHON_VERSION} scripts/build_release_wheel.py && \
     if [ "${CLEAN_BUILD_ARTIFACTS}" = "1" ]; then \
         rm -rf build; \
     fi

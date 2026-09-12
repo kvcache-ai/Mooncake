@@ -16,7 +16,7 @@ on:
         type: string
         required: true
       build-profile:
-        # ci uses Ninja and CI diagnostics; release preserves the release make build.
+        # ci enables diagnostics; release retains its bounded build parallelism.
         type: string
         required: true
       cmake-args:
@@ -40,9 +40,12 @@ jobs:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     env:
       BUILD_PROFILE: ${{ inputs.build-profile }}
-      CMAKE_ARGS: ${{ inputs.cmake-args }}
+      CMAKE_ARGS: >-
+        -DLIBFABRIC_INCLUDE_DIR=/usr/include
+        -DLIBFABRIC_LIBRARY=/usr/lib/x86_64-linux-gnu/libfabric.so
+        -DENABLE_SCCACHE=ON ${{ inputs.cmake-args }}
+      CMAKE_BUILD_PARALLEL_LEVEL: ${{ inputs.build-profile == 'release' && '3' || '2' }}
       EFA_VARIANT: ${{ inputs.variant }}
-      USE_CUDA: ${{ inputs.variant != 'non-cuda' }}
       VARIANT_FLAG: ${{ fromJSON('{"cuda":"EFA_BUILD","cuda13":"EFA_CU13_BUILD","non-cuda":"EFA_NON_CUDA_BUILD"}')[inputs.variant] }}
       CUDA_VERSION: ${{ inputs.variant == 'cuda13' && '13.0.2' || '12.8.1' }}
       TORCH_CUDA_ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
@@ -96,67 +99,13 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update -y
-          packages=(libfabric-dev libfabric1)
-          if [ "$BUILD_PROFILE" = ci ]; then
-            packages=(ninja-build "${packages[@]}")
-          fi
-          sudo apt install -y "${packages[@]}"
+          sudo apt install -y ninja-build libfabric-dev libfabric1
           sudo bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           if [ "$BUILD_PROFILE" = ci ]; then
             df -h
           fi
         shell: bash
-
-      - name: Configure project
-        run: |
-          generator=()
-          if [ "$BUILD_PROFILE" = ci ]; then
-            generator=(-G Ninja)
-          fi
-
-          cuda_args=(-DUSE_CUDA=OFF)
-          if [ "$USE_CUDA" = true ]; then
-            cuda_args=(
-              -DUSE_CUDA=ON
-              -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
-            )
-          fi
-
-          read -r -a profile_args <<< "$CMAKE_ARGS"
-          mkdir build
-          cd build
-          cmake "${generator[@]}" .. \
-            -DUSE_EFA=ON \
-            -DLIBFABRIC_INCLUDE_DIR=/usr/include \
-            -DLIBFABRIC_LIBRARY=/usr/lib/x86_64-linux-gnu/libfabric.so \
-            -DENABLE_SCCACHE=ON \
-            -DCMAKE_BUILD_TYPE=Release \
-            "${profile_args[@]}" \
-            "${cuda_args[@]}"
-        shell: bash
-
-      - name: Build project
-        run: |
-          if [ "$USE_CUDA" = true ]; then
-            export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-            export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-          fi
-
-          cd build
-          if [ "$BUILD_PROFILE" = release ]; then
-            make -j3
-            sudo make install
-          else
-            cmake --build .
-            sudo cmake --install .
-            df -h
-          fi
-        shell: bash
-
-      - name: Run sccache stat for check
-        if: ${{ env.SCCACHE_PATH != '' }}
-        shell: bash
-        run: ${SCCACHE_PATH} --show-stats
 
       - name: Generate Python version tag
         id: python-tag
@@ -166,12 +115,19 @@ jobs:
 
       - name: Build Python wheel
         run: |
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          if [ "$EFA_VARIANT" != non-cuda ]; then
+            export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}"
+            export LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}"
+          fi
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
           export "$VARIANT_FLAG=1"
-          PYTHON_VERSION=${{ matrix.python-version }} \
-            OUTPUT_DIR=dist-py${{ steps.python-tag.outputs.python_version_tag }} \
-            ./scripts/build_wheel.sh
+          OUTPUT_DIR=dist-py${{ steps.python-tag.outputs.python_version_tag }} \
+            python${{ matrix.python-version }} scripts/build_release_wheel.py
         shell: bash
+
+      - name: Run sccache stat for check
+        if: ${{ env.SCCACHE_PATH != '' }}
+        run: ${SCCACHE_PATH} --show-stats
 
       - name: Verify libfabric is excluded from the wheel
         run: |
@@ -189,12 +145,13 @@ jobs:
         run: |
           WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
           inspect_dir=$(mktemp -d)
-          unzip -q "$WHL" mooncake/engine.so -d "$inspect_dir"
+          unzip -q "$WHL" 'mooncake/engine*.so' -d "$inspect_dir"
+          engines=("$inspect_dir"/mooncake/engine*.so)
           cuda_major=${CUDA_VERSION%%.*}
-          if ! readelf -d "$inspect_dir/mooncake/engine.so" | \
+          if ! readelf -d "${engines[0]}" | \
               grep -Fq "Shared library: [libcudart.so.${cuda_major}]"; then
             echo "::error::EFA wheel does not depend on libcudart.so.${cuda_major}"
-            readelf -d "$inspect_dir/mooncake/engine.so" | grep NEEDED
+            readelf -d "${engines[0]}" | grep NEEDED
             exit 1
           fi
           echo "OK: EFA wheel depends on libcudart.so.${cuda_major}"

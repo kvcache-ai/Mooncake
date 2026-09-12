@@ -300,7 +300,7 @@ fi
 
 print_section "Verifying essential build tools"
 
-# Verify getconf and ldd (required for glibc version detection in build_wheel.sh)
+# Verify getconf and ldd (used for glibc version detection in repair_wheel.sh)
 if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
     if ! command -v getconf >/dev/null 2>&1; then
         print_error "getconf not found after installing system packages. This should not happen."
