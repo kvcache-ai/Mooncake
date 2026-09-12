@@ -12,7 +12,7 @@
 # to "1" for the MUSA/MTLink path. EP_USE_MACA: set to "1" for the MACA/MTLink
 # path.
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 4.0)
 
 # Include common build utilities.
 include("${SOURCE_DIR}/../../mooncake-common/SetupPyTorchEnv.cmake")

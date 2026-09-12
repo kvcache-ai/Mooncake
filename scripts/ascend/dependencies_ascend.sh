@@ -36,6 +36,11 @@ clone_repo_if_not_exists() {
     fi
 }
 
+print_error() {
+    echo -e "ERROR: $1"
+    exit 1
+}
+
 # Function to check command success
 check_success() {
     if [ $? -ne 0 ]; then
@@ -45,12 +50,16 @@ check_success() {
 
 set +e
 
+sh $SCRIPT_DIR/../install_toolchain.sh
+check_success "Failed to install toolchain"
+echo "toolchain installed successfully."
+export PATH=/opt/mooncake-toolchain/bin:$PATH
+
 # System detection and dependency installation
 if command -v apt-get &> /dev/null; then
     echo "Detected apt-get. Using Debian-based package manager."
     apt-get update
     apt-get install -y build-essential \
-            cmake \
             git \
             wget \
             libibverbs-dev \
@@ -77,7 +86,7 @@ if command -v apt-get &> /dev/null; then
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
-    yum install -y cmake \
+    yum install -y \
             gflags-devel \
             glog-devel \
             libibverbs-devel \
@@ -95,11 +104,10 @@ elif command -v yum &> /dev/null; then
     clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
     cd yaml-cpp || exit
     rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd ../..
+    cmake -B build -G Ninja
+    cmake --build build
+    cmake --install build
+    cd -
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1
@@ -129,12 +137,9 @@ if ! git submodule update --init --recursive; then
     fi
 fi
 rm -rf build
-mkdir -p build
-cd build
-cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
-make -j
-make install -j
-cd ..
+cmake -B build -G Ninja -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+cmake --build build
+cmake --install build
 
 echo -e "Mooncake installed successfully."
 

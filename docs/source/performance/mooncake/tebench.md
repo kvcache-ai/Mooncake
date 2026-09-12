@@ -17,10 +17,8 @@ It evaluates **bandwidth and latency** across different `(block_size, batch_size
 Typical out-of-tree build:
 
 ```bash
-mkdir -p build
-cd build
-cmake .. -DUSE_TENT=ON
-cmake --build . -j
+cmake -B build -G Ninja -DUSE_TENT=ON
+cmake --build build
 ```
 
 ## 2. Execution Model

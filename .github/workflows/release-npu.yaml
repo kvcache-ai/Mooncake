@@ -94,7 +94,7 @@ jobs:
           source /usr/local/Ascend/cann/set_env.sh
           sudo bash -x dependencies.sh -y
           sudo bash scripts/ascend/dependencies_ascend_installation.sh
-          echo "PATH=/usr/local/go/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "PATH=/opt/mooncake-toolchain/bin:${PATH}" >> "$GITHUB_ENV"
 
       - name: Configure project
         shell: bash
@@ -104,8 +104,6 @@ jobs:
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           source /usr/local/Ascend/cann/set_env.sh
           rm -rf build
-          mkdir build
-          cd build
           cmake_args=(
             -DUSE_ASCEND_DIRECT=ON
             -DUSE_ETCD=ON
@@ -117,7 +115,7 @@ jobs:
             -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
             -DCMAKE_SKIP_INSTALL_RPATH=ON
           )
-          cmake .. "${cmake_args[@]}"
+          cmake -B build -G Ninja "${cmake_args[@]}"
 
       - name: Build project
         shell: bash
@@ -126,10 +124,9 @@ jobs:
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           source /usr/local/Ascend/cann/set_env.sh
-          export PATH="/usr/local/go/bin:${PATH}"
-          cd build
-          cmake --build . -j"$(nproc)"
-          sudo cmake --install .
+          export PATH="/opt/mooncake-toolchain/bin:${PATH}"
+          cmake --build build
+          sudo cmake --install build
 
       - name: Generate Python version tag
         id: generate_tag_release
