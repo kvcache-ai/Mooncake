@@ -131,7 +131,12 @@ class HighPerformanceTcpClient::Lane
                 self->runHandler(epoch, [&] {
                     if (self->finishForcedIfAny()) return;
                     if (error) {
-                        self->finishIoError(error);
+                        if (error == asio::error::host_not_found)
+                            self->finishCurrent(
+                                FAILED, 0, false,
+                                HighPerformanceTcpStatus::kStaleRegistration);
+                        else
+                            self->finishIoError(error);
                         return;
                     }
                     self->connect(epoch, std::move(results));
@@ -145,7 +150,8 @@ class HighPerformanceTcpClient::Lane
         socket_.close(ignored);
         if (!current_->local_host.empty()) {
             if (results.empty()) {
-                finishIoError(asio::error::host_not_found);
+                finishCurrent(FAILED, 0, false,
+                              HighPerformanceTcpStatus::kStaleRegistration);
                 return;
             }
             std::error_code error;
@@ -171,7 +177,12 @@ class HighPerformanceTcpClient::Lane
             self->runHandler(epoch, [&] {
                 if (self->finishForcedIfAny()) return;
                 if (error) {
-                    self->finishIoError(error);
+                    if (error == asio::error::connection_refused)
+                        self->finishCurrent(
+                            FAILED, 0, false,
+                            HighPerformanceTcpStatus::kStaleRegistration);
+                    else
+                        self->finishIoError(error);
                     return;
                 }
                 std::error_code option_error;
