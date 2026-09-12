@@ -191,6 +191,14 @@ struct NvmeKvConnectorEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_NVME_KV_TRANSPORT);
 };
 
+struct RedisConnectionEnvironmentVariables {
+    // Keep the DB index as a string so an explicitly empty value remains
+    // distinguishable from a nonempty malformed value.
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_DB_INDEX);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_USERNAME);
+    MC_DEFINE_ENV_VAR(std::string, MC_REDIS_PASSWORD);
+};
+
 struct ClientAutoDiscoveryEnvironmentVariables {
     // Keep the raw strings to preserve std::stoi prefix acceptance and the
     // distinction between unset and explicitly empty filter values.
