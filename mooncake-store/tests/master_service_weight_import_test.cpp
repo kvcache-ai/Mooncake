@@ -193,8 +193,7 @@ TEST_F(MasterServiceWeightImportTest, CommitFailsWhenPayloadMissing) {
     EXPECT_EQ(got.error(), ErrorCode::WEIGHT_NOT_FOUND);
 
     // Failed transfer path: abort IMPORTING and delete partial objects.
-    const std::string partial =
-        "weights/demo/model-b/v1/1/partial-payload";
+    const std::string partial = "weights/demo/model-b/v1/1/partial-payload";
     PutCompletedObject(service, client_id, partial, segment.name,
                        ObjectDataType::WEIGHT, group_id);
 

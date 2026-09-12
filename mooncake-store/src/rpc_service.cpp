@@ -1930,9 +1930,9 @@ void RegisterRpcService(
             &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::AbortWeightImport>(
         &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::RemoveWeightRevision>(
-            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RemoveWeightRevision>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

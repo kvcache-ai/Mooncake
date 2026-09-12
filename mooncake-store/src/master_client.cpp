@@ -1428,8 +1428,7 @@ MasterClient::AbortWeightImport(const AbortWeightImportRequest& request) {
 }
 
 tl::expected<RemoveWeightRevisionResponse, ErrorCode>
-MasterClient::RemoveWeightRevision(
-    const RemoveWeightRevisionRequest& request) {
+MasterClient::RemoveWeightRevision(const RemoveWeightRevisionRequest& request) {
     return invoke_rpc<&WrappedMasterService::RemoveWeightRevision,
                       RemoveWeightRevisionResponse>(request);
 }
