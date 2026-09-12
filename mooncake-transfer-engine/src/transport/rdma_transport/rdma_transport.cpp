@@ -40,6 +40,22 @@
 
 namespace mooncake {
 
+namespace {
+
+// Mirrors the ownership test the submit path already uses (see the
+// buffer.protocol checks below): descs published by this transport, plus
+// legacy descs with no protocol field. Without this, RDMA's removal can
+// erase a same-address desc belonging to HIP/nvlink, which now filter.
+bool isOwnRdmaDesc(const TransferMetadata::BufferDesc &desc) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    return desc.protocol.empty() || desc.protocol == "rdma";
+#else
+    return true;
+#endif
+}
+
+}  // namespace
+
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
@@ -372,7 +388,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         size_t n = std::min(committed, chunks.size());
         for (size_t ri = 0; ri < n; ++ri) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                chunks[ri].first, /*update_metadata=*/false);
+                chunks[ri].first, isOwnRdmaDesc, /*update_metadata=*/false);
             if (rc)
                 LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
                                 "at "
@@ -565,7 +581,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         // chunk); publish once after all removals, below.
         for (uint64_t ca : chunk_addrs) {
             int rc = metadata_->removeLocalMemoryBuffer(
-                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+                reinterpret_cast<void *>(ca), isOwnRdmaDesc,
+                /*update_metadata=*/false);
             if (rc && !first_err) first_err = rc;
         }
 
@@ -616,7 +633,8 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
         return first_err;
     }
 
-    int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    int rc = metadata_->removeLocalMemoryBuffer(addr, isOwnRdmaDesc,
+                                                update_metadata);
     if (rc) return rc;
 
     // force_sequential is used by batch operations to avoid nested parallelism
