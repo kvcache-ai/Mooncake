@@ -881,8 +881,8 @@ Status RdmaTransport::submitTransferTask(
 
         auto request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
-                         request.length, request_buffer_id,
-                         request_device_id)) {
+                         request.length, request_buffer_id, request_device_id,
+                         request.advise_retry_cnt)) {
             request_buffer_id = -1;
             request_device_id = -1;
         }

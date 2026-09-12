@@ -196,4 +196,51 @@ TEST_F(SubmitTransferTaskTest, GroupedRequestsReportFailurePerRequest) {
     EXPECT_EQ(request_statuses, std::vector(2, status.s));
     EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
 }
+
+TEST_F(SubmitTransferTaskTest, RequestWideSelectionHonorsRetryHint) {
+    auto fallback_context =
+        std::make_shared<RdmaContext>(*transport_, "mlx5_fallback");
+    RdmaTransportTestPeer::addContext(*transport_, fallback_context);
+
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1u);
+    desc->buffers[0].lkey = {11, 22};
+    desc->buffers[0].rkey = {11, 22};
+    desc->topology.clear();
+    ASSERT_EQ(desc->topology.parse(
+                  R"({"cpu:0": [["mlx5_unit_test"], ["mlx5_fallback"]]})"),
+              0);
+
+    Transport::TransferRequest retried_request;
+    retried_request.opcode = Transport::TransferRequest::WRITE;
+    retried_request.source = reinterpret_cast<void *>(kBufferAddr);
+    retried_request.length = block_size_;
+    retried_request.target_id = LOCAL_SEGMENT_ID;
+    retried_request.target_offset = 0;
+    retried_request.advise_retry_cnt = 2;
+
+    Transport::TransferRequest failing_request = retried_request;
+    failing_request.source =
+        reinterpret_cast<void *>(kBufferAddr + 2 * block_size_);
+    failing_request.advise_retry_cnt = 0;
+
+    Transport::TransferTask retried_task;
+    retried_task.request = &retried_request;
+    retried_task.batch_id = transport_->allocateBatchID(1);
+    Transport::TransferTask failing_task;
+    failing_task.request = &failing_request;
+    failing_task.batch_id = transport_->allocateBatchID(1);
+
+    auto status =
+        transport_->submitTransferTask({&retried_task, &failing_task});
+    ASSERT_TRUE(status.IsAddressNotRegistered());
+    ASSERT_EQ(retried_task.slice_list.size(), 1u);
+    EXPECT_EQ(retried_task.slice_list[0]->rdma.source_lkey, 22u)
+        << "retry hint 2 must select the fallback HCA for the request-wide "
+           "fast path";
+
+    EXPECT_EQ(transport_->freeBatchID(retried_task.batch_id), Status::OK());
+    EXPECT_EQ(transport_->freeBatchID(failing_task.batch_id), Status::OK());
+}
 }  // namespace
