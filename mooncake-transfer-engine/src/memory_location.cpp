@@ -32,7 +32,7 @@ std::string genGpuNodeName(int node) {
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUNRISE)
+    defined(USE_COREX) || defined(USE_SUNRISE) || defined(USE_XPU)
 // A GPU-less host (e.g. an RDMA-only sidecar) has no device for
 // cudaPointerGetAttributes to classify, yet a CUDA-enabled build probes
 // every buffer, each call failing and logging a per-buffer ERROR that
@@ -55,7 +55,7 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
-    defined(USE_COREX) || defined(USE_SUNRISE)
+    defined(USE_COREX) || defined(USE_SUNRISE) || defined(USE_XPU)
     static const bool cuda_device_present = detectCudaDevicePresent();
 
     if (cuda_device_present) {
