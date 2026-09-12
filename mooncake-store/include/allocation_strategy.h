@@ -62,6 +62,7 @@ class AllocatorManager {
             new SegmentAllocatorRegistration(allocator,
                                              std::move(client_liveness)));
         addRegistration(name, registration);
+        invalidateSnapshotCache();
         return registration;
     }
 
@@ -98,6 +99,9 @@ class AllocatorManager {
             }
         }
 
+        if (registration_removed) {
+            invalidateSnapshotCache();
+        }
         return registration_removed;
     }
 
@@ -128,7 +132,37 @@ class AllocatorManager {
         for (size_t i = 0; i < replacements.size(); ++i) {
             (*targets[i])->BindAllocator(replacements[i].replacement);
         }
+        invalidateSnapshotCache();
         return true;
+    }
+
+    // Shared copy-on-write snapshot for per-request reads: the registry is
+    // deep-copied only after a mutator (or an owner-map mutation in
+    // SegmentManager) invalidated the cache; readers then share one immutable
+    // instance. Mutators and readers synchronize through SegmentManager's
+    // segment_mutex_ (exclusive vs shared), so the cache needs no lock.
+    std::shared_ptr<const AllocatorManager> SharedSnapshot(
+        const std::unordered_map<std::string, UUID>* owners = nullptr) const {
+        auto& cache = owners == nullptr
+                          ? snapshot_cache_
+                          : owner_snapshots_cache_[owners];
+        if (cache == nullptr) {
+            auto fresh = std::make_shared<AllocatorManager>();
+            fresh->names_ = names_;
+            fresh->allocators_ = allocators_;
+            if (owners != nullptr) {
+                fresh->owner_by_name_ = *owners;
+            }
+            cache = std::move(fresh);
+        }
+        return cache;
+    }
+
+    // Owner-map mutation sites in SegmentManager call this so cached
+    // snapshots carrying a stale owner mapping are dropped.
+    void invalidateSnapshotCache() const {
+        snapshot_cache_.reset();
+        owner_snapshots_cache_.clear();
     }
 
     AllocatorManager Snapshot(
@@ -203,6 +237,10 @@ class AllocatorManager {
         std::string, std::vector<std::shared_ptr<SegmentAllocatorRegistration>>>
         allocators_;
     std::unordered_map<std::string, UUID> owner_by_name_;
+    mutable std::shared_ptr<const AllocatorManager> snapshot_cache_;
+    mutable std::unordered_map<const void*,
+                               std::shared_ptr<const AllocatorManager>>
+        owner_snapshots_cache_;
     friend class ScopedSegmentAccess;
     friend class SegmentSerializer;
 };

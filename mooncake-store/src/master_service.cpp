@@ -4474,7 +4474,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
                 append_preferred_segment(preferred_segment);
             }
         }
-        AllocatorManager allocator_snapshot;
+        std::shared_ptr<const AllocatorManager> allocator_snapshot;
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
@@ -4499,7 +4499,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocator_snapshot, value_length, config.replica_num,
+            *allocator_snapshot, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
 
         if (!allocation_result.has_value()) {
@@ -6316,7 +6316,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     // so terminal cleanup cannot pass this operation before its metadata
     // changes become visible.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
+    std::shared_ptr<const AllocatorManager> allocator_snapshot;
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
@@ -6330,7 +6330,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         }
 
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.size, tgt_segment);
+            *allocator_snapshot, metadata.size, tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -6745,14 +6745,14 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
                                pending_quota_charge);
         };
 
-        AllocatorManager allocator_snapshot;
+        std::shared_ptr<const AllocatorManager> allocator_snapshot;
         {
             ScopedAllocatorAccess allocator_access =
                 segment_manager_.getAllocatorAccess();
             allocator_snapshot = allocator_access.SnapshotAllocatorManager();
         }
         auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.size, tgt_segment);
+            *allocator_snapshot, metadata.size, tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -9605,14 +9605,14 @@ auto MasterService::PromotionAllocStart(
     // was already admitted and its entry lock stays held until the staged
     // replica and task state are committed or rolled back.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
+    std::shared_ptr<const AllocatorManager> allocator_snapshot;
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         allocator_snapshot = allocator_access.SnapshotAllocatorManager();
     }
     auto allocation_result = allocation_strategy_->Allocate(
-        allocator_snapshot, size, config.replica_num, preferred_segments);
+        *allocator_snapshot, size, config.replica_num, preferred_segments);
     if (!allocation_result) {
         refund_pending_quota();
         return tl::make_unexpected(allocation_result.error());
