@@ -137,6 +137,7 @@ mooncake_master --default_kv_lease_ttl=500 &
 MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python test_store_setup_lifecycle.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
 
 pip install torch numpy safetensors packaging
