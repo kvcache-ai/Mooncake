@@ -95,6 +95,10 @@ without RDMA. Each rank still owns its staging output. Merely placing data in
 another process on the same host does not make that process's pointers locally
 addressable. Use separate directories for separate model instances.
 
+For large memory-mapped tables, consider prefaulting the mappings at startup
+(for example, with Linux `MAP_POPULATE`). Resident file pages can still require
+per-process page-table faults on first access, delaying random row lookups.
+
 C++:
 
 - constructor `EngramStore(const std::map<int, EngramStoreConfig>& layers, std::shared_ptr<PyClient>)`
