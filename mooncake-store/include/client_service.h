@@ -251,10 +251,27 @@ class Client {
      * entries are issued as one scatter transfer so the transport can coalesce
      * everything bound for the same segment, then awaited together. Requires
      * memory replicas. Returns per-entry total bytes transferred or an
-     * ErrorCode. Used by RealClient get sessions. No Master RPC.
+     * ErrorCode. Used by session get. No Master RPC.
      */
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
         const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets);
+
+    /**
+     * @brief Batch ranged read from restored LOCAL_DISK arenas.
+     *
+     * Counterpart of BatchTransferReadRanges the same way BatchGetOffloadObject
+     * is the counterpart of BatchGet: one transfer_engine_addr for the batch,
+     * plus a restore pointer and object size per entry. Fragments use
+     * src_offsets into that restored object. Used by session get after RPC
+     * restore into the owner's TE-registered client buffer. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    BatchTransferReadOffloadRanges(
+        const std::string& transfer_engine_addr,
+        const std::vector<uint64_t>& remote_bases,
+        const std::vector<size_t>& remote_sizes,
         const std::vector<std::vector<Slice>>& slices,
         const std::vector<std::vector<uint64_t>>& src_offsets);
 
@@ -263,7 +280,7 @@ class Client {
      * from all entries and all memory replicas are issued as one scatter
      * transfer, then awaited together. Returns per-entry logical bytes
      * transferred (counted once, not per replica) or an ErrorCode. Used by
-     * RealClient put sessions.
+     * session put.
      */
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
         const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,

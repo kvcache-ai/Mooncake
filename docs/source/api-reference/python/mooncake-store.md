@@ -2895,9 +2895,16 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
-Range calls only check the cached lease locally (zero Master RPCs). Put sessions
-reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one complete replica chosen by
+`SelectBestReplica`, plus lease). Range calls only check the cached lease
+locally (zero Master RPCs). MEMORY replicas use `BatchTransferReadRanges`.
+LOCAL_DISK replicas restore on the owner then scatter object-byte ranges into
+already `register_buffer`'d destinations (the reader does not need a setup
+local buffer). DISK/DFS replicas `BatchGet` into a temporary host buffer and
+scatter by `src_offset`. NoF is not a session range type: a start that lands
+on a NoF replica fails the later range read with `INVALID_REPLICA`. Put
+sessions reserve object space via Master `BatchPutStart` and finalize with
+`BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where

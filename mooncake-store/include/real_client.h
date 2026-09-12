@@ -8,6 +8,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -693,6 +694,13 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
 
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffer_ranges_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets);
+
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
@@ -829,6 +837,22 @@ class RealClient : public PyClient {
         const std::string &target_rpc_service_addr,
         std::unordered_map<std::string, std::vector<Slice>> &objects,
         const OffloadReadRange *read_range = nullptr);
+
+    // Owner restore for LOCAL_DISK: RPC batch_get_offload_object or
+    // BatchGetLocal. Callers copy out of the restored arena (sequential
+    // BatchGetOffloadObject or session BatchTransferReadOffloadRanges) while
+    // the returned lease is alive; the destructor releases the owner buffer.
+    // allow_pinned: sequential memcpy may restore into the unregistered pinned
+    // arena. Session scatter is TE-only, so it must pass false and land in the
+    // owner's registered client buffer.
+    class OffloadRestoreLease;
+    tl::expected<std::unique_ptr<OffloadRestoreLease>, ErrorCode>
+    restore_offload_objects(
+        const std::string &target_rpc_service_addr,
+        const std::vector<std::string> &keys,
+        const std::vector<int64_t> &restore_sizes,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects,
+        bool allow_pinned = true);
 
     bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
@@ -1018,9 +1042,13 @@ class RealClient : public PyClient {
 
     // KV transfer sessions (process-local; not shared with DummyClient).
     // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
-    // memory replica + lease); ranges only compare lease locally (no Master).
-    // Put sessions track writable + inflight so end/revoke can seal the
-    // session and wait for outstanding range writes before finalize/free.
+    // replica selected by SelectBestReplica + lease). Range calls only compare
+    // the cached lease locally (no Master). MEMORY uses
+    // BatchTransferReadRanges; LOCAL_DISK restores on the owner then
+    // BatchTransferReadOffloadRanges; DISK/DFS BatchGet into a temp buffer
+    // then scatter by src_offset. Put sessions track writable + inflight so
+    // end/revoke can seal the session and wait for outstanding range writes
+    // before finalize/free.
     struct PutSessionEntry {
         std::vector<Replica::Descriptor> replicas;
         uint64_t object_size{0};
@@ -1032,6 +1060,9 @@ class RealClient : public PyClient {
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+
+    void wait_session_put_idle(std::unique_lock<std::mutex> &lock,
+                               const std::vector<std::string> &keys);
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
