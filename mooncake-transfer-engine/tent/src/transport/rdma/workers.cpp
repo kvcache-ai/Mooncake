@@ -356,7 +356,16 @@ Status Workers::submit(RdmaSliceList& slice_list, int worker_id) {
         priority = slice_list.first->priority;
     }
 
-    worker.queues[priority].push(slice_list);
+    // Use try_push to avoid blocking when queue is full. If the queue is full,
+    // return an error so the caller can fail the slice immediately instead of
+    // spinning indefinitely. This prevents livelock when the worker thread
+    // itself tries to re-enqueue retried slices into a full queue.
+    if (!worker.queues[priority].try_push(slice_list)) {
+        LOG(WARNING) << "Worker " << worker_id << " queue full (capacity "
+                     << Workers::kCapacity << "), rejecting slice";
+        return Status(Status::Code::kTooManyRequests,
+                      "Worker submit queue is full, cannot accept more slices");
+    }
     if (!worker.inflight_slices.fetch_add(slice_list.num_slices)) {
         std::lock_guard<std::mutex> lock(worker.mutex);
         if (worker.in_suspend) worker.cv.notify_all();
@@ -766,8 +775,18 @@ void Workers::asyncPostSend() {
                     updateSliceStatus(slice, FAILED);
                     discountFromOwner(worker, slice);
                 } else {
-                    // The re-submit moves the count to the lane it lands on.
-                    submitFromTick(worker, slice);
+                    releaseSliceQuota(slice);
+                    // The worker must never block on enqueue: if the queue is
+                    // full, fail the slice immediately rather than spinning.
+                    // Spinning here wedges the worker (it stops popping its own
+                    // queue) and livelocks the whole engine. See #3636/#3637.
+                    Status st = submit(slice);
+                    if (!st.ok()) {
+                        LOG(WARNING) << "Slice " << slice
+                                     << " failed: re-enqueue rejected ("
+                                     << st.message() << ")";
+                        updateSliceStatus(slice, FAILED);
+                    }
                 }
             }
             continue;
@@ -796,6 +815,7 @@ void Workers::asyncPostSend() {
             [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
         for (int id = 0; id < num_submitted; ++id) {
             auto slice = slices[id];
+<<<<<<< HEAD
             if (!slice->failed) continue;
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
@@ -814,6 +834,35 @@ void Workers::asyncPostSend() {
                 disableEndpoint(slice);
                 updateSliceStatus(slice, FAILED);
                 discountFromOwner(worker, slice);
+=======
+            if (slice->failed) {
+                releaseSliceQuota(slice);
+                if (slice->task->cancel_requested.load(
+                        std::memory_order_acquire)) {
+                    updateSliceStatus(slice, CANCELED);
+                    worker.inflight_slices.fetch_sub(1);
+                    continue;
+                }
+                slice->retry_count++;
+                if (slice->retry_count >=
+                    transport_->params_->workers.max_retry_count) {
+                    LOG(WARNING)
+                        << "Slice " << slice << " failed: retry count exceeded";
+                    disableEndpoint(slice);
+                    updateSliceStatus(slice, FAILED);
+                } else {
+                    // Non-blocking re-enqueue: never wedge the worker on a
+                    // full queue. Fail the slice instead. See #3636/#3637.
+                    Status st = submit(slice);
+                    if (!st.ok()) {
+                        LOG(WARNING) << "Slice " << slice
+                                     << " failed: re-enqueue rejected ("
+                                     << st.message() << ")";
+                        updateSliceStatus(slice, FAILED);
+                    }
+                }
+                worker.inflight_slices.fetch_sub(1);
+>>>>>>> d96993a ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
             } else {
                 submitFromTick(worker, slice);
             }
@@ -1119,9 +1168,117 @@ void Workers::asyncPollCq() {
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) continue;
         auto poll_ts = getCurrentTimeInNano();
+<<<<<<< HEAD
         for (int i = 0; i < nr_poll; ++i)
             handleCompletion(worker, *context, wc[i], poll_ts,
                              i + 1 == nr_poll);
+=======
+        for (int i = 0; i < nr_poll; ++i) {
+            auto slice = (RdmaSlice*)wc[i].wr_id;
+            worker.inflight_slice_set.erase(slice);
+            auto ep = slice->ep_weak_ptr.lock();
+            double enqueue_lat =
+                (slice->submit_ts - slice->enqueue_ts) / 1000.0;
+            double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
+            double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
+            releaseSliceQuota(slice, overall_lat_sec);
+            if (slice->word != PENDING) continue;
+            if (!ep) {
+                updateSliceStatus(slice, FAILED);
+                num_slices++;
+                continue;
+            }
+            if (wc[i].status != IBV_WC_SUCCESS) {
+                if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
+                    // TE handles them automatically
+                    LOG(INFO) << "Detected error WQE for slice " << slice
+                              << " (opcode: " << slice->task->request.opcode
+                              << ", source_addr: " << (void*)slice->source_addr
+                              << ", dest_addr: " << (void*)slice->target_addr
+                              << ", length: " << slice->length
+                              << ", local_nic: " << context->name()
+                              << "): " << ibv_wc_status_str(wc[i].status);
+                }
+                // GPUDirect reachability learning: a protection/access error
+                // on a GPU buffer means the chosen NIC cannot P2P-DMA to that
+                // GPU (ibv_reg_mr succeeded but the PCIe path is unusable).
+                // Record it so selection avoids that NIC and converges onto a
+                // reachable rail instead of exhausting retries. The local side
+                // (source NIC -> source GPU) surfaces as LOC_PROT; the remote
+                // side (target NIC -> target GPU) as REM_ACCESS or, for a
+                // remote GDR-read failure, REM_OP (observed on strict fabrics).
+                bool local_gdr_err = (wc[i].status == IBV_WC_LOC_PROT_ERR);
+                bool remote_gdr_err = (wc[i].status == IBV_WC_REM_ACCESS_ERR ||
+                                       wc[i].status == IBV_WC_REM_OP_ERR);
+                if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
+                    slice->source_nic_name) {
+                    GdrReachability::instance().reportLocalFailure(
+                        slice->source_nic_name, slice->source_gpu_ordinal);
+                } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
+                           slice->target_nic_name && slice->target_machine_id) {
+                    GdrReachability::instance().reportRemoteFailure(
+                        *slice->target_machine_id, slice->target_nic_name,
+                        slice->target_gpu_ordinal);
+                }
+                slice->retry_count++;
+                if (slice->retry_count >=
+                    transport_->params_->workers.max_retry_count) {
+                    LOG(WARNING)
+                        << "Slice " << slice << " failed: retry count exceeded";
+                    num_slices += ep->acknowledge(slice, FAILED);
+                    disableEndpoint(slice);
+                } else {
+                    num_slices += ep->acknowledge(slice, PENDING);
+                    disableEndpoint(slice);
+                    if (slice->task->cancel_requested.load(
+                            std::memory_order_acquire)) {
+                        updateSliceStatus(slice, CANCELED);
+                    } else {
+                        // Non-blocking re-enqueue: never wedge the worker on a
+                        // full queue. Fail the slice instead. See #3636/#3637.
+                        Status st = submit(slice);
+                        if (!st.ok()) {
+                            LOG(WARNING) << "Slice " << slice
+                                         << " failed: re-enqueue rejected ("
+                                         << st.message() << ")";
+                            updateSliceStatus(slice, FAILED);
+                        }
+                    }
+                }
+            } else {
+                num_slices += ep->acknowledge(slice, COMPLETED);
+                // A successful GPU transfer re-admits any learned GDR
+                // unreachability for the (GPU, NIC) pair(s) it used, so a
+                // transient exclusion (or a recovered path) heals. Skipped
+                // entirely until something has actually been excluded.
+                if (GdrReachability::hasAnyExclusion()) {
+                    auto& gdr = GdrReachability::instance();
+                    if (slice->source_gpu_ordinal >= 0 &&
+                        slice->source_nic_name)
+                        gdr.reportLocalSuccess(slice->source_nic_name,
+                                               slice->source_gpu_ordinal);
+                    if (slice->target_gpu_ordinal >= 0 &&
+                        slice->target_nic_name && slice->target_machine_id)
+                        gdr.reportRemoteSuccess(*slice->target_machine_id,
+                                                slice->target_nic_name,
+                                                slice->target_gpu_ordinal);
+                }
+                // A successful transfer proves this rail is healthy; clear
+                // any accumulated error count so a previously-cooled-down
+                // rail can be used again without waiting for the full
+                // cooldown to expire. The monitor pointer is resolved once
+                // in generatePostPath, so no map lookup is needed here.
+                if (auto* rail = slice->rail_monitor; rail && rail->ready())
+                    rail->markRecovered(slice->source_dev_id,
+                                        slice->target_dev_id);
+                worker.perf.inflight_lat.add(inflight_lat);
+                worker.perf.enqueue_lat.add(enqueue_lat);
+            }
+        }
+    }
+    if (num_slices) {
+        worker.inflight_slices.fetch_sub(num_slices);
+>>>>>>> d96993a ([Bugfix][TENT] Add non-blocking try_push to BoundedMPSCQueue and fail slices on queue full (#3636))
     }
 }
 
