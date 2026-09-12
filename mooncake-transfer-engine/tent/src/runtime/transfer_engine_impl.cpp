@@ -380,6 +380,10 @@ Status TransferEngineImpl::construct() {
         conf_->get("runtime_queue/mlu_local_threshold", 0.0);
     runtime_queue_config_.limits.promotion_slack_ns =
         conf_->get("runtime_queue/promotion_slack_ns", 0UL);
+    runtime_queue_config_.limits.mlu_probe_owners =
+        conf_->get("runtime_queue/mlu_probe_owners", 0UL);
+    runtime_queue_config_.limits.mlu_probe_ceiling_factor =
+        conf_->get("runtime_queue/mlu_probe_ceiling_factor", 2.0);
     runtime_queue_config_.max_dispatch_owners =
         conf_->get("runtime_queue/max_dispatch_owners", 64UL);
     runtime_queue_config_.max_dispatch_bytes =
@@ -2225,7 +2229,14 @@ Status TransferEngineImpl::finishQueuedOwner(
                 "runtime dispatch window accounting underflow" LOC_MARK);
         }
     }
-    CHECK_STATUS(runtime_queue_->complete(owner_id, terminal_status));
+    auto probe_outcome = LocalTransferAdmissionQueue::ProbeOutcome::None;
+    CHECK_STATUS(
+        runtime_queue_->complete(owner_id, terminal_status, &probe_outcome));
+    if (probe_outcome != LocalTransferAdmissionQueue::ProbeOutcome::None) {
+        TentMetrics::instance().recordDeadlineProbe(
+            probe_outcome ==
+            LocalTransferAdmissionQueue::ProbeOutcome::MetDeadline);
+    }
     if (queued.in_dispatch_window) {
         --dispatch_inflight_owners_;
         dispatch_inflight_bytes_ -= queued.byte_charge;

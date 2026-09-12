@@ -14,7 +14,9 @@
 
 #include "tent/runtime/admission_queue.h"
 
+#include <algorithm>
 #include <atomic>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -817,6 +819,619 @@ TEST(AdmissionQueueTest,
     EXPECT_EQ(queue.dispatchingBytes(), 0u);
     ASSERT_EQ(queue.retireBatch(1).code(), Status::Code::kOk);
     EXPECT_EQ(queue.dispatchingBytes(), 0u);
+}
+
+// --- RFC #2519 step 3: the drop / estimate feedback loop -----------------
+//
+// The drop decision, the traffic it lets through, and the bandwidth estimate
+// learned from that traffic form a loop: dropping shapes what is sent, what
+// is sent is the only thing the estimate can learn from, and the estimate
+// is what the next drop is judged against. RDMA throughput is queue-depth
+// bound, so a trickle admitted under a low estimate can genuinely achieve a
+// low rate and confirm the estimate. These tests drive the queue against a
+// model of such a link to see whether the loop returns to saturation or
+// settles on a plateau below it.
+//
+// Model: the link saturates at `line_rate` with `saturating_owners` in
+// flight and achieves a proportional fraction below that; the estimate
+// follows what was achieved with the transmit smoothing (alpha weights the
+// old value, as in DeviceSelector).
+struct QueueDepthBoundLink {
+    double line_rate;
+    int saturating_owners;
+    double alpha;
+    double rate;
+
+    double achieved(int concurrent) const {
+        return line_rate * std::min(concurrent, saturating_owners) /
+               saturating_owners;
+    }
+    void observe(int concurrent) {
+        rate = alpha * rate + (1.0 - alpha) * achieved(concurrent);
+    }
+};
+
+struct FeedbackRound {
+    int admitted;
+    int dropped;
+    double rate_after;
+};
+
+// One round: offer `owners` equal, eligible owners with the same deadline,
+// dispatch, complete whatever was admitted, retire the batch, and let the
+// link learn from the concurrency that round achieved.
+FeedbackRound runFeedbackRound(LocalTransferAdmissionQueue& queue,
+                               QueueDepthBoundLink& link, uint64_t token,
+                               int owners, size_t length,
+                               uint64_t deadline_ns) {
+    std::vector<QueueOwnerInput> inputs;
+    for (int i = 0; i < owners; ++i)
+        inputs.push_back(
+            makeDegradationEligibleOwnerWithDeadline(i, length, deadline_ns));
+    std::vector<QueueOwnerId> ids;
+    EXPECT_EQ(queue.tryAdmit(makeSubmit(token, owners, std::move(inputs)), ids)
+                  .code(),
+              Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(owners, 1 << 30, &dropped);
+    for (auto id : picked)
+        EXPECT_EQ(queue.complete(id, TransferStatusEnum::COMPLETED).code(),
+                  Status::Code::kOk);
+    EXPECT_EQ(queue.retireBatch(token).code(), Status::Code::kOk);
+
+    link.observe(static_cast<int>(picked.size()));
+    return {static_cast<int>(picked.size()), static_cast<int>(dropped.size()),
+            link.rate};
+}
+
+// Shared scenario: 8 owners of 1 MB per round, a 10 ms window, theta 0.95,
+// a link that needs all 8 in flight to reach 1 GB/s (1 MB per ms). At line
+// rate the last owner scores MLU 0.8 and everything is admitted. The i-th
+// owner is judged behind the i-1 picked before it in the same call.
+constexpr double kLineRate = 1e9;
+constexpr int kSaturatingOwners = 8;
+constexpr size_t kOwnerBytes = 1'000'000;
+constexpr uint64_t kNow = 1'000'000'000;
+constexpr uint64_t kDeadline = kNow + 10'000'000;  // 10 ms window
+constexpr double kThetaLocal = 0.95;
+
+std::unique_ptr<LocalTransferAdmissionQueue> makeFeedbackQueue(
+    QueueDepthBoundLink& link, int& hook_calls, size_t probe_owners = 0) {
+    QueueLimits limits{16, 1 << 30, 0, 0};
+    limits.deadline_aware = true;
+    limits.mlu_local_threshold = kThetaLocal;
+    limits.mlu_probe_owners = probe_owners;
+    auto queue = std::make_unique<LocalTransferAdmissionQueue>(limits);
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue->setDegradationPolicy([&link] { return link.rate; }, hooks,
+                                [] { return kNow; });
+    return queue;
+}
+
+// From an optimistic seed nothing is dropped, the link stays saturated and
+// the estimate never moves: the loop does not starve itself from a clean
+// start.
+TEST(AdmissionQueueTest, Step3FeedbackCleanStartStaysSaturated) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, kLineRate};
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls);
+    for (uint64_t round = 1; round <= 30; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_EQ(r.admitted, kSaturatingOwners) << "round " << round;
+        ASSERT_EQ(r.dropped, 0) << "round " << round;
+        ASSERT_NEAR(r.rate_after, kLineRate, 1e-9 * kLineRate)
+            << "round " << round;
+    }
+    EXPECT_EQ(hook_calls, 0);
+}
+
+// An estimate depressed to what 6 of 8 owners achieve drops one owner a
+// round, but the 7 that get through achieve more than the estimate says,
+// so it climbs back and admission returns to 8: the shallow basin recovers.
+TEST(AdmissionQueueTest, Step3FeedbackShallowDepressionRecovers) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, 0.0};
+    link.rate = link.achieved(6);  // 0.75 GB/s
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls);
+
+    int recovered_at = -1;
+    for (uint64_t round = 1; round <= 40; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_GE(r.admitted, 7) << "round " << round;  // never gets worse
+        if (r.admitted == kSaturatingOwners && recovered_at < 0)
+            recovered_at = static_cast<int>(round);
+        if (recovered_at > 0)
+            ASSERT_EQ(r.admitted, kSaturatingOwners) << "round " << round;
+    }
+    EXPECT_GT(recovered_at, 0);
+    EXPECT_LE(recovered_at, 25);
+    EXPECT_NEAR(link.rate, kLineRate, 0.02 * kLineRate);
+    EXPECT_EQ(hook_calls, recovered_at - 1);  // one drop per round until then
+}
+
+// An estimate depressed to what 4 of 8 owners achieve is a fixed point: the
+// 5th owner scores MLU 1.0, so exactly 4 are admitted, 4 achieve exactly the
+// rate the estimate already holds, and nothing ever pulls it back up. This
+// pins the J21 finding under the queue-depth-bound model: with no probe
+// (mlu_probe_owners = 0, the default) the loop has a self-sustaining plateau
+// below saturation and nothing spends evidence on climbing out.
+TEST(AdmissionQueueTest, Step3FeedbackDeepDepressionIsSelfSustaining) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, 0.0};
+    link.rate = link.achieved(4);  // 0.5 GB/s
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls);
+
+    for (uint64_t round = 1; round <= 50; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_EQ(r.admitted, 4) << "round " << round;
+        ASSERT_EQ(r.dropped, 4) << "round " << round;
+        ASSERT_NEAR(r.rate_after, link.achieved(4), 1e-9 * link.achieved(4))
+            << "round " << round;
+    }
+    EXPECT_EQ(hook_calls, 4 * 50);
+}
+
+// One probe per pick from the same plateau: the 5th owner the drop would
+// reject is dispatched, 5 achieve more than the estimate says, it climbs
+// past the point where a 5th is admitted on its own merits, the probe moves
+// to the 6th, and so on up to saturation.
+TEST(AdmissionQueueTest, Step3FeedbackDeepDepressionRecoversWithOneProbe) {
+    QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, 0.0};
+    link.rate = link.achieved(4);
+    int hook_calls = 0;
+    auto queue = makeFeedbackQueue(link, hook_calls, /*probe_owners=*/1);
+
+    int recovered_at = -1;
+    size_t probes_at_50 = 0;
+    for (uint64_t round = 1; round <= 60; ++round) {
+        auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                  kOwnerBytes, kDeadline);
+        ASSERT_GE(r.admitted, 4) << "round " << round;  // never below plateau
+        if (r.admitted == kSaturatingOwners && recovered_at < 0)
+            recovered_at = static_cast<int>(round);
+        if (recovered_at > 0)
+            ASSERT_EQ(r.admitted, kSaturatingOwners) << "round " << round;
+        if (round == 50) probes_at_50 = queue->probeStats().dispatched;
+    }
+    EXPECT_GT(recovered_at, 0);
+    EXPECT_LE(recovered_at, 40);
+    EXPECT_NEAR(link.rate, kLineRate, 0.02 * kLineRate);
+    // At most one probe a round on the way up; once the estimate carries
+    // saturation on its own nothing is infeasible and probing stops.
+    EXPECT_GT(queue->probeStats().dispatched, 0u);
+    EXPECT_LE(queue->probeStats().dispatched, 60u);
+    EXPECT_EQ(queue->probeStats().dispatched, probes_at_50);
+}
+
+// The budget buys time, not a cheaper climb. From the same plateau a larger
+// budget reaches saturation in fewer rounds, but the probes spent getting
+// there stay about the same: the estimate has a fixed distance to move and
+// each probe moves it by about the same amount whenever it is spent. What a
+// larger budget does add is exposure when the estimate is right -- that many
+// more late transfers per pick -- so 1 is the recommended value.
+TEST(AdmissionQueueTest,
+     Step3FeedbackLargerProbeBudgetRecoversFasterAtTheSameCost) {
+    struct Outcome {
+        int recovered_at;
+        size_t probes;
+    };
+    auto climb = [](size_t probe_owners) {
+        QueueDepthBoundLink link{kLineRate, kSaturatingOwners, 0.9, 0.0};
+        link.rate = link.achieved(4);
+        int hook_calls = 0;
+        auto queue = makeFeedbackQueue(link, hook_calls, probe_owners);
+        Outcome out{-1, 0};
+        for (uint64_t round = 1; round <= 60; ++round) {
+            auto r = runFeedbackRound(*queue, link, round, kSaturatingOwners,
+                                      kOwnerBytes, kDeadline);
+            if (r.admitted == kSaturatingOwners && out.recovered_at < 0)
+                out.recovered_at = static_cast<int>(round);
+        }
+        out.probes = queue->probeStats().dispatched;
+        return out;
+    };
+
+    const Outcome one = climb(1), two = climb(2), four = climb(4);
+    EXPECT_GT(one.recovered_at, 0);
+    EXPECT_GT(two.recovered_at, 0);
+    EXPECT_GT(four.recovered_at, 0);
+    EXPECT_LE(two.recovered_at, one.recovered_at);
+    EXPECT_LE(four.recovered_at, two.recovered_at);
+    EXPECT_LT(four.recovered_at, one.recovered_at);  // strictly faster overall
+    EXPECT_NEAR(static_cast<double>(two.probes),
+                static_cast<double>(one.probes), 5.0);
+    EXPECT_NEAR(static_cast<double>(four.probes),
+                static_cast<double>(one.probes), 5.0);
+}
+
+// ---- probe mechanics ----
+
+// With a probe budget the owner the drop would reject is dispatched instead:
+// not terminal, not signalled, counted as dispatching like any other owner.
+TEST(AdmissionQueueTest, Step3ProbeDispatchesTheOwnerTheDropWouldReject) {
+    QueueLimits limits = step3Limits(1.5);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    int hook_calls = 0;
+    DegradationHooks hooks;
+    hooks.on_local_decode_suggested = [&](const Request&) { ++hook_calls; };
+    queue.setDegradationPolicy([] { return 1e9; }, hooks,
+                               [] { return uint64_t{1'000'000'000}; });
+
+    // Same pair as Step3DropsInfeasibleAndKeepsFeasible: owner 1 has MLU
+    // 1.6 >= 1.5 and would be dropped; owner 2 is comfortably feasible.
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 2,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                      0, 16, 1'000'000'010),
+                                  makeDegradationEligibleOwnerWithDeadline(
+                                      1, 16, 2'000'000'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+
+    std::vector<QueueOwnerId> dropped;
+    auto picked = queue.pickForDispatch(4, 1 << 20, &dropped);
+    EXPECT_EQ(picked, (std::vector<QueueOwnerId>{1, 2}));
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(hook_calls, 0);
+    EXPECT_EQ(queue.probeStats().dispatched, 1u);
+    EXPECT_EQ(queue.dispatchingBytes(), 32u);  // the probe is dispatched too
+    EXPECT_EQ(queue.outstandingOwners(), 2u);
+}
+
+// The budget is per pick and covers only the infeasible: two owners that
+// each score MLU 1.6 on their own and a budget of one, the first is probed
+// and the second dropped (it would be even with nothing ahead of it); the
+// next pick starts with a fresh budget.
+TEST(AdmissionQueueTest, Step3ProbeBudgetIsPerPickAndDropsTheRest) {
+    QueueLimits limits = step3Limits(1.5);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 2,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                      0, 16, 1'000'000'010),
+                                  makeDegradationEligibleOwnerWithDeadline(
+                                      1, 16, 1'000'000'010)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{1});
+    EXPECT_EQ(dropped, std::vector<QueueOwnerId>{2});
+    EXPECT_EQ(queue.probeStats().dispatched, 1u);
+
+    ASSERT_EQ(queue.complete(1, TransferStatusEnum::COMPLETED).code(),
+              Status::Code::kOk);
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(2, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'000'010)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    dropped.clear();
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{3});
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(queue.probeStats().dispatched, 2u);
+}
+
+// Probing only ever replaces a drop: with the drop disabled (no threshold)
+// the budget has nothing to spend on, and nothing is counted as a probe.
+TEST(AdmissionQueueTest, Step3ProbeIsInertWithoutDrop) {
+    QueueLimits limits = step3Limits(/*theta_local=*/0.0);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 2,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                      0, 16, 1'000'000'010),
+                                  makeDegradationEligibleOwnerWithDeadline(
+                                      1, 16, 1'000'000'011)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              (std::vector<QueueOwnerId>{1, 2}));
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(queue.probeStats().dispatched, 0u);
+}
+
+// The probe's collateral when the estimate is right. A large, urgent owner
+// that genuinely cannot make its deadline is the probe; its bytes join the
+// queue ahead of everyone behind it, so a small, looser owner that was
+// feasible on its own is now judged behind 1000 bytes it did not have to wait
+// for and is dropped instead. Without the probe the large owner is dropped
+// and the small one goes: the probe trades a feasible transfer for an
+// infeasible one whenever the estimate was telling the truth. (Dispatching
+// the probe after the feasible owners would avoid this, but a pick whose
+// owner budget the feasible owners fill every time would then never have
+// room for it, and an owner held back for a probe that never comes is
+// neither transferred nor signalled.)
+TEST(AdmissionQueueTest, Step3ProbeCanDropTheFeasibleOwnerBehindIt) {
+    // 1 B per ns; A: 1000 B in a 400 ns window (MLU 2.5); B: 100 B in a
+    // 600 ns window (MLU 0.17 alone, 1.83 behind A).
+    auto admitBoth = [](LocalTransferAdmissionQueue& queue) {
+        std::vector<QueueOwnerId> ids;
+        ASSERT_EQ(
+            queue
+                .tryAdmit(makeSubmit(1, 2,
+                                     {makeDegradationEligibleOwnerWithDeadline(
+                                          0, 1000, 1'000'000'400),
+                                      makeDegradationEligibleOwnerWithDeadline(
+                                          1, 100, 1'000'000'600)}),
+                          ids)
+                .code(),
+            Status::Code::kOk);
+    };
+
+    {
+        LocalTransferAdmissionQueue queue(step3Limits(1.5));
+        queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                                   [] { return uint64_t{1'000'000'000}; });
+        admitBoth(queue);
+        std::vector<QueueOwnerId> dropped;
+        EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+                  std::vector<QueueOwnerId>{2});           // B goes
+        EXPECT_EQ(dropped, std::vector<QueueOwnerId>{1});  // A dropped
+    }
+    {
+        QueueLimits limits = step3Limits(1.5);
+        limits.mlu_probe_owners = 1;
+        LocalTransferAdmissionQueue queue(limits);
+        queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                                   [] { return uint64_t{1'000'000'000}; });
+        admitBoth(queue);
+        std::vector<QueueOwnerId> dropped;
+        EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+                  std::vector<QueueOwnerId>{1});           // A probed
+        EXPECT_EQ(dropped, std::vector<QueueOwnerId>{2});  // B collateral
+        EXPECT_EQ(queue.probeStats().dispatched, 1u);
+        EXPECT_EQ(queue.dispatchingBytes(), 1000u);
+    }
+}
+
+// Of several rejected owners the most urgent is the probe -- EDF order, the
+// same order the drop meets them in -- not the smallest or the largest: its
+// verdict is the soonest to arrive, and size is left out of the choice on
+// purpose (a bigger probe lifts the meter more per round, and costs more
+// per pick when the estimate is right). The rest are judged behind it.
+TEST(AdmissionQueueTest, Step3ProbeIsTheMostUrgentRejectedOwner) {
+    QueueLimits limits = step3Limits(1.5);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    // 1 B per ns. Owner 1: 28 B in 10 ns (MLU 2.8), the most urgent and the
+    // largest. Owner 2: 16 B in 10 ns (MLU 1.6 alone), same deadline,
+    // admitted after 1 so behind it in EDF order, and the smallest. Owner 3:
+    // 20 B in 12 ns (MLU 1.67 alone). All three are rejected; 1 is the probe.
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 3,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                      0, 28, 1'000'000'010),
+                                  makeDegradationEligibleOwnerWithDeadline(
+                                      1, 16, 1'000'000'010),
+                                  makeDegradationEligibleOwnerWithDeadline(
+                                      2, 20, 1'000'000'012)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{1});
+    EXPECT_EQ(dropped, (std::vector<QueueOwnerId>{2, 3}));
+    EXPECT_EQ(queue.probeStats().dispatched, 1u);
+}
+
+// An owner far past the threshold is infeasible whatever the estimate says;
+// probing it buys a late transfer and no information. With the default
+// ceiling of 2 x theta, an owner at MLU 3.2 is dropped with budget to spare
+// while one at 1.6 is probed, budget for both notwithstanding; with the
+// ceiling removed the 3.2 owner is a candidate like any other and goes too.
+TEST(AdmissionQueueTest, Step3ProbeSkipsOwnersFarPastTheThreshold) {
+    auto admitBoth = [](LocalTransferAdmissionQueue& queue) {
+        std::vector<QueueOwnerId> ids;
+        // 1 B per ns. Owner 1: 32 B in 10 ns (MLU 3.2); owner 2: 16 B in
+        // 10 ns (MLU 1.6). Same deadline, so EDF keeps admission order.
+        ASSERT_EQ(
+            queue
+                .tryAdmit(makeSubmit(1, 2,
+                                     {makeDegradationEligibleOwnerWithDeadline(
+                                          0, 32, 1'000'000'010),
+                                      makeDegradationEligibleOwnerWithDeadline(
+                                          1, 16, 1'000'000'010)}),
+                          ids)
+                .code(),
+            Status::Code::kOk);
+    };
+
+    {
+        QueueLimits limits = step3Limits(1.5);  // ceiling 3.0
+        limits.mlu_probe_owners = 1;
+        LocalTransferAdmissionQueue queue(limits);
+        queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                                   [] { return uint64_t{1'000'000'000}; });
+        admitBoth(queue);
+        std::vector<QueueOwnerId> dropped;
+        EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+                  std::vector<QueueOwnerId>{2});
+        EXPECT_EQ(dropped, std::vector<QueueOwnerId>{1});
+        EXPECT_EQ(queue.probeStats().dispatched, 1u);
+    }
+    {
+        QueueLimits limits = step3Limits(1.5);
+        limits.mlu_probe_owners = 2;  // budget for both, ceiling drops one
+        LocalTransferAdmissionQueue queue(limits);
+        queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                                   [] { return uint64_t{1'000'000'000}; });
+        admitBoth(queue);
+        std::vector<QueueOwnerId> dropped;
+        EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+                  std::vector<QueueOwnerId>{2});
+        EXPECT_EQ(dropped, std::vector<QueueOwnerId>{1});
+    }
+    {
+        QueueLimits limits = step3Limits(1.5);
+        limits.mlu_probe_owners = 2;
+        limits.mlu_probe_ceiling_factor = 0.0;  // no ceiling
+        LocalTransferAdmissionQueue queue(limits);
+        queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                                   [] { return uint64_t{1'000'000'000}; });
+        admitBoth(queue);
+        std::vector<QueueOwnerId> dropped;
+        EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+                  (std::vector<QueueOwnerId>{1, 2}));  // EDF order
+        EXPECT_TRUE(dropped.empty());
+        EXPECT_EQ(queue.probeStats().dispatched, 2u);
+    }
+}
+
+// complete() hands back the probe's verdict and tallies it: COMPLETED inside
+// the window is a met deadline; a late completion or any other terminal
+// status is a miss; an owner that was not a probe reports nothing.
+TEST(AdmissionQueueTest, Step3ProbeVerdictIsJudgedAtCompletion) {
+    QueueLimits limits = step3Limits(1.5);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    uint64_t now = 1'000'000'000;
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [&now] { return now; });
+    using Outcome = LocalTransferAdmissionQueue::ProbeOutcome;
+
+    // Three rounds, one owner each: 16 B in a 10 ns window is MLU 1.6, the
+    // probe every time. A fourth owner is feasible and never a probe.
+    auto admitProbeCandidate = [&](uint64_t token) {
+        std::vector<QueueOwnerId> ids;
+        ASSERT_EQ(
+            queue
+                .tryAdmit(makeSubmit(token, 1,
+                                     {makeDegradationEligibleOwnerWithDeadline(
+                                         0, 16, now + 10)}),
+                          ids)
+                .code(),
+            Status::Code::kOk);
+        ASSERT_EQ(queue.pickForDispatch(4, 1 << 20).size(), 1u);
+    };
+
+    // 1: completes before its deadline -> met.
+    admitProbeCandidate(1);
+    Outcome out = Outcome::MissedDeadline;
+    ASSERT_EQ(queue.complete(1, TransferStatusEnum::COMPLETED, &out).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(out, Outcome::MetDeadline);
+
+    // 2: completes, but the clock has passed its deadline -> missed.
+    admitProbeCandidate(2);
+    now += 10;  // exactly at the deadline is not inside the window
+    ASSERT_EQ(queue.complete(2, TransferStatusEnum::COMPLETED, &out).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(out, Outcome::MissedDeadline);
+
+    // 3: fails inside the window -> missed all the same.
+    admitProbeCandidate(3);
+    ASSERT_EQ(queue.complete(3, TransferStatusEnum::FAILED, &out).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(out, Outcome::MissedDeadline);
+
+    // 4: a feasible owner is not a probe and reports None.
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(4, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, now + 1'000'000)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    ASSERT_EQ(queue.pickForDispatch(4, 1 << 20), std::vector<QueueOwnerId>{4});
+    out = Outcome::MetDeadline;
+    ASSERT_EQ(queue.complete(4, TransferStatusEnum::COMPLETED, &out).code(),
+              Status::Code::kOk);
+    EXPECT_EQ(out, Outcome::None);
+
+    const auto stats = queue.probeStats();
+    EXPECT_EQ(stats.dispatched, 3u);
+    EXPECT_EQ(stats.met_deadline, 1u);
+    EXPECT_EQ(stats.missed_deadline, 2u);
+}
+
+// A probe is still an owner: with no room left in the dispatch budget it
+// waits like a feasible one would, and is not dropped for lack of room.
+TEST(AdmissionQueueTest, Step3ProbeRespectsTheDispatchBudget) {
+    QueueLimits limits = step3Limits(1.5);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'000'010)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_TRUE(queue.pickForDispatch(4, /*max_bytes=*/8, &dropped).empty());
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(queue.probeStats().dispatched, 0u);  // left queued, not counted
+    EXPECT_EQ(queue.outstandingOwners(), 1u);
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{1});
+    EXPECT_EQ(queue.probeStats().dispatched, 1u);
+}
+
+// A threshold <= 0 disables the drop; a negative one must not leak through
+// the predictor's "nothing to predict" sentinel and drop (or probe) owners.
+TEST(AdmissionQueueTest, Step3NegativeThresholdDropsNothing) {
+    QueueLimits limits = step3Limits(/*theta_local=*/-2.0);
+    limits.mlu_probe_owners = 1;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> ids;
+    ASSERT_EQ(
+        queue
+            .tryAdmit(makeSubmit(1, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'000'010)}),
+                      ids)
+            .code(),
+        Status::Code::kOk);
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_EQ(queue.pickForDispatch(4, 1 << 20, &dropped),
+              std::vector<QueueOwnerId>{1});
+    EXPECT_TRUE(dropped.empty());
+    EXPECT_EQ(queue.probeStats().dispatched, 0u);
 }
 
 TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {
