@@ -20,6 +20,11 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#include "tent/platform/cuda.h"
+#endif
+
 #include <algorithm>
 #include <cassert>
 #include <cerrno>
@@ -82,6 +87,63 @@ uint16_t getRdmaBindDefaultPort(const Config& config) {
     }
 
     return 0;
+}
+
+// Make GPUDirect RDMA writes visible to the dest GPU owner (ToOwner: this
+// rank's device, not P2P peers on other GPUs). Prefer a host-side flush;
+// if that API is missing or fails, cudaDeviceSynchronize on that device so
+// notify return still means the owner can consume the buffer.
+#ifdef USE_CUDA
+void flushGpuDirectWritesOrSynchronize(int device) {
+    cudaError_t err = cudaSuccess;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11030
+    int options = 0;
+    err = cudaDeviceGetAttribute(
+        &options, cudaDevAttrGPUDirectRDMAFlushWritesOptions, device);
+    if (err == cudaSuccess &&
+        (options & cudaFlushGPUDirectRDMAWritesOptionHost) != 0) {
+        err = cudaDeviceFlushGPUDirectRDMAWrites(
+            cudaFlushGPUDirectRDMAWritesTargetCurrentDevice,
+            cudaFlushGPUDirectRDMAWritesToOwner);
+        if (err == cudaSuccess) {
+            LOG_FIRST_N(INFO, 1)
+                << "RDMA dest GPUDirect write flush enabled on device "
+                << device;
+            return;
+        }
+        LOG(WARNING) << "RDMA gdr-flush device " << device
+                     << " failed: " << cudaGetErrorString(err)
+                     << "; falling back to cudaDeviceSynchronize";
+        (void)cudaGetLastError();
+    } else if (err != cudaSuccess) {
+        LOG(WARNING) << "RDMA gdr-flush cudaDeviceGetAttribute device "
+                     << device << " failed: " << cudaGetErrorString(err)
+                     << "; falling back to cudaDeviceSynchronize";
+        (void)cudaGetLastError();
+    } else {
+        LOG_FIRST_N(WARNING, 8)
+            << "RDMA gdr-flush host option unsupported on device " << device
+            << "; falling back to cudaDeviceSynchronize";
+    }
+#endif
+    err = cudaDeviceSynchronize();
+    if (err != cudaSuccess) {
+        LOG(WARNING) << "RDMA gdr-flush fallback cudaDeviceSynchronize device "
+                     << device << " failed: " << cudaGetErrorString(err);
+        (void)cudaGetLastError();
+    }
+}
+#endif
+
+Status flushDestGpuDirectWrites(const Topology* topology) {
+#ifdef USE_CUDA
+    CudaPlatform::forEachActiveDevice(
+        topology, "RDMA gdr-flush",
+        [](int device) { flushGpuDirectWritesOrSynchronize(device); });
+#else
+    (void)topology;
+#endif
+    return Status::OK();
 }
 
 }  // namespace
@@ -890,12 +952,27 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
 
 Status RdmaTransport::receiveNotification(
     std::vector<Notification>& notify_list) {
-    std::lock_guard<std::mutex> lock(notify_mutex_);
-    if (notify_list_.empty()) {
-        return Status::OK();
+    {
+        std::lock_guard<std::mutex> lock(notify_mutex_);
+        if (notify_list_.empty()) {
+            return Status::OK();
+        }
+        notify_list = std::move(notify_list_);
+        notify_list_.clear();
     }
-    notify_list = std::move(notify_list_);
-    notify_list_.clear();
+    // Empty polls skip CUDA. After any non-empty drain, flush GPUDirect writes
+    // on every topology CUDA device that already has a primary context — not
+    // only transfer-done messages. Never flush while holding notify_mutex_
+    // (this thread may enter CUDA; the notify worker is a different path).
+    bool flush = caps.gpu_to_gpu;
+    if (conf_) {
+        flush =
+            flush &&
+            conf_->get("transports/rdma/flush_gpu_direct_rdma_writes", true);
+    }
+    if (flush) {
+        (void)flushDestGpuDirectWrites(local_topology_.get());
+    }
     return Status::OK();
 }
 
