@@ -421,7 +421,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](MemoryGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     py::class_<BatchGuard>(m, "BatchGuard")
@@ -433,7 +432,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](BatchGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     // -------------------------------------------------------------------------

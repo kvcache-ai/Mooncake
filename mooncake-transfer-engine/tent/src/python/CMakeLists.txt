@@ -27,3 +27,13 @@ find_package(
   REQUIRED)
 target_include_directories(tentpy PRIVATE ${Python3_INCLUDE_DIRS})
 target_link_libraries(tentpy PUBLIC tent_link_group)
+
+if(BUILD_UNIT_TESTS)
+  add_test(
+    NAME tent_python_guards_test
+    COMMAND
+      ${CMAKE_COMMAND} -E env "PYTHONPATH=$<TARGET_FILE_DIR:tentpy>"
+      "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/mooncake-common:$<TARGET_FILE_DIR:tent_metrics>:$ENV{LD_LIBRARY_PATH}"
+      ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/../../tests/test_python_guards.py)
+endif()
