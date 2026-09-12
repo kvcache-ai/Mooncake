@@ -1,8 +1,9 @@
-'''
+"""
 this test case is from https://github.com/HanHan009527/sglang/blob/a100-ci/test/manual/ep/test_moe_mooncake.py
 End-to-End Integration Test for SGLang with Mooncake Elastic EP Backend.
-'''
+"""
 
+import os
 import unittest
 from types import SimpleNamespace
 
@@ -17,8 +18,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-ib_devices = get_rdma_devices_args()
-
+ib_devices = os.getenv("MOONCAKE_DEVICE") or get_rdma_devices_args()
 
 
 class TestMooncakeBackend(CustomTestCase):

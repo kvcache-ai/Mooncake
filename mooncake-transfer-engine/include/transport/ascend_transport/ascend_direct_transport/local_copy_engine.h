@@ -16,6 +16,8 @@
 #ifndef LOCAL_COPY_ENGINE_H
 #define LOCAL_COPY_ENGINE_H
 
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #include <acl/acl.h>
@@ -35,8 +37,8 @@ class LocalCopyEngine {
 
     ~LocalCopyEngine();
 
-    // Initialize the local copy engine. Creates and owns its own ACL stream
-    // for async operations internally.
+    // Initialize the local copy engine. Streams are created lazily per device
+    // under that device's current ACL context (not at Initialize time).
     // transfer_timeout: timeout in milliseconds for sync operations
     // Returns 0 on success, non-zero on failure
     int Initialize(int32_t transfer_timeout);
@@ -76,8 +78,25 @@ class LocalCopyEngine {
                                          aclrtPtrAttributes &src_attrs,
                                          aclrtPtrAttributes &dst_attrs);
 
+    // Return (or lazily create) a stream belonging to the current ACL device
+    // context. The stream must be created while that device's context is
+    // current so aclrtMemcpyAsync does not return 107003.
+    aclrtStream GetOrCreateStreamForCurrentDevice();
+
    private:
-    aclrtStream stream_;
+    // Stream plus the ACL context it was created under. Destroying a stream
+    // requires that same context to be current, otherwise aclrtDestroyStream
+    // can return 107003 (ACL_ERROR_RT_STREAM_CONTEXT).
+    struct DeviceStream {
+        aclrtStream stream = nullptr;
+        aclrtContext context = nullptr;
+    };
+
+    // Per-device streams keyed by ACL device id. A single shared stream is
+    // unsafe across devices because Initialize() may run under device0
+    // context while workers later copy under other device contexts.
+    std::unordered_map<int32_t, DeviceStream> streams_;
+    mutable std::mutex streams_mu_;
     int32_t transfer_timeout_;
     bool initialized_;
 };

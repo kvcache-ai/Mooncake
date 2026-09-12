@@ -26,10 +26,15 @@ type BufferHandle struct {
 }
 
 type RegisteredMemory struct {
-	engine       *TransferEngine
+	engine       localMemoryTransport
 	bufferList   []BufferHandle
 	mu           sync.Mutex
 	maxChunkSize uint64
+}
+
+type localMemoryTransport interface {
+	registerLocalMemory(uintptr, uint64, string) error
+	unregisterLocalMemory(uintptr) error
 }
 
 func NewRegisteredMemory(transferEngine *TransferEngine, maxChunkSize uint64) *RegisteredMemory {

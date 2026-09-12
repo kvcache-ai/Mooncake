@@ -1,19 +1,24 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <array>
 
 #include <unistd.h>
 
 #include "client_service.h"
+#include "environ.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -143,6 +148,7 @@ class DfsSyncClientTest : public ::testing::Test {
     void ExpectDfsValue(const std::string& key, const std::string& expected) {
         auto query = QueryDfsOnly(key);
         ASSERT_TRUE(query.has_value());
+        last_read_lease_deadline_ = query->lease_timeout;
         std::vector<char> output(expected.size());
         const auto& descriptor = query->replicas[0].get_dfs_descriptor();
         auto results = backend_->BatchRead(
@@ -151,6 +157,13 @@ class DfsSyncClientTest : public ::testing::Test {
         ASSERT_TRUE(results[0].has_value());
         EXPECT_EQ(std::memcmp(output.data(), expected.data(), expected.size()),
                   0);
+    }
+
+    void WaitForReadLeaseExpiry() {
+        // The verification read holds a lease too. Allow the master's deadline
+        // to pass before testing the successful synchronous write path.
+        std::this_thread::sleep_until(last_read_lease_deadline_ +
+                                      std::chrono::milliseconds(100));
     }
 
     static std::vector<std::vector<Slice>> MakeSlices(
@@ -191,6 +204,7 @@ class DfsSyncClientTest : public ::testing::Test {
     void* segment_ = nullptr;
     size_t segment_size_ = 0;
     std::string root_;
+    std::chrono::steady_clock::time_point last_read_lease_deadline_{};
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
 };
 
@@ -203,6 +217,10 @@ TEST_F(DfsSyncClientTest, PutAndUpsertReturnAfterDfsWrite) {
 
     std::string updated(4096, 'B');
     std::vector<Slice> updated_slices{{updated.data(), updated.size()}};
+    auto leased_upsert = writer_->Upsert(key, updated_slices, DfsConfig());
+    ASSERT_FALSE(leased_upsert.has_value());
+    EXPECT_EQ(leased_upsert.error(), ErrorCode::OBJECT_HAS_LEASE);
+    WaitForReadLeaseExpiry();
     ASSERT_TRUE(writer_->Upsert(key, updated_slices, DfsConfig()).has_value());
     ExpectDfsValue(key, updated);
 }
@@ -222,6 +240,14 @@ TEST_F(DfsSyncClientTest, BatchPutAndBatchUpsertReturnAfterDfsWrite) {
     std::vector<std::string> updated{std::string(4096, 'E'),
                                      std::string(4096, 'F')};
     auto updated_slices = MakeSlices(updated);
+    auto leased_upserts =
+        writer_->BatchUpsert(keys, updated_slices, DfsConfig());
+    ASSERT_EQ(leased_upserts.size(), keys.size());
+    for (const auto& result : leased_upserts) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::OBJECT_HAS_LEASE);
+    }
+    WaitForReadLeaseExpiry();
     auto upsert_results =
         writer_->BatchUpsert(keys, updated_slices, DfsConfig());
     ASSERT_EQ(upsert_results.size(), keys.size());
@@ -281,6 +307,40 @@ TEST_F(DfsSyncClientTest, MissingDfsBackendRevokesObject) {
     EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
+TEST_F(DfsSyncClientTest, ExistingClientUsesOnlineExpandedDfsCapacity) {
+    const std::string old_key = "before_expansion";
+    std::string old_value(4096, 'O');
+    std::vector<Slice> old_slices{{old_value.data(), old_value.size()}};
+    ASSERT_TRUE(writer_->Put(old_key, old_slices, DfsConfig()));
+    auto old_query = QueryDfsOnly(old_key);
+    ASSERT_TRUE(old_query);
+    const auto old_path = old_query->replicas[0].get_dfs_descriptor().file_path;
+    auto expanded = master_.service()->ExpandDfsShards(4);
+    ASSERT_TRUE(expanded);
+    EXPECT_EQ(*expanded, 4);
+
+    std::string new_key;
+    for (int i = 0; i < 1000; ++i) {
+        new_key = "after_expansion_" + std::to_string(i);
+        if (std::hash<std::string>{}(new_key) % 4 == 3) break;
+    }
+    ASSERT_EQ(std::hash<std::string>{}(new_key) % 4, 3);
+    std::string value(4096, 'N');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(new_key, write_slices, DfsConfig()));
+    auto query = QueryDfsOnly(new_key);
+    ASSERT_TRUE(query);
+    EXPECT_EQ(query->replicas[0].get_dfs_descriptor().shard_idx, 3);
+    std::string output(value.size(), '\0');
+    std::vector<Slice> read_slices{{output.data(), output.size()}};
+    ASSERT_TRUE(writer_->Get(new_key, *query, read_slices));
+    EXPECT_EQ(output, value);
+    ExpectDfsValue(old_key, old_value);
+    auto after = QueryDfsOnly(old_key);
+    ASSERT_TRUE(after);
+    EXPECT_EQ(after->replicas[0].get_dfs_descriptor().file_path, old_path);
+}
+
 TEST_F(DfsSyncClientTest, GetReadsDfsIntoMultipleSlices) {
     const std::string key = "dfs_multi_slice_get";
     std::string value(4096, 'M');
@@ -332,8 +392,7 @@ TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
 }
 
 TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
-    const char* checksum_enabled = std::getenv("MOONCAKE_STORE_CHECKSUM");
-    if (checksum_enabled == nullptr || std::string(checksum_enabled) != "1") {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
         GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
     }
 
@@ -358,6 +417,151 @@ TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
     ASSERT_EQ(results.size(), 1);
     ASSERT_FALSE(results[0].has_value());
     EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST_F(DfsSyncClientTest, GetVerifiesDfsChecksumAndRecordsError) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+
+    const std::string key = "dfs_single_checksum";
+    std::string value(4096, 'V');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_TRUE(query->object_checksum.has_value());
+
+    const std::array<std::string, 1> mismatch_label{
+        toString(ErrorCode::CHECKSUM_MISMATCH)};
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+    const int64_t base_errors = metric->dfs_read_errors.value(mismatch_label);
+
+    const std::optional<uint64_t> bad_checksum(*query->object_checksum ^
+                                               uint64_t{1});
+    std::vector<Replica::Descriptor> replicas = query->replicas;
+    QueryResult corrupted(std::move(replicas), query->lease_timeout,
+                          bad_checksum);
+
+    std::vector<char> output(value.size());
+    std::vector<Slice> read_slices{{output.data(), output.size()}};
+    auto result = writer_->Get(key, corrupted, read_slices);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::CHECKSUM_MISMATCH);
+
+    // The I/O completed, so it still counts as a read op, exactly as in the
+    // batch path; the rejection lands in the error family instead.
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+    EXPECT_EQ(metric->dfs_read_errors.value(mismatch_label), base_errors + 1);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsCountSuccessfulWriteAndRead) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const int64_t base_write_ops = metric->dfs_write_ops.value();
+    const int64_t base_write_bytes = metric->dfs_write_bytes.value();
+    const int64_t base_read_ops = metric->dfs_read_ops.value();
+    const int64_t base_read_bytes = metric->dfs_read_bytes.value();
+
+    const std::string key = "dfs_metric_success";
+    std::string value(4096, 'Q');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    EXPECT_EQ(metric->dfs_write_ops.value(), base_write_ops + 1);
+    EXPECT_EQ(metric->dfs_write_bytes.value(),
+              base_write_bytes + static_cast<int64_t>(value.size()));
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::vector<char> output(value.size());
+    std::vector<Slice> read_slices{{output.data(), output.size()}};
+    ASSERT_TRUE(writer_->Get(key, *query, read_slices).has_value());
+
+    EXPECT_EQ(metric->dfs_read_ops.value(), base_read_ops + 1);
+    EXPECT_EQ(metric->dfs_read_bytes.value(),
+              base_read_bytes + static_cast<int64_t>(value.size()));
+    // Host-resident slices never go through the D2H staging path.
+    EXPECT_EQ(metric->dfs_writes_skipped.value(), 0);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsCountWriteFailureSeparatelyFromOps) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const std::array<std::string, 1> write_fail_label{
+        toString(ErrorCode::FILE_WRITE_FAIL)};
+    const int64_t base_write_ops = metric->dfs_write_ops.value();
+    const int64_t base_errors =
+        metric->dfs_write_errors.value(write_fail_label);
+
+    std::vector<std::string> keys{"dfs_metric_ok", "dfs_metric_fail"};
+    std::vector<std::string> values{std::string(4096, 'R'),
+                                    std::string(4096, 'S')};
+    auto slices = MakeSlices(values);
+    adapter_->FailWriteCall(adapter_->WriteCalls() + 2);
+
+    auto results = writer_->BatchPut(keys, slices, DfsConfig());
+    ASSERT_EQ(results.size(), keys.size());
+    ASSERT_TRUE(results[0].has_value());
+    ASSERT_FALSE(results[1].has_value());
+
+    // The failed key must not inflate ops/bytes; it lands in the error family
+    // instead, keyed by the ErrorCode name.
+    EXPECT_EQ(metric->dfs_write_ops.value(), base_write_ops + 1);
+    EXPECT_EQ(metric->dfs_write_errors.value(write_fail_label),
+              base_errors + 1);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsRecordUnavailableBackend) {
+    auto client_without_backend = CreateClient("127.0.0.1:18104");
+    ASSERT_NE(client_without_backend, nullptr);
+    auto* metric = client_without_backend->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const std::array<std::string, 1> unavailable_label{
+        toString(ErrorCode::DFS_SERVICE_UNAVAILABLE)};
+    ASSERT_EQ(metric->dfs_write_errors.value(unavailable_label), 0);
+
+    std::string value(4096, 'T');
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    auto result = client_without_backend->Put("dfs_metric_no_backend", slices,
+                                              DfsConfig());
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+    EXPECT_EQ(metric->dfs_write_errors.value(unavailable_label), 1);
+    EXPECT_EQ(metric->dfs_write_ops.value(), 0);
+}
+
+TEST_F(DfsSyncClientTest, DfsMetricsAppearInSerializedOutput) {
+    auto* metric = writer_->GetDfsMetricPtr();
+    if (metric == nullptr) {
+        GTEST_SKIP() << "Client metrics are disabled";
+    }
+    const std::string key = "dfs_metric_serialize";
+    std::string value(4096, 'U');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto serialized = writer_->SerializeMetrics();
+    ASSERT_TRUE(serialized.has_value());
+    EXPECT_NE(serialized->find("mooncake_dfs_write_bytes_total"),
+              std::string::npos);
+    EXPECT_NE(serialized->find("mooncake_dfs_write_ops_total"),
+              std::string::npos);
+
+    auto summary = writer_->GetSummaryMetrics();
+    ASSERT_TRUE(summary.has_value());
+    EXPECT_NE(summary->find("=== DFS Metrics Summary ==="), std::string::npos);
 }
 
 }  // namespace mooncake::test

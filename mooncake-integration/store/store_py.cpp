@@ -429,6 +429,8 @@ bool tensor_destination_matches_metadata(const PyTensorInfo &target,
                                stored.metadata.header.ndim);
 }
 
+// Read tensor payloads directly into caller-owned CUDA buffers.  Metadata is
+// fetched separately so no complete-object host staging buffer is needed.
 template <typename ResultType>
 bool apply_indexed_results(const char *context,
                            const std::vector<ResultType> &op_results,
@@ -835,8 +837,10 @@ class MooncakeStorePyWrapper {
     }
 
     std::vector<std::optional<ParsedTensorMetadata>>
-    batch_get_tensor_metadata_prefixes(const std::vector<std::string> &keys,
-                                       const std::string &context) {
+    batch_get_tensor_metadata_prefixes(
+        const std::vector<std::string> &keys, const std::string &context,
+        const PyClient::QueryResultCache *snapshot = nullptr,
+        std::vector<int64_t> *errors = nullptr) {
         std::vector<std::optional<ParsedTensorMetadata>> metadata(keys.size());
         if (keys.empty()) return metadata;
 
@@ -844,6 +848,10 @@ class MooncakeStorePyWrapper {
         auto scratch = store_->allocate_client_buffer(scratch_size);
         if (!scratch) {
             LOG(ERROR) << context << ": failed to allocate metadata buffer";
+            if (errors) {
+                std::fill(errors->begin(), errors->end(),
+                          to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE));
+            }
             return metadata;
         }
 
@@ -863,12 +871,19 @@ class MooncakeStorePyWrapper {
         std::vector<std::vector<std::vector<int64_t>>> results;
         {
             py::gil_scoped_release release_gil;
-            results =
-                store_->get_into_ranges(buffers, all_keys, all_dst_offsets,
-                                        all_src_offsets, all_sizes, nullptr);
+            results = snapshot ? real_client_->get_into_ranges_from_snapshot(
+                                     buffers, all_keys, all_dst_offsets,
+                                     all_src_offsets, all_sizes, *snapshot)
+                               : store_->get_into_ranges(
+                                     buffers, all_keys, all_dst_offsets,
+                                     all_src_offsets, all_sizes, nullptr);
         }
         if (results.size() != 1 || results[0].size() != keys.size()) {
             LOG(ERROR) << context << ": metadata read result size mismatch";
+            if (errors) {
+                std::fill(errors->begin(), errors->end(),
+                          to_py_ret(ErrorCode::INTERNAL_ERROR));
+            }
             return metadata;
         }
 
@@ -877,6 +892,12 @@ class MooncakeStorePyWrapper {
             if (results[0][i].size() != 1 ||
                 results[0][i][0] !=
                     static_cast<int64_t>(sizeof(TensorMetadata))) {
+                if (errors) {
+                    (*errors)[i] =
+                        results[0][i].size() == 1 && results[0][i][0] < 0
+                            ? results[0][i][0]
+                            : to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
                 continue;
             }
             metadata[i] = parse_tensor_metadata_from_prefix(
@@ -909,8 +930,89 @@ class MooncakeStorePyWrapper {
         }
 
         if (!use_dummy_client_) {
-            LOG(ERROR) << context
-                       << ": CUDA IPC tensor read requires a dummy client";
+            if (keys.empty()) return results;
+            // Keep both reads on one snapshot. Re-querying between the prefix
+            // and payload can select a different version after an upsert.
+            PyClient::QueryResultCache snapshot;
+            {
+                py::gil_scoped_release release_gil;
+                auto queries = store_->batch_query(keys);
+                if (queries.size() != keys.size()) {
+                    return std::vector<int64_t>(
+                        keys.size(), to_py_ret(ErrorCode::INTERNAL_ERROR));
+                }
+                snapshot.reserve(keys.size());
+                for (size_t i = 0; i < keys.size(); ++i) {
+                    snapshot.emplace(keys[i], std::move(queries[i]));
+                }
+            }
+            auto metadata = batch_get_tensor_metadata_prefixes(
+                keys, context, &snapshot, &results);
+            std::vector<void *> buffers;
+            std::vector<std::vector<std::string>> all_keys;
+            std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+            std::vector<std::vector<std::vector<size_t>>> all_sizes;
+            std::vector<size_t> original_indices;
+            buffers.reserve(keys.size());
+            all_keys.reserve(keys.size());
+            all_dst_offsets.reserve(keys.size());
+            all_src_offsets.reserve(keys.size());
+            all_sizes.reserve(keys.size());
+            original_indices.reserve(keys.size());
+
+            for (size_t i = 0; i < keys.size(); ++i) {
+                PyTensorInfo target = extract_tensor_destination_info(
+                    tensors_list[i].cast<py::object>(), keys[i]);
+                if (!target.valid() || !metadata[i].has_value() ||
+                    !tensor_destination_matches_metadata(target, *metadata[i],
+                                                         keys[i], context)) {
+                    continue;
+                }
+                const auto &stored = *metadata[i];
+                if (stored.data_offset >
+                    std::numeric_limits<size_t>::max() - stored.data_bytes) {
+                    LOG(ERROR)
+                        << context << " : tensor range overflows for key "
+                        << keys[i];
+                    continue;
+                }
+                if (stored.data_bytes == 0) {
+                    results[i] = 0;
+                    continue;
+                }
+
+                buffers.push_back(reinterpret_cast<void *>(target.data_ptr));
+                all_keys.push_back({keys[i]});
+                all_dst_offsets.push_back({{0}});
+                all_src_offsets.push_back({{stored.data_offset}});
+                all_sizes.push_back({{stored.data_bytes}});
+                original_indices.push_back(i);
+            }
+
+            if (buffers.empty()) return results;
+
+            std::vector<std::vector<std::vector<int64_t>>> range_results;
+            {
+                py::gil_scoped_release release_gil;
+                range_results = real_client_->get_into_ranges_from_snapshot(
+                    buffers, all_keys, all_dst_offsets, all_src_offsets,
+                    all_sizes, snapshot);
+            }
+            for (size_t i = 0; i < original_indices.size(); ++i) {
+                const size_t original_index = original_indices[i];
+                results[original_index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                if (range_results.size() != original_indices.size() ||
+                    range_results[i].size() != 1 ||
+                    range_results[i][0].size() != 1) {
+                    continue;
+                }
+                const int64_t result = range_results[i][0][0];
+                if (result < 0 || static_cast<size_t>(result) ==
+                                      metadata[original_index]->data_bytes) {
+                    results[original_index] = result;
+                }
+            }
             return results;
         }
 
@@ -2273,12 +2375,17 @@ PYBIND11_MODULE(store, m) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return real_client->setup_real(
-                    local_hostname, metadata_server, global_segment_size,
-                    local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine, "", enable_ssd_offload,
-                    ssd_offload_path, tenant_id, enable_client_http_server,
-                    client_http_port);
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = real_client->setup_real(
+                        local_hostname, metadata_server, global_segment_size,
+                        local_buffer_size, protocol, rdma_devices,
+                        master_server_addr, transfer_engine, "",
+                        enable_ssd_offload, ssd_offload_path, tenant_id,
+                        enable_client_http_server, client_http_port);
+                }
+                return ret;
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -2301,9 +2408,14 @@ PYBIND11_MODULE(store, m) {
                     config[key] = value;
                 }
 
-                auto result = real_client->setup_internal(config);
-                return result.has_value() ? 0
-                                          : static_cast<int>(result.error());
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    auto result = real_client->setup_internal(config);
+                    ret = result.has_value() ? 0
+                                             : static_cast<int>(result.error());
+                }
+                return ret;
             },
             py::arg("config"),
             "Setup the store with a configuration dictionary.\n"

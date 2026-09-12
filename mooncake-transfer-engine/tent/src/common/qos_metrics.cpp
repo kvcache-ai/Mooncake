@@ -368,6 +368,8 @@ bool appendQosMetricsJsonl(const std::string& path,
         return false;
     }
     output << root.dump() << '\n';
+    // Closing flushes buffered output and can reveal delayed write errors.
+    output.close();
     if (!output) {
         *error = "failed to write QoS JSONL output: " + path;
         return false;

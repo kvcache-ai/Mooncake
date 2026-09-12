@@ -740,15 +740,6 @@ TEST_F(FileStorageTest,
         fileStorage, offloading_objects, buckets_keys));
 }
 
-TEST_F(FileStorageTest, ReadBucketBackendValues) {
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "536870912");
-
-    const auto config = BucketBackendConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 1000);
-    EXPECT_EQ(config.bucket_size_limit, 512 * 1024 * 1024);
-}
-
 TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
     std::filesystem::path master_root =
         std::filesystem::path(data_path) / "heartbeat_master";

@@ -7,9 +7,9 @@
 
 #include "bool_parser.h"
 #include "common/byte_size.h"
-#include "common/client_buffer_allocation.h"
 #include "environ.h"
 #include "environment_variables.h"
+#include "hugepage_config.h"
 
 namespace mooncake {
 
@@ -54,7 +54,8 @@ MmapArenaConfig MmapArenaConfig::FromEnvironment(bool enabled_by_flag,
     //                               regular pages if HugeTLB is unavailable
     // This preserves both pre-existing contracts and avoids surprising
     // operators with a silent hugepage downgrade.
-    config.hugepages_explicitly_requested = get_hugepage_size_from_env() > 0;
+    config.hugepages_explicitly_requested =
+        HugepageConfig::FromEnvironment().enabled;
 
     // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB",
     // etc.

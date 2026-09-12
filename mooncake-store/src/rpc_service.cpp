@@ -1697,6 +1697,15 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyPromotionFailure(
     return result;
 }
 
+tl::expected<int, ErrorCode> WrappedMasterService::GetDfsShardCount() const {
+    return master_service_.GetDfsShardCount();
+}
+
+tl::expected<int, ErrorCode> WrappedMasterService::ExpandDfsShards(
+    int shard_count) {
+    return master_service_.ExpandDfsShards(shard_count);
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
     return master_service_.CreateDrainJob(request);
