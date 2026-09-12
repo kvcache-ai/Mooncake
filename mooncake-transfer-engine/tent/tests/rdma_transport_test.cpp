@@ -482,6 +482,13 @@ TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {
     // A real fault surfacing after the endpoint is gone has nothing left to
     // act on.
     EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, false, false), Action::ReportOnly);
+    // The notify QP stays published while the endpoint retires, so a real
+    // fault can still arrive on a not-ready endpoint: it is triaged as on any
+    // other live endpoint, and only flushes are skipped.
+    EXPECT_EQ(classify(IBV_WC_RETRY_EXC_ERR, true, false),
+              Action::RetireEndpoint);
+    EXPECT_EQ(classify(IBV_WC_LOC_LEN_ERR, true, false),
+              Action::DisableNotification);
 }
 
 // context_set_ is subscripted by NicID, so it must keep one slot per NIC even

@@ -136,9 +136,31 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
 
     bool sendNotification(const std::string& name, const std::string& msg);
 
-    // Unpublishes the notify QP after a fault confined to it, leaving the data
-    // QPs and the endpoint lifecycle untouched. Notifications stay off for the
-    // remaining lifetime of the endpoint.
+    // Whether the notify QP is connected and not disabled after a fault.
+    bool notifyConnected() const {
+        return notify_connected_.load(std::memory_order_acquire);
+    }
+
+    // One notification WR (send or receive) left the CQ. Called by the
+    // transport for every completion of this endpoint's notify QP.
+    void noteNotifyCompletion() {
+        uint32_t inflight = notify_inflight_.load(std::memory_order_relaxed);
+        while (inflight > 0 &&
+               !notify_inflight_.compare_exchange_weak(
+                   inflight, inflight - 1, std::memory_order_acq_rel,
+                   std::memory_order_relaxed)) {
+        }
+    }
+
+    uint32_t notifyInflight() const {
+        return notify_inflight_.load(std::memory_order_acquire);
+    }
+
+    // Turns notifications off after a fault confined to the notify QP,
+    // leaving the data QPs and the endpoint lifecycle untouched.
+    // Notifications stay off for the remaining lifetime of the endpoint. The
+    // QP itself stays published until deconstruct(), so completions already
+    // in the CQ are still delivered.
     void disableNotification(const std::string& reason);
 
     // Process RECV completion: parse message and add to transport queue
@@ -275,6 +297,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     size_t notify_pending_count_ = 0;  // Number of pending sends
     uint64_t notify_send_wr_id_ = 0;   // Circular counter for wr_id
     std::atomic<bool> notify_connected_{false};
+    // Notification WRs posted on the notify QP whose completion has not been
+    // polled yet. finishDestroy() waits for it: the QP must not be destroyed
+    // while completions the peer already saw acknowledged are still in the CQ,
+    // because the provider drops them with the QP.
+    std::atomic<uint32_t> notify_inflight_{0};
 
     // Two-phase destruction constants (matching TE)
     static constexpr double kFinishDestroyTimeoutSec = 30.0;

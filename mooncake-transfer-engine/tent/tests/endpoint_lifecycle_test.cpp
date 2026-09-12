@@ -45,6 +45,16 @@ class EndpointTestAccess {
         endpoint.notify_connected_.store(true, std::memory_order_relaxed);
     }
 
+    static void beginDestroy(RdmaEndPoint& endpoint) {
+        endpoint.beginDestroy();
+    }
+
+    // Stands in for notification WRs posted on the notify QP whose
+    // completions the worker has not polled yet.
+    static void setNotifyInflight(RdmaEndPoint& endpoint, uint32_t count) {
+        endpoint.notify_inflight_.store(count, std::memory_order_release);
+    }
+
     static bool notifyConnected(const RdmaEndPoint& endpoint) {
         return endpoint.notify_connected_.load(std::memory_order_relaxed);
     }
@@ -334,6 +344,33 @@ TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {
 
     endpoint.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+// Destroying the notify QP takes its completions with it, so an endpoint
+// whose notify CQ has not caught up is not finished yet. The data QPs have
+// their own counters; this is the notify side of the same gate.
+TEST(EndpointLifecycleTest, FinishDestroyWaitsForNotifyCompletions) {
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EndpointTestAccess::setNotifyInflight(endpoint, 3);
+    EndpointTestAccess::beginDestroy(endpoint);
+
+    EXPECT_FALSE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
+    endpoint.noteNotifyCompletion();
+    endpoint.noteNotifyCompletion();
+    EXPECT_FALSE(endpoint.finishDestroy());
+
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+    // Never below zero, whatever order the completions arrive in.
+    endpoint.noteNotifyCompletion();
+    EXPECT_EQ(endpoint.notifyInflight(), 0u);
+
+    EXPECT_TRUE(endpoint.finishDestroy());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
 }
 
 }  // namespace
