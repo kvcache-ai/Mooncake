@@ -101,8 +101,18 @@ void* ShmHelper::allocate(size_t size) {
     unsigned int flags = MFD_CLOEXEC;
     if (use_hugepage_) {
         bool use_memfd = true;
-        size = align_up(size, get_hugepage_size_from_env(&flags, use_memfd));
-        LOG(INFO) << "Using huge pages for shared memory, size: " << size;
+        // get_hugepage_size_from_env reads MC_STORE_HUGEPAGE_SIZE (2MB or 1GB)
+        // and sets MFD_HUGETLB | MFD_HUGE_2MB/1GB in flags.
+        // mlx5 ibv_reg_mr (without IBV_ACCESS_HUGETLB) requires the MR size
+        // to be a multiple of 16 * hugepage_size (ConnectX-6/7 firmware MTT
+        // block constraint: 2MB -> 32MB alignment, 1GB -> 16GB alignment).
+        const size_t hugepage_size =
+            get_hugepage_size_from_env(&flags, use_memfd);
+        const size_t rdma_align = 16 * hugepage_size;
+        size = align_up(size, rdma_align);
+        LOG(INFO) << "Using huge pages for shared memory, hugepage_size="
+                  << hugepage_size << " rdma_align=" << rdma_align
+                  << " size=" << size;
     }
 
     int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, flags);
