@@ -214,6 +214,25 @@ host/fabric limits. Compare one rail/one lane, one rail/multiple lanes, and two
 rails/the same total lanes: the last two differ in single-READ slicing as well
 as rail placement.
 
+### Tuning concurrent READs
+
+For one peer with `C` outstanding large READs and `R` rails, at most
+`min(connections_per_peer, C * R)` payload streams can be active. This assumes
+the READs are large enough to slice across all rails. Four outstanding READs
+with four total lanes therefore have the same four-stream upper bound with
+one or two rails; adding a rail alone does not increase that bound.
+
+When receiver workers are busy and socket receive queues remain backed up,
+compare lane and worker counts separately. For four outstanding READs on two
+rails, first compare four and eight `connections_per_peer` at the same
+`worker_count`, then compare four and eight client workers with eight lanes.
+Keep the server configuration fixed for this comparison. More lanes sharing
+the same workers may not increase receive throughput.
+
+Use per-thread CPU measurements: tebench's submitting threads also consume
+CPU polling for completion. More workers trade CPU resources for throughput;
+choose counts for the workload and available CPU budget.
+
 ### Measured scope
 
 On two Xeon 8457C virtual machines, with four workers and four total lanes,
@@ -227,7 +246,29 @@ following medians:
 | 4 KiB, one concurrent task | Mean latency (microseconds) | 72 | 78 |
 
 Both interfaces carried payload-direction traffic, but their underlying
-resource independence is not guaranteed. Four concurrent READs showed no
-additional gain. A same-pool 4 KiB/64 MiB closed-loop mix still delayed small
+resource independence is not guaranteed. In that four-lane/four-worker setup,
+four concurrent READs showed no additional gain. A same-pool 4 KiB/64 MiB
+closed-loop mix still delayed small
 tasks behind large ones: static slicing offers neither latency isolation nor
 universal bandwidth scaling.
+
+A follow-up on a different pair of Xeon 8457C VMs used two rails, four
+concurrent 64 MiB READs, batch size one, a 1-second warmup and 10-second
+measurements. Server workers stayed at four. Interleaved runs of the existing
+Release build from `4682e076` gave:
+
+| Client lanes / workers | Runs | Median GB/s [min, max] |
+| --- | ---: | ---: |
+| 4 / 4 | 4 | 8.898 [6.660, 9.716] |
+| 8 / 4 | 3 | 7.515 [5.851, 8.047] |
+| 8 / 8 | 3 | 11.072 [10.820, 12.178] |
+
+All runs are included. The hosts had other CPU workloads, so these are
+configuration comparisons within that environment, not a remeasurement of the
+earlier VM pair or a guarantee of independent NIC bandwidth. Increasing lanes
+alone did not help. Eight lanes and eight client workers increased median
+throughput by about 24% over four/four, while client process CPU use rose from
+about 7.4 to 9.1 core equivalents. Receiver worker CPU and sender
+receive-window counters support receiver execution capacity as one limit.
+This is a configuration to evaluate when CPU resources permit, not a new
+default or a claim about small READs, WRITEs or other workloads.
