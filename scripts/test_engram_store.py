@@ -324,6 +324,39 @@ class EngramStoreTestBase(unittest.TestCase):
 
 
 class TestEngramStoreMetadata(EngramStoreTestBase):
+    def test_local_tables_lifetime_and_bounds(self):
+        import gc
+        import weakref
+
+        cfg = self.create_config()
+        cfg.row_bytes = 264
+        table = self.EngramStore({1: cfg, 14: cfg})
+        arrays = [
+            np.arange(n * 264, dtype=np.uint32).astype(np.uint8).reshape(n, 264)
+            for n in cfg.table_vocab_sizes
+        ]
+        expected = np.stack([a[-1].copy() for a in arrays])
+        refs = [weakref.ref(a) for a in arrays]
+        for a in arrays:
+            a.flags.writeable = False
+        table.bind_local(1, arrays)
+        del arrays, a
+        gc.collect()
+        assert all(ref() is not None for ref in refs)
+        ids = (np.array(cfg.table_vocab_sizes, dtype=np.int64) - 1)[None, None]
+        output = np.empty((1, 1, len(cfg.table_vocab_sizes), 264), dtype=np.uint8)
+        table.lookup_into(1, ids, output)  # No Store or registered output.
+        np.testing.assert_array_equal(output[0, 0], expected)
+        with self.assertRaises(RuntimeError):
+            table.lookup_into(14, ids, output)
+        ids[0, 0, 0] += 1
+        with self.assertRaises(RuntimeError):
+            table.lookup_into(1, ids, output)
+        assert not output.any()
+        del table
+        gc.collect()
+        assert all(ref() is None for ref in refs)
+
     def test_creation_and_metadata(self):
         cfg, engram_store = self.create_engram_store()
         self.assertEqual(

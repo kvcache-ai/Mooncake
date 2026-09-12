@@ -33,10 +33,16 @@ class EngramStore {
 
     ~EngramStore() = default;
 
+    // Bind immutable caller-owned tables before lookup, without a Store client.
+    // The caller must keep these buffers alive until this EngramStore is
+    // destroyed.
+    int bind_local(int layer_id, const std::vector<const void*>& buffers,
+                   const std::vector<size_t>& sizes);
+
     /**
      * Lookup embedding rows for a batch of precomputed row IDs.
      * @param row_ids [B, L, H] precomputed row IDs, where H == num_heads
-     * The caller must keep output registered with this Store during the call.
+     * Store-backed lookup requires registered output; local lookup does not.
      * @param output [B, L, H, row_bytes] contiguous byte output buffer
      * @param output_size Size of output buffer in bytes
      * @return 0 on success, negative on error
@@ -72,6 +78,7 @@ class EngramStore {
     struct Layer {
         EngramStoreConfig config;
         std::vector<std::string> keys;
+        std::vector<const void*> local_tables;
     };
     const Layer& get_layer(int layer_id) const;
     std::map<int, Layer> layers_;

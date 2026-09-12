@@ -24,7 +24,7 @@ EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
                 "EngramStore requires nonnegative layer IDs, positive "
                 "row_bytes and nonempty tables");
         }
-        Layer layer{config, {}};
+        Layer layer{config, {}, {}};
         for (size_t h = 0; h < config.table_vocab_sizes.size(); ++h) {
             const int64_t vocab_size = config.table_vocab_sizes[h];
             if (vocab_size <= 0 ||
@@ -49,13 +49,31 @@ const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
     return it->second;
 }
 
+int EngramStore::bind_local(int layer_id,
+                            const std::vector<const void*>& buffers,
+                            const std::vector<size_t>& sizes) {
+    const auto& layer = get_layer(layer_id);
+    if (store_ || !layer.local_tables.empty() ||
+        buffers.size() != layer.keys.size() || sizes.size() != buffers.size()) {
+        return -1;
+    }
+    for (size_t h = 0; h < buffers.size(); ++h) {
+        if (!buffers[h] ||
+            sizes[h] != static_cast<size_t>(layer.config.table_vocab_sizes[h]) *
+                            layer.config.row_bytes)
+            return -1;
+    }
+    layers_.at(layer_id).local_tables = buffers;
+    return 0;
+}
+
 int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                              void* output_buffer, size_t output_size) const {
     const auto& layer = get_layer(layer_id);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
-    if (store_ == nullptr || row_ids == nullptr || output_buffer == nullptr ||
-        B <= 0 || L <= 0) {
+    if ((!store_ && layer.local_tables.empty()) || row_ids == nullptr ||
+        output_buffer == nullptr || B <= 0 || L <= 0) {
         return -1;
     }
 
@@ -80,6 +98,30 @@ int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
         std::memset(output_buffer, 0, expected_size);
         return -1;
     };
+
+    if (!layer.local_tables.empty()) {
+        // Validate all IDs before touching output. No metadata or transfer
+        // work.
+        for (size_t t = 0; t < token_count; ++t) {
+            for (int h = 0; h < num_heads; ++h) {
+                const auto id = row_ids[t * num_heads + h];
+                if (id < 0 || id >= table_vocab_sizes[h]) return fail_lookup();
+            }
+        }
+        auto* dst = static_cast<char*>(output_buffer);
+        for (size_t t = 0; t < token_count; ++t) {
+            for (int h = 0; h < num_heads; ++h) {
+                const size_t index = t * num_heads + h;
+                const auto* src =
+                    static_cast<const char*>(layer.local_tables[h]);
+                std::memcpy(
+                    dst + index * row_bytes,
+                    src + static_cast<size_t>(row_ids[index]) * row_bytes,
+                    row_bytes);
+            }
+        }
+        return 0;
+    }
 
     std::vector<void*> buffers{output_buffer};
     std::vector<std::vector<std::string>> all_keys(1);

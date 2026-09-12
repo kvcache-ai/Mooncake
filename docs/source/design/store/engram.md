@@ -58,6 +58,7 @@ Python:
 
 - `EngramStore(layers, store=None)`
 - `populate(layer_id, embedding_buffers, config=ReplicateConfig())`
+- `bind_local(layer_id, embedding_buffers)`
 - `lookup_into(layer_id, row_ids, output)`
 - `remove_from_store(layer_id, force=False)`
 - `get_layer_ids()`
@@ -67,7 +68,32 @@ Python:
 - `get_row_bytes(layer_id)`
 
 The Python `store` argument accepts the existing `MooncakeDistributedStore`
-wrapper, or `None` for metadata-only construction.
+wrapper, or `None` for metadata-only construction or local table binding.
+
+### Local table mode
+
+Construct without a Store client and bind immutable, contiguous `uint8` tables
+before starting lookup workers:
+
+```python
+table = EngramStore({1: layer1})
+heads = [np.memmap(path, mode="r", dtype=np.uint8, shape=(rows, layer1.row_bytes))
+         for path, rows in zip(paths, layer1.table_vocab_sizes)]
+table.bind_local(1, heads)
+table.lookup_into(1, row_ids, output)
+```
+
+This mode copies selected rows directly from CPU-addressable memory into output;
+it performs no Store metadata queries, registration, or network transfers. The
+Python binding retains the supplied list and arrays. Do not change that list,
+modify/resize the arrays, or truncate/unmap their backing files while bound.
+Binding a layer twice, binding with a Store client, and lookup of an unbound
+layer are rejected. C++ callers retain ownership of the bound memory.
+
+Same-host ranks can map the same immutable tmpfs files to share physical pages
+without RDMA. Each rank still owns its staging output. Merely placing data in
+another process on the same host does not make that process's pointers locally
+addressable. Use separate directories for separate model instances.
 
 C++:
 
@@ -97,7 +123,7 @@ It writes output in place and returns `None`. Neither argument is implicitly
 converted. The explicit `layer_id` selects a configured layer; position
 `h` in the last row-ID dimension selects `engram:l{layer_id}:h{h}`.
 
-The caller must register the entire output buffer with the same Store client
+For Store-backed reads, the caller must register the entire output buffer with the same Store client
 before the first nonempty lookup, keep it registered throughout each call, and
 unregister it when finished. `lookup_into` does not allocate, register, or
 unregister output; there is no registration flag or automatic-registration mode.
@@ -142,7 +168,8 @@ the keys written by the failed populate attempt before returning an error.
 
 ## Lookup Flow
 
-Each lookup follows the same simplified backend flow:
+Each Store-backed lookup follows this flow (local mode validates IDs and copies
+rows directly):
 
 1. validate the `row_ids` shape and bounds
 2. build per-head byte ranges for the requested rows
