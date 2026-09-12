@@ -5,7 +5,11 @@ run-ci:
 
 store:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-store/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-store/**/*'
+      - 'python/mooncake/mooncake_ssd_*.py'
+      - 'python/mooncake/spdk_tgt_create.py'
+      - 'python/tests/ssd/**/*'
 
 Mooncake Conductor:
   - changed-files:

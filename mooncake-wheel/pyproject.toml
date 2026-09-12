@@ -35,6 +35,9 @@ dependencies = ["aiohttp", "requests", "msgpack", "typing_extensions>=4.0; pytho
 keywords = ["mooncake", "transfer engine", "kv cache", "llm inference", "rdma"]
 classifiers = ["Development Status :: 5 - Production/Stable", "Environment :: GPU :: NVIDIA CUDA", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "License :: OSI Approved :: Apache Software License", "Operating System :: POSIX :: Linux", "Programming Language :: C++", "Programming Language :: Python :: 3", "Programming Language :: Python :: 3 :: Only", "Programming Language :: Python :: 3.10", "Programming Language :: Python :: 3.11", "Programming Language :: Python :: 3.12", "Programming Language :: Python :: 3.13", "Programming Language :: Python :: Implementation :: CPython", "Topic :: Scientific/Engineering :: Artificial Intelligence", "Topic :: System :: Distributed Computing"]
 
+[project.optional-dependencies]
+administration = ["paramiko"]
+
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"
 Documentation = "https://kvcache-ai.github.io/Mooncake"
