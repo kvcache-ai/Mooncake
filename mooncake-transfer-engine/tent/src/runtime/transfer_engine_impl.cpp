@@ -94,6 +94,7 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
+    bool force_tcp{false};
 };
 
 template <typename T>
@@ -215,6 +216,7 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         captureExplicitConfigValue(config, "local_segment_name", std::string());
     preserved.rpc_server_hostname = captureExplicitConfigValue(
         config, "rpc_server_hostname", std::string());
+    preserved.force_tcp = config.get("transports/force_tcp", false);
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
     return preserved;
@@ -240,6 +242,9 @@ void restoreExplicitTransferEngineConfig(
                                preserved.rpc_server_hostname);
     restoreExplicitConfigValue(config, "rpc_server_port",
                                preserved.rpc_server_port);
+    if (preserved.force_tcp) {
+        ConfigHelper::forceTcp(config);
+    }
 }
 
 TransferEngineImpl::TransferEngineImpl()
@@ -1385,7 +1390,8 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
     const TransportType hint = request.transport_hint;
 
     // Legacy mode: use original logic (before TransportSelector)
-    if (transport_selector_ && transport_selector_->isLegacyMode()) {
+    if (transport_selector_ && transport_selector_->isLegacyMode() &&
+        !transport_selector_->isForceTcp()) {
         SelectionResult result;
         std::vector<TransportType> raw;
         if (desc->type == SegmentType::File) {

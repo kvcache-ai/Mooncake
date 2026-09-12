@@ -186,6 +186,8 @@ class Config {
 struct ConfigHelper {
     Status loadFromEnv(Config& config);
 
+    static void forceTcp(Config& config);
+
     // Common parsing utilities for environment variable values
     static bool parseBool(const std::string& str, bool default_value = false);
     static int parseInt(const std::string& str, int default_value = 0);
