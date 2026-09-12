@@ -60,22 +60,10 @@ Status checkedAdd(size_t lhs, size_t rhs, size_t& out) {
     return Status::OK();
 }
 
-Status validateLimits(const QueueLimits& limits) {
-    if (limits.staging_owner_reserve > limits.max_outstanding_owners) {
-        return Status::InvalidArgument(
-            "staging owner reserve exceeds owner limit" LOC_MARK);
-    }
-    if (limits.staging_byte_reserve > limits.max_outstanding_bytes) {
-        return Status::InvalidArgument(
-            "staging byte reserve exceeds byte limit" LOC_MARK);
-    }
-    return Status::OK();
-}
-
 }  // namespace
 
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
-    : limits_(limits), limits_status_(validateLimits(limits)) {}
+    : limits_(limits), limits_status_(limits.validate()) {}
 
 Status LocalTransferAdmissionQueue::tryAdmit(
     const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids) {

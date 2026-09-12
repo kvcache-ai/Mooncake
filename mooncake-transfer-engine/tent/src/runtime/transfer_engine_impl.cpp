@@ -28,6 +28,7 @@
 #include <unordered_set>
 
 #include "tent/common/config.h"
+#include "tent/common/config_parser.h"
 #include "tent/common/status.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
@@ -104,104 +105,6 @@ std::optional<T> captureExplicitConfigValue(const Config& config,
         return std::nullopt;
     }
     return config.get<T>(key, default_value);
-}
-
-std::optional<long long> tryParseConfigIntString(const std::string& value) {
-    try {
-        size_t parsed_chars = 0;
-        long long parsed_value = std::stoll(value, &parsed_chars);
-        if (parsed_chars == value.size()) {
-            return parsed_value;
-        }
-    } catch (...) {
-    }
-    return std::nullopt;
-}
-
-Status validateRpcServerPortValue(long long value, const std::string& source,
-                                  uint16_t& port) {
-    constexpr long long kMinPort = 0;
-    constexpr long long kMaxPort = std::numeric_limits<uint16_t>::max();
-    if (value < kMinPort || value > kMaxPort) {
-        return Status::InvalidArgument("Invalid rpc_server_port '" + source +
-                                       "', expected value in range [0, " +
-                                       std::to_string(kMaxPort) + "]" +
-                                       LOC_MARK);
-    }
-
-    port = static_cast<uint16_t>(value);
-    return Status::OK();
-}
-
-Status getRpcServerPortFromConfig(const Config& config, uint16_t default_value,
-                                  uint16_t& port) {
-    constexpr const char* kKey = "rpc_server_port";
-    if (!config.contains(kKey)) {
-        port = default_value;
-        return Status::OK();
-    }
-
-    json raw_value = config.get<json>(kKey, json());
-    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
-        long long numeric_value = raw_value.get<long long>();
-        return validateRpcServerPortValue(numeric_value,
-                                          std::to_string(numeric_value), port);
-    }
-
-    if (raw_value.is_string()) {
-        auto string_value = raw_value.get<std::string>();
-        auto parsed_value = tryParseConfigIntString(string_value);
-        if (!parsed_value.has_value()) {
-            return Status::InvalidArgument(
-                "Invalid rpc_server_port '" + string_value +
-                "', expected integer in range [0, 65535]" LOC_MARK);
-        }
-        return validateRpcServerPortValue(*parsed_value, string_value, port);
-    }
-
-    return Status::InvalidArgument(
-        "rpc_server_port must be an integer or integer string" LOC_MARK);
-}
-
-Status getRpcServerThreadsFromConfig(const Config& config, size_t default_value,
-                                     size_t& threads) {
-    constexpr const char* kKey = "rpc_server_threads";
-    constexpr long long kMinThreads = 1;
-    constexpr long long kMaxThreads = 1024;
-    auto validate = [&](long long value, const std::string& source) -> Status {
-        if (value < kMinThreads || value > kMaxThreads) {
-            return Status::InvalidArgument(
-                "Invalid rpc_server_threads '" + source +
-                "', expected value in range [1, " +
-                std::to_string(kMaxThreads) + "]" LOC_MARK);
-        }
-        threads = static_cast<size_t>(value);
-        return Status::OK();
-    };
-    if (!config.contains(kKey)) {
-        threads = default_value;
-        return Status::OK();
-    }
-
-    json raw_value = config.get<json>(kKey, json());
-    if (raw_value.is_number_integer() || raw_value.is_number_unsigned()) {
-        long long numeric_value = raw_value.get<long long>();
-        return validate(numeric_value, std::to_string(numeric_value));
-    }
-    if (raw_value.is_string()) {
-        auto string_value = raw_value.get<std::string>();
-        auto parsed_value = tryParseConfigIntString(string_value);
-        if (!parsed_value.has_value()) {
-            return Status::InvalidArgument(
-                "Invalid rpc_server_threads '" + string_value +
-                "', expected integer in range [1, " +
-                std::to_string(kMaxThreads) + "]" LOC_MARK);
-        }
-        return validate(*parsed_value, string_value);
-    }
-
-    return Status::InvalidArgument(
-        "rpc_server_threads must be an integer or integer string" LOC_MARK);
 }
 
 PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
@@ -356,10 +259,7 @@ Status TransferEngineImpl::construct() {
     // rpc_server_threads, use several so attachments can be read in parallel.
     size_t rpc_server_threads = 1;
     const size_t rpc_threads_default =
-        conf_->get("transports/tcp/enable", false)
-            ? std::min<size_t>(
-                  8, std::max<size_t>(4, std::thread::hardware_concurrency()))
-            : 1;
+        getDefaultRpcServerThreads(*conf_, std::thread::hardware_concurrency());
     CHECK_STATUS(getRpcServerThreadsFromConfig(*conf_, rpc_threads_default,
                                                rpc_server_threads));
     merge_requests_ = conf_->get("merge_requests", true);
@@ -387,12 +287,10 @@ Status TransferEngineImpl::construct() {
     runtime_queue_config_.progress_fallback_interval =
         std::chrono::microseconds(
             conf_->get("runtime_queue/progress_fallback_interval_us", 50000UL));
-    if (runtime_queue_config_.enabled &&
-        (runtime_queue_config_.max_dispatch_owners == 0 ||
-         runtime_queue_config_.max_dispatch_bytes == 0)) {
-        return Status::InvalidArgument(
-            "runtime queue dispatch window must be non-zero" LOC_MARK);
-    }
+    CHECK_STATUS(validateRuntimeQueueDispatchWindow(
+        runtime_queue_config_.enabled,
+        runtime_queue_config_.max_dispatch_owners,
+        runtime_queue_config_.max_dispatch_bytes));
     runtime_queue_ = std::make_unique<LocalTransferAdmissionQueue>(
         runtime_queue_config_.limits);
     if (!hostname_.empty())
