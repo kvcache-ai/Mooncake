@@ -152,8 +152,8 @@ CachelibBufferAllocator::Create(std::string segment_name, size_t base,
 tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
 CreateBufferAllocator(BufferAllocatorType allocator_type,
                       std::string segment_name, size_t base, size_t size,
-                      std::string transport_endpoint,
-                      ReplicaType replica_type) {
+                      std::string transport_endpoint, ReplicaType replica_type,
+                      uint32_t min_alignment_bytes) {
     switch (allocator_type) {
         case BufferAllocatorType::CACHELIB: {
             auto allocator = CachelibBufferAllocator::Create(
@@ -170,7 +170,8 @@ CreateBufferAllocator(BufferAllocatorType allocator_type,
             return std::shared_ptr<BufferAllocatorBase>(
                 std::make_shared<OffsetBufferAllocator>(
                     std::move(segment_name), base, size,
-                    std::move(transport_endpoint), replica_type));
+                    std::move(transport_endpoint), replica_type,
+                    min_alignment_bytes));
         default:
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -345,7 +346,8 @@ std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
                                              std::string transport_endpoint,
-                                             ReplicaType replica_type)
+                                             ReplicaType replica_type,
+                                             uint32_t min_alignment_bytes)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
@@ -370,7 +372,7 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         // Create the offset allocator
         offset_allocator_ = offset_allocator::OffsetAllocator::create(
             base, size, static_cast<uint32_t>(init_capacity),
-            static_cast<uint32_t>(max_capacity));
+            static_cast<uint32_t>(max_capacity), min_alignment_bytes);
         if (!offset_allocator_) {
             LOG(ERROR) << "status=failed_to_create_offset_allocator";
             throw std::runtime_error("Failed to create offset allocator");

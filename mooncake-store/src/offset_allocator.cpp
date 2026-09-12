@@ -532,28 +532,29 @@ OffsetAllocationHandle::~OffsetAllocationHandle() {
 }
 
 // Helper function to calculate the multiplier
-static uint64_t calculateMultiplier(size_t size) {
+static uint64_t calculateMultiplier(size_t size, uint32 min_alignment_bytes) {
     uint64_t multiplier_bits = 0;
-    for (; SmallFloat::MAX_BIN_SIZE < (size >> multiplier_bits);
+    for (; (uint64_t{1} << multiplier_bits) < min_alignment_bytes ||
+           SmallFloat::MAX_BIN_SIZE < (size >> multiplier_bits);
          multiplier_bits++) {
     }
     return multiplier_bits;
 }
 
 // Thread-safe OffsetAllocator implementation
-std::shared_ptr<OffsetAllocator> OffsetAllocator::create(uint64_t base,
-                                                         size_t size,
-                                                         uint32 init_capacity,
-                                                         uint32 max_capacity) {
+std::shared_ptr<OffsetAllocator> OffsetAllocator::create(
+    uint64_t base, size_t size, uint32 init_capacity, uint32 max_capacity,
+    uint32 min_alignment_bytes) {
     // Use a custom deleter to allow private constructor
-    return std::shared_ptr<OffsetAllocator>(
-        new OffsetAllocator(base, size, init_capacity, max_capacity));
+    return std::shared_ptr<OffsetAllocator>(new OffsetAllocator(
+        base, size, init_capacity, max_capacity, min_alignment_bytes));
 }
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
-                                 uint32 init_capacity, uint32 max_capacity)
+                                 uint32 init_capacity, uint32 max_capacity,
+                                 uint32 min_alignment_bytes)
     : m_base(base),
-      m_multiplier_bits(calculateMultiplier(size)),
+      m_multiplier_bits(calculateMultiplier(size, min_alignment_bytes)),
       m_capacity(size) {
     m_allocator = std::make_unique<__Allocator>(size >> m_multiplier_bits,
                                                 init_capacity, max_capacity);
