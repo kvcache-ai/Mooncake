@@ -3490,6 +3490,393 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     return status;
 }
 
+namespace {
+
+// Same scoping rule the bounded path uses: an explicit tenant_id on the
+// entry wins over the scoped key spelling.
+std::pair<TenantId, std::string> ResolveStandbyObject(
+    const StandbyObjectEntry& entry) {
+    auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
+    TenantId tenant_id(entry.tenant_id);
+    if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
+        tenant_id = std::move(scoped_tenant_id);
+    }
+    return std::make_pair(std::move(tenant_id), std::move(user_key));
+}
+
+}  // namespace
+
+struct PreparedObject {
+    const StandbyObjectEntry* entry;
+    TenantId tenant_id;
+    std::string user_key;
+    std::vector<Replica> replicas;
+};
+
+// Shared state for the tolerant legacy-snapshot restore (#3760): one bad
+// entry or descriptor must not cost the whole index. Validation runs in
+// three phases — cheap per-entry validation, ambiguity-discard overlap
+// resolution, then construction for the survivors — and only segment-level
+// structural corruption stays fail-fast. The bounded handoff path keeps its
+// fail-fast chunk loop: its chunks stream from a metadata store the standby
+// wrote from its own live index, so the contents are internally consistent
+// by construction, and deferring overlap resolution across chunk installs
+// would break the bounded-memory shape.
+struct MasterService::LegacyRestoreContext {
+    const std::vector<StandbyObjectEntry>& objects;
+    const std::unordered_map<std::string, const StandbySegmentInfo*>&
+        segments_by_alias;
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>&
+        allocators;
+    std::unordered_map<std::string, uint64_t>& accounted_bytes;
+    size_t& rejected_count;
+    size_t& already_existing_count;
+    std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
+    std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
+
+    struct AcceptedEntry {
+        const StandbyObjectEntry* entry;
+        TenantId tenant_id;
+        std::string user_key;
+        size_t shard_idx;
+    };
+    std::vector<AcceptedEntry> accepted;
+    std::unordered_set<std::string> object_ids;
+    // segment -> (address, size, index into `accepted`, descriptor index)
+    std::unordered_map<
+        const StandbySegmentInfo*,
+        std::vector<std::tuple<uintptr_t, uint64_t, size_t, size_t>>>
+        pending_ranges;
+    std::unordered_map<size_t, std::unordered_set<size_t>> discarded_replicas;
+    std::unordered_map<size_t, std::vector<PreparedObject>> objects_by_shard;
+};
+
+void MasterService::NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
+                                               const StandbyObjectEntry& entry,
+                                               const char* reason) {
+    ++ctx.rejected_count;
+    LOG(WARNING) << "RestoreFromStandbySnapshot: skipping object, key="
+                 << entry.key << ", reason=" << reason;
+    MasterMetricManager::instance().inc_standby_restore_rejected_objects(
+        reason);
+}
+
+tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
+    LegacyRestoreContext& ctx) {
+    for (const auto& entry : ctx.objects) {
+        auto [tenant_id, user_key] = ResolveStandbyObject(entry);
+        if (!tenant_id.IsValid()) {
+            NoteLegacyStandbyRejection(ctx, entry, "invalid_tenant_id");
+            continue;
+        }
+        if (!ctx.object_ids.insert(tenant_id.MakeScopedKey(user_key)).second) {
+            NoteLegacyStandbyRejection(ctx, entry, "duplicate_object");
+            continue;
+        }
+        const size_t existing_shard_idx = getShardIndex(tenant_id, user_key);
+        {
+            MetadataShardAccessorRO existing_shard(this, existing_shard_idx);
+            auto existing_tenant = existing_shard->tenants.find(tenant_id);
+            if (existing_tenant != existing_shard->tenants.end() &&
+                existing_tenant->second.metadata.contains(user_key)) {
+                NoteLegacyStandbyRejection(ctx, entry, "object_already_exists");
+                ++ctx.already_existing_count;
+                continue;
+            }
+        }
+        bool valid = true;
+        // (segment, address, size, descriptor index) for this object's
+        // live memory replicas. They join ctx.pending_ranges only after the
+        // object is ctx.accepted, so a rejected object never leaves ranges
+        // whose owner index a later ctx.accepted object would reuse.
+        std::vector<
+            std::tuple<const StandbySegmentInfo*, uintptr_t, uint64_t, size_t>>
+            object_ranges;
+        for (size_t desc_idx = 0; desc_idx < entry.metadata.replicas.size();
+             ++desc_idx) {
+            const auto& desc = entry.metadata.replicas[desc_idx];
+            if (!desc.is_memory_replica()) {
+                continue;
+            }
+            const auto& buffer = desc.get_memory_descriptor().buffer_descriptor;
+            auto segment_it =
+                ctx.segments_by_alias.find(buffer.transport_endpoint_);
+            if (segment_it == ctx.segments_by_alias.end()) {
+                NoteLegacyStandbyRejection(ctx, entry, "unknown_endpoint");
+                valid = false;
+                break;
+            }
+            if (buffer.size_ != entry.metadata.size || buffer.size_ == 0 ||
+                buffer.buffer_address_ >
+                    std::numeric_limits<uintptr_t>::max() - buffer.size_) {
+                NoteLegacyStandbyRejection(ctx, entry,
+                                           "invalid_memory_descriptor");
+                valid = false;
+                break;
+            }
+            if (desc.status != ReplicaStatus::REMOVED &&
+                desc.status != ReplicaStatus::FAILED) {
+                object_ranges.emplace_back(segment_it->second,
+                                           buffer.buffer_address_, buffer.size_,
+                                           desc_idx);
+            }
+        }
+        if (!valid) {
+            continue;
+        }
+        // Routing is decoupled from groups: metadata always lands on the
+        // (tenant, key) shard, group membership lives in group_domain_.
+        const auto shard_idx = getShardIndex(tenant_id, user_key);
+        const size_t owner = ctx.accepted.size();
+        ctx.accepted.push_back(
+            {&entry, std::move(tenant_id), std::move(user_key), shard_idx});
+        for (const auto& [segment, addr, size, desc_idx] : object_ranges) {
+            ctx.pending_ranges[segment].emplace_back(addr, size, owner,
+                                                     desc_idx);
+        }
+    }
+
+    // Overlap is ambiguity, not recency: the promotion context carries no
+    // replay order (the standby snapshot enumerates unordered maps), so an
+    // overlapping pair cannot prove which descriptor is newer. Every
+    // descriptor in a transitively overlapping group is discarded,
+    // replicas independent of the conflict are kept, and an object is
+    // dropped only when no reliable replica remains (#3760).
+    for (auto& [segment, ranges] : ctx.pending_ranges) {
+        std::sort(ranges.begin(), ranges.end());
+        size_t run_start = 0;
+        while (run_start < ranges.size()) {
+            const auto range_end = [&](size_t idx) -> uintptr_t {
+                return std::get<0>(ranges[idx]) + std::get<1>(ranges[idx]);
+            };
+            size_t run_last = run_start;
+            uintptr_t run_end = range_end(run_start);
+            while (run_last + 1 < ranges.size() &&
+                   std::get<0>(ranges[run_last + 1]) < run_end) {
+                ++run_last;
+                run_end = std::max(run_end, range_end(run_last));
+            }
+            if (run_last > run_start) {
+                for (size_t j = run_start; j <= run_last; ++j) {
+                    const auto& [addr, size, owner, desc_idx] = ranges[j];
+                    ctx.discarded_replicas[owner].insert(desc_idx);
+                    LOG(WARNING)
+                        << "RestoreFromStandbySnapshot: discarding "
+                        << "ambiguous overlapping replica, segment="
+                        << segment->segment_name << ", addr=0x" << std::hex
+                        << addr << "+0x" << size << std::dec
+                        << ", key=" << ctx.accepted[owner].entry->key;
+                }
+            }
+            run_start = run_last + 1;
+        }
+    }
+    for (size_t owner = 0; owner < ctx.accepted.size(); ++owner) {
+        auto& accepted_entry = ctx.accepted[owner];
+        const auto discarded_it = ctx.discarded_replicas.find(owner);
+        if (accepted_entry.entry == nullptr ||
+            discarded_it == ctx.discarded_replicas.end()) {
+            continue;
+        }
+        size_t reliable = 0;
+        for (size_t desc_idx = 0;
+             desc_idx < accepted_entry.entry->metadata.replicas.size();
+             ++desc_idx) {
+            const auto& desc =
+                accepted_entry.entry->metadata.replicas[desc_idx];
+            if (desc.status == ReplicaStatus::REMOVED ||
+                desc.status == ReplicaStatus::FAILED ||
+                discarded_it->second.contains(desc_idx)) {
+                continue;
+            }
+            ++reliable;
+        }
+        if (reliable == 0) {
+            NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
+                                       "no_reliable_replica");
+            ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
+                                                accepted_entry.user_key);
+            accepted_entry.entry = nullptr;
+        } else {
+            // Survives with some descriptors discarded: the canonical
+            // repair record carries only the survivors.
+            ctx.repair_canonical_keys.emplace_back(accepted_entry.tenant_id,
+                                                   accepted_entry.user_key);
+        }
+    }
+
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
+    LegacyRestoreContext& ctx) {
+    // Construction phase: build replicas and accounting for survivors
+    // only.
+    for (size_t owner = 0; owner < ctx.accepted.size(); ++owner) {
+        const auto& accepted_entry = ctx.accepted[owner];
+        if (accepted_entry.entry == nullptr) {
+            continue;
+        }
+        const auto& entry = *accepted_entry.entry;
+        const auto& standby_meta = entry.metadata;
+        const auto discarded_it = ctx.discarded_replicas.find(owner);
+        std::vector<Replica> replicas;
+        replicas.reserve(standby_meta.replicas.size());
+        bool construction_ok = true;
+        // Per-object bytes join the segment totals only once the whole
+        // object validates, so a mid-construction rejection never leaves
+        // phantom accounting behind for later capacity checks or metrics.
+        std::unordered_map<std::string, uint64_t> object_bytes;
+
+        for (size_t desc_idx = 0; desc_idx < standby_meta.replicas.size();
+             ++desc_idx) {
+            if (discarded_it != ctx.discarded_replicas.end() &&
+                discarded_it->second.contains(desc_idx)) {
+                continue;
+            }
+            const auto& desc = standby_meta.replicas[desc_idx];
+            if (desc.is_memory_replica()) {
+                const auto& buffer =
+                    desc.get_memory_descriptor().buffer_descriptor;
+                auto alloc = ctx.allocators.at(buffer.transport_endpoint_);
+                const auto* segment =
+                    ctx.segments_by_alias.at(buffer.transport_endpoint_);
+                if (desc.status != ReplicaStatus::REMOVED &&
+                    desc.status != ReplicaStatus::FAILED) {
+                    const uint64_t used =
+                        ctx.accounted_bytes[segment->segment_name] +
+                        object_bytes[segment->segment_name];
+                    if (used > segment->capacity ||
+                        buffer.size_ > segment->capacity - used) {
+                        NoteLegacyStandbyRejection(ctx, entry,
+                                                   "capacity_overflow");
+                        construction_ok = false;
+                        break;
+                    }
+                    object_bytes[segment->segment_name] += buffer.size_;
+                }
+
+                replicas.push_back(Replica(
+                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status));
+            } else if (desc.is_nof_replica()) {
+                const auto& buffer =
+                    desc.get_nof_descriptor().buffer_descriptor;
+                if (buffer.size_ != standby_meta.size || buffer.size_ == 0) {
+                    NoteLegacyStandbyRejection(ctx, entry,
+                                               "invalid_nof_descriptor");
+                    construction_ok = false;
+                    break;
+                }
+                auto& alloc = ctx.allocators[buffer.transport_endpoint_];
+                if (!alloc) {
+                    alloc = std::make_shared<DummyBufferAllocator>(
+                        buffer.transport_endpoint_, buffer.transport_endpoint_);
+                }
+                replicas.push_back(Replica(
+                    desc.id, std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status, ReplicaType::NOF_SSD));
+            } else if (desc.is_disk_replica()) {
+                const auto& disk_desc = desc.get_disk_descriptor();
+                if (disk_desc.object_size != standby_meta.size) {
+                    NoteLegacyStandbyRejection(ctx, entry,
+                                               "invalid_disk_descriptor");
+                    construction_ok = false;
+                    break;
+                }
+                replicas.push_back(Replica(desc.id, disk_desc.file_path,
+                                           disk_desc.object_size, desc.status));
+            } else if (desc.is_local_disk_replica()) {
+                const auto& local_disk_desc = desc.get_local_disk_descriptor();
+                if (local_disk_desc.object_size != standby_meta.size) {
+                    NoteLegacyStandbyRejection(ctx, entry,
+                                               "invalid_local_disk_descriptor");
+                    construction_ok = false;
+                    break;
+                }
+                replicas.push_back(Replica(desc.id, local_disk_desc.client_id,
+                                           local_disk_desc.object_size,
+                                           local_disk_desc.transport_endpoint,
+                                           desc.status));
+            } else {
+                LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
+                           << "descriptor, tenant="
+                           << accepted_entry.tenant_id.value()
+                           << ", key=" << accepted_entry.user_key;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
+        if (!construction_ok) {
+            continue;
+        }
+        for (const auto& [segment_name, bytes] : object_bytes) {
+            ctx.accounted_bytes[segment_name] += bytes;
+        }
+        ctx.objects_by_shard[accepted_entry.shard_idx].push_back(
+            {accepted_entry.entry, std::move(accepted_entry.tenant_id),
+             std::move(accepted_entry.user_key), std::move(replicas)});
+    }
+
+    return {};
+}
+
+tl::expected<size_t, ErrorCode> MasterService::InstallLegacyStandbyObjects(
+    LegacyRestoreContext& ctx) {
+    size_t restored_count = 0;
+    for (const auto& [shard_idx, shard_objects] : ctx.objects_by_shard) {
+        restored_count += shard_objects.size();
+    }
+    // A snapshot whose objects all fail to land is a failed restore, not
+    // an empty cluster: reporting success here would let the supervisor
+    // serve on zero state. Duplicates of already-served objects are the
+    // exception, since their state is present already. How partial
+    // restores gate serving is N07/N08 scope (#3808), not this stop-gap.
+    if (!ctx.objects.empty() && restored_count == 0 &&
+        ctx.already_existing_count < ctx.objects.size()) {
+        LOG(ERROR) << "RestoreFromStandbySnapshot: every standby object "
+                   << "was rejected, objects=" << ctx.objects.size()
+                   << ", rejected=" << ctx.rejected_count;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    for (const auto& [shard_idx, shard_objects] : ctx.objects_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (const auto& object : shard_objects) {
+            auto tenant = shard->tenants.find(object.tenant_id);
+            if (tenant != shard->tenants.end() &&
+                tenant->second.metadata.contains(object.user_key)) {
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+        }
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    for (auto& [shard_idx, shard_objects] : ctx.objects_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (auto& object : shard_objects) {
+            const auto& standby_meta = object.entry->metadata;
+            auto& tenant_state =
+                GetOrCreateTenantState(shard.get(), object.tenant_id);
+            auto [it, inserted] = tenant_state.metadata.emplace(
+                std::piecewise_construct,
+                std::forward_as_tuple(object.user_key),
+                std::forward_as_tuple(
+                    standby_meta.client_id, now, standby_meta.size,
+                    std::move(object.replicas), std::nullopt,
+                    standby_meta.hard_pinned.value_or(false),
+                    standby_meta.data_type, standby_meta.group_id,
+                    object.tenant_id, object.user_key));
+            (void)inserted;
+            if (!standby_meta.group_id.empty()) {
+                it->second.lease_ = RegisterGroupMember(
+                    object.tenant_id, object.user_key, standby_meta.group_id);
+            }
+            tenant_state.processing_keys.erase(object.user_key);
+        }
+    }
+    return restored_count;
+}
+
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
@@ -3544,14 +3931,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         return record->second;
     };
 
-    const auto resolve_standby_object = [](const StandbyObjectEntry& entry) {
-        auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
-        TenantId tenant_id(entry.tenant_id);
-        if (tenant_id.IsDefault() && !scoped_tenant_id.IsDefault()) {
-            tenant_id = std::move(scoped_tenant_id);
-        }
-        return std::make_pair(std::move(tenant_id), std::move(user_key));
-    };
+    const auto& resolve_standby_object = ResolveStandbyObject;
 
     ReplicaID max_live_id = 0;
     if (metadata_store) {
@@ -3612,8 +3992,23 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
 
         restored_memory_segments.push_back(seg);
-        auto allocator = std::make_shared<DummyBufferAllocator>(
-            seg.segment_name, seg.transport_endpoint);
+        // Reuse the live standby allocator only on an exact endpoint
+        // match. Restored buffers hold their allocator by weak_ptr, so a
+        // later snapshot that swaps the keepalive must not expire the
+        // buffers an earlier snapshot restored onto the same endpoint. A
+        // name match with a changed endpoint is a different physical
+        // segment: reusing its allocator would make the replica report
+        // the stale endpoint and look readable before the new endpoint
+        // remounts.
+        std::shared_ptr<BufferAllocatorBase> allocator;
+        if (auto keepalive =
+                standby_allocator_keepalive_.find(seg.transport_endpoint);
+            keepalive != standby_allocator_keepalive_.end()) {
+            allocator = keepalive->second;
+        } else {
+            allocator = std::make_shared<DummyBufferAllocator>(
+                seg.segment_name, seg.transport_endpoint);
+        }
         restored_allocators[seg.transport_endpoint] = allocator;
         if (seg.segment_name != seg.transport_endpoint) {
             restored_allocators[seg.segment_name] = allocator;
@@ -3626,12 +4021,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
     }
 
-    struct PreparedObject {
-        const StandbyObjectEntry* entry;
-        TenantId tenant_id;
-        std::string user_key;
-        std::vector<Replica> replicas;
-    };
     const bool bounded_restore = metadata_store != nullptr;
     // Batch restore spans chunks, so it needs an ordered cross-chunk index;
     // legacy restore keeps its contiguous vector-and-sort validation path.
@@ -3642,6 +4031,17 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         bounded_memory_ranges;
     std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
     size_t restored_object_count = 0;
+
+    size_t rejected_count = 0;
+    // Objects skipped because the live index already holds them are not
+    // losses: their state is present, just not from this snapshot.
+    size_t already_existing_count = 0;
+    // Conflict-derived discards become durable repair records after the index
+    // installs, so a later promotion cannot replay them: full drops as
+    // key-level REMOVE, partial discards as a canonical PUT_END carrying only
+    // the survivors.
+    std::vector<std::pair<TenantId, std::string>> repair_remove_keys;
+    std::vector<std::pair<TenantId, std::string>> repair_canonical_keys;
 
     const auto restore_chunk =
         [&](const std::vector<StandbyObjectEntry>& objects)
@@ -3875,10 +4275,22 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     };
 
     if (legacy_objects) {
-        auto restored = restore_chunk(*legacy_objects);
-        if (!restored) {
-            return restored;
+        LegacyRestoreContext legacy_ctx{
+            *legacy_objects,     memory_segments_by_alias,
+            restored_allocators, restored_accounted_memory_bytes,
+            rejected_count,      already_existing_count,
+            repair_remove_keys,  repair_canonical_keys};
+        if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
+            return tl::make_unexpected(r.error());
         }
+        if (auto r = ConstructLegacyStandbyReplicas(legacy_ctx); !r) {
+            return tl::make_unexpected(r.error());
+        }
+        auto installed = InstallLegacyStandbyObjects(legacy_ctx);
+        if (!installed) {
+            return tl::make_unexpected(installed.error());
+        }
+        restored_object_count += *installed;
     } else {
         std::vector<StandbyObjectEntry> objects;
         for (;;) {
@@ -3926,10 +4338,83 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         RebuildTenantQuotaUsageFromMetadata();
     }
 
+    // Durable repair for conflict-derived discards: a later promotion must
+    // not replay what this one dropped. One record per affected object goes
+    // through the fenced writer (REMOVE for full drops, canonical PUT_END
+    // carrying only the survivors for partial ones), and the restore fails
+    // unless the batch becomes durable, so the candidate never serves an
+    // index whose discards could resurrect. With no OpLog configured there
+    // is nothing to replay into, so the local filter stands alone.
+    if ((!repair_remove_keys.empty() || !repair_canonical_keys.empty()) &&
+        enable_oplog_ && ordered_oplog_writer_) {
+        const size_t total =
+            repair_remove_keys.size() + repair_canonical_keys.size();
+        auto remaining = std::make_shared<std::atomic<size_t>>(total);
+        auto done = std::make_shared<std::promise<void>>();
+        std::future<void> durable_future = done->get_future();
+        auto on_durable = [remaining, done](const OpLogEntry&) {
+            if (remaining->fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                done->set_value();
+            }
+        };
+
+        ErrorCode repair_err = ErrorCode::OK;
+        for (const auto& [tenant, key] : repair_remove_keys) {
+            auto r = AppendOpLogWithDurableFinalize(
+                OpType::REMOVE, tenant.value(), key, {}, on_durable);
+            if (!r) {
+                repair_err = r.error();
+                break;
+            }
+        }
+        for (const auto& [tenant, key] : repair_canonical_keys) {
+            if (repair_err != ErrorCode::OK) break;
+            const size_t shard_idx = getShardIndex(tenant, key);
+            MetadataShardAccessorRO shard(this, shard_idx);
+            auto tenant_it = shard->tenants.find(tenant);
+            if (tenant_it == shard->tenants.end() ||
+                !tenant_it->second.metadata.contains(key)) {
+                // Survived the conflict but failed construction (e.g.
+                // capacity): nothing installed, so the canonical state is
+                // absence. Repudiate the key outright.
+                auto r = AppendOpLogWithDurableFinalize(
+                    OpType::REMOVE, tenant.value(), key, {}, on_durable);
+                if (!r) {
+                    repair_err = r.error();
+                    break;
+                }
+                continue;
+            }
+            auto r = AppendOpLogWithDurableFinalize(
+                OpType::PUT_END, tenant.value(), key,
+                SerializeMetadataForOpLog(tenant_it->second.metadata.at(key)),
+                on_durable);
+            if (!r) {
+                repair_err = r.error();
+            }
+        }
+        if (repair_err == ErrorCode::OK &&
+            durable_future.wait_for(std::chrono::seconds(10)) !=
+                std::future_status::ready) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: repair batch not "
+                          "durable within 10s, failing the restore";
+            repair_err = ErrorCode::INTERNAL_ERROR;
+        }
+        if (repair_err != ErrorCode::OK) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: durable repair failed, "
+                          "error="
+                       << toString(repair_err);
+            return tl::make_unexpected(repair_err);
+        }
+        LOG(INFO) << "RestoreFromStandbySnapshot: durable repair records="
+                  << total;
+    }
+
     LOG(INFO) << "Restored from standby: " << restored_object_count
               << " objects, " << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
-              << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+              << ", invalid_endpoints=" << invalid_replica_endpoints_.size()
+              << ", rejected_objects=" << rejected_count;
     return {};
 }
 
