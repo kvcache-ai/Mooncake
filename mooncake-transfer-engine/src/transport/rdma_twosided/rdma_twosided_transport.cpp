@@ -18,9 +18,11 @@
 
 #include <mutex>
 #include <random>
+#include <vector>
 
 #include "config.h"
 #include "transport/rdma_twosided/ctrl_channel.h"
+#include "transport/rdma_twosided/msg_channel.h"
 
 namespace mooncake {
 
@@ -32,13 +34,26 @@ RdmaTwoSidedTransport::RdmaTwoSidedTransport() {
 }
 
 RdmaTwoSidedTransport::~RdmaTwoSidedTransport() {
+    stopBounceManager();
     stopCtrlWorker();
-    std::lock_guard<std::mutex> lock(ctrl_mutex_);
-    for (auto &entry : ctrl_channels_) {
-        if (entry.second) entry.second->disconnect();
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        for (auto &entry : ctrl_channels_) {
+            if (entry.second) entry.second->disconnect();
+        }
+        ctrl_channels_.clear();
+        msg_channels_.clear();
+        ctrl_cv_.notify_all();
     }
-    ctrl_channels_.clear();
-    ctrl_cv_.notify_all();
+    // Release TE-owned managed buffers; peer-owned ones are only unregistered.
+    std::vector<void *> owned;
+    {
+        std::lock_guard<std::mutex> lock(managed_mutex_);
+        for (auto &entry : managed_buffers_) {
+            if (entry.second.owned) owned.push_back(entry.second.addr);
+        }
+    }
+    for (auto *addr : owned) releaseManagedBuffer(addr);
 }
 
 int RdmaTwoSidedTransport::install(std::string &local_server_name,
@@ -46,8 +61,11 @@ int RdmaTwoSidedTransport::install(std::string &local_server_name,
                                    std::shared_ptr<Topology> topo) {
     int ret = RdmaTransport::install(local_server_name, meta, topo);
     if (ret) return ret;
-    if (globalConfig().rdma_notify_enabled) {
+    if (globalConfig().rdma_notify_enabled || globalConfig().rdma_msg_enabled) {
         startCtrlWorker();
+    }
+    if (globalConfig().rdma_msg_enabled) {
+        startBounceManager();
     }
     return 0;
 }
@@ -56,6 +74,9 @@ int RdmaTwoSidedTransport::onSetupRdmaConnections(
     const HandShakeDesc &peer_desc, HandShakeDesc &local_desc) {
     if (peer_desc.ctrl_channel) {
         return onSetupCtrlChannel(peer_desc, local_desc);
+    }
+    if (peer_desc.msg_channel) {
+        return onSetupMsgChannel(peer_desc, local_desc);
     }
     return RdmaTransport::onSetupRdmaConnections(peer_desc, local_desc);
 }

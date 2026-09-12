@@ -403,9 +403,19 @@ int CtrlChannel::acceptPassive(const HandShakeDesc &peer_desc,
 }
 
 int CtrlChannel::postSessionOpen() {
-    // PR2: SESSION_OPEN / credit / MsgChannel deferred to later PRs.
-    (void)transport_;
-    return 0;
+    if (!globalConfig().rdma_credit_enabled && !globalConfig().rdma_msg_enabled)
+        return 0;
+    CtrlFrame frame;
+    frame.type = CtrlFrameType::SESSION_OPEN;
+    frame.session = transport_.localCtrlSessionId();
+    frame.epoch = 1;
+    frame.seq = 0;  // filled by sendCtrlFrame
+    uint32_t slots = static_cast<uint32_t>(globalConfig().rdma_msg_pool_base);
+    uint32_t slot_size =
+        static_cast<uint32_t>(globalConfig().rdma_msg_slot_size);
+    if (encodeSessionOpenPayload(slots, slot_size, frame.payload))
+        return ERR_INVALID_ARGUMENT;
+    return sendCtrlFrame(frame);
 }
 
 int CtrlChannel::sendCtrlFrame(const CtrlFrame &frame_in) {

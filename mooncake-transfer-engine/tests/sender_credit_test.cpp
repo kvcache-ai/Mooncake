@@ -112,6 +112,23 @@ TEST(SenderCreditTest, RollbackRestores) {
     EXPECT_EQ(slots, 4u);
 }
 
+TEST(SenderCreditTest, GrantTotalIgnoresConsumed) {
+    SenderCreditLedger l;
+    ASSERT_EQ(l.activate(kPeer, kSession, kEpoch), 0);
+    grant(l, 1, 4, 400);
+    ASSERT_EQ(l.tryReserve(kPeer, kSession, kEpoch,
+                           {{CreditResource::BounceSlots, 3},
+                            {CreditResource::BounceBytes, 300}}),
+              0);
+    uint64_t total = 0;
+    ASSERT_EQ(l.grantTotal(kPeer, kSession, kEpoch, CreditResource::BounceSlots,
+                           total),
+              0);
+    // An oversized transfer caps its reservation against this ceiling, which
+    // must stay put while other transfers hold credits.
+    EXPECT_EQ(total, 4u);
+}
+
 TEST(SenderCreditTest, StaleEpochCannotTouchNewGeneration) {
     SenderCreditLedger l;
     ASSERT_EQ(l.activate(kPeer, kSession, kEpoch), 0);

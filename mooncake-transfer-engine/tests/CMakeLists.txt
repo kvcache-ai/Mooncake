@@ -103,6 +103,13 @@ target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 add_test(NAME sender_credit_test COMMAND sender_credit_test)
 
+# Serialized READ_RESP backpressure queue (lost-wakeup regression; no RDMA).
+add_executable(pending_read_resp_queue_test
+               ${WORKSPACE}/pending_read_resp_queue_test.cpp)
+target_link_libraries(pending_read_resp_queue_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME pending_read_resp_queue_test COMMAND pending_read_resp_queue_test)
+
 # CtrlChannel RDMA notify correctness. Self-skips without RDMA.
 add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
 target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags

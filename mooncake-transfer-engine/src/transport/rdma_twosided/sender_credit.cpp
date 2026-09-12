@@ -167,6 +167,21 @@ int SenderCreditLedger::available(const std::string &peer, uint64_t session,
     return 0;
 }
 
+int SenderCreditLedger::grantTotal(const std::string &peer, uint64_t session,
+                                   uint64_t epoch, CreditResource resource,
+                                   uint64_t &out) const {
+    if (epoch == 0) return ERR_INVALID_ARGUMENT;
+    size_t i = 0;
+    if (resourceIndex(resource, i)) return ERR_INVALID_ARGUMENT;
+    std::lock_guard<std::mutex> lock(mutex_);
+    Key key{peer, session};
+    auto it = entries_.find(key);
+    if (it == entries_.end() || it->second.epoch != epoch)
+        return ERR_INVALID_ARGUMENT;
+    out = it->second.grants[i];
+    return 0;
+}
+
 uint64_t SenderCreditLedger::availableForPeer(const std::string &peer,
                                               CreditResource resource) const {
     size_t i = 0;
