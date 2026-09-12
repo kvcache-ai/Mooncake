@@ -1,6 +1,7 @@
 #include "common/client_buffer_allocation.h"
 
 #include "config.h"
+#include "config/hugepage_config.h"
 #include "ub_allocator.h"
 
 #include <cstdlib>
@@ -56,6 +57,34 @@ tl::expected<void *, std::string> allocate_vram_memory(
 #endif
 
 }  // namespace
+
+size_t get_hugepage_size_from_env(unsigned int *out_flags, bool use_memfd) {
+    const HugepageConfig config = HugepageConfig::FromEnvironment();
+    if (!config.enabled) {
+        return 0;
+    }
+
+    const size_t size = config.page_size;
+    if (out_flags == nullptr) {
+        return size;
+    }
+    if (use_memfd) {
+        *out_flags |= MFD_HUGETLB;
+        *out_flags |= size == SZ_2MB     ? MFD_HUGE_2MB
+                      : size == SZ_512MB ? MFD_HUGE_512MB
+                                         : MFD_HUGE_1GB;
+    } else {
+        *out_flags |= MAP_HUGETLB;
+        *out_flags |= size == SZ_2MB     ? MAP_HUGE_2MB
+                      : size == SZ_512MB ? MAP_HUGE_512MB
+                                         : MAP_HUGE_1GB;
+    }
+    LOG(INFO) << "Using hugepage size: "
+              << (size == SZ_2MB     ? "2MB"
+                  : size == SZ_512MB ? "512MB"
+                                     : "1GB");
+    return size;
+}
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,

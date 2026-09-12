@@ -965,11 +965,16 @@ class BenchmarkRunner:
         sessions = self._make_sessions()
         per_lane_stats: List[Optional[PhaseStats]] = [None] * self.lane_count
         threads: List[threading.Thread] = []
+        errors: List[Optional[BaseException]] = [None] * self.lane_count
 
         def runner(index: int, session: StoreSession) -> None:
             stats = PhaseStats(name=f"{phase_name}/lane{index}")
             stats.start_time = time.perf_counter()
-            worker_builder(session, index)(stats)
+            try:
+                worker_builder(session, index)(stats)
+            except BaseException as exc:
+                errors[index] = exc
+                return
             stats.end_time = time.perf_counter()
             per_lane_stats[index] = stats
 
@@ -984,6 +989,11 @@ class BenchmarkRunner:
 
         for thread in threads:
             thread.join()
+
+        # Join every lane before allowing the caller to release shared buffers.
+        for lane_id, error in enumerate(errors):
+            if error is not None:
+                raise RuntimeError(f"{phase_name} lane {lane_id} failed") from error
 
         merged = merge_stats(phase_name, [s for s in per_lane_stats if s is not None])
         log_phase_stats(merged)

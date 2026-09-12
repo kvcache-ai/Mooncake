@@ -204,6 +204,13 @@ class NcclTransport {
     // NCCL backend.
     virtual bool allRanksSucceeded(bool local_success) = 0;
     virtual NcclLsaTopology lsaTopology() const = 0;
+
+    // Failure path for an obsolete communicator generation. The caller must
+    // first ensure that no Mooncake kernel can still access its device context.
+    // Unlike shutdown(), an implementation may release it without healthy peer
+    // participation. The default preserves source compatibility for external
+    // transports that do not need a distinct local-abort path.
+    virtual int abort() { return shutdown(); }
 };
 
 // Create the CUDA-only NCCL LSA/GIN device transport.

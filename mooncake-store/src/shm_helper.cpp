@@ -11,6 +11,7 @@
 
 #include "common/client_buffer_allocation.h"
 #include "config.h"
+#include "config/hugepage_config.h"
 #if defined(USE_ASCEND_DIRECT)
 #include "ascend_allocator.h"
 #endif
@@ -37,8 +38,7 @@ ShmHelper* ShmHelper::getInstance() {
 }
 
 ShmHelper::ShmHelper() {
-    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
 }
 
 ShmHelper::~ShmHelper() { cleanup(); }

@@ -264,6 +264,10 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 #endif
 #if defined(USE_MUSA)
         return allocatePerQpGpuVaControlBuffers();
+#elif defined(USE_MACA)
+        // MACA C500 currently rejects the GPU-VA control UMEM at CREATE_QP;
+        // start with the host-mapped control layout used by the fallback path.
+        return allocateControlBuffer(ControlMemoryMode::kHostMapped);
 #else
         return allocateControlBuffer(ControlMemoryMode::kGpuVa);
 #endif

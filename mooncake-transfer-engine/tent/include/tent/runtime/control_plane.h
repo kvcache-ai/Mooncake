@@ -30,6 +30,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <limits>
 
 #include "tent/runtime/metastore.h"
 #include "tent/runtime/segment.h"
@@ -121,6 +122,16 @@ struct XferDataDesc {
     uint64_t peer_mem_addr;
     size_t length;
 };
+
+// Standard TCP RPC payload boundaries. READ retains the server's 1 GiB cap;
+// WRITE uses a 32-bit RPC attachment that includes XferDataDesc.
+inline constexpr size_t kTcpMaxReadBytes = size_t{1} << 30;
+inline constexpr size_t kTcpMaxWriteBytes =
+    std::numeric_limits<uint32_t>::max() - sizeof(XferDataDesc);
+
+inline constexpr size_t tcpMaxTransferBytes(Request::OpCode opcode) {
+    return opcode == Request::READ ? kTcpMaxReadBytes : kTcpMaxWriteBytes;
+}
 
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;

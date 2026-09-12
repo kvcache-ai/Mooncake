@@ -572,6 +572,20 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 }
 
+tl::expected<int, ErrorCode> MasterService::GetDfsShardCount() const {
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return dfs_allocator_->GetShardCount();
+}
+
+tl::expected<int, ErrorCode> MasterService::ExpandDfsShards(int shard_count) {
+    if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+    return dfs_allocator_->ExpandShards(shard_count);
+}
+
 void MasterService::InitDfsAllocatorFromEnvironment(
     const MasterServiceConfig& config) {
     enable_dfs_ = Environ::GetBool(
@@ -606,7 +620,7 @@ void MasterService::InitDfsAllocatorFromEnvironment(
     }
 
     LOG(INFO) << "DFS allocator initialized, config={" << dfs_config.FormatStr()
-              << "}";
+              << "}, ready_shard_count=" << dfs_allocator_->GetShardCount();
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
@@ -4432,41 +4446,17 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
-auto MasterService::AllocateAndInsertMetadata(
-    metadata::TenantCatalog& tenant_state, const UUID& client_id,
-    const std::string& key, uint64_t value_length,
-    const ReplicateConfig& config, const std::string& writer_host_id,
-    const std::string& group_id, const TenantId& tenant_id,
-    const std::chrono::system_clock::time_point& now,
-    const ResolvedSoftPinRequest& soft_pin_request,
-    uint64_t& quota_deficit_bytes,
-    std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    const auto deadline_to_index = committed_soft_pin_timeout;
-    if (tenant_state.ContainsObject(key)) {
-        LOG(INFO) << "key=" << key << ", info=object_already_exists";
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-    }
-
-    const uint64_t pending_quota_charge =
-        RequestedMemoryQuotaCharge(value_length, config);
-    auto quota_result =
-        ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
-                          pending_quota_charge, &quota_deficit_bytes);
-    if (!quota_result) {
-        return tl::make_unexpected(quota_result.error());
-    }
-    auto refund_pending_quota = [&] {
-        ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
-                           pending_quota_charge);
-    };
-
+auto MasterService::AllocateReplicas(const std::string& key,
+                                     uint64_t value_length,
+                                     const ReplicateConfig& config,
+                                     const std::string& writer_host_id)
+    -> tl::expected<std::vector<Replica>, ErrorCode> {
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
+
     if (config.replica_num > 0) {
         std::vector<std::string> preferred_segments;
         auto append_preferred_segment = [&preferred_segments](
@@ -4516,7 +4506,6 @@ auto MasterService::AllocateAndInsertMetadata(
             VLOG(1) << "Failed to allocate replicas for key=" << key
                     << ", error: " << allocation_result.error();
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                refund_pending_quota();
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
@@ -4524,7 +4513,6 @@ auto MasterService::AllocateAndInsertMetadata(
                 if (has_enough_memory_segments) {
                     need_mem_eviction_ = true;
                 }
-                refund_pending_quota();
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
         } else {
@@ -4551,13 +4539,11 @@ auto MasterService::AllocateAndInsertMetadata(
             VLOG(1) << "Failed to allocate nof replicas for key=" << key
                     << ", error: " << allocation_result.error();
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
-                refund_pending_quota();
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
                 need_nof_eviction_ = true;
-                refund_pending_quota();
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
         } else {
@@ -4591,7 +4577,6 @@ auto MasterService::AllocateAndInsertMetadata(
                 << ", allocated_memory_replicas=" << allocated_memory_replicas
                 << ", requested_nof_replicas=" << config.nof_replica_num
                 << ", allocated_nof_replicas=" << allocated_nof_replicas;
-        refund_pending_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 
@@ -4621,17 +4606,35 @@ auto MasterService::AllocateAndInsertMetadata(
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=dfs_allocator_not_initialized";
-            refund_pending_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
         auto alloc = dfs_allocator_->Allocate(key, value_length);
         if (!alloc) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=" << alloc.error();
-            refund_pending_quota();
             return tl::make_unexpected(alloc.error());
         }
         replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
+    }
+
+    return replicas;
+}
+
+auto MasterService::InsertMetadata(
+    metadata::TenantCatalog& tenant_state, const UUID& client_id,
+    const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config, const std::string& group_id,
+    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
+    const ResolvedSoftPinRequest& soft_pin_request,
+    std::vector<Replica>&& replicas, uint64_t pending_quota_charge,
+    std::optional<std::chrono::system_clock::time_point>
+        committed_soft_pin_timeout)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    const auto deadline_to_index = committed_soft_pin_timeout;
+    if (tenant_state.ContainsObject(key)) {
+        FreeDfsReplicas(key, replicas);
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -4679,7 +4682,6 @@ auto MasterService::AllocateAndInsertMetadata(
     if (!tenant_state.InsertObject(key, entry)) {
         FreeDfsReplicas(key, entry->metadata().GetAllReplicas());
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
-        refund_pending_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
     }
     if (enable_multi_tenants_) {
@@ -4688,7 +4690,8 @@ auto MasterService::AllocateAndInsertMetadata(
         if (!adopt_result) {
             LogTenantQuotaLedgerError(adopt_result, "adopt_pending", tenant_id,
                                       key);
-            refund_pending_quota();
+            ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                               pending_quota_charge);
             object_lock.unlock();
             tenant_state.EraseObjectIf(key, entry.get());
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
@@ -4703,6 +4706,51 @@ auto MasterService::AllocateAndInsertMetadata(
     entry->is_processing = true;
 
     return replica_list;
+}
+
+auto MasterService::AllocateAndInsertMetadata(
+    metadata::TenantCatalog& tenant_state, const UUID& client_id,
+    const std::string& key, uint64_t value_length,
+    const ReplicateConfig& config, const std::string& writer_host_id,
+    const std::string& group_id, const TenantId& tenant_id,
+    const std::chrono::system_clock::time_point& now,
+    const ResolvedSoftPinRequest& soft_pin_request,
+    uint64_t& quota_deficit_bytes,
+    std::optional<std::chrono::system_clock::time_point>
+        committed_soft_pin_timeout)
+    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    if (tenant_state.ContainsObject(key)) {
+        LOG(INFO) << "key=" << key << ", info=object_already_exists";
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
+    const uint64_t pending_quota_charge =
+        RequestedMemoryQuotaCharge(value_length, config);
+    auto quota_result =
+        ChargeTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                          pending_quota_charge, &quota_deficit_bytes);
+    if (!quota_result) {
+        return tl::make_unexpected(quota_result.error());
+    }
+
+    auto allocation_result =
+        AllocateReplicas(key, value_length, config, writer_host_id);
+    if (!allocation_result) {
+        ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                           pending_quota_charge);
+        return tl::make_unexpected(allocation_result.error());
+    }
+
+    auto insert_result = InsertMetadata(
+        tenant_state, client_id, key, value_length, config, group_id, tenant_id,
+        now,
+        soft_pin_request, std::move(allocation_result.value()),
+        pending_quota_charge, std::move(committed_soft_pin_timeout));
+    if (!insert_result) {
+        ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                           pending_quota_charge);
+    }
+    return insert_result;
 }
 
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
@@ -5378,8 +5426,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
 //
 // Three-way dispatch depending on key state:
 //   Case A: key does not exist  → allocate new buffers (same as PutStart)
-//   Case B: key exists, same size → in-place update (reuse existing buffers)
-//   Case C: key exists, different size → discard old + allocate new
+//   Case B: key exists, same size, no readers → in-place update
+//   Case C: key exists, different size or leased memory → allocate new buffers
 //
 // Before reaching Case B/C the function runs safety checks and may preempt
 // an in-progress Put/Upsert on the same key.  Preempted PROCESSING replicas
@@ -5667,14 +5715,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 }
 
                 if (metadata.size == slice_length) {
-                    // --- Case B: same size — in-place update ---
-                    // Reuse existing buffer addresses.  No allocation or
-                    // deallocation. The client will RDMA-write new data to the
-                    // same addresses.
-                    //
-                    // hard_pinned is const and preserved automatically — upsert
-                    // does not change the eviction protection level of an
-                    // existing object.
+                    // Validate same-size DFS topology before changing storage.
                     const size_t existing_dfs_replicas =
                         metadata.CountReplicas(&Replica::fn_is_dfs_replica);
                     if (config.dfs_replica_num > 0 ||
@@ -5701,7 +5742,19 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                 ErrorCode::INVALID_PARAMS);
                         }
                     }
+                }
 
+                const bool has_read_lease = !metadata.IsLeaseExpired(now);
+                if (has_read_lease &&
+                    metadata.HasReplica([](const Replica& replica) {
+                        return !replica.is_memory_replica();
+                    })) {
+                    // File-backed reads can resolve storage by key, so they
+                    // cannot retain an old version across replacement.
+                    return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+                }
+
+                if (metadata.size == slice_length && !has_read_lease) {
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -5739,8 +5792,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return replica_list;
                 }
 
-                // --- Case C: different size — discard old replicas and
-                // reallocate
+                // --- Case C: different size or active readers — reallocate
                 // --- Old buffers cannot be reused.  Move them to
                 // discarded_replicas_ for delayed release (readers may still
                 // hold descriptors without refcnt), then allocate fresh buffers
@@ -5766,6 +5818,33 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const bool has_replacement_charge =
                     enable_multi_tenants_ &&
                     metadata.quota_ledger.TotalChargedBytes() != 0;
+
+                // A leased memory snapshot still references the old replica
+                // descriptors. Allocate the replacement before removing the
+                // old metadata so an allocation failure leaves the old object
+                // readable instead of turning it into OBJECT_NOT_FOUND.
+                std::optional<std::vector<Replica>> replacement_replicas;
+                uint64_t replacement_pending_quota_charge = 0;
+                if (has_read_lease) {
+                    replacement_pending_quota_charge =
+                        RequestedMemoryQuotaCharge(slice_length, merged_config);
+                    auto quota_result = ChargeTenantQuota(
+                        quota_account, replacement_pending_quota_charge,
+                        &quota_deficit_bytes);
+                    if (!quota_result) {
+                        return tl::make_unexpected(quota_result.error());
+                    }
+                    auto allocation_result = AllocateReplicas(
+                        key, slice_length, merged_config, writer_host_id);
+                    if (!allocation_result) {
+                        ReleaseTenantQuota(quota_account,
+                                           replacement_pending_quota_charge);
+                        return tl::make_unexpected(allocation_result.error());
+                    }
+                    replacement_replicas.emplace(
+                        std::move(allocation_result.value()));
+                }
+
                 if (has_replacement_charge) {
                     auto transfer_result =
                         metadata.quota_ledger.TransferReplacementCharge(
@@ -5774,17 +5853,31 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         LogTenantQuotaLedgerError(transfer_result,
                                                   "transfer_replacement_out",
                                                   object_id.tenant_id, key);
+                        if (replacement_replicas.has_value()) {
+                            FreeDfsReplicas(key, *replacement_replicas);
+                            ReleaseTenantQuota(
+                                quota_account,
+                                replacement_pending_quota_charge);
+                        }
                         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
                     }
                 }
+                // A query granted before this write lock can retain its
+                // descriptor for a full read TTL. Keep the old allocation for
+                // at least that long as well as the writer grace period.
+                const auto release_at =
+                    std::chrono::system_clock::now() +
+                    std::max(
+                        std::chrono::milliseconds(default_kv_lease_ttl_),
+                        std::chrono::duration_cast<std::chrono::milliseconds>(
+                            put_start_release_timeout_sec_));
                 auto old_replicas =
                     PopReplicasWithCacheTotalAccounting(metadata);
                 if (!old_replicas.empty()) {
                     FreeDfsReplicas(key, old_replicas);
                     std::lock_guard lock(discarded_replicas_mutex_);
-                    discarded_replicas_.emplace_back(
-                        std::move(old_replicas),
-                        now + put_start_release_timeout_sec_);
+                    discarded_replicas_.emplace_back(std::move(old_replicas),
+                                                     release_at);
                 }
                 EraseMetadataLocked(tenant_state, object_entry,
                                     object_id.tenant_id, std::move(entry_lock),
@@ -5793,12 +5886,28 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
-                auto allocate_result = AllocateAndInsertMetadata(
-                    tenant_state, client_id, key, slice_length, merged_config,
-                    writer_host_id, existing_group_id, object_id.tenant_id, now,
-                    *soft_pin_request, quota_deficit_bytes,
-                    std::move(committed_soft_pin_timeout));
+                tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+                    allocate_result =
+                        replacement_replicas.has_value()
+                            ? InsertMetadata(
+                                  tenant_state, client_id, key, slice_length,
+                                  merged_config, existing_group_id,
+                                  object_id.tenant_id, now, *soft_pin_request,
+                                  std::move(*replacement_replicas),
+                                  replacement_pending_quota_charge,
+                                  std::move(committed_soft_pin_timeout))
+                            : AllocateAndInsertMetadata(
+                                  tenant_state, client_id, key, slice_length,
+                                  merged_config, writer_host_id,
+                                  existing_group_id, object_id.tenant_id, now,
+                                  *soft_pin_request, quota_deficit_bytes,
+                                  std::move(committed_soft_pin_timeout));
+
                 if (!allocate_result) {
+                    if (replacement_replicas.has_value()) {
+                        ReleaseTenantQuota(quota_account,
+                                           replacement_pending_quota_charge);
+                    }
                     if (has_replacement_charge) {
                         auto rollback_result =
                             replacement_charge.ReleaseReplacement(

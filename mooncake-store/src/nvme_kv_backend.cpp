@@ -4,7 +4,6 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -18,6 +17,7 @@
 #include <utility>
 #include <vector>
 
+#include "config/nvme_kv_io_concurrency_config.h"
 #include "nvme_kv_executor_util.h"
 #include "nvme_kv_key_codec.h"
 #include "nvme_kv_key_conflict_policy.h"
@@ -28,31 +28,11 @@ namespace mooncake {
 namespace {
 
 constexpr uint32_t kMinMaxValueSize = sizeof(NvmeKvObjectHeader) + 1;
-constexpr size_t kDefaultMaxIoConcurrency = 256;
-constexpr size_t kDefaultIoConcurrency = 18;
-constexpr size_t kDefaultPrepareConcurrency = 12;
-constexpr size_t kDefaultBatchSubmitConcurrency = 6;
-constexpr size_t kDefaultRootSubmitConcurrency = 1;
 constexpr size_t kDefaultReadPlanBatchSize = 8;
 
 size_t PositiveSizeEnvOr(const char *name, size_t fallback, size_t maximum) {
     const uint32_t parsed = ParseNvmeKvU32EnvOr(name, 0);
     return parsed == 0 ? fallback : std::min<size_t>(parsed, maximum);
-}
-
-size_t MaxIoConcurrency() {
-    return PositiveSizeEnvOr("MOONCAKE_NVME_KV_MAX_IO_CONCURRENCY",
-                             kDefaultMaxIoConcurrency, UINT32_MAX);
-}
-
-std::optional<size_t> ConfiguredIoConcurrency(size_t max_io_concurrency) {
-    const char *configured = std::getenv("MOONCAKE_NVME_KV_IO_CONCURRENCY");
-    if (configured == nullptr || configured[0] == '\0') {
-        return std::nullopt;
-    }
-    const size_t parsed = PositiveSizeEnvOr("MOONCAKE_NVME_KV_IO_CONCURRENCY",
-                                            0, max_io_concurrency);
-    return parsed == 0 ? std::nullopt : std::optional<size_t>(parsed);
 }
 
 class IndexQueue {
@@ -216,37 +196,16 @@ NvmeKvStorageBackend::NvmeKvStorageBackend(
     : StorageBackendInterface(file_storage_config_) {}
 
 void NvmeKvStorageBackend::InitIoWorkers() {
-    const size_t max_io_concurrency = MaxIoConcurrency();
-    if (auto configured = ConfiguredIoConcurrency(max_io_concurrency);
-        configured.has_value()) {
-        io_parallelism_ = *configured;
-    } else {
-        const size_t queue_depth =
-            std::max<size_t>(1, connector_->GetCapabilities().queue_depth);
-        io_parallelism_ = std::min(
-            queue_depth, std::min(kDefaultIoConcurrency, max_io_concurrency));
-    }
+    const auto config = NvmeKvIoConcurrencyConfig::FromEnvironment(
+        connector_->GetCapabilities().queue_depth);
+    const size_t max_io_concurrency = config.max_io_concurrency;
+    io_parallelism_ = config.io_concurrency;
+    batch_submit_concurrency_ = config.batch_submit_concurrency;
+    root_submit_concurrency_ = config.root_submit_concurrency;
+    prepare_concurrency_ = config.prepare_concurrency;
     if (io_parallelism_ > 1) {
         io_workers_ = std::make_unique<ThreadPool>(io_parallelism_);
     }
-    const size_t max_submit_concurrency =
-        io_parallelism_ > 1 ? io_parallelism_ - 1 : 1;
-    batch_submit_concurrency_ = PositiveSizeEnvOr(
-        "MOONCAKE_NVME_KV_BATCH_SUBMIT_CONCURRENCY",
-        std::min(kDefaultBatchSubmitConcurrency, max_submit_concurrency),
-        max_submit_concurrency);
-    root_submit_concurrency_ = PositiveSizeEnvOr(
-        "MOONCAKE_NVME_KV_ROOT_SUBMIT_CONCURRENCY",
-        std::min(kDefaultRootSubmitConcurrency, max_submit_concurrency),
-        max_submit_concurrency);
-    const size_t max_prepare_concurrency =
-        io_parallelism_ > batch_submit_concurrency_
-            ? io_parallelism_ - batch_submit_concurrency_
-            : 1;
-    prepare_concurrency_ = PositiveSizeEnvOr(
-        "MOONCAKE_NVME_KV_PREPARE_CONCURRENCY",
-        std::min(kDefaultPrepareConcurrency, max_prepare_concurrency),
-        max_prepare_concurrency);
     if (batch_submit_concurrency_ > 1) {
         submit_workers_ =
             std::make_unique<ThreadPool>(batch_submit_concurrency_);

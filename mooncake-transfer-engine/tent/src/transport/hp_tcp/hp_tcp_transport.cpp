@@ -118,7 +118,8 @@ Status HighPerformanceTcpTransport::validateParams() const {
     if (params_.worker_count == 0 || params_.connections_per_peer == 0 ||
         params_.max_outstanding_tasks == 0 ||
         params_.max_outstanding_bytes == 0 || params_.max_transfer_bytes == 0 ||
-        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0) {
+        params_.connect_timeout_ms == 0 || params_.progress_timeout_ms == 0 ||
+        params_.idle_connection_timeout_ms == 0) {
         return Status::InvalidArgument(
             "invalid high-performance TCP limits" LOC_MARK);
     }
@@ -240,7 +241,7 @@ Status HighPerformanceTcpTransport::install(
             static_cast<size_t>(std::min<uint64_t>(kIoProgressStepBytes,
                                                    params_.max_transfer_bytes)),
             params_.connect_timeout_ms, params_.progress_timeout_ms,
-            params_.connections_per_peer},
+            params_.connections_per_peer, params_.idle_connection_timeout_ms},
         workers_.get());
 
     const uint64_t max_connections_u64 = std::max<uint64_t>(
@@ -422,6 +423,10 @@ Status HighPerformanceTcpTransport::uninstall() {
     workers_.reset();
     admission_.reset();
     metadata_.reset();
+    {
+        std::lock_guard<std::mutex> lock(lane_sequence_mutex_);
+        next_lane_sequence_.clear();
+    }
     installed_.store(false, std::memory_order_release);
     return first;
 }
@@ -559,6 +564,14 @@ Status HighPerformanceTcpTransport::planTask(
     task->setRequestId(request_id);
     planned_task = task;
 
+    uint64_t lane_sequence;
+    {
+        std::lock_guard<std::mutex> lock(lane_sequence_mutex_);
+        // Preserve the first lane choice, then advance independently.
+        auto it = next_lane_sequence_.try_emplace(request.target_id, request_id)
+                      .first;
+        lane_sequence = it->second++;
+    }
     uint64_t slice_offset = 0;
     for (size_t slice = 0; slice < slice_count; ++slice) {
         const uint64_t slice_length =
@@ -568,7 +581,7 @@ Status HighPerformanceTcpTransport::planTask(
         uint32_t endpoint_id = 0;
         if (slice_count == 1) {
             lane_id = static_cast<uint32_t>(
-                request_id %
+                lane_sequence %
                 static_cast<uint64_t>(params_.connections_per_peer));
             endpoint_id = static_cast<uint32_t>(lane_id % endpoint_count);
         } else {
@@ -576,9 +589,9 @@ Status HighPerformanceTcpTransport::planTask(
             const size_t lanes_for_endpoint =
                 1 + (params_.connections_per_peer - 1 - endpoint_id) /
                         endpoint_count;
-            lane_id = static_cast<uint32_t>(endpoint_id +
-                                            (request_id % lanes_for_endpoint) *
-                                                endpoint_count);
+            lane_id = static_cast<uint32_t>(
+                endpoint_id +
+                (lane_sequence % lanes_for_endpoint) * endpoint_count);
         }
         const auto& endpoint = endpoint_attr.endpoints[endpoint_id];
         const size_t owner_worker =

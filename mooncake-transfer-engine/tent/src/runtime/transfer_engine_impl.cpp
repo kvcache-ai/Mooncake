@@ -739,7 +739,10 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     options.internal = internal;
     if (location == kWildcardLocation ||
         LocationParser(location).type() == "cpu") {
-        if (transport_list_[SHM])
+        if (transport_list_[MNNVL] &&
+            transport_list_[MNNVL]->capabilities().dram_to_dram)
+            options.type = MNNVL;  // EGM: host memory NVLink peers can address
+        else if (transport_list_[SHM])
             options.type = SHM;
         else if (transport_list_[RDMA])
             options.type = RDMA;
@@ -763,7 +766,13 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                MemoryOptions& options) {
     if (options.type == UNSPEC) {
-        if (transport_list_[RDMA])
+        auto location_type = LocationParser(options.location).type();
+        bool host_location =
+            options.location == kWildcardLocation || location_type == "cpu";
+        if (host_location && transport_list_[MNNVL] &&
+            transport_list_[MNNVL]->capabilities().dram_to_dram)
+            options.type = MNNVL;  // EGM: host memory NVLink peers can address
+        else if (transport_list_[RDMA])
             options.type = RDMA;
         else if (transport_list_[TCP])
             options.type = TCP;
@@ -923,11 +932,14 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             }
         }
         if (options.internal) desc.internal = options.internal;
+        desc.permission = options.perm;
         desc_list.push_back(std::move(desc));
     }
 
+    bool need_sync = false;
     auto status = local_segment_tracker_->addInBatch(
-        desc_list, [&](std::vector<BufferDesc>& descs) -> Status {
+        desc_list,
+        [&](std::vector<BufferDesc>& descs) -> Status {
             const bool hp_tcp_required =
                 options.type == HP_TCP ||
                 (options.type == UNSPEC && transports.size() == 1 &&
@@ -948,11 +960,19 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 }
             }
             return Status::OK();
+        },
+        [&](BufferDesc& desc) {
+            need_sync = true;
+            deregisterRemovedBuffer(desc);
         });
-    if (!status.ok()) return status;
     // Synchronize local segment to metadata server so remote peers can see the
     // new buffers
-    return metadata_->segmentManager().synchronizeLocal();
+    if (status.ok()) return metadata_->segmentManager().synchronizeLocal();
+    if (need_sync) {
+        auto sync_status = metadata_->segmentManager().synchronizeLocal();
+        if (!sync_status.ok()) LOG(WARNING) << sync_status.ToString();
+    }
+    return status;
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
@@ -962,24 +982,7 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             removed = true;
-            const auto registered_transports = desc.transports;
-            for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                auto& transport = transport_list_[type];
-                if (!transport) continue;
-                const auto transport_type = static_cast<TransportType>(type);
-                const bool advertised =
-                    std::find(registered_transports.begin(),
-                              registered_transports.end(),
-                              transport_type) != registered_transports.end();
-                if (!advertised && !transport->tracksLocalBuffer(desc))
-                    continue;
-                auto status = transport->removeMemoryBuffer(desc);
-                if (!status.ok()) LOG(WARNING) << status.ToString();
-            }
-            for (auto type : registered_transports) {
-                TentMetrics::instance().recordRegisteredBufferBytes(
-                    type, -static_cast<int64_t>(desc.length));
-            }
+            deregisterRemovedBuffer(desc);
             return Status::OK();
         });
     if (!status.ok()) return status;
@@ -1000,26 +1003,7 @@ Status TransferEngineImpl::unregisterLocalMemory(
             (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
             [&](BufferDesc& desc) -> Status {
                 removed = true;
-                const auto registered_transports = desc.transports;
-                for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                    auto& transport = transport_list_[type];
-                    if (!transport) continue;
-                    const auto transport_type =
-                        static_cast<TransportType>(type);
-                    const bool advertised =
-                        std::find(registered_transports.begin(),
-                                  registered_transports.end(),
-                                  transport_type) !=
-                        registered_transports.end();
-                    if (!advertised && !transport->tracksLocalBuffer(desc))
-                        continue;
-                    auto s = transport->removeMemoryBuffer(desc);
-                    if (!s.ok()) LOG(WARNING) << s.ToString();
-                }
-                for (auto type : registered_transports) {
-                    TentMetrics::instance().recordRegisteredBufferBytes(
-                        type, -static_cast<int64_t>(desc.length));
-                }
+                deregisterRemovedBuffer(desc);
                 return Status::OK();
             });
         if (!status.ok()) return status;
@@ -1027,6 +1011,29 @@ Status TransferEngineImpl::unregisterLocalMemory(
     }
     if (!removed_any) return Status::OK();
     return metadata_->segmentManager().synchronizeLocal();
+}
+
+void TransferEngineImpl::deregisterRemovedBuffer(BufferDesc& desc) {
+    const BufferDesc original_desc = desc;
+    const auto& registered_transports = original_desc.transports;
+    for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
+        auto& transport = transport_list_[type];
+        if (!transport) continue;
+        const auto transport_type = static_cast<TransportType>(type);
+        const bool advertised =
+            std::find(registered_transports.begin(),
+                      registered_transports.end(),
+                      transport_type) != registered_transports.end();
+        BufferDesc transport_desc = original_desc;
+        if (!advertised && !transport->tracksLocalBuffer(transport_desc))
+            continue;
+        auto status = transport->removeMemoryBuffer(transport_desc);
+        if (!status.ok()) LOG(WARNING) << status.ToString();
+    }
+    for (auto type : registered_transports) {
+        TentMetrics::instance().recordRegisteredBufferBytes(
+            type, -static_cast<int64_t>(original_desc.length));
+    }
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
@@ -1492,6 +1499,7 @@ struct TransferEngineImpl::PreparedSubmit {
     struct Task {
         size_t merged_task_index{0};
         size_t task_id{0};
+        size_t public_length{0};
     };
 
     struct Owner {
@@ -1767,13 +1775,19 @@ void TransferEngineImpl::findStagingPolicy(const Request& request,
     if (transport_list_[MNNVL] && transport_list_[NVLINK]) {
         auto& xport = transport_list_[MNNVL];
         auto& caps = xport->capabilities();
+        // A remote host buffer is directly addressable only when the peer
+        // exported it over MNNVL (EGM); plain host memory still needs the
+        // staging path even if this side advertises dram_to_dram.
+        const bool remote_mnnvl =
+            std::find(entry->transports.begin(), entry->transports.end(),
+                      MNNVL) != entry->transports.end();
         if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CPU &&
-            !caps.dram_to_dram) {
+            !(caps.dram_to_dram && remote_mnnvl)) {
             policy.push_back(server_addr);
             policy.push_back(topology_->findNearMem(local, Topology::MEM_CUDA));
             policy.push_back("");  // remote stage
         } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
-                   !caps.gpu_to_dram) {
+                   !(caps.gpu_to_dram && remote_mnnvl)) {
             policy.push_back(server_addr);
             policy.push_back("");  // no local stage
             policy.push_back(desc->getMemory().topology.findNearMem(
@@ -1849,6 +1863,38 @@ Status TransferEngineImpl::prepareSubmit(
     auto merged =
         mergeRequests(request_list, merge_boundaries, merge_requests_);
 
+    // Limit only oversized merges that would use standard TCP. In
+    // particular, an UNSPEC request selected for RDMA/HP TCP keeps its own
+    // transport's limits. Ordinary-size submissions need no extra route lookup
+    // or allocation here, and a too-large single request remains independent.
+    // This bounds initial TCP selection only. A later route change/failover
+    // to TCP can still reject an oversized owner; it is not split on retry.
+    if (merged.request_list.size() < request_list.size()) {
+        std::vector<bool> tcp_limited;
+        for (size_t i = 0; i < merged.request_list.size(); ++i) {
+            const auto& request = merged.request_list[i];
+            if (request.length <= tcpMaxTransferBytes(request.opcode)) continue;
+            if (request.transport_hint == TCP ||
+                (request.transport_hint == UNSPEC &&
+                 getTransportType(request, 0).transport == TCP)) {
+                if (tcp_limited.empty())
+                    tcp_limited.resize(merged.request_list.size(), false);
+                tcp_limited[i] = true;
+            }
+        }
+        if (!tcp_limited.empty()) {
+            for (const auto& [public_id, owner_id] : merged.task_lookup) {
+                if (tcp_limited[owner_id]) {
+                    auto& limit = merge_boundaries[public_id].max_merge_bytes;
+                    limit = std::min<uint64_t>(
+                        limit,
+                        tcpMaxTransferBytes(request_list[public_id].opcode));
+                }
+            }
+            merged = mergeRequests(request_list, merge_boundaries, true);
+        }
+    }
+
     prepared.owners.reserve(merged.request_list.size());
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
@@ -1873,7 +1919,8 @@ Status TransferEngineImpl::prepareSubmit(
         } else {
             owner.derived_task_ids.push_back(task_id);
         }
-        prepared.tasks.push_back({merged_task_index, task_id});
+        prepared.tasks.push_back({merged_task_index, task_id,
+                                  request_list[public_task_index].length});
     }
     return Status::OK();
 }
@@ -1916,6 +1963,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
+            task.public_length = task_plan.public_length;
             if (task.type != UNSPEC) {
                 auto owner_it =
                     owner_task_id_by_merged_task.find(merged_task_id);
@@ -1932,6 +1980,7 @@ Status TransferEngineImpl::commitPreparedSubmit(
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = merged_request;
+        task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time =
             prepared.submit_time;  // Record start time for latency tracking
@@ -2137,6 +2186,7 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         task.runtime_policy = prepared.runtime_policy;
         task.status = PENDING;
         task.request = owner.request;
+        task.public_length = task_plan.public_length;
         task.staging = false;
         task.start_time = prepared.submit_time;
         task.type = UNSPEC;
@@ -2660,6 +2710,13 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (task.type == HP_TCP) task_status = {PENDING, 0};
     Status result =
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
+    if (task.type == TCP && task_status.s == FAILED &&
+        result.IsRpcServiceError()) {
+        // Standard TCP reports an uncertain WRITE through this error result.
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        task.suppress_failover = true;
+        return Status::OK();
+    }
     if (result.ok() || task.type != HP_TCP || task_status.s != FAILED) {
         return result;
     }
@@ -2841,7 +2898,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
                 task_status.s = public_status;
                 task_status.transferred_bytes =
                     public_status == COMPLETED
-                        ? batch->task_list[public_task_id].request.length
+                        ? batch->task_list[public_task_id].public_length
                         : 0;
                 return Status::OK();
             }
@@ -2871,7 +2928,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     recordTaskCompletionMetrics(batch->task_list[poll_task_id], prev_status,
                                 task_status.s);
 
-    if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
+    if (task_status.s == COMPLETED) {
+        task_status.transferred_bytes =
+            batch->task_list[public_task_id].public_length;
+        CHECK_STATUS(maybeFireSubmitHooks(batch));
+    }
     return Status::OK();
 }
 
@@ -2991,13 +3052,9 @@ Status TransferEngineImpl::getBatchStatus(BatchID batch_id,
         overall_status.s = worst_failure;
     }
     // else: some tasks still PENDING → overall_status.s stays PENDING
-    // Transfer-bound notifications may only be delivered once the transfer
-    // they are attached to has actually completed. The second parameter is
-    // "verify completion before sending", so passing the batch's completion
-    // into it inverted the guard: for a batch still in flight, or one that
-    // ended in failure, check was false and every hook fired anyway.
-    if (overall_status.s == COMPLETED)
-        CHECK_STATUS(maybeFireSubmitHooks(batch, /*check=*/false));
+    // A hook belongs to its own submit interval. Other intervals can still
+    // be pending or failed without withholding this interval's notification.
+    CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
 

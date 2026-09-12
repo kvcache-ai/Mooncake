@@ -40,6 +40,7 @@ class HighPerformanceTcpClient::Lane
     }
 
     void cancelAll(TransferStatusEnum terminal) {
+        cancelTimer();
         while (!queue_.empty()) {
             Operation operation = std::move(queue_.front());
             queue_.pop_front();
@@ -50,9 +51,6 @@ class HighPerformanceTcpClient::Lane
             return;
         }
         forced_terminal_ = terminal;
-        ++timer_generation_;
-        std::error_code ignored;
-        timer_.cancel(ignored);
         resolver_.cancel();
         closeDirty();
         // The outstanding async callback owns the final completion. Releasing
@@ -133,7 +131,12 @@ class HighPerformanceTcpClient::Lane
                 self->runHandler(epoch, [&] {
                     if (self->finishForcedIfAny()) return;
                     if (error) {
-                        self->finishIoError(error);
+                        if (error == asio::error::host_not_found)
+                            self->finishCurrent(
+                                FAILED, 0, false,
+                                HighPerformanceTcpStatus::kStaleRegistration);
+                        else
+                            self->finishIoError(error);
                         return;
                     }
                     self->connect(epoch, std::move(results));
@@ -147,7 +150,8 @@ class HighPerformanceTcpClient::Lane
         socket_.close(ignored);
         if (!current_->local_host.empty()) {
             if (results.empty()) {
-                finishIoError(asio::error::host_not_found);
+                finishCurrent(FAILED, 0, false,
+                              HighPerformanceTcpStatus::kStaleRegistration);
                 return;
             }
             std::error_code error;
@@ -173,7 +177,12 @@ class HighPerformanceTcpClient::Lane
             self->runHandler(epoch, [&] {
                 if (self->finishForcedIfAny()) return;
                 if (error) {
-                    self->finishIoError(error);
+                    if (error == asio::error::connection_refused)
+                        self->finishCurrent(
+                            FAILED, 0, false,
+                            HighPerformanceTcpStatus::kStaleRegistration);
+                    else
+                        self->finishIoError(error);
                     return;
                 }
                 std::error_code option_error;
@@ -355,6 +364,24 @@ class HighPerformanceTcpClient::Lane
         timer_.cancel(ignored);
     }
 
+    void armIdleTimer() {
+        if (current_ || !queue_.empty() || !socket_.is_open()) return;
+        const uint64_t generation = ++timer_generation_;
+        timer_.expires_after(
+            std::chrono::milliseconds(config_.idle_connection_timeout_ms));
+        auto self = shared_from_this();
+        timer_.async_wait([self, generation](const std::error_code& error) {
+            if (error || generation != self->timer_generation_ ||
+                self->current_ || !self->queue_.empty()) {
+                return;
+            }
+            // Only the client knows that no request is in transit. Closing
+            // here releases receiver capacity without racing a reused WRITE
+            // against server-side eviction. The next operation reconnects.
+            self->closeDirty();
+        });
+    }
+
     bool matches(uint64_t epoch) const {
         return current_.has_value() && epoch == operation_epoch_;
     }
@@ -412,6 +439,7 @@ class HighPerformanceTcpClient::Lane
         completeStandalone(std::move(operation), terminal, bytes,
                            remote_status);
         startNext();
+        armIdleTimer();
     }
 
     void completeStandalone(

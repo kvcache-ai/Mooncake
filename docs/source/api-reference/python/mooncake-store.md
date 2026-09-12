@@ -760,6 +760,56 @@ store.put("key-a", b"value-a", config)
 
 ---
 
+(choosing-a-parallel-tensor-io-api)=
+## Choosing a Parallel Tensor IO API
+
+Use the API that matches the object being stored. The single-axis TP methods
+and the manifest-backed weight snapshot API have different storage contracts.
+
+| Requirement | Public API | Contract |
+| --- | --- | --- |
+| Store and retrieve a complete tensor | `put_tensor()` / `get_tensor()` | One ordinary Store tensor object. |
+| Split a full tensor and read a TP shard | `put_tensor_with_tp()` / `get_tensor_with_tp()` | Legacy single-axis TP tensor objects; batch and registered-buffer variants are also available. |
+| Save weights and restore into a different TP/DP/EP/PP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
+| Use `put/get_tensor_with_cp`, `*_with_dp`, `*_with_ep`, or `*_with_pp` | No such public convenience methods | DP/EP/PP weight placement is expressed through the manifest API; CP is not a supported axis. |
+| Supply an arbitrary parallel strategy through `*_with_config` | No such public tensor API | `ReplicateConfig` controls Store replication and placement policy, not tensor parallel topology. |
+
+For example, with an already initialized `MooncakeDistributedStore`, the
+legacy TP write accepts the **full** tensor and writes all shards. `tp_rank`
+on this write does not select a single shard to persist:
+
+```python
+import torch
+
+tensor = torch.linspace(0, 23, 24, dtype=torch.float32).reshape(4, 6)
+assert store.put_tensor_with_tp("tp-example", tensor, tp_size=2, split_dim=1) == 0
+shard = store.get_tensor_with_tp("tp-example", tp_rank=1, tp_size=2, split_dim=1)
+assert torch.equal(shard, tensor[:, 3:])
+```
+
+### Parallel configuration boundaries
+
+The model-weight API uses typed `ParallelTopology`, `WeightPlacementManifest`,
+and `WeightRuntimeBindingManifest` values supplied by the framework adapter.
+It does not provide a factory that generates a separate put/get method family
+for each axis, or accept an arbitrary strategy dictionary.
+
+- TP and EP can describe logical splits. EP splits the leading logical expert
+  dimension; TP names an explicit logical dimension.
+- DP describes replicas or ownership. PP describes framework-provided tensor
+  or layer ownership. Neither implies a tensor split dimension.
+- CP (context parallelism) is absent from the current topology and axis types.
+  A sequence-dimension slice through the TP API does not establish CP topology
+  support or CP-aware KV-cache resharding.
+- Combining supported axes still requires complete logical coverage and
+  compatible source/target tensor descriptors. The planner is copy-only; it
+  does not convert dtype, quantization, packing, or model semantics.
+
+See the [manifest contracts](../../design/reshard-manifest.md),
+[weight reshard planner](../../design/model-weight-reshard-planner.md), and
+[Store upload planning](../../design/model-weight-store-upload-planning.md)
+for the configuration and execution boundaries.
+
 ## Model Weight Snapshot API
 
 Heterogeneous model-weight snapshots use the manifest-backed Reshard API.
@@ -787,7 +837,8 @@ placement and runtime binding manifests.
 
 ### Breaking Change and Migration
 
-This release removes the public `*_with_parallelism` API family and the
+PR [#3772](https://github.com/kvcache-ai/Mooncake/pull/3772) removed the public
+`*_with_parallelism` API family and the
 associated `ParallelAxis`, `TensorParallelism`, and `ReadTarget` helper types.
 Applications that create heterogeneous model-weight snapshots migrate their
 write path to `begin_weight_snapshot()`, `write_tensor()`, and `commit()`.

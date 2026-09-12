@@ -3,10 +3,13 @@ import importlib.util
 import json
 import os
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 class FakeBufferLease:
@@ -214,6 +217,103 @@ class StoreSessionMetadataTest(unittest.TestCase):
         summary = json.loads((output_dir / "summary.json").read_text())
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["journal_records"], 5)
+
+
+class WorkerFailureTest(unittest.TestCase):
+    def setUp(self):
+        args = bench.build_parser().parse_args(["--scenario=metadata_smoke"])
+        self.runner = bench.BenchmarkRunner(args)
+        self.runner._sessions = [Mock()]
+        hook = patch.object(threading, "excepthook")
+        hook.start()
+        self.addCleanup(hook.stop)
+
+    def test_worker_and_builder_errors_reach_caller(self):
+        for during_build in (False, True):
+            for error in (ValueError("store failed"), SystemExit(0)):
+                with self.subTest(during_build=during_build, error=type(error)):
+
+                    def build(session, lane):
+                        if during_build:
+                            raise error
+
+                        def work(stats):
+                            raise error
+
+                        return work
+
+                    with self.assertRaisesRegex(
+                        RuntimeError, "probe.*lane 0"
+                    ) as caught:
+                        self.runner._run_threads("probe", build)
+                    self.assertIs(caught.exception.__cause__, error)
+
+    def test_failure_joins_every_lane_before_returning(self):
+        self.runner.lane_count = 2
+        self.runner._sessions = [Mock(), Mock()]
+        joined = []
+        finished = threading.Event()
+        original_join = threading.Thread.join
+
+        def join(thread, *args, **kwargs):
+            original_join(thread, *args, **kwargs)
+            joined.append(thread.name)
+
+        def build(session, lane):
+            def work(stats):
+                if lane == 0:
+                    raise RuntimeError("first lane failed")
+                finished.set()
+                stats.requests = 1
+
+            return work
+
+        with patch.object(threading.Thread, "join", join):
+            with self.assertRaises(RuntimeError):
+                self.runner._run_threads("probe", build)
+        self.assertEqual(joined, ["probe-lane0", "probe-lane1"])
+        self.assertTrue(finished.is_set())
+
+    def test_healthy_lanes_keep_their_statistics(self):
+        self.runner.lane_count = 2
+        self.runner._sessions = [Mock(), Mock()]
+
+        def build(session, lane):
+            def work(stats):
+                stats.requests = lane + 1
+                stats.successful_requests = lane + 1
+
+            return work
+
+        stats = self.runner._run_threads("probe", build)
+        self.assertEqual(stats.requests, 3)
+        self.assertEqual(stats.successful_requests, 3)
+        self.assertEqual(stats.failed_requests, 0)
+
+    def test_cli_fails_without_writing_success_and_closes_store(self):
+        for scenario, operation in (("metadata_smoke", "put"), ("verify_write", "get")):
+            with self.subTest(scenario=scenario), TemporaryDirectory() as directory:
+                store = Mock()
+                store.setup.return_value = 0
+                store.put.return_value = 0
+                getattr(store, operation).side_effect = RuntimeError("store failed")
+                argv = [
+                    "store_kv_bench.py",
+                    "--scenario",
+                    scenario,
+                    "--nr-objects=1",
+                    "--output-dir",
+                    directory,
+                ]
+                with (
+                    patch.object(bench, "MooncakeDistributedStore", return_value=store),
+                    patch.object(sys, "argv", argv),
+                    patch.object(bench.LOG, "exception") as log_error,
+                ):
+                    self.assertEqual(bench.main(), 1)
+                log_error.assert_called_once()
+                store.close.assert_called_once()
+                self.assertFalse((Path(directory) / "summary.json").exists())
 
 
 class ZcopyBufferPoolTest(unittest.TestCase):

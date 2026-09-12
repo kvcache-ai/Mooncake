@@ -476,6 +476,147 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
 }
 #endif
 
+TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_sync_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        auto start = service.PutStart(context.client_id, "dfs_atomic",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        ASSERT_EQ(start->size(), 2);
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_atomic",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        auto query = service.GetReplicaList("dfs_atomic", TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 2);
+        for (const auto& replica : query->replicas) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+
+        ReplicateConfig mismatched_config;
+        auto leased_upsert = service.UpsertStart(
+            context.client_id, "dfs_atomic", TenantId::Default(), 4096, config);
+        ASSERT_FALSE(leased_upsert.has_value());
+        EXPECT_EQ(leased_upsert.error(), ErrorCode::OBJECT_HAS_LEASE);
+
+        mismatched_config.replica_num = 1;
+        auto upsert =
+            service.UpsertStart(context.client_id, "dfs_atomic",
+                                TenantId::Default(), 4096, mismatched_config);
+        ASSERT_FALSE(upsert.has_value());
+        EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
+
+        query = service.GetReplicaList("dfs_atomic", TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 2);
+        for (const auto& replica : query->replicas) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+
+        auto revoke_start = service.PutStart(context.client_id, "dfs_revoke",
+                                             TenantId::Default(), 4096, config);
+        ASSERT_TRUE(revoke_start.has_value());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "dfs_revoke",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        auto revoked =
+            service.GetReplicaList("dfs_revoke", TenantId::Default());
+        ASSERT_FALSE(revoked.has_value());
+        EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    {
+        MasterService service(MakeStrictTenantConfig({"default"}));
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig dfs_config;
+        dfs_config.replica_num = 1;
+        dfs_config.dfs_replica_num = 1;
+
+        auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
+                                       TenantId::Default(),
+                                       kStrictTenantQuotaBytes, dfs_config);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+        ReplicateConfig memory_config;
+        memory_config.replica_num = 1;
+        auto retry = service.PutStart(
+            context.client_id, "quota_after_dfs_failure", TenantId::Default(),
+            kStrictTenantQuotaBytes, memory_config);
+        ASSERT_TRUE(retry.has_value()) << toString(retry.error());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "quota_after_dfs_failure",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
+    MasterServiceConfig service_config;
+    service_config.memory_allocator = BufferAllocatorType::OFFSET;
+    service_config.default_kv_lease_ttl = 10 * 1000;
+    MasterService service(service_config);
+
+    constexpr size_t kSegmentSize = 1024 * 1024;
+    const auto context = PrepareSimpleSegment(
+        service, "leased_upsert_segment", kDefaultSegmentBase, kSegmentSize);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    const std::string key = "leased_upsert_allocation_failure";
+    auto initial = service.PutStart(context.client_id, key, TenantId::Default(),
+                                    kSegmentSize, config);
+    ASSERT_TRUE(initial.has_value()) << toString(initial.error());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, key, TenantId::Default(),
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    // Retain a read lease so UpsertStart must allocate a replacement instead
+    // of reusing the old buffer.
+    auto snapshot = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(snapshot.has_value());
+
+    auto failed = service.UpsertStart(
+        context.client_id, key, TenantId::Default(), kSegmentSize, config);
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    auto still_readable = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(still_readable.has_value());
+    ASSERT_EQ(still_readable->replicas.size(), snapshot->replicas.size());
+    EXPECT_EQ(still_readable->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_,
+              snapshot->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.buffer_address_);
+}
+
 // DFS replicas live in their own variant branch, so is_disk_replica() does not
 // match them. KV subscribers still expect one logical tier per storage class,
 // which is what these assertions pin down.

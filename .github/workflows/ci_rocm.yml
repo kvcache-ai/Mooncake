@@ -3,11 +3,21 @@ name: 'Build Wheel (ROCm)'
 # ROCm/HIP CI parity with the standard CUDA wheel CI: build the AMD ROCm wheel
 # on PRs so packaging regressions are caught. Runs inside the ROCm dev image so
 # hipcc / HIP headers / hsa-runtime are available; no GPU is needed to compile.
-# On-device transfer tests (test_transfer_on_hip.py) require AMD hardware and
-# run outside GitHub-hosted runners.
+# On-device external-PD tests consume these artifacts later on the trusted
+# self-hosted ROCm runner in integration-test-rocm.yml.
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'Git revision to build (used by trusted E2E dispatches)'
+        required: false
+        type: string
+      python_versions:
+        description: 'JSON array of Python versions to build'
+        required: false
+        default: '["3.10", "3.12"]'
+        type: string
 
 jobs:
   build-wheel-rocm:
@@ -17,9 +27,10 @@ jobs:
     # so it also loads on the ROCm 7.0 image variants.
     container: rocm/dev-ubuntu-22.04:7.2.3-complete
     strategy:
+      fail-fast: false
       matrix:
         # 3.10 covers the SGLang ROCm image; 3.12 covers vLLM ROCm.
-        python-version: ['3.10', '3.12']
+        python-version: ${{ fromJSON(inputs.python_versions) }}
     env:
       HIP_BUILD: "1"
       SCCACHE_GHA_ENABLED: "true"
@@ -37,14 +48,34 @@ jobs:
         apt-get update -y
         apt-get install -y --no-install-recommends git ca-certificates
 
-    - uses: actions/checkout@v4
+    - name: Check out source
+      uses: actions/checkout@v4
       with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
         persist-credentials: false
-        submodules: recursive
+        submodules: false
 
     - name: Mark repository as safe
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
       shell: bash
+
+    - name: Check out submodules
+      shell: bash
+      run: |
+        set -eo pipefail
+        git submodule sync --recursive
+        for attempt in 1 2 3; do
+          if git -c http.version=HTTP/1.1 submodule update \
+            --init --recursive --depth=1 --jobs=2; then
+            exit 0
+          fi
+          if [ "$attempt" -eq 3 ]; then
+            echo "Submodule checkout failed after $attempt attempts" >&2
+            exit 1
+          fi
+          echo "Submodule checkout attempt $attempt failed; retrying..." >&2
+          sleep $((attempt * 10))
+        done
 
     - name: Install toolchain and Python ${{ matrix.python-version }}
       shell: bash
@@ -96,6 +127,7 @@ jobs:
         rm -rf build && mkdir build && cd build
         cmake -G Ninja .. \
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+          -DENABLE_MULTI_PROTOCOL=ON \
           -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
           -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
           -DCMAKE_BUILD_TYPE=Release \
@@ -147,7 +179,8 @@ jobs:
           mooncake-wheel/dist-rocm-py${{ steps.generate_tag.outputs.python_version_tag }}/*.whl
         # ROCm runtime is excluded from the wheel and bound at load time.
         export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
-        site="$("$smoke_venv/bin/python" -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')"
+        "$smoke_venv/bin/python" scripts/tone_tests/python/verify_rocm_wheel.py
+        site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
         "$site/mooncake_master" --version
 
     - name: Upload Python wheel artifact

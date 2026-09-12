@@ -90,7 +90,8 @@ Status SegmentTracker::add(uint64_t base, size_t length,
 
 Status SegmentTracker::addInBatch(
     std::vector<BufferDesc>& desc_list,
-    std::function<Status(std::vector<BufferDesc>&)> callback) {
+    std::function<Status(std::vector<BufferDesc>&)> callback,
+    std::function<void(BufferDesc&)> on_removed) {
     std::vector<BufferDesc> new_desc_list;
     // Read-only pre-scan (see add()): skip the ref-count publication when no
     // entry duplicates an already-registered range.
@@ -139,24 +140,34 @@ Status SegmentTracker::addInBatch(
         // Roll back the duplicate ref-counts so a failed registration does
         // not leave buffers pinned forever.
         if (!bumped.empty()) {
-            manager_.updateLocal([&](SegmentDesc& desc) -> Status {
-                auto& detail = std::get<MemorySegmentDesc>(desc.detail);
-                for (auto& range : bumped) {
-                    for (auto it = detail.buffers.begin();
-                         it != detail.buffers.end(); ++it) {
-                        if (it->addr == range.first &&
-                            it->length == range.second) {
-                            it->ref_count--;
-                            // The original owner unregistered while we held
-                            // the extra reference; drop the entry so it is
-                            // no longer advertised.
-                            if (it->ref_count == 0) detail.buffers.erase(it);
-                            break;
+            std::vector<BufferDesc> removed;
+            auto rollback_status =
+                manager_.updateLocal([&](SegmentDesc& desc) -> Status {
+                    auto& detail = std::get<MemorySegmentDesc>(desc.detail);
+                    for (auto& range : bumped) {
+                        for (auto it = detail.buffers.begin();
+                             it != detail.buffers.end(); ++it) {
+                            if (it->addr == range.first &&
+                                it->length == range.second) {
+                                it->ref_count--;
+                                // The original owner unregistered while we held
+                                // the extra reference; drop the entry so it is
+                                // no longer advertised.
+                                if (it->ref_count == 0) {
+                                    removed.push_back(*it);
+                                    detail.buffers.erase(it);
+                                }
+                                break;
+                            }
                         }
                     }
-                }
-                return Status::OK();
-            });
+                    return Status::OK();
+                });
+            if (!rollback_status.ok()) {
+                LOG(WARNING) << rollback_status.ToString();
+            } else if (on_removed) {
+                for (auto& buffer : removed) on_removed(buffer);
+            }
         }
         return status;
     }

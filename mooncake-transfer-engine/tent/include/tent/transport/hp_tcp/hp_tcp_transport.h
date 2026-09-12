@@ -3,6 +3,7 @@
 #define TENT_HP_TCP_TRANSPORT_H_
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -90,6 +91,10 @@ class HighPerformanceTcpTransport final : public Transport {
     HighPerformanceTcpBufferRegistry registry_;
 
     std::atomic<uint64_t> next_request_id_{1};
+    // Request IDs are global; lane rotation must advance independently per
+    // peer so periodic fan-out cannot pin a peer to one lane or rail.
+    std::mutex lane_sequence_mutex_;
+    std::map<SegmentID, uint64_t> next_lane_sequence_;
     std::atomic<bool> installed_{false};
     std::atomic<bool> stopping_{false};
     mutable std::mutex lifecycle_mutex_;

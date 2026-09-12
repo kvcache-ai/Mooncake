@@ -1,3 +1,5 @@
+#include <map>
+#include <memory>
 // Copyright 2024 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,7 +50,7 @@ class TransferMetadataTest : public ::testing::Test {
         google::InitGoogleLogging("TransferMetadataTest");
         FLAGS_logtostderr = 1;  // output to stdout
 
-        const char* env = std::getenv("MC_METADATA_SERVER");
+        const char *env = std::getenv("MC_METADATA_SERVER");
         if (env)
             metadata_server = env;
         else
@@ -110,11 +112,11 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
         ASSERT_EQ(re, 0);
     }
     addr = 1000;
-    re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+    re = metadata_client->removeLocalMemoryBuffer((void *)addr, false);
     ASSERT_EQ(re, ERR_ADDRESS_NOT_REGISTERED);
     for (int i = 9; i > 0; --i) {
         addr = i * 2048;
-        re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+        re = metadata_client->removeLocalMemoryBuffer((void *)addr, false);
         ASSERT_EQ(re, 0);
     }
     re = metadata_client->removeLocalSegment("test_local_segment");
@@ -421,7 +423,7 @@ TransferMetadata::BufferDesc makeRdmaBufferDesc(uint64_t addr) {
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
-    const std::string& name, uint64_t addr) {
+    const std::string &name, uint64_t addr) {
     auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
     segment_desc->name = name;
     segment_desc->protocol = "rdma";
@@ -474,7 +476,7 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
 
     ASSERT_EQ(server.removeLocalMemoryBuffer(
-                  reinterpret_cast<void*>(kInitialAddr), false),
+                  reinterpret_cast<void *>(kInitialAddr), false),
               0);
     ASSERT_EQ(
         server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
@@ -1055,9 +1057,247 @@ TEST(HandshakeFrameTest, RejectsInvalidLength) {
     close(fds[1]);
 }
 
+namespace {
+
+// Hardware-free in-memory MetadataStoragePlugin. get() returns false for keys
+// absent from the store (a removed/unmounted segment) and can be made to fail
+// a bounded number of times via failNext() to reproduce a transient backend
+// blip. No RDMA/CUDA/etcd is required.
+class FakeMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return false;  // transient blip: the key may still be in store_
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return false;
+        value = it->second;
+        return true;
+    }
+
+    // Error-aware variant: forced failures report kUnavailable (the key may
+    // still live in the backend), missing keys report kNotFound (the master
+    // removed them), and present keys report kFound.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return GetResult::kUnavailable;
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return GetResult::kNotFound;
+        value = it->second;
+        return GetResult::kFound;
+    }
+    bool set(const std::string &key, const Json::Value &value) override {
+        store_[key] = value;
+        return true;
+    }
+    bool remove(const std::string &key) override {
+        store_.erase(key);
+        return true;
+    }
+
+    // Simulate the master-side cleanup of a peer's segment key (unmount or
+    // client expiry): the key vanishes from the backend, so every later
+    // get() returns false.
+    void drop(const std::string &key) { store_.erase(key); }
+
+    // Inject n transient get() failures for key without removing the key,
+    // modelling a curl timeout / etcd blip that resolves next sync cycle.
+    void failNext(const std::string &key, int n) { forced_failures_[key] = n; }
+
+   private:
+    std::map<std::string, Json::Value> store_;
+    std::map<std::string, int> forced_failures_;
+};
+
+// A backend that only implements the legacy bool get() and cannot tell a
+// missing key from a backend failure, so it inherits the default
+// getWithStatus() mapping instead of overriding it.
+class OpaqueMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return false;
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return false;
+        value = it->second;
+        return true;
+    }
+    bool set(const std::string &key, const Json::Value &value) override {
+        store_[key] = value;
+        return true;
+    }
+    bool remove(const std::string &key) override {
+        store_.erase(key);
+        return true;
+    }
+    void failNext(const std::string &key, int n) { forced_failures_[key] = n; }
+
+   private:
+    std::map<std::string, Json::Value> store_;
+    std::map<std::string, int> forced_failures_;
+};
+
+// Exposes the protected storage-plugin injection seam to hardware-free tests.
+class TestableTransferMetadata : public TransferMetadata {
+   public:
+    explicit TestableTransferMetadata(
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin)
+        : TransferMetadata(std::move(storage_plugin)) {}
+};
+
+}  // namespace
+
+class TransferMetadataStaleSegmentInvalidationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging(
+            "TransferMetadataStaleSegmentInvalidationTest");
+        FLAGS_logtostderr = 1;
+    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    // Publish a remote rdma segment to the fake backend and cache it locally
+    // (as a non-local id), returning the cached descriptor so callers can
+    // assert on cache state.
+    std::shared_ptr<TransferMetadata::SegmentDesc> seedRemoteSegment(
+        TransferMetadata &client, const std::string &name) {
+        auto desc = makeRdmaSegmentDesc(name, 0x1000);
+        EXPECT_EQ(client.updateSegmentDesc(name, *desc), 0);
+        EXPECT_NE(client.getSegmentID(name),
+                  static_cast<TransferMetadata::SegmentID>(-1));
+        return client.getSegmentDescByName(name);
+    }
+};
+
+// Red on master / green on branch: a cached remote segment whose backend key
+// is removed (peer unmount) is invalidated only after the consecutive-failure
+// streak reaches the threshold -- not on the first failure. On master there
+// is no invalidation branch, so the stale entry is never erased and the final
+// expectation fails.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       ErasesStaleEntryAfterConsecutiveFailures) {
+    // No background refresh thread (interval == 0) with the cache-hit fast path
+    // on (metacache == true): getSegmentDescByName reflects the local cache,
+    // and we drive syncSegmentCache explicitly to count failures precisely.
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "B";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Peer B unmounts: the master removes mooncake/ram/B; every get() fails.
+    plugin->drop("mooncake/ram/B");
+
+    // First failed sync: streak is 1, below the threshold -> retain the entry,
+    // guarding against a single transient blip purging the whole cache.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+
+    // Second consecutive failed sync: streak reaches the threshold -> the
+    // stale cached entry is invalidated. Red-on-master: master never erases,
+    // so getSegmentDescByName keeps returning the cached descriptor.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_EQ(client.getSegmentDescByName(name), nullptr);
+}
+
+// Transient-failure guard: a segment that fails once and then succeeds on the
+// next cycle must NOT be invalidated -- the successful fetch resets its
+// streak. Guards against an erase-on-first-failure regression.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       TransientFailureIsRetained) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "C";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // One transient get() failure: the key still lives in the backend, so the
+    // segment is genuinely alive and must not count toward removal.
+    plugin->failNext("mooncake/ram/C", 1);
+
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+
+    // Next cycle the blip clears: get() succeeds again, the streak resets to
+    // zero, and the cached entry survives.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+}
+
+// Backend-outage guard: a sustained transient failure (kUnavailable) must NOT
+// advance the invalidation streak, so the cached entry survives even after
+// many consecutive sync cycles -- only an authoritative key removal
+// (kNotFound) can invalidate. Guards against a metadata-service outage
+// purging the entire live cache.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       BackendOutageDoesNotInvalidateCache) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "D";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Sustained backend outage: every get() fails for 5 sync cycles (well
+    // past the invalidation threshold of 2), but the key still lives in
+    // the backend -- this is kUnavailable, not kNotFound.
+    plugin->failNext("mooncake/ram/D", 5);
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(client.syncSegmentCache(""), 0);
+        EXPECT_NE(client.getSegmentDescByName(name), nullptr)
+            << "entry purged after " << (i + 1) << " transient failures";
+    }
+
+    // Outage clears: get() succeeds again, the entry was never invalidated.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+}
+
+// Default-mapping guard: a backend that only implements the legacy bool
+// get() (no getWithStatus() override) inherits the default mapping, which
+// must fail closed -- an ambiguous false is kUnavailable, never kNotFound --
+// so a sustained failure cannot purge the cached entry. Guards against the
+// default treating an opaque backend failure as an authoritative removal.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       DefaultPluginMappingFailsClosed) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<OpaqueMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "E";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Sustained failures through the inherited default path: 5 sync cycles
+    // of get() == false with no way to prove the key is gone.
+    plugin->failNext("mooncake/ram/E", 5);
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(client.syncSegmentCache(""), 0);
+        EXPECT_NE(client.getSegmentDescByName(name), nullptr)
+            << "default mapping invalidated after " << (i + 1)
+            << " opaque failures";
+    }
+}
+
 }  // namespace mooncake
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }
