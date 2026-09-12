@@ -32,8 +32,7 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
 
-// Experimental: Per-thread SegmentDesc & EndPoint Caches
-// #define CONFIG_CACHE_SEGMENT_DESC
+// Experimental: Per-thread EndPoint Cache
 // #define CONFIG_CACHE_ENDPOINT
 
 namespace mooncake {
@@ -276,41 +275,16 @@ WorkerPool::~WorkerPool() {
 
 int WorkerPool::submitPostSend(
     const std::vector<Transport::Slice *> &slice_list) {
-#ifdef CONFIG_CACHE_SEGMENT_DESC
-    thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
-    thread_local std::unordered_map<SegmentID,
-                                    std::shared_ptr<RdmaTransport::SegmentDesc>>
-        segment_desc_map;
-    uint64_t current_ts = getCurrentTimeInNano();
-
-    if (current_ts - tl_last_cache_ts > 1000000000) {
-        segment_desc_map.clear();
-        tl_last_cache_ts = current_ts;
-    }
-
-    for (auto &slice : slice_list) {
-        auto target_id = slice->target_id;
-        if (!segment_desc_map.count(target_id)) {
-            segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id);
-            if (!segment_desc_map[target_id]) {
-                segment_desc_map.clear();
-                LOG(ERROR) << "Cannot get target segment description #"
-                           << target_id;
-                return ERR_INVALID_ARGUMENT;
-            }
-        }
-    }
-#else
+    // Cache only within this submission: a thread-local descriptor cache would
+    // bypass refresh requests consumed by getSegmentDescForTransfer().
     std::unordered_map<SegmentID, std::shared_ptr<RdmaTransport::SegmentDesc>>
         segment_desc_map;
     for (auto &slice : slice_list) {
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id))
             segment_desc_map[target_id] =
-                context_.engine().meta()->getSegmentDescByID(target_id);
+                context_.engine().meta()->getSegmentDescForTransfer(target_id);
     }
-#endif  // CONFIG_CACHE_SEGMENT_DESC
 
     SliceList prepared_slice_list;
     uint64_t submitted_slice_count = 0;
@@ -330,8 +304,9 @@ int WorkerPool::submitPostSend(
         if (selectPeerDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
                              slice->length, context_.deviceName(), buffer_id,
                              device_id)) {
-            peer_segment_desc = context_.engine().meta()->getSegmentDescByID(
-                slice->target_id, true);
+            peer_segment_desc =
+                context_.engine().meta()->getSegmentDescForTransfer(
+                    slice->target_id, true);
             if (!peer_segment_desc) {
                 LOG(ERROR) << "Cannot reload target segment #"
                            << slice->target_id;
@@ -645,6 +620,11 @@ void WorkerPool::performPostSend(int thread_id) {
                         break;
                     }
                 }
+                if (!local_context_inactive) {
+                    for (auto *slice : entry.second)
+                        context_.engine().meta()->requestSegmentRefresh(
+                            slice->target_id);
+                }
                 LOG(WARNING) << "Worker: Cannot make connection for endpoint: "
                              << entry.first
                              << (has_peer_alternative
@@ -678,6 +658,9 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->readyToSend()) {
             if (endpoint->readyAckTimedOut()) {
+                for (auto *slice : entry.second)
+                    context_.engine().meta()->requestSegmentRefresh(
+                        slice->target_id);
                 LOG(ERROR) << "Worker: Timed out waiting for RDMA ready ACK "
                            << "for endpoint: " << entry.first
                            << ", deleting endpoint";
@@ -900,6 +883,10 @@ void WorkerPool::processCompletions(int thread_id,
                     markRailFailed(slice->peer_nic_path, true);
                     redispatch_counter_++;
                 }
+                // Record the failure even when this slice has no retries left.
+                // The next submission must not reuse its stale rkey/topology.
+                context_.engine().meta()->requestSegmentRefresh(
+                    slice->target_id);
                 if (slice->rdma.endpoint) {
                     context_.deleteEndpointByPtr(slice->rdma.endpoint);
                 }
@@ -944,8 +931,8 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
             auto target_id = slice->target_id;
             if (!segment_desc_map.count(target_id)) {
                 segment_desc_map[target_id] =
-                    context_.engine().meta()->getSegmentDescByID(target_id,
-                                                                 true);
+                    context_.engine().meta()->getSegmentDescForTransfer(
+                        target_id, true);
             }
         }
     }

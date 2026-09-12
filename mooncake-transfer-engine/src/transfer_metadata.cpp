@@ -767,6 +767,7 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
         auto iter = segment_name_to_id_map_.find(segment_name);
         if (iter != segment_name_to_id_map_.end()) {
             LOG(INFO) << "removeSegmentDesc " << segment_name << " finish";
+            segment_refresh_requests_.erase(iter->second);
             segment_id_to_desc_map_.erase(iter->second);
             segment_name_to_id_map_.erase(iter);
         } else {
@@ -1513,6 +1514,7 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             // skipped by the collect phase and must never be purged here.
             if (name_it != segment_name_to_id_map_.end() &&
                 name_it->second != LOCAL_SEGMENT_ID) {
+                segment_refresh_requests_.erase(name_it->second);
                 segment_id_to_desc_map_.erase(name_it->second);
                 segment_name_to_id_map_.erase(name_it);
                 ++invalidated_count;
@@ -1596,6 +1598,35 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
     return segment_desc;
 }
 
+void TransferMetadata::requestSegmentRefresh(SegmentID segment_id) {
+    if (segment_id == LOCAL_SEGMENT_ID) return;
+    RWSpinlock::WriteGuard guard(segment_lock_);
+    if (segment_id_to_desc_map_.count(segment_id))
+        segment_refresh_requests_.insert(segment_id);
+}
+
+std::shared_ptr<TransferMetadata::SegmentDesc>
+TransferMetadata::getSegmentDescForTransfer(SegmentID segment_id,
+                                            bool force_update) {
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        if (segment_id == LOCAL_SEGMENT_ID ||
+            (!force_update && globalConfig().metacache &&
+             !segment_refresh_requests_.count(segment_id))) {
+            auto it = segment_id_to_desc_map_.find(segment_id);
+            return it == segment_id_to_desc_map_.end() ? nullptr : it->second;
+        }
+    }
+
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        segment_refresh_requests_.erase(segment_id);
+    }
+    auto desc = getSegmentDescByID(segment_id, true);
+    if (!desc) requestSegmentRefresh(segment_id);
+    return desc;
+}
+
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
     if (segment_id != LOCAL_SEGMENT_ID &&
@@ -1610,15 +1641,18 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
 
         // Fetch segment descriptor without holding lock (may involve network
         // I/O)
-        auto segment_desc = getSegmentDesc(segment_name);
+        auto segment_desc = getSegmentDescInternal(segment_name, true);
         if (!segment_desc) return nullptr;
 
         // Update cache with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto old_iter = segment_id_to_desc_map_.find(segment_id);
-        auto old_desc = old_iter == segment_id_to_desc_map_.end()
-                            ? nullptr
-                            : old_iter->second;
+        auto name_iter = segment_name_to_id_map_.find(segment_name);
+        if (old_iter == segment_id_to_desc_map_.end() ||
+            name_iter == segment_name_to_id_map_.end() ||
+            name_iter->second != segment_id)
+            return nullptr;
+        auto old_desc = old_iter->second;
         if (!shouldInstallFetchedSegmentDesc(segment_name, segment_id, old_desc,
                                              segment_desc)) {
             return old_desc;
@@ -1708,6 +1742,7 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
     if (segment_name_to_id_map_.count(segment_name)) {
         int segment_id = segment_name_to_id_map_[segment_name];
         segment_name_to_id_map_.erase(segment_name);
+        segment_refresh_requests_.erase(segment_id);
         segment_id_to_desc_map_.erase(segment_id);
     }
     return 0;
@@ -1965,18 +2000,26 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     Json::Value peer;
     int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
-    if (ret) return ret;
-    if (TransferHandshakeUtil::decode(peer, peer_desc)) {
+    if (!ret && TransferHandshakeUtil::decode(peer, peer_desc)) {
         LOG(ERROR) << "Handshake from " << peer_server_name
                    << " has invalid notify_rq_depth";
-        return ERR_INVALID_ARGUMENT;
+        ret = ERR_INVALID_ARGUMENT;
     }
-    if (!peer_desc.reply_msg.empty()) {
+    if (!ret && !peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
                    << peer_desc.reply_msg;
-        return ERR_METADATA;
+        ret = ERR_METADATA;
     }
-    return 0;
+    // A stale RPC address can refuse connections or reach a server that
+    // rejects the handshake. Refresh only this peer for the next attempt,
+    // preserving version checks and the caller's retry policy. P2P mappings
+    // have no storage backend and must remain intact.
+    if (ret && !p2p_handshake_mode_) {
+        RpcMetaDesc refreshed_location;
+        (void)getRpcMetaEntryInternal(peer_server_name, refreshed_location,
+                                      true);
+    }
+    return ret;
 }
 
 int TransferMetadata::sendNotify(const std::string &peer_server_name,
