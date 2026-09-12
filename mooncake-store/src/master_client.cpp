@@ -233,6 +233,11 @@ struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ReportNoFTargetUnreachable> {
+    static constexpr const char* value = "ReportNoFTargetUnreachable";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
 };
@@ -1083,6 +1088,15 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
                      ", ssd_total_capacity_bytes=", ssd_total_capacity_bytes);
     return invoke_rpc<&WrappedMasterService::ReportSsdCapacity, void>(
         client_id, ssd_total_capacity_bytes);
+}
+
+tl::expected<void, ErrorCode> MasterClient::ReportNoFTargetUnreachable(
+    const UUID& client_id, const std::vector<std::string>& te_endpoints) {
+    ScopedVLogTimer timer(1, "MasterClient::ReportNoFTargetUnreachable");
+    timer.LogRequest("client_id=", client_id,
+                     ", endpoints=", te_endpoints.size());
+    return invoke_rpc<&WrappedMasterService::ReportNoFTargetUnreachable, void>(
+        client_id, te_endpoints);
 }
 
 tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
