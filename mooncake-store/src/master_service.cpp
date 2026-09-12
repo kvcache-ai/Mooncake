@@ -10866,16 +10866,27 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
-            for (const auto& [segment, client_id] : unready_segments) {
-                UnmountSegment(segment.id, client_id);
+        {
+            // Copy the records while holding the segment lock. UnmountSegment
+            // acquires the same lock, so it must run after this accessor is
+            // destroyed or snapshot restore deadlocks on an unready segment.
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            (void)segment_access.GetUnreadySegments(unready_segments);
+        }
+        for (const auto& [segment, client_id] : unready_segments) {
+            auto unmount_result = UnmountSegment(segment.id, client_id);
+            if (!unmount_result &&
+                unmount_result.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+                LOG(WARNING)
+                    << "[Restore] Failed to unmount unready segment "
+                    << segment.name << ": " << toString(unmount_result.error());
             }
         }
 
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
         std::vector<std::pair<Segment, UUID>> all_segments;
         auto err = segment_access.GetAllSegments(all_segments);
 

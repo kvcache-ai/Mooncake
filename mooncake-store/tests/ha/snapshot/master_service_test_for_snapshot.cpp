@@ -132,6 +132,23 @@ TEST_F(MasterServiceSnapshotTest, MountUnmountSegmentWithOffsetAllocator) {
     EXPECT_TRUE(unmount_result4.has_value());
 }
 
+TEST_F(MasterServiceSnapshotTest,
+       ApplySnapshotStateUnmountsUnreadySegmentsWithoutDeadlocking) {
+    service_.reset(new MasterService());
+    const auto context = PrepareSimpleSegment(*service_);
+
+    auto graceful_unmount_result = service_->GracefulUnmountSegment(
+        context.segment_id, context.client_id, /*grace_period_ms=*/60000);
+    ASSERT_TRUE(graceful_unmount_result.has_value());
+
+    // ApplySnapshotState must release its segment accessor before calling
+    // UnmountSegment, which acquires the same non-recursive mutex.
+    auto result = ApplySnapshotStateForTest(*service_);
+    ASSERT_TRUE(result.has_value()) << result.error().message;
+    EXPECT_FALSE(
+        service_->QuerySegmentStatusById(context.segment_id).has_value());
+}
+
 TEST_F(MasterServiceSnapshotTest, RandomMountUnmountSegment) {
     service_.reset(new MasterService());
     // Define a constant buffer address for the segment.
