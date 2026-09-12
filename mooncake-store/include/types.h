@@ -393,6 +393,12 @@ enum class ErrorCode : int32_t {
     TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
     TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
     TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
+
+    // Weight revision management errors (Range: -1800 to -1899) — RFC #4017
+    WEIGHT_NOT_FOUND = -1800,  ///< Weight revision not found / not visible.
+    WEIGHT_NOT_READY = -1801,  ///< Weight revision is not READY.
+    WEIGHT_STALE_GENERATION = -1802,  ///< CAS generation mismatch.
+    WEIGHT_CONFLICT = -1803,          ///< Conflicting weight revision state.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;

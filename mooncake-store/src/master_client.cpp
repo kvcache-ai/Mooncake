@@ -335,6 +335,41 @@ struct RpcNameTraits<&WrappedMasterService::BatchEvictDiskReplica> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BeginWeightImport> {
+    static constexpr const char* value = "BeginWeightImport";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CommitWeightImport> {
+    static constexpr const char* value = "CommitWeightImport";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::GetWeightMetadata> {
+    static constexpr const char* value = "GetWeightMetadata";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ListWeightRevisions> {
+    static constexpr const char* value = "ListWeightRevisions";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UpdateWeightPolicy> {
+    static constexpr const char* value = "UpdateWeightPolicy";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::AbortWeightImport> {
+    static constexpr const char* value = "AbortWeightImport";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::RemoveWeightRevision> {
+    static constexpr const char* value = "RemoveWeightRevision";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
     static constexpr const char* value = "PollRemoveAll";
 };
@@ -1398,6 +1433,48 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchEvictDiskReplica(
             keys.size(), client_id_, keys, tenant_id, replica_type);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+tl::expected<BeginWeightImportResponse, ErrorCode>
+MasterClient::BeginWeightImport(const BeginWeightImportRequest& request) {
+    return invoke_rpc<&WrappedMasterService::BeginWeightImport,
+                      BeginWeightImportResponse>(request);
+}
+
+tl::expected<CommitWeightImportResponse, ErrorCode>
+MasterClient::CommitWeightImport(const CommitWeightImportRequest& request) {
+    return invoke_rpc<&WrappedMasterService::CommitWeightImport,
+                      CommitWeightImportResponse>(request);
+}
+
+tl::expected<GetWeightMetadataResponse, ErrorCode>
+MasterClient::GetWeightMetadata(const GetWeightMetadataRequest& request) {
+    return invoke_rpc<&WrappedMasterService::GetWeightMetadata,
+                      GetWeightMetadataResponse>(request);
+}
+
+tl::expected<ListWeightRevisionsResponse, ErrorCode>
+MasterClient::ListWeightRevisions(const ListWeightRevisionsRequest& request) {
+    return invoke_rpc<&WrappedMasterService::ListWeightRevisions,
+                      ListWeightRevisionsResponse>(request);
+}
+
+tl::expected<UpdateWeightPolicyResponse, ErrorCode>
+MasterClient::UpdateWeightPolicy(const UpdateWeightPolicyRequest& request) {
+    return invoke_rpc<&WrappedMasterService::UpdateWeightPolicy,
+                      UpdateWeightPolicyResponse>(request);
+}
+
+tl::expected<AbortWeightImportResponse, ErrorCode>
+MasterClient::AbortWeightImport(const AbortWeightImportRequest& request) {
+    return invoke_rpc<&WrappedMasterService::AbortWeightImport,
+                      AbortWeightImportResponse>(request);
+}
+
+tl::expected<RemoveWeightRevisionResponse, ErrorCode>
+MasterClient::RemoveWeightRevision(const RemoveWeightRevisionRequest& request) {
+    return invoke_rpc<&WrappedMasterService::RemoveWeightRevision,
+                      RemoveWeightRevisionResponse>(request);
 }
 
 }  // namespace mooncake

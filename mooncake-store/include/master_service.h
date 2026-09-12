@@ -41,6 +41,8 @@
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
+#include "weight_management.h"
+#include "weight_metadata_store.h"
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -203,6 +205,22 @@ class MasterService {
     tl::expected<std::optional<TenantQuotaSnapshot>, ErrorCode>
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
+
+    // RFC #4017 PR1: revision-level weight metadata registry.
+    tl::expected<BeginWeightImportResponse, ErrorCode> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    tl::expected<CommitWeightImportResponse, ErrorCode> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    tl::expected<GetWeightMetadataResponse, ErrorCode> GetWeightMetadata(
+        const GetWeightMetadataRequest& request) const;
+    ListWeightRevisionsResponse ListWeightRevisions(
+        const ListWeightRevisionsRequest& request) const;
+    tl::expected<UpdateWeightPolicyResponse, ErrorCode> UpdateWeightPolicy(
+        const UpdateWeightPolicyRequest& request);
+    tl::expected<AbortWeightImportResponse, ErrorCode> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    tl::expected<RemoveWeightRevisionResponse, ErrorCode> RemoveWeightRevision(
+        const RemoveWeightRevisionRequest& request);
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -2844,6 +2862,7 @@ class MasterService {
     mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
     ShardedTenantQuotaTable<1024> tenant_quota_table_;
+    WeightMetadataStore weight_metadata_store_;
 
     // HTTP metadata server pointer for cleanup on client timeout
     // nullptr means cleanup is disabled
