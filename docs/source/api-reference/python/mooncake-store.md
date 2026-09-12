@@ -770,8 +770,8 @@ and the manifest-backed weight snapshot API have different storage contracts.
 | --- | --- | --- |
 | Store and retrieve a complete tensor | `put_tensor()` / `get_tensor()` | One ordinary Store tensor object. |
 | Split a full tensor and read a TP shard | `put_tensor_with_tp()` / `get_tensor_with_tp()` | Legacy single-axis TP tensor objects; batch and registered-buffer variants are also available. |
-| Save weights and restore into a different TP/DP/EP/PP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
-| Use `put/get_tensor_with_cp`, `*_with_dp`, `*_with_ep`, or `*_with_pp` | No such public convenience methods | DP/EP/PP weight placement is expressed through the manifest API; CP is not a supported axis. |
+| Save weights and restore into a different TP/DP/EP/PP/CP placement | `begin_weight_snapshot()` and `WeightStore.load_manifest()` / `plan_load()` / `load()` | Immutable manifest-managed fragments, with framework-supplied placement and runtime bindings. |
+| Use `put/get_tensor_with_cp`, `*_with_dp`, `*_with_ep`, or `*_with_pp` | No such public convenience methods | Express these axes through the manifest API. |
 | Supply an arbitrary parallel strategy through `*_with_config` | No such public tensor API | `ReplicateConfig` controls Store replication and placement policy, not tensor parallel topology. |
 
 For example, with an already initialized `MooncakeDistributedStore`, the
@@ -794,13 +794,20 @@ and `WeightRuntimeBindingManifest` values supplied by the framework adapter.
 It does not provide a factory that generates a separate put/get method family
 for each axis, or accept an arbitrary strategy dictionary.
 
-- TP and EP can describe logical splits. EP splits the leading logical expert
-  dimension; TP names an explicit logical dimension.
+- TP, EP, and CP can describe logical splits. EP splits the leading logical
+  expert dimension; TP and CP name explicit logical dimensions.
 - DP describes replicas or ownership. PP describes framework-provided tensor
   or layer ownership. Neither implies a tensor split dimension.
-- CP (context parallelism) is absent from the current topology and axis types.
-  A sequence-dimension slice through the TP API does not establish CP topology
-  support or CP-aware KV-cache resharding.
+- CP (context parallelism) uses `ParallelTopology(cp_size=...)` and
+  `ParallelRank(cp=...)`. Use `ReplicatedAxis("cp")` for weights replicated
+  across context workers, `SplitAxis("cp", dim=...)` for explicitly partitioned
+  logical tensors, or `OwnershipAxis("cp")` for declared owners. CP composes
+  with TP/DP/EP/PP and uses the same snapshot and restore lifecycle.
+- CP defaults to size 1 and rank 0. Existing CP-free JSON and canonical IDs
+  remain unchanged. Active CP requires explicit per-tensor axis semantics.
+- These model-weight contracts do not provide a KV-cache adapter, page-table
+  mapping, or attention collectives. The framework supplies logical fragment
+  offsets and shapes; the planner does not infer token ownership.
 - Combining supported axes still requires complete logical coverage and
   compatible source/target tensor descriptors. The planner is copy-only; it
   does not convert dtype, quantization, packing, or model semantics.

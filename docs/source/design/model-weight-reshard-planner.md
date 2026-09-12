@@ -62,16 +62,62 @@ when it exceeds the configured limit.
   complete source replica. An `OwnershipAxis(kind="dp")` routes each tensor
   through its declared owner and does not require every tensor on every DP
   rank.
+- **CP** uses `ReplicatedAxis(kind="cp")` for weights shared across context
+  workers, `SplitAxis(kind="cp", dim=...)` for an explicitly partitioned
+  logical dimension, or `OwnershipAxis(kind="cp")` for declared owners.
+  CP splits and replicas can be restored into a different CP size or combined
+  with TP, EP, PP, and DP. Fragment offsets and shapes come from the adapter.
 
-All four axes are resolved by one logical-box plan, rather than by model-wide
+All five axes are resolved by one logical-box plan, rather than by model-wide
 per-axis conversion passes.
 
 ### Supported axes and Store API selection
 
-The current `ParallelTopology` and `ParallelRank` types contain TP, PP, EP, and
-DP only. CP (context parallelism) is not a supported axis, and `SplitAxis`
-accepts only TP and EP. N-D logical planning therefore does not imply support
-for arbitrary named parallel strategies or CP-aware KV-cache layouts.
+`ParallelTopology` and `ParallelRank` contain TP, PP, EP, DP, and CP.
+`SplitAxis` accepts TP, EP, and CP. The framework must declare the role of an
+active CP axis for each tensor; CP ownership is never inferred from another
+axis. The placement validator checks CP rank bounds, participant uniqueness,
+split geometry, and coverage of every declared replica.
+
+For example, a framework can describe independent CP and TP splits as follows:
+
+```python
+from mooncake.reshard.weight import (
+    ParallelRank, ParallelTopology, SplitAxis, TopologyParticipant,
+)
+
+topology = ParallelTopology(
+    cp_size=2, tp_size=2, pp_size=1, ep_size=1, dp_size=1,
+    participants=tuple(
+        TopologyParticipant(f"worker-c{cp}-t{tp}", ParallelRank(cp=cp, tp=tp))
+        for cp in range(2) for tp in range(2)
+    ),
+)
+axes = (SplitAxis("cp", dim=0), SplitAxis("tp", dim=1))
+```
+
+The adapter still supplies the tensor descriptor, all four participants'
+logical fragments, and their runtime bindings. For ordinary model weights
+replicated across context workers, use `ReplicatedAxis("cp")` instead of a CP
+split. Store upload deduplicates identical logical regions among replicas;
+restore materializes every requested CP target.
+
+For `OwnershipAxis("cp")` on a tensor without DP ownership, each declared
+owner must independently cover the entire tensor. Within each complete source
+DP replica, planning and Store upload select the smallest canonical owner
+coordinate tuple. With other ownership coordinates fixed, CP owners 1 and 2
+therefore select CP rank 1, independently of input order. A partial owner cannot
+be combined with another owner to form a complete tensor. This is separate
+from `OwnershipAxis("dp")`, whose source contract requires a single owner.
+
+`cp_size` defaults to 1 and `cp` rank to 0. Default CP fields are omitted from
+canonical JSON and identity payloads, preserving existing CP-free topology,
+placement, and fragment IDs. Non-default values participate in identity and
+validation. Unknown axis names remain rejected.
+
+This extends model-weight placement and Store snapshot I/O. It does not add
+an attention implementation, a KV-cache manifest, token-to-page translation,
+or automatic discovery of framework CP layouts.
 
 Store callers use the manifest-backed weight snapshot lifecycle for these
 multi-axis weight placements. Legacy `*_with_tp` methods remain available for
@@ -151,7 +197,7 @@ This phase does not accept Store `with_parallelism` metadata or Store keys as a
 planner input. A future Store adapter must translate one committed Store
 snapshot into a complete canonical `StoredWeightManifest` or
 `WeightPlacementManifest`, including tensor identity and descriptor, every
-logical fragment's offset, shape, object range, and all TP, PP, EP, and DP
+logical fragment's offset, shape, object range, and all TP, PP, EP, DP, and CP
 semantics. If Store metadata cannot represent any required fact, the adapter
 must reject that snapshot; it must not infer a tensor layout from a key,
 parameter name, rank, or `mode="full"` reconstruction.

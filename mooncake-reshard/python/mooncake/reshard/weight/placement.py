@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Optional
 
 from ..contracts import (
@@ -25,6 +25,7 @@ from .types import (
     ReplicatedAxis,
     SplitAxis,
     TensorDescriptor,
+    _parallel_rank_identity,
     _require_nonempty_string,
     _require_u64,
     require_manifest_items,
@@ -301,8 +302,15 @@ def _logical_placement_id(
             "pp_size": topology.pp_size,
             "ep_size": topology.ep_size,
             "dp_size": topology.dp_size,
+            **({"cp_size": topology.cp_size} if topology.cp_size != 1 else {}),
             "topology_id": topology.topology_id,
-            "participants": [asdict(item) for item in topology.participants],
+            "participants": [
+                {
+                    "participant_id": item.participant_id,
+                    "rank": _parallel_rank_identity(item.rank),
+                }
+                for item in topology.participants
+            ],
         },
         "tensors": [
             {
@@ -323,7 +331,7 @@ def _logical_placement_id(
         "parts": [
             {
                 "participant_id": part.participant_id,
-                "rank": asdict(part.rank),
+                "rank": _parallel_rank_identity(part.rank),
                 "fragments": [
                     _placement_fragment_identity(fragment)
                     for fragment in part.fragments
@@ -352,7 +360,7 @@ def _placement_fragment_identity(fragment: PlacementFragment) -> dict[str, objec
         "global_offset": fragment.global_offset,
         "local_shape": fragment.local_shape,
         "nbytes": fragment.nbytes,
-        "rank": asdict(fragment.rank),
+        "rank": _parallel_rank_identity(fragment.rank),
         "aliases": fragment.aliases,
     }
     # Keep the pre-virtual-stage canonical payload byte-for-byte stable. A

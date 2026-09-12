@@ -62,8 +62,9 @@ def _validate_outer_strides(
 
 GeometryKey: TypeAlias = tuple[TensorId, tuple[int, ...], tuple[int, ...]]
 SourceSortKey: TypeAlias = Union[
-    tuple[int, int, int, int, str],
+    tuple[int, int, int, int, int, str],
     tuple[
+        int,
         int,
         int,
         int,
@@ -80,12 +81,13 @@ def _geometry_key(fragment: LogicalSourceFragment) -> GeometryKey:
 
 def _source_sort_key(fragment: LogicalSourceFragment) -> SourceSortKey:
     if isinstance(fragment, StoredFragmentSnapshot):
-        return (0, 0, 0, 0, fragment.object_key, fragment.fragment_id)
+        return (0, 0, 0, 0, 0, fragment.object_key, fragment.fragment_id)
     return (
         fragment.rank.dp,
         fragment.rank.pp,
         fragment.rank.ep,
         fragment.rank.tp,
+        fragment.rank.cp,
         fragment.fragment_id,
     )
 

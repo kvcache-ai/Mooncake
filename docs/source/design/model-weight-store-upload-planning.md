@@ -8,7 +8,7 @@ evidence for each upload operation.
 ## Inputs
 
 - `WeightPlacementManifest` describes global tensor geometry and TP, PP, EP,
-  and DP ownership.
+  DP, and CP semantics.
 - `WeightRuntimeBindingManifest` values provide the live source bindings for
   populated placement participants.
 
@@ -25,10 +25,17 @@ The planner stores one complete source replica:
 2. It requires every selected source binding in that replica to have the same
    generation.
 3. It selects the lowest eligible DP rank deterministically.
-4. It retains logical TP, PP, and EP ownership in every selected fragment.
+4. It retains logical TP, PP, EP, and CP ownership in every selected fragment.
 
 The resulting manifest has one stored fragment per selected logical source
 fragment. DP replicas do not duplicate payload objects.
+
+CP can declare logical splits, complete replicas, or explicit ownership.
+For split CP, the selected DP replica must cover the full tensor across CP
+ranks. Identical logical regions on replicated CP workers are stored once,
+with the lowest CP rank preferred when the other parallel coordinates match.
+Restore uses the stored logical geometry to fill every requested CP target,
+including a different CP size or split dimension.
 
 ## Plan Contents
 

@@ -25,7 +25,7 @@ The public Python API is split by responsibility:
 `WeightPlacementManifest` describes one complete, address-free global logical
 placement of a model-weight generation. It contains:
 
-- a `ParallelTopology` with TP, PP, EP, and DP sizes plus the selected
+- a `ParallelTopology` with TP, PP, EP, DP, and CP sizes plus the selected
   participants;
 - per-tensor `SplitAxis(kind, dim)`, `ReplicatedAxis(kind)`, and
   `OwnershipAxis(kind)` entries that distinguish logical sharding, complete
@@ -37,9 +37,13 @@ placement of a model-weight generation. It contains:
 - a placement ID and digest computed after the complete part set validates.
 
 `ParallelTopology.world_size` is the selected participant count. It is not
-inferred from `tp_size * pp_size * ep_size * dp_size`: parallel axes may share
+inferred from `tp_size * pp_size * ep_size * dp_size * cp_size`: parallel axes may share
 workers, and a placement may select one complete DP replica while retaining the
-runtime's declared `dp_size`. A tensor that declares independent `SplitAxis`
+runtime's declared `dp_size`. `cp_size` defaults to 1 and `ParallelRank.cp` to 0;
+existing CP-free JSON and canonical IDs remain unchanged. Declare
+`ReplicatedAxis("cp")` for context workers that share weights,
+`SplitAxis("cp", dim=...)` for an explicitly partitioned logical dimension,
+or `OwnershipAxis("cp")` for explicit owners. A tensor that declares independent `SplitAxis`
 values must provide the rank combinations needed to prove its axis-to-dimension
 splits.
 
@@ -62,7 +66,9 @@ logical_plan = plan_placement_transfer(source_placement, target_placement)
 ```
 
 The result is a backend-neutral `LogicalTransferPlan`. TP and EP use N-D
-logical-box split and merge, PP routes framework-provided ownership, and DP
+logical-box split and merge; explicit CP splits use the same geometry. CP
+replicas can be restored to each requested target worker. PP routes
+framework-provided ownership, and DP
 selects a complete source replica or follows a declared DP owner. The plan
 contains compact N-D overlap regions but no runtime addresses, endpoints,
 allocation bounds, leases, or backend request.

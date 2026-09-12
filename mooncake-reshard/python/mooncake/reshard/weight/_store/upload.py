@@ -55,7 +55,7 @@ UploadSource = tuple[
     WeightRuntimeBindingManifest,
 ]
 UploadGeometryKey: TypeAlias = tuple[TensorId, tuple[int, ...], tuple[int, ...]]
-UploadSortKey: TypeAlias = tuple[int, int, int, int, str, str]
+UploadSortKey: TypeAlias = tuple[int, int, int, int, int, str, str]
 
 
 def _runtime_sort_key(source: UploadSource) -> UploadSortKey:
@@ -65,6 +65,7 @@ def _runtime_sort_key(source: UploadSource) -> UploadSortKey:
         placement.rank.pp,
         placement.rank.ep,
         placement.rank.tp,
+        placement.rank.cp,
         binding.worker_id,
         binding.fragment_id,
     )
