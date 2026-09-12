@@ -2710,6 +2710,13 @@ Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
     if (task.type == HP_TCP) task_status = {PENDING, 0};
     Status result =
         transport->getTransferStatus(sub_batch, task.sub_task_id, task_status);
+    if (task.type == TCP && task_status.s == FAILED &&
+        result.IsRpcServiceError()) {
+        // Standard TCP reports an uncertain WRITE through this error result.
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+        task.suppress_failover = true;
+        return Status::OK();
+    }
     if (result.ok() || task.type != HP_TCP || task_status.s != FAILED) {
         return result;
     }
