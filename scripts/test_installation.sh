@@ -37,12 +37,16 @@ python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succ
 echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
+cp -r python/tests/services test_env/service_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+
+echo "Running HTTP metadata server test..."
+python -m unittest service_tests/test_http_metadata_server.py
 
 echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
@@ -65,6 +69,11 @@ echo "Verifying transfer_engine_bench entry point..."
 # Check if the transfer_engine_bench entry point is installed and executable
 which transfer_engine_bench || { echo "ERROR: transfer_engine_bench entry point not found!"; exit 1; }
 echo "Success: transfer_engine_bench entry point found"
+
+echo "Verifying mooncake_http_metadata_server entry point..."
+which mooncake_http_metadata_server || { echo "ERROR: mooncake_http_metadata_server entry point not found!"; exit 1; }
+mooncake_http_metadata_server --help >/dev/null
+echo "Success: mooncake_http_metadata_server entry point found"
 
 cd ..
 

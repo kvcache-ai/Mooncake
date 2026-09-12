@@ -15,10 +15,12 @@
 /mooncake-reshard @ShangmingCai @stmatengss @Bo-Vincent @zxpdemonio
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco @Aionw
+/python/mooncake/http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /python/mooncake/ep.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/tests/services/test_http_metadata_server.py @ykwd @stmatengss @zxpdemonio
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov

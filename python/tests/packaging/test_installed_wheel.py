@@ -33,6 +33,10 @@ def test_wheel_imports_outside_the_repository(tmp_path: Path) -> None:
     subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
     python = environment / "bin" / "python"
     subprocess.run(
+        [str(python), "-m", "pip", "install", "aiohttp"],
+        check=True,
+    )
+    subprocess.run(
         [str(python), "-m", "pip", "install", "--no-deps", str(wheel)],
         check=True,
     )
@@ -45,6 +49,7 @@ from importlib import metadata
 from pathlib import Path
 import mooncake
 import mooncake.engine
+import mooncake.http_metadata_server
 import mooncake.reshard
 import mooncake.store
 
@@ -54,6 +59,7 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+assert mooncake.http_metadata_server.KVBootstrapServer is not None
 for ep_module in (
     "ep.py",
     "mooncake_ep_buffer.py",
@@ -63,6 +69,12 @@ for ep_module in (
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],
+        cwd=tmp_path,
+        env=clean_environment,
+        check=True,
+    )
+    subprocess.run(
+        [str(environment / "bin" / "mooncake_http_metadata_server"), "--help"],
         cwd=tmp_path,
         env=clean_environment,
         check=True,
