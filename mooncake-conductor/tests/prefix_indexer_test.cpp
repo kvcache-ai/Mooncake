@@ -94,7 +94,8 @@ EngineOwner GpuOwner(const std::string& instance_id = "instance-a",
 SharedObjectOwner SharedOwner(const std::string& object_id = "object-a",
                               const std::string& stream = "pool-stream",
                               const std::string& backend = "backend-a") {
-    return {.source_stream = stream, .backend_id = backend, .object_id = object_id};
+    return {
+        .source_stream = stream, .backend_id = backend, .object_id = object_id};
 }
 
 ProjectedPrefix Prefix(uint64_t value) { return {.value = value}; }
