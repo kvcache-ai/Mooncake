@@ -1140,14 +1140,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // The dangling-replica heal in Client::Put needs an existence check
         // against this process's offload files, which only the FileStorage
         // owns. true: backing file is gone, false: present, nullopt: unknown.
+        // Offload storage keys are tenant-scoped (the default tenant
+        // included), so probe with the scoped key: a raw object key never
+        // hits the scoped index and would report every healthy file gone.
         std::weak_ptr<FileStorage> weak_storage = file_storage_;
         client_->SetLocalDiskProbe(
-            [weak_storage](const std::string &key) -> std::optional<bool> {
+            [weak_storage,
+             tenant_id](const std::string &key) -> std::optional<bool> {
                 auto storage = weak_storage.lock();
                 if (!storage) {
                     return std::nullopt;
                 }
-                auto exists = storage->Exists(key);
+                auto exists =
+                    storage->Exists(TenantId(tenant_id).MakeScopedKey(key));
                 if (!exists) {
                     return std::nullopt;
                 }
@@ -3423,6 +3428,30 @@ RealClient::batch_get_buffer_internal(
                                << "': " << toString(read_result.error());
                     op_status[idx_it->second] =
                         tl::make_unexpected(read_result.error());
+                    // A dead LOCAL_DISK replica must not stay failed forever.
+                    // Heal it like the Put path does: if the backing file is
+                    // proven gone, evict the dangling replica and retry the
+                    // key once so a surviving replica can serve the read;
+                    // when nothing survives, the retry surfaces a real miss.
+                    // A batch read also dies wholesale, so a key whose file
+                    // provably exists is retried as-is: its failure came from
+                    // a sibling's wiped bucket file, not from its own data.
+                    // The retry allocates through the allocator and lands in
+                    // final_results directly; op_status stays an error so the
+                    // duplicate fan-out and handle assembly below ignore it.
+                    if (client_) {
+                        const auto heal =
+                            client_->healDanglingLocalDiskReplica(key);
+                        if (heal == Client::DiskReplicaHealResult::kEvicted ||
+                            heal == Client::DiskReplicaHealResult::kPresent) {
+                            auto healed = batch_get_buffer_internal(
+                                {key}, client_buffer_allocator);
+                            if (!healed.empty() && healed[0]) {
+                                final_results[op.original_index] =
+                                    std::move(healed[0]);
+                            }
+                        }
+                    }
                 }
             }
         }
