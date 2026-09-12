@@ -94,6 +94,7 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> local_segment_name;
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
+    std::optional<std::vector<std::string>> rdma_whitelist;
 };
 
 template <typename T>
@@ -217,6 +218,8 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
         config, "rpc_server_hostname", std::string());
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
+    preserved.rdma_whitelist = captureExplicitConfigValue(
+        config, "topology/rdma_whitelist", std::vector<std::string>());
     return preserved;
 }
 
@@ -240,6 +243,8 @@ void restoreExplicitTransferEngineConfig(
                                preserved.rpc_server_hostname);
     restoreExplicitConfigValue(config, "rpc_server_port",
                                preserved.rpc_server_port);
+    restoreExplicitConfigValue(config, "topology/rdma_whitelist",
+                               preserved.rdma_whitelist);
 }
 
 TransferEngineImpl::TransferEngineImpl()
