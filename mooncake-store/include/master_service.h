@@ -2151,6 +2151,26 @@ class MasterService {
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
+    // Allocate the physical replicas without changing object metadata.  This
+    // is used by leased upserts to prove that replacement storage is available
+    // before the old metadata is removed.
+    auto AllocateReplicas(const std::string& key, uint64_t value_length,
+                          const ReplicateConfig& config,
+                          const std::string& writer_host_id)
+        -> tl::expected<std::vector<Replica>, ErrorCode>;
+
+    auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
+                        const std::string& key, uint64_t value_length,
+                        const ReplicateConfig& config,
+                        const std::string& group_id, const TenantId& tenant_id,
+                        const std::chrono::system_clock::time_point& now,
+                        const ResolvedSoftPinRequest& soft_pin_request,
+                        std::vector<Replica>&& replicas,
+                        uint64_t pending_quota_charge,
+                        std::optional<std::chrono::system_clock::time_point>
+                            committed_soft_pin_timeout = std::nullopt)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
