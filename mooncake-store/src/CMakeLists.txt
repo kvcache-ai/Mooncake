@@ -496,6 +496,10 @@ if(USE_ASCEND
   target_include_directories(mooncake_store_client_objects
                              PRIVATE $ENV{ASCEND_PATH}/include)
 endif()
+if(USE_TENT)
+  target_compile_definitions(mooncake_store_client_objects PRIVATE USE_TENT)
+  target_link_libraries(mooncake_store_client_objects PRIVATE tent)
+endif()
 
 # Reduced Store library linked by mooncake_master.
 add_library(
@@ -575,6 +579,9 @@ if(USE_SUNRISE)
   target_link_libraries(
     mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
+if(USE_TENT)
+  target_link_libraries(mooncake_store PRIVATE tent)
 endif()
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store DESTINATION lib)
