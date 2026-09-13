@@ -33,8 +33,8 @@ Serializer<offset_allocator::__Allocator>::serialize(
 
     // usedBins array
     packer.pack_array(offset_allocator::NUM_TOP_BINS);
-    for (unsigned char m_usedBin : allocator.m_usedBins) {
-        packer.pack(m_usedBin);
+    for (uint16_t used_bin : allocator.m_usedBins) {
+        packer.pack(used_bin);
     }
 
     // binIndex array
@@ -154,10 +154,9 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                          i < offset_allocator::NUM_TOP_BINS;
          i++) {
         allocator->m_usedBins[i] =
-            used_bins_array.via.array.ptr[i].as<uint8_t>();
+            used_bins_array.via.array.ptr[i].as<uint16_t>();
     }
 
-    // Deserialize binIndices array
     const auto &bin_indices_array = array_items[index++];
     if (bin_indices_array.type != msgpack::type::ARRAY) {
         return tl::unexpected(
@@ -166,20 +165,29 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                                "binIndices is not an array"));
     }
 
-    if (bin_indices_array.via.array.size != offset_allocator::NUM_LEAF_BINS) {
+    const uint32_t serialized_bin_count = bin_indices_array.via.array.size;
+    const bool legacy_format =
+        serialized_bin_count == offset_allocator::LEGACY_NUM_LEAF_BINS;
+    if (!legacy_format &&
+        serialized_bin_count != offset_allocator::NUM_LEAF_BINS) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize offset_allocator::__Allocator binIndices "
-                        "invalid size: expected {}, got {}",
+                        "invalid size: expected {} or {}, got {}",
                         offset_allocator::NUM_LEAF_BINS,
-                        bin_indices_array.via.array.size)));
+                        offset_allocator::LEGACY_NUM_LEAF_BINS,
+                        serialized_bin_count)));
     }
 
-    for (uint32_t i = 0; i < bin_indices_array.via.array.size &&
-                         i < offset_allocator::NUM_LEAF_BINS;
-         i++) {
-        allocator->m_binIndices[i] =
+    std::vector<offset_allocator::NodeIndex> serialized_bin_indices(
+        serialized_bin_count);
+    for (uint32_t i = 0; i < serialized_bin_count; ++i) {
+        serialized_bin_indices[i] =
             bin_indices_array.via.array.ptr[i].as<uint32_t>();
+    }
+    if (!legacy_format) {
+        std::copy(serialized_bin_indices.begin(), serialized_bin_indices.end(),
+                  allocator->m_binIndices);
     }
 
     try {
@@ -330,6 +338,14 @@ Serializer<offset_allocator::__Allocator>::deserialize(
 
     // Deserialize freeOffset
     allocator->m_freeOffset = array_items[index++].as<uint32_t>();
+
+    if (legacy_format &&
+        !allocator->rebuildFreeBins(serialized_bin_indices.data(),
+                                    serialized_bin_count)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize offset_allocator::__Allocator invalid legacy bins"));
+    }
 
     return allocator;
 }
