@@ -166,7 +166,7 @@ class SpdkNofOperationState : public OperationState {
         return result_.has_value();
     }
 
-    void set_completed(ErrorCode error_code) {
+    virtual void set_completed(ErrorCode error_code) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
@@ -354,6 +354,84 @@ class MemcpyWorkerPool {
 #ifdef USE_NOF
 // struct SpdkNofSubTask;
 struct SpdkNofQos;
+
+/**
+ * @brief DMA capable bounce buffer owned by a NoF operation
+ *
+ * SPDK can only DMA from memory it allocated, so unaligned requests borrow
+ * one of these instead of the caller's buffer.
+ */
+struct SpdkNofStagingBuffer {
+    void* ptr = nullptr;
+
+    SpdkNofStagingBuffer() = default;
+    explicit SpdkNofStagingBuffer(void* buffer) : ptr(buffer) {}
+    SpdkNofStagingBuffer(const SpdkNofStagingBuffer&) = delete;
+    SpdkNofStagingBuffer& operator=(const SpdkNofStagingBuffer&) = delete;
+    SpdkNofStagingBuffer(SpdkNofStagingBuffer&& other) noexcept
+        : ptr(other.ptr) {
+        other.ptr = nullptr;
+    }
+    SpdkNofStagingBuffer& operator=(SpdkNofStagingBuffer&& other) noexcept {
+        if (this != &other) {
+            SpdkWrapper::GetInstance().Free(ptr);
+            ptr = other.ptr;
+            other.ptr = nullptr;
+        }
+        return *this;
+    }
+    ~SpdkNofStagingBuffer() { SpdkWrapper::GetInstance().Free(ptr); }
+};
+
+/**
+ * @brief Operation state for a NoF request split into several block aligned
+ * I/Os
+ *
+ * An unaligned request expands into more than one task, or into a task that
+ * runs against a bounce buffer. The request only completes once every part
+ * has completed, at which point read payloads staged in a bounce buffer are
+ * copied back into the caller's buffer.
+ */
+class SpdkNofStagedOperationState : public SpdkNofOperationState {
+   public:
+    // A read payload to move from a bounce buffer back to the caller.
+    struct CopyBack {
+        void* dest = nullptr;
+        const void* source = nullptr;
+        size_t size = 0;
+    };
+
+    SpdkNofStagedOperationState(int part_count,
+                                std::vector<SpdkNofStagingBuffer> staging,
+                                std::vector<CopyBack> copy_backs)
+        : staging_(std::move(staging)),
+          copy_backs_(std::move(copy_backs)),
+          pending_parts_(part_count) {}
+
+    void set_completed(ErrorCode error_code) override {
+        if (error_code != ErrorCode::OK) {
+            failed_.store(true, std::memory_order_relaxed);
+        }
+        if (pending_parts_.fetch_sub(1, std::memory_order_acq_rel) > 1) {
+            return;
+        }
+
+        const bool failed = failed_.load(std::memory_order_relaxed);
+        if (!failed) {
+            for (const auto& copy_back : copy_backs_) {
+                std::memcpy(copy_back.dest, copy_back.source, copy_back.size);
+            }
+        }
+        SpdkNofOperationState::set_completed(failed ? ErrorCode::TRANSFER_FAIL
+                                                    : ErrorCode::OK);
+    }
+
+   private:
+    std::vector<SpdkNofStagingBuffer> staging_;
+    std::vector<CopyBack> copy_backs_;
+    std::atomic<int> pending_parts_;
+    std::atomic<bool> failed_{false};
+};
 
 /**
  * @brief Spdk nvmf operation descriptor
