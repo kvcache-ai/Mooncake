@@ -4,6 +4,11 @@ set -euo pipefail
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/../../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-"$REPO_ROOT/build"}
+# The store pybind module is loaded from the build tree and links libasio.so,
+# which lives in "$BUILD_DIR/mooncake-common" while the module itself only
+# carries an $ORIGIN RUNPATH. Put that directory on the loader path so a
+# source build can run this script before the project is installed.
+export LD_LIBRARY_PATH="$BUILD_DIR/mooncake-common${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 LOG_DIR=${LOG_DIR:-/tmp/mooncake_nof_heartbeat_e2e}
 MASTER_RPC=${MASTER_RPC:-127.0.0.1:50051}
 MASTER_HOST=${MASTER_RPC%:*}
