@@ -837,7 +837,10 @@ int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
         auto& queue = slice_queue_[qp_index];
         for (int wr_idx = 0; wr_idx < wr_count; ++wr_idx) {
             auto current = slice_list[wr_idx];
-            if (!current->failed) queue.push(current);
+            if (current->failed) continue;  // never reached the hardware
+            queue.push(current);
+            // One signalled work request, one completion owed.
+            current->completions_owed.fetch_add(1, std::memory_order_acq_rel);
         }
     }
     if (rc) {
