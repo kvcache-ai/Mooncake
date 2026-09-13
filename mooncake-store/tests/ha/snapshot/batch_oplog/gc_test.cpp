@@ -1,6 +1,9 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 #include <gtest/gtest.h>
+#include <cstdint>
 #include <map>
+#include <string_view>
+#include <vector>
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
