@@ -295,6 +295,16 @@ if(USE_NOF)
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
 
+  set(SPDK_ISA_L_LIB_DIR
+      "${CMAKE_SOURCE_DIR}/extern/spdk/isa-l/.libs"
+      CACHE PATH "isa-l static library directory")
+  if(NOT EXISTS "${SPDK_ISA_L_LIB_DIR}/libisal.a")
+    message(
+      FATAL_ERROR
+        "isa-l not found at ${SPDK_ISA_L_LIB_DIR}/libisal.a. Run "
+        "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
+  endif()
+
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
       ${SPDK_LIB_DIR}/libspdk_event.a
@@ -347,6 +357,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      -L${SPDK_ISA_L_LIB_DIR}
       isal
       elf
       ibverbs

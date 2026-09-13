@@ -459,14 +459,6 @@ if [ "$INSTALL_SPDK" = true ]; then
         check_success "Failed to copy DPDK libraries"
     fi
 
-    # `make install` does not install SPDK's bundled isa-l, which the USE_NOF
-    # link list references as -lisal.
-    if ls isa-l/.libs/libisal.a >/dev/null 2>&1; then
-        echo "Copying ISA-L library to /usr/local/lib..."
-        cp isa-l/.libs/libisal.a /usr/local/lib/
-        check_success "Failed to copy ISA-L library"
-    fi
-
     print_success "SPDK installed successfully"
     cd "${REPO_ROOT}"
 fi
