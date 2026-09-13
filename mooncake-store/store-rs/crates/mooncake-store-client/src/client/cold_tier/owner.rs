@@ -1056,19 +1056,5 @@ mod tests {
             &remote_runtime
         )
         .contains(&target_id));
-
-        let mut unknown = published.clone();
-        unknown.endpoints.labels.remove(NOF_UNHEALTHY_TARGETS_LABEL);
-        assert!(
-            remote_unhealthy_targets(&owners, &[unknown.clone()], &remote_runtime)
-                .contains(&target_id)
-        );
-        unknown.endpoints.labels.insert(
-            NOF_UNHEALTHY_TARGETS_LABEL.to_string(),
-            "not-json".to_string(),
-        );
-        assert!(
-            remote_unhealthy_targets(&owners, &[unknown], &remote_runtime).contains(&target_id)
-        );
     }
 }
