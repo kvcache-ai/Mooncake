@@ -157,6 +157,8 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      wget \
                      unzip \
                      libibverbs-dev \
+                     librdmacm-dev \
+                     libelf-dev \
                      libgoogle-glog-dev \
                      libjsoncpp-dev \
                      libunwind-dev \
@@ -455,6 +457,14 @@ if [ "$INSTALL_SPDK" = true ]; then
         echo "Copying DPDK libraries to /usr/local/lib..."
         cp dpdk/build/lib/*.a /usr/local/lib/
         check_success "Failed to copy DPDK libraries"
+    fi
+
+    # Copy the ISA-L library built as an SPDK submodule. `make install` does not
+    # install it, but the USE_NOF link list references -lisal.
+    if ls isa-l/.libs/libisal.a >/dev/null 2>&1; then
+        echo "Copying ISA-L library to /usr/local/lib..."
+        cp isa-l/.libs/libisal.a /usr/local/lib/
+        check_success "Failed to copy ISA-L library"
     fi
 
     print_success "SPDK installed successfully"
