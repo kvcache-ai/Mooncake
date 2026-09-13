@@ -283,7 +283,8 @@ target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_datapath_roundtrip_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 # Each case runs in its own process: the test forks a server child, which must
-# happen before the client process initializes any engine state.
+# happen before the client process initializes any engine state. The CUDA case
+# is built into the same binary but run manually on a GPU host.
 add_test(
   NAME tent_tcp_datapath_roundtrip_test_single_threaded
   COMMAND tent_tcp_datapath_roundtrip_test
