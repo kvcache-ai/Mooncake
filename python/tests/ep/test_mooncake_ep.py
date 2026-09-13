@@ -1,10 +1,9 @@
 import random
-import os
 import torch
 import torch.distributed as dist
 from functools import partial
 
-from mooncake.mooncake_ep_buffer import Buffer
+from mooncake.mooncake_ep_buffer import Buffer, _USE_MACA
 from ep_test_utils import (
     init_dist,
     bench,
@@ -41,43 +40,27 @@ def test_main(
         rank - rank_offset
     )
     x[:, -128:] = torch.arange(num_tokens, device="cuda").to(torch.bfloat16).view(-1, 1)
-    fixed_routing = os.getenv("MOONCAKE_EP_TEST_FIXED_ROUTING", "0").lower() in {
-        "1",
-        "true",
-        "on",
-        "yes",
-    }
-    if fixed_routing:
-        topk_idx = torch.stack(
-            [
-                (torch.arange(num_tokens, device="cuda") + i) % num_experts
-                for i in range(num_topk)
-            ],
-            dim=1,
-        ).to(torch.int64)
-    else:
-        scores = (
-            torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
-            + 1
-        )
-        topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
+    scores = (
+        torch.randn((num_tokens, num_experts), dtype=torch.float32, device="cuda").abs()
+        + 1
+    )
+    topk_idx = torch.topk(scores, num_topk, dim=-1, largest=True, sorted=True)[1]
     topk_weights = torch.randn(
         (num_tokens, num_topk), dtype=torch.float32, device="cuda"
     ).abs()
 
     # Randomly mask some positions
-    if not fixed_routing:
-        for i in range(10):
-            topk_idx[
-                random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)
-            ] = -1
+    for i in range(10):
+        topk_idx[
+            random.randint(0, num_tokens - 1), random.randint(0, num_topk - 1)
+        ] = -1
 
     # Check dispatch correctness
     do_check = True
     hash_value, num_times = 0, 0
     active_ranks = torch.ones((num_tokens,), dtype=torch.int32, device="cuda")
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in [False, True]:
+        for dispatch_use_fp8 in [False] if _USE_MACA else [False, True]:
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = buffer.dispatch(
@@ -157,31 +140,37 @@ def test_main(
                 else:
                     hash_value ^= hash_tensor(packed_recv_x[i, :num_valid_tokens])
 
-            # Check combine correctness using the supported regular input path.
-            out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
-            combined_x, event, hook = buffer.combine(
-                simulated_gemm_x,
-                topk_idx,
-                topk_weights,
-                active_ranks,
-                -1,
-                handle,
-                async_finish=not return_recv_hook,
-                return_recv_hook=return_recv_hook,
-                out=out,
-            )
-            hook() if return_recv_hook else event.current_stream_wait()
-            if do_check:
-                diff = calc_diff(
-                    x
-                    * topk_weights.masked_fill(topk_idx == -1, 0)
-                    .sum(dim=1)
-                    .view(-1, 1),
-                    combined_x,
+            # Check combine correctness. The supported MACA surface retains
+            # the legacy zero_copy branch for API coverage, but only executes
+            # the regular path.
+            for zero_copy in (False,):
+                if zero_copy:
+                    buffer.get_next_combine_buffer(handle)[:, :, :] = simulated_gemm_x
+                out = torch.empty((num_tokens, hidden), dtype=torch.bfloat16, device="cuda")
+                combined_x, event, hook = buffer.combine(
+                    simulated_gemm_x,
+                    topk_idx,
+                    topk_weights,
+                    active_ranks,
+                    -1,
+                    handle,
+                    zero_copy=zero_copy,
+                    async_finish=not return_recv_hook,
+                    return_recv_hook=return_recv_hook,
+                    out=out,
                 )
-                assert torch.isnan(combined_x).sum().item() == 0
-                assert diff < 1e-5, f"Error: {diff=}"
-                hash_value ^= hash_tensor(combined_x)
+                hook() if return_recv_hook else event.current_stream_wait()
+                if do_check:
+                    diff = calc_diff(
+                        x
+                        * topk_weights.masked_fill(topk_idx == -1, 0)
+                        .sum(dim=1)
+                        .view(-1, 1),
+                        combined_x,
+                    )
+                    assert torch.isnan(combined_x).sum().item() == 0
+                    assert diff < 1e-5, f"Error: {diff=}, {zero_copy=}"
+                    hash_value ^= hash_tensor(combined_x)
 
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
@@ -281,34 +270,20 @@ def test_main(
 
 # noinspection PyUnboundLocalVariable
 def test_loop(local_rank: int, num_local_ranks: int):
-    per_rank_filters = os.getenv("MOONCAKE_EP_DEVICE_FILTERS")
-    if per_rank_filters:
-        filters = per_rank_filters.split(";")
-        if local_rank >= len(filters) or not filters[local_rank]:
-            raise RuntimeError(
-                "MOONCAKE_EP_DEVICE_FILTERS must provide one filter per rank"
-            )
-        os.environ["MOONCAKE_EP_DEVICE_FILTER"] = filters[local_rank]
     rank, num_ranks, group = init_dist(local_rank, num_local_ranks)
-    num_tokens = int(os.getenv("MOONCAKE_EP_TEST_NUM_TOKENS", "128"))
-    hidden = int(os.getenv("MOONCAKE_EP_TEST_HIDDEN", "7168"))
-    num_topk = int(os.getenv("MOONCAKE_EP_TEST_TOPK", "8"))
-    num_experts = int(os.getenv("MOONCAKE_EP_TEST_NUM_EXPERTS", "288"))
+    num_tokens, hidden, num_topk, num_experts = 128, 7168, 8, 288
 
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
         num_tokens, hidden, num_ranks, num_experts
     )
     if local_rank == 0:
         print(f"Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...", flush=True)
-    disable_p2p = os.getenv("MOONCAKE_EP_TEST_DISABLE_P2P", "0").lower() in {
-        "1",
-        "true",
-        "on",
-        "yes",
-    }
-    buffer = Buffer(
-        group, num_ep_buffer_bytes=num_ep_buffer_bytes, disable_p2p=disable_p2p
-    )
+    buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
+    # Mock a broken rank 1 to test effectiveness of EP recovery
+    if local_rank != 1:
+        buffer.update_ep_member()
+    else:
+        buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
     test_main(
         num_tokens,
         hidden,

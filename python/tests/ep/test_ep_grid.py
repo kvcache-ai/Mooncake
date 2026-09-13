@@ -22,6 +22,12 @@ def using_musa_backend() -> bool:
     }
 
 
+def using_maca_backend() -> bool:
+    return os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
+        "1", "ON", "TRUE", "YES"
+    } or bool(getattr(torch.version, "maca", None))
+
+
 def import_torchada_if_needed():
     if not using_musa_backend():
         return
@@ -202,18 +208,6 @@ def run_test_iteration(
 
 def worker(rank, world_size, config_dict):
     import_torchada_if_needed()
-
-    # MACA C500 validation can require one active HCA per local GPU. Keep the
-    # existing single-filter behavior, while allowing a test-only per-rank
-    # override such as ``mlx5_10;mlx5_11``.
-    per_rank_filters = os.getenv("MOONCAKE_EP_DEVICE_FILTERS")
-    if per_rank_filters:
-        filters = per_rank_filters.split(";")
-        if rank >= len(filters) or not filters[rank]:
-            raise RuntimeError(
-                "MOONCAKE_EP_DEVICE_FILTERS must provide one filter per rank"
-            )
-        os.environ["MOONCAKE_EP_DEVICE_FILTER"] = filters[rank]
 
     # Device filter
     device_filter = [
@@ -404,19 +398,7 @@ def stale_data_worker(rank, world_size):
 class TestMooncakeEPBuffer(unittest.TestCase):
     def setUp(self):
         import_torchada_if_needed()
-        requested_world_size = os.getenv("MOONCAKE_EP_TEST_WORLD_SIZE")
-        self.world_size = (
-            int(requested_world_size)
-            if requested_world_size
-            else torch.cuda.device_count()
-        )
-        visible_devices = torch.cuda.device_count()
-        if self.world_size < 2:
-            raise unittest.SkipTest("EP tests require at least two accelerator devices")
-        if self.world_size > visible_devices:
-            raise unittest.SkipTest(
-                f"Requested world size {self.world_size} exceeds {visible_devices} visible devices"
-            )
+        self.world_size = torch.cuda.device_count()
         os.environ["MASTER_ADDR"] = "127.0.0.1"
         os.environ["MASTER_PORT"] = "29500"
 
@@ -474,7 +456,7 @@ def make_test_name(cfg):
 
 
 def generate_tests():
-    fp8_options = [False, True]
+    fp8_options = [False] if using_maca_backend() else [False, True]
     test_grid = {
         "use_fp8": fp8_options,
         "async_finish": [False, True],

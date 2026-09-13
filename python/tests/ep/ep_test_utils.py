@@ -20,7 +20,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
 
     torch.cuda.set_device(local_rank)
     dist.init_process_group(
-        backend=os.getenv("MOONCAKE_EP_TEST_BACKEND", "mooncake"),
+        backend="mooncake",
         init_method=f"tcp://{ip}:{port}",
         world_size=num_nodes * num_local_ranks,
         rank=node_rank * num_local_ranks + local_rank,
@@ -28,10 +28,7 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device("cuda")
 
-    group_backend = os.getenv("MOONCAKE_EP_TEST_GROUP_BACKEND")
-    group = dist.new_group(
-        list(range(num_local_ranks * num_nodes)), backend=group_backend
-    )
+    group = dist.new_group(list(range(num_local_ranks * num_nodes)))
     return dist.get_rank(), dist.get_world_size(), group
 
 
