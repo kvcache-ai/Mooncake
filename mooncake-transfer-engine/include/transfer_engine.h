@@ -115,6 +115,12 @@ class TransferEngine {
     int getRpcPort();
 
     bool isUsingTent() const { return use_tent_; }
+    // Expose the internal TENT engine so callers (Store, TransferSubmitter)
+    // can call tent::TransferEngine native API directly, bypassing the
+    // compat-layer type conversion. Returns nullptr when not in TENT mode.
+    std::shared_ptr<mooncake::tent::TransferEngine> getTentEngine() const {
+        return use_tent_ ? impl_tent_ : nullptr;
+    }
 
     SegmentHandle openSegment(const std::string& segment_name);
 
@@ -145,6 +151,7 @@ class TransferEngine {
         std::span<const size_t> remote_offsets;
         std::span<const size_t> lengths;
         std::function<void(size_t, const Status&)> on_fragment_complete;
+        int intent_type = 0;
     };
 
     class ScatterTransferOperation {

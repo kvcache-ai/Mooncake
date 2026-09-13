@@ -70,6 +70,8 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
+        // Business intent for TENT scheduling (0 = unspecified).
+        int intent_type = 0;
         // Adjacent requests in a group may be scheduled as one unit.
         uint64_t task_group_id = kNoTaskGroup;
     };
