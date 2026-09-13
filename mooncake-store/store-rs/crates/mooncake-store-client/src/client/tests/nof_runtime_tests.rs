@@ -8,6 +8,8 @@ use crate::{
     NofTargetConfig,
 };
 
+use super::cold_tier::nof::managed_backend::NofManagedStorageBackend;
+
 struct FakePhysicalNof {
     records: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
     available: AtomicBool,
@@ -546,6 +548,69 @@ fn managed_nof_persists_route_reads_cold_and_releases_locator() {
         "managed NoF locator remains allocated: {:?}",
         backend.records.lock().keys().collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn managed_nof_batch_write_keeps_original_indices_after_validation_error() {
+    let backend = Arc::new(FakeManagedNof::default());
+    let storage = NofManagedStorageBackend::new(
+        NofBackend::new(backend.clone()).expect("managed NoF backend should build"),
+    );
+    let owner = ClientRuntimeId::new("managed-batch-owner", ClientEpoch(1));
+    let invalid_locator = NofManagedLocator::new(b"invalid".to_vec())
+        .expect("locator")
+        .to_hex();
+    let valid_locator = NofManagedLocator::new(b"valid".to_vec())
+        .expect("locator")
+        .to_hex();
+    let invalid_backing = mooncake_store_core::ColdBackingRoute {
+        owner: owner.clone(),
+        cold_tier_id: "nof-managed-a".to_string(),
+        object_locator: invalid_locator,
+        length: 8,
+        checksum: None,
+        state: mooncake_store_core::ColdBackingState::PendingOffload,
+        replicas: Vec::new(),
+    };
+    let valid_backing = mooncake_store_core::ColdBackingRoute {
+        owner,
+        cold_tier_id: "nof-managed-a".to_string(),
+        object_locator: valid_locator.clone(),
+        length: 3,
+        checksum: None,
+        state: mooncake_store_core::ColdBackingState::PendingOffload,
+        replicas: Vec::new(),
+    };
+    let invalid_payload = [1u8; 3];
+    let valid_payload = [7u8; 3];
+    let writes = [
+        ColdObjectWrite {
+            route: None,
+            cold_backing: &invalid_backing,
+            payload: &invalid_payload,
+        },
+        ColdObjectWrite {
+            route: None,
+            cold_backing: &valid_backing,
+            payload: &valid_payload,
+        },
+    ];
+
+    let results = storage.put_objects_batch_profiled(&writes, &mut |_, _| {});
+
+    assert!(results[0].is_err());
+    let materialized = results[1]
+        .as_ref()
+        .expect("second write should succeed after first validation error");
+    assert_eq!(materialized.object_locator, valid_locator);
+    assert_eq!(
+        materialized.state,
+        mooncake_store_core::ColdBackingState::Materialized
+    );
+    let stored = backend.records.lock();
+    assert_eq!(stored.len(), 1);
+    let locator = NofManagedLocator::from_hex(&valid_locator).expect("valid locator");
+    assert_eq!(stored.get(&locator).map(Vec::as_slice), Some(&valid_payload[..]));
 }
 
 #[test]

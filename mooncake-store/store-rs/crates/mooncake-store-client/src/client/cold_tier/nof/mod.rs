@@ -10,7 +10,7 @@ mod backend;
 mod backing;
 pub mod extent_store;
 mod managed;
-mod managed_backend;
+pub(in crate::client) mod managed_backend;
 mod object;
 mod physical;
 pub(in crate::client) mod physical_backend;

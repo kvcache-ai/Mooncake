@@ -125,10 +125,7 @@ const DEFAULT_DEVICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_OBJECTS_PER_CLIENT: usize = 16;
 const DEFAULT_VALUE_BYTES: usize = 64 * 1024;
 const DEFAULT_REPLICA_COUNT: usize = 2;
-const DEFAULT_TARGET_WORKERS: usize = 2;
-const DEFAULT_QUEUE_DEPTH: u32 = 64;
 const DEFAULT_SUBMIT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
-const DEFAULT_INFLIGHT_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_BARRIER_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_READ_RETRIES: usize = 20;
 const DEFAULT_READ_RETRY_DELAY_MS: u64 = 250;
@@ -152,10 +149,7 @@ struct TestConfig {
     value_bytes: usize,
     batch_size: usize,
     replica_count: usize,
-    target_workers: u32,
-    queue_depth: u32,
     submit_chunk_bytes: u64,
-    inflight_bytes: u64,
     test_prefix: String,
     redis_url: String,
     keyspace: String,
@@ -292,13 +286,10 @@ impl TestConfig {
             value_bytes,
             batch_size,
             replica_count,
-            target_workers: parse_env("NOF_TARGET_WORKERS", DEFAULT_TARGET_WORKERS as u32)?,
-            queue_depth: parse_env("NOF_QUEUE_DEPTH", DEFAULT_QUEUE_DEPTH)?,
             submit_chunk_bytes: parse_env(
                 "NOF_SUBMIT_CHUNK_BYTES",
                 DEFAULT_SUBMIT_CHUNK_BYTES as u64,
             )?,
-            inflight_bytes: parse_env("NOF_INFLIGHT_BYTES", DEFAULT_INFLIGHT_BYTES as u64)?,
             test_prefix: env::var("NOF_TEST_PREFIX")
                 .unwrap_or_else(|_| "nof-multi-client".to_string()),
             redis_url: env::var("NOF_REDIS_URL")
@@ -573,11 +564,8 @@ fn build_client(
         let mut device_config =
             SpdkNofBlockDeviceConfig::tcp(&target.traddr, &target.port, &target.subnqn, 1);
         device_config.hostnqn = Some(config.host_nqn.clone());
-        device_config.worker_count = config.target_workers;
-        device_config.queue_depth = config.queue_depth;
         device_config.no_huge = true;
         device_config.submit_chunk_bytes = config.submit_chunk_bytes;
-        device_config.inflight_bytes_limit = config.inflight_bytes;
         let device = Arc::new(SpdkNofBlockDevice::connect(device_config)?);
         let executor = Arc::new(ExtentStoreExecutor::new(
             device,

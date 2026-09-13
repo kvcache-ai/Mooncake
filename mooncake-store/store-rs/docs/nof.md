@@ -81,15 +81,15 @@ Managed ExtentStore targets also reuse the existing Cold Tier scheduler. The sam
 watermarks drive bounded victim selection, route-safe `PendingDelete` transitions, and allocator
 release through the normal owner path. The shared `PersistentStorageBackend::compact` interface is
 used by local ExtentStore and Managed NoF: local ExtentStore removes fully dead non-active
-segments, while Managed NoF returns allocator quarantine to its free-range index after the grace
-period. Neither implementation moves a live route without a route CAS and locator update.
+segments, while Managed NoF releases locators through the same route-safe owner path. Neither
+implementation moves a live route without a route CAS and locator update.
 
 Released NoF extents do not have a second persistent quarantine journal. Graceful owner handoff
 fences and flushes accepted writes before recovery, and recovery rebuilds the allocator only from
-materialized routes while stale locators are rejected. Persisting the in-memory quarantine alone
-would not solve a crashed-process transport-fencing problem; if crash-time late I/O becomes a
-supported requirement, it needs a device/session epoch fence in the SPDK transport rather than
-another allocator journal.
+materialized routes while stale locators are no longer published. Normal shutdown relies on
+drain to wait for writes accepted by the outgoing process before the owner releases locators. If
+crash-time late I/O becomes a supported requirement, it needs a device/session epoch fence in the
+SPDK transport rather than another allocator journal.
 
 Mooncake remains authoritative for logical object existence, while KVCS remains authoritative for
 provider layout and provider-internal metadata:
@@ -175,9 +175,9 @@ allocates an aligned ExtentStore record, flushes the block device, and returns a
 Publication is owner-driven: the target owner reserves an extent, CAS-publishes a
 `PendingWrite` location in `ObjectRoute.nof_backing`, the writer performs the direct write and
 flush, and the owner CAS-publishes `Materialized`. If the CAS fails or the entry is deleted,
-the owner releases the locator; released extents stay quarantined for a grace period before
-reuse so late direct writes cannot overwrite a recycled extent. Reads, deletes, replicas,
-load balancing, retries, and owner-scoped health reuse the existing Cold Tier runtime.
+the owner releases the locator after the normal drain/write ordering guarantees complete.
+Reads, deletes, replicas, load balancing, retries, and owner-scoped health reuse the existing Cold
+Tier runtime.
 
 The managed owner rebuilds ExtentStore state from materialized routes after an abnormal owner
 loss or when a target is brought back online. It lists routes filtered by `target_id` and
@@ -193,10 +193,10 @@ Normal shutdown uses the graceful-drain route-snapshot handoff described in
 route index again. Crash takeover and target re-online use the route-index lookup above. The fast
 path transfers metadata only; it does not move payloads or change executor locators.
 
-`SpdkNofBlockDevice` is the transport below ExtentStore. It attaches an NVMe-oF controller, uses
-per-worker qpairs and DMA buffers, performs aligned block I/O, exposes geometry and transport
-statistics, and implements the flush barrier. Extent alignment is not part of the generic NoF
-traits.
+`SpdkNofBlockDevice` is the transport below ExtentStore. It attaches an NVMe-oF controller,
+serializes I/O through the current SPDK qpair, uses SPDK DMA buffers for submitted chunks,
+performs aligned block I/O, exposes geometry, and implements the flush barrier. Extent alignment
+is not part of the generic NoF traits.
 
 A StoreClient target set uses exactly one authority mode. Provider-owned KVCS targets and
 Mooncake-managed ExtentStore targets are configured on separate clients so recovery and deletion
@@ -305,8 +305,8 @@ Mooncake-managed ExtentStore targets; provider-owned KVCS targets do not have Mo
 snapshots.
 
 The local drain waits for writes already accepted by the outgoing process. It is not a
-cross-client data-plane lock. Existing route states, publication ordering, and the executor's
-reuse grace period remain the protections against late writes.
+cross-client data-plane lock. Existing route states and publication ordering remain the
+protections against late writes.
 
 ### Heartbeat health
 
