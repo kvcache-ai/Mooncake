@@ -75,7 +75,6 @@ struct MooncakeEpBuffer {
 
     // GDR buffer — allocated by p2p_transport_; peer mappings are optional.
     int buffer_idx{};
-    int phase_epochs[2]{};
     // TBO owns multiple logical dispatchers but shares one native Buffer.
     // Keep a private top-k snapshot slot per dispatch metadata tensor so
     // interleaved subbatches cannot overwrite one another.
