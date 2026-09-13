@@ -78,10 +78,11 @@ VLLM_LOGGING_LEVEL=DEBUG CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 **Proxy (Decoder Node):**
 
 ```bash
-python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
+# From a vLLM repository checkout.
+python examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \
   --host 0.0.0.0 --port 8000 \
-  --prefiller-host 10.0.28.193 --prefiller-port 8010 \
-  --decoder-host 10.0.28.202 --decoder-port 8020
+  --prefill http://10.0.28.193:8010 8998 \
+  --decode http://10.0.28.202:8020
 ```
 
 ### Benchmark Script
