@@ -78,7 +78,8 @@ impl NofManagedStorageBackend {
         } else {
             None
         };
-        for ((index, write), status) in indices.into_iter().zip(writes.iter()).zip(statuses) {
+        for (index, status) in indices.into_iter().zip(statuses) {
+            let write = &writes[index];
             results[index] = Some(match status {
                 Ok(()) => match flush.as_ref() {
                     Some(Ok(())) => Ok(ColdBackingRoute {

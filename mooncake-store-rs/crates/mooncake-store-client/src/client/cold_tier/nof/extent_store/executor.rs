@@ -119,7 +119,7 @@ impl ExtentStoreExecutor {
             .ok_or_else(|| {
                 StoreError::InvalidState("managed ExtentStore value is too large".to_string())
             })?;
-        Ok(align_up(raw, self.config.alignment))
+        align_up_checked(raw, self.config.alignment)
     }
 
     fn validate_locator(&self, locator: ExtentLocator, expected_len: u64) -> Result<ExtentLocator> {
@@ -271,6 +271,14 @@ impl NofManagedAllocator for ExtentStoreExecutor {
                     request.length,
                 )?;
                 state.reserved.remove(request.locator.as_bytes());
+                if range_is_free(&state.free, locator.offset, locator.record_len) {
+                    return Ok(());
+                }
+                if range_overlaps_free(&state.free, locator.offset, locator.record_len) {
+                    return Err(StoreError::InvalidState(
+                        "managed ExtentStore release overlaps an existing free range".to_string(),
+                    ));
+                }
                 release(&mut state.free, locator.offset, locator.record_len);
                 Ok(())
             })
@@ -336,7 +344,7 @@ fn validate_config(
             "managed ExtentStore alignment must be a non-zero power of two".to_string(),
         ));
     }
-    config.start_offset = align_up(config.start_offset, config.alignment);
+    config.start_offset = align_up_checked(config.start_offset, config.alignment)?;
     if config.device_bytes == 0 || config.device_bytes > capacity {
         config.device_bytes = capacity;
     }
@@ -348,8 +356,13 @@ fn validate_config(
     Ok(config)
 }
 
-fn align_up(value: u64, alignment: u64) -> u64 {
-    (value + alignment - 1) & !(alignment - 1)
+fn align_up_checked(value: u64, alignment: u64) -> Result<u64> {
+    value
+        .checked_add(alignment - 1)
+        .map(|value| value & !(alignment - 1))
+        .ok_or_else(|| {
+            StoreError::InvalidState("managed ExtentStore alignment overflow".to_string())
+        })
 }
 
 fn allocate(free: &mut Vec<FreeRange>, len: u64) -> Option<u64> {
@@ -378,6 +391,26 @@ fn release(free: &mut Vec<FreeRange>, offset: u64, len: u64) {
         merged.push(range);
     }
     *free = merged;
+}
+
+fn range_is_free(free: &[FreeRange], offset: u64, len: u64) -> bool {
+    let Some(end) = offset.checked_add(len) else {
+        return false;
+    };
+    free.iter().any(|range| {
+        let range_end = range.offset.saturating_add(range.len);
+        range.offset <= offset && end <= range_end
+    })
+}
+
+fn range_overlaps_free(free: &[FreeRange], offset: u64, len: u64) -> bool {
+    let Some(end) = offset.checked_add(len) else {
+        return true;
+    };
+    free.iter().any(|range| {
+        let range_end = range.offset.saturating_add(range.len);
+        offset < range_end && range.offset < end
+    })
 }
 
 fn encode_header(dst: &mut [u8], payload_len: u64, checksum: Option<u64>) {
@@ -409,11 +442,8 @@ pub struct SpdkNofBlockDeviceConfig {
     pub subnqn: String,
     pub nsid: u32,
     pub hostnqn: Option<String>,
-    pub worker_count: u32,
-    pub queue_depth: u32,
     pub no_huge: bool,
     pub submit_chunk_bytes: u64,
-    pub inflight_bytes_limit: u64,
 }
 
 impl SpdkNofBlockDeviceConfig {
@@ -424,11 +454,8 @@ impl SpdkNofBlockDeviceConfig {
             subnqn: subnqn.to_string(),
             nsid,
             hostnqn: None,
-            worker_count: 1,
-            queue_depth: 64,
             no_huge: true,
             submit_chunk_bytes: 4 * 1024 * 1024,
-            inflight_bytes_limit: 64 * 1024 * 1024,
         }
     }
 }
