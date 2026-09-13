@@ -22,7 +22,8 @@ class BatchOpLogSnapshotPublisher {
    private:
     ErrorCode PublishImpl(std::string_view owner_token,
                           std::string_view descriptor_json,
-                          const SnapshotMaintenanceLease& lease);
+                          const SnapshotMaintenanceLease& lease,
+                          std::optional<std::string>* expected_fallback);
 
     HaKvBackend& backend_;
     std::string cluster_id_;
