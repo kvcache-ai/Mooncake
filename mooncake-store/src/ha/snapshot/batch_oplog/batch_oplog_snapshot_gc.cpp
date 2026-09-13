@@ -62,10 +62,12 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                 return ErrorCode::INTERNAL_ERROR;
         auto verify = [&](const std::string& key, uint64_t size, uint32_t crc) {
             auto info = store_.InspectObject(key);
-            if (!info || info->stored_size != size ||
-                (info->crc32c && *info->crc32c != crc))
+            if (!info || info->stored_size != size) return false;
+            if (info->crc32c) return *info->crc32c == crc;
+            std::vector<uint8_t> bytes;
+            if (!store_.DownloadBuffer(key, bytes) || bytes.size() != size)
                 return false;
-            return true;
+            return Crc32cValue(bytes.data(), bytes.size()) == crc;
         };
         if (!verify(md->segments.key, md->segments.stored_size,
                     md->segments.crc32c))
