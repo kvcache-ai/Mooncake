@@ -616,6 +616,214 @@ class FreeRatioFirstAllocationStrategy final : public RankedAllocationStrategy {
     }
 };
 
+/**
+ * @brief Capacity-aware power-of-two-choices allocation strategy.
+ *
+ * Each replica samples two distinct eligible segments uniformly. The segment
+ * with the higher free-space ratio wins; when the ratios differ by less than
+ * one percentage point, the segment with more absolute free bytes wins. This
+ * keeps utilization balanced across heterogeneous capacities without sending
+ * every write to a newly mounted empty segment.
+ */
+class CapacityAwareP2CAllocationStrategy final
+    : public RandomAllocationStrategy {
+   public:
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>(),
+        const ReplicaType replica_type = ReplicaType::MEMORY) override {
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const auto& names = allocator_manager.getNames();
+        if (names.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_num);
+        std::set<std::string> used_segments;
+
+        for (const auto& preferred_segment : preferred_segments) {
+            if (excluded_segments.contains(preferred_segment) ||
+                used_segments.contains(preferred_segment)) {
+                continue;
+            }
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(preferred_segment);
+                if (replicas.size() == replica_num) {
+                    return replicas;
+                }
+            }
+        }
+
+        while (replicas.size() < replica_num) {
+            std::vector<size_t> eligible;
+            eligible.reserve(names.size());
+            for (size_t index = 0; index < names.size(); ++index) {
+                const auto& name = names[index];
+                if (!excluded_segments.contains(name) &&
+                    !used_segments.contains(name)) {
+                    eligible.push_back(index);
+                }
+            }
+            if (eligible.empty()) {
+                break;
+            }
+
+            bool allocated = false;
+            const size_t max_trials =
+                std::min(kMaxP2CTrials, (eligible.size() + 1) / 2);
+            for (size_t trial = 0;
+                 trial < max_trials && !eligible.empty() && !allocated;
+                 ++trial) {
+                const size_t first_position = randomIndex(eligible.size());
+                size_t second_position = first_position;
+                if (eligible.size() > 1) {
+                    second_position = randomIndex(eligible.size() - 1);
+                    if (second_position >= first_position) {
+                        ++second_position;
+                    }
+                }
+
+                const size_t first_index = eligible[first_position];
+                const size_t second_index = eligible[second_position];
+                const bool first_wins =
+                    first_index == second_index ||
+                    PreferFirst(allocator_manager, names[first_index],
+                                names[second_index]);
+                const size_t winner_index =
+                    first_wins ? first_index : second_index;
+                const size_t runner_up_index =
+                    first_wins ? second_index : first_index;
+
+                auto buffer = allocateSingle(allocator_manager,
+                                             names[winner_index], slice_length);
+                size_t allocated_index = winner_index;
+                if (!buffer && runner_up_index != winner_index) {
+                    buffer =
+                        allocateSingle(allocator_manager,
+                                       names[runner_up_index], slice_length);
+                    allocated_index = runner_up_index;
+                }
+                if (buffer) {
+                    replicas.emplace_back(std::move(buffer),
+                                          ReplicaStatus::PROCESSING,
+                                          replica_type);
+                    used_segments.insert(names[allocated_index]);
+                    allocated = true;
+                    break;
+                }
+
+                RemoveEligiblePosition(
+                    eligible, std::max(first_position, second_position));
+                if (first_position != second_position) {
+                    RemoveEligiblePosition(
+                        eligible, std::min(first_position, second_position));
+                }
+            }
+
+            if (!allocated) {
+                break;
+            }
+        }
+
+        if (replicas.size() >= replica_num) {
+            return replicas;
+        }
+
+        size_t fallback_index = randomIndex(names.size());
+        // Reaching this path means the sampled candidates were full. Walk the
+        // complete segment list so scale-out can use remaining capacity even
+        // when the cluster contains more than Random's normal retry limit.
+        const size_t max_retry = names.size();
+        for (size_t retry = 0;
+             retry < max_retry && replicas.size() < replica_num; ++retry) {
+            const auto& name = names[fallback_index % names.size()];
+            ++fallback_index;
+            if (excluded_segments.contains(name) ||
+                used_segments.contains(name)) {
+                continue;
+            }
+            auto buffer = allocateSingle(allocator_manager, name, slice_length);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING, replica_type);
+                used_segments.insert(name);
+            }
+        }
+
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return replicas;
+    }
+
+   private:
+    struct SegmentLoad {
+        uint64_t capacity = 0;
+        uint64_t free_bytes = 0;
+        double free_ratio = 0.0;
+    };
+
+    static constexpr size_t kMaxP2CTrials = 4;
+    static constexpr double kFreeRatioEpsilon = 0.01;
+
+    static void RemoveEligiblePosition(std::vector<size_t>& eligible,
+                                       size_t position) {
+        eligible[position] = eligible.back();
+        eligible.pop_back();
+    }
+
+    static SegmentLoad GetSegmentLoad(const AllocatorManager& allocator_manager,
+                                      const std::string& name) {
+        SegmentLoad load;
+        const auto* allocators = allocator_manager.getAllocators(name);
+        if (!allocators) {
+            return load;
+        }
+        for (const auto& allocator : *allocators) {
+            if (!allocator) {
+                continue;
+            }
+            const auto capacity = static_cast<uint64_t>(allocator->capacity());
+            const auto used = static_cast<uint64_t>(allocator->size());
+            load.capacity += capacity;
+            load.free_bytes += capacity > used ? capacity - used : 0;
+        }
+        if (load.capacity > 0) {
+            load.free_ratio = static_cast<double>(load.free_bytes) /
+                              static_cast<double>(load.capacity);
+        }
+        return load;
+    }
+
+    static bool PreferFirst(const AllocatorManager& allocator_manager,
+                            const std::string& first,
+                            const std::string& second) {
+        const auto first_load = GetSegmentLoad(allocator_manager, first);
+        const auto second_load = GetSegmentLoad(allocator_manager, second);
+        const double ratio_difference =
+            first_load.free_ratio - second_load.free_ratio;
+        if (ratio_difference > kFreeRatioEpsilon) {
+            return true;
+        }
+        if (ratio_difference < -kFreeRatioEpsilon) {
+            return false;
+        }
+        return first_load.free_bytes > second_load.free_bytes;
+    }
+};
+
 class SsdFreeRatioFirstAllocationStrategy final
     : public RankedAllocationStrategy {
    public:
@@ -724,6 +932,8 @@ inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
                 local_ssd);
         case AllocationStrategyType::LOCAL_FIRST:
             return std::make_shared<RandomAllocationStrategy>();
+        case AllocationStrategyType::CAPACITY_AWARE_P2C:
+            return std::make_shared<CapacityAwareP2CAllocationStrategy>();
         default:
             return std::make_shared<RandomAllocationStrategy>();
     }

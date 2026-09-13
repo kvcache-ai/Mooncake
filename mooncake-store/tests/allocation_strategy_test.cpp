@@ -27,7 +27,8 @@ static constexpr size_t MiB = 1024 * 1024;
 
 // Strategy types for parameterized tests
 const auto kStrategyTypes = ::testing::Values(
-    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST);
+    AllocationStrategyType::RANDOM, AllocationStrategyType::FREE_RATIO_FIRST,
+    AllocationStrategyType::CAPACITY_AWARE_P2C);
 
 const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
                                                BufferAllocatorType::OFFSET);
@@ -90,6 +91,9 @@ INSTANTIATE_TEST_SUITE_P(
                 break;
             case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
                 strategy_str = "SsdFreeRatioFirst";
+                break;
+            case AllocationStrategyType::CAPACITY_AWARE_P2C:
+                strategy_str = "CapacityAwareP2C";
                 break;
             default:
                 strategy_str = "Unknown";
@@ -686,6 +690,155 @@ TEST_P(AllocationStrategyParameterizedTest,
     // Verify that utilization ratios are balanced (within 15%)
     EXPECT_LT(util_diff, 15.0)
         << "FreeRatioFirst should balance utilization ratios";
+}
+
+TEST_F(AllocationStrategyTest,
+       CapacityAwareP2CBalancesIssue2430HeterogeneousSegments) {
+    constexpr size_t kSmallCount = 8;
+    constexpr size_t kLargeCount = 2;
+    constexpr size_t kSmallCapacity = 8 * MiB;
+    constexpr size_t kLargeCapacity = 20 * MiB;
+    constexpr size_t kSliceLength = 4 * 1024;
+
+    AllocatorManager allocator_manager;
+    for (size_t index = 0; index < kSmallCount; ++index) {
+        const auto name = "small_" + std::to_string(index);
+        allocator_manager.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x100000000ULL + index * kLargeCapacity,
+                      kSmallCapacity, name));
+    }
+    for (size_t index = 0; index < kLargeCount; ++index) {
+        const auto name = "large_" + std::to_string(index);
+        allocator_manager.addAllocator(
+            name, std::make_shared<OffsetBufferAllocator>(
+                      name, 0x200000000ULL + index * kLargeCapacity,
+                      kLargeCapacity, name));
+    }
+
+    CapacityAwareP2CAllocationStrategy strategy;
+    const size_t total_capacity =
+        kSmallCount * kSmallCapacity + kLargeCount * kLargeCapacity;
+    const size_t allocation_count = total_capacity * 70 / 100 / kSliceLength;
+    size_t large_allocations = 0;
+    std::vector<std::vector<Replica>> replicas;
+    replicas.reserve(allocation_count);
+    for (size_t index = 0; index < allocation_count; ++index) {
+        auto result = strategy.Allocate(allocator_manager, kSliceLength);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 1);
+        const auto descriptor = result->front().get_descriptor();
+        ASSERT_TRUE(descriptor.is_memory_replica());
+        const auto& endpoint = descriptor.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        large_allocations += endpoint.rfind("large_", 0) == 0;
+        replicas.push_back(std::move(*result));
+    }
+
+    const double large_used_share =
+        static_cast<double>(large_allocations) / allocation_count;
+    const double large_capacity_share =
+        static_cast<double>(kLargeCount * kLargeCapacity) / total_capacity;
+    EXPECT_NEAR(large_used_share, large_capacity_share, 0.05);
+
+    double min_utilization = 1.0;
+    double max_utilization = 0.0;
+    for (const auto& name : allocator_manager.getNames()) {
+        const auto* allocators = allocator_manager.getAllocators(name);
+        ASSERT_NE(allocators, nullptr);
+        ASSERT_EQ(allocators->size(), 1);
+        const auto& allocator = allocators->front();
+        const double utilization =
+            static_cast<double>(allocator->size()) / allocator->capacity();
+        min_utilization = std::min(min_utilization, utilization);
+        max_utilization = std::max(max_utilization, utilization);
+    }
+    EXPECT_LT(max_utilization - min_utilization, 0.05);
+}
+
+TEST_F(AllocationStrategyTest,
+       CapacityAwareP2CBoundsIssue2430FreshSegmentShare) {
+    constexpr size_t kOldCount = 8;
+    constexpr size_t kCapacity = 8 * MiB;
+    constexpr size_t kSliceLength = 4 * 1024;
+    constexpr size_t kPostMountAllocations = 500;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::unique_ptr<AllocatedBuffer>> prefilled;
+    for (size_t index = 0; index < kOldCount; ++index) {
+        const auto name = "old_" + std::to_string(index);
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, 0x100000000ULL + index * kCapacity, kCapacity, name);
+        const size_t prefill_count = kCapacity * 70 / 100 / kSliceLength;
+        for (size_t allocation = 0; allocation < prefill_count; ++allocation) {
+            auto buffer = allocator->allocate(kSliceLength);
+            ASSERT_NE(buffer, nullptr);
+            prefilled.push_back(std::move(buffer));
+        }
+        allocator_manager.addAllocator(name, std::move(allocator));
+    }
+    const std::string fresh_name = "fresh";
+    allocator_manager.addAllocator(
+        fresh_name, std::make_shared<OffsetBufferAllocator>(
+                        fresh_name, 0x300000000ULL, kCapacity, fresh_name));
+
+    CapacityAwareP2CAllocationStrategy strategy;
+    size_t fresh_allocations = 0;
+    std::vector<std::vector<Replica>> replicas;
+    for (size_t index = 0; index < kPostMountAllocations; ++index) {
+        auto result = strategy.Allocate(allocator_manager, kSliceLength);
+        ASSERT_TRUE(result.has_value());
+        const auto descriptor = result->front().get_descriptor();
+        ASSERT_TRUE(descriptor.is_memory_replica());
+        const auto& endpoint = descriptor.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        fresh_allocations += endpoint == fresh_name;
+        replicas.push_back(std::move(*result));
+    }
+
+    const double fresh_share =
+        static_cast<double>(fresh_allocations) / kPostMountAllocations;
+    EXPECT_GT(fresh_share, 0.10);
+    EXPECT_LT(fresh_share, 0.35);
+}
+
+TEST_F(AllocationStrategyTest,
+       CapacityAwareP2CCompletesIssue2430ScaleOutAllocations) {
+    constexpr size_t kOldCount = 100;
+    constexpr size_t kNewCount = 50;
+    constexpr size_t kCapacity = 8 * MiB;
+    constexpr size_t kSliceLength = 512 * 1024;
+    constexpr size_t kAllocationCount = 480;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::unique_ptr<AllocatedBuffer>> prefilled;
+    for (size_t index = 0; index < kOldCount; ++index) {
+        const auto name = "old_" + std::to_string(index);
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, 0x100000000ULL + index * kCapacity, kCapacity, name);
+        auto buffer = allocator->allocate(kCapacity);
+        ASSERT_NE(buffer, nullptr);
+        prefilled.push_back(std::move(buffer));
+        allocator_manager.addAllocator(name, std::move(allocator));
+    }
+    for (size_t index = 0; index < kNewCount; ++index) {
+        const auto name = "new_" + std::to_string(index);
+        allocator_manager.addAllocator(
+            name,
+            std::make_shared<OffsetBufferAllocator>(
+                name, 0x500000000ULL + index * kCapacity, kCapacity, name));
+    }
+
+    CapacityAwareP2CAllocationStrategy strategy;
+    std::vector<std::vector<Replica>> replicas;
+    replicas.reserve(kAllocationCount);
+    for (size_t index = 0; index < kAllocationCount; ++index) {
+        auto result = strategy.Allocate(allocator_manager, kSliceLength);
+        ASSERT_TRUE(result.has_value()) << "allocation " << index;
+        ASSERT_EQ(result->size(), 1);
+        replicas.push_back(std::move(*result));
+    }
+    EXPECT_EQ(replicas.size(), kAllocationCount);
 }
 
 // Test the performance comparison between strategies

@@ -441,12 +441,16 @@ class MasterServiceSupervisorConfig {
                 AllocationStrategyType::SSD_FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "local_first") {
             allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+        } else if (config.allocation_strategy == "capacity_aware_p2c") {
+            allocation_strategy_type =
+                AllocationStrategyType::CAPACITY_AWARE_P2C;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
                          << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, local_first "
+                            "ssd_free_ratio_first, local_first, "
+                            "capacity_aware_p2c "
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
@@ -735,12 +739,16 @@ class WrappedMasterServiceConfig {
                 AllocationStrategyType::SSD_FREE_RATIO_FIRST;
         } else if (config.allocation_strategy == "local_first") {
             allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+        } else if (config.allocation_strategy == "capacity_aware_p2c") {
+            allocation_strategy_type =
+                AllocationStrategyType::CAPACITY_AWARE_P2C;
         } else {
             LOG(WARNING) << "Unrecognized allocation_strategy value: '"
                          << config.allocation_strategy
                          << "'. Defaulting to 'random'. "
                          << "Valid options are: random, free_ratio_first, cxl, "
-                            "ssd_free_ratio_first, local_first "
+                            "ssd_free_ratio_first, local_first, "
+                            "capacity_aware_p2c "
                             "(case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }

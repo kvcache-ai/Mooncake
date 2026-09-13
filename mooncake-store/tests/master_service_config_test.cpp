@@ -82,4 +82,21 @@ TEST(MasterServiceConfigTest, OplogBatchMaxEntriesBuilderOverrideRespected) {
     EXPECT_EQ(17u, config.oplog_batch_max_entries);
 }
 
+TEST(MasterServiceConfigTest, CapacityAwareP2CStrategyPropagates) {
+    MasterConfig master_config{};
+    master_config.allocation_strategy = "capacity_aware_p2c";
+
+    MasterServiceSupervisorConfig supervisor_config(master_config);
+    EXPECT_EQ(AllocationStrategyType::CAPACITY_AWARE_P2C,
+              supervisor_config.allocation_strategy_type);
+
+    WrappedMasterServiceConfig wrapped_config(master_config, 1);
+    EXPECT_EQ(AllocationStrategyType::CAPACITY_AWARE_P2C,
+              wrapped_config.allocation_strategy_type);
+
+    MasterServiceConfig service_config(wrapped_config);
+    EXPECT_EQ(AllocationStrategyType::CAPACITY_AWARE_P2C,
+              service_config.allocation_strategy_type);
+}
+
 }  // namespace mooncake::test
