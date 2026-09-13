@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
@@ -246,6 +247,45 @@ class RejectingOrderedOpLogWriter : public OrderedOpLogWriter {
     size_t rejected_commits_{0};
 };
 
+// Self-contained arrive-gate injected into MasterService via
+// MasterService::snapshot_arrive_hook_. Owns all the barrier state
+// (armed flag, mutex, CV) that used to live on MasterService as
+// *ForTesting members; Arm/Disarm/Wait keep those semantics.
+struct SnapshotBarrierGate {
+    void Arm() {
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = false;
+        armed.store(true, std::memory_order_release);
+    }
+
+    void Disarm() {
+        armed.store(false, std::memory_order_release);
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = false;
+    }
+
+    // Invoked by PutStart through the injected hook when it enters the
+    // snapshot section (client_mutex_ released, snapshot_mutex_ held shared).
+    void Arrive() {
+        if (!armed.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex);
+        reached = true;
+        cv.notify_all();
+    }
+
+    bool WaitForArrive(std::chrono::milliseconds timeout) {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout, [this] { return reached; });
+    }
+
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::atomic<bool> armed{false};
+    bool reached{false};
+};
+
 class RejectOnceOrderedOpLogWriter : public OrderedOpLogWriter {
    public:
     RejectOnceOrderedOpLogWriter(OrderedOpLogWriterConfig config,
@@ -281,6 +321,13 @@ class MasterServiceHATest : public ::testing::Test {
    protected:
     static void EnableDfsForTesting(MasterService& service) {
         service.enable_dfs_ = true;
+    }
+
+    // Friend access applies to this fixture, not TEST_F subclasses; funnel
+    // the hook through a static member.
+    static void SetSnapshotArriveHookForTesting(MasterService& service,
+                                                std::function<void()> hook) {
+        service.snapshot_arrive_hook_ = std::move(hook);
     }
 
     static void SetUpTestSuite() {
@@ -602,34 +649,6 @@ class MasterServiceHATest : public ::testing::Test {
         return segment;
     }
 
-    static std::string FindGroupIdOnDifferentShard(MasterService& service,
-                                                   size_t source_shard,
-                                                   const std::string& prefix) {
-        for (size_t index = 0; index < MasterService::kNumShards * 2; ++index) {
-            std::string group_id = prefix + std::to_string(index);
-            if (service.getShardIndex(group_id) != source_shard) {
-                return group_id;
-            }
-        }
-        return {};
-    }
-
-    static std::string FindGroupIdOnDifferentShardFromObject(
-        MasterService& service, const TenantId& tenant_id,
-        const std::string& key, const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service, service.getShardIndex(tenant_id, key), prefix);
-    }
-
-    static std::string FindGroupIdOnDifferentShardFromGroup(
-        MasterService& service, const std::string& group_id,
-        const std::string& prefix) {
-        return FindGroupIdOnDifferentShard(
-            service, service.getShardIndex(group_id), prefix);
-    }
-
-    // Friend access to MasterService::metadata_shards_ and
-    // getShardIndex, which are otherwise private.
     // MasterServiceHATest is friended; TEST_F-generated subclasses are not,
     // hence this static funnel. Seeds an in-flight PromotionTask for a
     // given (tenant, key) so NotifyPromotionSuccess can proceed without
@@ -639,18 +658,26 @@ class MasterServiceHATest : public ::testing::Test {
     static void SeedPromotionTaskForTesting(
         MasterService* service, const TenantId& tenant, const std::string& key,
         const UUID& holder_id, ReplicaID alloc_id, uint64_t object_size) {
-        const size_t shard_idx = service->getShardIndex(tenant, key);
-        auto shard_access =
-            MasterService::MetadataShardAccessorRW(service, shard_idx);
-        auto& tenant_state =
-            service->GetOrCreateTenantState(shard_access.get(), tenant);
-        tenant_state.promotion_tasks.emplace(
-            key, MasterService::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
+        // The tenant container is resolved by tenant_id (there is no shard
+        // routing); create it on demand.
+        auto tenant_handle = service->GetOrCreateTenantCatalogHandle(tenant);
+        auto& tenant_state = *tenant_handle;
+        auto entry = tenant_state.Get(key);
+        if (!entry) {
+            entry = std::make_shared<mooncake::metadata::ObjectEntry>(
+                std::make_unique<ObjectMetadata>(
+                    holder_id, std::chrono::system_clock::now(), object_size,
+                    std::vector<Replica>{}, std::nullopt, false,
+                    ObjectDataType::UNKNOWN, "", tenant, key));
+            tenant_state.InsertObject(key, entry);
+        }
+        auto entry_lock = entry->LockUnique();
+        entry->promotion_task = mooncake::PromotionTask{
+            .source_id = 0,
+            .alloc_id = alloc_id,
+            .object_size = object_size,
+            .start_time = std::chrono::system_clock::now(),
+            .holder_id = holder_id};
     }
 
     static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
@@ -752,11 +779,8 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasMetadataEntryForTesting(MasterService& service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        const auto shard_idx = service.getShardIndex(tenant_id, key);
-        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
-        auto tenant = shard->tenants.find(tenant_id);
-        return tenant != shard->tenants.end() &&
-               tenant->second.metadata.contains(key);
+        auto tenant = service.catalog_.Lookup(tenant_id);
+        return tenant && tenant->ContainsObject(key);
     }
 
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
@@ -806,17 +830,18 @@ class MasterServiceHATest : public ::testing::Test {
     static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
                                                     const TenantId& tenant_id,
                                                     const std::string& key) {
-        const size_t shard_idx = service.getShardIndex(tenant_id, key);
-        MasterService::MetadataShardAccessorRO shard(&service, shard_idx);
-        const auto tenant = shard->tenants.find(tenant_id);
-        if (tenant == shard->tenants.end()) {
+        auto tenant_handle = service.catalog_.Lookup(tenant_id);
+        if (!tenant_handle) {
             return false;
         }
-        const auto metadata = tenant->second.metadata.find(key);
-        return metadata != tenant->second.metadata.end() &&
-               metadata->second.HasReplica([](const Replica& replica) {
-                   return replica.is_memory_replica() && replica.is_completed();
-               });
+        auto entry = tenant_handle->Get(key);
+        if (!entry) {
+            return false;
+        }
+        auto lk = entry->LockShared();
+        return entry->metadata().HasReplica([](const Replica& replica) {
+            return replica.is_memory_replica() && replica.is_completed();
+        });
     }
 
     static bool MemoryReplicaAffiliatedWithForTesting(
@@ -841,8 +866,7 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
         ASSERT_TRUE(accessor.Exists());
-        SpinLocker locker(&accessor.Get().lock);
-        accessor.Get().lease_->SetDeadline(deadline);
+        accessor.Get().SetLeaseDeadlineForTesting(deadline);
     }
 
     static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
@@ -854,8 +878,7 @@ class MasterServiceHATest : public ::testing::Test {
         if (!accessor.Exists()) {
             return {};
         }
-        SpinLocker locker(&accessor.Get().lock);
-        return accessor.Get().lease_->ExpiresAt();
+        return accessor.Get().EvictionDeadline();
     }
 
     static uint64_t EvictTenantMemoryForQuotaForTesting(
@@ -870,12 +893,17 @@ class MasterServiceHATest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
-    static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
+    SnapshotBarrierGate snapshot_gate_;
+
+    static std::unique_lock<std::shared_mutex> LockRouteForTesting(
         MasterService& service, const TenantId& tenant_id,
         const std::string& key) {
-        const size_t shard_idx = service.getShardIndex(tenant_id, key);
-        return std::unique_lock<SharedMutex>(
-            service.metadata_shards_[shard_idx].mutex);
+        // ObjectIndex's route lock. Holding it EXCLUSIVE gates PutStart at its
+        // first Pin inside the snapshot barrier, letting the test observe the
+        // barrier (snapshot held, client_mutex_ released) without racing the
+        // async PutStart.
+        auto tenant_handle = service.GetOrCreateTenantCatalogHandle(tenant_id);
+        return tenant_handle->LockRouteForTesting();
     }
 
     template <typename CreateTask>
@@ -893,15 +921,19 @@ class MasterServiceHATest : public ::testing::Test {
         auto segment_lock = std::make_unique<ScopedSegmentAccess>(
             service.segment_manager_.getSegmentAccess());
         auto task = std::async(std::launch::async, std::move(create_task));
-        auto& metadata_mutex =
-            service.metadata_shards_[service.getShardIndex(tenant_id, key)]
-                .mutex;
+        auto tenant_handle = service.GetOrCreateTenantCatalogHandle(tenant_id);
+        // `available` means the entry's per-object mutex is free (or the entry
+        // has not been published yet); the create task holds that mutex while
+        // it discovers.
         const auto wait_for_metadata = [&](bool available, auto timeout) {
             const auto deadline = std::chrono::steady_clock::now() + timeout;
             while (std::chrono::steady_clock::now() < deadline) {
-                std::unique_lock<SharedMutex> metadata_lock(metadata_mutex,
-                                                            std::try_to_lock);
-                if (metadata_lock.owns_lock() == available) {
+                auto entry = tenant_handle->Get(key);
+                std::unique_lock<std::shared_mutex> probe =
+                    entry != nullptr ? entry->TryLockUnique()
+                                     : std::unique_lock<std::shared_mutex>();
+                const bool mutex_free = !probe.owns_lock();
+                if (mutex_free == available) {
                     return true;
                 }
                 std::this_thread::yield();
@@ -1421,12 +1453,12 @@ TEST_F(MasterServiceHATest, RestoreFailureKeepsExistingState) {
 }
 
 TEST_F(MasterServiceHATest,
-       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherShard) {
+       RestoreRejectsUngroupedObjectDuplicatedIntoAnotherGroup) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
 
-    const std::string key = "standby_cross_shard_duplicate";
-    const std::string endpoint = "standby_cross_shard_segment";
+    const std::string key = "standby_cross_group_duplicate";
+    const std::string endpoint = "standby_cross_group_segment";
     auto existing = MakeStandbyObject(key, endpoint);
     ASSERT_TRUE(service
                     .RestoreFromStandbySnapshot(
@@ -1434,9 +1466,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromObject(
-        service, kDefaultTenant, key, "group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "group-" + key;
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -1460,9 +1490,7 @@ TEST_F(MasterServiceHATest,
                     .has_value());
 
     auto duplicate = MakeStandbyObject(key, endpoint);
-    duplicate.metadata.group_id = FindGroupIdOnDifferentShardFromGroup(
-        service, existing.metadata.group_id, "replacement-group-");
-    ASSERT_FALSE(duplicate.metadata.group_id.empty());
+    duplicate.metadata.group_id = "replacement-group";
 
     auto result = service.RestoreFromStandbySnapshot(
         {duplicate}, 8, {MakeStandbyMemorySegment(endpoint)});
@@ -1661,6 +1689,8 @@ TEST_F(MasterServiceHATest,
         MasterServiceConfig::builder()
             .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
             .build());
+    SetSnapshotArriveHookForTesting(service,
+                                    [this] { snapshot_gate_.Arrive(); });
     const UUID client_id = generate_uuid();
     const std::string key = "local_first_lock_order_key";
     Segment segment = MakeSegment("local_first_lock_order_segment");
@@ -1669,41 +1699,41 @@ TEST_F(MasterServiceHATest,
 
     ReplicateConfig config;
     config.replica_num = 1;
-    auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
+    // Deterministically gate PutStart inside the snapshot barrier: holding the
+    // owning route lock EXCLUSIVE parks it at its first Pin, after it released
+    // client_mutex_ and while it holds snapshot_mutex_ (shared).
+    snapshot_gate_.Arm();
+    auto route_lock = LockRouteForTesting(service, kDefaultTenant, key);
     auto put = std::async(std::launch::async, [&] {
         return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
     });
 
-    const auto deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    bool reached_snapshot = false;
-    while (std::chrono::steady_clock::now() < deadline) {
-        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
-                service, kDefaultTenant, key)) {
-            reached_snapshot = true;
-            break;
-        }
-        std::this_thread::yield();
-    }
-    if (!reached_snapshot) {
-        shard_lock.unlock();
+    if (!snapshot_gate_.WaitForArrive(std::chrono::seconds(5))) {
+        // PutStart never entered the barrier within the deadline. Unblock it
+        // and drain the future so the service destructs cleanly, then fail.
+        route_lock.unlock();
         EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
                   std::future_status::ready);
         if (put.wait_for(std::chrono::seconds(0)) ==
             std::future_status::ready) {
             (void)put.get();
         }
+        snapshot_gate_.Disarm();
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
     // ReMountSegment holds client_mutex_ exclusively while waiting for the
     // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
-    shard_lock.unlock();
+    route_lock.unlock();
+    // A real re-acquire would block PutStart forever on client_mutex_ (held by
+    // the test), so a generous window still catches it; a slow-but-legal
+    // LOCAL_FIRST allocation completes far within it.
     const bool completed_while_client_locked =
-        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+        put.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     client_lock.unlock();
 
+    snapshot_gate_.Disarm();
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
     ASSERT_TRUE(result.has_value()) << toString(result.error());

@@ -767,12 +767,15 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             ASSERT_TRUE(service->client_liveness_records_.contains(owner));
         }
 
-        for (const auto& shard : service->metadata_shards_) {
-            for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-                (void)tenant_id;
-                for (const auto& [key, metadata] : tenant_state.metadata) {
-                    (void)key;
-                    for (const auto& replica : metadata.GetAllReplicas()) {
+        service->catalog_.Visit(
+            [&](const TenantId&,
+                const std::shared_ptr<mooncake::metadata::TenantCatalog>&
+                    handle) {
+                auto objs = handle->SnapshotObjects();
+                for (const auto& entry : objs) {
+                    auto lk = entry->LockShared();
+                    for (const auto& replica :
+                         entry->metadata().GetAllReplicas()) {
                         if (replica.is_memory_replica()) {
                             const auto record = replica.getClientLiveness();
                             ASSERT_TRUE(record);
@@ -790,8 +793,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                         }
                     }
                 }
-            }
-        }
+            });
     }
 
     // Test snapshot and restore functionality

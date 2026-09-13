@@ -1,4 +1,4 @@
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 
 #include <string>
 #include <unordered_map>

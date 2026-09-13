@@ -1071,33 +1071,22 @@ MasterScenario& MasterScenario::When(ExpireAtAction action) {
     }
 
     const TenantId tenant(action.tenant);
-    auto update = [&](size_t shard_idx) {
-        MasterService::MetadataShardAccessorRW shard(service_.get(), shard_idx);
-        auto tenant_it = shard->tenants.find(tenant);
-        if (tenant_it == shard->tenants.end()) {
-            return false;
-        }
-        auto metadata_it = tenant_it->second.metadata.find(action.key);
-        if (metadata_it == tenant_it->second.metadata.end()) {
-            return false;
-        }
-        SpinLocker locker(&metadata_it->second.lock);
-        metadata_it->second.lease_->SetDeadline(action.lease_timeout);
-        metadata_it->second.soft_pin_timeout = action.soft_pin_timeout;
-        return true;
-    };
-
-    const size_t routed = service_->getShardIndex(tenant, action.key);
-    if (update(routed)) {
+    // All of a tenant's keys live in one tenant container, so a single
+    // directory lookup finds the object (there is no per-shard probe).
+    auto tenant_handle = service_->catalog_.Lookup(tenant);
+    if (!tenant_handle) {
+        Fail("ExpireAt(" + action.key + ") could not find object");
         return *this;
     }
-    for (size_t shard_idx = 0; shard_idx < MasterService::kNumShards;
-         ++shard_idx) {
-        if (shard_idx != routed && update(shard_idx)) {
-            return *this;
-        }
+    auto entry = tenant_handle->Get(action.key);
+    if (!entry) {
+        Fail("ExpireAt(" + action.key + ") could not find object");
+        return *this;
     }
-    Fail("ExpireAt(" + action.key + ") could not find object");
+    auto entry_lock = entry->LockUnique();
+    entry->metadata().SetLeaseDeadlineForTesting(action.lease_timeout);
+    entry->metadata().SetCommittedSoftPinTimeoutForTesting(
+        action.soft_pin_timeout);
     return *this;
 }
 
