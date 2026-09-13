@@ -195,7 +195,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 } else {
                     // IBGDA path — send directly from source buffer
                     mc_fence();
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+                    // MACA and MUSA execute two 32-lane sub-warps in one
+                    // hardware warp; serialize posts sharing one QP.
                     for (int half = 0; half < 2; ++half) {
                         if ((sub_warp_id & 1) == half) {
 #endif
@@ -205,7 +207,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                               active_qps_per_rank),
                                 dst_rank, num_qp_per_rank, src_ptr, dst_ptr,
                                 num_bytes_per_msg, lane_id);
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                         }
                         __syncwarp();
                     }
@@ -562,17 +564,19 @@ combine(void* combined_x, int32_t* active_ranks,
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+#ifndef MOONCAKE_EP_USE_MUSA
                 mc_fence();
+#endif
             } else {
                 // IBGDA path — stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if (not zero_copy)
                     UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
-#ifdef MOONCAKE_EP_USE_MACA
-                // C500 executes two 32-lane sub-warps in one 64-lane hardware
-                // warp. Combine assigns both sub-warps to the same expert QP;
-                // serialize their leaders before entering the QP mutex.
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
+                // Match dispatch publication and avoid concurrent posts from
+                // the two 32-lane sub-warps sharing one QP.
+                mc_fence();
                 for (int half = 0; half < 2; ++half) {
                     if ((sub_warp_id & 1) == half) {
 #endif
@@ -581,7 +585,7 @@ combine(void* combined_x, int32_t* active_ranks,
                                           active_qps_per_rank),
                             dst_rank, num_qp_per_rank, buf_ptr, dst_ptr,
                             num_bytes_per_slot, lane_id);
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                     }
                     __syncwarp();
                 }
@@ -590,7 +594,13 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+#ifdef MOONCAKE_EP_USE_MUSA
+        // Publish all local/P2P payload stores once for this CTA before any
+        // expert completion word is made observable by a peer.
+        mc_fence_barrier_fence();
+#else
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+#endif
         if (sub_warp_id == 1 and lane_id == 0) {
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
@@ -606,7 +616,11 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         __syncwarp();
     } else {
+#ifdef MOONCAKE_EP_USE_MUSA
+        mc_fence_barrier_fence();
+#else
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+#endif
     }
 
     // Receiving phase
@@ -644,8 +658,55 @@ combine(void* combined_x, int32_t* active_ranks,
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+#ifdef MOONCAKE_EP_USE_MUSA
+    // A completion word is stable for the entire combine. When the expert
+    // count is smaller than the token/expert fanout, acquire every expert
+    // once per reduction CTA instead of repeatedly acquiring the same words
+    // for every token.
+    const bool wait_all_experts =
+        num_experts <= num_combined_tokens * num_topk;
+    if (wait_all_experts && thread_id == 0) {
+        for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+            const int expert_src_rank = expert_idx / num_local_experts;
+            const unsigned long long start_time = clock64();
+            while (mc_ld_acquire(rdma_recv_signal_buffer + expert_idx) == 0 &&
+                   active_ranks[expert_src_rank]) {
+                const unsigned long long end_time = clock64();
+                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                    active_ranks[expert_src_rank] = 0;
+            }
+        }
+    }
+    __syncthreads();
+    for (int token_idx = sm_id; token_idx < num_combined_tokens;
+         token_idx += num_sms) {
+        // CUDA's cooperative grid barrier above orders an expert-owning block
+        // before every token-reduction block. MUSA has no grid barrier, so
+        // the reduction block waits only on the experts selected by its token.
+        if (!wait_all_experts && thread_id == 0) {
+            #pragma unroll
+            for (int i = 0; i < num_topk; ++i) {
+                const int expert_idx =
+                    static_cast<int>(__ldg(topk_idx + token_idx * num_topk + i));
+                if (expert_idx < 0)
+                    continue;
+                const int expert_src_rank = expert_idx / num_local_experts;
+                const unsigned long long start_time = clock64();
+                while (mc_ld_acquire(rdma_recv_signal_buffer + expert_idx) == 0 &&
+                       active_ranks[expert_src_rank]) {
+                    const unsigned long long end_time = clock64();
+                    if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                        active_ranks[expert_src_rank] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        if (thread_id < hidden_bf16_int4) {
+#else
     if (thread_id < hidden_bf16_int4) {
-        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+        for (int token_idx = sm_id; token_idx < num_combined_tokens;
+             token_idx += num_sms) {
+#endif
             mc_fence();
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
@@ -682,8 +743,13 @@ combine(void* combined_x, int32_t* active_ranks,
             for (int j = 0; j < kNumElemsPerInt4; ++ j)
                 combined_bf16[j] = __float2bfloat16(combined_values[j]);
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
+#ifdef MOONCAKE_EP_USE_MUSA
         }
+#endif
     }
+#ifndef MOONCAKE_EP_USE_MUSA
+    }
+#endif
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
