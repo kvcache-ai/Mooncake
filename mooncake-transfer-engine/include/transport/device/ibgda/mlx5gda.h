@@ -7,11 +7,7 @@
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
-#if defined(USE_MACA)
-#define MAX_QP_COUNT 288
-#else
 #define MAX_QP_COUNT 256
-#endif
 
 struct mlx5gda_cq_dbr {
     uint64_t unused;
