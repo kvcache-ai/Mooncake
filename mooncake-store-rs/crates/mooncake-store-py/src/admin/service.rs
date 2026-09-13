@@ -3536,6 +3536,7 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
+            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3602,6 +3603,7 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
+            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
