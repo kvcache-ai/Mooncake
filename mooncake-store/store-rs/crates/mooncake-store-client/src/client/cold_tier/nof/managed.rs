@@ -49,7 +49,7 @@ impl NofManagedLocator {
     }
 
     pub fn from_hex(encoded: &str) -> Result<Self> {
-        if encoded.is_empty() || encoded.len() % 2 != 0 {
+        if encoded.is_empty() || !encoded.len().is_multiple_of(2) {
             return Err(StoreError::InvalidState(
                 "managed NoF locator hex must contain a non-empty even number of digits"
                     .to_string(),

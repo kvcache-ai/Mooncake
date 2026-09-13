@@ -321,7 +321,7 @@ impl NofOwnerState {
                 }
             };
             if let Err(error) = control_client.transfer_nof_owner_snapshot(
-                &successor,
+                successor,
                 &target_id,
                 &self.local_runtime,
                 &successor.runtime,
