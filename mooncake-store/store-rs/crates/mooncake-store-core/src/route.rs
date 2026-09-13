@@ -1222,8 +1222,8 @@ mod tests {
                 priority: 0,
             }],
             cold_backing: None,
-
-            nof_backing: None,};
+            nof_backing: None,
+        };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, route);
@@ -1272,8 +1272,8 @@ mod tests {
             compatibility: CompatibilityDescriptor::default(),
             replicas: Vec::<ReplicaRoute>::new(),
             cold_backing: None,
-
-            nof_backing: None,};
+            nof_backing: None,
+        };
         let encoded = serde_json::to_string(&route).unwrap();
         let decoded: ObjectRoute = serde_json::from_str(&encoded).unwrap();
         assert_eq!(decoded, route);
