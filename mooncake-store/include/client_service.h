@@ -197,7 +197,8 @@ class Client {
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
     std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
-        const std::vector<TransferEngine::ScatterTransferRange>& transfers);
+        const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+        int intent = 0);
 
     /**
      * @brief Transfers data using pre-queried object information
@@ -256,7 +257,7 @@ class Client {
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
         const std::vector<Replica::Descriptor>& replicas,
         const std::vector<std::vector<Slice>>& slices,
-        const std::vector<std::vector<uint64_t>>& src_offsets);
+        const std::vector<std::vector<uint64_t>>& src_offsets, int intent = 0);
 
     /**
      * @brief Batch ranged write into cached replicas (replication). Fragments
@@ -268,7 +269,7 @@ class Client {
     std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
         const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
         const std::vector<std::vector<Slice>>& slices,
-        const std::vector<std::vector<uint64_t>>& dst_offsets);
+        const std::vector<std::vector<uint64_t>>& dst_offsets, int intent = 0);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -816,7 +817,7 @@ class Client {
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+                           TransferRequest::OpCode op_code, int intent = 0);
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
@@ -830,9 +831,9 @@ class Client {
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t dst_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
-                            std::vector<Slice>& slices);
+                            std::vector<Slice>& slices, int intent = 0);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+                           std::vector<Slice>& slices, int intent = 0);
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
