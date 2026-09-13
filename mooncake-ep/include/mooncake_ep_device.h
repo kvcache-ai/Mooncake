@@ -61,8 +61,7 @@ using ep_fp8x2_storage_t = uint16_t;
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
     const auto x0 = __maca_fp8_e4m3(x.x);
     const auto x1 = __maca_fp8_e4m3(x.y);
-    return static_cast<uint16_t>(x0.__x) |
-           (static_cast<uint16_t>(x1.__x) << 8);
+    return static_cast<uint16_t>(x0.__x) | (static_cast<uint16_t>(x1.__x) << 8);
 }
 #endif
 
