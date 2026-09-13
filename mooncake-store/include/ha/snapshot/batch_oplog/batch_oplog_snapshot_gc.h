@@ -2,6 +2,7 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <functional>
 #include "types.h"
 namespace mooncake {
 class HaKvBackend;
@@ -13,6 +14,9 @@ class BatchOpLogSnapshotGc {
                          std::string);
     ErrorCode Run(const SnapshotMaintenanceLease&, std::string_view published,
                   const std::optional<std::string>& expected_fallback);
+    ErrorCode Run(const SnapshotMaintenanceLease&, std::string_view,
+                  const std::optional<std::string>&,
+                  const std::function<bool()>& cancelled);
 
    private:
     HaKvBackend& backend_;

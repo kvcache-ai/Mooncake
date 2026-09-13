@@ -14,7 +14,14 @@ BatchOpLogSnapshotGc::BatchOpLogSnapshotGc(HaKvBackend& b,
 ErrorCode BatchOpLogSnapshotGc::Run(
     const SnapshotMaintenanceLease& lease, std::string_view published,
     const std::optional<std::string>& expected_fallback) {
-    if (!lease.IsHeld()) return ErrorCode::ETCD_TRANSACTION_FAIL;
+    return Run(lease, published, expected_fallback, {});
+}
+ErrorCode BatchOpLogSnapshotGc::Run(
+    const SnapshotMaintenanceLease& lease, std::string_view published,
+    const std::optional<std::string>& expected_fallback,
+    const std::function<bool()>& cancelled) {
+    if (!lease.IsHeld() || (cancelled && cancelled()))
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
     std::unordered_set<std::string> keep;
     bool first = true;
     for (const auto& key : {ha::BuildBatchOpLogSnapshotLatestKey(cluster_),
@@ -77,7 +84,8 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                 return ErrorCode::INTERNAL_ERROR;
         keep.insert(m);
     }
-    if (!lease.IsHeld()) return ErrorCode::ETCD_TRANSACTION_FAIL;
+    if (!lease.IsHeld() || (cancelled && cancelled()))
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
     std::vector<std::string> keys;
     auto listed = store_.ListObjectsWithPrefix(root_ + "/batch-oplog/", keys);
     if (!listed) return ErrorCode::INTERNAL_ERROR;
@@ -89,7 +97,8 @@ ErrorCode BatchOpLogSnapshotGc::Run(
     }
     for (const auto& p : prefixes)
         if (!keep.count(p)) {
-            if (!lease.IsHeld()) return ErrorCode::ETCD_TRANSACTION_FAIL;
+            if (!lease.IsHeld() || (cancelled && cancelled()))
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
             auto e = store_.DeleteObjectsWithPrefix(p);
             if (!e) return ErrorCode::INTERNAL_ERROR;
         }
