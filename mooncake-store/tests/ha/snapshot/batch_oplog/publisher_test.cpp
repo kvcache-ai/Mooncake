@@ -128,6 +128,22 @@ TEST(BatchOpLogSnapshotPublisherTest, PublishesAndRotatesPointersAtomically) {
         backend.values[ha::BuildBatchOpLogSnapshotFallbackKey("cluster")]);
 }
 
+TEST(BatchOpLogSnapshotPublisherTest, CapturesPublishedFallbackState) {
+    FakeBackend backend;
+    auto lease = SnapshotMaintenanceLease::MakeForTesting("cluster", "101");
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(ha::BuildBatchOpLogSnapshotMaintenanceKey("cluster"),
+                          "101"));
+    BatchOpLogSnapshotPublisher publisher(backend, "cluster");
+    std::optional<std::string> fallback;
+    const auto first = MakeDescriptor(1);
+    ASSERT_EQ(ErrorCode::OK, publisher.Publish(*lease, first, &fallback));
+    EXPECT_FALSE(fallback.has_value());
+    const auto second = MakeDescriptor(2);
+    ASSERT_EQ(ErrorCode::OK, publisher.Publish(*lease, second, &fallback));
+    EXPECT_EQ(first, fallback.value());
+}
+
 TEST(BatchOpLogSnapshotPublisherTest,
      RepairsMissingLatestAndPreservesFallback) {
     FakeBackend backend;
