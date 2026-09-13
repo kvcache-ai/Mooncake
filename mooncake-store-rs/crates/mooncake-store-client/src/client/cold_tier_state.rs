@@ -534,7 +534,7 @@ enum PendingBackingRoute {
     Nof(mooncake_store_core::ColdBackingRoute),
     Managed {
         backing: mooncake_store_core::ColdBackingRoute,
-        route: ObjectRoute,
+        route: Box<ObjectRoute>,
     },
 }
 
@@ -557,7 +557,7 @@ impl PendingBackingRoute {
 
     fn managed_route(&self) -> Option<&ObjectRoute> {
         match self {
-            Self::Managed { route, .. } => Some(route),
+            Self::Managed { route, .. } => Some(route.as_ref()),
             _ => None,
         }
     }
@@ -565,7 +565,7 @@ impl PendingBackingRoute {
     fn publish_local(self, route: &mut ObjectRoute) {
         match self {
             Self::Cold(backing) => route.cold_backing = Some(backing),
-            Self::Managed { route: managed_route, .. } => *route = managed_route,
+            Self::Managed { route: managed_route, .. } => *route = *managed_route,
             Self::Nof(_) => {}
         }
     }

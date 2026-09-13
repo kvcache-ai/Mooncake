@@ -155,7 +155,7 @@ impl StorageOwnerState {
                     .pending_managed_backing(route, length, checksum)?
                     .map(|pending| super::super::PendingBackingRoute::Managed {
                         backing: pending.backing,
-                        route: pending.route,
+                        route: Box::new(pending.route),
                     }));
             }
             return Ok(self
@@ -189,7 +189,7 @@ impl StorageOwnerState {
                     {
                         return Ok(Some(super::super::PendingBackingRoute::Managed {
                             backing: pending.backing,
-                            route: pending.route,
+                            route: Box::new(pending.route),
                         }));
                     }
                 } else if let Some(backing) = self

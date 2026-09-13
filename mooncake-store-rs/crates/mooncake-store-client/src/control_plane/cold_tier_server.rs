@@ -255,17 +255,13 @@ pub(super) async fn handle_transfer_nof_owner_snapshot(
     let from = request
         .from
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("transfer_nof_owner_snapshot requires from"))
-        .and_then(|runtime| {
-            try_runtime_id(runtime).map_err(|error| Status::invalid_argument(error.to_string()))
-        })?;
+        .ok_or_else(|| Status::invalid_argument("transfer_nof_owner_snapshot requires from"))?;
+    let from = try_runtime_id(from).map_err(|error| Status::invalid_argument(error.to_string()))?;
     let to = request
         .to
         .as_ref()
-        .ok_or_else(|| Status::invalid_argument("transfer_nof_owner_snapshot requires to"))
-        .and_then(|runtime| {
-            try_runtime_id(runtime).map_err(|error| Status::invalid_argument(error.to_string()))
-        })?;
+        .ok_or_else(|| Status::invalid_argument("transfer_nof_owner_snapshot requires to"))?;
+    let to = try_runtime_id(to).map_err(|error| Status::invalid_argument(error.to_string()))?;
     let routes = request
         .routes
         .into_iter()
@@ -301,10 +297,9 @@ pub(super) async fn handle_manage_nof_backing(
     }
     let route = request
         .route
-        .ok_or_else(|| Status::invalid_argument("manage_nof_backing requires route"))
-        .and_then(|route| {
-            try_object_route(route).map_err(|error| Status::invalid_argument(error.to_string()))
-        })?;
+        .ok_or_else(|| Status::invalid_argument("manage_nof_backing requires route"))?;
+    let route =
+        try_object_route(route).map_err(|error| Status::invalid_argument(error.to_string()))?;
     let action = match pb::ManagedNofRouteAction::try_from(request.action).unwrap_or_default() {
         pb::ManagedNofRouteAction::Prepare => ManagedNofRouteAction::Prepare,
         pb::ManagedNofRouteAction::Publish => ManagedNofRouteAction::Publish,
