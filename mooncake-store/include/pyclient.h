@@ -475,7 +475,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return QueryResult(
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place,
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),

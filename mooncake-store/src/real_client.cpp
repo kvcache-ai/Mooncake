@@ -3214,7 +3214,7 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             continue;
@@ -5359,7 +5359,7 @@ RealClient::batch_get_into_internal(
         }
 
         // Validate replica list
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -5785,7 +5785,7 @@ std::vector<int> RealClient::batch_get_session_start(
             continue;
         }
 
-        auto query_result = query_results[i].value();
+        const auto &query_result = query_results[i].value();
         if (query_result.IsLeaseExpired()) {
             results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
@@ -6507,7 +6507,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Validate replica list
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
