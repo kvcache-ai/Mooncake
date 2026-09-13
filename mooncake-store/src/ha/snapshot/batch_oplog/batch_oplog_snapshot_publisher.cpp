@@ -36,13 +36,15 @@ ErrorCode BatchOpLogSnapshotPublisher::Publish(
     if (!lease.IsHeld()) {
         return ErrorCode::ETCD_TRANSACTION_FAIL;
     }
-    auto candidate = ha::DecodeBatchOpLogSnapshotDescriptor(descriptor_json);
     if (expected_fallback) {
-        std::string latest;
-        auto err = backend_.Get(ha::BuildBatchOpLogSnapshotLatestKey(cluster_),
-                                latest);
+        std::string fallback;
+        auto err = backend_.Get(
+            ha::BuildBatchOpLogSnapshotFallbackKey(cluster_), fallback);
+        if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST) {
+            return err;
+        }
         *expected_fallback = err == ErrorCode::OK
-                                 ? std::optional<std::string>(latest)
+                                 ? std::optional<std::string>(fallback)
                                  : std::nullopt;
     }
     return PublishImpl(lease.owner_token(), descriptor_json, lease);
