@@ -292,6 +292,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
+                    mc_fence();
 #ifdef MOONCAKE_EP_USE_MACA
                     for (int half = 0; half < 2; ++half) {
                         if ((sub_warp_id & 1) == half) {
