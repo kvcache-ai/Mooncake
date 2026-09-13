@@ -1369,9 +1369,9 @@ class MasterService {
                           const std::string& writer_host_id)
         -> tl::expected<std::vector<Replica>, ErrorCode>;
 
-    auto InsertMetadata(metadata::TenantCatalog& tenant_state, const UUID& client_id,
-                        const std::string& key, uint64_t value_length,
-                        const ReplicateConfig& config,
+    auto InsertMetadata(metadata::TenantCatalog& tenant_state,
+                        const UUID& client_id, const std::string& key,
+                        uint64_t value_length, const ReplicateConfig& config,
                         const std::string& group_id, const TenantId& tenant_id,
                         const std::chrono::system_clock::time_point& now,
                         const ResolvedSoftPinRequest& soft_pin_request,
@@ -1381,8 +1381,9 @@ class MasterService {
                             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
-    // Helper: allocate replicas, create ObjectMetadata, insert into the tenant container,
-    // and return descriptor list.  Shared by PutStart and UpsertStart.
+    // Helper: allocate replicas, create ObjectMetadata, insert into the tenant
+    // container, and return descriptor list.  Shared by PutStart and
+    // UpsertStart.
     auto AllocateAndInsertMetadata(
         metadata::TenantCatalog& tenant_state, const UUID& client_id,
         const std::string& key, uint64_t value_length,

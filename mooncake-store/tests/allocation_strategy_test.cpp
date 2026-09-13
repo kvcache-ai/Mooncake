@@ -861,14 +861,14 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstSnapshotPreservesOwnerRanking) {
     state.AddSegment("busy", 0, kSegmentSize, 1000 * MiB, 900 * MiB);
     state.AddSegment("free", 1, kSegmentSize, 1000 * MiB, 100 * MiB);
 
-    AllocatorManager snapshot;
+    std::shared_ptr<const AllocatorManager> snapshot;
     {
         auto placement = state.GetPlacement();
         snapshot = placement.SnapshotAllocatorManager();
     }
 
     SsdFreeRatioFirstAllocationStrategy strategy(state.local_ssd);
-    auto result = strategy.Allocate(snapshot, 64 * 1024);
+    auto result = strategy.Allocate(*snapshot, 64 * 1024);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1u);
     EXPECT_EQ(result->front()

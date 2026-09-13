@@ -143,9 +143,8 @@ class AllocatorManager {
     // segment_mutex_ (exclusive vs shared), so the cache needs no lock.
     std::shared_ptr<const AllocatorManager> SharedSnapshot(
         const std::unordered_map<std::string, UUID>* owners = nullptr) const {
-        auto& cache = owners == nullptr
-                          ? snapshot_cache_
-                          : owner_snapshots_cache_[owners];
+        auto& cache = owners == nullptr ? snapshot_cache_
+                                        : owner_snapshots_cache_[owners];
         if (cache == nullptr) {
             auto fresh = std::make_shared<AllocatorManager>();
             fresh->names_ = names_;

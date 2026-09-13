@@ -4743,8 +4743,7 @@ auto MasterService::AllocateAndInsertMetadata(
 
     auto insert_result = InsertMetadata(
         tenant_state, client_id, key, value_length, config, group_id, tenant_id,
-        now,
-        soft_pin_request, std::move(allocation_result.value()),
+        now, soft_pin_request, std::move(allocation_result.value()),
         pending_quota_charge, std::move(committed_soft_pin_timeout));
     if (!insert_result) {
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),

@@ -224,7 +224,6 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
             segment_manager_->client_by_name_[segment.name] = client_id;
-    segment_manager_->allocator_manager_.invalidateSnapshotCache();
             segment_manager_->allocator_manager_.invalidateSnapshotCache();
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
             AddHostSegment(segment_manager_->segments_by_host_, segment);
@@ -532,7 +531,8 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
                     segment_manager_->segment_id_by_name_[segment_name] =
                         candidate_id;
                     segment_manager_->client_by_name_[segment_name] = owner;
-                    segment_manager_->allocator_manager_.invalidateSnapshotCache();
+                    segment_manager_->allocator_manager_
+                        .invalidateSnapshotCache();
                     return true;
                 }
             }
