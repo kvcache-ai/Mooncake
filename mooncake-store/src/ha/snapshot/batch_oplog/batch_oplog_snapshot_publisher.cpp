@@ -31,9 +31,19 @@ BatchOpLogSnapshotPublisher::BatchOpLogSnapshotPublisher(HaKvBackend& backend,
     : backend_(backend), cluster_id_(std::move(cluster_id)) {}
 
 ErrorCode BatchOpLogSnapshotPublisher::Publish(
-    const SnapshotMaintenanceLease& lease, std::string_view descriptor_json) {
+    const SnapshotMaintenanceLease& lease, std::string_view descriptor_json,
+    std::optional<std::string>* expected_fallback) {
     if (!lease.IsHeld()) {
         return ErrorCode::ETCD_TRANSACTION_FAIL;
+    }
+    auto candidate = ha::DecodeBatchOpLogSnapshotDescriptor(descriptor_json);
+    if (expected_fallback) {
+        std::string latest;
+        auto err = backend_.Get(ha::BuildBatchOpLogSnapshotLatestKey(cluster_),
+                                latest);
+        *expected_fallback = err == ErrorCode::OK
+                                 ? std::optional<std::string>(latest)
+                                 : std::nullopt;
     }
     return PublishImpl(lease.owner_token(), descriptor_json, lease);
 }

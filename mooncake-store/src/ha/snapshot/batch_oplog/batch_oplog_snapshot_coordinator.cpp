@@ -416,7 +416,9 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     }
 
     BatchOpLogSnapshotPublisher publisher(backend_, cluster_id_);
-    ErrorCode publish_error = publisher.Publish(*lease, *descriptor);
+    std::optional<std::string> expected_fallback;
+    ErrorCode publish_error =
+        publisher.Publish(*lease, *descriptor, &expected_fallback);
     if (publish_error != ErrorCode::OK) {
         auto cleanup = object_store_.DeleteObjectsWithPrefix(artifact_prefix);
         if (!cleanup) {
@@ -428,7 +430,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         BatchOpLogSnapshotGc gc(backend_, object_store_, cluster_id_,
                                 config_.snapshot_root);
         try {
-            if (gc.Run(*lease, *descriptor) != ErrorCode::OK)
+            if (gc.Run(*lease, *descriptor, expected_fallback) != ErrorCode::OK)
                 LOG(WARNING) << "Batch snapshot object GC skipped or failed";
         } catch (const std::exception& e) {
             LOG(WARNING) << "Batch snapshot object GC threw: " << e.what();

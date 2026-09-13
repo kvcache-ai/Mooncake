@@ -11,8 +11,9 @@ BatchOpLogSnapshotGc::BatchOpLogSnapshotGc(HaKvBackend& b,
                                            SnapshotObjectStore& s,
                                            std::string c, std::string r)
     : backend_(b), store_(s), cluster_(std::move(c)), root_(std::move(r)) {}
-ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease,
-                                    std::string_view published) {
+ErrorCode BatchOpLogSnapshotGc::Run(
+    const SnapshotMaintenanceLease& lease, std::string_view published,
+    const std::optional<std::string>& expected_fallback) {
     if (!lease.IsHeld()) return ErrorCode::ETCD_TRANSACTION_FAIL;
     std::unordered_set<std::string> keep;
     bool first = true;
@@ -23,10 +24,14 @@ ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease,
         if (e == ErrorCode::ETCD_KEY_NOT_EXIST) {
             if (key.find("/latest") != std::string::npos)
                 return ErrorCode::INTERNAL_ERROR;
+            if (expected_fallback.has_value())
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
             continue;
         }
         if (e != ErrorCode::OK) return e;
         if (first && raw != published) return ErrorCode::ETCD_TRANSACTION_FAIL;
+        if (!first && expected_fallback != std::optional<std::string>(raw))
+            return ErrorCode::ETCD_TRANSACTION_FAIL;
         first = false;
         auto d = ha::DecodeBatchOpLogSnapshotDescriptor(raw);
         if (!d) return ErrorCode::INTERNAL_ERROR;
@@ -54,6 +59,19 @@ ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease,
                 md->object_chunks[i].key !=
                     ha::BuildBatchOpLogSnapshotObjectChunkKey(
                         root_, d->snapshot_id, i))
+                return ErrorCode::INTERNAL_ERROR;
+        auto verify = [&](const std::string& key, uint64_t size, uint32_t crc) {
+            auto info = store_.InspectObject(key);
+            if (!info || info->stored_size != size ||
+                (info->crc32c && *info->crc32c != crc))
+                return false;
+            return true;
+        };
+        if (!verify(md->segments.key, md->segments.stored_size,
+                    md->segments.crc32c))
+            return ErrorCode::INTERNAL_ERROR;
+        for (const auto& chunk : md->object_chunks)
+            if (!verify(chunk.key, chunk.stored_size, chunk.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         keep.insert(m);
     }
