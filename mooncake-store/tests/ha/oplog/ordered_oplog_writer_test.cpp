@@ -929,6 +929,8 @@ TEST(OrderedOpLogWriterFailureTest, RetryTimeoutStopsFurtherAttempts) {
     EXPECT_EQ(OrderedOpLogWriterTerminalReason::kRetryTimeout, state->reason);
     EXPECT_NE(0u, state->occurred_at_ms);
     EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, writer.LastError());
+    EXPECT_EQ(0u,
+              HAMetricManager::instance().get_writer_runtime().retry_delay_ms);
     for (int i = 0; i < 100 && terminal_callbacks.load() != 1; ++i) {
         std::this_thread::sleep_for(10ms);
     }
@@ -1097,6 +1099,8 @@ TEST(OrderedOpLogWriterFailureTest, StopInterruptsRetryBackoff) {
     writer.Stop();
     EXPECT_LT(FakeBatchWriter::Clock::now() - started_at, 250ms);
     EXPECT_FALSE(writer.GetTerminalState().has_value());
+    EXPECT_EQ(0u,
+              HAMetricManager::instance().get_writer_runtime().retry_delay_ms);
 }
 
 TEST(OrderedOpLogWriterFailureTest, SuccessAfterRetryRestoresAccepting) {

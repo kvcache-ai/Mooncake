@@ -108,6 +108,7 @@ struct OrderedOpLogWriter::Impl {
                         .count())};
             accepting = false;
             last_error = error;
+            retry_delay_ms = 0;
             terminal_reason =
                 reason == OrderedOpLogWriterTerminalReason::kRetryTimeout
                     ? "retry_timeout"
@@ -540,6 +541,7 @@ void OrderedOpLogWriter::Stop() {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->accepting = false;
         impl_->stop_requested = true;
+        impl_->retry_delay_ms = 0;
         impl_->PublishRuntime();
         if (!impl_->running) {
             return;
