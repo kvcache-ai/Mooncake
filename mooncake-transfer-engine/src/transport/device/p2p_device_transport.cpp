@@ -150,8 +150,8 @@ int macaAllocFlagFromEnv() {
     // fine-grained memory. Select it explicitly with
     // MOONCAKE_EP_MACA_ALLOC=fine; keep the allocator default intuitive for
     // ordinary P2P/non-IBGDA users.
-    const std::string mode = getLowerEnv("MOONCAKE_EP_MACA_ALLOC");
-    return macaAllocFlagFromMode(mode, "MOONCAKE_EP_MACA_ALLOC");
+    return macaAllocFlagFromMode(getLowerEnv("MOONCAKE_EP_MACA_ALLOC"),
+                                 "MOONCAKE_EP_MACA_ALLOC");
 }
 
 std::string macaIpcMode() {
