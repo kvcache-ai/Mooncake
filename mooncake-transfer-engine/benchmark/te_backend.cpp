@@ -364,7 +364,19 @@ int TEBenchRunner::startInitiator(int num_threads) {
     target_infos_.clear();
     for (const auto& name : names) {
         SegmentID handle = engine_->openSegment(name);
+        if (handle == static_cast<SegmentID>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open target segment: " << name;
+            return -1;
+        }
         auto info = engine_->getMetadata()->getSegmentDescByID(handle);
+        if (!info) {
+            LOG(ERROR) << "Target segment descriptor not found: " << name;
+            return -1;
+        }
+        if (info->buffers.empty()) {
+            LOG(ERROR) << "Target segment has no registered buffers: " << name;
+            return -1;
+        }
         std::sort(info->buffers.begin(), info->buffers.end(),
                   [](const TransferMetadata::BufferDesc& a,
                      const TransferMetadata::BufferDesc& b) {

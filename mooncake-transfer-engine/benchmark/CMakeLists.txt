@@ -101,4 +101,23 @@ if(BUILD_UNIT_TESTS)
     PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
   add_test(NAME tebench_target_metrics_test COMMAND tebench_target_metrics_test)
+
+  if(USE_TCP AND NOT USE_SUNRISE)
+    add_executable(tebench_startup_test tests/startup_test.cpp te_backend.cpp
+                                        utils.cpp)
+    target_link_libraries(tebench_startup_test PRIVATE transfer_engine gtest
+                                                       gtest_main)
+    target_include_directories(
+      tebench_startup_test
+      PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+              "${CMAKE_CURRENT_SOURCE_DIR}/../tent/include")
+    if(USE_CUDA)
+      target_link_libraries(tebench_startup_test PRIVATE CUDA::cudart)
+    endif()
+    if(USE_HIP)
+      target_link_libraries(tebench_startup_test PRIVATE hip::host)
+    endif()
+    add_test(NAME tebench_startup_test COMMAND tebench_startup_test)
+    set_tests_properties(tebench_startup_test PROPERTIES TIMEOUT 60)
+  endif()
 endif()
