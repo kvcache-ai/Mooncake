@@ -142,7 +142,10 @@ ErrorCode BatchOpLogSnapshotPublisher::PublishImpl(
     err = backend_.Txn(txn);
     if (err == ErrorCode::OK && expected_fallback) {
         *expected_fallback =
-            latest_valid ? std::optional<std::string>(latest) : std::nullopt;
+            latest_valid
+                ? std::optional<std::string>(latest)
+                : (fallback_exists ? std::optional<std::string>(fallback)
+                                   : std::nullopt);
     }
     return err;
 }
