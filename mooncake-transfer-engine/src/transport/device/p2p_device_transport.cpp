@@ -146,8 +146,9 @@ int macaAllocFlagFromMode(const std::string& mode, const char* env_name) {
 }
 
 int macaAllocFlagFromEnv() {
-    return macaAllocFlagFromMode(getLowerEnv("MOONCAKE_EP_MACA_ALLOC"),
-                                 "MOONCAKE_EP_MACA_ALLOC");
+    const std::string mode = getLowerEnv("MOONCAKE_EP_MACA_ALLOC");
+    if (mode.empty()) return mcDeviceMallocFinegrained;
+    return macaAllocFlagFromMode(mode, "MOONCAKE_EP_MACA_ALLOC");
 }
 
 std::string macaIpcMode() {

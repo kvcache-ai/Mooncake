@@ -2,7 +2,11 @@
 
 #define NUM_MAX_NVL_PEERS 8
 #define NUM_MAX_RDMA_PEERS 20
+#if defined(MOONCAKE_EP_USE_MACA)
+#define MAX_QP_COUNT 288
+#else
 #define MAX_QP_COUNT 256
+#endif
 #define NUM_MAX_FIFO_SLOTS 32768
 #define NUM_WORKSPACE_BYTES (32 * 1024 * 1024)
 #define NUM_MAX_LOCAL_EXPERTS 1024

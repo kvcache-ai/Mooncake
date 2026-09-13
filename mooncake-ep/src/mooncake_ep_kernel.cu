@@ -292,12 +292,21 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     mc_fence();
                 } else {
                     // IBGDA path — send directly from source buffer
+#ifdef MOONCAKE_EP_USE_MACA
+                    for (int half = 0; half < 2; ++half) {
+                        if ((sub_warp_id & 1) == half) {
+#endif
                     mc_rdma_put(comm_ctx,
                                 ep_qp_channel(dst_expert_local_idx,
                                               num_qp_per_rank,
                                               active_qps_per_rank),
                                 dst_rank, num_qp_per_rank, src_ptr, dst_ptr,
                                 num_bytes_per_msg, lane_id);
+#ifdef MOONCAKE_EP_USE_MACA
+                        }
+                        __syncwarp();
+                    }
+#endif
                 }
 
                 // Increase counter after finishing
@@ -363,7 +372,16 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-        while (mc_ld_acquire(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
+#ifdef MOONCAKE_EP_USE_MACA
+        while (atomicAdd(atomic_finish_counter_per_expert +
+                             responsible_expert_idx, 0) !=
+               FINISHED_SUM_TAG * 2) {
+        }
+#else
+        while (mc_ld_acquire(atomic_finish_counter_per_expert +
+                             responsible_expert_idx) != FINISHED_SUM_TAG * 2) {
+        }
+#endif
         if (dst_rank != rank) {
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
             mc_red_add(comm_ctx, dst_rank,

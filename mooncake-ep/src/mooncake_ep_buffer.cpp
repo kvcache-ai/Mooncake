@@ -17,7 +17,7 @@ int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap,
     // existing expert-scaled policy until its high-QP path is fully tuned.
     int target = cap;
     if (target <= 0) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
         target = std::max(8, num_local_experts);
 #else
         target = 8;

@@ -204,12 +204,11 @@ class Buffer:
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
-
             if is_update:
                 self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
+            all_to_all_size = len(local_qpns) // self.group_size
             local_qpns = list(
                 torch.unbind(
                     torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(

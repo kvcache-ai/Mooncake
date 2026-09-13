@@ -49,7 +49,12 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MACA)
+    uint32_t old;
+    do {
+        old = atomicCAS(&qp->mutex, 0u, 1u);
+    } while (old != 0);
+#elif defined(MOONCAKE_EP_USE_MUSA)
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
@@ -61,7 +66,11 @@ __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
-#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MACA)
+    __threadfence_system();
+    atomicExch(&qp->mutex, 0u);
+    __threadfence_system();
+#elif defined(MOONCAKE_EP_USE_MUSA)
     mc_st_release_u32(&qp->mutex, 0u);
 #else
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
@@ -188,6 +197,15 @@ __device__ __forceinline__ void mc_ibgda_write_rdma_atomic_add_wqe(
     ++qp->wq_head;
 }
 
+__device__ __forceinline__ void mc_ibgda_ensure_wqe_capacity(
+    mlx5gda_qp_devctx* qp) {
+    const uint16_t depth_mask = qp->wqeid_mask;
+    if (depth_mask != 0 &&
+        static_cast<uint16_t>(qp->wq_head - qp->wq_tail) >= depth_mask) {
+        mc_ibgda_poll_cq(qp, static_cast<uint16_t>(qp->wq_head - depth_mask));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // High-level IBGDA operations
 // ---------------------------------------------------------------------------
@@ -202,6 +220,7 @@ __device__ __forceinline__ void mc_ibgda_put(const IbgdaContext& ctx,
                                              uint32_t nbytes) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
+    mc_ibgda_ensure_wqe_capacity(qp);
     mc_ibgda_write_rdma_write_wqe(qp, reinterpret_cast<uint64_t>(send_ptr),
                                   mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
                                   mc_bswap32(ctx.rkeys[dst_rank]), nbytes);
@@ -219,6 +238,7 @@ __device__ __forceinline__ void mc_ibgda_red_add(
     int32_t value) {
     auto* qp = mc_ibgda_channel(ctx, channel, dst_rank, qps_per_rank);
     mc_ibgda_lock(qp);
+    mc_ibgda_ensure_wqe_capacity(qp);
     mc_ibgda_write_rdma_atomic_add_wqe(
         qp, value, laddr, mc_bswap32(ctx.rkeys[src_rank]), recv_raddr,
         mc_bswap32(ctx.rkeys[dst_rank]));
