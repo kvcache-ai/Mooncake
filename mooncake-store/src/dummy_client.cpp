@@ -276,10 +276,20 @@ DummyClient::DummyClient()
 }
 
 DummyClient::~DummyClient() {
-    // tearDownAll() runs while the guard is still open: unregister_shm() is
-    // itself an RPC, and the ping thread is only joined inside tearDownAll().
-    // Draining first would reject the unmap and spin the reconnection loop
-    // for the whole wait (#3943 review).
+    // Teardown-order invariant (review #3943): an in-flight RPC never touches
+    // the members tearDownAll() resets. The RPC path holds a ScopedCall
+    // across the whole round trip and otherwise touches only the client pool
+    // (kept alive process-wide by the registry), atomic flags like
+    // connected_, by-value arguments, and the drain's shared State.
+    // shm_helper_, the registered-buffer tables, the local/hot-cache mappings
+    // and the ping thread are only ever accessed synchronously on caller
+    // threads, outside the drain's scope; a caller racing ~DummyClient is a
+    // usage-level data race no teardown order can fix.
+    //
+    // The reverse order is impossible: unregister_shm() is itself an RPC and
+    // the ping thread is only joined inside tearDownAll(), so draining first
+    // would reject the unmap and spin the reconnection loop for the whole
+    // wait (#3943 review).
     tearDownAll();
     // Never release the pool under a suspended request coroutine (#3909).
     if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
