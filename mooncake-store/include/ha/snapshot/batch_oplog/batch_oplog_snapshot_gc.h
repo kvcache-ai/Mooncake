@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <string_view>
 #include "types.h"
 namespace mooncake {
 class HaKvBackend;
@@ -9,7 +10,7 @@ class BatchOpLogSnapshotGc {
    public:
     BatchOpLogSnapshotGc(HaKvBackend&, SnapshotObjectStore&, std::string,
                          std::string);
-    ErrorCode Run(const SnapshotMaintenanceLease&);
+    ErrorCode Run(const SnapshotMaintenanceLease&, std::string_view published);
 
    private:
     HaKvBackend& backend_;

@@ -1,6 +1,7 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 #include <unordered_set>
 #include <vector>
+#include "crc32c.h"
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
@@ -10,9 +11,11 @@ BatchOpLogSnapshotGc::BatchOpLogSnapshotGc(HaKvBackend& b,
                                            SnapshotObjectStore& s,
                                            std::string c, std::string r)
     : backend_(b), store_(s), cluster_(std::move(c)), root_(std::move(r)) {}
-ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease) {
+ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease,
+                                    std::string_view published) {
     if (!lease.IsHeld()) return ErrorCode::ETCD_TRANSACTION_FAIL;
     std::unordered_set<std::string> keep;
+    bool first = true;
     for (const auto& key : {ha::BuildBatchOpLogSnapshotLatestKey(cluster_),
                             ha::BuildBatchOpLogSnapshotFallbackKey(cluster_)}) {
         std::string raw;
@@ -23,6 +26,8 @@ ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease) {
             continue;
         }
         if (e != ErrorCode::OK) return e;
+        if (first && raw != published) return ErrorCode::ETCD_TRANSACTION_FAIL;
+        first = false;
         auto d = ha::DecodeBatchOpLogSnapshotDescriptor(raw);
         if (!d) return ErrorCode::INTERNAL_ERROR;
         auto m =
@@ -34,13 +39,18 @@ ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease) {
         std::string manifest;
         auto x = store_.DownloadString(d->manifest_key, manifest);
         if (!x) return ErrorCode::INTERNAL_ERROR;
+        if (manifest.size() != d->manifest_size ||
+            Crc32cValue(manifest.data(), manifest.size()) != d->manifest_crc32c)
+            return ErrorCode::INTERNAL_ERROR;
         auto md = ha::DecodeBatchOpLogSnapshotManifest(manifest);
         if (!md || md->snapshot_id != d->snapshot_id ||
+            md->segments.stored_size == 0 ||
             md->segments.key !=
                 ha::BuildBatchOpLogSnapshotSegmentsKey(root_, d->snapshot_id))
             return ErrorCode::INTERNAL_ERROR;
         for (size_t i = 0; i < md->object_chunks.size(); ++i)
             if (md->object_chunks[i].chunk_index != i ||
+                md->object_chunks[i].stored_size == 0 ||
                 md->object_chunks[i].key !=
                     ha::BuildBatchOpLogSnapshotObjectChunkKey(
                         root_, d->snapshot_id, i))
@@ -52,8 +62,9 @@ ErrorCode BatchOpLogSnapshotGc::Run(const SnapshotMaintenanceLease& lease) {
     auto listed = store_.ListObjectsWithPrefix(root_ + "/batch-oplog/", keys);
     if (!listed) return ErrorCode::INTERNAL_ERROR;
     std::unordered_set<std::string> prefixes;
+    const std::string namespace_prefix = root_ + "/batch-oplog/";
     for (const auto& k : keys) {
-        auto p = k.find('/', root_.size() + 12);
+        auto p = k.find('/', namespace_prefix.size());
         if (p != std::string::npos) prefixes.insert(k.substr(0, p + 1));
     }
     for (const auto& p : prefixes)

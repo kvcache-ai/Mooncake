@@ -428,7 +428,7 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
         BatchOpLogSnapshotGc gc(backend_, object_store_, cluster_id_,
                                 config_.snapshot_root);
         try {
-            if (gc.Run(*lease) != ErrorCode::OK)
+            if (gc.Run(*lease, *descriptor) != ErrorCode::OK)
                 LOG(WARNING) << "Batch snapshot object GC skipped or failed";
         } catch (const std::exception& e) {
             LOG(WARNING) << "Batch snapshot object GC threw: " << e.what();
