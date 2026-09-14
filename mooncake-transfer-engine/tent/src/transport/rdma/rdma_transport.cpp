@@ -587,16 +587,25 @@ Status RdmaTransport::submitTransferTasks(
             rdma_batch->slice_chain.push_back(slice_lists[i].first);
             Status submit_st = workers_->submit(slice_lists[i], i);
             if (!submit_st.ok()) {
-                // The slices were allocated and attached to the task, but the
-                // initial submit was rejected (queue full). Without this check
-                // the batch would stay PENDING forever: nothing queued it and
-                // nothing marked it failed. Cancel the task so its slices are
-                // drained (CANCELED) and the batch can be retried. See #3636.
-                RdmaTask* rejected_task = slice_lists[i].first->task;
-                LOG(WARNING) << "Initial submit rejected for worker " << i
-                             << ": " << submit_st.message()
-                             << ", canceling task " << rejected_task;
-                workers_->cancel(rejected_task);
+                // Worker i's queue is full. Workers [0, i) have already
+                // accepted their slice lists. Because slice_lists are built
+                // by round-robin across all requests, each list may carry
+                // slices belonging to *different* tasks; cancelling only the
+                // first slice's task would leave the other tasks' slices
+                // running without a matching completion path.
+                //
+                // Cancel every task in the batch to ensure all submitted
+                // slices are drained before the caller retries. This is the
+                // atomic admission guarantee: either all workers accept their
+                // lists, or all tasks are cancelled and the whole submission
+                // is rejected.
+                LOG(WARNING)
+                    << "Initial submit rejected for worker " << i << ": "
+                    << submit_st.message() << ", canceling all "
+                    << rdma_batch->task_list.size() << " tasks";
+                for (RdmaTask* task : rdma_batch->task_list) {
+                    workers_->cancel(task);
+                }
                 return Status::TooManyRequests(
                     "Initial slice submit rejected (worker queue "
                     "full)" LOC_MARK);
