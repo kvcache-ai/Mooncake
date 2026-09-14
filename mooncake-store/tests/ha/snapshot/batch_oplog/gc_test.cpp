@@ -61,7 +61,7 @@ TEST(BatchOpLogSnapshotGcTest, PointerMismatchSkipsDeletion) {
     Backend b;
     Store s;
     auto l = SnapshotMaintenanceLease::MakeForTesting("c", "1");
-    b.v[ha::BuildBatchOpLogSnapshotLatestKey("c")] = "changed";
+    b.v[::mooncake::ha::BuildBatchOpLogSnapshotLatestKey("c")] = "changed";
     EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL,
               BatchOpLogSnapshotGc(b, s, "c", "r")
                   .Run(*l, "published", std::nullopt));
