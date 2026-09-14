@@ -5,6 +5,7 @@
 #include <string_view>
 #include <vector>
 #include "ha/kv/ha_kv_backend.h"
+#include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
 namespace mooncake::test {
