@@ -115,10 +115,7 @@ impl StoreTransport for NoopTransport {
 }
 
 const DEFAULT_TARGETS: &str =
-    "8.141.27.180|192.168.22.78|nof-78|nqn.2026-09.io.mooncake:nof-78|4420,\
-182.92.21.56|192.168.22.80|nof-80|nqn.2026-09.io.mooncake:nof-80|4420,\
-47.93.122.112|192.168.22.81|nof-81|nqn.2026-09.io.mooncake:nof-81|4420,\
-59.110.29.176|192.168.22.82|nof-82|nqn.2026-09.io.mooncake:nof-82|4420";
+    "127.0.0.1|127.0.0.1|nof-local|nqn.2026-09.io.mooncake:nof-local|4420";
 const DEFAULT_CLIENT_IDS: &str = "client-0,client-1,client-2,client-3";
 const DEFAULT_HOST_NQN: &str = "nqn.2026-09.io.mooncake:client-dev-5";
 const DEFAULT_DEVICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;

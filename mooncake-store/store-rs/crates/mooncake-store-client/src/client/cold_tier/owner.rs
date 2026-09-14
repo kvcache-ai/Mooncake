@@ -22,6 +22,7 @@ use crate::placement::stable_rendezvous_score;
 
 const TARGET_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) const TARGET_HEARTBEAT_FAILURE_THRESHOLD: u32 = 3;
+pub(super) const TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD: u32 = 60;
 pub(in crate::client) const NOF_TARGET_SET_LABEL: &str = "nof.target-set";
 pub(in crate::client) const NOF_UNHEALTHY_TARGETS_LABEL: &str = "nof.unhealthy-targets";
 const NOF_MANAGED_LABELS: [&str; 2] = [NOF_TARGET_SET_LABEL, NOF_UNHEALTHY_TARGETS_LABEL];
@@ -143,6 +144,10 @@ impl NofTargetHealthState {
         Err(self.last_error.clone().unwrap_or_else(|| {
             StoreError::Transport("NoF target has no successful heartbeat".to_string())
         }))
+    }
+
+    fn downline_ready(&self) -> bool {
+        self.consecutive_failures >= TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD
     }
 }
 
@@ -343,6 +348,18 @@ impl NofOwnerState {
             .iter()
             .filter(|(_, owner)| owner == &&self.local_runtime)
             .map(|(target_id, _)| target_id.clone())
+            .collect()
+    }
+
+    pub(super) fn locally_owned_downline_ready_target_ids(&self) -> Vec<String> {
+        self.locally_owned_target_ids()
+            .into_iter()
+            .filter(|target_id| {
+                self.targets
+                    .get(target_id)
+                    .map(|target| target.health.read().downline_ready())
+                    .unwrap_or(false)
+            })
             .collect()
     }
 
@@ -815,6 +832,18 @@ mod tests {
         backend.fail.store(false, Ordering::Relaxed);
         target.heartbeat("nof-a");
         assert!(target.health_snapshot().is_ok());
+    }
+
+    #[test]
+    fn heartbeat_downline_waits_for_the_long_failure_window() {
+        let backend = Arc::new(CountingHealthBackend::new(true));
+        let target = runtime_target(backend);
+        for _ in 0..TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD - 1 {
+            target.heartbeat("nof-a");
+        }
+        assert!(!target.health.read().downline_ready());
+        target.heartbeat("nof-a");
+        assert!(target.health.read().downline_ready());
     }
 
     #[test]

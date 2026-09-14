@@ -23,7 +23,7 @@ use crate::client::{
 use crate::control_plane::{ControlPlaneClient, ManagedNofRouteAction};
 
 use super::backing::validate_payload;
-use super::managed::NofManagedAllocationRequest;
+use super::managed::{NofManagedAllocationRequest, NofManagedRouteIdentity};
 use super::managed_backend::NofManagedStorageBackend;
 use super::object::NofObjectState;
 use super::physical_backend::NofPhysicalStorageBackend;
@@ -103,6 +103,12 @@ pub(in crate::client) struct NofTargetManager {
 pub(in crate::client) struct ManagedPendingBacking {
     pub(in crate::client) backing: ColdBackingRoute,
     pub(in crate::client) route: ObjectRoute,
+}
+
+#[derive(Clone)]
+pub(in crate::client) struct NofManagedRecoveryTarget {
+    pub(in crate::client) target_id: String,
+    pub(in crate::client) backend: NofBackend,
 }
 
 impl NofTargetManager {
@@ -239,6 +245,43 @@ impl NofTargetManager {
         self.state.targets.keys().map(String::as_str)
     }
 
+    pub(in crate::client) fn locally_owned_managed_target_ids(&self) -> Vec<String> {
+        if !self.is_managed() {
+            return Vec::new();
+        }
+        self.state.locally_owned_target_ids()
+    }
+
+    pub(in crate::client) fn managed_recovery_targets(&self) -> Vec<NofManagedRecoveryTarget> {
+        self.locally_owned_managed_target_ids()
+            .into_iter()
+            .filter_map(|target_id| {
+                let backend = self.managed_targets.get(&target_id)?.clone();
+                backend.backing.managed_recovery()?;
+                Some(NofManagedRecoveryTarget { target_id, backend })
+            })
+            .collect()
+    }
+
+    pub(in crate::client) fn managed_downline_ready_target_ids(&self) -> Vec<String> {
+        if !self.is_managed() {
+            return Vec::new();
+        }
+        self.state.locally_owned_downline_ready_target_ids()
+    }
+
+    pub(in crate::client) fn managed_target_health(
+        &self,
+        target_id: &str,
+    ) -> Result<Option<PersistentStorageBackendHealth>> {
+        if !self.is_managed()
+            || self.state.owner_for(target_id).as_ref() != Some(&self.state.local_runtime)
+        {
+            return Ok(None);
+        }
+        self.state.health_snapshot(target_id).map(Some)
+    }
+
     pub(in crate::client) fn accept_nof_owner_snapshot(
         &self,
         target_id: String,
@@ -304,6 +347,16 @@ impl NofTargetManager {
                     key: route.key.0.clone(),
                     length,
                     checksum,
+                    route_identity: Some(NofManagedRouteIdentity {
+                        key: route.key.clone(),
+                        namespace: route.namespace.clone(),
+                        logical_key: route.logical_key.clone(),
+                        canonical_key: route.canonical_key.clone(),
+                        sharing_scope: route.sharing_scope.clone(),
+                        qos_tier: route.qos_tier.clone(),
+                        route_version: route.version.next(),
+                        target_id: target_id.to_string(),
+                    }),
                 }]);
                 ensure_batch_len("managed reserve", 1, reservations.len())?;
                 let locator = reservations
@@ -386,57 +439,9 @@ impl NofTargetManager {
                 }
             }
             ManagedNofRouteAction::Release => {
-                let backing = route.nof_backing.as_ref().ok_or_else(|| {
-                    StoreError::NotFound("managed NoF route is missing".to_string())
-                })?;
-                let (locator, target_length, target_checksum, is_primary) =
-                    if backing.target_id == target_id {
-                        (
-                            backing.object_locator.clone(),
-                            backing.length,
-                            backing.checksum,
-                            true,
-                        )
-                    } else if let Some(replica) = backing
-                        .replicas
-                        .iter()
-                        .find(|replica| replica.target_id == target_id)
-                    {
-                        (
-                            replica.object_locator.clone(),
-                            backing.length,
-                            backing.checksum,
-                            false,
-                        )
-                    } else {
-                        return Ok(route);
-                    };
-                let mut next = route.clone();
-                next.version = next.version.next();
-                if is_primary {
-                    if let Some(promoted) = next
-                        .nof_backing
-                        .as_mut()
-                        .expect("managed backing was checked")
-                        .replicas
-                        .first()
-                        .cloned()
-                    {
-                        let next_backing = next.nof_backing.as_mut().unwrap();
-                        next_backing.owner = promoted.owner;
-                        next_backing.target_id = promoted.target_id;
-                        next_backing.object_locator = promoted.object_locator;
-                        next_backing.replicas.remove(0);
-                    } else {
-                        next.nof_backing = None;
-                    }
-                } else {
-                    next.nof_backing
-                        .as_mut()
-                        .expect("managed backing was checked")
-                        .replicas
-                        .retain(|replica| replica.target_id != target_id);
-                }
+                let Some((next, release)) = route_without_managed_target(&route, target_id)? else {
+                    return Ok(route);
+                };
                 let cas = route_ops.compare_and_swap_route(
                     &route.key,
                     Some(route.version),
@@ -454,9 +459,9 @@ impl NofTargetManager {
                     .and_then(|backend| backend.backing.managed_allocator())
                     .expect("managed allocator capability was checked during construction");
                 let results = allocator.release_batch(&[super::managed::NofManagedReadRequest {
-                    locator: super::managed::NofManagedLocator::from_hex(&locator)?,
-                    length: target_length,
-                    checksum: target_checksum,
+                    locator: super::managed::NofManagedLocator::from_hex(&release.locator)?,
+                    length: release.length,
+                    checksum: release.checksum,
                 }]);
                 ensure_batch_len("managed release", 1, results.len())?;
                 results.into_iter().next().expect("length checked above")?;
@@ -666,6 +671,41 @@ impl NofTargetManager {
         )
     }
 
+    pub(in crate::client) fn forget_managed_target_route(
+        &self,
+        target_id: &str,
+        route: ObjectRoute,
+    ) -> Result<ObjectRoute> {
+        if !self.is_managed() {
+            return Err(StoreError::Unsupported(
+                "managed NoF route control requires a managed target".to_string(),
+            ));
+        }
+        if self.state.owner_for(target_id).as_ref() != Some(&self.state.local_runtime) {
+            return Err(StoreError::Conflict(format!(
+                "managed NoF target {target_id} is not owned by {}",
+                self.state.local_runtime
+            )));
+        }
+        let Some((next, _release)) = route_without_managed_target(&route, target_id)? else {
+            return Ok(route);
+        };
+        let route_ops = self.route_ops.as_ref().ok_or_else(|| {
+            StoreError::InvalidState(
+                "managed NoF route control is missing route operations".to_string(),
+            )
+        })?;
+        let cas = route_ops.compare_and_swap_route(&route.key, Some(route.version), Some(&next))?;
+        if cas.applied {
+            Ok(next)
+        } else {
+            Err(StoreError::Conflict(format!(
+                "managed NoF route {} changed while forgetting target {target_id}",
+                route.key.0
+            )))
+        }
+    }
+
     fn dispatch_managed_route_action(
         &self,
         target_id: &str,
@@ -840,6 +880,67 @@ impl NofTargetManager {
             self.state.release();
         }
     }
+}
+
+struct ManagedTargetRelease {
+    locator: String,
+    length: u64,
+    checksum: Option<u64>,
+}
+
+fn route_without_managed_target(
+    route: &ObjectRoute,
+    target_id: &str,
+) -> Result<Option<(ObjectRoute, ManagedTargetRelease)>> {
+    let backing = route
+        .nof_backing
+        .as_ref()
+        .ok_or_else(|| StoreError::NotFound("managed NoF route is missing".to_string()))?;
+    let (locator, is_primary) = if backing.target_id == target_id {
+        (backing.object_locator.clone(), true)
+    } else if let Some(replica) = backing
+        .replicas
+        .iter()
+        .find(|replica| replica.target_id == target_id)
+    {
+        (replica.object_locator.clone(), false)
+    } else {
+        return Ok(None);
+    };
+    let mut next = route.clone();
+    next.version = next.version.next();
+    if is_primary {
+        if let Some(promoted) = next
+            .nof_backing
+            .as_mut()
+            .expect("managed backing was checked")
+            .replicas
+            .first()
+            .cloned()
+        {
+            let next_backing = next.nof_backing.as_mut().unwrap();
+            next_backing.owner = promoted.owner;
+            next_backing.target_id = promoted.target_id;
+            next_backing.object_locator = promoted.object_locator;
+            next_backing.replicas.remove(0);
+        } else {
+            next.nof_backing = None;
+        }
+    } else {
+        next.nof_backing
+            .as_mut()
+            .expect("managed backing was checked")
+            .replicas
+            .retain(|replica| replica.target_id != target_id);
+    }
+    Ok(Some((
+        next,
+        ManagedTargetRelease {
+            locator,
+            length: backing.length,
+            checksum: backing.checksum,
+        },
+    )))
 }
 
 fn recover_managed_owned_targets(state: &NofOwnerState, targets: &BTreeMap<String, NofBackend>) {
@@ -1181,5 +1282,37 @@ mod tests {
             }),
             "test selection should include a target whose heartbeat owner is remote"
         );
+    }
+
+    #[test]
+    fn managed_route_target_removal_promotes_the_next_replica() {
+        let primary = owner_lease("client-a", 1, "same-target-set").runtime;
+        let replica = owner_lease("client-b", 1, "same-target-set").runtime;
+        let mut route = route("managed-nof-route");
+        route.nof_backing = Some(NofBackingRoute {
+            owner: primary.clone(),
+            target_id: "nof-a".to_string(),
+            object_locator: "aaaa".to_string(),
+            length: 128,
+            checksum: Some(7),
+            state: ColdBackingState::Materialized,
+            replicas: vec![mooncake_store_core::NofBackingReplica {
+                owner: replica.clone(),
+                target_id: "nof-b".to_string(),
+                object_locator: "bbbb".to_string(),
+            }],
+        });
+
+        let (next, release) = route_without_managed_target(&route, "nof-a")
+            .expect("route removal should succeed")
+            .expect("primary target should exist");
+        let backing = next.nof_backing.expect("replica should be promoted");
+        assert_eq!(backing.owner, replica);
+        assert_eq!(backing.target_id, "nof-b");
+        assert_eq!(backing.object_locator, "bbbb");
+        assert!(backing.replicas.is_empty());
+        assert_eq!(release.locator, "aaaa");
+        assert_eq!(release.length, 128);
+        assert_eq!(release.checksum, Some(7));
     }
 }

@@ -3,7 +3,9 @@
 //! A managed executor returns opaque locators. Mooncake owns the route that binds a locator to a
 //! target, while the executor owns its physical layout and allocator internals.
 
-use mooncake_store_core::{Result, StoreError};
+use mooncake_store_core::{NamespaceScope, ObjectKey, Result, RouteVersion, StoreError};
+
+use crate::client::{ColdObjectManifest, RecoveredColdObject};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NofManagedLimits {
@@ -76,10 +78,46 @@ fn hex_digit(byte: u8) -> Result<u8> {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NofManagedRouteIdentity {
+    pub key: ObjectKey,
+    pub namespace: Option<NamespaceScope>,
+    pub logical_key: Option<String>,
+    pub canonical_key: Option<String>,
+    pub sharing_scope: Option<String>,
+    pub qos_tier: Option<String>,
+    pub route_version: RouteVersion,
+    pub target_id: String,
+}
+
+impl NofManagedRouteIdentity {
+    pub(in crate::client) fn manifest(
+        &self,
+        object_locator: String,
+        length: u64,
+        checksum: Option<u64>,
+    ) -> ColdObjectManifest {
+        ColdObjectManifest {
+            key: self.key.clone(),
+            namespace: self.namespace.clone(),
+            logical_key: self.logical_key.clone(),
+            canonical_key: self.canonical_key.clone(),
+            sharing_scope: self.sharing_scope.clone(),
+            qos_tier: self.qos_tier.clone(),
+            route_version: self.route_version,
+            cold_tier_id: self.target_id.clone(),
+            object_locator,
+            length,
+            checksum,
+        }
+    }
+}
+
 pub struct NofManagedAllocationRequest {
     pub key: String,
     pub length: u64,
     pub checksum: Option<u64>,
+    pub route_identity: Option<NofManagedRouteIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -117,4 +155,9 @@ pub trait NofManagedWrite: Send + Sync {
 /// Complete-object reads using opaque executor locators.
 pub trait NofManagedRead: Send + Sync {
     fn get_batch(&self, requests: &[NofManagedReadRequest]) -> Vec<Result<Option<Vec<u8>>>>;
+}
+
+/// Optional reverse-recovery scan for executors whose physical records carry Mooncake manifests.
+pub trait NofManagedRecovery: Send + Sync {
+    fn scan_recovered_objects(&self, target_id: &str) -> Result<Vec<RecoveredColdObject>>;
 }
