@@ -5572,21 +5572,31 @@ std::vector<int> RealClient::batch_get_into_multi_buffer_ranges(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const std::vector<std::vector<size_t>> &all_src_offsets) {
-    return ToPyResults(batch_get_into_multi_buffer_ranges_internal(
-        keys, all_buffers, all_sizes, all_src_offsets));
+    if (keys.size() != all_buffers.size() || keys.size() != all_sizes.size() ||
+        keys.size() != all_src_offsets.size()) {
+        LOG(ERROR) << "Invalid get ranges args";
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+    std::vector<MultiBufferRangeRequest> requests;
+    requests.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        requests.push_back(MultiBufferRangeRequest{
+            .key = keys[i],
+            .buffers = all_buffers[i],
+            .sizes = all_sizes[i],
+            .src_offsets = all_src_offsets[i],
+        });
+    }
+    return ToPyResults(batch_get_into_multi_buffer_ranges_internal(requests));
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffer_ranges_internal(
-    const std::vector<std::string> &keys,
-    const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
-    const std::vector<std::vector<size_t>> &all_src_offsets) {
+    const std::vector<MultiBufferRangeRequest> &requests) {
     std::vector<tl::expected<int64_t, ErrorCode>> results(
-        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    if (!client_ || keys.size() != all_buffers.size() ||
-        keys.size() != all_sizes.size() ||
-        keys.size() != all_src_offsets.size()) {
+        requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (!client_) {
         LOG(ERROR) << "Invalid get ranges args";
         return results;
     }
@@ -5627,15 +5637,15 @@ RealClient::batch_get_into_multi_buffer_ranges_internal(
     {
         std::lock_guard<std::mutex> lock(session_mutex_);
         auto now = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < keys.size(); ++i) {
-            const auto &buffers = all_buffers[i];
-            const auto &sizes = all_sizes[i];
-            const auto &offsets = all_src_offsets[i];
+        for (size_t i = 0; i < requests.size(); ++i) {
+            const auto &buffers = requests[i].buffers;
+            const auto &sizes = requests[i].sizes;
+            const auto &offsets = requests[i].src_offsets;
             if (buffers.size() != sizes.size() ||
                 buffers.size() != offsets.size()) {
                 continue;
             }
-            auto it = get_sessions_.find(keys[i]);
+            auto it = get_sessions_.find(requests[i].key);
             if (it == get_sessions_.end()) {
                 continue;
             }
@@ -5702,7 +5712,7 @@ RealClient::batch_get_into_multi_buffer_ranges_internal(
             }
             const auto &endpoint =
                 op.replica.get_local_disk_descriptor().transport_endpoint;
-            auto &plan = local_disk_ops[endpoint][keys[op.index]];
+            auto &plan = local_disk_ops[endpoint][requests[op.index].key];
             plan.restore_size = static_cast<int64_t>(total_size);
             for (size_t j = 0; j < op.slices.size(); ++j) {
                 plan.fragments.push_back(
@@ -5808,14 +5818,14 @@ RealClient::batch_get_into_multi_buffer_ranges_internal(
         std::unordered_set<std::string> seen;
         auto fail_key = [&](const std::string &key, ErrorCode error) {
             for (size_t idx : file_ops) {
-                if (keys[ops[idx].index] == key) {
+                if (requests[ops[idx].index].key == key) {
                     ops[idx].result = tl::unexpected(error);
                 }
             }
         };
         for (size_t idx : file_ops) {
             auto &op = ops[idx];
-            const auto &key = keys[op.index];
+            const auto &key = requests[op.index].key;
             if (!seen.insert(key).second) {
                 continue;
             }
@@ -5854,7 +5864,7 @@ RealClient::batch_get_into_multi_buffer_ranges_internal(
                 char *src = static_cast<char *>(handles.at(key)->ptr());
                 for (size_t idx : file_ops) {
                     auto &op = ops[idx];
-                    if (keys[op.index] != key || op.result) {
+                    if (requests[op.index].key != key || op.result) {
                         continue;
                     }
                     op.result = 0;
@@ -5885,7 +5895,7 @@ RealClient::batch_get_into_multi_buffer_ranges_internal(
         if (op.result) {
             if (now >= op.lease) {
                 results[op.index] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
-                get_sessions_.erase(keys[op.index]);
+                get_sessions_.erase(requests[op.index].key);
             } else {
                 results[op.index] = op.result.value();
             }

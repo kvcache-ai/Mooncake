@@ -668,12 +668,18 @@ class RealClient : public PyClient {
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
 
+    // One get-session range request: a key plus per-buffer destination
+    // addresses, sizes, and object-byte source offsets.
+    struct MultiBufferRangeRequest {
+        std::string key;
+        std::vector<void *> buffers;
+        std::vector<size_t> sizes;
+        std::vector<size_t> src_offsets;
+    };
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffer_ranges_internal(
-        const std::vector<std::string> &keys,
-        const std::vector<std::vector<void *>> &all_buffers,
-        const std::vector<std::vector<size_t>> &all_sizes,
-        const std::vector<std::vector<size_t>> &all_src_offsets);
+        const std::vector<MultiBufferRangeRequest> &requests);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
