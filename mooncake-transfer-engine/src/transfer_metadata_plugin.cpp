@@ -93,39 +93,20 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
     virtual ~RedisStoragePlugin() { disconnectLocked(); }
 
+    // Delegates to getWithStatus() so both lookup entry points share the same
+    // reconnect-and-retry path. Deliberately does not take
+    // access_client_mutex_: getWithStatus() takes it, and the mutex is not
+    // recursive.
     virtual bool get(const std::string &key, Json::Value &value) {
-        std::lock_guard<std::mutex> lock(access_client_mutex_);
-        redisReply *resp = execLocked("GET", key, [&key](redisContext *ctx) {
-            return static_cast<redisReply *>(
-                redisCommand(ctx, "GET %s", key.c_str()));
-        });
-        if (!resp) return false;
-        if (resp->type == REDIS_REPLY_ERROR) {
-            LOG(ERROR) << "RedisStoragePlugin: get " << key << " rejected by "
-                       << metadata_uri_ << ": "
-                       << (resp->str ? resp->str : "unknown error");
-            freeReplyObject(resp);
-            return false;
-        }
-        if (!resp->str) {
+        const GetResult status = getWithStatus(key, value);
+        if (status == GetResult::kNotFound) {
             // A nil reply means the key is absent, which is an expected result
             // when looking up a segment that is not registered (yet). Not an
             // error, so it must not be logged as one.
             LOG(WARNING) << "RedisStoragePlugin: unable to get " << key
                          << " from " << metadata_uri_;
-            freeReplyObject(resp);
-            return false;
         }
-
-        auto json_file = std::string(resp->str);
-        freeReplyObject(resp);
-
-        std::string errs;
-        if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
-            return false;
-        }
-        return true;
+        return status == GetResult::kFound;
     }
 
     // Distinguishes a nil reply (key absent — kNotFound) from a connection
@@ -134,15 +115,15 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
     GetResult getWithStatus(const std::string &key,
                             Json::Value &value) override {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
-        if (!client_) return GetResult::kUnavailable;
-
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "GET %s", key.c_str());
-        if (!resp) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
-            return GetResult::kUnavailable;
-        }
+        redisReply *resp = execLocked("GET", key, [&key](redisContext *ctx) {
+            return static_cast<redisReply *>(
+                redisCommand(ctx, "GET %s", key.c_str()));
+        });
+        // execLocked() has already rebuilt the connection and retried once, so
+        // a null reply here means the backend is unreachable, never that the
+        // key is absent. Reporting kNotFound in that case would let
+        // syncSegmentCache() evict live entries during an outage.
+        if (!resp) return GetResult::kUnavailable;
         if (resp->type == REDIS_REPLY_ERROR) {
             LOG(ERROR) << "RedisStoragePlugin: get " << key << " rejected by "
                        << metadata_uri_ << ": "

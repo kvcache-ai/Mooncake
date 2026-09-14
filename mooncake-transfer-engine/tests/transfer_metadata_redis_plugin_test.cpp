@@ -400,6 +400,52 @@ TEST_F(RedisStoragePluginTest, GetSucceedsAfterServerDropsConnection) {
     EXPECT_EQ(server.accept_count(), 2);
 }
 
+// #3072 added getWithStatus() so syncSegmentCache() can tell an absent key from
+// a backend outage. It is a second entry point into the same connection, so it
+// has to recover from a dropped connection exactly like get() does.
+TEST_F(RedisStoragePluginTest,
+       GetWithStatusRecoversAfterServerDropsConnection) {
+    FakeRedisServer server;
+    server.SetValue("mooncake/node-7", "{\"segment\":\"node-7\"}");
+    auto plugin = MetadataStoragePlugin::Create(server.endpoint());
+    ASSERT_NE(plugin, nullptr);
+
+    Json::Value read;
+    ASSERT_EQ(plugin->getWithStatus("mooncake/node-7", read),
+              GetResult::kFound);
+
+    server.DropConnections();
+
+    read = Json::Value();
+    EXPECT_EQ(plugin->getWithStatus("mooncake/node-7", read),
+              GetResult::kFound);
+    EXPECT_EQ(read["segment"].asString(), "node-7");
+    EXPECT_EQ(server.accept_count(), 2) << "plugin did not reconnect";
+}
+
+// The invariant #3072 protects: an outage must never be reported as kNotFound,
+// because syncSegmentCache() would then evict still-live cache entries. An
+// absent key must still be reported as kNotFound so genuine unmounts are seen.
+TEST_F(RedisStoragePluginTest, GetWithStatusDistinguishesAbsentKeyFromOutage) {
+    FakeRedisServer server;
+    server.SetValue("mooncake/node-8", "{\"segment\":\"node-8\"}");
+    auto plugin = MetadataStoragePlugin::Create(server.endpoint());
+    ASSERT_NE(plugin, nullptr);
+
+    Json::Value read;
+    ASSERT_EQ(plugin->getWithStatus("mooncake/node-8", read),
+              GetResult::kFound);
+    EXPECT_EQ(plugin->getWithStatus("mooncake/absent", read),
+              GetResult::kNotFound);
+
+    server.Stop();
+
+    EXPECT_EQ(plugin->getWithStatus("mooncake/node-8", read),
+              GetResult::kUnavailable);
+    EXPECT_EQ(plugin->getWithStatus("mooncake/absent", read),
+              GetResult::kUnavailable);
+}
+
 TEST_F(RedisStoragePluginTest, RemoveSucceedsAfterServerDropsConnection) {
     FakeRedisServer server;
     server.SetValue("mooncake/node-3", "{\"segment\":\"node-3\"}");
