@@ -226,6 +226,59 @@ void *AllocateStoreMemoryImpl(size_t total_size, const std::string &protocol) {
     }
     return buffer;
 }
+
+void *AllocateExactOnBoundDevice(size_t total_size, const std::string &protocol,
+                                 size_t *actual_size,
+                                 AscendHostAllocFn host_alloc,
+                                 size_t host_alignment,
+                                 bool defer_hugetlb_population) {
+    void *ptr =
+        host_alloc != nullptr
+            ? host_alloc(total_size, host_alignment, defer_hugetlb_population)
+            : AllocateStoreMemoryImpl(total_size, protocol);
+    if (ptr == nullptr) {
+        return nullptr;
+    }
+    *actual_size = total_size;
+    CommitAgentDeviceSlot();
+    return ptr;
+}
+
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+void *AllocateFabricBestEffort(size_t target_size, size_t *actual_size) {
+    // Try 100%, 90%, ... down to 50% of configured size (1G-aligned).
+    // Skip candidates that fall below the unaligned 50% floor after round-down
+    // (e.g. 2.1 GiB target → 50% is 1.05 GiB → 1 GiB must not be accepted).
+    // Probe attempts are quiet; only the final failure logs ERROR.
+    const size_t min_size =
+        target_size * static_cast<size_t>(kBestEffortMinPercent) / 100;
+    size_t last_tried = 0;
+    for (int pct = kBestEffortStartPercent; pct >= kBestEffortMinPercent;
+         pct -= kBestEffortPercentStep) {
+        size_t sz =
+            (pct == kBestEffortStartPercent)
+                ? align_down_1g(target_size)
+                : align_down_1g(target_size * static_cast<size_t>(pct) / 100);
+        if (sz == 0 || sz < min_size || sz == last_tried) {
+            continue;
+        }
+        last_tried = sz;
+        void *ptr = allocate_fabric_exact(sz, /*quiet=*/true);
+        if (ptr != nullptr) {
+            *actual_size = sz;
+            CommitAgentDeviceSlot();
+            if (sz < target_size) {
+                LOG(WARNING) << "Fabric mem best-effort: target=" << target_size
+                             << ", actual=" << sz << " (" << pct << "%)";
+            }
+            return ptr;
+        }
+    }
+    LOG(ERROR) << "Fabric mem best-effort failed: cannot allocate at least "
+               << kBestEffortMinPercent << "% of target=" << target_size;
+    return nullptr;
+}
+#endif
 }  // namespace
 
 void *ascend_allocate_vmm_memory_direct(size_t total_size) {
@@ -264,62 +317,30 @@ void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
 
 void *ascend_allocate_memory_best_effort(size_t target_size,
                                          const std::string &protocol,
-                                         size_t *actual_size) {
+                                         size_t *actual_size,
+                                         AscendHostAllocFn host_alloc,
+                                         size_t host_alignment,
+                                         bool defer_hugetlb_population) {
     if (actual_size == nullptr) {
         LOG(ERROR) << "ascend_allocate_memory_best_effort: actual_size is null";
         return nullptr;
     }
     *actual_size = 0;
-
     if (!BindNextAgentDevice()) {
         return nullptr;
     }
-
     if (!globalConfig().ascend_use_fabric_mem) {
-        void *ptr = AllocateStoreMemoryImpl(target_size, protocol);
-        if (ptr) {
-            *actual_size = target_size;
-            CommitAgentDeviceSlot();
-        }
-        return ptr;
+        return AllocateExactOnBoundDevice(target_size, protocol, actual_size,
+                                          host_alloc, host_alignment,
+                                          defer_hugetlb_population);
     }
-
+    (void)protocol;
+    (void)host_alloc;
+    (void)host_alignment;
+    (void)defer_hugetlb_population;
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
-    (void)protocol;
-    // Try 100%, 90%, ... down to 50% of configured size (1G-aligned).
-    // Skip candidates that fall below the unaligned 50% floor after round-down
-    // (e.g. 2.1 GiB target → 50% is 1.05 GiB → 1 GiB must not be accepted).
-    // Probe attempts are quiet; only the final failure logs ERROR.
-    const size_t min_size =
-        target_size * static_cast<size_t>(kBestEffortMinPercent) / 100;
-    size_t last_tried = 0;
-    for (int pct = kBestEffortStartPercent; pct >= kBestEffortMinPercent;
-         pct -= kBestEffortPercentStep) {
-        size_t sz =
-            (pct == kBestEffortStartPercent)
-                ? align_down_1g(target_size)
-                : align_down_1g(target_size * static_cast<size_t>(pct) / 100);
-        if (sz == 0 || sz < min_size || sz == last_tried) {
-            continue;
-        }
-        last_tried = sz;
-        void *ptr = allocate_fabric_exact(sz, /*quiet=*/true);
-        if (ptr != nullptr) {
-            *actual_size = sz;
-            CommitAgentDeviceSlot();
-            if (sz < target_size) {
-                LOG(WARNING) << "Fabric mem best-effort: target=" << target_size
-                             << ", actual=" << sz << " (" << pct << "%)";
-            }
-            return ptr;
-        }
-    }
-
-    LOG(ERROR) << "Fabric mem best-effort failed: cannot allocate at least "
-               << kBestEffortMinPercent << "% of target=" << target_size;
-    return nullptr;
+    return AllocateFabricBestEffort(target_size, actual_size);
 #else
-    (void)protocol;
     LOG(ERROR) << "Fabric mem mode is not supported, please upgrade Ascend "
                   "HDK and CANN.";
     return nullptr;
