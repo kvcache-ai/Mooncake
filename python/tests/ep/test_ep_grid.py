@@ -24,7 +24,10 @@ def using_musa_backend() -> bool:
 
 def using_maca_backend() -> bool:
     return os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
-        "1", "ON", "TRUE", "YES"
+        "1",
+        "ON",
+        "TRUE",
+        "YES",
     } or bool(getattr(torch.version, "maca", None))
 
 
