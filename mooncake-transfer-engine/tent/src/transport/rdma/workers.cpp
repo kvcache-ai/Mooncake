@@ -1389,10 +1389,6 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
             }
         }
     } else {
-        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
-            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
-                                         nullptr, /*bytes_moved=*/true);
-        });
         // A successful GPU transfer re-admits any learned GDR
         // unreachability for the (GPU, NIC) pair(s) it used, so a
         // transient exclusion (or a recovered path) heals. Skipped
@@ -1416,6 +1412,13 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
         // in generatePostPath, so no map lookup is needed here.
         if (auto* rail = slice->rail_monitor; rail && rail->ready())
             rail->markRecovered(slice->source_dev_id, slice->target_dev_id);
+        // Publish COMPLETED only after every path state proved by this WC is
+        // visible. The caller may submit its next request immediately after
+        // observing completion, including while a recovery probe is active.
+        ep->acknowledge(slice, COMPLETED, [&sweep](RdmaSlice* swept) {
+            sweep.self->retireSweptSlice(*sweep.worker, swept, sweep.now_ns,
+                                         nullptr, /*bytes_moved=*/true);
+        });
         if (transport_->params_->workers.show_latency_info) {
             worker.perf.inflight_lat.add(inflight_lat);
             worker.perf.enqueue_lat.add(enqueue_lat);
