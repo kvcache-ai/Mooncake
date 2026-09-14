@@ -118,9 +118,20 @@ static bool initMemoryAllocator(const char* protocol) {
         return false;
 #endif
     } else {
-        allocateMemory = malloc;
+        // Ascend SVM (_devmm_mem_remote_map) requires a 64KB page-aligned
+        // src_va. Fallback protocols (rdma/tcp/ascend) use posix_memalign to
+        // guarantee 64KB alignment, otherwise aclrtHostRegister fails with
+        // EINVAL on a misaligned address.
+        allocateMemory = [](size_t s) -> void* {
+            void* p = nullptr;
+            if (posix_memalign(&p, 64 * 1024, s) != 0) {
+                return nullptr;
+            }
+            return p;
+        };
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using 64KB-aligned malloc/free for protocol: "
+                     << protocol;
     }
     g_protocol = protocol;
     return true;
