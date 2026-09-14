@@ -1033,7 +1033,10 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
             return tl::unexpected(offset_allocator_result.error());
         }
 
-        // Create OffsetBufferAllocator instance
+        // Create OffsetBufferAllocator instance. The snapshot carries no
+        // protocol, so the allocator keeps the transfer default: descriptors
+        // restored from a snapshot report "tcp" until the buffer is rebuilt,
+        // and Replica::replace_memory_buffer keeps that value across a remount.
         auto allocator = std::make_shared<OffsetBufferAllocator>(
             segment_name, base, total_size, transport_endpoint);
 

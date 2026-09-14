@@ -1263,8 +1263,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 continue;
             }
             const RegionResourceSpec spec{
-                restore.segment.id, restore.segment.name, restore.segment.base,
-                restore.segment.size, restore.segment.te_endpoint};
+                restore.segment.id,          restore.segment.name,
+                restore.segment.base,        restore.segment.size,
+                restore.segment.te_endpoint, restore.segment.protocol};
             auto allocations =
                 BuildRegionLiveAllocations(spec, restore.descriptors);
             if (!allocations) {
@@ -1275,7 +1276,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 auto imported = ImportOffsetBufferAllocator(
                     restore.segment.name, restore.segment.base,
                     restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
+                    *allocations, ReplicaType::MEMORY,
+                    restore.segment.protocol);
                 if (!imported) {
                     return fail_remount(ErrorCode::INVALID_PARAMS);
                 }
@@ -1286,7 +1288,8 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 auto imported = ImportCachelibBufferAllocator(
                     restore.segment.name, restore.segment.base,
                     restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
+                    *allocations, ReplicaType::MEMORY,
+                    restore.segment.protocol);
                 if (!imported) {
                     return fail_remount(ErrorCode::INVALID_PARAMS);
                 }

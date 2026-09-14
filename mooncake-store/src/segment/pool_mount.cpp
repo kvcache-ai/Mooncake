@@ -14,8 +14,9 @@ RegionKind ClassifyRegion(const Segment& segment) {
 }
 
 RegionResourceSpec MakeResourceSpec(const Segment& segment) {
-    return RegionResourceSpec{segment.id, segment.name, segment.base,
-                              segment.size, segment.te_endpoint};
+    return RegionResourceSpec{segment.id,          segment.name,
+                              segment.base,        segment.size,
+                              segment.te_endpoint, segment.protocol};
 }
 
 }  // namespace

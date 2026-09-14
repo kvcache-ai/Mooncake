@@ -215,9 +215,9 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
     }
 
     if (live_allocations.empty()) {
-        auto allocator =
-            CreateBufferAllocator(*allocator_type(), spec.name, spec.base,
-                                  spec.size, spec.transport_endpoint);
+        auto allocator = CreateBufferAllocator(
+            *allocator_type(), spec.name, spec.base, spec.size,
+            spec.transport_endpoint, ReplicaType::MEMORY, spec.protocol);
         if (!allocator) {
             return tl::make_unexpected(allocator.error());
         }
@@ -227,7 +227,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
     if (*allocator_type() == BufferAllocatorType::CACHELIB) {
         auto restored = ImportCachelibBufferAllocator(
             spec.name, spec.base, spec.size, spec.transport_endpoint,
-            live_allocations);
+            live_allocations, ReplicaType::MEMORY, spec.protocol);
         if (!restored) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -238,7 +238,7 @@ tl::expected<PreparedRegionResource, ErrorCode> MemoryRegionDriver::PrepareOpen(
     if (*allocator_type() == BufferAllocatorType::OFFSET) {
         auto restored = ImportOffsetBufferAllocator(
             spec.name, spec.base, spec.size, spec.transport_endpoint,
-            live_allocations);
+            live_allocations, ReplicaType::MEMORY, spec.protocol);
         if (!restored) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -307,6 +307,7 @@ tl::expected<RegionDriverRegistry, ErrorCode> CreateRegionDrivers(
         RegionKind::HOST_MEMORY,
         std::make_unique<MemoryRegionDriver>(config.memory_allocator));
     if (config.cxl) {
+        // No protocol: change_to_cxl() stamps each buffer when handed out.
         auto allocator = CreateBufferAllocator(
             BufferAllocatorType::CACHELIB, config.cxl->path, DEFAULT_CXL_BASE,
             config.cxl->size, config.cxl->path);

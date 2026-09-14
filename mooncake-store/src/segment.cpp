@@ -251,9 +251,9 @@ ErrorCode ScopedSegmentAccess::MountSegment(
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto created =
-        CreateBufferAllocator(segment_manager_->memory_allocator_, segment.name,
-                              buffer, size, segment.te_endpoint);
+    auto created = CreateBufferAllocator(
+        segment_manager_->memory_allocator_, segment.name, buffer, size,
+        segment.te_endpoint, ReplicaType::MEMORY, segment.protocol);
     if (!created) {
         return created.error();
     }
@@ -1317,6 +1317,8 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         }
     }
 
+    // No protocol: NoFSegment carries no transport protocol (NoF replicas are
+    // addressed by endpoint alone), so these buffers keep the transfer default.
     auto created = CreateBufferAllocator(
         nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
         segment.te_endpoint, ReplicaType::NOF_SSD);
@@ -1552,6 +1554,8 @@ ErrorCode SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
               << std::fixed << std::setprecision(2)
               << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
+    // No protocol: change_to_cxl() stamps each buffer with "cxl" when it is
+    // handed out; stamping the allocator would mark them before that.
     auto created =
         CreateBufferAllocator(BufferAllocatorType::CACHELIB, cxl_path,
                               DEFAULT_CXL_BASE, cxl_size, cxl_path);
