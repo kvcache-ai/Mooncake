@@ -37,6 +37,10 @@ namespace mooncake::test {
 
 class FakeBatchHaKvBackend : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         auto it = kvs_.find(std::string(key));
         if (it == kvs_.end()) {

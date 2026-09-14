@@ -1077,12 +1077,6 @@ TEST(EtcdHaKvBackendDeleteTest, RejectsUnboundedAndReversedRanges) {
     EXPECT_EQ(ErrorCode::OK, backend.DeleteRange("a", "a"));
 }
 
-TEST(OpLogBatchStorageDeleteTest, UnsupportedBackendFailsClosed) {
-    FakeHaKvBackend backend;
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS,
-              backend.HaKvBackend::DeleteRange("a", "b"));
-}
-
 #ifdef STORE_USE_ETCD
 TEST(EtcdHaKvBackendDeleteTest, RealEtcdDeleteWhileAppending) {
     const char* endpoints = std::getenv("MOONCAKE_N10_TEST_ETCD_ENDPOINTS");
