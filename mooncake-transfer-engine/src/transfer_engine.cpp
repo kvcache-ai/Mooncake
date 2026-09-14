@@ -652,6 +652,8 @@ int TransferEngine::registerLocalMemory(void* addr, size_t length,
                                         bool update_metadata) {
     if (use_tent_) {
         mooncake::tent::MemoryOptions option;
+        option.perm = remote_accessible ? mooncake::tent::kGlobalReadWrite
+                                        : mooncake::tent::kLocalReadWrite;
         if (!location.empty() && location != kWildcardLocation)
             option.location = location;
         auto status = impl_tent_->registerLocalMemory(addr, length, option);
@@ -745,6 +747,7 @@ Status TransferEngine::submitTransfer(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.priority = item.priority;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
             requests.push_back(req);
@@ -771,6 +774,7 @@ Status TransferEngine::submitTransferWithNotify(
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
+            req.priority = item.priority;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
             requests.push_back(req);
