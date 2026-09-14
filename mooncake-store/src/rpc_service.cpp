@@ -1,5 +1,6 @@
 #include "rpc_service.h"
 #include "request_context.h"
+#include "tracing.h"
 #include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
@@ -962,8 +963,11 @@ void WrappedMasterService::ExistKey_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.exist_key", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(ExistKey(key));
+    auto result = ExistKey(key);
+    if (!result.has_value()) hop_b_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchExistKey_with_context(
@@ -978,8 +982,16 @@ void WrappedMasterService::BatchExistKey_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.batch_exist_key", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(BatchExistKey(keys));
+    auto result = BatchExistKey(keys);
+    for (const auto& r : result) {
+        if (!r.has_value()) {
+            hop_b_span.SetError(toString(r.error()));
+            break;
+        }
+    }
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchReplicaClear_with_context(
@@ -1026,8 +1038,11 @@ void WrappedMasterService::GetReplicaList_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.get_replica_list", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(GetReplicaList(key));
+    auto result = GetReplicaList(key);
+    if (!result.has_value()) hop_b_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchGetReplicaList_with_context(
@@ -1042,8 +1057,16 @@ void WrappedMasterService::BatchGetReplicaList_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.batch_get_replica_list", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(BatchGetReplicaList(keys));
+    auto result = BatchGetReplicaList(keys);
+    for (const auto& r : result) {
+        if (!r.has_value()) {
+            hop_b_span.SetError(toString(r.error()));
+            break;
+        }
+    }
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::PutStart_with_context(
@@ -1058,8 +1081,11 @@ void WrappedMasterService::PutStart_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.put_start", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(PutStart(client_id, key, slice_length, config));
+    auto result = PutStart(client_id, key, slice_length, config);
+    if (!result.has_value()) hop_b_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::PutEnd_with_context(
@@ -1106,8 +1132,16 @@ void WrappedMasterService::BatchPutStart_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.batch_put_start", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(BatchPutStart(client_id, keys, slice_lengths, config));
+    auto result = BatchPutStart(client_id, keys, slice_lengths, config);
+    for (const auto& r : result) {
+        if (!r.has_value()) {
+            hop_b_span.SetError(toString(r.error()));
+            break;
+        }
+    }
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchPutEnd_with_context(
@@ -1154,8 +1188,11 @@ void WrappedMasterService::Remove_with_context(
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
     }
+    ScopedSpan hop_b_span("mooncake-master", "master.remove", &rc);
     CurrentCtxScope guard(std::move(rc));
-    ctx.response_msg(Remove(key, force));
+    auto result = Remove(key, force);
+    if (!result.has_value()) hop_b_span.SetError(toString(result.error()));
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::RemoveByRegex_with_context(

@@ -1177,20 +1177,30 @@ PYBIND11_MODULE(store, m) {
                const std::optional<std::string>& request_id,
                const std::optional<std::string>& trace_id,
                const std::optional<std::string>& span_id,
-               const std::optional<std::string>& parent_span_id) {
+               const std::optional<std::string>& parent_span_id,
+               const std::optional<std::string>& caller_id,
+               const std::optional<std::string>& caller_role) {
                 (void)self;
                 RequestContext ctx = g_current_ctx.value_or(RequestContext{});
                 if (request_id) ctx.request_id = *request_id;
                 if (trace_id) ctx.trace_id = *trace_id;
                 if (span_id) ctx.span_id = *span_id;
                 if (parent_span_id) ctx.parent_span_id = *parent_span_id;
+                // Caller attribution (plan_trace.md §2.8): which dummy-client /
+                // TP rank and which thread role (e.g. prefetch/backup). Optional
+                // merge: omitted args preserve any value already on this thread.
+                if (caller_id) ctx.caller_id = *caller_id;
+                if (caller_role) ctx.caller_role = *caller_role;
                 set_current_request_context(std::move(ctx));
             },
             py::arg("request_id") = py::none(),
             py::arg("trace_id") = py::none(), py::arg("span_id") = py::none(),
             py::arg("parent_span_id") = py::none(),
-            "Set per-request context (request_id/trace_id/...) on the calling "
-            "thread; consumed by subsequent store/master operations.")
+            py::arg("caller_id") = py::none(),
+            py::arg("caller_role") = py::none(),
+            "Set per-request context (request_id/trace_id/..., plus optional "
+            "caller_id/caller_role attribution) on the calling thread; consumed "
+            "by subsequent store/master operations.")
         .def(
             "clear_request_context",
             [](MooncakeStorePyWrapper& self) {

@@ -1,6 +1,8 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "tracing.h"
+
 #include <chrono>  // For std::chrono
 #include <csignal>
 #include <memory>  // For std::unique_ptr
@@ -118,6 +120,17 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+DEFINE_string(otlp_traces_endpoint, "",
+              "OTLP traces collector endpoint, given WITHOUT a scheme: "
+              "\"host:port\" for --otlp_traces_protocol=grpc (e.g. collector:4317) "
+              "or \"host:port/path\" for http (e.g. collector:4318 or "
+              "collector:4318/v1/traces; the /v1/traces path is appended when only "
+              "host:port is given). When empty, tracing is disabled. Requires "
+              "building with MOONCAKE_ENABLE_OTEL_TRACING=ON; otherwise this flag "
+              "is a no-op.");
+DEFINE_string(otlp_traces_protocol, "http",
+              "OTLP transport protocol for traces: \"http\" (default) or "
+              "\"grpc\". Ignored when --otlp_traces_endpoint is empty.");
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -469,6 +482,9 @@ int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    mooncake::InitTracing(FLAGS_otlp_traces_endpoint, "mooncake-master",
+                          FLAGS_otlp_traces_protocol);
 
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);

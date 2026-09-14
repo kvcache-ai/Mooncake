@@ -18,6 +18,7 @@ set(MOONCAKE_CENTRALIZED_MASTER_SOURCES
     offset_allocator.cpp
     http_metadata_server.cpp
     task_manager.cpp
+    tracing.cpp
 )
 
 set(MOONCAKE_P2P_MASTER_SOURCES
@@ -142,6 +143,27 @@ target_link_libraries(mooncake_store
     PRIVATE
         transfer_engine
 )
+
+# OpenTelemetry tracing (plan_trace.md): OTLP/HTTP (built-in curl) and OTLP/gRPC
+# exporters fold the pre-built, installed opentelemetry-cpp imported targets
+# (found in top-level CMakeLists.txt; produced by install_otel.sh with
+# WITH_OTLP_HTTP=ON, WITH_OTLP_GRPC=ON) statically into this target. gRPC +
+# abseil visibly grow the binaries, so only enable MOONCAKE_ENABLE_OTEL_TRACING
+# when tracing binaries are actually needed.
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+    target_compile_definitions(mooncake_store PUBLIC MOONCAKE_ENABLE_OTEL_TRACING)
+    target_link_libraries(mooncake_store PUBLIC
+        opentelemetry-cpp::trace
+        opentelemetry-cpp::resources
+        opentelemetry-cpp::otlp_recordable
+        opentelemetry-cpp::otlp_http_exporter
+        opentelemetry-cpp::otlp_http_client
+        opentelemetry-cpp::otlp_grpc_exporter
+    )
+    if(TARGET opentelemetry-cpp::otlp_grpc_client)
+        target_link_libraries(mooncake_store PUBLIC opentelemetry-cpp::otlp_grpc_client)
+    endif()
+endif()
 
 # The client aggregate still includes both architectures until C4 splits the
 # public client facade. Master executables use the isolated targets below.
@@ -290,6 +312,27 @@ endif()
 
 add_library(mooncake_master_core STATIC ${MOONCAKE_CENTRALIZED_MASTER_SOURCES})
 target_link_libraries(mooncake_master_core PUBLIC mooncake_master_support)
+
+# OpenTelemetry tracing (plan_trace.md): OTLP/HTTP (built-in curl) and OTLP/gRPC
+# exporters fold the pre-built, installed opentelemetry-cpp imported targets
+# (found in top-level CMakeLists.txt; produced by install_otel.sh with
+# WITH_OTLP_HTTP=ON, WITH_OTLP_GRPC=ON) statically into this target. gRPC +
+# abseil visibly grow the binaries, so only enable MOONCAKE_ENABLE_OTEL_TRACING
+# when tracing binaries are actually needed.
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+    target_compile_definitions(mooncake_master_core PUBLIC MOONCAKE_ENABLE_OTEL_TRACING)
+    target_link_libraries(mooncake_master_core PUBLIC
+        opentelemetry-cpp::trace
+        opentelemetry-cpp::resources
+        opentelemetry-cpp::otlp_recordable
+        opentelemetry-cpp::otlp_http_exporter
+        opentelemetry-cpp::otlp_http_client
+        opentelemetry-cpp::otlp_grpc_exporter
+    )
+    if(TARGET opentelemetry-cpp::otlp_grpc_client)
+        target_link_libraries(mooncake_master_core PUBLIC opentelemetry-cpp::otlp_grpc_client)
+    endif()
+endif()
 
 add_library(mooncake_p2p_master_core STATIC ${MOONCAKE_P2P_MASTER_SOURCES})
 target_link_libraries(mooncake_p2p_master_core PUBLIC mooncake_master_support)
