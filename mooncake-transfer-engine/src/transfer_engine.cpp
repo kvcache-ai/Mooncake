@@ -576,9 +576,20 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
 }
 
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
-    if (use_tent_)
-        return Status::OK();
-    else
+    if (use_tent_) {
+        // TENT owns its segment cache, so actively probe the peer instead of
+        // reporting OK unconditionally. Returning OK here left classic callers
+        // (e.g. the Python wrapper's handle_map_) holding a dead peer's cached
+        // handle forever, because they only evict the handle on a non-OK
+        // status. A stale/unknown handle or an unreachable peer makes
+        // probePeerAliveByID fail (invalid handle, empty RPC address, or RPC
+        // error); surface that as a non-OK status so the caller closes and
+        // re-opens the segment on the next transfer. Refs #3995
+        // (P0-stale-handle).
+        auto probe_status = impl_tent_->probePeerAliveByID(sid);
+        if (probe_status.ok()) return Status::OK();
+        return Status::Endpoint(std::string(probe_status.message()));
+    } else
         return impl_->CheckSegmentStatus(sid);
 }
 
