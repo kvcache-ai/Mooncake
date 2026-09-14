@@ -1,3 +1,5 @@
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
+
 add_subdirectory(cachelib_memory_allocator)
 add_subdirectory(local_ssd)
 
@@ -39,6 +41,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
+    weight_metadata_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
     offset_allocator.cpp
@@ -449,6 +452,7 @@ target_link_libraries(
           mooncake_common
           Mooncake::zstd
           Mooncake::xxhash
+          OpenSSL::Crypto
           asio_shared
           yalantinglibs::yalantinglibs)
 if(KV_EVENTS_ZMQ_FOUND)
@@ -550,6 +554,7 @@ target_link_libraries(
           JsonCpp::JsonCpp
           yaml-cpp
           Mooncake::xxhash
+          OpenSSL::Crypto
           numa)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store_master PRIVATE Mooncake::libzmq)
@@ -581,7 +586,8 @@ target_link_libraries(
          asio_shared
          transfer_engine
          yalantinglibs::yalantinglibs
-  PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash numa)
+  PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash
+          OpenSSL::Crypto numa)
 if(KV_EVENTS_ZMQ_FOUND)
   target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
