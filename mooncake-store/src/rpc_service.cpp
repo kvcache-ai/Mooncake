@@ -15,6 +15,7 @@
 #include "common/scoped_vlog_timer.h"
 #include "version.h"
 #include "request_context.h"
+#include "tracing.h"
 
 namespace mooncake {
 namespace {
@@ -1817,31 +1818,63 @@ RequestContext BridgeRequestContext(const std::string& attachment,
     }
     return request_context;
 }
+
+void SetSpanError(ScopedSpan& span, ErrorCode error) {
+    span.SetError(toString(error));
+}
+
+template <typename T>
+void SetSpanError(ScopedSpan& span, const tl::expected<T, ErrorCode>& result) {
+    if (!result.has_value()) SetSpanError(span, result.error());
+}
+
+template <typename T>
+void SetSpanError(ScopedSpan& span,
+                  const std::vector<tl::expected<T, ErrorCode>>& results) {
+    for (const auto& result : results) {
+        if (!result.has_value()) {
+            SetSpanError(span, result.error());
+            return;
+        }
+    }
+}
 }  // namespace
 
 void WrappedMasterService::ExistKey_with_context(
     coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
     const std::string& key, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "ExistKey_with_context"));
-    ctx.response_msg(ExistKey(key, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "ExistKey_with_context");
+    ScopedSpan span("mooncake-master", "master.exist_key", &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result = ExistKey(key, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchExistKey_with_context(
     coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
     const std::vector<std::string>& keys, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "BatchExistKey_with_context"));
-    ctx.response_msg(BatchExistKey(keys, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "BatchExistKey_with_context");
+    ScopedSpan span("mooncake-master", "master.batch_exist_key",
+                    &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result = BatchExistKey(keys, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchReplicaClear_with_context(
     coro_rpc::context<tl::expected<std::vector<std::string>, ErrorCode>> ctx,
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "BatchReplicaClear_with_context"));
     ctx.response_msg(
@@ -1854,7 +1887,8 @@ void WrappedMasterService::GetReplicaListByRegex_with_context(
         ErrorCode>>
         ctx,
     const std::string& str, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "GetReplicaListByRegex_with_context"));
     ctx.response_msg(GetReplicaListByRegex(str, tenant_id));
@@ -1863,10 +1897,16 @@ void WrappedMasterService::GetReplicaListByRegex_with_context(
 void WrappedMasterService::GetReplicaList_with_context(
     coro_rpc::context<tl::expected<GetReplicaListResponse, ErrorCode>> ctx,
     const std::string& key, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "GetReplicaList_with_context"));
-    ctx.response_msg(GetReplicaList(key, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "GetReplicaList_with_context");
+    ScopedSpan span("mooncake-master", "master.get_replica_list",
+                    &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result = GetReplicaList(key, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchGetReplicaList_with_context(
@@ -1874,10 +1914,16 @@ void WrappedMasterService::BatchGetReplicaList_with_context(
         std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>>
         ctx,
     const std::vector<std::string>& keys, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "BatchGetReplicaList_with_context"));
-    ctx.response_msg(BatchGetReplicaList(keys, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "BatchGetReplicaList_with_context");
+    ScopedSpan span("mooncake-master", "master.batch_get_replica_list",
+                    &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result = BatchGetReplicaList(keys, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::PutStart_with_context(
@@ -1885,17 +1931,23 @@ void WrappedMasterService::PutStart_with_context(
         ctx,
     const UUID& client_id, const std::string& key, uint64_t slice_length,
     const ReplicateConfig& config, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "PutStart_with_context"));
-    ctx.response_msg(PutStart(client_id, key, slice_length, config, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "PutStart_with_context");
+    ScopedSpan span("mooncake-master", "master.put_start", &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result = PutStart(client_id, key, slice_length, config, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::PutEnd_with_context(
     coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const UUID& client_id,
     const ObjectMeta& object_meta, ReplicaType replica_type,
     const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "PutEnd_with_context"));
     ctx.response_msg(PutEnd(client_id, object_meta, replica_type, tenant_id));
@@ -1905,7 +1957,8 @@ void WrappedMasterService::PutRevoke_with_context(
     coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const UUID& client_id,
     const std::string& key, ReplicaType replica_type,
     const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "PutRevoke_with_context"));
     ctx.response_msg(PutRevoke(client_id, key, replica_type, tenant_id));
@@ -1918,18 +1971,25 @@ void WrappedMasterService::BatchPutStart_with_context(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<uint64_t>& slice_lengths, const ReplicateConfig& config,
     const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "BatchPutStart_with_context"));
-    ctx.response_msg(
-        BatchPutStart(client_id, keys, slice_lengths, config, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "BatchPutStart_with_context");
+    ScopedSpan span("mooncake-master", "master.batch_put_start",
+                    &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result =
+        BatchPutStart(client_id, keys, slice_lengths, config, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::BatchPutEnd_with_context(
     coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     ReplicaType replica_type, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "BatchPutEnd_with_context"));
     ctx.response_msg(
@@ -1940,7 +2000,8 @@ void WrappedMasterService::BatchPutRevoke_with_context(
     coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
     const UUID& client_id, const std::vector<std::string>& keys,
     ReplicaType replica_type, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "BatchPutRevoke_with_context"));
     ctx.response_msg(BatchPutRevoke(client_id, keys, replica_type, tenant_id));
@@ -1949,16 +2010,22 @@ void WrappedMasterService::BatchPutRevoke_with_context(
 void WrappedMasterService::Remove_with_context(
     coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
     const std::string& key, bool force, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "Remove_with_context"));
-    ctx.response_msg(Remove(key, force, tenant_id));
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
+    RequestContext request_context =
+        BridgeRequestContext(attachment, "Remove_with_context");
+    ScopedSpan span("mooncake-master", "master.remove", &request_context);
+    CurrentCtxScope guard(std::move(request_context));
+    auto result = Remove(key, force, tenant_id);
+    SetSpanError(span, result);
+    ctx.response_msg(std::move(result));
 }
 
 void WrappedMasterService::RemoveByRegex_with_context(
     coro_rpc::context<tl::expected<long, ErrorCode>> ctx,
     const std::string& str, bool force, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
+    const std::string attachment =
+        ctx.get_context_info()->release_request_attachment();
     CurrentCtxScope guard(
         BridgeRequestContext(attachment, "RemoveByRegex_with_context"));
     ctx.response_msg(RemoveByRegex(str, force, tenant_id));
@@ -1966,9 +2033,9 @@ void WrappedMasterService::RemoveByRegex_with_context(
 
 void WrappedMasterService::RemoveAll_with_context(
     coro_rpc::context<long> ctx, bool force, const std::string& tenant_id) {
-    auto attachment = ctx.get_context_info()->release_request_attachment();
-    CurrentCtxScope guard(
-        BridgeRequestContext(attachment, "RemoveAll_with_context"));
+    CurrentCtxScope guard(BridgeRequestContext(
+        ctx.get_context_info()->release_request_attachment(),
+        "RemoveAll_with_context"));
     ctx.response_msg(RemoveAll(force, tenant_id));
 }
 

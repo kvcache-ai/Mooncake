@@ -9,6 +9,7 @@
 #include "common/byte_size.h"
 #include "glog_compat.h"
 #include "real_client.h"
+#include "tracing.h"
 #include "version.h"
 
 using namespace mooncake;
@@ -33,6 +34,13 @@ DEFINE_bool(start_offload_rpc_server, true,
             "Disable for a write-only owner.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
+
+DEFINE_string(otlp_traces_endpoint, "",
+              "OTLP traces collector endpoint, without a scheme: "
+              "\"host:port\" for --otlp_traces_protocol=grpc, or "
+              "\"host:port/path\" for http. When empty, tracing is disabled.");
+DEFINE_string(otlp_traces_protocol, "http",
+              "OTLP transport protocol for traces: http (default) or grpc.");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
@@ -134,6 +142,8 @@ int main(int argc, char *argv[]) {
 
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+    mooncake::InitTracing(FLAGS_otlp_traces_endpoint, "mooncake-real-client",
+                          FLAGS_otlp_traces_protocol);
     if (!FLAGS_log_dir.empty()) {
         // MC_LOG_DIR may have initialized glog (and set FLAGS_log_dir) from
         // a static initializer before main — see glog_compat.h.
