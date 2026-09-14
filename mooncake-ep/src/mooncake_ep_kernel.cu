@@ -21,10 +21,19 @@ using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_nc;
 using mooncake::device::mc_ld_nc_s32;
 using mooncake::device::mc_ld_nc_f32;
+
+#ifdef MOONCAKE_EP_USE_MUSA
+#define MOONCAKE_EP_COPY_UNROLL 7
+#else
+#define MOONCAKE_EP_COPY_UNROLL 7
+#endif
 using mooncake::device::mc_st_na;
 using mooncake::device::mc_ld_acquire;
 using mooncake::device::mc_st_release;
 using mooncake::device::mc_atomic_add_release;
+#ifdef MOONCAKE_EP_USE_MUSA
+using mooncake::device::mc_atomic_add_relaxed;
+#endif
 using mooncake::device::mc_fence;
 using mooncake::device::mc_fence_barrier_fence;
 
@@ -189,9 +198,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                     // Local or P2P path — warp-cooperative copy
                     const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
                     const auto* dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
+#ifndef MOONCAKE_EP_USE_MUSA
                     mc_fence();
+#endif
                     UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, mc_ld_nc, mc_st_na);
+#ifndef MOONCAKE_EP_USE_MUSA
                     mc_fence();
+#endif
                 } else {
                     // IBGDA path — send directly from source buffer
                     mc_fence();
@@ -216,7 +229,12 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
                 // Increase counter after finishing
                 __syncwarp();
-                lane_id == 0 ? mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+                lane_id == 0 ?
+#ifdef MOONCAKE_EP_USE_MUSA
+                    mc_atomic_add_relaxed(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+#else
+                    mc_atomic_add_release(atomic_finish_counter_per_expert + dst_expert_idx, 1) : 0;
+#endif
             }
         }
     } else if (is_count_warp) {
@@ -268,7 +286,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             }
         }
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    __syncthreads();
+#else
     mc_fence_barrier_fence();
+#endif
 
     // Issue count sends
     if (responsible_expert_idx < num_experts and sub_warp_id == 0 and lane_id == 0) {
@@ -288,6 +310,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         }
 #endif
         if (dst_rank != rank) {
+#ifdef MOONCAKE_EP_USE_MUSA
+            mc_fence();
+#endif
             int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
             mc_red_add(comm_ctx, dst_rank,
                        ep_qp_channel(dst_expert_local_idx, num_qp_per_rank,
@@ -373,8 +398,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
-            mc_fence();
-            UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
+            UNROLLED_WARP_COPY(MOONCAKE_EP_COPY_UNROLL, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
 
             // Copy scales
             if (kUseFP8) {
@@ -415,10 +439,11 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device));
-    num_warp_groups = cell_div(num_experts, device_prop.multiProcessorCount);
-    // MUSA keeps four 32-thread pseudo-warps per group. The range is also
-    // constrained by the count group and the maximum supported CTA shape.
-    num_warp_groups = max(3, min(8, num_warp_groups));
+    // Keep enough data groups per CTA to amortize the count group. The
+    // previous SM-derived choice selected three groups on S5000, leaving only
+    // two groups for token copies while launching 96 CTAs for 288 experts.
+    // Six groups reduce the grid to 48 CTAs and leave five data groups.
+    num_warp_groups = 6;
 #endif
     EP_HOST_ASSERT(kNumMaxTopK + 1 <= num_warp_groups * kNumWarpsPerGroup &&
                    "Too many top-k selections");
@@ -563,7 +588,7 @@ combine(void* combined_x, int32_t* active_ranks,
             if (write_dst != nullptr) {
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
-                UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+                    UNROLLED_WARP_COPY(MOONCAKE_EP_COPY_UNROLL, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
 #ifndef MOONCAKE_EP_USE_MUSA
                 mc_fence();
 #endif
@@ -571,7 +596,7 @@ combine(void* combined_x, int32_t* active_ranks,
                 // IBGDA path — stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
                 if (not zero_copy)
-                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
+                    UNROLLED_WARP_COPY(MOONCAKE_EP_COPY_UNROLL, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
                 __syncwarp();
 #if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
                 // Match dispatch publication and avoid concurrent posts from
@@ -649,7 +674,9 @@ combine(void* combined_x, int32_t* active_ranks,
     // mc_grid_sync() is a no-op on split-kernel platforms; use a block-wide
     // fence/barrier before reduction so threads see peer writes.
     __syncthreads();
+#ifndef MOONCAKE_EP_USE_MUSA
     mc_fence();
+#endif
     __syncthreads();
 #else
     mc_grid_sync();
@@ -658,9 +685,66 @@ combine(void* combined_x, int32_t* active_ranks,
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+#ifdef MOONCAKE_EP_USE_MUSA
+    // A completion word is stable for the entire combine. When the expert
+    // count is smaller than the token/expert fanout, acquire every expert
+    // once per reduction CTA instead of repeatedly acquiring the same words
+    // for every token.
+    const bool wait_all_experts =
+        num_experts <= num_combined_tokens * num_topk;
+    if (wait_all_experts) {
+        const int entry_idx = thread_id;
+        const int token_offset = entry_idx / num_topk;
+        const int topk_offset = entry_idx % num_topk;
+        const int token_idx = sm_id + token_offset * num_sms;
+        if (token_idx < num_combined_tokens) {
+            const int expert_idx = static_cast<int>(
+                __ldg(topk_idx + token_idx * num_topk + topk_offset));
+            if (expert_idx >= 0) {
+                const int expert_src_rank = expert_idx / num_local_experts;
+            const unsigned long long start_time = clock64();
+            while (mc_ld_acquire(rdma_recv_signal_buffer + expert_idx) == 0 &&
+                   active_ranks[expert_src_rank]) {
+                const unsigned long long end_time = clock64();
+                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                    active_ranks[expert_src_rank] = 0;
+            }
+            }
+        }
+    }
+    __syncthreads();
+    for (int token_idx = sm_id; token_idx < num_combined_tokens;
+         token_idx += num_sms) {
+        // CUDA's cooperative grid barrier above orders an expert-owning block
+        // before every token-reduction block. MUSA has no grid barrier, so
+        // the reduction block waits only on the experts selected by its token.
+        if (!wait_all_experts && thread_id == 0) {
+            #pragma unroll
+            for (int i = 0; i < num_topk; ++i) {
+                const int expert_idx =
+                    static_cast<int>(__ldg(topk_idx + token_idx * num_topk + i));
+                if (expert_idx < 0)
+                    continue;
+                const int expert_src_rank = expert_idx / num_local_experts;
+                const unsigned long long start_time = clock64();
+                while (mc_ld_acquire(rdma_recv_signal_buffer + expert_idx) == 0 &&
+                       active_ranks[expert_src_rank]) {
+                    const unsigned long long end_time = clock64();
+                    if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                        active_ranks[expert_src_rank] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        if (thread_id < hidden_bf16_int4) {
+#else
     if (thread_id < hidden_bf16_int4) {
-        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+        for (int token_idx = sm_id; token_idx < num_combined_tokens;
+             token_idx += num_sms) {
+#endif
+#ifndef MOONCAKE_EP_USE_MUSA
             mc_fence();
+#endif
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
             float reg_topk_weights[kNumMaxTopk];
@@ -670,7 +754,11 @@ combine(void* combined_x, int32_t* active_ranks,
                 reg_topk_weights[i] = __ldg(topk_weights + token_idx * num_topk + i);
             }
 
+#ifdef MOONCAKE_EP_USE_MUSA
+            float2 combined_values[kNumElemsPerInt4 / 2] = {};
+#else
             float combined_values[kNumElemsPerInt4] = {0.0f};
+#endif
             #pragma unroll
             for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
                 // Skip experts on inactive ranks (timed out during combine recv)
@@ -683,21 +771,46 @@ combine(void* combined_x, int32_t* active_ranks,
 
                 // Reduce
                 auto x_vec = mc_ld_nc(reinterpret_cast<const int4*>(rdma_buffer_row) + thread_id);
+#ifdef MOONCAKE_EP_USE_MUSA
+                const auto x_bf162 = reinterpret_cast<nv_bfloat162*>(&x_vec);
+                #pragma unroll
+                for (int j = 0; j < kNumElemsPerInt4 / 2; ++j) {
+                    const float2 values = {__bfloat162float(x_bf162[j].x),
+                                           __bfloat162float(x_bf162[j].y)};
+                    combined_values[j].x += values.x * reg_topk_weights[i];
+                    combined_values[j].y += values.y * reg_topk_weights[i];
+                }
+#else
                 const auto x_bf16 = reinterpret_cast<nv_bfloat16*>(&x_vec);
                 #pragma unroll
                 for (int j = 0; j < kNumElemsPerInt4; ++ j)
                     combined_values[j] += __bfloat162float(x_bf16[j]) * reg_topk_weights[i];
+#endif
             }
 
             // Write results
+#ifdef MOONCAKE_EP_USE_MUSA
+            int4 combined_int4;
+            auto combined_bf162 = reinterpret_cast<nv_bfloat162*>(&combined_int4);
+            #pragma unroll
+            for (int j = 0; j < kNumElemsPerInt4 / 2; ++j)
+                combined_bf162[j] = __floats2bfloat162_rn(combined_values[j].x,
+                                                           combined_values[j].y);
+#else
             int4& combined_int4 = *reinterpret_cast<int4*>(combined_values);
             auto combined_bf16 = reinterpret_cast<nv_bfloat16*>(&combined_values);
             #pragma unroll
             for (int j = 0; j < kNumElemsPerInt4; ++ j)
                 combined_bf16[j] = __float2bfloat16(combined_values[j]);
+#endif
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
+#ifdef MOONCAKE_EP_USE_MUSA
         }
+#endif
     }
+#ifndef MOONCAKE_EP_USE_MUSA
+    }
+#endif
 }
 
 void combine(void* combined_x, int32_t* active_ranks,

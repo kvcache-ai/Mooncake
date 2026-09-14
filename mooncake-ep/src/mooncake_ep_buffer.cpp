@@ -12,9 +12,10 @@ namespace {
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap,
                                int num_local_experts) {
 #ifdef MOONCAKE_EP_USE_MUSA
-    // MUSA's verified protocol uses one active QP until each QP owns an
-    // independent source row.
-    return 1;
+    // MUSA defaults to the verified single-QP protocol, but allow bounded
+    // experiments with multiple expert QPs. Each expert maps to one channel,
+    // so the caller can validate queue scaling without changing buffer layout.
+    return cap > 0 ? std::min(qps_per_rank, cap) : 1;
 #else
     if (!is_roce) return qps_per_rank;
     // CUDA RoCE shares HCAs across local GPUs; spreading small EP messages
@@ -109,9 +110,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
-    // Optional runtime override for the CUDA/MACA RoCE active-QP count.
+    // Optional runtime override for the active-QP count.
     active_qps_cap_ = 0;
-#ifndef MOONCAKE_EP_USE_MUSA
     if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
         char* end = nullptr;
         long v = std::strtol(env, &end, 10);
@@ -123,12 +123,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                          << env << "'";
         }
     }
-    LOG(INFO) << "[EP] RoCE active QPs/rank override = "
+    LOG(INFO) << "[EP] active QPs/rank = "
               << (active_qps_cap_ > 0 ? std::to_string(active_qps_cap_)
-                                      : "auto");
-#else
-    LOG(INFO) << "[EP] MUSA active QPs/rank = 1";
-#endif
+                                      : "default");
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -326,6 +323,25 @@ MooncakeEpBuffer::dispatch(
             num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
             active_qps_per_rank);
     };
+#ifdef MOONCAKE_EP_USE_MUSA
+    static thread_local int dispatch_phase_profile_calls = 0;
+    const char* dispatch_phase_profile_env =
+        std::getenv("MOONCAKE_EP_PROFILE_PHASES");
+    const int dispatch_phase_profile_call = std::getenv("MOONCAKE_EP_PROFILE_PHASE_CALL")
+        ? std::max(1, static_cast<int>(std::strtol(
+              std::getenv("MOONCAKE_EP_PROFILE_PHASE_CALL"), nullptr, 10)))
+        : 1;
+    const bool profile_split_phases =
+        dispatch_phase_profile_env && !return_recv_hook && !graph_capture &&
+        ++dispatch_phase_profile_calls == dispatch_phase_profile_call;
+    cudaEvent_t send_begin = nullptr, send_end = nullptr, recv_end = nullptr;
+    if (profile_split_phases) {
+        CUDA_CHECK(cudaEventCreate(&send_begin));
+        CUDA_CHECK(cudaEventCreate(&send_end));
+        CUDA_CHECK(cudaEventCreate(&recv_end));
+        CUDA_CHECK(cudaEventRecord(send_begin, launch_stream));
+    }
+#endif
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -334,7 +350,15 @@ MooncakeEpBuffer::dispatch(
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
+#ifdef MOONCAKE_EP_USE_MUSA
+        if (profile_split_phases)
+            CUDA_CHECK(cudaEventRecord(send_end, launch_stream));
+#endif
         launcher(LOW_LATENCY_RECV_PHASE);
+#ifdef MOONCAKE_EP_USE_MUSA
+        if (profile_split_phases)
+            CUDA_CHECK(cudaEventRecord(recv_end, launch_stream));
+#endif
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
@@ -352,6 +376,19 @@ MooncakeEpBuffer::dispatch(
     } else if (not return_recv_hook and not graph_capture) {
         stream_wait(compute_stream_raw, launch_stream);
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    if (profile_split_phases) {
+        CUDA_CHECK(cudaEventSynchronize(recv_end));
+        float send_ms = 0.0f, recv_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&send_ms, send_begin, send_end));
+        CUDA_CHECK(cudaEventElapsedTime(&recv_ms, send_end, recv_end));
+        LOG(INFO) << "[EP MUSA profile] dispatch send=" << send_ms * 1000.0f
+                  << " us recv=" << recv_ms * 1000.0f << " us";
+        cudaEventDestroy(send_begin);
+        cudaEventDestroy(send_end);
+        cudaEventDestroy(recv_end);
+    }
+#endif
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
@@ -452,6 +489,25 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
             zero_copy, active_qps_per_rank);
     };
+#ifdef MOONCAKE_EP_USE_MUSA
+    static thread_local int combine_phase_profile_calls = 0;
+    const char* combine_phase_profile_env =
+        std::getenv("MOONCAKE_EP_PROFILE_PHASES");
+    const int combine_phase_profile_call = std::getenv("MOONCAKE_EP_PROFILE_PHASE_CALL")
+        ? std::max(1, static_cast<int>(std::strtol(
+              std::getenv("MOONCAKE_EP_PROFILE_PHASE_CALL"), nullptr, 10)))
+        : 1;
+    const bool profile_split_phases =
+        combine_phase_profile_env && !return_recv_hook && !graph_capture &&
+        ++combine_phase_profile_calls == combine_phase_profile_call;
+    cudaEvent_t send_begin = nullptr, send_end = nullptr, recv_end = nullptr;
+    if (profile_split_phases) {
+        CUDA_CHECK(cudaEventCreate(&send_begin));
+        CUDA_CHECK(cudaEventCreate(&send_end));
+        CUDA_CHECK(cudaEventCreate(&recv_end));
+        CUDA_CHECK(cudaEventRecord(send_begin, launch_stream));
+    }
+#endif
     if (return_recv_hook &&
         (!graph_capture || !macaHostPhaseFenceCoversPeers())) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -460,7 +516,15 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     } else {
 #ifdef MOONCAKE_EP_SPLIT_SEND_RECV
         launcher(LOW_LATENCY_SEND_PHASE);
+#ifdef MOONCAKE_EP_USE_MUSA
+        if (profile_split_phases)
+            CUDA_CHECK(cudaEventRecord(send_end, launch_stream));
+#endif
         launcher(LOW_LATENCY_RECV_PHASE);
+#ifdef MOONCAKE_EP_USE_MUSA
+        if (profile_split_phases)
+            CUDA_CHECK(cudaEventRecord(recv_end, launch_stream));
+#endif
 #else
         launcher(LOW_LATENCY_SEND_PHASE | LOW_LATENCY_RECV_PHASE);
 #endif
@@ -478,6 +542,19 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     } else if (not return_recv_hook and not graph_capture) {
         stream_wait(compute_stream_raw, launch_stream);
     }
+#ifdef MOONCAKE_EP_USE_MUSA
+    if (profile_split_phases) {
+        CUDA_CHECK(cudaEventSynchronize(recv_end));
+        float send_ms = 0.0f, recv_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&send_ms, send_begin, send_end));
+        CUDA_CHECK(cudaEventElapsedTime(&recv_ms, send_end, recv_end));
+        LOG(INFO) << "[EP MUSA profile] combine send=" << send_ms * 1000.0f
+                  << " us recv=" << recv_ms * 1000.0f << " us";
+        cudaEventDestroy(send_begin);
+        cudaEventDestroy(send_end);
+        cudaEventDestroy(recv_end);
+    }
+#endif
 
     // Receiver callback
     std::optional<std::function<void()>> recv_hook = std::nullopt;
