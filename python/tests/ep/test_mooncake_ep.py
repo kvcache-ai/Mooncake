@@ -61,7 +61,7 @@ def test_main(
     hash_value, num_times = 0, 0
     active_ranks = torch.ones((num_tokens,), dtype=torch.int32, device="cuda")
     for return_recv_hook in (False, True):
-        for dispatch_use_fp8 in [False] if _USE_MACA else [False, True]:
+        for dispatch_use_fp8 in [False, True]:
             num_times += 1
             for i in range((num_times % 2) + 1):
                 packed_recv_x, packed_recv_count, handle, event, hook = buffer.dispatch(

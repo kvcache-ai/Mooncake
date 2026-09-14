@@ -404,6 +404,11 @@ class Buffer:
         if use_fp8 is None:
             use_fp8 = not _USE_MACA
 
+        if _USE_MACA:
+            assert not (
+                async_finish and return_recv_hook
+            ), "MACA does not support async_finish and return_recv_hook together"
+
         # MUSA and MACA use split SEND/RECV launches because they do not expose
         # CUDA cooperative-grid synchronization. Only MACA adds a phase fence.
         if _USE_SPLIT_SEND_RECV and async_finish:
@@ -562,6 +567,11 @@ class Buffer:
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
         if zero_copy:
             raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
+
+        if _USE_MACA:
+            assert not (
+                async_finish and return_recv_hook
+            ), "MACA does not support async_finish and return_recv_hook together"
 
         assert x.dim() == 3 and x.is_contiguous()
         assert x.dtype == torch.bfloat16

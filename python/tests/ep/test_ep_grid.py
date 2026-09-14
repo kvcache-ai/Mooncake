@@ -459,7 +459,7 @@ def make_test_name(cfg):
 
 
 def generate_tests():
-    fp8_options = [False] if using_maca_backend() else [False, True]
+    fp8_options = [False, True]
     test_grid = {
         "use_fp8": fp8_options,
         "async_finish": [False, True],
