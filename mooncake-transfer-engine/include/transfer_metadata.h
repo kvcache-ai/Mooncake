@@ -40,6 +40,18 @@ namespace mooncake {
 struct MetadataStoragePlugin;
 struct HandShakePlugin;
 
+// Result of a metadata-backend lookup, distinguishing an authoritative
+// key absence (kNotFound — the master removed the segment key on peer
+// unmount/expiry) from a transient backend failure (kUnavailable — curl
+// timeout, etcd blip, connection drop). syncSegmentCache() advances its
+// invalidation streak only for kNotFound so a metadata-service outage
+// cannot purge the live cache.
+enum class GetResult {
+    kFound,
+    kNotFound,
+    kUnavailable,
+};
+
 #define P2PHANDSHAKE "P2PHANDSHAKE"
 
 class TransferMetadata {
@@ -205,6 +217,16 @@ class TransferMetadata {
 
     ~TransferMetadata();
 
+   protected:
+    // Test-only seam: inject a storage plugin directly, bypassing the
+    // conn-string plugin factory (which LOG(FATAL)s without a real
+    // etcd/redis/http backend) and the P2P handshake daemon. Derived
+    // hardware-free unit tests substitute an in-memory
+    // MetadataStoragePlugin to exercise syncSegmentCache without RDMA/CUDA.
+    explicit TransferMetadata(
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin);
+
+   public:
     std::shared_ptr<SegmentDesc> getSegmentDescByName(
         const std::string &segment_name, bool force_update = false);
 
@@ -216,8 +238,11 @@ class TransferMetadata {
     int updateSegmentDesc(const std::string &segment_name,
                           const SegmentDesc &desc);
 
-    std::shared_ptr<SegmentDesc> getSegmentDesc(
-        const std::string &segment_name);
+    // Fetch a segment descriptor from the metadata backend. When |status|
+    // is non-null it receives the GetResult so the caller (syncSegmentCache)
+    // can distinguish an authoritative key removal from a transient outage.
+    std::shared_ptr<SegmentDesc> getSegmentDesc(const std::string &segment_name,
+                                                GetResult *status = nullptr);
 
     SegmentID getSegmentID(const std::string &segment_name);
 
@@ -269,7 +294,8 @@ class TransferMetadata {
 
    private:
     std::shared_ptr<SegmentDesc> getSegmentDescInternal(
-        const std::string &segment_name, bool force_rpc_update);
+        const std::string &segment_name, bool force_rpc_update,
+        GetResult *status = nullptr);
     int getRpcMetaEntryInternal(const std::string &server_name,
                                 RpcMetaDesc &desc, bool force_update);
     int publishSegmentDesc(const std::string &segment_name,
@@ -295,6 +321,11 @@ class TransferMetadata {
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
+    // Per-REMOTE-segment consecutive fetch-failure streak, guarded by
+    // segment_lock_. Bumped in syncSegmentCache's apply phase when a cached
+    // segment's backend fetch fails; reset to 0 on a successful fetch. Once it
+    // reaches kStaleSegmentFailureThreshold the cached entry is invalidated.
+    std::unordered_map<std::string, int> segment_failure_counts_;
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;

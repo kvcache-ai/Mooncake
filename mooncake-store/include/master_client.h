@@ -1,18 +1,19 @@
 #pragma once
 
+#include <atomic>
 #include <csignal>
 #include <memory>
 #include <string>
 #include <type_traits>
 #include <vector>
 #include <variant>
-#include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
+#include "config/rpc_protocol_config.h"
 #include "config/rpc_timeout_config.h"
 #include "replica.h"
 #include "segment.h"
@@ -62,10 +63,19 @@ inline void ApplyRpcTimeoutOverrides(ClientConfig& client_config,
     }
 }
 
-inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
+    bool ha_enabled = false) {
     RpcClientPool::PoolConfig config;
-    const char* value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (ha_enabled) {
+        // HA monitor and heartbeat loops own the retry schedule. Keep each
+        // attempt bounded so a deleted pod IP that silently drops SYNs cannot
+        // block failover on YLT's default 4 x 30-second retry budget.
+        config.connect_retry_count = 0;
+        config.reconnect_wait_time = std::chrono::milliseconds{0};
+        config.client_config.connect_timeout_duration = std::chrono::seconds{1};
+    }
+    
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
 
@@ -85,10 +95,18 @@ class MasterClient {
                  std::string tenant_id = "default")
         : client_accessor_(GetStoreRpcClientIoContextPool(),
                            detail::MakeMasterRpcClientPoolConfig()),
+          ha_control_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
+          ha_probe_client_accessor_(
+              GetStoreRpcClientIoContextPool(),
+              detail::MakeMasterRpcClientPoolConfig(/*ha_enabled=*/true)),
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
     ~MasterClient();
+
+    void EnableHaConnectionPolicy();
 
     const std::string& tenant_id() const { return tenant_id_.value(); }
 
@@ -683,6 +701,16 @@ class MasterClient {
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
         Args&&... args);
 
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_with_pool(
+        RpcClientPool& client_accessor, Args&&... args);
+
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode>
+    invoke_rpc_with_client_pool(
+        const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+        Args&&... args);
+
     /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -697,6 +725,8 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     RpcClientPool client_accessor_;
+    RpcClientPool ha_control_client_accessor_;
+    RpcClientPool ha_probe_client_accessor_;
 
     // The client identification.
     const UUID client_id_;
@@ -710,6 +740,7 @@ class MasterClient {
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
+    std::atomic<bool> ha_connection_policy_enabled_{false};
 };
 
 }  // namespace mooncake

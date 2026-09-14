@@ -147,6 +147,17 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
 
+    // Read only from the supplied snapshot. Never re-query a key or renew a
+    // lease: an expired snapshot fails with LEASE_EXPIRED.
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache);
+
     /**
      * @brief Batch query object placement/lease metadata for later read reuse
      * @param keys Vector of keys to query
@@ -634,7 +645,8 @@ class RealClient : public PyClient {
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
-        const QueryResultCache *query_result_cache = nullptr);
+        const QueryResultCache *query_result_cache = nullptr,
+        bool allow_query_refresh = true);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -654,7 +666,8 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
-        const QueryResultCache *query_result_cache = nullptr);
+        const QueryResultCache *query_result_cache = nullptr,
+        bool allow_query_refresh = true);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,

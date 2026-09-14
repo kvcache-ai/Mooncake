@@ -85,6 +85,7 @@ jobs:
             *) echo "::error::Unsupported architecture: $BUILD_ARCHITECTURE"; exit 1 ;;
           esac
           [ "$BUILD_VARIANT" = cuda13 ] && arch_list+=';10.3'
+          cmake_args+=' -DENABLE_KV_EVENTS=ON'
           {
             echo "VARIANT_FLAG=$variant_flag"
             echo "TORCH_CUDA_ARCH_LIST=$arch_list"

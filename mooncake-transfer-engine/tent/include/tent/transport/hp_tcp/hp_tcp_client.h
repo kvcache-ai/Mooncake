@@ -34,6 +34,7 @@ class HighPerformanceTcpClient {
         uint64_t connect_timeout_ms{2000};
         uint64_t progress_timeout_ms{30000};
         size_t connections_per_peer{4};
+        uint64_t idle_connection_timeout_ms{60000};
     };
 
     struct Operation {

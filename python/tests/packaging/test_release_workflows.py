@@ -65,6 +65,7 @@ def test_standard_release_profiles(tmp_path, architecture, variant):
     )
     assert defines["USE_HTTP"] == "ON"
     assert defines["ENABLE_SCCACHE"] == "ON"
+    assert defines["ENABLE_KV_EVENTS"] == "ON"
     assert (
         profile["VARIANT_FLAG"]
         == {"cuda": "", "cuda13": "CU13_BUILD", "non-cuda": "NON_CUDA_BUILD"}[variant]

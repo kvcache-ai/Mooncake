@@ -7,6 +7,10 @@ store:
   - changed-files:
     - any-glob-to-any-file: 'mooncake-store/**/*'
 
+Mooncake Conductor:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-conductor/**/*'
+
 Transfer Engine:
   - changed-files:
     - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'

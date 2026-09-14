@@ -184,6 +184,8 @@ MemoryEvictAction EvictMemory(double target_ratio) {
 
 DfsEvictAction EvictDfs() { return {}; }
 
+TenantEvictAction EvictTenants() { return {}; }
+
 ObjectSpec<> Object(std::string key) { return ObjectSpec<>(std::move(key)); }
 
 ObjectsSpec<> Objects(size_t begin, size_t end) {
@@ -1115,6 +1117,14 @@ MasterScenario& MasterScenario::When(DfsEvictAction) {
         return *this;
     }
     service_->RunDfsEvictionForTesting();
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(TenantEvictAction) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    service_->RunTenantEvictForTesting();
     return *this;
 }
 

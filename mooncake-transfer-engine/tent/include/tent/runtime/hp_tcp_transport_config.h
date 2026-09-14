@@ -24,6 +24,8 @@ struct HighPerformanceTcpParams {
     uint64_t max_transfer_bytes{1ULL << 30};
     uint64_t connect_timeout_ms{2000};
     uint64_t progress_timeout_ms{30000};
+    // Release pooled sockets only when the client has no work on the lane.
+    uint64_t idle_connection_timeout_ms{60000};
 };
 
 struct HpTcpTransportConfig {
