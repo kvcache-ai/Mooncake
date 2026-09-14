@@ -108,6 +108,9 @@ Status ControlClient::bootstrapUb(const std::string& server_addr,
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    // Check before addition/allocation or reading the caller's source buffer.
+    if (length > kTcpMaxWriteBytes)
+        return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
     std::string response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     std::string request;
@@ -136,6 +139,8 @@ Status ControlClient::sendData(const std::string& server_addr,
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    if (length > kTcpMaxReadBytes)
+        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
@@ -506,12 +511,17 @@ void ControlService::onSendData(const std::string_view& request,
     auto length = le64toh(desc->length);
 
     // Validate request size to prevent buffer over-read
-    if (request.size() < sizeof(XferDataDesc) + length) {
+    if (length > kTcpMaxWriteBytes ||
+        length > request.size() - sizeof(XferDataDesc)) {
         response = "SendData failed: invalid request size";
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadWrite) {
+            response = "SendData failed: remote write permission denied";
+            return;
+        }
         auto status =
             Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
         if (!status.ok()) {
@@ -546,13 +556,17 @@ void ControlService::onRecvData(const std::string_view& request,
     };
 
     // Validate length to prevent DoS via excessive memory allocation
-    constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
-    if (length > kMaxTransferSize) {
+    if (length > kTcpMaxReadBytes) {
         fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadOnly &&
+            buffer->permission != kGlobalReadWrite) {
+            fail("RecvData failed: remote read permission denied");
+            return;
+        }
         auto& loader = Platform::getLoader();
         if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
             // assign() skips the resize() zero-fill pass.

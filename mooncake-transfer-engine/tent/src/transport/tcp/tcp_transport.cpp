@@ -175,6 +175,8 @@ Status TcpTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = task.status_word.load(std::memory_order_acquire);
     status.transferred_bytes =
         task.transferred_bytes.load(std::memory_order_acquire);
+    if (status.s == TransferStatusEnum::FAILED && task.non_replayable_failure)
+        return Status::RpcServiceError("TCP WRITE outcome is unknown" LOC_MARK);
     return Status::OK();
 }
 
@@ -189,18 +191,35 @@ Status TcpTransport::removeMemoryBuffer(BufferDesc &desc) {
 }
 
 void TcpTransport::startTransfer(TcpTask *task) {
-    if (task->request.target_id == LOCAL_SEGMENT_ID &&
-        IsLoopbackEndpoint(local_segment_name_)) {
-        LOG_FIRST_N(WARNING, 1)
-            << "TCP transfer targets LOCAL_SEGMENT_ID on loopback endpoint "
-            << local_segment_name_
-            << ". When running multiple store instances on the same host with "
-               "MC_STORE_MEMCPY=0, TCP local transfers will fail. Enable "
-               "MC_STORE_MEMCPY or SHM, or use a non-loopback address.";
+    // Terminal publication allows freeBatch() to destroy task immediately.
+    // The worker must own the callback and keep no task accesses after it.
+    auto notify_progress = std::move(task->notify_progress);
+    const auto progress_batch_id = task->progress_batch_id;
+    bool completed = false;
+    try {
+        if (task->request.target_id == LOCAL_SEGMENT_ID &&
+            IsLoopbackEndpoint(local_segment_name_)) {
+            LOG_FIRST_N(WARNING, 1)
+                << "TCP transfer targets LOCAL_SEGMENT_ID on loopback endpoint "
+                << local_segment_name_
+                << ". When running multiple store instances on the same host "
+                   "with "
+                   "MC_STORE_MEMCPY=0, TCP local transfers will fail. Enable "
+                   "MC_STORE_MEMCPY or SHM, or use a non-loopback address.";
+        }
+        auto status = doTransferWithRetry(task);
+        completed = status.ok();
+        if (!completed) {
+            LOG(WARNING) << "TCP transfer failed: " << status.ToString();
+        }
+    } catch (const std::exception &error) {
+        // enqueue() stores exceptions in a future which the submit path does
+        // not consume. Convert failures here while task is still owned.
+        LOG(WARNING) << "TCP worker exception: " << error.what();
+    } catch (...) {
+        LOG(WARNING) << "TCP worker exception: unknown exception";
     }
-
-    auto status = doTransferWithRetry(task);
-    if (status.ok()) {
+    if (completed) {
         // Store bytes before status: a reader who acquires COMPLETED will
         // also see the final transferred_bytes value.
         task->transferred_bytes.store(task->request.length,
@@ -208,12 +227,10 @@ void TcpTransport::startTransfer(TcpTask *task) {
         task->status_word.store(TransferStatusEnum::COMPLETED,
                                 std::memory_order_release);
     } else {
-        LOG(WARNING) << "TCP transfer failed after " << params_.max_retry_count
-                     << " retries: " << status.ToString();
         task->status_word.store(TransferStatusEnum::FAILED,
                                 std::memory_order_release);
     }
-    if (task->notify_progress) task->notify_progress(task->progress_batch_id);
+    if (notify_progress) notify_progress(progress_batch_id);
 }
 
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {
@@ -260,13 +277,22 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         LOG(WARNING) << "TCP transfer attempt " << attempt
                      << " failed: " << status.ToString();
 
+        if (task->request.opcode == Request::WRITE &&
+            status.IsRpcServiceError() && !status.IsRpcConnectionError()) {
+            task->non_replayable_failure = true;
+            return status;
+        }
+
         if (!status.IsRpcServiceError() && !status.IsInternalError()) {
             return status;
         }
 
-        // Peer may have restarted with a new address; re-resolve before retry
-        if (status.IsRpcServiceError()) {
-            rpc_server_addr.clear();
+        // Only a pre-send connection failure permits an endpoint refresh
+        // followed by automatic WRITE replay.
+        if (status.IsRpcConnectionError()) {
+            CHECK_STATUS(metadata_->segmentManager().invalidateRemote(
+                task->request.target_id));
+            if (attempt == params_.max_retry_count) break;
             auto resolve = findRemoteSegment(
                 task->request.target_offset, task->request.length,
                 task->request.target_id, rpc_server_addr);

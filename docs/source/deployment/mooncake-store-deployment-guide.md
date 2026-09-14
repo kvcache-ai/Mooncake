@@ -262,25 +262,45 @@ HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
 - The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+- The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
+- `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
-For snapshot-based standby bootstrap, also configure:
+For legacy catalog snapshot-based standby bootstrap, configure:
 
 - `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
 - `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
 - `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
 
+For the new batch OpLog snapshot path, configure:
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+enable_oplog: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
+snapshot_object_store_type: "local"
+```
+
+The new path stores immutable artifacts below a cluster-specific batch OpLog
+snapshot root. It restores `latest`, then `fallback`, then a proven complete
+OpLog and replays only the suffix after the snapshot cursor. It remains
+non-serving if recovery cannot prove a complete state.
+
 ### Standby Bootstrap
 
 When a Standby starts, it follows this sequence:
 
-1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
-   - Load the latest snapshot from the configured catalog and object store.
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true` for legacy catalog snapshots, or `enable_oplog_snapshot=true` for batch OpLog snapshots):
+   - Legacy mode loads the latest snapshot from the configured catalog and object store. Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
    - Rebuild object metadata and segment state from the snapshot baseline.
 2. **OpLog Catch-up**:
    - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
@@ -322,9 +342,10 @@ cluster_id: "mooncake_cluster"
 enable_oplog: true
 oplog_poll_interval_ms: 1000
 oplog_batch_max_entries: 1024
-enable_snapshot: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
-snapshot_catalog_store_type: "embedded"
 rpc_port: 50051
 ```
 
@@ -338,9 +359,10 @@ cluster_id: "mooncake_cluster"
 enable_oplog: true
 oplog_poll_interval_ms: 1000
 oplog_batch_max_entries: 1024
-enable_snapshot_restore: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
-snapshot_catalog_store_type: "embedded"
 rpc_port: 50052
 ```
 
@@ -624,6 +646,8 @@ mooncake_master \
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
+| `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
@@ -814,7 +838,7 @@ is required.
 | `MOONCAKE_ENABLE_DFS` | Master | `false` | Enable master-side DFS allocation. `MOONCAKE_DFS_ENABLED` is accepted as a compatibility fallback. |
 | `MOONCAKE_DFS_ROOT_DIR` | Master and clients | `/mnt/3fs/mooncake` | Absolute shared shard root; use the same path string in every process. Falls back to `MOONCAKE_DISTRIBUTED_ROOT_DIR`. |
 | `MOONCAKE_DFS_FS_ADAPTER` | Master and clients | `hf3fs` | Filesystem adapter: `hf3fs` or `posix`. Falls back to `MOONCAKE_DISTRIBUTED_FS_TYPE`. |
-| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Number of DFS shard files. |
+| `MOONCAKE_DFS_SHARD_COUNT` | Master and clients | `64` | Initial shard count. The master also discovers existing contiguous shard files at startup; running clients open added shards on demand. |
 | `MOONCAKE_DFS_SHARD_CAPACITY` | Master and clients | `4294967296` (4 GiB) | Logical file capacity of each shard in bytes. Each object is allocated wholly within one shard. |
 | `MOONCAKE_DFS_ALIGNMENT` | Master and clients | `4096` | Allocation alignment in bytes; must be a power of two and divide the shard capacity. |
 | `MOONCAKE_DFS_SINGLE_TENANT` | Master and clients | `true` | Currently must remain `true`. |
@@ -823,6 +847,51 @@ is required.
 | `MOONCAKE_DFS_EVICTION_LOW_WATERMARK` | Master | `0.7` | Usage ratio targeted by an eviction cycle. |
 | `MOONCAKE_DFS_DEFERRED_FREE_SECONDS` | Master | `30` | Delay before a freed shard range may be reused. |
 | `MOONCAKE_DFS_EVICTION_CHECK_INTERVAL` | Master | `5` | Eviction check interval in seconds. |
+
+#### Growing DFS capacity online
+
+The default shard allocator supports adding shard files while the master and
+clients remain running. Use the master's existing HTTP admin listener:
+
+```bash
+curl http://127.0.0.1:9003/api/v1/dfs/shard_count
+curl -X PUT http://127.0.0.1:9003/api/v1/dfs/shard_count \
+  -H 'Content-Type: application/json' -d '{"shard_count": 128}'
+```
+
+Both requests return the current count, for example
+`{"success":true,"shard_count":128}`. A PUT sets the desired **total** count,
+not the number to add. Repeating the current count succeeds without changing
+anything; shrinking, non-integer values, and non-positive counts return HTTP
+400. DFS-disabled masters and concurrent expansion requests return HTTP 409;
+unavailable or standby services return HTTP 503. Filesystem preparation runs
+off the HTTP I/O threads, so health checks and other administration remain
+available while an expansion is pending.
+
+Upgrade the master and every DFS client to a version supporting online shard
+expansion before increasing capacity. An already running upgraded client can
+open a new shard from its descriptor even when its initial
+`MOONCAKE_DFS_SHARD_COUNT` is smaller. Older binaries reject those descriptors.
+Every process must still use the same shared root, adapter, shard capacity, and
+alignment. Provision sufficient backing filesystem space before expanding;
+changing the root or per-shard capacity online is unsupported.
+
+Only one active master may manage a DFS root. Do not create, rename, truncate,
+or remove its shard files outside that master. Clients do not create shard
+files during initialization; they open them only from published descriptors.
+
+The allocator prepares new files and allocation state before publishing the
+expanded shard set. Existing paths and allocated ranges remain unchanged,
+including when the shard index gains another decimal digit. Allocation, reads,
+writes, deferred frees, and eviction continue to use ready shards. A failed
+expansion leaves the published shard count unchanged.
+
+On startup, the master discovers the contiguous existing shard layout and uses
+at least the configured count. Duplicate indices, missing intermediate shards,
+and unexpected file sizes are rejected rather than silently changing the
+layout. This preserves **capacity**, not cached key metadata or allocation
+ownership: DFS allocator recovery, snapshots, and HA remain subject to the
+limitations below. Do not treat online expansion as a data durability guarantee.
 
 #### Requesting and accessing DFS replicas
 
@@ -841,10 +910,11 @@ store.put("key", b"value", config)
 with at least one memory replica (`replica_num >= 1`), so DFS-only placement is
 not supported.
 
-Each key hashes to exactly one DFS shard. Allocation does not fall back to a
-different shard, so a request may return `NO_AVAILABLE_HANDLE` when its selected
-shard is full even if other shards have free space. A DFS object is never
-striped across shards. The selected shard must have room for the object rounded
+Allocation first tries the key's hash-selected DFS shard, then tries other
+ready shards if that shard has no suitable extent. This lets new shards accept
+writes even when older shards are full. `NO_AVAILABLE_HANDLE` means no ready
+shard could satisfy the allocation. A DFS object is never striped across shards.
+The selected shard must have room for the object rounded
 up to `MOONCAKE_DFS_ALIGNMENT`, plus up to one alignment unit of allocator
 padding (`MOONCAKE_DFS_ALIGNMENT - 1` bytes); usable object capacity is
 therefore lower than the shard file's
@@ -876,9 +946,8 @@ reads for that descriptor.
   their replication configuration does not expose `dfs_replica_num`, and their
   setup API cannot initialize the distributed `FileStorage` backend. Use the
   native C++ or Python/RealClient API.
-- A DFS object must fit in its key-selected shard after alignment and allocator
-  padding; objects are not striped and allocation does not fall back to another
-  shard.
+- A DFS object must fit in a single shard after alignment and allocator
+  padding; objects are not striped across shards.
 - DFS allocator state is currently in memory. A master restart or HA leader
   failover does not reconstruct existing DFS allocations, so DFS cannot provide
   continuity across those events.
@@ -1139,7 +1208,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
 | `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
-| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
+| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` initially; `1000` during HA runtime | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. HA clients retain the normal retry budget during initial discovery and configuration, then use one bounded attempt per runtime reconnect because their monitor and heartbeat loops own the retry schedule. An explicit value overrides both defaults. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |

@@ -66,6 +66,23 @@ when it exceeds the configured limit.
 All four axes are resolved by one logical-box plan, rather than by model-wide
 per-axis conversion passes.
 
+### Supported axes and Store API selection
+
+The current `ParallelTopology` and `ParallelRank` types contain TP, PP, EP, and
+DP only. CP (context parallelism) is not a supported axis, and `SplitAxis`
+accepts only TP and EP. N-D logical planning therefore does not imply support
+for arbitrary named parallel strategies or CP-aware KV-cache layouts.
+
+Store callers use the manifest-backed weight snapshot lifecycle for these
+multi-axis weight placements. Legacy `*_with_tp` methods remain available for
+ordinary TP tensor objects, but there are no corresponding CP/DP/EP/PP method
+factories or `*_with_config` tensor methods. The former public
+`*_with_parallelism` family was removed by
+PR [#3772](https://github.com/kvcache-ai/Mooncake/pull/3772).
+See {ref}`Choosing a Parallel Tensor IO API <choosing-a-parallel-tensor-io-api>`
+for entry points and the distinction between parallel topology and Store
+replication configuration.
+
 ## Validation
 
 Placement construction validates the complete participant set, tensor
