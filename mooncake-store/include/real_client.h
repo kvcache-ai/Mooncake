@@ -156,7 +156,7 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
-        const QueryResultCache &query_result_cache);
+        const QueryResultCache &query_result_cache) override;
 
     /**
      * @brief Batch query object placement/lease metadata for later read reuse

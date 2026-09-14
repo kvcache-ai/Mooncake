@@ -1,6 +1,7 @@
 #include "engram/engram_store.h"
 
 #include <cstring>
+#include <chrono>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -10,6 +11,10 @@
 
 namespace mooncake {
 namespace engram {
+
+struct EngramStore::QueryCacheEntry {
+    mooncake::PyClient::RangedReadSnapshot snapshot;
+};
 
 EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
                          std::shared_ptr<PyClient> store)
@@ -47,6 +52,33 @@ const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
                                     std::to_string(layer_id));
     }
     return it->second;
+}
+
+std::shared_ptr<const EngramStore::QueryCacheEntry>
+EngramStore::get_query_cache(int layer_id,
+                             const std::vector<std::string>& keys) const {
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(query_cache_mutex_);
+        auto it = query_cache_.find(layer_id);
+        if (it != query_cache_.end() && it->second &&
+            it->second->snapshot.reusable(now)) {
+            return it->second;
+        }
+    }
+
+    auto entry = std::make_shared<QueryCacheEntry>();
+    entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
+    if (!entry->snapshot.reusable(now)) return nullptr;
+
+    std::lock_guard<std::mutex> lock(query_cache_mutex_);
+    query_cache_[layer_id] = entry;
+    return entry;
+}
+
+void EngramStore::invalidate_query_cache(int layer_id) const {
+    std::lock_guard<std::mutex> lock(query_cache_mutex_);
+    query_cache_.erase(layer_id);
 }
 
 int EngramStore::bind_local(int layer_id,
@@ -164,19 +196,12 @@ int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
         }
     }
 
-    mooncake::PyClient::QueryResultCache query_result_cache;
-    auto query_results = store_->batch_query(embed_keys);
-    if (query_results.size() != embed_keys.size()) {
-        return fail_lookup();
-    }
-    query_result_cache.reserve(embed_keys.size());
-    for (size_t i = 0; i < embed_keys.size(); ++i) {
-        query_result_cache.emplace(embed_keys[i], query_results[i]);
-    }
+    auto query_cache = get_query_cache(layer_id, embed_keys);
+    if (!query_cache) return fail_lookup();
 
-    auto results = store_->get_into_ranges(buffers, all_keys, all_dst_offsets,
-                                           all_src_offsets, all_sizes,
-                                           &query_result_cache);
+    auto results = store_->get_into_ranges_from_snapshot(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        query_cache->snapshot);
     if (results.size() != 1 ||
         results[0].size() != static_cast<size_t>(num_heads)) {
         return fail_lookup();
@@ -242,6 +267,7 @@ int EngramStore::remove_from_store(int layer_id, bool force) {
         }
     }
 
+    if (first_error == 0 && removed > 0) invalidate_query_cache(layer_id);
     return first_error != 0 ? first_error : removed;
 }
 
@@ -346,6 +372,7 @@ int EngramStore::populate(int layer_id,
         return -1;
     }
 
+    invalidate_query_cache(layer_id);
     return 0;
 }
 
