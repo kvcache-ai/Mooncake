@@ -679,7 +679,7 @@ OffsetAllocatorSnapshot::ValidateUsedNodes(
 tl::expected<uint32_t, std::string> OffsetAllocatorSnapshot::ValidateBins(
     std::vector<NodeState>& state) const {
     constexpr uint32_t kUnused = __Allocator::Node::unused;
-    uint8_t expected_used_bins[NUM_TOP_BINS] = {};
+    uint16_t expected_used_bins[NUM_TOP_BINS] = {};
     uint32_t expected_used_bins_top = 0;
     uint32_t bin_nodes = 0;
     uint32_t free_storage = 0;
@@ -689,8 +689,8 @@ tl::expected<uint32_t, std::string> OffsetAllocatorSnapshot::ValidateBins(
         uint32_t node_index = layout->m_binIndices[bin];
         if (node_index == kUnused) continue;
         const uint32_t top_bin = bin >> TOP_BINS_INDEX_SHIFT;
-        expected_used_bins[top_bin] |= uint8_t{1}
-                                       << (bin & LEAF_BINS_INDEX_MASK);
+        expected_used_bins[top_bin] |=
+            uint16_t{1} << (bin & LEAF_BINS_INDEX_MASK);
         expected_used_bins_top |= uint32_t{1} << top_bin;
         uint32_t previous = kUnused;
         while (node_index != kUnused) {

@@ -1,13 +1,14 @@
 #include "allocator.h"
+#include "common/zstd_util.h"
 #include "offset_allocator/offset_allocator.h"
 #include "mutex.h"
 #include "serialize/serializer.h"
 #include "serializer.h"
 #include "types.h"
-#include "utils/zstd_util.h"
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <functional>
@@ -2410,15 +2411,28 @@ TEST_F(OffsetAllocatorTest, SnapshotValidationAcceptsRoundingAndBoundsUsage) {
         EXPECT_EQ((*restored)->get_metrics().allocated_num_, 1U);
 
 #ifndef OFFSET_ALLOCATOR_NOT_ROUND_UP
-        // A 4097-byte request consumes 4608 bytes. Both bin rounding and the
-        // large allocator's unit shift allow [4097, 4608], not arbitrary values
-        // below the occupied size. Exact original requests cannot be recovered
-        // from the layout alone.
-        for (const uint64_t requested : {4096U, 4097U, 4608U, 4609U}) {
+        const auto candidate_snapshot = allocator->CaptureSnapshot();
+        const uint64_t unit_size =
+            uint64_t{1} << candidate_snapshot.multiplier_bits;
+        const uint32_t requested_units =
+            static_cast<uint32_t>((4097 + unit_size - 1) / unit_size);
+        const auto rounded =
+            std::lower_bound(bin_sizes.begin(), bin_sizes.end(), requested_units);
+        ASSERT_NE(rounded, bin_sizes.end());
+        ASSERT_NE(rounded, bin_sizes.begin());
+        const uint64_t min_requested =
+            (static_cast<uint64_t>(*(rounded - 1))
+             << candidate_snapshot.multiplier_bits) +
+            1;
+        const uint64_t max_requested =
+            static_cast<uint64_t>(*rounded)
+            << candidate_snapshot.multiplier_bits;
+        for (const uint64_t requested : {min_requested - 1, min_requested,
+                                         max_requested, max_requested + 1}) {
             auto candidate = allocator->CaptureSnapshot();
             candidate.allocated_size = requested;
             EXPECT_EQ(candidate.Validate().has_value(),
-                      requested >= 4097 && requested <= 4608);
+                      requested >= min_requested && requested <= max_requested);
         }
 #endif
     }
