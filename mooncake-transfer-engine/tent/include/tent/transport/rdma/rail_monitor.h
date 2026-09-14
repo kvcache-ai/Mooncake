@@ -51,11 +51,17 @@ class RailMonitor {
     RailMonitor &operator=(const RailMonitor &) = delete;
 
    public:
+    // The shared topology references keep segment snapshots alive while rail
+    // failure handling uses their derived mappings.
     // rail_topo_json: optional JSON string describing rail topology.
     // conf: optional Config pointer; when non-null, overrides the default
     //   error_threshold / error_window_secs / cooldown_secs values via
     //   kCfgErrorThreshold / kCfgErrorWindowSecs / kCfgCooldownSecs.
-    Status load(const Topology *local, const Topology *remote,
+    // A later call with the same NIC/memory layout only refreshes the pins
+    // (segment COW snapshots); it does not rebuild rail_states_ or reprint
+    // the config banner.
+    Status load(std::shared_ptr<const Topology> local,
+                std::shared_ptr<const Topology> remote,
                 const std::string &rail_topo_json = "",
                 const Config *conf = nullptr);
 
@@ -69,7 +75,9 @@ class RailMonitor {
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
-    const Topology *remote() { return remote_; }
+    const Topology *local() const { return local_.get(); }
+
+    const Topology *remote() const { return remote_.get(); }
 
    private:
     Status loadFromJson(const std::string &rail_topo_json);
@@ -80,8 +88,8 @@ class RailMonitor {
 
    private:
     bool ready_{false};
-    const Topology *local_{nullptr};
-    const Topology *remote_{nullptr};
+    std::shared_ptr<const Topology> local_;
+    std::shared_ptr<const Topology> remote_;
 
     struct PairHash {
         std::size_t operator()(const std::pair<int, int> &p) const noexcept {

@@ -232,6 +232,9 @@ TEST(BatchOpLogSnapshotTypesTest, RejectsInvalidManifestJson) {
 }
 
 TEST(BatchOpLogSnapshotTypesTest, BuildsControlAndArtifactKeys) {
+    EXPECT_EQ(BuildBatchOpLogSnapshotRoot("cluster-a/"),
+              "mooncake_master_snapshot/cluster-a");
+    EXPECT_TRUE(BuildBatchOpLogSnapshotRoot("../cluster").empty());
     EXPECT_EQ(BuildBatchOpLogSnapshotMaintenanceKey("cluster-a/"),
               "/oplog/cluster-a/snapshot/maintenance");
     EXPECT_EQ(BuildBatchOpLogSnapshotLatestKey("cluster-a"),
@@ -244,6 +247,8 @@ TEST(BatchOpLogSnapshotTypesTest, BuildsControlAndArtifactKeys) {
 
     const auto snapshot_id = BuildBatchOpLogSnapshotId(9, 12345);
     ASSERT_EQ(snapshot_id, "9-12345");
+    EXPECT_EQ(BuildBatchOpLogSnapshotArtifactPrefix("snapshots/", snapshot_id),
+              "snapshots/batch-oplog/9-12345/");
     EXPECT_EQ(BuildBatchOpLogSnapshotDescriptorKey("snapshots", snapshot_id),
               "snapshots/batch-oplog/9-12345/descriptor.json");
     EXPECT_EQ(BuildBatchOpLogSnapshotManifestKey("snapshots/", snapshot_id),

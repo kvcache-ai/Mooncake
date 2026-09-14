@@ -17,7 +17,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include <ylt/util/tl/expected.hpp>
-#include "utils.h"
+#include "common/network.h"
 
 namespace mooncake {
 namespace testing {
@@ -222,6 +222,7 @@ class InProcMaster {
         return std::string("http://127.0.0.1:") +
                std::to_string(http_metrics_port_);
     }
+    std::shared_ptr<WrappedMasterService> service() const { return wrapped_; }
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;

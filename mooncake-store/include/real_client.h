@@ -5,6 +5,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
+#include <functional>
 #include <map>
 #include <memory>
 #include <shared_mutex>
@@ -14,12 +15,13 @@
 #include <unordered_set>
 #include <vector>
 
-#include "pyclient.h"
-#include "client_service.h"
+#include "common/client_buffer_allocation.h"
 #include "client_buffer.h"
+#include "client_service.h"
 #include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
-#include "utils.h"
+#include "common/network.h"
+#include "pyclient.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -145,6 +147,17 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) override;
 
+    // Read only from the supplied snapshot. Never re-query a key or renew a
+    // lease: an expired snapshot fails with LEASE_EXPIRED.
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache);
+
     /**
      * @brief Batch query object placement/lease metadata for later read reuse
      * @param keys Vector of keys to query
@@ -245,6 +258,11 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+    std::vector<int> batch_put_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, bool stage_nonlocal);
 
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
@@ -286,11 +304,21 @@ class RealClient : public PyClient {
 
     int upsert_from(const std::string &key, void *buffer, size_t size,
                     const ReplicateConfig &config = ReplicateConfig{});
-
     std::vector<int> batch_upsert_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, bool stage_nonlocal);
 
     int upsert_parts(const std::string &key,
                      std::vector<std::span<const char>> values,
@@ -483,9 +511,22 @@ class RealClient : public PyClient {
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config, const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_dummy_helper(
@@ -503,6 +544,18 @@ class RealClient : public PyClient {
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
         const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_staged_shm_helper(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
         const std::vector<std::vector<std::string>> &all_keys,
         const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
@@ -592,7 +645,8 @@ class RealClient : public PyClient {
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,
-        const QueryResultCache *query_result_cache = nullptr);
+        const QueryResultCache *query_result_cache = nullptr,
+        bool allow_query_refresh = true);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -612,11 +666,25 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
-        const QueryResultCache *query_result_cache = nullptr);
+        const QueryResultCache *query_result_cache = nullptr,
+        bool allow_query_refresh = true);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+
+    using LocalDiskOffloadObjects =
+        std::unordered_map<std::string, std::vector<Slice>>;
+    using LocalDiskOffloadReader = std::function<tl::expected<void, ErrorCode>(
+        const std::string &, LocalDiskOffloadObjects &)>;
+
+    // Dependency-injected overload used to verify routing decisions without
+    // requiring multiple live SSD offload servers.
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const std::vector<tl::expected<QueryResult, ErrorCode>> &query_results,
+        const LocalDiskOffloadReader &local_disk_reader);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -638,11 +706,18 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> upsert_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
-
     std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{},
+        bool stage_nonlocal = false);
 
     tl::expected<void, ErrorCode> upsert_parts_internal(
         const std::string &key, std::vector<std::span<const char>> values,
@@ -667,7 +742,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config = ReplicateConfig{});
+        const ReplicateConfig &config = ReplicateConfig{},
+        bool stage_nonlocal = false);
 
     tl::expected<void, ErrorCode> put_parts_internal(
         const std::string &key,
@@ -765,9 +841,9 @@ class RealClient : public PyClient {
 
     /**
      * @brief Mount a shared memory file region and return segment ids.
-     *        If size > max_mr_size, it will be split into multiple chunks
-     *        and mounted separately. RealClient will open(path) + mmap
-     *        internally for each chunk.
+     *        Protocols with a registration limit split larger regions into
+     *        multiple chunks. RealClient will open(path) + mmap internally
+     *        for each chunk.
      */
     int mountSegment(const std::string &path, size_t offset, size_t size,
                      const std::string &protocol, const std::string &location,
@@ -782,7 +858,7 @@ class RealClient : public PyClient {
 
     /**
      * @brief Allocate memory internally and mount segments to master.
-     *        If size > max_mr_size, it will be split into multiple chunks.
+     *        Protocols with a registration limit split larger regions.
      *        Memory is allocated via allocate_buffer_allocator_memory.
      *        The actual allocated size (aligned up to Slab::kSize) is written
      *        to out_allocated_size if non-null.
@@ -799,6 +875,14 @@ class RealClient : public PyClient {
     int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
                               uint64_t grace_period_seconds = 0);
 
+    /**
+     * @brief Deregister this store's disk tier from the master and wait out a
+     * grace period, so a planned shutdown stops being advertised as an owner
+     * of offloaded keys before it stops serving them. No-op when SSD offload
+     * is not enabled on this client.
+     */
+    int drainLocalDiskSegment(uint64_t grace_period_seconds = 0);
+
     struct MountedSegmentRecord {
         void *mmap_base = nullptr;
         size_t size = 0;
@@ -813,6 +897,11 @@ class RealClient : public PyClient {
     };
 
     void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_write_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id, bool is_upsert);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -958,6 +1047,19 @@ class RealClient : public PyClient {
     bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
                                         uint64_t dummy_addr, size_t dst_offset,
                                         size_t size, void *&out_real) const;
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_shm_helper_impl(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &dummy_buffer_sizes,
+        const std::vector<size_t> *buffer_capacities,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,

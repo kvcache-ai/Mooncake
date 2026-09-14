@@ -28,7 +28,10 @@
 #endif
 
 #include "transfer_metadata_plugin.h"
+#include "common.h"
 #include "transport/transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
+#include "transport/shm_transport/shm_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -40,6 +43,34 @@ bool overlapWithRegion(uintptr_t addr, uint64_t length, void* region_addr,
                        uint64_t region_length) {
     return overlap(reinterpret_cast<void*>(addr), length, region_addr,
                    region_length);
+}
+
+Transport* tryInstallShmTransport(MultiTransport* multi_transports,
+                                  std::shared_ptr<Topology> topology) {
+    if (!multi_transports) return nullptr;
+    if (Transport* existing = multi_transports->getTransport("shm")) {
+        return existing;
+    }
+    return multi_transports->installTransport("shm", topology);
+}
+
+int maybeInstallShmTransport(MultiTransport* multi_transports,
+                             std::shared_ptr<Topology> topology) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!multi_transports || !envFlagEnabled("MC_FORCE_SHM")) return 0;
+    Transport* shm = tryInstallShmTransport(multi_transports, topology);
+    if (!shm) {
+        LOG(WARNING) << "MC_FORCE_SHM is set but failed to install SHM "
+                        "transport; continuing without it";
+        return 0;
+    }
+    LOG(INFO) << "SHM transport installed for same-host DRAM copies";
+    return 0;
+#else
+    (void)multi_transports;
+    (void)topology;
+    return 0;
+#endif
 }
 }  // namespace
 
@@ -223,6 +254,25 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
 #endif
     }
 
+    // MC_FORCE_SHM:
+    // - Without ENABLE_MULTI_PROTOCOL: SHM-only (skip RDMA/TCP), like
+    //   MC_FORCE_TCP.
+    // - With ENABLE_MULTI_PROTOCOL: fall through so auto-discover still
+    //   installs RDMA/TCP, then maybeInstallShmTransport appends SHM.
+#ifndef ENABLE_MULTI_PROTOCOL
+    if (envFlagEnabled("MC_FORCE_SHM")) {
+        Transport* shm_transport =
+            tryInstallShmTransport(multi_transports_.get(), local_topology_);
+        if (!shm_transport) {
+            LOG(ERROR)
+                << "MC_FORCE_SHM is set but failed to install SHM transport";
+            return -1;
+        }
+        LOG(INFO) << "MC_FORCE_SHM is set, using SHM transport only";
+        return 0;
+    }
+#endif
+
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     Transport* ascend_transport =
         multi_transports_->installTransport("ascend", local_topology_);
@@ -326,10 +376,37 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(INFO) << "Using MACA transport";
         }
 
-#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK) || defined(USE_MUSA)
 
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
         const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+#ifdef USE_MUSA
+        const char* gpu_p2p_protocol = "musa";
+        const char* gpu_p2p_name = "MUSA";
+        const bool force_gpu_p2p = force_mnnvl || getenv("MC_FORCE_MUSA");
+#else
+        const char* gpu_p2p_protocol = "nvlink";
+        const char* gpu_p2p_name = "NVLink";
+        const bool force_gpu_p2p = force_mnnvl;
+#endif
+        // The cross-node GPU P2P transport is only constructible when its own
+        // build flag is set, so a build that enables USE_INTRA_NVLINK alone
+        // must keep the RDMA/TCP fallback instead of requesting a protocol
+        // MultiTransport cannot create.
+#if defined(USE_MNNVL) || defined(USE_MUSA)
+        constexpr bool kGpuP2PCompiled = true;
+#else
+        constexpr bool kGpuP2PCompiled = false;
+#endif
+        const bool no_hca = local_topology_->getHcaList().empty();
+        // MC_FORCE_HCA keeps the same meaning as on the non-NVLink path:
+        // install RDMA even when topology discovery found no HCA.
+        const bool force_hca = getenv("MC_FORCE_HCA") != nullptr;
+        if (force_gpu_p2p && !kGpuP2PCompiled) {
+            LOG(WARNING) << gpu_p2p_name
+                         << " transport was requested but is not compiled in, "
+                            "falling back to RDMA/TCP";
+        }
         // Explicit env var overrides take priority over HCA auto-detection
         if (intra_env) {
             Transport* t =
@@ -340,16 +417,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
             Transport* t =
-                multi_transports_->installTransport("nvlink", nullptr);
+                multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
-                LOG(ERROR) << "Failed to install NVLink transport";
+                LOG(ERROR) << "Failed to install " << gpu_p2p_name
+                           << " transport";
                 return -1;
             }
-            LOG(INFO) << "Using cross-node NVLink transport "
-                      << "(MC_FORCE_MNNVL or no HCA detected)";
-        } else {
+            LOG(INFO) << "Using " << gpu_p2p_name << " transport "
+                      << "(forced or no HCA detected)";
+        } else if (!no_hca || force_hca) {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);
             if (!t) {
@@ -357,6 +435,19 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
                 return -1;
             }
             LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
+        } else {
+#ifdef USE_TCP
+            Transport* t = multi_transports_->installTransport("tcp", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install TCP transport";
+                return -1;
+            }
+            LOG(INFO) << "Using TCP transport (no HCA detected)";
+#else
+            LOG(ERROR) << "No HCA detected and neither " << gpu_p2p_name
+                       << " nor TCP transport is compiled in";
+            return -1;
+#endif
         }
 
 #elif !defined(USE_SUNRISE)
@@ -415,6 +506,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
+    maybeInstallShmTransport(multi_transports_.get(), local_topology_);
     return 0;
 }
 
@@ -471,6 +563,33 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
     return 0;
 }
 
+void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+    auto* shm =
+        dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
+    if (!shm) {
+        LOG(ERROR) << "allocateSharedMemory requires ShmTransport "
+                      "(set MC_FORCE_SHM=1 or installTransport(\"shm\"))";
+        return nullptr;
+    }
+    return shm->allocateSharedMemory(length);
+}
+
+int TransferEngineImpl::freeSharedMemory(void* addr) {
+    if (!addr) return ERR_INVALID_ARGUMENT;
+    auto* shm =
+        dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
+    if (!shm) return ERR_INVALID_ARGUMENT;
+    std::string shm_name;
+    if (!shm->getShmName(addr, &shm_name)) return ERR_INVALID_ARGUMENT;
+    int uret = unregisterLocalMemory(addr, true);
+    if (uret && uret != ERR_ADDRESS_NOT_REGISTERED) {
+        LOG(WARNING) << "unregisterLocalMemory failed before freeSharedMemory, "
+                        "ret="
+                     << uret;
+    }
+    return shm->freeSharedMemory(addr);
+}
+
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 device::P2pTransport* TransferEngineImpl::getOrCreateP2pTransport(
@@ -520,16 +639,30 @@ int TransferEngineImpl::sendNotifyByID(
         LOG(ERROR) << "sendNotifyByID: invalid segment ID " << target_id;
         return ERR_METADATA;
     }
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-    return ret;
+    return sendNotifyByName(desc->name, std::move(notify_msg));
 }
 
 int TransferEngineImpl::sendNotifyByName(
     std::string remote_agent, TransferMetadata::NotifyDesc notify_msg) {
+    if (globalConfig().rdma_notify_enabled) {
+        Transport* transport = getTransport("rdma_twosided");
+        if (!transport) transport = getTransport("rdma");
+        auto* rdma_twosided = dynamic_cast<RdmaTwoSidedTransport*>(transport);
+        if (rdma_twosided) {
+            int ret = rdma_twosided->sendRdmaNotify(remote_agent, notify_msg);
+            if (ret == 0) return 0;
+            if (!globalConfig().rdma_notify_oob_fallback) {
+                LOG(ERROR) << "sendNotifyByName: RDMA notify failed for "
+                           << remote_agent << " ret=" << ret
+                           << " (OOB fallback disabled)";
+                return ret;
+            }
+            VLOG(1) << "sendNotifyByName: RDMA notify unavailable for "
+                    << remote_agent << ", falling back to OOB";
+        }
+    }
     Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
-    return ret;
+    return metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
 }
 
 int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {

@@ -626,6 +626,12 @@ class TransferSubmitter {
     bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
                                 const std::vector<Slice>& slices) const;
 
+    void appendMemcpyOperations(const AllocatedBuffer::Descriptor& handle,
+                                const std::vector<Slice>& slices,
+                                TransferRequest::OpCode op_code,
+                                uint64_t buffer_offset,
+                                std::vector<MemcpyOperation>& operations);
+
     /**
      * @brief Submit memcpy operation asynchronously
      */

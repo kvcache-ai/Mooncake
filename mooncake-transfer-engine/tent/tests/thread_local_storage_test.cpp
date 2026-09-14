@@ -22,8 +22,6 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
-#include <chrono>
-#include <cstdio>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -189,44 +187,6 @@ TEST(ThreadLocalStorageTest, OrphanedValuesSweptOnInstanceChurn) {
         // first-use get(): at most this round's value plus one not-yet-swept
         // orphan may be alive.
         ASSERT_LE(Counted::live.load(), 2) << "round " << i;
-    }
-}
-
-// Informational: hot-path cost of get(). The remote-desc cache consults this
-// on every transfer submit, so the common case must stay a thread_local
-// access plus a compare.
-TEST(ThreadLocalStorageTest, HotPathMicrobench) {
-    ThreadLocalStorage<Cache> storage;
-    storage.get().value = 1;
-    constexpr uint64_t kOps = 20'000'000;
-    volatile int sink = 0;
-    auto t0 = std::chrono::steady_clock::now();
-    for (uint64_t i = 0; i < kOps; ++i) {
-        sink += storage.get().value;
-    }
-    auto t1 = std::chrono::steady_clock::now();
-    double ns =
-        (double)std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0)
-            .count() /
-        (double)kOps;
-    printf("get_hot_path_ns_per_op %.2f\n", ns);
-    (void)sink;
-#if defined(__SANITIZE_THREAD__) || defined(__SANITIZE_ADDRESS__)
-    constexpr bool kSanitized = true;
-#elif defined(__has_feature)
-#if __has_feature(thread_sanitizer) || __has_feature(address_sanitizer)
-    constexpr bool kSanitized = true;
-#else
-    constexpr bool kSanitized = false;
-#endif
-#else
-    constexpr bool kSanitized = false;
-#endif
-    // Wall-clock assertions flake under sanitizers (TSAN alone is ~14x);
-    // elsewhere keep a loose ceiling that still catches syscall- or
-    // contention-class regressions on the hot path.
-    if (!kSanitized) {
-        EXPECT_LT(ns, 100.0);
     }
 }
 

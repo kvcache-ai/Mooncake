@@ -77,6 +77,27 @@ static inline std::string getHostname() {
     return hostname;
 }
 
+// True when the variable is set to anything other than 0/false/no/off.
+// Used by MC_FORCE_SHM.
+inline bool envFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (!value || !*value) return false;
+    auto eqIgnoreCase = [](const char *a, const char *b) {
+        for (; *a && *b; ++a, ++b) {
+            unsigned char ca = static_cast<unsigned char>(*a);
+            unsigned char cb = static_cast<unsigned char>(*b);
+            if (ca >= 'A' && ca <= 'Z')
+                ca = static_cast<unsigned char>(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z')
+                cb = static_cast<unsigned char>(cb - 'A' + 'a');
+            if (ca != cb) return false;
+        }
+        return *a == *b;
+    };
+    return !eqIgnoreCase(value, "0") && !eqIgnoreCase(value, "false") &&
+           !eqIgnoreCase(value, "no") && !eqIgnoreCase(value, "off");
+}
+
 // libnuma fills the cache numa_node_to_cpus() reads lazily and without locking,
 // so concurrent first callers each allocate it and all but one are orphaned --
 // a leak LeakSanitizer fails the build on. Worker pools bind every thread at
@@ -143,6 +164,20 @@ static inline std::string getCurrentDateTime() {
     std::ostringstream oss;
     oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
         << std::setw(6) << std::setfill('0') << micros.count();
+    return oss.str();
+}
+
+static inline std::string formatEpochMicroseconds(uint64_t epoch_us) {
+    if (epoch_us == 0) return "legacy(0)";
+
+    const auto seconds = static_cast<std::time_t>(epoch_us / 1000000);
+    const auto micros = epoch_us % 1000000;
+    std::tm local_time{};
+    localtime_r(&seconds, &local_time);
+
+    std::ostringstream oss;
+    oss << std::put_time(&local_time, "%Y-%m-%d %H:%M:%S") << "."
+        << std::setw(6) << std::setfill('0') << micros;
     return oss.str();
 }
 

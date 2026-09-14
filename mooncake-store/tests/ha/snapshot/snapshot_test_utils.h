@@ -22,7 +22,7 @@
 #include "segment.h"
 #include "serialize/serializer.h"
 #include "types.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake::test {
 
@@ -142,7 +142,7 @@ inline void PackDiskReplica(
 inline std::vector<uint8_t> BuildSegmentsPayload() {
     SegmentManager segment_manager(BufferAllocatorType::OFFSET);
     SegmentSerializer serializer(&segment_manager);
-    auto serialized = serializer.Serialize();
+    auto serialized = serializer.Serialize(LocalSsdPersistedState{});
     if (!serialized) {
         throw std::runtime_error(serialized.error().message);
     }

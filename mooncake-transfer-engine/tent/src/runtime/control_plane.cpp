@@ -16,6 +16,7 @@
 #include "tent/runtime/transfer_engine_impl.h"
 
 #include <cassert>
+#include <exception>
 #include <set>
 #include <utility>
 
@@ -57,6 +58,24 @@ Status ControlClient::getSegmentDesc(const std::string& server_addr,
     return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
 }
 
+Status ControlClient::decodeBootstrapResponse(const std::string& response_raw,
+                                              BootstrapDesc& response) {
+    try {
+        response = json::parse(response_raw).get<BootstrapDesc>();
+    } catch (const std::exception& e) {
+        return Status::MalformedJson(
+            std::string("Invalid bootstrap response: ") + e.what() + LOC_MARK);
+    }
+    if (!response.reply_msg.empty()) {
+        return Status::RpcServiceError(response.reply_msg);
+    }
+    if (response.local_gid.empty()) {
+        return Status::InvalidArgument(
+            "Missing peer GID in bootstrap" LOC_MARK);
+    }
+    return Status::OK();
+}
+
 Status ControlClient::bootstrap(const std::string& server_addr,
                                 const BootstrapDesc& request,
                                 BootstrapDesc& response) {
@@ -65,19 +84,53 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     request_raw = j.dump();
     CHECK_STATUS(tl_rpc_agent.call(server_addr, BootstrapRdma, request_raw,
                                    response_raw));
-    response = json::parse(response_raw).get<BootstrapDesc>();
+    return decodeBootstrapResponse(response_raw, response);
+}
+
+Status ControlClient::bootstrapUb(const std::string& server_addr,
+                                  const UbBootstrapDesc& request,
+                                  UbBootstrapDesc& response) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, BootstrapUb, request_raw, response_raw));
+    try {
+        response = json::parse(response_raw).get<UbBootstrapDesc>();
+    } catch (const std::exception& e) {
+        return Status::MalformedJson(
+            std::string("Malformed UB bootstrap response: ") + e.what() +
+            LOC_MARK);
+    }
     return Status::OK();
 }
 
 Status ControlClient::sendData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
-    std::string request, response;
+    // Check before addition/allocation or reading the caller's source buffer.
+    if (length > kTcpMaxWriteBytes)
+        return Status::InvalidArgument("TCP WRITE exceeds RPC payload limit");
+    std::string response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
-    request.resize(sizeof(XferDataDesc) + length);
-    memcpy(&request[0], &desc, sizeof(desc));
-    Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr, length);
-    auto status = tl_rpc_agent.call(server_addr, SendData, request, response);
+    std::string request;
+    request.reserve(sizeof(XferDataDesc) + length);
+    request.resize(sizeof(XferDataDesc));
+    memcpy(request.data(), &desc, sizeof(desc));
+    auto& loader = Platform::getLoader();
+    if (loader.getMemoryType(local_mem_addr) == MTYPE_CPU) {
+        // Single copy into the RPC attachment; avoids the resize() zero-fill
+        // and the extra copy in call().
+        request.append(reinterpret_cast<const char*>(local_mem_addr), length);
+    } else {
+        // resize() zero-fills the payload, so an unchecked copy failure would
+        // ship zeros that the peer stores successfully and reports COMPLETED.
+        request.resize(sizeof(XferDataDesc) + length);
+        CHECK_STATUS(
+            loader.copy(request.data() + sizeof(desc), local_mem_addr, length));
+    }
+    auto status = tl_rpc_agent.callOwned(server_addr, SendData,
+                                         std::move(request), response);
     if (!status.ok()) return status;
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
@@ -86,6 +139,8 @@ Status ControlClient::sendData(const std::string& server_addr,
 Status ControlClient::recvData(const std::string& server_addr,
                                uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
+    if (length > kTcpMaxReadBytes)
+        return Status::InvalidArgument("TCP READ exceeds RPC payload limit");
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
@@ -94,9 +149,8 @@ Status ControlClient::recvData(const std::string& server_addr,
     if (!status.ok()) return status;
     if (response.size() != length)
         return Status::RpcServiceError(
-            "RecvData failed: target address not in registered buffer");
-    Platform::getLoader().copy(local_mem_addr, response.data(), length);
-    return Status::OK();
+            response.empty() ? "RecvData failed: empty response" : response);
+    return Platform::getLoader().copy(local_mem_addr, response.data(), length);
 }
 
 inline void to_json(nlohmann::json& j, const Notification& n) {
@@ -155,6 +209,26 @@ Status ControlClient::delegate(const std::string& server_addr,
                                 : Status::RpcServiceError(response_raw);
 }
 
+void ControlClient::delegateAsync(const std::string& server_addr,
+                                  const Request& request,
+                                  DelegateCallback callback) {
+    json j = request;
+    std::string request_raw = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, Delegate, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            if (!status.ok()) {
+                callback(std::move(status), false);
+                return;
+            }
+            callback(response_raw.empty()
+                         ? Status::OK()
+                         : Status::RpcServiceError(response_raw),
+                     true);
+        });
+}
+
 Status ControlClient::pinStageBuffer(const std::string& server_addr,
                                      const std::string& location,
                                      uint64_t& addr) {
@@ -175,6 +249,25 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
     CHECK_STATUS(
         tl_rpc_agent.call(server_addr, Unpin, request_raw, response_raw));
     return Status::OK();
+}
+
+void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
+                                          uint64_t addr,
+                                          UnpinStageBufferCallback callback) {
+    json j = addr;
+    std::string request_raw = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, Unpin, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            if (!status.ok()) {
+                callback(std::move(status));
+                return;
+            }
+            callback(response_raw.empty()
+                         ? Status::OK()
+                         : Status::RpcServiceError(response_raw));
+        });
 }
 
 ControlService::ControlService(const std::string& type,
@@ -199,16 +292,27 @@ ControlService::ControlService(const std::string& type,
         [this](const std::string_view& request, std::string& response) {
             onBootstrapRdma(request, response);
         });
+    // SendData/RecvData copy the full TCP payload. Running them inline on the
+    // io_context serializes every bulk transfer and stalls Probe/Bootstrap
+    // on the same thread. Offload matches Delegate: the connection coroutine
+    // suspends, copies run on the blocking executor, and other RPCs proceed.
+    rpc_server_->registerFunction(
+        BootstrapUb,
+        [this](const std::string_view& request, std::string& response) {
+            onBootstrapUb(request, response);
+        });
     rpc_server_->registerFunction(
         SendData,
         [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         RecvData,
         [this](const std::string_view& request, std::string& response) {
             onRecvData(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         Notify, [this](const std::string_view& request, std::string& response) {
             onNotify(request, response);
@@ -217,11 +321,14 @@ ControlService::ControlService(const std::string& type,
         Probe, [this](const std::string_view& request, std::string& response) {
             onProbe(request, response);
         });
+    // onDelegate runs a whole transfer to completion; holding the io_context
+    // thread for that long blocked every other RPC on this node.
     rpc_server_->registerFunction(
         Delegate,
         [this](const std::string_view& request, std::string& response) {
             onDelegate(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         Pin, [this](const std::string_view& request, std::string& response) {
             onPinStageBuffer(request, response);
@@ -245,6 +352,10 @@ ControlService::ControlService(const std::string& type,
 ControlService::~ControlService() {
     // Stop RPC workers while callback state and synchronization primitives are
     // still alive. Member destruction would otherwise tear them down first.
+    {
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+        ub_bootstrap_callback_ = {};
+    }
     rpc_server_.reset();
 }
 
@@ -299,13 +410,13 @@ void ControlService::finishNotifyCallback() {
     notify_cb_cv_.notify_all();
 }
 
-Status ControlService::start(uint16_t& port, bool ipv6_) {
-    return rpc_server_->start(port, ipv6_);
+Status ControlService::start(uint16_t& port, bool ipv6_, size_t threads) {
+    return rpc_server_->start(port, ipv6_, threads);
 }
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    // Re-use the cached dump shared across concurrent peer fetches.
+    // Reuse the cached dump shared across concurrent peer fetches.
     auto cached = manager_->getLocalDumpedJson();
     response = *cached;
 }
@@ -357,6 +468,37 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
     response = j.dump();
 }
 
+void ControlService::onBootstrapUb(const std::string_view& request,
+                                   std::string& response) {
+    UbBootstrapDesc response_desc;
+    try {
+        auto request_desc =
+            json::parse(std::string(request)).get<UbBootstrapDesc>();
+        int ret = -1;
+        {
+            // Callback replacement during uninstall is serialized with
+            // invocation, so an in-flight bootstrap cannot outlive the UB
+            // transport object it targets.
+            std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+            if (ub_bootstrap_callback_) {
+                ret = ub_bootstrap_callback_(request_desc, response_desc);
+            } else {
+                response_desc.reply_msg =
+                    "UB bootstrap callback is not registered";
+            }
+        }
+        if (ret != 0 && response_desc.reply_msg.empty()) {
+            response_desc.reply_msg =
+                "UB bootstrap callback failed, ret=" + std::to_string(ret);
+        }
+    } catch (const std::exception& e) {
+        response_desc.reply_msg =
+            std::string("Malformed UB bootstrap request: ") + e.what();
+    }
+    json j = response_desc;
+    response = j.dump();
+}
+
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
     if (request.size() < sizeof(XferDataDesc)) {
@@ -369,13 +511,26 @@ void ControlService::onSendData(const std::string_view& request,
     auto length = le64toh(desc->length);
 
     // Validate request size to prevent buffer over-read
-    if (request.size() < sizeof(XferDataDesc) + length) {
+    if (length > kTcpMaxWriteBytes ||
+        length > request.size() - sizeof(XferDataDesc)) {
         response = "SendData failed: invalid request size";
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
-        Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadWrite) {
+            response = "SendData failed: remote write permission denied";
+            return;
+        }
+        auto status =
+            Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+        if (!status.ok()) {
+            // A non-empty response is interpreted as an RPC error by the
+            // client (see ControlClient::sendData). Without this the sender's
+            // transfer would be reported COMPLETED even though the destination
+            // buffer was never written.
+            response = "SendData failed: copy: " + status.ToString();
+        }
     } else {
         response = "SendData failed: target address not in registered buffer";
     }
@@ -392,19 +547,41 @@ void ControlService::onRecvData(const std::string_view& request,
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 
+    // The client accepts any response of exactly `length` bytes as payload (see
+    // ControlClient::recvData), so an error of that size must be padded or it
+    // would be copied into the caller's buffer and reported as success.
+    auto fail = [&response, length](std::string message) {
+        response = std::move(message);
+        if (response.size() == length) response.push_back(' ');
+    };
+
     // Validate length to prevent DoS via excessive memory allocation
-    constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
-    if (length > kMaxTransferSize) {
-        response = "RecvData failed: length exceeds maximum allowed";
+    if (length > kTcpMaxReadBytes) {
+        fail("RecvData failed: length exceeds maximum allowed");
         return;
     }
 
-    if (local_desc->findBuffer(peer_mem_addr, length)) {
-        response.resize(length);
-        Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
-                                   length);
+    if (auto* buffer = local_desc->findBuffer(peer_mem_addr, length)) {
+        if (buffer->permission != kGlobalReadOnly &&
+            buffer->permission != kGlobalReadWrite) {
+            fail("RecvData failed: remote read permission denied");
+            return;
+        }
+        auto& loader = Platform::getLoader();
+        if (loader.getMemoryType((void*)peer_mem_addr) == MTYPE_CPU) {
+            // assign() skips the resize() zero-fill pass.
+            response.assign(reinterpret_cast<const char*>(peer_mem_addr),
+                            length);
+        } else {
+            response.resize(length);
+            auto status =
+                loader.copy(response.data(), (void*)peer_mem_addr, length);
+            if (!status.ok()) {
+                fail("RecvData failed: copy: " + status.ToString());
+            }
+        }
     } else {
-        response = "RecvData failed: target address not in registered buffer";
+        fail("RecvData failed: target address not in registered buffer");
     }
 }
 

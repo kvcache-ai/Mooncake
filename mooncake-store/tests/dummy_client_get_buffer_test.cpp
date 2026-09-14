@@ -5,6 +5,7 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <sys/mman.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -14,11 +15,15 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <algorithm>
+#include <limits>
+#include <numeric>
 
+#include "common/network.h"
+#include "default_config.h"
 #include "dummy_client.h"
 #include "environ.h"
 #include "real_client.h"
-#include "default_config.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -43,8 +48,12 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::isExist_internal>(&rc);
     server.register_handler<&RealClient::getSize_internal>(&rc);
     server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
+    server.register_handler<&RealClient::get_into_ranges_shm_helper>(&rc);
+    server.register_handler<&RealClient::get_into_ranges_staged_shm_helper>(
+        &rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
+    server.register_handler<&RealClient::allocate_buffer_dummy>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
@@ -428,6 +437,144 @@ TEST_F(DummyClientGetBufferTest, BatchQueryPreservesObjectChecksum) {
     ASSERT_TRUE(dummy_results[0].has_value());
     EXPECT_EQ(dummy_results[0]->object_checksum,
               real_results[0]->object_checksum);
+}
+
+TEST_F(DummyClientGetBufferTest, ExternalHostRegistrationLifecycle) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    constexpr size_t kSize = 4096;
+    std::vector<char> source(kSize);
+    std::vector<char> destination(kSize, 0);
+    std::iota(source.begin(), source.end(), 0);
+
+    ASSERT_EQ(dummy_client_->register_buffer(source.data(), kSize), 0);
+    ASSERT_EQ(dummy_client_->register_buffer(destination.data(), kSize), 0);
+    EXPECT_EQ(dummy_client_->register_buffer(source.data(), kSize), 0)
+        << "same range registration should be reference counted";
+    EXPECT_NE(dummy_client_->register_buffer(source.data(), kSize - 1), 0);
+    EXPECT_NE(dummy_client_->register_buffer(source.data() + 1, kSize - 1), 0);
+    EXPECT_NE(
+        dummy_client_->register_buffer(
+            reinterpret_cast<void *>(std::numeric_limits<uintptr_t>::max() - 3),
+            8),
+        0);
+
+    const std::string key = "dummy_external_host_lifecycle";
+    ASSERT_EQ(dummy_client_->put_from(key, source.data() + 128, 512), 0);
+    ASSERT_EQ(dummy_client_->get_into(key, destination.data() + 256, 512), 512);
+    EXPECT_TRUE(std::equal(source.begin() + 128, source.begin() + 640,
+                           destination.begin() + 256));
+
+    ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
+    ASSERT_EQ(dummy_client_->put_from(key, source.data() + 128, 512), 0)
+        << "one duplicate unregister must keep registration alive";
+    ASSERT_EQ(dummy_client_->unregister_buffer(source.data()), 0);
+    EXPECT_NE(dummy_client_->unregister_buffer(source.data()), 0);
+    EXPECT_NE(dummy_client_->put_from(key, source.data(), 1), 0)
+        << "transfers after the final unregister must be rejected";
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+}
+
+TEST_F(DummyClientGetBufferTest,
+       UnregisterMissingRealBufferMappingIsIdempotent) {
+    auto client = RealClient::create();
+    ASSERT_NE(client, nullptr);
+
+    const auto result =
+        client->unregister_shm_buffer_internal(0x1234, UUID{1, 2});
+    EXPECT_TRUE(result.has_value());
+}
+
+TEST_F(DummyClientGetBufferTest, ExternalHostRangedRead) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dummy_external_host_ranged_read";
+    const std::string data = "0123456789abcdefghijklmnopqrstuvwxyz";
+    PutData(key, data);
+
+    std::vector<char> destination(32, '_');
+    ASSERT_EQ(
+        dummy_client_->register_buffer(destination.data(), destination.size()),
+        0);
+
+    const auto results = dummy_client_->get_into_ranges(
+        {destination.data()}, {{key}}, {{{4, 20}}}, {{{2, 10}}}, {{{6, 8}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 1);
+    ASSERT_EQ(results[0][0], (std::vector<int64_t>{6, 8}));
+    EXPECT_EQ(std::string(destination.begin() + 4, destination.begin() + 10),
+              data.substr(2, 6));
+    EXPECT_EQ(std::string(destination.begin() + 20, destination.begin() + 28),
+              data.substr(10, 8));
+    EXPECT_EQ(destination[0], '_');
+    EXPECT_EQ(destination[15], '_');
+
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination.data()), 0);
+    const auto rejected = dummy_client_->get_into_ranges(
+        {destination.data()}, {{key}}, {{{4, 20}}}, {{{2, 10}}}, {{{6, 8}}});
+    ASSERT_EQ(rejected.size(), 1);
+    ASSERT_EQ(rejected[0].size(), 1);
+    EXPECT_EQ(rejected[0][0],
+              (std::vector<int64_t>{toInt(ErrorCode::INVALID_PARAMS),
+                                    toInt(ErrorCode::INVALID_PARAMS)}));
+}
+
+// A sparse destination larger than the staging pool must cost only the bytes
+// requested. mmap keeps the regression's large unused gaps physically unbacked.
+TEST_F(DummyClientGetBufferTest, ExternalHostSparseRangedReadBeyondPool) {
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+    const std::string key = "dummy_external_sparse_ranges";
+    const std::string data = "0123456789";
+    PutData(key, data);
+
+    constexpr size_t capacity = kLocalBufSize + 4096;
+    void *mapping = mmap(nullptr, capacity, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mapping, MAP_FAILED);
+    auto unmap = [](void *ptr) { munmap(ptr, capacity); };
+    std::unique_ptr<void, decltype(unmap)> owner(mapping, unmap);
+    auto *destination = static_cast<char *>(mapping);
+    ASSERT_EQ(dummy_client_->register_buffer(destination, capacity), 0);
+    destination[0] = '_';
+    destination[1] = '_';
+    destination[capacity - 2] = '_';
+    destination[capacity - 1] = '_';
+
+    auto direct = dummy_client_->allocate_client_buffer(8);
+    ASSERT_TRUE(direct.has_value());
+    // Mixed SHM/external buffers, distant fragments, zero bytes at capacity,
+    // invalid destination/source ranges, and a missing key in one RPC.
+    const auto results = dummy_client_->get_into_ranges(
+        {destination, direct->ptr()}, {{key, key + "_missing"}, {key}},
+        {{{capacity - 1, 0, capacity, capacity, capacity + 1,
+           std::numeric_limits<size_t>::max(), capacity - 2},
+          {1}},
+         {{2}}},
+        {{{0, 1, 0, 0, 0, 0, data.size()}, {0}}, {{3}}},
+        {{{1, 1, 0, 1, 0, 1, 1}, {1}}, {{2}}});
+    ASSERT_EQ(results.size(), 2);
+    ASSERT_EQ(results[0].size(), 2);
+    ASSERT_EQ(results[0][0].size(), 7);
+    EXPECT_EQ(results[0][0][0], 1);
+    EXPECT_EQ(results[0][0][1], 1);
+    EXPECT_EQ(results[0][0][2], 0);
+    for (size_t i = 3; i < 7; ++i) EXPECT_LT(results[0][0][i], 0);
+    ASSERT_EQ(results[0][1].size(), 1);
+    EXPECT_LT(results[0][1][0], 0);
+    EXPECT_EQ(results[1], (std::vector<std::vector<int64_t>>{{2}}));
+    EXPECT_EQ(destination[capacity - 1], '0');
+    EXPECT_EQ(destination[0], '1');
+    EXPECT_EQ(destination[capacity - 2], '_');
+    EXPECT_EQ(destination[1], '_');
+    EXPECT_EQ(std::string(static_cast<char *>(direct->ptr()) + 2, 2), "34");
+
+    // Registration lookup and copy-back must also work from an interior base.
+    const auto interior = dummy_client_->get_into_ranges(
+        {destination + 1}, {{key}}, {{{capacity - 2}}}, {{{2}}}, {{{1}}});
+    EXPECT_EQ(interior,
+              (std::vector<std::vector<std::vector<int64_t>>>{{{1}}}));
+    EXPECT_EQ(destination[capacity - 1], '2');
+    ASSERT_EQ(dummy_client_->unregister_buffer(destination), 0);
 }
 
 // ---- Test: get_buffer via hot cache shm zero-copy path ----

@@ -14,7 +14,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "mutex.h"
-#include "utils.h"
+#include "common/result.h"
 #include "file_storage.h"
 
 namespace mooncake {
@@ -372,6 +372,12 @@ class PyClient {
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
+    virtual std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
     virtual int upsert_parts(
         const std::string &key, std::vector<std::span<const char>> values,
         const ReplicateConfig &config = ReplicateConfig{}) = 0;
@@ -469,7 +475,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return QueryResult(
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place,
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),

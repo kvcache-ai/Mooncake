@@ -110,7 +110,7 @@ TEST(CloseDmabufExport, Idempotent) {
 TEST(ExportDmabuf, HostMemoryYieldsHostReg) {
     std::vector<char> buf(4096);
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(buf.data(), exp);
+    int ret = RdmaContext::exportDmabuf(buf.data(), buf.size(), exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
@@ -122,7 +122,7 @@ TEST(ExportDmabuf, LargeHostBufferYieldsHostReg) {
     constexpr size_t kSize = 8ULL * 1024 * 1024;  // 8 MiB
     std::vector<char> buf(kSize);
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(buf.data(), exp);
+    int ret = RdmaContext::exportDmabuf(buf.data(), kSize, exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
@@ -134,7 +134,7 @@ TEST(ExportDmabuf, MmapAnonymousYieldsHostReg) {
     ASSERT_NE(p, MAP_FAILED);
 
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(p, exp);
+    int ret = RdmaContext::exportDmabuf(p, 4096, exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);
@@ -145,7 +145,7 @@ TEST(ExportDmabuf, MmapAnonymousYieldsHostReg) {
 TEST(ExportDmabuf, StackAddressYieldsHostReg) {
     char stack_buf[128];
     DmabufExport exp;
-    int ret = RdmaContext::exportDmabuf(stack_buf, exp);
+    int ret = RdmaContext::exportDmabuf(stack_buf, sizeof(stack_buf), exp);
     EXPECT_EQ(ret, 0);
     EXPECT_EQ(exp.method, DmabufExport::Method::kHostReg);
     EXPECT_EQ(exp.fd, -1);

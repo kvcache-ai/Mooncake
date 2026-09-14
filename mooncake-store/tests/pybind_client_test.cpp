@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -20,6 +21,7 @@
 #include <cuda_runtime_api.h>
 #endif
 
+#include "config.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 
@@ -61,6 +63,30 @@ class ScopedEnvVar {
     std::string name_;
     std::optional<std::string> previous_;
 };
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t max_mr_size)
+        : old_max_mr_size_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = max_mr_size;
+    }
+
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = old_max_mr_size_; }
+
+   private:
+    size_t old_max_mr_size_;
+};
+
+TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
+    constexpr size_t kMaxMrSize = 64 * 1024 * 1024;
+    ScopedMaxMrSize limit(kMaxMrSize);
+
+    EXPECT_EQ(GetTransportRegistrationLimit("rdma"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("tcp"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
+    EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
+    EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
 
 class RealClientTest : public ::testing::Test {
    protected:
@@ -146,7 +172,148 @@ class RealClientTest : public ::testing::Test {
     }
 };
 
+TEST_F(RealClientTest, BatchGetIntoUsesSelectedLocalDiskEndpoint) {
+    StartMasterAndSetupClient();
+
+    constexpr size_t object_size = 16;
+    auto make_local_disk = [object_size](const std::string& endpoint,
+                                         ReplicaStatus status) {
+        Replica::Descriptor replica;
+        LocalDiskDescriptor descriptor;
+        descriptor.client_id = generate_uuid();
+        descriptor.object_size = object_size;
+        descriptor.transport_endpoint = endpoint;
+        replica.descriptor_variant = std::move(descriptor);
+        replica.status = status;
+        return replica;
+    };
+
+    struct TestCase {
+        std::string name;
+        std::vector<Replica::Descriptor> replicas;
+        std::string expected_endpoint;
+    };
+    std::vector<TestCase> test_cases;
+    // SelectBestReplica currently chooses the last COMPLETE LOCAL_DISK
+    // descriptor. Both list orders make a first-vs-last mismatch observable.
+    test_cases.push_back(
+        {.name = "a_then_b",
+         .replicas = {make_local_disk("endpoint-a", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-b", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-b"});
+    test_cases.push_back(
+        {.name = "b_then_a",
+         .replicas = {make_local_disk("endpoint-b", ReplicaStatus::COMPLETE),
+                      make_local_disk("endpoint-a", ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-a"});
+    test_cases.push_back(
+        {.name = "not_ready_then_complete",
+         .replicas = {make_local_disk("endpoint-not-ready",
+                                      ReplicaStatus::PROCESSING),
+                      make_local_disk("endpoint-complete",
+                                      ReplicaStatus::COMPLETE)},
+         .expected_endpoint = "endpoint-complete"});
+
+    for (auto& test_case : test_cases) {
+        SCOPED_TRACE(test_case.name);
+        std::vector<tl::expected<QueryResult, ErrorCode>> query_results;
+        query_results.emplace_back(QueryResult(
+            std::move(test_case.replicas),
+            std::chrono::steady_clock::now() + std::chrono::minutes(1)));
+
+        std::vector<char> destination(object_size);
+        std::string visited_endpoint;
+        // Stop at the offload RPC boundary after recording its destination.
+        // The injected error also prevents checksum verification of the
+        // intentionally untouched destination buffer.
+        auto local_disk_reader = [&visited_endpoint](
+                                     const std::string& endpoint,
+                                     RealClient::LocalDiskOffloadObjects&)
+            -> tl::expected<void, ErrorCode> {
+            visited_endpoint = endpoint;
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        };
+
+        std::vector<tl::expected<int64_t, ErrorCode>> results;
+        {
+            GLogMuter muter;
+            results = py_client_->batch_get_into_internal(
+                {"endpoint-selection-key"}, {destination.data()},
+                {destination.size()}, query_results, local_disk_reader);
+        }
+
+        EXPECT_EQ(visited_endpoint, test_case.expected_endpoint);
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_FALSE(results[0].has_value());
+        EXPECT_EQ(results[0].error(), ErrorCode::RPC_FAIL);
+    }
+}
+
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar cache_size("MC_STORE_LOCAL_HOT_CACHE_SIZE", "1048576");
+    ScopedEnvVar block_size("MC_STORE_LOCAL_HOT_BLOCK_SIZE", "4096");
+    ScopedEnvVar shared_cache("MC_STORE_LOCAL_HOT_CACHE_USE_SHM", "1");
+    ScopedEnvVar admission("MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD", "1");
+    StartMasterAndSetupClient();
+    const std::string key = "snapshot_gpu_hot_cache";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+
+    // Populate the key-based cache with the new value after taking the old
+    // snapshot. Keep the read buffer alive until the async cache fill
+    // completes.
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    ASSERT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+    bool cache_ready = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (py_client_->acquire_hot_cache(key).has_value()) {
+            ASSERT_TRUE(py_client_->release_hot_cache(key).has_value());
+            cache_ready = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_TRUE(cache_ready);
+
+    void* destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&destination, original.size()), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> owner(destination, cleanup);
+    ASSERT_EQ(py_client_->register_buffer(destination, original.size()), 0);
+    registered = true;
+    EXPECT_EQ(py_client_->get_into_ranges_from_snapshot(
+                  {destination}, {{key}}, {{{0}}}, {{{0}}},
+                  {{{original.size()}}}, snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{32}}}));
+    std::string actual(original.size(), '\0');
+    ASSERT_EQ(cudaMemcpy(actual.data(), destination, actual.size(),
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, original);
+}
+
 TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
@@ -276,6 +443,95 @@ TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     EXPECT_EQ(allocated_size, slab_size * 2);
     ASSERT_FALSE(segment_ids.empty());
     EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, TcpSetupDoesNotSplitAtMaxMrSize) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(2 * slab_size);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE", 6 * slab_size,
+                               0, "tcp", "", master_address_),
+        0);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 6 * slab_size);
+}
+
+TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17815", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "efa", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 2u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 2u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 4u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 3 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
+TEST_F(RealClientTest, DynamicMountApisDoNotSplitRdma) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17816", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 1u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 2u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 6 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
 }
 
 TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
@@ -442,6 +698,72 @@ TEST_F(RealClientTest, GetIntoAcceptsSubrangeOfLocalRegisteredBuffer) {
     auto bytes_read = py_client_->get_into(key, dst, test_data.size());
     ASSERT_EQ(bytes_read, static_cast<int64_t>(test_data.size()));
     EXPECT_EQ(std::string(dst, test_data.size()), test_data);
+}
+
+TEST_F(RealClientTest, RangedSnapshotPreservesPayloadAcrossSameSizeUpsert) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_upsert";
+    const std::string original(32, 'A');
+    const std::string replacement(32, 'B');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(original)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(key, std::move(queries[0]));
+    auto destination = py_client_->allocate_client_buffer(original.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&](size_t offset, size_t size) {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{offset}}}, {{{offset}}},
+            {{{size}}}, snapshot);
+    };
+
+    // Pause between prefix and payload, then replace the same-size object.
+    EXPECT_EQ(read(0, 4),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    ASSERT_EQ(py_client_->upsert(key, std::span<const char>(replacement)), 0);
+    EXPECT_EQ(read(4, 28),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{28}}}));
+    EXPECT_EQ(std::string(static_cast<char*>(destination->ptr()), 32),
+              original);
+    auto current = py_client_->get_buffer(key);
+    ASSERT_NE(current, nullptr);
+    EXPECT_EQ(std::string(static_cast<char*>(current->ptr()), current->size()),
+              replacement);
+}
+
+TEST_F(RealClientTest, RangedSnapshotDoesNotRefreshExpiredOrMissingEntries) {
+    StartMasterAndSetupClient();
+    const std::string key = "ranged_snapshot_expired";
+    const std::string data(32, 'A');
+    ASSERT_EQ(py_client_->put(key, std::span<const char>(data)), 0);
+    auto queries = py_client_->batch_query({key});
+    ASSERT_EQ(queries.size(), 1);
+    ASSERT_TRUE(queries[0].has_value());
+    PyClient::QueryResultCache snapshot;
+    snapshot.emplace(
+        key, QueryResult(
+                 std::vector<Replica::Descriptor>(queries[0]->replicas),
+                 std::chrono::steady_clock::now() - std::chrono::seconds(1)));
+    auto destination = py_client_->allocate_client_buffer(data.size());
+    ASSERT_TRUE(destination.has_value());
+    auto read = [&]() {
+        return py_client_->get_into_ranges_from_snapshot(
+            {destination->ptr()}, {{key}}, {{{0}}}, {{{4}}}, {{{4}}}, snapshot);
+    };
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::LEASE_EXPIRED)}}}));
+    // The existing cache API still allows refresh for independent reads.
+    EXPECT_EQ(py_client_->get_into_ranges({destination->ptr()}, {{key}},
+                                          {{{0}}}, {{{4}}}, {{{4}}}, &snapshot),
+              (std::vector<std::vector<std::vector<int64_t>>>{{{4}}}));
+    snapshot.clear();
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::INVALID_PARAMS)}}}));
+    snapshot.emplace(key, tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+    EXPECT_EQ(read(), (std::vector<std::vector<std::vector<int64_t>>>{
+                          {{toInt(ErrorCode::OBJECT_NOT_FOUND)}}}));
 }
 
 // Test Get Operation will fail if the lease has expired.
@@ -883,6 +1205,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         0);
 
     std::string test_data(1000, '1');
+    std::string upsert_data(1000, '2');
     std::string dst_data(1000, '0');
 
     // Register buffers for zero-copy operations
@@ -894,26 +1217,36 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         py_client_->register_buffer(dst_data.data(), dst_data.size());
     ASSERT_EQ(reg_result_dst, 0)
         << "Dst data buffer registration should succeed";
+    int reg_result_upsert =
+        py_client_->register_buffer(upsert_data.data(), upsert_data.size());
+    ASSERT_EQ(reg_result_upsert, 0)
+        << "Upsert data buffer registration should succeed";
 
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_upsert_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
     std::vector<std::vector<size_t>> all_sizes;
     auto ptr = test_data.data();
+    auto upsert_ptr = upsert_data.data();
     auto dst_ptr = dst_data.data();
     for (size_t i = 0; i < 10; i++) {
         keys.emplace_back("test_key_" + std::to_string(i));
         std::vector<void*> ptrs;
+        std::vector<void*> upsert_ptrs;
         std::vector<void*> dst_ptrs;
         std::vector<size_t> sizes;
         for (size_t j = 0; j < 10; j++) {
             ptrs.emplace_back(ptr);
+            upsert_ptrs.emplace_back(upsert_ptr);
             dst_ptrs.emplace_back(dst_ptr);
             sizes.emplace_back(10);
             ptr += 10;
+            upsert_ptr += 10;
             dst_ptr += 10;
         }
         all_ptrs.emplace_back(ptrs);
+        all_upsert_ptrs.emplace_back(upsert_ptrs);
         all_dst_ptrs.emplace_back(dst_ptrs);
         all_sizes.emplace_back(sizes);
     }
@@ -932,6 +1265,21 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     }
     EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
 
+    std::vector<int> upsert_results =
+        py_client_->batch_upsert_from_multi_buffers(keys, all_upsert_ptrs,
+                                                    all_sizes, config);
+    for (auto result : upsert_results) {
+        EXPECT_EQ(result, 0) << "Upsert operation should succeed";
+    }
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    get_results = py_client_->batch_get_into_multi_buffers(keys, all_dst_ptrs,
+                                                           all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get after upsert should succeed";
+    }
+    EXPECT_EQ(dst_data, upsert_data)
+        << "Retrieved data should match upserted data";
+
     // Unregister buffers
     int unreg_result_test = py_client_->unregister_buffer(test_data.data());
     ASSERT_EQ(unreg_result_test, 0)
@@ -939,6 +1287,9 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
+    int unreg_result_upsert = py_client_->unregister_buffer(upsert_data.data());
+    ASSERT_EQ(unreg_result_upsert, 0)
+        << "Upsert data buffer unregistration should succeed";
 }
 
 TEST_F(RealClientTest, TestPutGetSessionRanges) {

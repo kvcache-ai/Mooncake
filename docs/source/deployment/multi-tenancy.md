@@ -55,7 +55,8 @@ curl -s http://<master_host>:9003/api/v1/tenant_quotas
 # Query one tenant
 curl -s "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a"
 
-# Upsert an explicit policy. Explicit tenant policies must be positive.
+# Upsert an explicit policy. Explicit tenant policies must be between 1 byte
+# and 2^63 - 1 bytes.
 curl -s -X PUT "http://<master_host>:9003/api/v1/tenant_quotas?tenant_id=tenant-a" \
   -H 'Content-Type: application/json' \
   -d '{"requested_quota_bytes":2147483648}'
@@ -73,15 +74,15 @@ Each tenant quota snapshot returns:
     "tenant_id": "tenant-a",
     "requested_quota_bytes": 2147483648,
     "effective_quota_bytes": 2147483648,
-    "used_bytes": 0,
-    "reserved_bytes": 0,
-    "committed_count": 0,
-    "metadata_object_count": 0,
+    "charged_bytes": 0,
+    "admission_closed": false,
     "over_quota": false,
     "has_explicit_policy": true
   }
 }
 ```
+
+`charged_bytes` includes completed MEMORY replicas and in-flight MEMORY allocations. Put, Copy, Move, and promotion charge quota when admission starts; failed, revoked, partially completed, or expired operations refund the unused charge. `admission_closed` is `true` when the account rejects new writes, including after its explicit policy is removed.
 
 In HA mode, quota admin requests are served only by the active master service. Standby, candidate, or inactive services return HTTP 503. If strict multi-tenant mode is disabled, the quota admin API returns HTTP 409 with `UNAVAILABLE_IN_CURRENT_MODE`. Deleting a non-empty tenant returns HTTP 409 with `TENANT_NOT_EMPTY`.
 

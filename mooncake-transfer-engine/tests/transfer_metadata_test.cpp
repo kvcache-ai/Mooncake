@@ -1,3 +1,5 @@
+#include <map>
+#include <memory>
 // Copyright 2024 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,9 +24,15 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <mutex>
+#include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include "common.h"
 #include "config.h"
@@ -42,7 +50,7 @@ class TransferMetadataTest : public ::testing::Test {
         google::InitGoogleLogging("TransferMetadataTest");
         FLAGS_logtostderr = 1;  // output to stdout
 
-        const char* env = std::getenv("MC_METADATA_SERVER");
+        const char *env = std::getenv("MC_METADATA_SERVER");
         if (env)
             metadata_server = env;
         else
@@ -104,11 +112,11 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
         ASSERT_EQ(re, 0);
     }
     addr = 1000;
-    re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+    re = metadata_client->removeLocalMemoryBuffer((void *)addr, false);
     ASSERT_EQ(re, ERR_ADDRESS_NOT_REGISTERED);
     for (int i = 9; i > 0; --i) {
         addr = i * 2048;
-        re = metadata_client->removeLocalMemoryBuffer((void*)addr, false);
+        re = metadata_client->removeLocalMemoryBuffer((void *)addr, false);
         ASSERT_EQ(re, 0);
     }
     re = metadata_client->removeLocalSegment("test_local_segment");
@@ -202,6 +210,189 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
 
 namespace {
 
+#ifdef USE_HTTP
+class LocalHttpMetadataServer {
+   public:
+    LocalHttpMetadataServer() {
+        listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
+        if (listen_fd_ < 0) return;
+
+        int one = 1;
+        if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &one,
+                       sizeof(one)) != 0)
+            return;
+
+        sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port = 0;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&addr),
+                 sizeof(addr)) != 0)
+            return;
+        if (listen(listen_fd_, 16) != 0) return;
+
+        socklen_t len = sizeof(addr);
+        if (getsockname(listen_fd_, reinterpret_cast<sockaddr*>(&addr), &len) !=
+            0)
+            return;
+        port_ = ntohs(addr.sin_port);
+        ok_ = true;
+        thread_ = std::thread([this] { serve(); });
+    }
+
+    ~LocalHttpMetadataServer() {
+        stopped_.store(true, std::memory_order_release);
+        if (listen_fd_ >= 0) (void)shutdown(listen_fd_, SHUT_RDWR);
+        if (thread_.joinable()) thread_.join();
+        if (listen_fd_ >= 0) close(listen_fd_);
+    }
+
+    bool ok() const { return ok_; }
+    std::string uri() const {
+        return "http://127.0.0.1:" + std::to_string(port_) + "/metadata";
+    }
+
+   private:
+    static std::string decodeUrlComponent(const std::string& value) {
+        auto hex_digit = [](char c) -> int {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            return -1;
+        };
+
+        std::string decoded;
+        decoded.reserve(value.size());
+        for (size_t i = 0; i < value.size(); ++i) {
+            if (value[i] == '%' && i + 2 < value.size()) {
+                const int high = hex_digit(value[i + 1]);
+                const int low = hex_digit(value[i + 2]);
+                if (high >= 0 && low >= 0) {
+                    decoded.push_back(static_cast<char>((high << 4) | low));
+                    i += 2;
+                    continue;
+                }
+            }
+            decoded.push_back(value[i] == '+' ? ' ' : value[i]);
+        }
+        return decoded;
+    }
+
+    static bool sendExact(int fd, const std::string& value) {
+        size_t offset = 0;
+        while (offset < value.size()) {
+            const ssize_t n = send(fd, value.data() + offset,
+                                   value.size() - offset, MSG_NOSIGNAL);
+            if (n <= 0) return false;
+            offset += static_cast<size_t>(n);
+        }
+        return true;
+    }
+
+    static bool readRequest(int fd, std::string& request) {
+        constexpr size_t kMaximumRequestSize = 1 << 20;
+        char buffer[4096];
+        size_t header_end = std::string::npos;
+        while ((header_end = request.find("\r\n\r\n")) == std::string::npos) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+            if (n <= 0) return false;
+            request.append(buffer, static_cast<size_t>(n));
+            if (request.size() > kMaximumRequestSize) return false;
+        }
+
+        size_t content_length = 0;
+        std::istringstream headers(request.substr(0, header_end));
+        std::string line;
+        std::getline(headers, line);
+        while (std::getline(headers, line)) {
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            std::string lower = line;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return std::tolower(c); });
+            constexpr char kContentLength[] = "content-length:";
+            if (lower.rfind(kContentLength, 0) == 0) {
+                content_length =
+                    std::stoull(line.substr(sizeof(kContentLength) - 1));
+            }
+        }
+
+        const size_t complete_size = header_end + 4 + content_length;
+        while (request.size() < complete_size) {
+            const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+            if (n <= 0) return false;
+            request.append(buffer, static_cast<size_t>(n));
+            if (request.size() > kMaximumRequestSize) return false;
+        }
+        return true;
+    }
+
+    void handle(int fd) {
+        std::string request;
+        if (!readRequest(fd, request)) return;
+
+        const size_t request_line_end = request.find("\r\n");
+        if (request_line_end == std::string::npos) return;
+        std::istringstream request_line(request.substr(0, request_line_end));
+        std::string method;
+        std::string target;
+        std::string version;
+        request_line >> method >> target >> version;
+        (void)version;
+
+        const size_t key_pos = target.find("?key=");
+        if (key_pos == std::string::npos) return;
+        const std::string key = decodeUrlComponent(target.substr(key_pos + 5));
+
+        std::string body = "{}";
+        int status = 200;
+        if (method == "PUT") {
+            const size_t header_end = request.find("\r\n\r\n");
+            const std::string value = request.substr(header_end + 4);
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            values_[key] = value;
+        } else if (method == "GET") {
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            auto it = values_.find(key);
+            if (it == values_.end()) {
+                status = 404;
+            } else {
+                body = it->second;
+            }
+        } else if (method == "DELETE") {
+            std::lock_guard<std::mutex> lock(values_mutex_);
+            values_.erase(key);
+        } else {
+            status = 405;
+        }
+
+        const std::string response =
+            "HTTP/1.1 " + std::to_string(status) +
+            (status == 200 ? " OK\r\n" : " Error\r\n") +
+            "Content-Type: application/json\r\nContent-Length: " +
+            std::to_string(body.size()) + "\r\nConnection: close\r\n\r\n" +
+            body;
+        (void)sendExact(fd, response);
+    }
+
+    void serve() {
+        while (!stopped_.load(std::memory_order_acquire)) {
+            const int fd = accept(listen_fd_, nullptr, nullptr);
+            if (fd < 0) break;
+            handle(fd);
+            close(fd);
+        }
+    }
+
+    int listen_fd_ = -1;
+    uint16_t port_ = 0;
+    bool ok_ = false;
+    std::thread thread_;
+    std::atomic<bool> stopped_{false};
+    std::mutex values_mutex_;
+    std::unordered_map<std::string, std::string> values_;
+};
+#endif
+
 struct ScopedMetadataRefreshConfig {
     uint64_t old_interval_seconds;
     bool old_metacache;
@@ -232,7 +423,7 @@ TransferMetadata::BufferDesc makeRdmaBufferDesc(uint64_t addr) {
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
-    const std::string& name, uint64_t addr) {
+    const std::string &name, uint64_t addr) {
     auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
     segment_desc->name = name;
     segment_desc->protocol = "rdma";
@@ -285,7 +476,7 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
 
     ASSERT_EQ(server.removeLocalMemoryBuffer(
-                  reinterpret_cast<void*>(kInitialAddr), false),
+                  reinterpret_cast<void *>(kInitialAddr), false),
               0);
     ASSERT_EQ(
         server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
@@ -304,6 +495,317 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     }
 
     FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
+}
+
+TEST(TransferMetadataVersionTest, SyncAcceptsNewerMetadataVersion) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kUpdatedAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto updated_desc = makeRdmaSegmentDesc(remote_segment_name, kUpdatedAddr);
+    updated_desc->metadata_version = base_version + 1;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(updated_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 1);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kUpdatedAddr);
+}
+
+TEST(TransferMetadataVersionTest, SyncRejectsOlderMetadataVersion) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kStaleAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version + 1;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version + 1);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto stale_desc = makeRdmaSegmentDesc(remote_segment_name, kStaleAddr);
+    stale_desc->metadata_version = base_version;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(stale_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 1);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
+TEST(TransferMetadataVersionTest,
+     SyncAdvancesVersionForUnchangedDescriptorBeforeRejectingOlderUpdate) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kStaleAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto same_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    same_desc->metadata_version = base_version + 2;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(same_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 2);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto stale_desc = makeRdmaSegmentDesc(remote_segment_name, kStaleAddr);
+    stale_desc->metadata_version = base_version + 1;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(stale_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version + 2);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
+TEST(TransferMetadataVersionTest,
+     SyncInvalidatesRpcCacheForUnchangedNewerSegmentVersion) {
+#ifdef USE_HTTP
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint16_t kInitialRpcPort = 1234;
+    constexpr uint16_t kUpdatedRpcPort = 2345;
+
+    LocalHttpMetadataServer metadata_server;
+    ASSERT_TRUE(metadata_server.ok());
+
+    TransferMetadata publisher(metadata_server.uri());
+    TransferMetadata client(metadata_server.uri());
+
+    const std::string remote_segment_name = "rpc-refresh-segment";
+    ASSERT_EQ(publisher.updateSegmentDesc(
+                  remote_segment_name,
+                  *makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = kInitialRpcPort;
+    ASSERT_EQ(publisher.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+
+    TransferMetadata::RpcMetaDesc cached_rpc_desc;
+    ASSERT_EQ(client.getRpcMetaEntry(remote_segment_name, cached_rpc_desc), 0);
+    ASSERT_EQ(cached_rpc_desc.ip_or_host_name, "127.0.0.1");
+    ASSERT_EQ(cached_rpc_desc.rpc_port, kInitialRpcPort);
+
+    rpc_desc.ip_or_host_name = "127.0.0.2";
+    rpc_desc.rpc_port = kUpdatedRpcPort;
+    ASSERT_EQ(publisher.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+    ASSERT_EQ(publisher.updateSegmentDesc(
+                  remote_segment_name,
+                  *makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    ASSERT_EQ(client.getRpcMetaEntry(remote_segment_name, cached_rpc_desc), 0);
+    EXPECT_EQ(cached_rpc_desc.ip_or_host_name, "127.0.0.2");
+    EXPECT_EQ(cached_rpc_desc.rpc_port, kUpdatedRpcPort);
+#else
+    GTEST_SKIP() << "HTTP metadata storage is required";
+#endif
+}
+
+TEST(TransferMetadataVersionTest, SyncRejectsConflictingSameVersionMetadata) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kConflictingAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+    const uint64_t base_version =
+        static_cast<uint64_t>(getCurrentTimeInNano() / 1000);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kInitialAddr);
+    server_desc->metadata_version = base_version;
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    ASSERT_EQ(cached_desc->metadata_version, base_version);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    auto conflicting_desc =
+        makeRdmaSegmentDesc(remote_segment_name, kConflictingAddr);
+    conflicting_desc->metadata_version = base_version;
+    ASSERT_EQ(server.removeLocalSegment(remote_segment_name), 0);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(conflicting_desc)),
+              0);
+
+    ASSERT_EQ(client.syncSegmentCache(remote_segment_name), 0);
+    cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_NE(cached_desc, nullptr);
+    EXPECT_EQ(cached_desc->metadata_version, base_version);
+    EXPECT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+}
+
+TEST(TransferMetadataVersionTest, P2PSegmentUpdateKeepsLegacyVersionZero) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+    ASSERT_EQ(
+        metadata.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                                 makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+
+    auto desc = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_EQ(desc->metadata_version, 0U);
+
+    ASSERT_EQ(metadata.updateLocalSegmentDesc(), 0);
+    desc = metadata.getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    EXPECT_EQ(desc->metadata_version, 0U);
+}
+
+TEST(TransferMetadataVersionTest, P2PRpcMetaKeepsLegacyVersionZero) {
+    TransferMetadata metadata(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+
+    ASSERT_EQ(
+        metadata.addRpcMetaEntry("127.0.0.1:" + std::to_string(port), rpc_desc),
+        0);
+
+    EXPECT_EQ(rpc_desc.metadata_version, 0U);
+    EXPECT_EQ(metadata.localRpcMeta().metadata_version, 0U);
 }
 
 TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
@@ -555,9 +1057,247 @@ TEST(HandshakeFrameTest, RejectsInvalidLength) {
     close(fds[1]);
 }
 
+namespace {
+
+// Hardware-free in-memory MetadataStoragePlugin. get() returns false for keys
+// absent from the store (a removed/unmounted segment) and can be made to fail
+// a bounded number of times via failNext() to reproduce a transient backend
+// blip. No RDMA/CUDA/etcd is required.
+class FakeMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return false;  // transient blip: the key may still be in store_
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return false;
+        value = it->second;
+        return true;
+    }
+
+    // Error-aware variant: forced failures report kUnavailable (the key may
+    // still live in the backend), missing keys report kNotFound (the master
+    // removed them), and present keys report kFound.
+    GetResult getWithStatus(const std::string &key,
+                            Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return GetResult::kUnavailable;
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return GetResult::kNotFound;
+        value = it->second;
+        return GetResult::kFound;
+    }
+    bool set(const std::string &key, const Json::Value &value) override {
+        store_[key] = value;
+        return true;
+    }
+    bool remove(const std::string &key) override {
+        store_.erase(key);
+        return true;
+    }
+
+    // Simulate the master-side cleanup of a peer's segment key (unmount or
+    // client expiry): the key vanishes from the backend, so every later
+    // get() returns false.
+    void drop(const std::string &key) { store_.erase(key); }
+
+    // Inject n transient get() failures for key without removing the key,
+    // modelling a curl timeout / etcd blip that resolves next sync cycle.
+    void failNext(const std::string &key, int n) { forced_failures_[key] = n; }
+
+   private:
+    std::map<std::string, Json::Value> store_;
+    std::map<std::string, int> forced_failures_;
+};
+
+// A backend that only implements the legacy bool get() and cannot tell a
+// missing key from a backend failure, so it inherits the default
+// getWithStatus() mapping instead of overriding it.
+class OpaqueMetadataStoragePlugin : public MetadataStoragePlugin {
+   public:
+    bool get(const std::string &key, Json::Value &value) override {
+        auto fit = forced_failures_.find(key);
+        if (fit != forced_failures_.end() && fit->second > 0) {
+            --fit->second;
+            return false;
+        }
+        auto it = store_.find(key);
+        if (it == store_.end()) return false;
+        value = it->second;
+        return true;
+    }
+    bool set(const std::string &key, const Json::Value &value) override {
+        store_[key] = value;
+        return true;
+    }
+    bool remove(const std::string &key) override {
+        store_.erase(key);
+        return true;
+    }
+    void failNext(const std::string &key, int n) { forced_failures_[key] = n; }
+
+   private:
+    std::map<std::string, Json::Value> store_;
+    std::map<std::string, int> forced_failures_;
+};
+
+// Exposes the protected storage-plugin injection seam to hardware-free tests.
+class TestableTransferMetadata : public TransferMetadata {
+   public:
+    explicit TestableTransferMetadata(
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin)
+        : TransferMetadata(std::move(storage_plugin)) {}
+};
+
+}  // namespace
+
+class TransferMetadataStaleSegmentInvalidationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging(
+            "TransferMetadataStaleSegmentInvalidationTest");
+        FLAGS_logtostderr = 1;
+    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+
+    // Publish a remote rdma segment to the fake backend and cache it locally
+    // (as a non-local id), returning the cached descriptor so callers can
+    // assert on cache state.
+    std::shared_ptr<TransferMetadata::SegmentDesc> seedRemoteSegment(
+        TransferMetadata &client, const std::string &name) {
+        auto desc = makeRdmaSegmentDesc(name, 0x1000);
+        EXPECT_EQ(client.updateSegmentDesc(name, *desc), 0);
+        EXPECT_NE(client.getSegmentID(name),
+                  static_cast<TransferMetadata::SegmentID>(-1));
+        return client.getSegmentDescByName(name);
+    }
+};
+
+// Red on master / green on branch: a cached remote segment whose backend key
+// is removed (peer unmount) is invalidated only after the consecutive-failure
+// streak reaches the threshold -- not on the first failure. On master there
+// is no invalidation branch, so the stale entry is never erased and the final
+// expectation fails.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       ErasesStaleEntryAfterConsecutiveFailures) {
+    // No background refresh thread (interval == 0) with the cache-hit fast path
+    // on (metacache == true): getSegmentDescByName reflects the local cache,
+    // and we drive syncSegmentCache explicitly to count failures precisely.
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "B";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Peer B unmounts: the master removes mooncake/ram/B; every get() fails.
+    plugin->drop("mooncake/ram/B");
+
+    // First failed sync: streak is 1, below the threshold -> retain the entry,
+    // guarding against a single transient blip purging the whole cache.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+
+    // Second consecutive failed sync: streak reaches the threshold -> the
+    // stale cached entry is invalidated. Red-on-master: master never erases,
+    // so getSegmentDescByName keeps returning the cached descriptor.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_EQ(client.getSegmentDescByName(name), nullptr);
+}
+
+// Transient-failure guard: a segment that fails once and then succeeds on the
+// next cycle must NOT be invalidated -- the successful fetch resets its
+// streak. Guards against an erase-on-first-failure regression.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       TransientFailureIsRetained) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "C";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // One transient get() failure: the key still lives in the backend, so the
+    // segment is genuinely alive and must not count toward removal.
+    plugin->failNext("mooncake/ram/C", 1);
+
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+
+    // Next cycle the blip clears: get() succeeds again, the streak resets to
+    // zero, and the cached entry survives.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+}
+
+// Backend-outage guard: a sustained transient failure (kUnavailable) must NOT
+// advance the invalidation streak, so the cached entry survives even after
+// many consecutive sync cycles -- only an authoritative key removal
+// (kNotFound) can invalidate. Guards against a metadata-service outage
+// purging the entire live cache.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       BackendOutageDoesNotInvalidateCache) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<FakeMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "D";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Sustained backend outage: every get() fails for 5 sync cycles (well
+    // past the invalidation threshold of 2), but the key still lives in
+    // the backend -- this is kUnavailable, not kNotFound.
+    plugin->failNext("mooncake/ram/D", 5);
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(client.syncSegmentCache(""), 0);
+        EXPECT_NE(client.getSegmentDescByName(name), nullptr)
+            << "entry purged after " << (i + 1) << " transient failures";
+    }
+
+    // Outage clears: get() succeeds again, the entry was never invalidated.
+    ASSERT_EQ(client.syncSegmentCache(""), 0);
+    EXPECT_NE(client.getSegmentDescByName(name), nullptr);
+}
+
+// Default-mapping guard: a backend that only implements the legacy bool
+// get() (no getWithStatus() override) inherits the default mapping, which
+// must fail closed -- an ambiguous false is kUnavailable, never kNotFound --
+// so a sustained failure cannot purge the cached entry. Guards against the
+// default treating an opaque backend failure as an authoritative removal.
+TEST_F(TransferMetadataStaleSegmentInvalidationTest,
+       DefaultPluginMappingFailsClosed) {
+    ScopedMetadataRefreshConfig restore(0, true);
+
+    auto plugin = std::make_shared<OpaqueMetadataStoragePlugin>();
+    TestableTransferMetadata client(plugin);
+
+    const std::string name = "E";
+    ASSERT_TRUE(seedRemoteSegment(client, name));
+
+    // Sustained failures through the inherited default path: 5 sync cycles
+    // of get() == false with no way to prove the key is gone.
+    plugin->failNext("mooncake/ram/E", 5);
+
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_EQ(client.syncSegmentCache(""), 0);
+        EXPECT_NE(client.getSegmentDescByName(name), nullptr)
+            << "default mapping invalidated after " << (i + 1)
+            << " opaque failures";
+    }
+}
+
 }  // namespace mooncake
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

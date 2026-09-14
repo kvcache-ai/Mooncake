@@ -3,6 +3,7 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <mooncake_ep_configs.cuh>
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
 #include <elastic/mooncake_ep_elastic_exception.cuh>
 #include <elastic/mooncake_ep_elastic_math.cuh>
@@ -24,13 +25,10 @@ struct WorkspaceLayout {
     static constexpr int kNumMaxExpertsPerRank = 256;
     static constexpr int kNumMaxInflightAGRS = 32;
 
-    // Mooncake Device API does not rely on NCCL GIN remote RED on a single
-    // symmetric signal word.  Use per-source-rank signal slots for both phases:
-    // each sender atomically updates its own slot with release semantics and
-    // receivers poll the full slot vector.  Keep an independent counter/slot
-    // vector for each logical barrier tag, as hybrid kernels mix world and
-    // scale-up-only barriers in the same workspace and therefore must not share
-    // phase/sign state across tags.
+    // Reserve per-source-rank signal slots for the portable IBGDA barrier.
+    // NCCL LSA barriers aggregate arrivals in the first slot of each phase.
+    // Each logical barrier tag needs independent phase/sign state because
+    // hybrid kernels mix world and scale-up-only barriers in one workspace.
     static constexpr int kNumBarrierTags = 16;
     static constexpr int64_t kNumBarrierBytesPerTag =
         sizeof(unsigned long long) + 2 * kNumMaxRanks * sizeof(int);
@@ -52,8 +50,8 @@ struct WorkspaceLayout {
         EP_UNIFIED_ASSERT(num_experts_per_rank <= kNumMaxExpertsPerRank);
     }
 
-    static int64_t get_num_bytes() {
-        // Pure NVLink scaleup barrier signals
+    __forceinline__ __device__ __host__ static int64_t get_num_bytes() {
+        // Pure NVLink scaleup barrier signals.
         int64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
 
@@ -85,7 +83,7 @@ struct WorkspaceLayout {
         // Rank send/recv count, for PP prev/next ranks
         num_bytes += 2 * 2 * sizeof(int64_t);
 
-        // AGRS signals
+        // All-gather/reduce-scatter signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
         // Ensure LDG.256 work

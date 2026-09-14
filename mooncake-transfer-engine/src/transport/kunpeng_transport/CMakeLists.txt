@@ -1,4 +1,12 @@
-file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp" "ub_allocator.cpp")
+set(UB_ALLOCATOR_SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/ub_allocator.cpp")
+file(GLOB UB_SOURCES "*.cpp" "urma/urma_endpoint.cpp")
+list(REMOVE_ITEM UB_SOURCES "${UB_ALLOCATOR_SOURCE}")
+
+add_library(ub_allocator OBJECT "${UB_ALLOCATOR_SOURCE}")
+target_include_directories(
+  ub_allocator PUBLIC $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+                      $<INSTALL_INTERFACE:include>)
+target_link_libraries(ub_allocator PRIVATE glog::glog numa)
 
 # Build ub_transport with real URMA library if available Never include
 # mock_urma_api.cpp in ub_transport library For test, we will use

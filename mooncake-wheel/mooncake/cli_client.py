@@ -6,7 +6,6 @@ Minimal CLI module for mooncake_client.
 import os
 import stat
 import sys
-import subprocess
 
 
 def main():
@@ -23,8 +22,8 @@ def main():
         st = os.stat(bin_path)
         os.chmod(bin_path, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
-    # Run the binary with all arguments passed through
-    return subprocess.call([bin_path] + sys.argv[1:])
+    # Preserve the CLI process ID so callers can reliably stop the client.
+    os.execv(bin_path, [bin_path] + sys.argv[1:])
 
 
 if __name__ == "__main__":

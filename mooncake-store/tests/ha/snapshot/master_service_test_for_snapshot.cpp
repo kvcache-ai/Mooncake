@@ -1216,7 +1216,15 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
-    service_.reset(new MasterService());
+    // Snapshot mode keeps the invalid-handle sweep synchronous inside
+    // UnmountSegment. A default-configured MasterService would instead defer
+    // it to the replica cleanup worker, making the key-count assertion below
+    // race with that worker.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;
@@ -1272,7 +1280,11 @@ TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
 }
 
 TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two large segments
     constexpr size_t buffer1 = 0x300000000;
@@ -1328,7 +1340,11 @@ TEST_F(MasterServiceSnapshotTest, ReadableAfterPartialUnmountWithReplication) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentPerformance) {
-    service_.reset(new MasterService());
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 256;  // 256MB
     std::string segment_name = "perf_test_segment";
@@ -2406,19 +2422,30 @@ TEST_F(MasterServiceSnapshotTest, PutStartExpiringTest) {
 
     // Put key_2 again, should fail because eviction has not been triggered. And
     // this PutStart should trigger the eviction.
+    const int64_t eviction_attempts_before =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_FALSE(put_start_result.has_value());
+    ASSERT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // Wait a moment for the eviction to complete.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(4);
+    while (MasterMetricManager::instance().get_mem_eviction_attempts() <=
+               eviction_attempts_before &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_GT(MasterMetricManager::instance().get_mem_eviction_attempts(),
+              eviction_attempts_before)
+        << "Timed out waiting for asynchronous eviction";
 
     // Put key_2 again, should success because the previous one has been
     // discarded and released.
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(put_start_result.has_value())
+        << toString(put_start_result.error());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
     for (size_t i = 0; i < kReplicaCnt; i++) {
@@ -3330,8 +3357,7 @@ TEST_F(MasterServiceSnapshotTest, CopyStart) {
 
     // Mount 4 segments (segment_1, segment_2, segment_3, segment_4) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
@@ -3339,7 +3365,7 @@ TEST_F(MasterServiceSnapshotTest, CopyStart) {
     [[maybe_unused]] const auto context4 =
         PrepareSimpleSegment(*service_, "segment_4");
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     // Test Case 1: CopyStart a non-existent key, should fail.
     auto copy_result =
@@ -3474,15 +3500,13 @@ TEST_F(MasterServiceSnapshotTest, CopyEnd) {
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyEnd a non-existent key, should fail.
     auto copy_end_result =
@@ -3589,13 +3613,11 @@ TEST_F(MasterServiceSnapshotTest, CopyRevoke) {
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: CopyRevoke a non-existent key, should fail.
     auto copy_revoke_result = service_->CopyRevoke(
@@ -3680,13 +3702,11 @@ TEST_F(MasterServiceSnapshotTest, MoveEnd) {
 
     // Mount 2 segments (segment_1, segment_2) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveEnd a non-existent key, should fail.
     auto move_end_result =
@@ -3762,13 +3782,11 @@ TEST_F(MasterServiceSnapshotTest, MoveRevoke) {
     service_.reset(new MasterService());
 
     // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
-    [[maybe_unused]] const auto context2 =
-        PrepareSimpleSegment(*service_, "segment_2");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
+    const auto context2 = PrepareSimpleSegment(*service_, "segment_2");
 
-    UUID client_id = generate_uuid();
-    UUID invalid_client_id = generate_uuid();
+    UUID client_id = context1.client_id;
+    UUID invalid_client_id = context2.client_id;
 
     // Test Case 1: MoveRevoke a non-existent key, should fail.
     auto move_revoke_result = service_->MoveRevoke(
@@ -3860,14 +3878,13 @@ TEST_F(MasterServiceSnapshotTest, MoveStart) {
 
     // Mount 3 segments (segment_1, segment_2, segment_3) with
     // PrepareSimpleSegment
-    [[maybe_unused]] const auto context1 =
-        PrepareSimpleSegment(*service_, "segment_1");
+    const auto context1 = PrepareSimpleSegment(*service_, "segment_1");
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2");
     [[maybe_unused]] const auto context3 =
         PrepareSimpleSegment(*service_, "segment_3");
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     // Test Case 1: MoveStart a non-existent key, should fail.
     auto move_start_result =
@@ -4011,12 +4028,12 @@ TEST_F(MasterServiceSnapshotTest, ProtectCopyMoveSourceFromEviction) {
     // 16 MB
     constexpr size_t kBaseAddr = 0x100000000;
     constexpr size_t kSegmentSize = 16 * 1024 * 1024;  // 16 MB
-    [[maybe_unused]] const auto context1 =
+    const auto context1 =
         PrepareSimpleSegment(*service_, "segment_1", kBaseAddr, kSegmentSize);
     [[maybe_unused]] const auto context2 =
         PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
 
-    UUID client_id = generate_uuid();
+    UUID client_id = context1.client_id;
 
     const std::string copy_key = "copy_key";
     const std::string move_key = "move_key";

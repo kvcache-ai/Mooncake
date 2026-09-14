@@ -17,18 +17,56 @@ target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
 target_link_libraries(transport_uint_test PUBLIC transfer_engine gtest
                                                  gtest_main)
+if(USE_TENT)
+  target_compile_definitions(transport_uint_test PRIVATE USE_TENT)
+endif()
 add_test(NAME transport_uint_test COMMAND transport_uint_test)
+
+# Hardware-free tests for FlagCX transport range and descriptor validation.
+add_executable(flagcx_transport_internal_test
+               ${WORKSPACE}/flagcx_transport_internal_test.cpp)
+target_include_directories(
+  flagcx_transport_internal_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/transport/flagcx_transport)
+target_link_libraries(flagcx_transport_internal_test PUBLIC gtest gtest_main)
+add_test(NAME flagcx_transport_internal_test
+         COMMAND flagcx_transport_internal_test)
 
 add_executable(endpoint_store_test ${WORKSPACE}/endpoint_store_test.cpp)
 target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
+# Fingerprint, blob and option checks run without a VMM backend.
+add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
+target_include_directories(
+  shared_segment_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
+target_link_libraries(shared_segment_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+add_test(NAME shared_segment_test COMMAND shared_segment_test)
+
 add_executable(rdma_endpoint_state_test
                ${WORKSPACE}/rdma_endpoint_state_test.cpp)
 target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
                                                       gtest_main)
 add_test(NAME rdma_endpoint_state_test COMMAND rdma_endpoint_state_test)
+
+# Hardware-free regression tests for peer-rail pausing and the local-WC context
+# breaker. Both are plain per-worker-pool state, so this runs on every CI runner
+# without an RDMA device.
+add_executable(worker_pool_rail_state_test
+               ${WORKSPACE}/worker_pool_rail_state_test.cpp)
+target_link_libraries(worker_pool_rail_state_test PUBLIC transfer_engine gtest
+                                                         gtest_main)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  # Control GID I/O to exercise recovery while completion failures arrive.
+  target_link_options(
+    worker_pool_rail_state_test
+    PRIVATE
+    "-Wl,--wrap=_ZN8mooncake11RdmaContext17refreshCurrentGidEPNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEES7_"
+  )
+endif()
+add_test(NAME worker_pool_rail_state_test COMMAND worker_pool_rail_state_test)
 
 # Integration test for the monitorWorker reclaim tick (issue #1845). Self-skips
 # when no RDMA device is present, so safe to register with ctest.
@@ -53,8 +91,27 @@ target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest
 # Regression test for #2017 (registerLocalMemory must auto-chunk buffers larger
 # than the device max_mr_size; loopback WRITE past the boundary must succeed).
 add_executable(rdma_large_mr_test ${WORKSPACE}/rdma_large_mr_test.cpp)
-target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest gtest_main )
-# add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA dev + metadata server
+target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+# add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA
+# dev + metadata server
+
+# Ctrl frame codec + sender credit ledger unit tests (no RDMA device required).
+add_executable(ctrl_frame_test ${WORKSPACE}/ctrl_frame_test.cpp)
+target_link_libraries(ctrl_frame_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME ctrl_frame_test COMMAND ctrl_frame_test)
+
+add_executable(sender_credit_test ${WORKSPACE}/sender_credit_test.cpp)
+target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME sender_credit_test COMMAND sender_credit_test)
+
+# CtrlChannel RDMA notify correctness. Self-skips without RDMA.
+add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
+target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags
+                                              glog::glog gtest)
+add_test(NAME rdma_notify_test COMMAND rdma_notify_test)
+set_tests_properties(rdma_notify_test PROPERTIES LABELS "rdma")
 
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
@@ -93,6 +150,18 @@ if(USE_CXL)
   add_test(NAME cxl_transport_test COMMAND cxl_transport_test)
 endif()
 
+add_executable(shm_transport_test ${WORKSPACE}/shm_transport_test.cpp)
+target_link_libraries(shm_transport_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME shm_transport_test COMMAND shm_transport_test)
+
+if(USE_TCP)
+  add_executable(shm_transport_e2e_test ${WORKSPACE}/shm_transport_e2e_test.cpp)
+  target_link_libraries(shm_transport_e2e_test PUBLIC transfer_engine gtest
+                                                      gtest_main)
+  add_test(NAME shm_transport_e2e_test COMMAND shm_transport_e2e_test)
+endif()
+
 if(USE_NVMEOF)
   add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
   target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
@@ -118,6 +187,17 @@ if(USE_TCP)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
+
+  if(USE_CUDA)
+    add_executable(tcp_cuda_staging_test ${WORKSPACE}/tcp_cuda_staging_test.cpp)
+    target_compile_definitions(tcp_cuda_staging_test
+                               PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
+    target_include_directories(tcp_cuda_staging_test
+                               PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+    target_link_libraries(tcp_cuda_staging_test PUBLIC transfer_engine gtest
+                                                       gtest_main CUDA::cudart)
+    add_test(NAME tcp_cuda_staging_test COMMAND tcp_cuda_staging_test)
+  endif()
 endif()
 
 add_executable(tcp_address_validation_test
@@ -135,10 +215,11 @@ target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
 add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
 
 # Hardware-free unit tests for DmabufExport struct and
-# RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner —
-# no RDMA device or GPU required (host-memory paths only).
+# RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner — no
+# RDMA device or GPU required (host-memory paths only).
 add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
-target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
+target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest
+                                                gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
 if(USE_MNNVL)
@@ -176,6 +257,12 @@ if(USE_EFA)
                  ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
   target_link_libraries(efa_single_nic_large_mr_test
                         PUBLIC transfer_engine gflags::gflags glog::glog)
+
+  add_executable(efa_large_mr_test ${WORKSPACE}/efa_large_mr_test.cpp)
+  target_link_libraries(efa_large_mr_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+  # No add_test(): needs EFA hardware plus MC_MAX_MR_SIZE=67108864 in the
+  # environment, same as rdma_large_mr_test.
 
   add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
   target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags
@@ -299,6 +386,12 @@ add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
 
+add_executable(glog_preinitialized_test
+               ${WORKSPACE}/glog_preinitialized_test.cpp)
+target_link_libraries(glog_preinitialized_test PUBLIC transfer_engine gtest
+                                                      gtest_main glog::glog)
+add_test(NAME glog_preinitialized_test COMMAND glog_preinitialized_test)
+
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)
@@ -369,15 +462,14 @@ target_link_libraries(show_links_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME show_links_test COMMAND show_links_test)
 
 # The NCCL transport library target compiles only host-side setup, while the
-# CUDA example that includes the device helpers is opt-in. This probe instantiates
-# one consumer kernel against both header-only NCCL and IBGDA helpers so a
-# call-shape regression fails the build. Keep nvcc optional for host-only
-# DeviceTransport builds that consume JIT kernels.
+# CUDA example that includes the device helpers is opt-in. This probe
+# instantiates one consumer kernel against both header-only NCCL and IBGDA
+# helpers so a call-shape regression fails the build. Keep nvcc optional for
+# host-only DeviceTransport builds that consume JIT kernels.
 if(USE_NCCL_DEVICE AND NOT USE_CXI)
   if(CMAKE_VERSION VERSION_LESS 3.18)
-    message(STATUS
-      "Skipping NCCL/IBGDA device API compatibility compile test: "
-      "CMake 3.18+ is required for CUDA C++17")
+    message(STATUS "Skipping NCCL/IBGDA device API compatibility compile test: "
+                   "CMake 3.18+ is required for CUDA C++17")
   else()
     include(CheckLanguage)
     check_language(CUDA)
@@ -385,18 +477,22 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
       enable_language(CUDA)
       add_library(device_backend_api_compatibility_test OBJECT
                   ${WORKSPACE}/device_backend_api_compatibility_test.cu)
-      target_include_directories(device_backend_api_compatibility_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-      target_link_libraries(device_backend_api_compatibility_test PRIVATE
-        NCCL::nccl)
-      target_compile_options(device_backend_api_compatibility_test PRIVATE
-        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
-      set_target_properties(device_backend_api_compatibility_test PROPERTIES
-        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
+      target_include_directories(device_backend_api_compatibility_test
+                                 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+      target_link_libraries(device_backend_api_compatibility_test
+                            PRIVATE NCCL::nccl)
+      target_compile_options(
+        device_backend_api_compatibility_test
+        PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+      set_target_properties(
+        device_backend_api_compatibility_test
+        PROPERTIES CUDA_STANDARD 17
+                   CUDA_STANDARD_REQUIRED ON
+                   CUDA_EXTENSIONS OFF)
     else()
-      message(STATUS
-        "Skipping NCCL/IBGDA device API compatibility compile test: "
-        "nvcc not found")
+      message(
+        STATUS "Skipping NCCL/IBGDA device API compatibility compile test: "
+               "nvcc not found")
     endif()
   endif()
 endif()

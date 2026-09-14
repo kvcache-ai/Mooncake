@@ -16,12 +16,15 @@ struct KvPair {
 enum class KvCompareKind {
     kValueEquals,
     kKeyNotExists,
+    kCreateRevisionEquals,
 };
 
 struct KvCompare {
     std::string key;
     KvCompareKind kind{KvCompareKind::kValueEquals};
     std::string expected_value;
+    // Used only by kCreateRevisionEquals.
+    EtcdRevisionId expected_revision{0};
 };
 
 struct KvTxn {

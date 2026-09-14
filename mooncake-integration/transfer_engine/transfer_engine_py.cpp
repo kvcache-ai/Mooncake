@@ -15,14 +15,18 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <numeric>
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "shared_segment_py.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
+#include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #endif
 
 #ifdef USE_EFA
@@ -35,6 +39,10 @@
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
+#endif
+
+#ifdef USE_MUSA
+#include "transport/musa_transport/musa_transport.h"
 #endif
 
 #ifdef USE_INTRA_NVLINK
@@ -50,13 +58,13 @@ static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
 //  Handle allocateMemory function pointer based on protocol
-void initMemoryAllocator(const char* protocol) {
+static bool initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
         LOG(WARNING) << "Memory allocator already initialized with: "
                      << g_protocol;
-        return;
+        return true;
     }
-    g_protocol = protocol;
+    if (protocol == nullptr) protocol = "";
     if (strcmp(protocol, "nvlink") == 0) {
 #ifdef USE_MNNVL
         allocateMemory = [](size_t s) -> void* {
@@ -68,6 +76,19 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+        return false;
+#endif
+    } else if (strcmp(protocol, "musa") == 0) {
+#ifdef USE_MUSA
+        allocateMemory = [](size_t s) -> void* {
+            return mooncake::MusaTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void* p) {
+            mooncake::MusaTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MUSA memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'musa' requires -DUSE_MUSA=ON";
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
 #ifdef USE_HIP
@@ -80,6 +101,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected HIP memory allocator";
 #else
         LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
@@ -93,12 +115,26 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        return false;
 #endif
     } else {
-        allocateMemory = malloc;
+        // Ascend SVM (_devmm_mem_remote_map) requires a 64KB page-aligned
+        // src_va. Fallback protocols (rdma/tcp/ascend) use posix_memalign to
+        // guarantee 64KB alignment, otherwise aclrtHostRegister fails with
+        // EINVAL on a misaligned address.
+        allocateMemory = [](size_t s) -> void* {
+            void* p = nullptr;
+            if (posix_memalign(&p, 64 * 1024, s) != 0) {
+                return nullptr;
+            }
+            return p;
+        };
         freeMemory = free;
-        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+        LOG(WARNING) << "Using 64KB-aligned malloc/free for protocol: "
+                     << protocol;
     }
+    g_protocol = protocol;
+    return true;
 }
 
 TransferEnginePy::TransferEnginePy() {
@@ -169,8 +205,6 @@ int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
                                  const char* device_name) {
-    initMemoryAllocator(protocol);
-
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
@@ -181,17 +215,19 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* protocol,
                                     const char* device_name,
                                     const char* metadata_type) {
-    if (strcmp(protocol, "xgmi") == 0) {
+    if (protocol != nullptr && strcmp(protocol, "xgmi") == 0) {
         LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
                    << "Use 'hip' instead.";
         return -1;
     }
+    if (!initMemoryAllocator(protocol)) return -1;
 
     std::string proto = protocol ? std::string(protocol) : "";
     std::string conn_string = buildConnString(metadata_type, metadata_server);
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
+    bool use_flagcx = (proto == "flagcx");
 
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
@@ -218,18 +254,18 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    engine_ = std::make_unique<TransferEngine>(!use_flagcx, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
         auto hostname_port = parseHostNameWithPort(local_hostname);
-        int ret =
-            engine_->init(conn_string, local_hostname,
-                          hostname_port.first.c_str(), hostname_port.second);
+        int ret = engine_->init(conn_string, local_hostname,
+                                hostname_port.first.c_str(),
+                                hostname_port.second, proto);
         if (ret) return -1;
     } else {
         // the last two params are unused
-        int ret = engine_->init(conn_string, local_hostname, "", 0);
+        int ret = engine_->init(conn_string, local_hostname, "", 0, proto);
         if (ret) return -1;
     }
 
@@ -244,6 +280,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "EFA transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
     } else {
         // For non-EFA protocols (e.g. TCP), manually install TCP transport
         // since auto_discover is disabled to prevent RDMA installation
@@ -267,6 +312,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
             return -1;
         }
         LOG(INFO) << "CXI transport installed successfully";
+    } else if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
     } else {
         // For non-EFA protocols (e.g. TCP), manually install TCP transport
         // since auto_discover is disabled to prevent RDMA installation
@@ -280,6 +334,17 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         }
         LOG(INFO) << "TCP transport installed successfully";
     }
+#else
+    if (use_flagcx) {
+        LOG(INFO)
+            << "Installing FlagCX transport as requested by protocol parameter";
+        auto transport = engine_->installTransport("flagcx", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install FlagCX transport";
+            return -1;
+        }
+        LOG(INFO) << "FlagCX transport installed successfully";
+    }
 #endif
 
     free_list_.resize(kSlabSizeKBTabLen);
@@ -289,6 +354,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
+    if (allocateMemory == nullptr || freeMemory == nullptr) {
+        LOG(ERROR) << "Memory allocator is not initialized";
+        return nullptr;
+    }
     auto buffer = allocateMemory(capacity);
     if (!buffer) return nullptr;
     int ret = engine_->registerLocalMemory(buffer, capacity, kWildcardLocation);
@@ -478,6 +547,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) {
+            engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
                 LOG(WARNING)
@@ -491,8 +561,8 @@ int TransferEnginePy::transferSync(const char* target_hostname,
             return -1;
         }
 
-        TransferStatus status;
         bool completed = false;
+        TransferStatus status;
         while (!completed) {
             Status s = engine_->getTransferStatus(batch_id, 0, status);
             LOG_ASSERT(s.ok());
@@ -504,8 +574,10 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
                 completed = true;
             }
+            if (completed) break;
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout =
                 transfer_timeout_nsec_ + length;  // 1GiB per second
@@ -514,6 +586,7 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                           << current_ts - start_ts << "ns, local buffer "
                           << (void*)buffer << " remote buffer "
                           << (void*)peer_buffer_address << " length " << length;
+                engine_->freeBatchID(batch_id);
                 return -1;
             }
         }
@@ -534,7 +607,11 @@ int TransferEnginePy::batchTransferSync(
             handle = handle_map_[target_hostname];
         } else {
             handle = engine_->openSegment(target_hostname);
-            if (handle == (Transport::SegmentHandle)-1) return -1;
+            if (handle == (Transport::SegmentHandle)-1) {
+                LOG(ERROR) << "batchTransferSync: openSegment failed for "
+                           << target_hostname;
+                return -1;
+            }
             handle_map_[target_hostname] = handle;
         }
     }
@@ -576,6 +653,10 @@ int TransferEnginePy::batchTransferSync(
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
+            LOG(ERROR) << "batchTransferSync: submitTransfer failed for "
+                       << target_hostname << " (batch of " << batch_size
+                       << " requests, " << total_length
+                       << " bytes): " << s.ToString();
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
@@ -590,9 +671,8 @@ int TransferEnginePy::batchTransferSync(
             return -1;
         }
 
-        TransferStatus status;
         bool completed = false;
-        bool already_freed = false;
+        TransferStatus status;
         while (!completed) {
             Status s = engine_->getBatchTransferStatus(batch_id, status);
             LOG_ASSERT(s.ok());
@@ -600,13 +680,18 @@ int TransferEnginePy::batchTransferSync(
                 engine_->freeBatchID(batch_id);
                 return 0;
             } else if (status.s == TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "batchTransferSync: transfer FAILED for "
+                           << target_hostname << " (batch of " << batch_size
+                           << " requests, " << total_length
+                           << " bytes) on retry " << retry << "/" << max_retry;
                 engine_->freeBatchID(batch_id);
-                already_freed = true;
                 completed = true;
             } else if (status.s == TransferStatusEnum::TIMEOUT) {
                 LOG(INFO) << "Sync data transfer timeout";
+                engine_->freeBatchID(batch_id);
                 completed = true;
             }
+            if (completed) break;
             auto current_ts = getCurrentTimeInNano();
             const int64_t timeout =
                 transfer_timeout_nsec_ + total_length;  // 1GiB per second
@@ -616,13 +701,14 @@ int TransferEnginePy::batchTransferSync(
                 // TODO: as @doujiang24 mentioned, early free(while there are
                 // still waiting tasks) the batch_id may fail and cause memory
                 // leak(a known issue).
-                if (!already_freed) {
-                    engine_->freeBatchID(batch_id);
-                }
+                engine_->freeBatchID(batch_id);
                 return -1;
             }
         }
     }
+    LOG(ERROR) << "batchTransferSync: all " << max_retry
+               << " retries exhausted for " << target_hostname << " (batch of "
+               << batch_size << " requests, " << total_length << " bytes)";
     return -1;
 }
 
@@ -1067,14 +1153,39 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     pybind11::gil_scoped_release release;
     auto device_name_safe = device_name ? std::string(device_name) : "";
+
+    const bool use_tent =
+        getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
+#ifdef USE_TENT
+    if (use_tent) {
+        // The classic shim (TransferEngine(true, filter)) silently drops the
+        // filter on the TENT path and builds its own Config in init(), so
+        // inject the whitelist via the per-instance Config that TENT's public
+        // constructor already accepts. Avoids touching the process-global
+        // MC_TE_FILTERS env var (racey under concurrent callers, leaked on
+        // throw). Note: if MC_TE_FILTERS is also set in env, loadFromEnv()
+        // inside TransferEngineImpl will override this — env takes priority.
+        auto conf = std::make_shared<mooncake::tent::Config>();
+        conf->set("metadata_type", "p2p");
+        if (!device_name_safe.empty()) {
+            conf->set("topology/rdma_whitelist",
+                      std::vector<std::string>{device_name_safe});
+        }
+        mooncake::tent::TransferEngine tent_engine(conf);
+        return tent_engine.available() ? tent_engine.getLocalTopologyString()
+                                       : "{}";
+    }
+#else
+    (void)use_tent;
+#endif
+
+    // Classic path: device_filter is honored by classic TransferEngineImpl.
     auto device_filter = buildDeviceFilter(device_name_safe);
     std::shared_ptr<TransferEngine> tmp_engine =
         std::make_shared<TransferEngine>(true, device_filter);
-
     std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
     tmp_engine->init(metadata_conn_string, local_server_name);
-
-    return tmp_engine->getLocalTopology()->toString();
+    return tmp_engine->getLocalTopologyString();
 }
 
 std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
@@ -1098,6 +1209,16 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
     if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+
+    if (engine_->isUsingTent()) {
+        auto handle = engine_->openSegment(peer_server_name);
+        if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+            return -1;
+        auto liveness = engine_->probePeerAliveByID(handle);
+        engine_->closeSegment(handle);
+        return static_cast<int>(liveness);
+    }
+
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 
@@ -1132,6 +1253,12 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_MNNVL") = true;
 #else
     m.attr("SUPPORT_MNNVL") = false;
+#endif
+
+#ifdef USE_MUSA
+    m.attr("SUPPORT_MUSA") = true;
+#else
+    m.attr("SUPPORT_MUSA") = false;
 #endif
 
 #ifdef USE_INTRA_NVLINK
@@ -1272,6 +1399,8 @@ PYBIND11_MODULE(engine, m) {
 
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
+
+    mooncake::bind_shared_segment(m);
 
     // Bind RpcInterface (this also registers ReceivedData, ReceivedTensor, and
     // factory functions)

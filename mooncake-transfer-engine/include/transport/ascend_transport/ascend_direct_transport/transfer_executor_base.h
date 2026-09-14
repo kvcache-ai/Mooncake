@@ -79,7 +79,7 @@ class TransferExecutorBase {
     void processSliceList(const std::vector<Transport::Slice*>& slice_list);
 
     int registerMem(void* addr, size_t length, adxl::MemType mem_type,
-                    bool use_buffer_pool, bool roce_mode, bool agent_mode);
+                    bool use_buffer_pool);
     int deregisterMem(void* addr);
 
     const size_t getNumEngines() const { return adxl_engines_.size(); }
@@ -105,7 +105,9 @@ class TransferExecutorBase {
                    int32_t timeout_in_millis);
     std::string resolveTargetAdxlEngineName(
         const std::shared_ptr<TransferMetadata::SegmentDesc>& segment_desc,
-        size_t engine_idx) const;
+        uint64_t dest_addr) const;
+    void processHomogeneousSliceList(
+        const std::vector<Transport::Slice*>& slice_list);
 
     InitParams params_;
     std::unique_ptr<LocalCopyEngine> local_copy_engine_;

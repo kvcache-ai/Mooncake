@@ -13,12 +13,16 @@
 // limitations under the License.
 
 #include "tent/device_plugin.h"
+#include "tent/runtime/amd_location.h"
 
 #include <hip/hip_runtime.h>
 #include <string.h>
 #include <stdio.h>
 #include <string>
 #include <glog/logging.h>
+
+using mooncake::tent::isAmdGpuLocationType;
+using mooncake::tent::kAmdGpuLocationType;
 
 struct rocm_plugin_ctx_t {
     // reserved
@@ -73,7 +77,7 @@ static int rocm_destroy_plugin(void* handle) {
 static int rocm_alloc(void* ctx_, void** pptr, size_t size, const char* loc) {
     (void)ctx_;
     LocationParser location(loc);
-    if (location.type() != "rocm") return -1;
+    if (!isAmdGpuLocationType(location.type())) return -1;
     int hip_dev = 0;
     CHECK_HIP(hipGetDevice(&hip_dev));
     CHECK_HIP(hipSetDevice(location.index()));
@@ -109,7 +113,8 @@ static int rocm_query_location(void* ctx_, void* addr, size_t size,
     if (err != hipSuccess || attr.type != hipMemoryTypeDevice) return 0;
     buf[0].start = addr;
     buf[0].length = size;
-    snprintf(buf[0].location, LOCATION_LEN, "rocm:%d", attr.device);
+    snprintf(buf[0].location, LOCATION_LEN, "%s:%d", kAmdGpuLocationType,
+             attr.device);
     return 1;
 }
 
@@ -133,7 +138,7 @@ static int rocm_get_device_pci_bus_id(void* ctx_, int device_index,
 extern "C" int tent_register_device_plugin(device_plugin_t* out) {
     if (!out) return -1;
     memset(out, 0, sizeof(*out));
-    out->class_name = "rocm";
+    out->class_name = kAmdGpuLocationType;
     out->create_plugin = rocm_create_plugin;
     out->destroy_plugin = rocm_destroy_plugin;
     out->alloc = rocm_alloc;

@@ -1,13 +1,8 @@
 #include "registered_pinned_memory.h"
 
-#include <cstdlib>
 #include <string>
-#include <string_view>
 
 #include <glog/logging.h>
-
-#include "ascii_string.h"
-#include "integer_parser.h"
 
 #if defined(USE_CUDA)
 #include <cuda_runtime_api.h>
@@ -15,20 +10,6 @@
 
 namespace mooncake {
 namespace {
-
-std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
-    const char* raw_value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
-    if (!raw_value || raw_value[0] == '\0') return {false, 0};
-
-    const auto limit =
-        TryParseInteger<uint64_t>(TrimAsciiWhitespace(raw_value));
-    if (!limit.has_value()) {
-        LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << raw_value
-                     << "', disabling Store segment pinning";
-        return {false, 0};
-    }
-    return {*limit != 0, *limit};
-}
 
 void LogPinSkip(const std::string& owner, const char* reason, size_t size) {
     LOG(WARNING) << "Skip cudaHostRegister for " << owner << ": " << reason
@@ -88,18 +69,18 @@ RegisteredPinnedMemoryManager& RegisteredPinnedMemoryManager::instance() {
 }
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager()
-    : RegisteredPinnedMemoryManager(ParsePinnedMemoryConfig(),
-                                    DefaultPinOps()) {}
+    : RegisteredPinnedMemoryManager(
+          RegisteredPinnedMemoryConfig::FromEnvironment(), DefaultPinOps()) {}
 
 RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
-    std::pair<bool, uint64_t> config, PinOps pin_ops)
-    : enabled_(config.first), limit_bytes_(config.second), pin_ops_(pin_ops) {
+    RegisteredPinnedMemoryConfig config, PinOps pin_ops)
+    : limit_bytes_(config.max_bytes), pin_ops_(pin_ops) {
 #if defined(USE_CUDA)
     LOG(INFO) << "Store segment pinned memory is "
-              << (enabled_ ? "enabled" : "disabled")
+              << (limit_bytes_ != 0 ? "enabled" : "disabled")
               << ", max_bytes=" << limit_bytes_;
 #else
-    if (enabled_) {
+    if (limit_bytes_ != 0) {
         LOG(INFO) << "Store segment pinning requested but this build has no "
                      "CUDA runtime support";
     }
@@ -108,7 +89,7 @@ RegisteredPinnedMemoryManager::RegisteredPinnedMemoryManager(
 
 std::shared_ptr<RegisteredPinnedRegion> RegisteredPinnedMemoryManager::try_pin(
     void* addr, size_t size, const std::string& owner) {
-    if (!addr || size == 0 || !enabled_) return nullptr;
+    if (!addr || size == 0 || limit_bytes_ == 0) return nullptr;
     if (!pin_ops_.register_region || !pin_ops_.unregister_region) {
         return nullptr;
     }

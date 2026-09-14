@@ -122,6 +122,7 @@ The admin HTTP server runs on `metrics_port` (default: **9003**) and exposes the
 | `GET /metrics` | `text/plain; version=0.0.4` | All metrics in Prometheus exposition format |
 | `GET /metrics/summary` | `text/plain; version=0.0.4` | Human-readable summary (same content as the periodic log) |
 | `GET /health` | `application/json` | Health check with role, HA state, and service readiness |
+| `GET /version` | `application/json` | Master version (`version` for RPC compatibility, `display_version` for release + git hash) |
 | `GET /role` | `text/plain` | Current HA role (`leader` / `standby`) |
 | `GET /ha_status` | `text/plain` | Current HA runtime state (`serving` / `starting` / etc.) |
 
@@ -150,6 +151,9 @@ curl http://<master-host>:9003/metrics/summary
 
 # Check health
 curl http://<master-host>:9003/health
+
+# Check version
+curl http://<master-host>:9003/version
 ```
 
 ### Configuration
@@ -198,12 +202,22 @@ For `mooncake.mooncake_store_service`, set
 | `GET /health` | `application/json` | Client health check |
 | `GET /metrics` | `text/plain; version=0.0.4` | Prometheus-format client metrics |
 | `GET /metrics/summary` | `text/plain` | Human-readable client metrics summary |
+| `GET /version` | `application/json` | Client version (`version` for RPC compatibility, `display_version` for release + git hash) |
 
 ```bash
 curl http://<client-host>:9300/health
 curl http://<client-host>:9300/metrics
 curl http://<client-host>:9300/metrics/summary
+curl http://<client-host>:9300/version
 ```
+
+```json
+{"version":"2.0.0","display_version":"0.3.12.post1 (git: f9e8311f)"}
+```
+
+`/version` does not depend on client metric collection or on a fully
+initialized client, so it stays available whenever the client HTTP server is
+running.
 
 Set `MC_STORE_CLIENT_METRIC=0` to disable client metric collection. If the
 client HTTP server remains enabled while metrics are disabled, `/metrics` and

@@ -122,10 +122,15 @@ class CudaPlatform : public Platform {
 
     virtual const std::string type() const { return "cuda"; }
 
+    Status synchronizeDevices(const Topology* topology) override;
+
     Status getStreamFromPool(CUDAStreamHandle& outHandle,
                              int deviceId = CUDAStreamPool::kCurrentDevice);
 
    private:
+    // Device owning `addr`, or kCurrentDevice when `addr` is not device memory.
+    int getPointerDeviceId(void* addr);
+
     std::shared_ptr<Config> conf;
     CUDAStreamPool stream_pool;
 };

@@ -1,4 +1,4 @@
-# Mooncake Conductor Architecture
+# Mooncake Conductor
 
 ## Overview
 

@@ -131,14 +131,18 @@ class RdmaContext {
     int registerMemoryRegion(void *addr, size_t length, int access,
                              const DmabufExport &exp);
 
-    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // Exports a single dma_buf fd covering [addr, addr + length). GPU device
     // memory yields kDmabufReg with a live fd; host memory and the
     // nvidia-peermem path yield kHostReg with no fd. Any fd placed in out.fd
     // MUST be closed by the caller (via closeDmabufExport) AFTER every
     // registerMemoryRegion() call consuming it has returned — each successful
     // registration takes its own reference, so closing earlier would invalidate
     // the fd for the remaining NICs.
-    static int exportDmabuf(void *addr, DmabufExport &out);
+    // `length` is the length of the whole buffer the caller is going to
+    // register (chunked registrations derive their own offset from out.offset),
+    // and is used to guarantee the exported dma_buf really covers that range —
+    // see the VMM note in exportDmabuf().
+    static int exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);
@@ -173,6 +177,10 @@ class RdmaContext {
    public:
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
+    std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path,
+                                           int cq_index);
+    std::shared_ptr<RdmaEndPoint> findEndpoint(
+        const std::string &peer_nic_path);
 
     std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr);
@@ -260,13 +268,20 @@ class RdmaContext {
 
     int eventFd() const { return event_fd_; }
 
-    ibv_cq *cq();
+    ibv_cq *cq(int cq_index);
 
     std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
     }
 
     int cqCount() const { return cq_list_.size(); }
+    int postingThreadForPeer(const std::string &peer_nic_path) const;
+    int cqIndexForPostingThread(int thread_id) const;
+    int cqIndexForPeer(const std::string &peer_nic_path) const;
+    int transferWorkerCount() const { return transfer_worker_count_; }
+    std::unique_lock<std::mutex> lockEndpointLifecycle(
+        const std::string &peer_nic_path) const;
+    std::vector<std::unique_lock<std::mutex>> lockAllEndpointLifecycles() const;
 
     int poll(int num_entries, ibv_wc *wc, int cq_index = 0);
 
@@ -329,7 +344,9 @@ class RdmaContext {
 
     std::atomic<int> next_comp_channel_index_;
     std::atomic<int> next_comp_vector_index_;
-    std::atomic<int> next_cq_list_index_;
+
+    int transfer_worker_count_ = 0;
+    std::vector<std::unique_ptr<std::mutex>> endpoint_lifecycle_locks_;
 
     std::shared_ptr<WorkerPool> worker_pool_;
 

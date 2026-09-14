@@ -13,7 +13,7 @@
 #include "mutex.h"
 #include "rpc_service.h"
 #include "types.h"
-#include "utils/scoped_vlog_timer.h"
+#include "common/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
 #include "version.h"
 
@@ -218,6 +218,11 @@ struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
+    static constexpr const char* value = "UnmountLocalDiskSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
     static constexpr const char* value = "OffloadObjectHeartbeat";
 };
@@ -256,15 +261,27 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::CopyStart> {
     static constexpr const char* value = "CopyStart";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyStart> {
+    static constexpr const char* value = "DynamicReplicaCopyStart";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
     static constexpr const char* value = "CopyEnd";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyEnd> {
+    static constexpr const char* value = "DynamicReplicaCopyEnd";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
     static constexpr const char* value = "CopyRevoke";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyRevoke> {
+    static constexpr const char* value = "DynamicReplicaCopyRevoke";
 };
 
 template <>
@@ -323,9 +340,9 @@ struct RpcNameTraits<&WrappedMasterService::PollRemoveAll> {
 };
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
-tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
-
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_client_pool(
+    const std::shared_ptr<RpcClientPool::ClientPool>& client_pool,
+    Args&&... args) {
     // Increment RPC counter
     if (metrics_) {
         metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
@@ -334,7 +351,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto start_time = std::chrono::steady_clock::now();
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            auto ret = co_await pool->send_request(
+            auto ret = co_await client_pool->send_request(
                 [&](coro_io::client_reuse_hint,
                     coro_rpc::coro_rpc_client& client) {
                     return client.send_request<ServiceMethod>(
@@ -363,6 +380,19 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
             }
             co_return result->result();
         }());
+}
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc_with_pool(
+    RpcClientPool& client_accessor, Args&&... args) {
+    return invoke_rpc_with_client_pool<ServiceMethod, ReturnType>(
+        client_accessor.GetClientPool(), std::forward<Args>(args)...);
+}
+
+template <auto ServiceMethod, typename ReturnType, typename... Args>
+tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
+    return invoke_rpc_with_pool<ServiceMethod, ReturnType>(
+        client_accessor_, std::forward<Args>(args)...);
 }
 
 template <auto ServiceMethod, typename ResultType, typename... Args>
@@ -418,19 +448,34 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
 
 MasterClient::~MasterClient() = default;
 
+void MasterClient::EnableHaConnectionPolicy() {
+    MutexLocker lock(&connect_mutex_);
+    if (!client_addr_param_.empty()) {
+        ha_control_client_accessor_.GetOrCreateClientPool(client_addr_param_);
+    }
+    ha_connection_policy_enabled_.store(true, std::memory_order_release);
+}
+
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
     MutexLocker lock(&connect_mutex_);
-    if (client_addr_param_ != master_addr) {
+    const bool use_ha_control_pool =
+        ha_connection_policy_enabled_.load(std::memory_order_acquire);
+    if (use_ha_control_pool) {
+        ha_probe_client_accessor_.GetOrCreateClientPool(master_addr);
+    } else {
         client_accessor_.GetOrCreateClientPool(master_addr);
-        client_addr_param_ = master_addr;
     }
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result =
-        invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
+        use_ha_control_pool
+            ? invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
+                                   std::string>(ha_probe_client_accessor_)
+            : invoke_rpc_with_pool<&WrappedMasterService::ServiceReady,
+                                   std::string>(client_accessor_);
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
@@ -444,6 +489,13 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
         timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
         return ErrorCode::INVALID_VERSION;
     }
+    if (use_ha_control_pool) {
+        // Only move foreground traffic after the fast control-plane probe has
+        // established that the new leader is ready and version-compatible.
+        client_accessor_.GetOrCreateClientPool(master_addr);
+        ha_control_client_accessor_.GetOrCreateClientPool(master_addr);
+    }
+    client_addr_param_ = master_addr;
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
 }
@@ -892,8 +944,17 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
     timer.LogRequest("client_id=", client_id_);
 
+    std::shared_ptr<RpcClientPool::ClientPool> ping_pool;
+    {
+        MutexLocker lock(&connect_mutex_);
+        ping_pool =
+            ha_connection_policy_enabled_.load(std::memory_order_acquire)
+                ? ha_control_client_accessor_.GetClientPool()
+                : client_accessor_.GetClientPool();
+    }
     auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
+        invoke_rpc_with_client_pool<&WrappedMasterService::Ping, PingResponse>(
+            ping_pool, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -938,6 +999,18 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
             client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegment(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountLocalDiskSegment");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::UnmountLocalDiskSegment, void>(
+            client_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1126,6 +1199,26 @@ tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
     return result;
 }
 
+tl::expected<CopyStartResponse, ErrorCode>
+MasterClient::DynamicReplicaCopyStart(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyStart");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", src_segment=", src_segment,
+                     ", tgt_segments_count=", tgt_segments.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::DynamicReplicaCopyStart,
+                             CopyStartResponse>(
+        client_id_, key, tenant_id, src_segment, tgt_segments,
+        dynamic_replication_lease_id, dynamic_replication_version_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     const UUID& task_id) {
     ScopedVLogTimer timer(1, "MasterClient::QueryTask");
@@ -1153,6 +1246,21 @@ tl::expected<void, ErrorCode> MasterClient::CopyEnd(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::DynamicReplicaCopyEnd(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyEnd");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::DynamicReplicaCopyEnd, void>(
+            client_id_, key, tenant_id, dynamic_replication_lease_id,
+            dynamic_replication_version_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
     size_t batch_size) {
     ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
@@ -1175,6 +1283,21 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(
 
     auto result = invoke_rpc<&WrappedMasterService::CopyRevoke, void>(
         client_id_, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::DynamicReplicaCopyRevoke(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyRevoke");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::DynamicReplicaCopyRevoke, void>(
+            client_id_, key, tenant_id, dynamic_replication_lease_id,
+            dynamic_replication_version_epoch);
     timer.LogResponseExpected(result);
     return result;
 }

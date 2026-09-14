@@ -8,7 +8,6 @@
 #include "e2e_utils.h"
 #include "process_handler.h"
 #include "types.h"
-#include "utils.h"
 
 // Command line flags
 USE_engine_flags;

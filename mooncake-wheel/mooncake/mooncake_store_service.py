@@ -12,6 +12,11 @@ from aiohttp import web
 from mooncake.store import MooncakeDistributedStore
 from mooncake.mooncake_config import MooncakeConfig
 
+# Caps a caller's /api/unmount_local_disk grace period so a malformed value
+# (e.g. milliseconds passed where seconds are expected) blocks a preStop hook
+# for minutes rather than hours.
+_MAX_UNMOUNT_LOCAL_DISK_GRACE_PERIOD_SECONDS = 3600
+
 
 def _timed_handler(operation_name, handler):
     async def wrapper(request):
@@ -250,6 +255,12 @@ class MooncakeStoreService:
                 web.post("/api/mount", _timed_handler("MOUNT", self.handle_mount)),
                 web.post(
                     "/api/unmount", _timed_handler("UNMOUNT", self.handle_unmount)
+                ),
+                web.post(
+                    "/api/unmount_local_disk",
+                    _timed_handler(
+                        "UNMOUNT_LOCAL_DISK", self.handle_unmount_local_disk
+                    ),
                 ),
                 web.put("/api/put", _timed_handler("PUT", self.handle_put)),
                 web.get("/api/get/{key}", _timed_handler("GET", self.handle_get)),
@@ -608,6 +619,74 @@ class MooncakeStoreService:
             )
         except Exception as e:
             logging.error("UNMOUNT error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+            )
+
+    async def handle_unmount_local_disk(self, request):
+        """Deregister this store's SSD offload tier before the process goes away.
+
+        Meant for a preStop hook. The master stops naming this store as the
+        owner of its offloaded keys, so a reader gets a clean miss instead of a
+        peer that is about to disappear; the call then holds for
+        grace_period_seconds so offload reads already in flight finish here.
+        Runs off the event loop because that wait is seconds long.
+        """
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": "Malformed JSON body"}),
+                content_type="application/json",
+            )
+        if not isinstance(data, dict):
+            return web.Response(
+                status=400,
+                text=json.dumps({"error": "Request body must be a JSON object"}),
+                content_type="application/json",
+            )
+
+        grace_period_seconds = data.get("grace_period_seconds", 0)
+        if (
+            type(grace_period_seconds) is not int
+            or grace_period_seconds < 0
+            or grace_period_seconds > _MAX_UNMOUNT_LOCAL_DISK_GRACE_PERIOD_SECONDS
+        ):
+            return web.Response(
+                status=400,
+                text=json.dumps(
+                    {
+                        "error": (
+                            "Invalid grace_period_seconds, must be a non-negative "
+                            "integer no greater than "
+                            f"{_MAX_UNMOUNT_LOCAL_DISK_GRACE_PERIOD_SECONDS}"
+                        )
+                    }
+                ),
+                content_type="application/json",
+            )
+
+        try:
+            ret = await asyncio.to_thread(
+                self.store.unmount_local_disk_segment, grace_period_seconds
+            )
+            if ret != 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps({"error": f"Unmount local disk failed, ret={ret}"}),
+                    content_type="application/json",
+                )
+
+            return web.Response(
+                status=200,
+                text=json.dumps({"status": "success"}),
+                content_type="application/json",
+            )
+        except Exception as e:
+            logging.error("UNMOUNT_LOCAL_DISK error: %s", e)
             return web.Response(
                 status=500,
                 text=json.dumps({"error": str(e)}),

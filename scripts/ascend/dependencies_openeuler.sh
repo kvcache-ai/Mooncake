@@ -72,8 +72,7 @@ echo -e "${YELLOW}Mooncake openEuler Dependencies Installer${NC}"
 echo "Repository root: ${REPO_ROOT}"
 echo "This script installs (same scope as root dependencies.sh):"
 echo "  - openEuler/RHEL system packages (dnf/yum)"
-echo "  - Git submodules (pybind11, yalantinglibs, ...)"
-echo "  - yalantinglibs (from extern/ submodule)"
+echo "  - Git submodules (pybind11)"
 echo "  - Go ${GOVER} (for USE_ETCD / libetcd_wrapper.so)"
 echo "Run scripts/ascend/dependencies_ascend_installation.sh afterward for Ascend extras."
 echo
@@ -206,34 +205,6 @@ if [ "$submodule_updated" != true ]; then
     print_error "git submodule update failed (direct GitHub and mirrors exhausted)"
 fi
 print_success "Git submodules initialized"
-
-print_section "Installing yalantinglibs from extern/ submodule"
-if [ -d "${REPO_ROOT}/extern/yalantinglibs" ]; then
-    cd "${REPO_ROOT}/extern/yalantinglibs"
-    rm -rf build
-    mkdir -p build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    check_success "Failed to configure yalantinglibs"
-    cmake --build . -j"$(nproc)"
-    check_success "Failed to build yalantinglibs"
-    cmake --install .
-    check_success "Failed to install yalantinglibs"
-    print_success "yalantinglibs installed from submodule"
-    cd "${REPO_ROOT}"
-else
-    print_warn "extern/yalantinglibs missing, building from upstream clone"
-    mkdir -p "${DEPS_BUILD_DIR}"
-    cd "${DEPS_BUILD_DIR}"
-    clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
-    cd yalantinglibs
-    git checkout 0.5.5
-    rm -rf build && mkdir -p build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    cmake --build . -j"$(nproc)"
-    cmake --install .
-    cd "${REPO_ROOT}"
-    print_success "yalantinglibs installed from git clone"
-fi
 
 print_section "Verifying essential build tools"
 for tool in getconf ldd patchelf cmake git; do

@@ -68,6 +68,8 @@ expect_failure 1 "ha-payload-bytes must be positive" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-payload-bytes 0
 expect_failure 1 "ha-pressure-sec must be positive" \
   "$SCRIPT" ha-failover-smoke --build-dir "$TEST_ROOT" --ha-pressure-sec 0
+expect_failure 1 "snapshot-chunk-object-count must be positive" \
+  "$SCRIPT" up --build-dir "$TEST_ROOT" --snapshot-chunk-object-count 0
 expect_failure 1 "memory-allocator must be offset or cachelib" \
   "$SCRIPT" allocator-recovery-smoke --build-dir "$TEST_ROOT" \
   --memory-allocator invalid
@@ -126,5 +128,42 @@ tr '\0' ' ' <"/proc/$MATCH_PID/cmdline" >"$MATCH_RUN/pids/master-0.cmd"
 expect_success "cluster is stopped" "$SCRIPT" down --run-dir "$MATCH_RUN"
 kill -0 "$MATCH_PID" 2>/dev/null && fail "matching PID was not stopped"
 expect_success "cluster is stopped" "$SCRIPT" down --run-dir "$MATCH_RUN"
+
+# Execute start_master with a fake binary, including both environment paths.
+FAKE_MASTER="$TEST_ROOT/fake-master"
+cat >"$FAKE_MASTER" <<'MASTER'
+#!/usr/bin/env bash
+[[ "$MOONCAKE_SNAPSHOT_LOCAL_PATH" == "$EXPECTED_SNAPSHOT_PATH" ]]
+[[ "${MOONCAKE_TEST_FAILPOINT_DIR:-}" == "$EXPECTED_FAILPOINT_PATH" ]]
+[[ "$*" == *"--enable_oplog_snapshot=true"* ]]
+MASTER
+chmod +x "$FAKE_MASTER"
+for failpoints in "" "$TEST_ROOT/failpoints"; do
+  (
+    source "$SCRIPT"
+    parse_up_options --build-dir "$TEST_ROOT" --run-dir "$TEST_ROOT/env-run" \
+      --enable-oplog-snapshot --snapshot-chunk-object-count 2
+    MASTER_BIN="$FAKE_MASTER"
+    ETCD_ENDPOINTS=127.0.0.1:1
+    RPC_PORTS=(10001)
+    ADMIN_PORTS=(10002)
+    FAILPOINT_DIR="$failpoints"
+    export EXPECTED_SNAPSHOT_PATH="$RUN_DIR/snapshots"
+    export EXPECTED_FAILPOINT_PATH="$failpoints"
+    start_process() { shift; "$@"; }
+    start_master 0
+  ) || fail "snapshot environment propagation failed"
+done
+
+(
+  source "$SCRIPT"
+  RUN_DIR="$TEST_ROOT/old-run"
+  mkdir -p "$RUN_DIR"
+  printf 'RPC_PORTS=10001\nADMIN_PORTS=10002\nBUILD_DIR=/unused\n' >"$RUN_DIR/cluster.env"
+  unset ENABLE_OPLOG_SNAPSHOT SNAPSHOT_CHUNK_OBJECT_COUNT
+  load_cluster_env
+  [[ "$ENABLE_OPLOG_SNAPSHOT" == false ]]
+  [[ "$SNAPSHOT_CHUNK_OBJECT_COUNT" == 1000000 ]]
+) || fail "older cluster.env did not retain pure OpLog defaults"
 
 echo "PASS"

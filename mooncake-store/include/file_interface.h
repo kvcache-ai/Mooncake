@@ -184,12 +184,11 @@ class PosixFile : public StorageFile {
 #ifdef USE_URING
 /**
  * @class UringFile
- * @brief StorageFile backed by a process-wide shared io_uring ring.
+ * @brief StorageFile backed by a thread-local io_uring ring.
  *
- * All UringFile instances share a single SharedUringRing singleton, so
- * construction and destruction only register/unregister an fd slot — no
- * per-file io_uring_queue_init / io_uring_queue_exit (no mmap/munmap,
- * no TLB shootdown).
+ * UringFile instances used by the same thread share one ring. Each thread
+ * lazily creates its own ring, avoiding cross-thread submission locks and
+ * per-file io_uring_queue_init / io_uring_queue_exit.
  */
 class UringFile : public StorageFile {
    public:
@@ -222,8 +221,11 @@ class UringFile : public StorageFile {
         void *buf;
         size_t len;
         off_t off;
+        size_t bytes_read = 0;
+        ErrorCode error = ErrorCode::OK;
+        bool completed = false;
     };
-    tl::expected<size_t, ErrorCode> batch_read(const ReadDesc *descs, int cnt);
+    tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.

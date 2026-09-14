@@ -14,6 +14,43 @@ struct ObjectMeta {
 };
 YLT_REFL(ObjectMeta, key, object_checksum);
 
+enum class ReplicaActionType {
+    ADD = 0,
+};
+
+struct ReplicaActionProposal {
+    ReplicaActionType action{ReplicaActionType::ADD};
+    UUID proposal_id{};
+    std::string tenant_id{"default"};
+    std::string key;
+    std::string requester_domain;
+    uint64_t observed_version_epoch{0};
+    uint64_t object_size_bytes{0};
+    std::string target_domain;
+    std::optional<std::string> preferred_target_segment;
+    int64_t expire_at_ms_epoch{0};
+};
+YLT_REFL(ReplicaActionProposal, action, proposal_id, tenant_id, key,
+         requester_domain, observed_version_epoch, object_size_bytes,
+         target_domain, preferred_target_segment, expire_at_ms_epoch);
+
+struct ReplicaActionLease {
+    UUID proposal_id{};
+    UUID lease_id{};
+    ReplicaActionType action{ReplicaActionType::ADD};
+    std::string tenant_id{"default"};
+    std::string key;
+    std::string source_segment;
+    std::string target_segment;
+    std::string target_domain;
+    uint64_t version_epoch{0};
+    int64_t expire_at_ms_epoch{0};
+    UUID task_id{};
+};
+YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
+         source_segment, target_segment, target_domain, version_epoch,
+         expire_at_ms_epoch, task_id);
+
 /**
  * @brief Response structure for Ping operation
  */

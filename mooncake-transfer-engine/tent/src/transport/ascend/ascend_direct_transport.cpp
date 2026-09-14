@@ -360,8 +360,13 @@ void AscendDirectTransport::startTransfer(
         LOG(ERROR) << "Failed to transfer to: " << remote_hixl
                    << ", status: " << hixl_ret
                    << ", errmsg: " << aclGetRecentErrMsg();
-        // disconnect to remote when transfer fail
-        disconnect(remote_hixl, 10);
+        // AutoConnect tears down failed routes inside HIXL. Calling
+        // Disconnect again is redundant; only discard our local bookkeeping.
+        if (auto_connect_) {
+            forgetConnectedSegment(remote_hixl);
+        } else {
+            disconnect(remote_hixl, 10);
+        }
         for (auto &task : tasks) {
             task->status_word = TransferStatusEnum::FAILED;
         }
@@ -430,7 +435,13 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
             LOG(ERROR) << "Get transfer status failed, ret: "
                        << hixlTransferStatusToString(xfer_status)
                        << ", errmsg: " << aclGetRecentErrMsg();
-            disconnect(task.remote_hixl, 10);
+            // HIXL DisconnectOnError has already handled AutoConnect failures.
+            // Explicit application timeouts still use disconnect() above.
+            if (auto_connect_) {
+                forgetConnectedSegment(task.remote_hixl);
+            } else {
+                disconnect(task.remote_hixl, 10);
+            }
             task.status_word = TransferStatusEnum::FAILED;
         }
         if (task.batch_size > 1) {
@@ -472,6 +483,12 @@ void AscendDirectTransport::disconnect(const std::string &remote_hixl,
                        << ", errmsg: " << aclGetRecentErrMsg();
         }
     }
+}
+
+void AscendDirectTransport::forgetConnectedSegment(
+    const std::string &remote_hixl) {
+    std::lock_guard<std::mutex> lock(connection_mutex_);
+    connected_segments_.erase(remote_hixl);
 }
 
 Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,

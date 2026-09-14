@@ -43,9 +43,22 @@ class RdmaEndPoint;
 class EndpointStore;
 class RdmaTransport;
 
+struct RdmaAddressSnapshot {
+    uint16_t lid = 0;
+    std::string gid;
+    int gid_index = -1;
+};
+
+enum class RdmaAddressRefreshResult {
+    UNCHANGED = 0,
+    CHANGED = 1,
+    FAILED = 2,
+};
+
 class RdmaContext {
     friend class RdmaCQ;
     friend class RdmaEndPoint;
+    friend class RdmaContextTestPeer;
 
    public:
     RdmaContext(RdmaTransport &transport);
@@ -63,6 +76,11 @@ class RdmaContext {
     int pause();
 
     int resume();
+
+    // Evict all cached endpoints so they are rebuilt with fresh QPs.
+    // Called on port recovery (IBV_EVENT_PORT_ACTIVE): QPs that entered
+    // IBV_QPS_ERR while the link was down are stale and must be torn down.
+    void evictEndpoints();
 
     enum DeviceStatus {
         DEVICE_UNINIT,
@@ -95,17 +113,50 @@ class RdmaContext {
     const std::string name() const { return device_name_; }
 
    public:
-    uint16_t lid() const { return lid_; }
+    // Take lid/gid/index under one lock so a bootstrap never mixes values from
+    // two address generations while the monitor thread refreshes the port.
+    RdmaAddressSnapshot address() const;
 
-    std::string gid() const;
+    uint16_t lid() const { return address().lid; }
 
-    int gidIndex() const { return gid_index_; }
+    std::string gid() const { return address().gid; }
+
+    int gidIndex() const { return address().gid_index; }
+
+    // Re-query the port's LID and GID. Auto-GID mode repeats the initial
+    // selection; an explicit gid_index keeps that index and refreshes its
+    // value. The new address is published before it becomes visible locally.
+    RdmaAddressRefreshResult refreshAddress(
+        RdmaAddressSnapshot *previous = nullptr,
+        RdmaAddressSnapshot *current = nullptr);
 
     ibv_context *nativeContext() const { return native_context_; }
 
     ibv_pd *nativePD() const { return native_pd_; }
 
-    uint8_t portNum() const { return params_->device.port; }
+    // The one port this context opened; 0 for a slot that never constructed.
+    uint8_t portNum() const { return params_ ? params_->device.port : 0; }
+
+    // Port speed in Gbps: the effective speed from ibv_query_port_speed()
+    // where the library provides it (LAG-aware), otherwise the negotiated
+    // link rate. 0 when neither could be determined.
+    double linkSpeedGbps() const;
+
+    // Re-read the port's negotiated speed and width from the hardware, so
+    // linkSpeedGbps() reflects a renegotiated link. Called from the monitor
+    // thread on IBV_EVENT_PORT_ACTIVE / IBV_EVENT_DEVICE_SPEED_CHANGE.
+    // Returns -1 and leaves the cached values untouched if no device is
+    // open or the query fails.
+    int refreshPortAttributes();
+
+    // Read the port's current state from the hardware. The monitor thread
+    // polls this for paused contexts so a link that came back without a
+    // usable IBV_EVENT_PORT_ACTIVE is still noticed. Deliberately leaves the
+    // cached speed/width alone: refreshLinkSpeed() diffs against them, so
+    // refreshing here would hide a renegotiated rate from the selector.
+    // Returns -1 and leaves *state untouched if no device is open or the
+    // query fails.
+    int queryPortState(ibv_port_state *state) const;
 
     int eventFd() const { return event_fd_; }
 
@@ -115,6 +166,18 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // True while linkSpeedGbps() is derived from ibv_query_port_speed()
+    // rather than the encoded speed x width.
+    bool effectiveSpeedKnown() const {
+        return effective_speed_mbps_.load(std::memory_order_relaxed) > 0;
+    }
+
+    // ibv_query_port_speed() errors since the device was opened. The verb
+    // being absent, or reporting 0, is not an error.
+    uint64_t effectiveSpeedQueryFailures() const {
+        return effective_speed_query_failures_.load(std::memory_order_relaxed);
+    }
+
     // PCIe Relaxed Ordering support
     bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
 
@@ -123,6 +186,14 @@ class RdmaContext {
 
    private:
     int openDevice(const std::string &device_name, uint8_t port);
+    // Decode one ibv_query_port result into active_speed_/active_width_.
+    void recordPortSpeed(const ibv_port_attr &port_attr);
+    // Ask ibv_query_port_speed() for the effective speed when the library
+    // has it; records 0 when the verb is absent or reports nothing, so
+    // linkSpeedGbps() falls back. A verb *error* keeps the last known value
+    // instead: on a degraded LAG, falling back would briefly restore the
+    // higher encoded rate. Failures are counted and logged on transition.
+    void queryEffectiveSpeed();
 
     // Release every resource currently owned by this context. This is
     // intentionally state-independent so it can clean up a partially completed
@@ -145,7 +216,22 @@ class RdmaContext {
     size_t num_comp_channel_ = 0;
     std::vector<ibv_comp_channel *> comp_channel_;
 
+    // The monitor thread may refresh these while bootstrap handlers read
+    // them. address_mutex_ keeps each lid/gid/index snapshot self-consistent;
+    // address_refresh_mutex_ serializes hardware reprobes and publication.
+    mutable std::mutex address_mutex_;
+    std::mutex address_refresh_mutex_;
     uint16_t lid_ = 0;
+    // Set by openDevice() and refreshed by refreshPortAttributes() on the
+    // monitor thread. Today every runtime reader is that same thread;
+    // atomic so a reader added elsewhere stays well-defined.
+    std::atomic<int> active_speed_{0};
+    std::atomic<int> active_width_{0};
+    // From ibv_query_port_speed(), converted to Mb/s; 0 = unavailable.
+    std::atomic<uint64_t> effective_speed_mbps_{0};
+    std::atomic<uint64_t> effective_speed_query_failures_{0};
+    // Whether the last query errored; drives the transition logging.
+    std::atomic<bool> effective_speed_query_failing_{false};
     int gid_index_ = -1;
     ibv_gid gid_;
 
@@ -161,7 +247,11 @@ class RdmaContext {
     // PCIe Relaxed Ordering support
     bool relaxed_ordering_enabled_ = false;
 
-    const IbvSymbols &verbs_;
+    // The context's own copy of the loader's verbs table (copied once at
+    // construction, read-only afterwards). A copy rather than a reference so
+    // tests can substitute individual entries and drive the port-attribute
+    // and event paths without an RNIC.
+    IbvSymbols verbs_;
 };
 
 }  // namespace tent
