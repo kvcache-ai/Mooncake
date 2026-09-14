@@ -182,8 +182,6 @@ class Buffer:
         return wrapped_hook
 
     def connect(self, is_update: bool = False):
-        from mooncake import ep
-
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
