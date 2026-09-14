@@ -101,13 +101,21 @@ object sizes and lifetimes seen by the master are the real ones for that
 geometry.
 
 Capture a real trace from a running master. `mooncake_master --v=1` logs one
-`action=put_start_begin` line per PutStart with `key=` and `value_length=`,
-one `action=remove_object` line per successful Remove, one
-`action=evict_object` line per evicted object, and on allocation failure an
-`action=put_start_alloc_failed` line with the requested size, total free
-space, and largest free region across segments. Capture until cumulative
-writes reach three to four times the cluster capacity so the pool is in
-steady-state eviction, then extract sizes with:
+`action=put_start_allocated` line with `key=` and `value_length=` every time a
+request actually reserves space, one `action=remove_object` line per successful
+Remove, one `action=evict_object` line per evicted object, and on allocation
+failure an `action=put_start_alloc_failed` line with the requested size, total
+free space, and largest free region across segments.
+
+Extract from `put_start_allocated`, not from the `action=put_start_begin` line
+PutStart logs on entry: `put_start_begin` precedes the duplicate-key and quota
+checks, so a request rejected with `OBJECT_ALREADY_EXISTS` emits a begin record
+without allocating, and replaying it invents pressure the master never saw.
+`put_start_begin` also misses UpsertStart, which allocates through the same
+path without logging one.
+
+Capture until cumulative writes reach three to four times the cluster capacity
+so the pool is in steady-state eviction, then extract sizes with:
 
 ```bash
 python3 mooncake-store/benchmarks/extract_alloc_trace.py master.INFO \

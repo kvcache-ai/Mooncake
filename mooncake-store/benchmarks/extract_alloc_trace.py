@@ -1,12 +1,24 @@
 #!/usr/bin/env python3
 """Extract an allocation-size trace from mooncake_master logs.
 
-``mooncake_master --v=1`` logs one ``action=put_start_begin`` line per PutStart
-with ``key=`` and ``value_length=``. This script turns such logs into the
-one-size-per-line format consumed by
-``allocation_strategy_bench --rl_trace_file`` and prints a per-octave size
-histogram so the captured distribution can be sanity-checked against the
-``master_value_size_bytes`` metric.
+``mooncake_master --v=1`` logs one ``action=put_start_allocated`` line with
+``key=`` and ``value_length=`` every time a request actually reserves space in
+an allocator. This script turns such logs into the one-size-per-line format
+consumed by ``allocation_strategy_bench --rl_trace_file`` and prints a
+per-octave size histogram so the captured distribution can be sanity-checked
+against the ``master_value_size_bytes`` metric.
+
+The record to key on is ``put_start_allocated``, not ``put_start_begin``:
+``put_start_begin`` is logged on entry to PutStart, before the duplicate-key
+and tenant-quota checks, so a request rejected with ``OBJECT_ALREADY_EXISTS``
+emits a begin record while allocating nothing. Replaying those as allocations
+invents pressure the master never saw -- putting one 48 MiB key twice into a
+single 64 MiB segment costs the master no allocator failure, but a
+begin-derived trace would fail the second put. ``put_start_begin`` also misses
+UpsertStart, which allocates through the same path without logging a begin
+record. Requests that reached the allocator and failed
+(``put_start_alloc_failed``) are excluded too: they reserved nothing, so they
+own no lifetime in the replay.
 
 With ``--events``, it also writes an ordered event log (``put``, ``remove``,
 ``evict``) keyed by object, using the ``action=remove_object`` and
@@ -23,7 +35,7 @@ import sys
 from collections import Counter
 
 PUT_RE = re.compile(
-    r"key=(?P<key>.*?), value_length=(?P<size>\d+), .*action=put_start_begin"
+    r"key=(?P<key>.*?), value_length=(?P<size>\d+), .*action=put_start_allocated"
 )
 REMOVE_RE = re.compile(r"key=(?P<key>.*?), size=(?P<size>\d+), .*action=remove_object")
 EVICT_RE = re.compile(r"key=(?P<key>.*?), size=(?P<size>\d+), .*action=evict_object")
@@ -76,7 +88,7 @@ def parse_logs(paths):
 def print_histogram(sizes, out=None):
     out = out if out is not None else sys.stderr
     if not sizes:
-        print("no put_start_begin lines found", file=out)
+        print("no put_start_allocated lines found", file=out)
         return
     buckets = Counter()
     order = {}
@@ -115,7 +127,7 @@ def main(argv=None):
 
     sizes, events = parse_logs(args.logs)
     with open(args.output, "w") as handle:
-        handle.write("# allocation sizes in bytes, one per PutStart\n")
+        handle.write("# allocation sizes in bytes, one per allocated request\n")
         handle.writelines(f"{size}\n" for size in sizes)
     if args.events:
         with open(args.events, "w") as handle:
