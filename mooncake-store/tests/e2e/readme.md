@@ -13,6 +13,7 @@ The E2E test suite includes several executable programs designed to test differe
 - **chaos_rand_test**: Long-term randomized chaos testing with configurable parameters.
 - **store_client_e2e.py**: Python `MooncakeDistributedStore` client that continuously issues `put/get` operations.
 - **run_nof_heartbeat_tcp_e2e.sh**: Scripted NoF heartbeat end-to-end test using a TCP SPDK target.
+- **run_nof_gpu_staging_e2e.sh**: Verify GPU multi-buffer PUT/GET using an isolated master and SPDK TCP malloc target.
 
 ## Parameters
 
@@ -122,6 +123,25 @@ PRE_FAULT_SUCCESS_TARGET=10 BUILD_DIR=/path/to/build ./run_nof_heartbeat_tcp_e2e
 - In default mode, the script verifies **service continuity** after NoF unmount by checking that post-fault I/O still succeeds.
 - In `CLIENT_GLOBAL_SEGMENT_SIZE=0` mode, the script verifies **NoF-only failure behavior** by checking that post-fault I/O starts failing after the NoF segment is removed.
 - Logs are written under `LOG_DIR` (default `/tmp/mooncake_nof_heartbeat_e2e`) and the final pass/fail summary is printed from `summary.log`.
+
+### run_nof_gpu_staging_e2e.sh
+
+Verify GPU buffer PUT/GET through the NOF backend using CPU staging.
+The launcher starts an isolated Mooncake master and SPDK TCP malloc target,
+then checks data integrity after a round trip.
+
+Requires a Mooncake build with `USE_CUDA=ON` and `USE_NOF=ON`, a built SPDK
+tree, CUDA-enabled PyTorch, and configured hugepages with write access
+to `/dev/hugepages`.
+
+Run from the repository root:
+
+```bash
+BUILD_DIR=/path/to/mooncake/build \
+SPDK_DIR=/path/to/spdk \
+NOF_TEST_PYTHON=/path/to/.venv/bin/python \
+bash mooncake-store/tests/e2e/run_nof_gpu_staging_e2e.sh
+```
 
 ### store_client_e2e.py
 
