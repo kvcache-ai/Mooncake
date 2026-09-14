@@ -662,9 +662,10 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     int device_count = 0;
     auto cuda_err = cudaGetDeviceCount(&device_count);
     if (cuda_err != cudaSuccess) {
+        // Teardown order: unmap, release, then free VA range.
         cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
         cuMemRelease(handle);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
         return Status::InternalError(std::string("cudaGetDeviceCount: ") +
                                      cudaGetErrorString(cuda_err) + LOC_MARK);
     }
@@ -686,9 +687,10 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     result = cuMemSetAccess((CUdeviceptr)ptr, size, accessDesc.data(),
                             accessDesc.size());
     if (result != CUDA_SUCCESS) {
+        // Teardown order: unmap, release, then free VA range.
         cuMemUnmap((CUdeviceptr)ptr, size);
-        cuMemAddressFree((CUdeviceptr)ptr, size);
         cuMemRelease(handle);
+        cuMemAddressFree((CUdeviceptr)ptr, size);
         return Status::InternalError(std::string("cuMemSetAccess: cuResult ") +
                                      std::to_string(result) + LOC_MARK);
     }
@@ -720,9 +722,10 @@ Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     size_t mapped_size = it->second;
     CUmemGenericAllocationHandle handle;
     CHECK_CU(cuMemRetainAllocationHandle(&handle, addr));
+    // Teardown order: unmap, release, then free VA range.
     CHECK_CU(cuMemUnmap((CUdeviceptr)addr, mapped_size));
-    CHECK_CU(cuMemAddressFree((CUdeviceptr)addr, mapped_size));
     CHECK_CU(cuMemRelease(handle));
+    CHECK_CU(cuMemAddressFree((CUdeviceptr)addr, mapped_size));
     allocate_set_.erase(it);
     return Status::OK();
 }
