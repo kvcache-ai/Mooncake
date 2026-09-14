@@ -105,6 +105,10 @@ class RailMonitor {
     bool tryRecoveryProbe(int local_nic, int remote_nic, uint64_t &token,
                           bool *probe_in_progress = nullptr);
 
+    // Return ownership when the admitted slice is cancelled or rejected
+    // before post, allowing another slice to use the same fresh snapshot.
+    void abandonRecoveryProbe(int local_nic, int remote_nic, uint64_t token);
+
     void markFailed(int local_nic, int remote_nic,
                     uint64_t probe_token = 0);
 

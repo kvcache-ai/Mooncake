@@ -3718,6 +3718,51 @@ TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
     EXPECT_EQ(lane0.inflight_slices.load(), 0);
 }
 
+TEST(RdmaWorkersRecoveryProbeTest, CancelledOwnerReleasesProbeToSibling) {
+    auto local = topologyWithRdmaNics(1);
+    auto remote_initial = topologyWithRdmaNics(1);
+    auto remote_refreshed = topologyWithRdmaNics(1);
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote_initial).ok());
+    for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
+    ASSERT_TRUE(rail.load(local, remote_refreshed).ok());
+
+    uint64_t owner_token = 0;
+    ASSERT_TRUE(rail.tryRecoveryProbe(0, 0, owner_token));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, local);
+    auto workers = RdmaTransportTestPeer::makeWorkers(transport);
+    RdmaTransportTestPeer::WorkerContext worker;
+
+    auto* task = RdmaTaskStorage::Get().allocate();
+    task->num_slices = 1;
+    task->status_word = PENDING;
+    task->first_error = PENDING;
+    task->cancel_requested.store(true);
+    task->ref();  // batch reference
+    task->ref();  // slice reference
+
+    auto* slice = RdmaSliceStorage::Get().allocate();
+    slice->task = task;
+    slice->word = PENDING;
+    slice->source_dev_id = 0;
+    slice->target_dev_id = 0;
+    slice->rail_monitor = &rail;
+    slice->rail_probe_token = owner_token;
+
+    EXPECT_TRUE(RdmaTransportTestPeer::dropUnpostableSlice(*workers, worker,
+                                                           slice));
+    EXPECT_EQ(slice->rail_probe_token, 0u);
+
+    uint64_t sibling_token = 0;
+    EXPECT_TRUE(rail.tryRecoveryProbe(0, 0, sibling_token))
+        << "Cancellation before post must not consume the recovery evidence";
+
+    RdmaSliceStorage::Get().deallocate(slice);
+    task->deref();
+}
+
 // A qp_pools layout with fewer queue pairs than lanes has two lanes posting
 // to and acknowledging on one queue pair at once. They share the endpoint's
 // read guard, so the queue pair's slice queue has to serialize them itself:

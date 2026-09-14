@@ -271,6 +271,21 @@ bool RailMonitor::tryRecoveryProbe(int local_nic, int remote_nic,
     return true;
 }
 
+void RailMonitor::abandonRecoveryProbe(int local_nic, int remote_nic,
+                                       uint64_t token) {
+    if (token == 0) return;
+    auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
+    if (it == rail_states_.end()) return;
+    auto& st = it->second;
+    if (st.active_probe_token != token) return;
+
+    st.active_probe_token = 0;
+    if (st.last_probe_generation == metadata_generation_ &&
+        metadata_generation_ > 0) {
+        st.last_probe_generation = metadata_generation_ - 1;
+    }
+}
+
 void RailMonitor::markFailed(int local_nic, int remote_nic,
                              uint64_t probe_token) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));

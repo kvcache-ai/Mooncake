@@ -182,6 +182,9 @@ class Workers {
     // slice then keeps whatever charge it has, so the release still balances.
     void rechargeSlice(RdmaSlice* slice, int dev_id);
 
+    // Release an admitted recovery probe that will not reach ibv_post_send.
+    void abandonRecoveryProbe(RdmaSlice* slice);
+
     // True when `slice` must not be posted -- the transfer was cancelled, or
     // another lane resolved the slice while it waited for a re-post. Retires
     // it like a sweep would (retireSweptSlice), so the caller can simply

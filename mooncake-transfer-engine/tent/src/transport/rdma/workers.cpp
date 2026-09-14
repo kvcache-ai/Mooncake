@@ -572,6 +572,19 @@ void Workers::rechargeSlice(RdmaSlice* slice, int dev_id) {
     if (prev >= 0) device_selector_->release(prev, slice->length, 0.0);
 }
 
+void Workers::abandonRecoveryProbe(RdmaSlice* slice) {
+    if (!slice) return;
+    if (auto* rail = slice->rail_monitor) {
+        if (slice->rail_probe_token != 0) {
+            rail->abandonRecoveryProbe(slice->source_dev_id,
+                                       slice->target_dev_id,
+                                       slice->rail_probe_token);
+        }
+        rail->cancelProbe(slice->source_dev_id, slice->target_dev_id);
+    }
+    slice->rail_probe_token = 0;
+}
+
 bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     if (!slice || !slice->task) return false;
     // Two reasons not to post. The caller cancelled the transfer; or another
@@ -586,6 +599,7 @@ bool Workers::dropUnpostableSlice(WorkerContext& worker, RdmaSlice* slice) {
     // back where they came from, each idempotently, since whichever path
     // resolved the slice may already have run them -- and updateSliceStatus
     // is a no-op once the slice is terminal.
+    abandonRecoveryProbe(slice);
     retireSweptSlice(worker, slice, getCurrentTimeInNano(), nullptr);
     updateSliceStatus(slice, CANCELED);
     return true;
@@ -914,18 +928,12 @@ void Workers::asyncPostSend() {
                     slice = slice->next;
                     continue;
                 }
+                abandonRecoveryProbe(slice);
                 VLOG(1) << "Failed to generate post path for slice " << slice
                         << ": " << status.ToString();
                 LOG_EVERY_N(ERROR, 10000)
                     << "Failed to generate post path for slice " << slice
                     << ": " << status.ToString();
-                // generatePostPath may have armed a probe/trial via admit()
-                // before a later validation failed (e.g. rkey out of bounds).
-                // The slice never reaches the wire, so roll back the admission
-                // or the rail is permanently blocked (Half-Open).
-                if (auto* rail = slice->rail_monitor)
-                    rail->cancelProbe(slice->source_dev_id,
-                                      slice->target_dev_id);
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 // Count first: resolving the slice lets the batch be freed.
                 discountFromOwner(worker, slice);
