@@ -8,6 +8,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
+    config/rpc_protocol_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -80,6 +81,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 set(MOONCAKE_STORE_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
+    config/hugepage_config.cpp
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
@@ -89,6 +91,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
     config/nvme_kv_connector_config.cpp
+    config/nvme_kv_io_concurrency_config.cpp
     config/nvme_kv_u32_parser.cpp
     nvme_kv_executor_io_uring.cpp
     nvme_kv_executor_ioctl.cpp
@@ -108,8 +111,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     file_storage.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
+    config/bucket_backend_config.cpp
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
+    config/client_auto_discovery_config.cpp
     config/cxl_segment_config.cpp
     config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
@@ -117,6 +122,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
+    config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
@@ -445,8 +451,9 @@ add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_client_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_client_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects

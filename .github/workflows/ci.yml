@@ -87,6 +87,35 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
+    - name: Run tensor snapshot regressions
+      env:
+        MASTER_SERVER: "127.0.0.1:50061"
+        MC_METADATA_SERVER: "P2PHANDSHAKE"
+        LOCAL_HOSTNAME: "127.0.0.1"
+        DEFAULT_KV_LEASE_TTL: "500"
+      run: |
+        source test_env/bin/activate
+        export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+        mooncake_master --port 50061 --default_kv_lease_ttl=500 \
+          >"$RUNNER_TEMP/tensor-snapshot-master.log" 2>&1 &
+        master_pid=$!
+        trap 'kill "$master_pid" 2>/dev/null || true; wait "$master_pid" 2>/dev/null || true' EXIT
+        python - <<'PY'
+        import socket
+        import time
+        for attempt in range(100):
+            try:
+                with socket.create_connection(("127.0.0.1", 50061), timeout=0.2):
+                    break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise RuntimeError("Tensor snapshot test master did not start")
+        PY
+        python mooncake-wheel/tests/test_tensor_read_snapshot.py -v
+        python mooncake-wheel/tests/test_cuda_fabric_compat.py -v
+      shell: bash
+
     - name: Run all PG CPU tests with latest PyTorch
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       env:
@@ -398,6 +427,20 @@ jobs:
 
     - name: Test CI service and smoke scripts
       run: python -m unittest discover -s scripts/ci/tests -v
+
+  tone-script-tests:
+    name: Test external CI lifecycle helpers
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Run focused shell regression tests
+      run: |
+        bash scripts/tone_tests/tests/test_common_cleanup.sh
+        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+      shell: bash
 
   clang-format:
     name: Check code format
@@ -750,6 +793,7 @@ jobs:
       - docs-check
       - reshard-type-check
       - ci-script-tests
+      - tone-script-tests
       - build-wheel
       - unit-tests
       - build-flags
@@ -771,7 +815,8 @@ jobs:
                 needs.clang-format.result == 'success' &&
                 needs.python-lint.result == 'success' &&
                 needs.reshard-type-check.result == 'success' &&
-                needs.ci-script-tests.result == 'success' }}
+                needs.ci-script-tests.result == 'success' &&
+                needs.tone-script-tests.result == 'success' }}
         run: |
           echo "$NEEDS_JSON"
           test "$PASSED" = true

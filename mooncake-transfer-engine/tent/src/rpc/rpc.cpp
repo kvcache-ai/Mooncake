@@ -259,7 +259,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             auto msg = "Failed to connect RPC server. server: " + server_addr +
                        ", func_id: " + std::to_string(func_id) +
                        ", message: " + std::string{conn_result.message()};
-            co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
+            co_return std::make_pair(Status::RpcConnectionError(msg + LOC_MARK),
                                      "");
         }
     }

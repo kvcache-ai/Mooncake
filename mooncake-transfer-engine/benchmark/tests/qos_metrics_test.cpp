@@ -14,9 +14,13 @@
 
 #include "qos_metrics_adapter.h"
 
+#include <csignal>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <string>
+#include <sys/resource.h>
+#include <unistd.h>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -27,6 +31,38 @@
 namespace mooncake {
 namespace tent {
 namespace {
+
+TEST(QosMetricsDeathTest, ReportsBufferedWriteFailure) {
+    std::string path = testing::TempDir() + "tebench-qos-jsonl-XXXXXX";
+    const int fd = mkstemp(path.data());
+    ASSERT_GE(fd, 0);
+    close(fd);
+
+    // Keep the file-size limit and signal handler out of the parent process.
+    EXPECT_EXIT(
+        {
+            if (std::signal(SIGXFSZ, SIG_IGN) == SIG_ERR) std::_Exit(2);
+            struct rlimit limit{};
+            if (setrlimit(RLIMIT_FSIZE, &limit) != 0) std::_Exit(3);
+            QosMetricsReport report;
+            std::string error;
+            const bool ok = appendQosMetricsJsonl(path, report, &error);
+            std::_Exit(!ok && error ==
+                                   "failed to write QoS JSONL output: " + path
+                           ? 0
+                           : 1);
+        },
+        testing::ExitedWithCode(0), "");
+    std::remove(path.c_str());
+}
+
+TEST(QosMetricsTest, ReportsOpenFailure) {
+    QosMetricsReport report;
+    std::string error;
+    const auto path = testing::TempDir();
+    EXPECT_FALSE(appendQosMetricsJsonl(path, report, &error));
+    EXPECT_EQ(error, "failed to open QoS JSONL output: " + path);
+}
 
 TEST(QosMetricsTest, SupportsBulkSamples) {
     XferMetricStats stats;
@@ -203,6 +239,9 @@ TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {
     std::remove(path.c_str());
     std::string error;
     ASSERT_TRUE(appendQosMetricsJsonl(path, report, &error)) << error;
+    auto next_report = report;
+    next_report.batch_size = 2;
+    ASSERT_TRUE(appendQosMetricsJsonl(path, next_report, &error)) << error;
 
     std::ifstream input(path);
     nlohmann::json record;
@@ -214,6 +253,9 @@ TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {
     EXPECT_TRUE(record["classes"][0]["slo_attainment"].is_null());
     EXPECT_TRUE(record["classes"][0]["isolation_leakage"].is_null());
     EXPECT_TRUE(record["classes"][0]["isolated_throughput_gbps"].is_null());
+    EXPECT_EQ(record["batch_size"], 1);
+    ASSERT_NO_THROW(input >> record);
+    EXPECT_EQ(record["batch_size"], 2);
     std::remove(path.c_str());
 }
 

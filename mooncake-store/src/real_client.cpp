@@ -10,6 +10,7 @@
 
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
+#include <cstring>
 #include <algorithm>
 #include <functional>
 #include <limits>
@@ -21,12 +22,15 @@
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
+#include "batch_read_fanout.h"
 #include "common.h"
 #include "config.h"
+#include "config/rpc_protocol_config.h"
 #include "store_rpc_client_io_context.h"
 #include "bool_parser.h"
 #include "client_auto_port_config.h"
 #include "config/cxl_segment_config.h"
+#include "config/hugepage_config.h"
 #include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
@@ -721,8 +725,7 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
 }
 
 RealClient::~RealClient() {
@@ -3185,6 +3188,7 @@ RealClient::batch_get_buffer_internal(
         QueryResult query_result;
         std::unique_ptr<BufferHandle> buffer_handle;
         std::vector<Slice> slices;
+        uint64_t total_size;
     };
     struct DiskKeyOp {
         size_t original_index;
@@ -3274,7 +3278,8 @@ RealClient::batch_get_buffer_internal(
             .key = key,
             .query_result = FilterQueryResult(query_result_values, replica),
             .buffer_handle = std::move(buffer_handle),
-            .slices = std::move(slices)});
+            .slices = std::move(slices),
+            .total_size = total_size});
     }
 
     if (valid_ops.empty() && disk_ops.empty()) {
@@ -3289,7 +3294,12 @@ RealClient::batch_get_buffer_internal(
         batch_keys.reserve(valid_ops.size());
         batch_query_results.reserve(valid_ops.size());
 
-        for (auto &op : valid_ops) {
+        // The slice map is keyed by string, so duplicate keys would collapse
+        // onto one destination. Transfer each unique key once (first
+        // occurrence as primary) and fan the verified bytes out locally.
+        const auto dedup = PlanDuplicateKeys(valid_ops);
+        for (const size_t op_idx : dedup.primaries) {
+            auto &op = valid_ops[op_idx];
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
             batch_slices[op.key] = op.slices;
@@ -3298,16 +3308,48 @@ RealClient::batch_get_buffer_internal(
         auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
-        // 4. Process results and create BufferHandles
-        for (size_t i = 0; i < valid_ops.size(); ++i) {
+        std::vector<tl::expected<int64_t, ErrorCode>> op_status(
+            valid_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
+        for (size_t i = 0; i < batch_get_results.size(); ++i) {
+            const size_t op_idx = dedup.primaries[i];
             if (batch_get_results[i]) {
+                op_status[op_idx] =
+                    static_cast<int64_t>(valid_ops[op_idx].total_size);
+            } else {
+                LOG(ERROR) << "BatchGet failed for key '"
+                           << valid_ops[op_idx].key
+                           << "': " << toString(batch_get_results[i].error());
+                op_status[op_idx] =
+                    tl::make_unexpected(batch_get_results[i].error());
+            }
+        }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = valid_ops[dup_idx];
+            const auto &primary_op = valid_ops[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_idx,
+                .primary_result_index = primary_idx,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = primary_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, op_status);
+
+        // 4. Process results and create BufferHandles. Duplicates copied from
+        // their primary above, before any handle is moved out here.
+        for (size_t i = 0; i < valid_ops.size(); ++i) {
+            if (op_status[i]) {
                 auto &op = valid_ops[i];
                 final_results[op.original_index] =
                     std::make_shared<BufferHandle>(
                         std::move(*op.buffer_handle));
-            } else {
-                LOG(ERROR) << "BatchGet failed for key '" << valid_ops[i].key
-                           << "': " << toString(batch_get_results[i].error());
             }
         }
     }
@@ -3318,8 +3360,11 @@ RealClient::batch_get_buffer_internal(
         std::unordered_map<std::string,
                            std::unordered_map<std::string, std::vector<Slice>>>
             offload_objects;
-        // Build key -> disk_ops index for result lookup
+        // Build key -> first disk_ops index for result lookup. The maps are
+        // keyed by string, so duplicate keys transfer once via the first
+        // occurrence and its verified bytes are fanned out locally below.
         std::unordered_map<std::string, size_t> disk_key_to_idx;
+        std::vector<std::pair<size_t, size_t>> duplicate_disk_ops;
 
         for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
             auto &op = disk_ops[idx];
@@ -3335,14 +3380,21 @@ RealClient::batch_get_buffer_internal(
                 LOG(ERROR) << "No LOCAL_DISK replica found for key: " << op.key;
                 continue;
             }
+            auto [primary_it, first_seen] =
+                disk_key_to_idx.emplace(op.key, idx);
+            if (!first_seen) {
+                duplicate_disk_ops.emplace_back(idx, primary_it->second);
+                continue;
+            }
             const auto &replica = *replica_ptr;
             offload_objects[replica.get_local_disk_descriptor()
                                 .transport_endpoint]
                 .emplace(op.key, std::vector<Slice>{
                                      {op.buffer_handle->ptr(), op.total_size}});
-            disk_key_to_idx[op.key] = idx;
         }
 
+        std::vector<tl::expected<int64_t, ErrorCode>> op_status(
+            disk_ops.size(), tl::make_unexpected(ErrorCode::INTERNAL_ERROR));
         for (auto &[endpoint, objects] : offload_objects) {
             if (objects.empty()) continue;
             auto read_result =
@@ -3360,15 +3412,48 @@ RealClient::batch_get_buffer_internal(
                             << "SSD checksum verification failed for key '"
                             << key
                             << "': " << toString(checksum_result.error());
+                        op_status[idx_it->second] =
+                            tl::make_unexpected(checksum_result.error());
                         continue;
                     }
-                    final_results[op.original_index] =
-                        std::make_shared<BufferHandle>(
-                            std::move(*op.buffer_handle));
+                    op_status[idx_it->second] =
+                        static_cast<int64_t>(op.total_size);
                 } else {
                     LOG(ERROR) << "SSD read failed for key '" << key
                                << "': " << toString(read_result.error());
+                    op_status[idx_it->second] =
+                        tl::make_unexpected(read_result.error());
                 }
+            }
+        }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : duplicate_disk_ops) {
+            const auto &dup_op = disk_ops[dup_idx];
+            const auto &primary_op = disk_ops[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_idx,
+                .primary_result_index = primary_idx,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.buffer_handle->ptr(),
+                         src = primary_op.buffer_handle->ptr(),
+                         size = primary_op.total_size, key = dup_op.key]() {
+                    return CopyMaybeDevice(
+                        dst, src, size, "duplicate SSD fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, op_status);
+
+        // Duplicates copied from their primary above, before any handle is
+        // moved out here.
+        for (size_t idx = 0; idx < disk_ops.size(); ++idx) {
+            if (op_status[idx]) {
+                auto &op = disk_ops[idx];
+                final_results[op.original_index] =
+                    std::make_shared<BufferHandle>(
+                        std::move(*op.buffer_handle));
             }
         }
     }
@@ -3453,7 +3538,13 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
             };
         }
     }
-    if (local_buffer_region_.has_value()) {
+    // A CUDA/UVA address can numerically fall inside the host-side local
+    // buffer range.  Only treat that range as an implicit writable region for
+    // host pointers; device destinations must be explicitly registered.
+    const bool is_device_pointer = device::GetAcceleratorRegistry()
+                                       .RuntimeAccelerators()
+                                       .FindDeviceForPointer(buffer) != nullptr;
+    if (!is_device_pointer && local_buffer_region_.has_value()) {
         const auto base =
             reinterpret_cast<uintptr_t>(local_buffer_region_->base);
         if (target >= base) {
@@ -3470,7 +3561,8 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
-    const std::string &key, const QueryResultCache *query_result_cache) {
+    const std::string &key, const QueryResultCache *query_result_cache,
+    bool allow_query_refresh) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3483,6 +3575,14 @@ RealClient::resolve_ranged_read_metadata(
             return build_ranged_read_metadata_from_query_result(key,
                                                                 cached->second);
         }
+        if (!allow_query_refresh) {
+            return tl::unexpected(cached == query_result_cache->end()
+                                      ? ErrorCode::INVALID_PARAMS
+                                      : ErrorCode::LEASE_EXPIRED);
+        }
+    }
+    if (!allow_query_refresh) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return build_ranged_read_metadata_from_query_result(key,
                                                         client_->Query(key));
@@ -3794,7 +3894,7 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    const QueryResultCache *query_result_cache) {
+    const QueryResultCache *query_result_cache, bool allow_query_refresh) {
     auto results = build_ranged_read_internal_error_results(
         buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
@@ -3828,7 +3928,8 @@ RealClient::get_into_ranges_internal(
         auto found = metadata_cache.find(key);
         if (found != metadata_cache.end()) return found->second;
         return metadata_cache
-            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache))
+            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache,
+                                                       allow_query_refresh))
             .first->second;
     };
 
@@ -3874,6 +3975,38 @@ RealClient::get_into_ranges_internal(
             if (metadata.replica.is_memory_replica()) {
                 if (client_->CanUseLocalMemcpy(metadata.replica) &&
                     runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                    if (!allow_query_refresh) {
+                        for (size_t k = 0; k < range_results.size(); ++k) {
+                            if (dst_offsets[k] > capacities[i] ||
+                                sizes[k] > capacities[i] - dst_offsets[k] ||
+                                is_object_range_overflow(
+                                    src_offsets[k], sizes[k],
+                                    static_cast<size_t>(metadata.total_size))) {
+                                continue;
+                            }
+                            if (metadata.query_result.IsLeaseExpired()) {
+                                range_results[k] =
+                                    tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                                continue;
+                            }
+                            // Even a full-object snapshot read must bypass
+                            // the key-based hot cache, which may hold a newer
+                            // version than the supplied replica descriptor.
+                            std::vector<Slice> slices{
+                                {static_cast<char *>(buffers[i]) +
+                                     dst_offsets[k],
+                                 sizes[k]}};
+                            auto query_result = FilterQueryResult(
+                                metadata.query_result, metadata.replica, false);
+                            auto read = client_->Get(keys[j], query_result,
+                                                     slices, src_offsets[k]);
+                            range_results[k] =
+                                read
+                                    ? tl::expected<int64_t, ErrorCode>(sizes[k])
+                                    : tl::unexpected(read.error());
+                        }
+                        continue;
+                    }
                     // Planning cache entries may be close to expiry. Renew and
                     // reselect the replica before copying into device memory.
                     auto refresh_result = resolve_ranged_read_metadata(keys[j]);
@@ -3965,6 +4098,10 @@ RealClient::get_into_ranges_internal(
                 range_results[k] = execute_ranged_read(
                     keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
                     metadata, false, false);
+                if (!allow_query_refresh && range_results[k] &&
+                    metadata.query_result.IsLeaseExpired()) {
+                    range_results[k] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
+                }
             }
         }
     }
@@ -4000,7 +4137,7 @@ RealClient::get_into_ranges_internal(
     };
 
     // Planning may consume most of a short lease; renew before submission.
-    if (!scatter_leases.empty()) refresh_leases();
+    if (allow_query_refresh && !scatter_leases.empty()) refresh_leases();
     auto operation = client_->SubmitScatter(memory_transfers);
     if (!operation.has_value()) {
         const auto failure =
@@ -4013,7 +4150,9 @@ RealClient::get_into_ranges_internal(
     }
 
     while (true) {
-        const auto delay = next_refresh_delay();
+        const auto delay = allow_query_refresh
+                               ? next_refresh_delay()
+                               : std::chrono::nanoseconds::max();
         const auto status = delay == std::chrono::nanoseconds::max()
                                 ? operation->wait()
                                 : operation->waitFor(delay);
@@ -4021,6 +4160,19 @@ RealClient::get_into_ranges_internal(
         refresh_leases();
     }
     return results;
+}
+
+std::vector<std::vector<std::vector<int64_t>>>
+RealClient::get_into_ranges_from_snapshot(
+    const std::vector<void *> &buffers,
+    const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+    const QueryResultCache &query_result_cache) {
+    return convert_ranged_read_results(get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes, nullptr,
+        &query_result_cache, false));
 }
 
 std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
@@ -5183,6 +5335,10 @@ RealClient::batch_get_into_internal(
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, ValidLocalDiskKeyInfo>
         valid_local_disk_operations;
+    // Fan-out jobs for duplicate LOCAL_DISK keys, built during the scan
+    // below; the copies run after the SSD reads, from the first
+    // occurrence's verified buffer.
+    std::vector<DuplicateFanOutJob> local_disk_dup_jobs;
     std::vector<DiskKeyInfo> disk_operations;
     valid_operations.reserve(num_keys);
 
@@ -5234,6 +5390,27 @@ RealClient::batch_get_into_internal(
         }
 
         if (replica.is_local_disk_replica()) {
+            if (valid_local_disk_operations.count(key)) {
+                // Duplicate key: the first occurrence stays the transfer
+                // primary; its verified bytes are fanned out to this
+                // duplicate's buffer after the SSD reads below.
+                const auto &primary = valid_local_disk_operations.at(key);
+                local_disk_dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = i,
+                    .primary_result_index = primary.original_index,
+                    .key = key,
+                    .dup_bytes = total_size,
+                    .primary_bytes = primary.total_size,
+                    .copy = [dst = buffers[i],
+                             src = buffers[primary.original_index],
+                             size = total_size, key]() {
+                        return CopyMaybeDevice(
+                            dst, src, size,
+                            "duplicate SSD fan-out, key: " + key);
+                    }});
+                results[i] = static_cast<int64_t>(total_size);
+                continue;
+            }
             std::vector<Slice> key_slices;
             allocateSlices(key_slices, replica, buffers[i]);
             valid_local_disk_operations.emplace(
@@ -5288,7 +5465,12 @@ RealClient::batch_get_into_internal(
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
 
-    for (const auto &op : valid_operations) {
+    // The slice map is keyed by string, so duplicate keys would collapse onto
+    // one destination. Transfer each unique key once (first occurrence as
+    // primary) and fan the verified bytes out to duplicate buffers locally.
+    const auto dedup = PlanDuplicateKeys(valid_operations);
+    for (const size_t op_idx : dedup.primaries) {
+        const auto &op = valid_operations[op_idx];
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
@@ -5300,7 +5482,7 @@ RealClient::batch_get_into_internal(
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[j];
+            const auto &op = valid_operations[dedup.primaries[j]];
 
             if (!batch_get_results[j]) {
                 const auto error = batch_get_results[j].error();
@@ -5309,6 +5491,24 @@ RealClient::batch_get_into_internal(
                 results[op.original_index] = tl::unexpected(error);
             }
         }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = valid_operations[dup_idx];
+            const auto &primary_op = valid_operations[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = dup_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
     }
 
     // ---- File-backed replicas: BatchGet into temp buffers, then scatter ----
@@ -5319,8 +5519,12 @@ RealClient::batch_get_into_internal(
         std::vector<size_t> disk_batch_indices;
         std::unordered_map<std::string, std::unique_ptr<BufferHandle>>
             disk_temp_handles;
+        // Duplicate keys share the first occurrence's temp buffer; the
+        // verified bytes are scattered into every duplicate destination
+        // after the batch read.
+        const auto disk_dedup = PlanDuplicateKeys(disk_operations);
 
-        for (size_t di = 0; di < disk_operations.size(); ++di) {
+        for (const size_t di : disk_dedup.primaries) {
             auto &op = disk_operations[di];
             const auto &replica = op.replica;
             const char *replica_type =
@@ -5375,6 +5579,33 @@ RealClient::batch_get_into_internal(
                 }
             }
         }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_di, primary_di] : disk_dedup.duplicates) {
+            const auto &dup_op = disk_operations[dup_di];
+            const auto &primary_op = disk_operations[primary_di];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [&disk_temp_handles, dst = dup_op.dst_buffer,
+                         size = dup_op.total_size, key = dup_op.key,
+                         is_dfs = dup_op.replica.is_dfs_replica()]()
+                    -> tl::expected<void, ErrorCode> {
+                    auto handle_it = disk_temp_handles.find(key);
+                    if (handle_it == disk_temp_handles.end()) {
+                        return tl::make_unexpected(
+                            ErrorCode::NO_AVAILABLE_HANDLE);
+                    }
+                    return CopyMaybeDevice(
+                        dst, handle_it->second->ptr(), size,
+                        std::string(is_dfs ? "DFS" : "DISK") +
+                            " duplicate read, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
     }
 
     // Prepare batch transfer data structures
@@ -5418,6 +5649,9 @@ RealClient::batch_get_into_internal(
             }
         }
     }
+
+    // Fan verified LOCAL_DISK primary bytes out to duplicate destinations.
+    FanOutDuplicates(local_disk_dup_jobs, results);
 
     auto end_time = std::chrono::steady_clock::now();
     [[maybe_unused]] auto elapsed_time =
@@ -6245,8 +6479,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                              // (BatchGet)
     };
 
+    // A duplicate of a disk/offload key: not transferred itself, receives the
+    // first occurrence's verified bytes in the fan-out passes below.
+    struct DuplicateDiskOp {
+        size_t original_index;
+        std::string key;
+        std::vector<void *> buffers;
+        std::vector<size_t> sizes;
+        uint64_t total_size;
+    };
+
     std::vector<ValidKeyInfo> valid_operations;
     std::unordered_map<std::string, DiskKeyInfo> valid_local_disk_ops;
+    std::vector<DuplicateDiskOp> duplicate_disk_ops;
     valid_operations.reserve(num_keys);
     auto local_endpoints = client_->GetLocalEndpoints();
     for (size_t i = 0; i < num_keys; ++i) {
@@ -6305,6 +6550,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                    replica.is_disk_replica() || replica.is_dfs_replica()) {
             // LOCAL_DISK: GPU buffers passed directly as scatter-gather slices
             // (zero-copy). DISK/DFS use a contiguous temp buffer at read time.
+            if (valid_local_disk_ops.count(key)) {
+                // Duplicate key: the first occurrence stays the transfer
+                // primary; its verified bytes fan out to this duplicate's
+                // buffers in the read paths below.
+                duplicate_disk_ops.push_back(
+                    DuplicateDiskOp{.original_index = i,
+                                    .key = key,
+                                    .buffers = all_buffers[i],
+                                    .sizes = all_sizes[i],
+                                    .total_size = total_size});
+                results.emplace_back(static_cast<int64_t>(total_size));
+                continue;
+            }
             valid_local_disk_ops.emplace(
                 key,
                 DiskKeyInfo{.key = key,
@@ -6344,7 +6602,12 @@ RealClient::batch_get_into_multi_buffers_internal(
         std::unordered_map<std::string, std::vector<Slice>> batch_slices;
         batch_keys.reserve(valid_operations.size());
         batch_query_results.reserve(valid_operations.size());
-        for (auto &op : valid_operations) {
+        // The slice map is keyed by string, so duplicate keys would collapse
+        // onto one destination. Transfer each unique key once (first
+        // occurrence as primary) and fan the verified bytes out locally.
+        const auto dedup = PlanDuplicateKeys(valid_operations);
+        for (const size_t op_idx : dedup.primaries) {
+            const auto &op = valid_operations[op_idx];
             batch_keys.push_back(op.key);
             batch_query_results.push_back(op.query_result);
             batch_slices[op.key] = op.slices;
@@ -6355,7 +6618,7 @@ RealClient::batch_get_into_multi_buffers_internal(
                               prefer_alloc_in_same_node);
 
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
-            const auto &op = valid_operations[j];
+            const auto &op = valid_operations[dedup.primaries[j]];
             if (!batch_get_results[j]) {
                 const auto error = batch_get_results[j].error();
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
@@ -6363,6 +6626,24 @@ RealClient::batch_get_into_multi_buffers_internal(
                 results[op.original_index] = tl::unexpected(error);
             }
         }
+
+        std::vector<DuplicateFanOutJob> dup_jobs;
+        for (const auto &[dup_idx, primary_idx] : dedup.duplicates) {
+            const auto &dup_op = valid_operations[dup_idx];
+            const auto &primary_op = valid_operations[primary_idx];
+            dup_jobs.push_back(DuplicateFanOutJob{
+                .dup_result_index = dup_op.original_index,
+                .primary_result_index = primary_op.original_index,
+                .key = dup_op.key,
+                .dup_bytes = dup_op.total_size,
+                .primary_bytes = primary_op.total_size,
+                .copy = [dst = dup_op.slices, src = primary_op.slices,
+                         size = dup_op.total_size, key = dup_op.key]() {
+                    return CopySlicesMaybeDevice(
+                        dst, src, size, "duplicate fan-out, key: " + key);
+                }});
+        }
+        FanOutDuplicates(dup_jobs, results);
     }
 
     // ---- LOCAL_DISK / file-backed replica read paths ----
@@ -6439,6 +6720,29 @@ RealClient::batch_get_into_multi_buffers_internal(
                     }
                 }
             }
+
+            // Fan verified LOCAL_DISK primary bytes out to duplicate
+            // destination buffer lists.
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &dup : duplicate_disk_ops) {
+                const auto &primary_op = valid_local_disk_ops.at(dup.key);
+                if (!primary_op.is_local_disk) continue;
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup.key,
+                    .dup_bytes = dup.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [dst = SlicesFromBuffers(dup.buffers, dup.sizes),
+                             src = SlicesFromBuffers(primary_op.buffers,
+                                                     primary_op.sizes),
+                             size = dup.total_size, key = dup.key]() {
+                        return CopySlicesMaybeDevice(
+                            dst, src, size,
+                            "duplicate SSD fan-out, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
         }
 
         // DISK/DFS: one batched BatchGet into temp buffers, then scatter.
@@ -6531,6 +6835,39 @@ RealClient::batch_get_into_multi_buffers_internal(
                         continue;
                 }
             }
+
+            // Fan the primary's verified temp bytes out to duplicate
+            // destination buffer lists (device-aware, same as primaries).
+            std::vector<DuplicateFanOutJob> dup_jobs;
+            for (const auto &dup : duplicate_disk_ops) {
+                const auto &primary_op = valid_local_disk_ops.at(dup.key);
+                if (primary_op.is_local_disk) continue;
+                dup_jobs.push_back(DuplicateFanOutJob{
+                    .dup_result_index = dup.original_index,
+                    .primary_result_index = primary_op.original_index,
+                    .key = dup.key,
+                    .dup_bytes = dup.total_size,
+                    .primary_bytes = primary_op.total_size,
+                    .copy = [&temp_handles,
+                             dst = SlicesFromBuffers(dup.buffers, dup.sizes),
+                             size = dup.total_size, key = dup.key,
+                             is_dfs = primary_op.replica.is_dfs_replica()]()
+                        -> tl::expected<void, ErrorCode> {
+                        auto handle_it = temp_handles.find(key);
+                        if (handle_it == temp_handles.end()) {
+                            return tl::make_unexpected(
+                                ErrorCode::NO_AVAILABLE_HANDLE);
+                        }
+                        return CopySlicesMaybeDevice(
+                            dst,
+                            {Slice{handle_it->second->ptr(),
+                                   static_cast<size_t>(size)}},
+                            size,
+                            std::string(is_dfs ? "DFS" : "DISK") +
+                                " duplicate read, key: " + key);
+                    }});
+            }
+            FanOutDuplicates(dup_jobs, results);
             // temp_handles: BufferHandle RAII releases allocator memory
         }
     }
@@ -7004,8 +7341,7 @@ RealClient::batch_get_into_offload_object_internal(
 
 ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    const char *value = std::getenv("MC_RPC_PROTOCOL");
-    if (value && std::string_view(value) == "rdma") {
+    if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         pool_conf.client_config.socket_config =
             coro_io::ib_socket_t::config_t{};
     }
