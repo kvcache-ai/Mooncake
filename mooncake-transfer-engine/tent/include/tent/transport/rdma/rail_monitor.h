@@ -100,7 +100,10 @@ class RailMonitor {
     // A paused rail may admit one slice after a newer remote metadata
     // snapshot arrives. A zero token requests ownership; a non-zero token
     // lets the owning slice retain that ownership across endpoint retries.
-    bool tryRecoveryProbe(int local_nic, int remote_nic, uint64_t &token);
+    // probe_in_progress distinguishes a sibling's active probe from a rail
+    // that has no recovery evidence left.
+    bool tryRecoveryProbe(int local_nic, int remote_nic, uint64_t &token,
+                          bool *probe_in_progress = nullptr);
 
     void markFailed(int local_nic, int remote_nic,
                     uint64_t probe_token = 0);

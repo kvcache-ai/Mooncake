@@ -233,16 +233,31 @@ void RailMonitor::cancelProbe(int local_nic, int remote_nic) {
 }
 
 bool RailMonitor::tryRecoveryProbe(int local_nic, int remote_nic,
-                                   uint64_t& token) {
+                                   uint64_t& token,
+                                   bool* probe_in_progress) {
+    if (probe_in_progress) *probe_in_progress = false;
     if (!recovery_probe_enabled_) return false;
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
     if (it == rail_states_.end()) return false;
     auto& st = it->second;
     if (!st.paused()) return false;
 
-    if (token != 0) return token == st.active_probe_token;
-    if (st.probe_in_flight) return false;
-    if (st.last_probe_generation == metadata_generation_) return false;
+    if (token != 0) {
+        if (token == st.active_probe_token) return true;
+        if (probe_in_progress)
+            *probe_in_progress =
+                st.active_probe_token != 0 || st.probe_in_flight;
+        return false;
+    }
+    if (st.probe_in_flight) {
+        if (probe_in_progress) *probe_in_progress = true;
+        return false;
+    }
+    if (st.last_probe_generation == metadata_generation_) {
+        if (probe_in_progress)
+            *probe_in_progress = st.active_probe_token != 0;
+        return false;
+    }
 
     st.last_probe_generation = metadata_generation_;
     do {

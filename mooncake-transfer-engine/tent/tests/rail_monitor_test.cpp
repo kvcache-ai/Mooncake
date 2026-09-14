@@ -464,8 +464,13 @@ TEST(RailMonitorRecoveryProbeTest,
     EXPECT_EQ(retry_token, probe_token);
 
     uint64_t competing_token = 0;
-    EXPECT_FALSE(rail.tryRecoveryProbe(0, 0, competing_token));
+    bool probe_in_progress = false;
+    EXPECT_FALSE(rail.tryRecoveryProbe(0, 0, competing_token,
+                                       &probe_in_progress));
     EXPECT_EQ(competing_token, 0u);
+    EXPECT_TRUE(probe_in_progress)
+        << "A sibling slice must wait instead of treating an active probe as "
+           "a permanent path failure";
     EXPECT_FALSE(rail.available(0, 0))
         << "Claiming a probe must not make the rail generally available";
 }
@@ -486,6 +491,12 @@ TEST(RailMonitorRecoveryProbeTest,
     ASSERT_TRUE(rail.tryRecoveryProbe(0, 0, failed_token));
     ASSERT_NE(failed_token, 0u);
     rail.markFailed(0, 0, failed_token);
+
+    uint64_t sibling_token = 0;
+    bool probe_in_progress = true;
+    EXPECT_FALSE(rail.tryRecoveryProbe(0, 0, sibling_token,
+                                       &probe_in_progress));
+    EXPECT_FALSE(probe_in_progress);
 
     EXPECT_FALSE(rail.available(0, 0));
     EXPECT_FALSE(rail.tryRecoveryProbe(0, 0, failed_token));
