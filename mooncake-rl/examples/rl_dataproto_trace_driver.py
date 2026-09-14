@@ -197,7 +197,9 @@ def step_geometry(rng: random.Random, args) -> StepGeometry:
     )
 
 
-def rollout_batch(g: StepGeometry, step: int, rank: int, rng: np.random.Generator) -> dict:
+def rollout_batch(
+    g: StepGeometry, step: int, rank: int, rng: np.random.Generator
+) -> dict:
     total = g.prompt_len + g.response_len
     ids = rng.integers(0, 150000, size=(g.rows, total), dtype=np.int64)
     return {
