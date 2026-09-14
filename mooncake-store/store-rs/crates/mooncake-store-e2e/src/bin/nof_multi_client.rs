@@ -115,14 +115,12 @@ impl StoreTransport for NoopTransport {
     }
 }
 
-const DEFAULT_TARGETS: &str =
-    "127.0.0.1|127.0.0.1|nof-local|nqn.2026-09.io.mooncake:nof-local|4420";
-const DEFAULT_CLIENT_IDS: &str = "client-0,client-1,client-2,client-3";
+const DEFAULT_CLIENT_IDS: &str = "client-0";
 const DEFAULT_HOST_NQN: &str = "nqn.2026-09.io.mooncake:client-dev-5";
 const DEFAULT_DEVICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 const DEFAULT_OBJECTS_PER_CLIENT: usize = 16;
 const DEFAULT_VALUE_BYTES: usize = 64 * 1024;
-const DEFAULT_REPLICA_COUNT: usize = 2;
+const DEFAULT_REPLICA_COUNT: usize = 1;
 const DEFAULT_SUBMIT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const DEFAULT_BARRIER_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_READ_RETRIES: usize = 20;
@@ -239,8 +237,9 @@ fn parse_client_ids(raw: &str) -> Result<Vec<String>> {
 
 impl TestConfig {
     fn from_env() -> Result<Self> {
-        let targets =
-            parse_targets(&env::var("NOF_TARGETS").unwrap_or_else(|_| DEFAULT_TARGETS.into()))?;
+        let targets = parse_targets(
+            &env::var("NOF_TARGETS").map_err(|_| invalid("NOF_TARGETS is required"))?,
+        )?;
         let client_ids = parse_client_ids(
             &env::var("NOF_CLIENT_IDS").unwrap_or_else(|_| DEFAULT_CLIENT_IDS.into()),
         )?;

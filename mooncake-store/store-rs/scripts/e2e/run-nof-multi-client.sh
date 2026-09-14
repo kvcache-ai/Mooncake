@@ -12,22 +12,26 @@ RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 KEYSPACE="${NOF_KEYSPACE:-mc/store-rs/nof-multi-client/${RUN_TAG}}"
 REDIS_URL="${NOF_REDIS_URL:-redis://127.0.0.1:6379/0}"
 BIND_IP="${NOF_BIND_IP:-127.0.0.1}"
-SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-/opt/spdk-26.05/install/lib}"
-RESET_TARGETS="${NOF_RESET_TARGETS:-1}"
-SKIP_TARGET_SSH_CHECK="${NOF_SKIP_TARGET_SSH_CHECK:-0}"
+SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-${MOONCAKE_SPDK_PREFIX:+${MOONCAKE_SPDK_PREFIX}/install/lib}}"
+RESET_TARGETS="${NOF_RESET_TARGETS:-0}"
+SKIP_TARGET_SSH_CHECK="${NOF_SKIP_TARGET_SSH_CHECK:-1}"
+NVMF_SERVICE="${NOF_NVMF_SERVICE:-}"
+TARGET_IMAGE="${NOF_TARGET_IMAGE:-}"
 TIMEOUT_SECONDS="${NOF_CLIENT_TIMEOUT_SECONDS:-180}"
 ENABLE_CORES="${NOF_ENABLE_CORES:-0}"
 STARTUP_SETTLE_SECONDS="${NOF_STARTUP_SETTLE_SECONDS:-2}"
 TEST_IMAGE_BYTES="${NOF_TEST_IMAGE_BYTES:-16G}"
 ROUTE_CONTROL="${NOF_ROUTE_CONTROL:-EmbeddedWrh}"
 RPC_BASE_PORT="${NOF_RPC_BASE_PORT:-21000}"
-CLIENT_IDS_SPEC="${NOF_CLIENT_IDS:-client-0,client-1,client-2,client-3}"
+CLIENT_IDS_SPEC="${NOF_CLIENT_IDS:-client-0}"
 LOCAL_CLIENT_IDS_SPEC="${NOF_LOCAL_CLIENT_IDS:-${CLIENT_IDS_SPEC}}"
-TARGETS_SPEC="${NOF_TARGETS:-127.0.0.1|127.0.0.1|nof-local|nqn.2026-09.io.mooncake:nof-local|4420}"
+TARGETS_SPEC="${NOF_TARGETS:-}"
 BARRIER_DIR="${NOF_BARRIER_DIR:-${LOG_DIR}/${RUN_TAG}/barrier}"
 
 [[ -x "${BINARY}" ]] || { echo "NOF_BINARY is not executable: ${BINARY}" >&2; exit 1; }
+[[ -n "${SPDK_LIB_DIR}" ]] || { echo "NOF_SPDK_LIB_DIR is required, or set MOONCAKE_SPDK_PREFIX" >&2; exit 1; }
 [[ -d "${SPDK_LIB_DIR}" ]] || { echo "NOF_SPDK_LIB_DIR does not exist: ${SPDK_LIB_DIR}" >&2; exit 1; }
+[[ -n "${TARGETS_SPEC}" ]] || { echo "NOF_TARGETS is required" >&2; exit 1; }
 for command in ssh ldd sha256sum timeout; do
   command -v "${command}" >/dev/null || { echo "${command} is required" >&2; exit 1; }
 done
@@ -60,8 +64,12 @@ fi
 
 reset_target() {
   local public_ip="$1"
+  [[ -n "${NVMF_SERVICE}" && -n "${TARGET_IMAGE}" ]] || {
+    echo "NOF_NVMF_SERVICE and NOF_TARGET_IMAGE are required when NOF_RESET_TARGETS=1" >&2
+    exit 1
+  }
   ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${public_ip}" \
-    "set -euo pipefail; systemctl stop mooncake-nvmf.service; rm -f /var/lib/mooncake-nof/nof.img; truncate -s '${TEST_IMAGE_BYTES}' /var/lib/mooncake-nof/nof.img; systemctl start mooncake-nvmf.service; test \"\$(systemctl is-active mooncake-nvmf.service)\" = active"
+    "set -euo pipefail; systemctl stop '${NVMF_SERVICE}'; mkdir -p -- \"\$(dirname '${TARGET_IMAGE}')\"; rm -f '${TARGET_IMAGE}'; truncate -s '${TEST_IMAGE_BYTES}' '${TARGET_IMAGE}'; systemctl start '${NVMF_SERVICE}'; test \"\$(systemctl is-active '${NVMF_SERVICE}')\" = active"
 }
 
 if [[ "${RESET_TARGETS}" == 1 ]]; then
@@ -81,8 +89,12 @@ check_target_endpoint() {
 for target in "${TARGETS[@]}"; do
   IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
   if [[ "${SKIP_TARGET_SSH_CHECK}" != 1 ]]; then
+    [[ -n "${NVMF_SERVICE}" ]] || {
+      echo "NOF_NVMF_SERVICE is required when NOF_SKIP_TARGET_SSH_CHECK=0" >&2
+      exit 1
+    }
     ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${public_ip}" \
-      "test \"\$(systemctl is-active mooncake-nvmf.service)\" = active && timeout 2 bash -c '</dev/tcp/${lan_ip}/${port}'"
+      "test \"\$(systemctl is-active '${NVMF_SERVICE}')\" = active && timeout 2 bash -c '</dev/tcp/${lan_ip}/${port}'"
   else
     check_target_endpoint "${lan_ip}" "${port}"
   fi
@@ -133,6 +145,7 @@ mkdir -p "${BARRIER_DIR}"
     "${RUN_TAG}" "${KEYSPACE}" "${BIND_IP}" "${REDIS_URL}"
   printf 'target_inventory=%s\nclient_ids=%s\nlocal_client_ids=%s\nroute_control=%s\n' \
     "${TARGETS_SPEC}" "${CLIENT_IDS_SPEC}" "${LOCAL_CLIENT_IDS_SPEC}" "${ROUTE_CONTROL}"
+  printf 'nvmf_service=%s\ntarget_image=%s\n' "${NVMF_SERVICE}" "${TARGET_IMAGE}"
   printf 'startup_settle_seconds=%s read_protocol=parallel_batch_get_into\n' \
     "${STARTUP_SETTLE_SECONDS}"
   printf 'hostname=%s\n' "$(hostname)"

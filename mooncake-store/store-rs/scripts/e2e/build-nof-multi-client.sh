@@ -17,12 +17,7 @@ done
 
 find_spdk_prefix() {
   local candidate pc
-  for candidate in \
-    "${MOONCAKE_SPDK_PREFIX:-}" \
-    /nvme/cruz.zxp/spdk-26.05-host \
-    /opt/spdk-26.05 \
-    /nvme/cruz.zxp/spdk-26.05-generic \
-    /nvme/cruz.zxp/spdk-26.05-generic-src; do
+  for candidate in "${MOONCAKE_SPDK_PREFIX:-}"; do
     [[ -n "${candidate}" ]] || continue
     for pc in \
       "${candidate}/install/lib/pkgconfig" \
@@ -41,10 +36,9 @@ find_spdk_prefix() {
 SPDK_PREFIX="$(find_spdk_prefix)" || {
   cat >&2 <<'MSG'
 SPDK development package not found.
-Expected spdk_nvme.pc, spdk_env_dpdk.pc and spdk_syslibs.pc under:
-  /opt/spdk-26.05/install/lib/pkgconfig
-  /nvme/cruz.zxp/spdk-26.05-host/lib/pkgconfig
-Set MOONCAKE_SPDK_PREFIX to an equivalent SPDK prefix.
+Set MOONCAKE_SPDK_PREFIX to an SPDK prefix that contains spdk_nvme.pc,
+spdk_env_dpdk.pc and spdk_syslibs.pc under install/lib/pkgconfig,
+lib/pkgconfig, build/lib/pkgconfig, or build/lib64/pkgconfig.
 MSG
   exit 1
 }
