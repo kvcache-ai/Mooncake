@@ -3,7 +3,7 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
-from mooncake.mooncake_ep_buffer import Buffer, _USE_MACA
+from mooncake.mooncake_ep_buffer import Buffer
 from ep_test_utils import (
     init_dist,
     bench,
