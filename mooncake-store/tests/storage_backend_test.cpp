@@ -3352,7 +3352,7 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
 
     std::vector<std::string> notified_keys;
     auto evict_result = storage_backend.EvictAboveDiskWatermark(
-        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.50,
+        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.25,
         [&](const std::vector<std::string>& evicted_keys) {
             notified_keys.insert(notified_keys.end(), evicted_keys.begin(),
                                  evicted_keys.end());

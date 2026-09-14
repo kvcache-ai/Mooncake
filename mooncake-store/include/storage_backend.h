@@ -1025,7 +1025,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     // FinalizeEviction removes persisted metadata, waits for in-flight reads,
     // and then deletes the data files.
     struct PendingEviction {
-        std::vector<std::string> keys;  // All keys in evicted buckets
+        std::vector<std::string> keys;  // Keys the eviction removed from the
+                                        // index (matched set; skipped
+                                        // duplicates are never re-pointed)
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
         std::vector<std::string> write_keys;

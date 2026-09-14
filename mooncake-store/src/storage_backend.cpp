@@ -1660,8 +1660,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             pending.skipped_keys.begin(), pending.skipped_keys.end());
         std::vector<size_t> committed_indices;
         for (size_t i = 0; i < bucket_keys.size(); ++i) {
-            if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end()) {
-                continue;
+            if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
+                object_bucket_map_.find(bucket_keys[i]) !=
+                    object_bucket_map_.end()) {
+                continue;  // Still persisted elsewhere: idempotent skip.
             }
             if (object_bucket_map_.find(bucket_keys[i]) ==
                 object_bucket_map_.end()) {
@@ -1681,7 +1683,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             return bucket_id;
         }
 
-        total_size_ += bucket->data_size + bucket->meta_size;
+        int64_t committed_data_size = bucket->meta_size;
         object_bucket_map_.reserve(object_bucket_map_.size() +
                                    committed_indices.size());
         for (size_t i : committed_indices) {
@@ -1689,9 +1691,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                 object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
             CHECK(inserted)
                 << "Reserved key became duplicated: " << bucket_keys[i];
+            committed_data_size +=
+                metadatas[i].data_size + metadatas[i].key_size;
             committed_keys.push_back(bucket_keys[i]);
             committed_metadatas.push_back(metadatas[i]);
         }
+        total_size_ += committed_data_size;
         auto ts = 0LL;
         // Update LRU timestamp for in case of eviction.
         if (bucket_backend_config_.eviction_policy ==
@@ -2826,10 +2831,12 @@ BucketStorageBackend::PrepareEviction(
             }
             result.write_keys.push_back(key);
         }
-        result.write_size = required_size;
-        pending_write_size_ += required_size;
-        pending_write_keys_.insert(result.write_keys.begin(),
-                                   result.write_keys.end());
+        if (!result.write_keys.empty()) {
+            result.write_size = required_size;
+            pending_write_size_ += required_size;
+            pending_write_keys_.insert(result.write_keys.begin(),
+                                       result.write_keys.end());
+        }
     }
 
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
@@ -3004,6 +3011,8 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
     for (const auto& key : pending.keys) {
         pending_eviction_keys_.erase(key);
     }
+    const std::unordered_set<std::string> restore_keys(pending.keys.begin(),
+                                                       pending.keys.end());
     for (auto& [bucket_id, bucket_meta] : pending.buckets) {
         if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
             continue;
@@ -3011,6 +3020,11 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
 
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
+            if (restore_keys.find(key) == restore_keys.end()) {
+                // matched-only mirror of the prepare phase: skipped duplicates
+                // stay pointed at their authoritative bucket, never re-pointed
+                continue;
+            }
             const auto& object_meta = bucket_meta->metadatas[i];
             object_bucket_map_[key] = StorageObjectMetadata{
                 bucket_id, object_meta.offset, object_meta.key_size,
