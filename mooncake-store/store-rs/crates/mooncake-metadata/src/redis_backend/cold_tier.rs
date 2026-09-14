@@ -1,13 +1,18 @@
+use std::collections::BTreeSet;
+
 use mooncake_store_core::{
     CasResult, ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord,
-    ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierUsageDelta, MetadataBackend, ObjectKey,
-    ObjectRoute, Result, RouteVersion, StoreError,
+    ColdTierDeviceUpdate, ColdTierPutDeviceResult, ColdTierUsageDelta, MetadataBackend,
+    NofBackingRouteFilter, ObjectKey, ObjectRoute, Result, RouteVersion, StoreError,
 };
 use redis::{Commands, Script};
 
 use crate::cold_tier::cold_tier_device_matches_filter;
 
-use super::{json_error, metadata_error, scan_keys, RedisMetadataBackend, CAS_OBJECT_ROUTE_SCRIPT};
+use super::{
+    bounded_set_members, json_error, metadata_error, scan_keys, RedisMetadataBackend,
+    CAS_OBJECT_ROUTE_SCRIPT,
+};
 
 const APPLY_COLD_TIER_USAGE_DELTA_SCRIPT: &str = r#"
 local key = KEYS[1]
@@ -61,6 +66,21 @@ fn route_matches_cold_backing_filter(route: &ObjectRoute, filter: &ColdBackingRo
     true
 }
 
+fn route_matches_nof_backing_filter(route: &ObjectRoute, filter: &NofBackingRouteFilter) -> bool {
+    let Some(backing) = route.nof_backing.as_ref() else {
+        return false;
+    };
+    if filter.state.is_some_and(|state| backing.state != state) {
+        return false;
+    }
+    let Some(target_id) = filter.target_id.as_deref() else {
+        return true;
+    };
+    backing
+        .all_targets()
+        .any(|(route_target_id, _, _)| route_target_id == target_id)
+}
+
 impl RedisMetadataBackend {
     pub(super) fn cold_backing_filter_index(
         &self,
@@ -100,6 +120,30 @@ impl RedisMetadataBackend {
         [device_index, state_index, owner_index]
     }
 
+    pub(super) fn nof_backing_filter_index(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Option<String> {
+        if let Some(target_id) = filter.target_id.as_deref() {
+            return Some(self.keyspace.object_nof_target_index(target_id));
+        }
+        filter
+            .state
+            .map(|state| self.keyspace.object_nof_backing_state_index(state))
+    }
+
+    pub(super) fn nof_backing_index_keys(&self, route: Option<&ObjectRoute>) -> Vec<String> {
+        let Some(backing) = route.and_then(|route| route.nof_backing.as_ref()) else {
+            return Vec::new();
+        };
+        let mut keys = BTreeSet::new();
+        for (target_id, _, _) in backing.all_targets() {
+            keys.insert(self.keyspace.object_nof_target_index(target_id));
+        }
+        keys.insert(self.keyspace.object_nof_backing_state_index(backing.state));
+        keys.into_iter().collect()
+    }
+
     pub(super) fn redis_list_object_routes_by_cold_backing(
         &self,
         filter: &ColdBackingRouteFilter,
@@ -107,10 +151,16 @@ impl RedisMetadataBackend {
         let Some(index) = self.cold_backing_filter_index(filter) else {
             return MetadataBackend::list_object_routes_by_cold_backing(self, filter);
         };
-        let keys = self
-            .query_readonly("redis list object routes by cold backing", |connection| {
-                connection.smembers::<_, Vec<String>>(&index)
-            })?;
+        let keys = self.query_readonly(
+            "redis list object routes by cold backing",
+            |connection| {
+                bounded_set_members(
+                    connection,
+                    &index,
+                    "redis sscan cold backing route index",
+                )
+            },
+        )?;
         let entries =
             self.query_readonly("redis load cold backing object routes", |connection| {
                 let mut entries = Vec::with_capacity(keys.len());
@@ -174,6 +224,62 @@ impl RedisMetadataBackend {
             .collect())
     }
 
+    pub(super) fn redis_list_object_routes_by_nof_backing(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        let Some(index) = self.nof_backing_filter_index(filter) else {
+            return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
+        };
+        let keys = self.query_readonly(
+            "redis list object routes by nof backing",
+            |connection| {
+                bounded_set_members(
+                    connection,
+                    &index,
+                    "redis sscan nof backing route index",
+                )
+            },
+        )?;
+        let entries = self.query_readonly(
+            "redis load nof backing object routes",
+            |connection| {
+                let mut entries = Vec::with_capacity(keys.len());
+                for key in &keys {
+                    let payload: Option<String> = redis::cmd("HGET")
+                        .arg(key.as_str())
+                        .arg("payload")
+                        .query(connection)?;
+                    entries.push((key.clone(), payload));
+                }
+                Ok(entries)
+            },
+        )?;
+        let mut stale_keys = Vec::new();
+        let mut routes = Vec::new();
+        for (key, payload) in entries {
+            if let Some(payload) = payload {
+                routes.push(serde_json::from_str(&payload).map_err(json_error)?);
+            } else {
+                stale_keys.push(key);
+            }
+        }
+        if !stale_keys.is_empty() {
+            let mut connection = self.connection("redis prune stale nof backing route index")?;
+            connection
+                .srem::<_, _, ()>(&index, stale_keys)
+                .map_err(|error| metadata_error("redis srem nof backing route index", error))?;
+        }
+        if routes.is_empty() {
+            return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
+        }
+        Ok(routes
+            .into_iter()
+            .filter(|route| route_matches_nof_backing_filter(route, filter))
+            .take(filter.limit.unwrap_or(usize::MAX))
+            .collect())
+    }
+
     pub(super) fn redis_compare_and_swap_object_route(
         &self,
         key: &ObjectKey,
@@ -191,7 +297,11 @@ impl RedisMetadataBackend {
             self.cold_backing_index_keys(current.as_ref());
         let [new_device_index, new_state_index, new_owner_index] =
             self.cold_backing_index_keys(next);
-        let current_payload = Script::new(CAS_OBJECT_ROUTE_SCRIPT)
+        let old_nof_indexes = self.nof_backing_index_keys(current.as_ref());
+        let new_nof_indexes = self.nof_backing_index_keys(next);
+        let script = Script::new(CAS_OBJECT_ROUTE_SCRIPT);
+        let mut invocation = script.prepare_invoke();
+        invocation
             .key(&object_key)
             .key(self.keyspace.object_index())
             .key(old_device_index.as_str())
@@ -199,7 +309,14 @@ impl RedisMetadataBackend {
             .key(old_owner_index.as_str())
             .key(new_device_index.as_str())
             .key(new_state_index.as_str())
-            .key(new_owner_index.as_str())
+            .key(new_owner_index.as_str());
+        for index in &old_nof_indexes {
+            invocation.key(index.as_str());
+        }
+        for index in &new_nof_indexes {
+            invocation.key(index.as_str());
+        }
+        invocation
             .arg(
                 expected
                     .map(|version| version.0.to_string())
@@ -221,6 +338,9 @@ impl RedisMetadataBackend {
             })
             .arg(if new_state_index.is_empty() { "0" } else { "1" })
             .arg(if new_owner_index.is_empty() { "0" } else { "1" })
+            .arg(old_nof_indexes.len())
+            .arg(new_nof_indexes.len());
+        let current_payload = invocation
             .invoke::<(i32, String)>(&mut connection)
             .map_err(|error| metadata_error("redis cas object route", error))?;
 

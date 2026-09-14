@@ -243,6 +243,26 @@ impl MetadataKeyspace {
         )
     }
 
+    pub fn object_nof_target_index(&self, target_id: &str) -> String {
+        format!(
+            "{}/indexes/objects/by-nof-target/{}",
+            self.slot_tag,
+            encode_key_component(target_id)
+        )
+    }
+
+    pub fn object_nof_backing_state_index(&self, state: ColdBackingState) -> String {
+        format!(
+            "{}/indexes/objects/by-nof-backing-state/{}",
+            self.slot_tag,
+            match state {
+                ColdBackingState::PendingOffload => "pending_offload",
+                ColdBackingState::Materialized => "materialized",
+                ColdBackingState::PendingDelete => "pending_delete",
+            }
+        )
+    }
+
     pub fn cold_tier_device(&self, device_id: &str) -> String {
         format!(
             "{}/system/cold-tier/devices/{}",

@@ -9,8 +9,8 @@ use mooncake_store_core::error::QuotaKind;
 use mooncake_store_core::{
     CasResult, ClientEpoch, ClientLease, ClientLifecycleState, ClientRuntimeId, ClientStableId,
     ColdBackingRouteFilter, ColdTierDeviceFilter, ColdTierDeviceRecord, ColdTierDeviceUpdate,
-    ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, MetadataBackend, ObjectKey,
-    ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
+    ColdTierPutDeviceResult, ColdTierUsageDelta, HandoffPlan, MetadataBackend,
+    NofBackingRouteFilter, ObjectKey, ObjectRoute, Result, RoutePolicy, RoutePolicyDomain,
     RouteVersion, SegmentAnnouncement, SegmentLifecycleState, SegmentName, SegmentReservation,
     StoreError, TenantObjectAccounting, TenantObjectAccountingState, TenantPolicy,
     TenantPolicyScope, TenantQuotaAbortOutcome, TenantQuotaFinalizeOutcome,
@@ -47,7 +47,8 @@ local has_old_owner_index = ARGV[6]
 local has_new_device_index = ARGV[7]
 local has_new_state_index = ARGV[8]
 local has_new_owner_index = ARGV[9]
-
+local old_nof_index_count = tonumber(ARGV[10])
+local new_nof_index_count = tonumber(ARGV[11])
 local current_payload = redis.call('HGET', key, 'payload')
 local current_version = redis.call('HGET', key, 'version')
 
@@ -64,6 +65,10 @@ end
 if has_old_device_index == '1' then redis.call('SREM', old_device_index, key) end
 if has_old_state_index == '1' then redis.call('SREM', old_state_index, key) end
 if has_old_owner_index == '1' then redis.call('SREM', old_owner_index, key) end
+local old_nof_index_offset = 8
+for i = 1, old_nof_index_count do
+    redis.call('SREM', KEYS[old_nof_index_offset + i], key)
+end
 if payload == '__delete__' then
     redis.call('DEL', key)
     redis.call('SREM', index, key)
@@ -75,6 +80,10 @@ redis.call('SADD', index, key)
 if has_new_device_index == '1' then redis.call('SADD', new_device_index, key) end
 if has_new_state_index == '1' then redis.call('SADD', new_state_index, key) end
 if has_new_owner_index == '1' then redis.call('SADD', new_owner_index, key) end
+local new_nof_index_offset = 8 + old_nof_index_count
+for i = 1, new_nof_index_count do
+    redis.call('SADD', KEYS[new_nof_index_offset + i], key)
+end
 return {1, payload}
 "#;
 
@@ -2126,6 +2135,13 @@ impl MetadataBackend for RedisMetadataBackend {
         filter: &ColdBackingRouteFilter,
     ) -> Result<Vec<ObjectRoute>> {
         self.redis_list_object_routes_by_cold_backing(filter)
+    }
+
+    fn list_object_routes_by_nof_backing(
+        &self,
+        filter: &NofBackingRouteFilter,
+    ) -> Result<Vec<ObjectRoute>> {
+        self.redis_list_object_routes_by_nof_backing(filter)
     }
 
     fn compare_and_swap_object_route(
