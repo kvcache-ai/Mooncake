@@ -34,7 +34,6 @@
 namespace mooncake {
 
 class RealClient;
-class PinnedBufferPool;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
@@ -1034,7 +1033,6 @@ class RealClient : public PyClient {
     std::condition_variable session_cv_;
     std::unordered_map<std::string, QueryResult> get_sessions_;
     std::unordered_map<std::string, PutSessionEntry> put_sessions_;
-    std::shared_ptr<PinnedBufferPool> session_staging_pool_;
 
     // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
     bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
@@ -1169,6 +1167,9 @@ class RealClient : public PyClient {
     DfsSessionStagingArena build_dfs_session_staging_arena(
         const std::vector<SessionRangeReadRequest> &requests,
         std::vector<int> &results);
+
+    bool session_range_requests_target_device(
+        const std::vector<SessionRangeReadRequest> &requests) const;
 
     void execute_session_dfs_range_reads(
         const std::vector<SessionRangeReadRequest> &requests,

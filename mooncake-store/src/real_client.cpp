@@ -21,7 +21,6 @@
 #include "real_client.h"
 #include "common/client_buffer_allocation.h"
 #include "registered_pinned_memory.h"
-#include "pinned_buffer_pool.h"
 #include "client_buffer.h"
 #include "replica_selection.h"
 #include "batch_read_fanout.h"
@@ -498,28 +497,26 @@ inline const Replica::Descriptor *SelectSessionReplica(
     return nullptr;
 }
 
-struct SessionStagingBacking {
-    std::shared_ptr<PinnedBufferPool> pool;
-    PinnedBufferPool::Buffer buffer;
-
-    ~SessionStagingBacking() {
-        if (pool && buffer.data) pool->Release(std::move(buffer));
-    }
-};
-
 std::shared_ptr<BufferHandle> AcquireSessionStaging(
-    const std::shared_ptr<PinnedBufferPool> &pool, size_t size) {
-    if (!pool || size == 0) return nullptr;
+    const std::shared_ptr<FileStorage> &file_storage,
+    const std::shared_ptr<ClientBufferAllocator> &fallback_allocator,
+    size_t size, bool prefer_pinned) {
+    if (size == 0) return nullptr;
 
     try {
-        auto backing = std::make_shared<SessionStagingBacking>();
-        backing->pool = pool;
-        backing->buffer = pool->Acquire(size);
-        if (!backing->buffer.data || backing->buffer.capacity < size) {
-            return nullptr;
+        std::optional<BufferHandle> allocation;
+        if (prefer_pinned && file_storage) {
+            allocation = file_storage->AllocatePinnedStagingBuffer(size);
+            if (!allocation) {
+                VLOG(1) << "Pinned session staging arena unavailable or "
+                           "exhausted; using default client buffer arena";
+            }
         }
-        return std::make_shared<BufferHandle>(backing->buffer.data, size,
-                                              [backing]() { (void)backing; });
+        if (!allocation && fallback_allocator) {
+            allocation = fallback_allocator->allocate(size);
+        }
+        if (!allocation) return nullptr;
+        return std::make_shared<BufferHandle>(std::move(*allocation));
     } catch (const std::bad_alloc &) {
         return nullptr;
     }
@@ -811,7 +808,6 @@ RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
-    session_staging_pool_ = std::make_shared<PinnedBufferPool>();
 }
 
 RealClient::~RealClient() {
@@ -6157,8 +6153,9 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
             request.cached_query_result, request.selected_replica));
     }
 
-    staging_arena.staging_buffer =
-        AcquireSessionStaging(session_staging_pool_, arena_size);
+    staging_arena.staging_buffer = AcquireSessionStaging(
+        file_storage_, client_buffer_allocator_, arena_size,
+        session_range_requests_target_device(requests));
     if (!staging_arena.object_keys.empty() && !staging_arena.staging_buffer) {
         for (const auto &object_key : staging_arena.object_keys) {
             fail_file_backed_requests_for_key(
@@ -6183,6 +6180,20 @@ RealClient::DfsSessionStagingArena RealClient::build_dfs_session_staging_arena(
                                             std::move(slices));
     }
     return staging_arena;
+}
+
+bool RealClient::session_range_requests_target_device(
+    const std::vector<SessionRangeReadRequest> &requests) const {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    for (const auto &request : requests) {
+        for (const void *destination : request.destination_buffers) {
+            if (runtime_accelerator.FindDeviceForPointer(destination)) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void RealClient::execute_session_dfs_range_reads(
