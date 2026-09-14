@@ -503,6 +503,17 @@ ErrorCode OpLogBatchStorage::ReadBatchesAfter(
     return ErrorCode::OK;
 }
 
+ErrorCode OpLogBatchStorage::DeleteBatchesThrough(uint64_t batch_id) {
+    if (!IsValidClusterId()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    // The suffix range starts immediately after the inclusive cutoff, and
+    // already handles UINT64_MAX without overflowing the batch ID.
+    const auto suffix = BuildBatchRecordRange(cluster_id_, batch_id);
+    return backend_.DeleteRange(BuildBatchRecordKey(cluster_id_, 0),
+                                suffix.begin_key);
+}
+
 bool OpLogBatchStorage::IsValidClusterId() const { return cluster_id_valid_; }
 
 ErrorCode OpLogBatchStorage::RejectLegacyLayout() const {
