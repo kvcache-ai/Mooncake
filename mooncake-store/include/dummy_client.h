@@ -21,6 +21,7 @@ namespace mooncake {
 class DummyClient : public PyClient {
    public:
     DummyClient();
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~DummyClient();
 
     int64_t unregister_shm();
@@ -312,6 +313,7 @@ class DummyClient : public PyClient {
     }
 
     RpcClientPool client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;
