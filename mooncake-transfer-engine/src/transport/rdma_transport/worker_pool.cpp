@@ -414,7 +414,34 @@ int WorkerPool::submitPostSend(
 
 void WorkerPool::enqueuePreparedSlices(const SliceList &slice_list,
                                        uint64_t submitted_slice_count) {
-    for (auto &slice : slice_list) enqueueSliceToOwner(slice);
+    size_t begin = 0;
+    while (begin < slice_list.size()) {
+        auto *slice = slice_list[begin];
+        const int owner_thread = postingThreadForPeer(slice->peer_nic_path);
+        if (owner_thread < 0 || owner_thread >= worker_count_) {
+            LOG(ERROR) << "Invalid RDMA worker owner " << owner_thread
+                       << " for peer " << slice->peer_nic_path;
+            slice->markFailed();
+            processed_slice_count_.fetch_add(1);
+            ++begin;
+            continue;
+        }
+
+        size_t end = begin + 1;
+        while (end < slice_list.size() &&
+               slice_list[end]->peer_nic_path == slice->peer_nic_path)
+            ++end;
+
+        {
+            std::lock_guard<std::mutex> lock(
+                worker_slice_queue_lock_[owner_thread]);
+            auto &queue =
+                worker_slice_queue_[owner_thread][slice->peer_nic_path];
+            queue.insert(queue.end(), slice_list.begin() + begin,
+                         slice_list.begin() + end);
+        }
+        begin = end;
+    }
 
     submitted_slice_count_.fetch_add(submitted_slice_count);
     if (submitted_slice_count &&

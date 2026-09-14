@@ -159,6 +159,10 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
                   [](const TransferMetadata::HandShakeDesc& peer,
                      TransferMetadata::HandShakeDesc& local) {
                       local.payload = "reply:" + peer.payload;
+                      local.rdma_max_dest_rd_atomic =
+                          peer.rdma_max_dest_rd_atomic;
+                      local.rdma_read_depth_supported =
+                          peer.rdma_read_depth_supported;
                       return 0;
                   },
                   port, sockfd),
@@ -187,9 +191,21 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
 
     TransferMetadata::HandShakeDesc request;
     request.payload = "bootstrap";
+    request.rdma_max_dest_rd_atomic = 128;
+    request.rdma_read_depth_supported = true;
     TransferMetadata::HandShakeDesc response;
     ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
     EXPECT_EQ(response.payload, "reply:bootstrap");
+    EXPECT_TRUE(response.rdma_read_depth_supported);
+    EXPECT_EQ(response.rdma_max_dest_rd_atomic, 128);
+
+    TransferMetadata::HandShakeDesc legacy_request;
+    legacy_request.payload = "legacy";
+    TransferMetadata::HandShakeDesc legacy_response;
+    ASSERT_EQ(
+        client.sendHandshake(server_name, legacy_request, legacy_response), 0);
+    EXPECT_FALSE(legacy_response.rdma_read_depth_supported);
+    EXPECT_EQ(legacy_response.rdma_max_dest_rd_atomic, 0);
 }
 
 // add, get and remove RPCMetaEntryMeta

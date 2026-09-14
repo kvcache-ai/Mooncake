@@ -212,11 +212,32 @@ class RdmaEndPointTestPeer {
         RWSpinlock::WriteGuard guard(endpoint.lock_);
         return endpoint.reconstruct();
     }
+
+    static bool reserveCompletionSlots(std::atomic<int> *outstanding,
+                                       size_t budget, int count) {
+        return RdmaEndPoint::reserveCompletionSlots(outstanding, budget, count);
+    }
 };
 
 }  // namespace mooncake
 
 namespace {
+
+TEST(RdmaCqReservationTest, AtomicallyReservesSharedCqBudget) {
+    std::atomic<int> outstanding{0};
+
+    EXPECT_TRUE(
+        RdmaEndPointTestPeer::reserveCompletionSlots(&outstanding, 4, 3));
+    EXPECT_EQ(outstanding.load(std::memory_order_relaxed), 3);
+    EXPECT_FALSE(
+        RdmaEndPointTestPeer::reserveCompletionSlots(&outstanding, 4, 2));
+    EXPECT_EQ(outstanding.load(std::memory_order_relaxed), 3);
+    EXPECT_TRUE(
+        RdmaEndPointTestPeer::reserveCompletionSlots(&outstanding, 4, 1));
+    EXPECT_EQ(outstanding.load(std::memory_order_relaxed), 4);
+    EXPECT_FALSE(
+        RdmaEndPointTestPeer::reserveCompletionSlots(&outstanding, 4, 1));
+}
 
 class InProcessRdmaTransport : public RdmaTransport {
    public:

@@ -192,6 +192,11 @@ class TransferMetadata {
         // Capability marker. Encoded only by transports that opt into
         // ready_ack; decoded from field presence to detect peer support.
         bool ready_ack_supported = false;
+        // Maximum responder resources available for inbound RDMA READs.
+        // Field presence is tracked separately for compatibility with peers
+        // that predate read-depth negotiation.
+        uint16_t rdma_max_dest_rd_atomic = 0;
+        bool rdma_read_depth_supported = false;
         // Per-peer RDMA CtrlChannel (notify QP). 0 = not supported / unused.
         // When ctrl_channel is true, this handshake only sets up the control
         // path (qp_num may be empty).

@@ -146,11 +146,45 @@ Status MultiTransport::submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
+    struct ScatterRoute {
+        std::shared_ptr<SegmentDesc> segment_desc;
+        Transport* fixed_transport = nullptr;
+        bool fixed = false;
+    };
+
     std::vector<Transport*> transports;
     transports.reserve(entries.size());
+    std::unordered_map<SegmentID, ScatterRoute> scatter_routes;
     for (const auto& request : entries) {
         Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
+        Status status;
+        if (task_sizes) {
+            auto [route_it, inserted] =
+                scatter_routes.try_emplace(request.target_id);
+            auto& route = route_it->second;
+            if (inserted) {
+                route.segment_desc =
+                    metadata_->getSegmentDescByID(request.target_id);
+                if (!route.segment_desc) {
+                    return Status::InvalidArgument(
+                        "Invalid target segment ID " +
+                        std::to_string(request.target_id));
+                }
+                route.fixed =
+                    route.segment_desc->protocol.find(',') == std::string::npos;
+            }
+            if (route.fixed && route.fixed_transport) {
+                transport = route.fixed_transport;
+                status = Status::OK();
+            } else {
+                status =
+                    selectTransport(request, route.segment_desc, transport);
+                if (status.ok() && route.fixed)
+                    route.fixed_transport = transport;
+            }
+        } else {
+            status = selectTransport(request, transport);
+        }
         if (!status.ok()) return status;
         assert(transport);
         transports.push_back(transport);
@@ -598,6 +632,13 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                        std::to_string(entry.target_id));
     }
 
+    return selectTransport(entry, target_segment_desc, transport);
+}
+
+Status MultiTransport::selectTransport(
+    const TransferRequest& entry,
+    const std::shared_ptr<SegmentDesc>& target_segment_desc,
+    Transport*& transport) {
     auto proto = target_segment_desc->protocol;
 #ifdef ENABLE_MULTI_PROTOCOL
     // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target

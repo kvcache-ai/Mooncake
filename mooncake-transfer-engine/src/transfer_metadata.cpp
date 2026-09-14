@@ -182,6 +182,9 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (desc.rdma_read_depth_supported)
+            root["rdma_max_dest_rd_atomic"] =
+                Json::UInt(desc.rdma_max_dest_rd_atomic);
         if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
             root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
             root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
@@ -230,6 +233,17 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        desc.rdma_read_depth_supported =
+            root.isMember("rdma_max_dest_rd_atomic");
+        desc.rdma_max_dest_rd_atomic = 0;
+        if (desc.rdma_read_depth_supported &&
+            root["rdma_max_dest_rd_atomic"].isUInt()) {
+            unsigned int depth = root["rdma_max_dest_rd_atomic"].asUInt();
+            if (depth > UINT8_MAX) return ERR_INVALID_ARGUMENT;
+            desc.rdma_max_dest_rd_atomic = static_cast<uint16_t>(depth);
+        } else if (desc.rdma_read_depth_supported) {
+            return ERR_INVALID_ARGUMENT;
         }
         desc.notify_qp_num = 0;
         desc.notify_rq_depth = 0;

@@ -274,6 +274,10 @@ class RdmaContext {
         return &cq_list_[cq_index].outstanding;
     }
 
+    uint8_t maxQpRdAtomic() const { return max_qp_rd_atomic_; }
+
+    uint8_t maxQpInitRdAtomic() const { return max_qp_init_rd_atomic_; }
+
     int cqCount() const { return cq_list_.size(); }
     int postingThreadForPeer(const std::string &peer_nic_path) const;
     int cqIndexForPostingThread(int thread_id) const;
@@ -333,6 +337,8 @@ class RdmaContext {
     RWSpinlock memory_regions_lock_;
     MemoryRegionMap memory_region_map_;
     std::vector<RdmaCq> cq_list_;
+    uint8_t max_qp_rd_atomic_ = 16;
+    uint8_t max_qp_init_rd_atomic_ = 16;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
 
