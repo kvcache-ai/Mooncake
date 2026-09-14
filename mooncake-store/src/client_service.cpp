@@ -558,7 +558,7 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
 }
 
 tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
-    const void* addr, size_t length, const std::string& protocol, bool enforce_max_mr_size) {
+    const void* addr, size_t length, const std::string& protocol) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

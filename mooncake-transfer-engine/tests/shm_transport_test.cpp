@@ -16,13 +16,16 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -171,15 +174,71 @@ void addPeerSegment(TransferMetadata& metadata, const std::string& shm_name,
     addPeerBuffers(metadata, {{shm_name, remote_addr}}, length);
 }
 
+std::optional<std::string> FindHugetlbfsMount(size_t hugepage_size) {
+    std::vector<const char*> candidates;
+    if (const char* env = std::getenv("MC_HUGETLBFS_PATH");
+        env && hugepage_size == SharedMemoryOptions::kHugepage2MB) {
+        candidates.push_back(env);
+    }
+    if (const char* env = std::getenv("MC_HUGETLBFS_PATH_512M");
+        env && hugepage_size == SharedMemoryOptions::kHugepage512MB) {
+        candidates.push_back(env);
+    }
+    if (const char* env = std::getenv("MC_HUGETLBFS_PATH_1G");
+        env && hugepage_size == SharedMemoryOptions::kHugepage1GB) {
+        candidates.push_back(env);
+    }
+    // Generic override applies to whichever size the caller requested.
+    if (const char* env = std::getenv("MC_HUGETLBFS_PATH"); env) {
+        candidates.push_back(env);
+    }
+    candidates.push_back(
+        SharedMemoryOptions::defaultHugetlbfsPathFor(hugepage_size));
+    if (hugepage_size == SharedMemoryOptions::kHugepage2MB) {
+        candidates.push_back("/tmp/mooncake_hugepages_2m");
+    } else if (hugepage_size == SharedMemoryOptions::kHugepage512MB) {
+        candidates.push_back("/tmp/mooncake_hugepages_512m");
+    } else if (hugepage_size == SharedMemoryOptions::kHugepage1GB) {
+        candidates.push_back("/tmp/mooncake_hugepages_1g");
+    }
+
+    for (const char* dir : candidates) {
+        if (!dir || !*dir) continue;
+        struct statfs sfs;
+        if (statfs(dir, &sfs) != 0) continue;
+        if (sfs.f_type != HUGETLBFS_MAGIC) continue;
+        if (static_cast<size_t>(sfs.f_bsize) != hugepage_size) continue;
+        if (access(dir, W_OK) != 0) continue;
+        return std::string(dir);
+    }
+    return std::nullopt;
+}
+
+std::optional<std::string> FindHugetlbfs2MBMount() {
+    return FindHugetlbfsMount(SharedMemoryOptions::kHugepage2MB);
+}
+
+std::optional<std::string> FindHugetlbfs512MBMount() {
+    return FindHugetlbfsMount(SharedMemoryOptions::kHugepage512MB);
+}
+
+std::optional<std::string> FindHugetlbfs1GBMount() {
+    return FindHugetlbfsMount(SharedMemoryOptions::kHugepage1GB);
+}
+
 }  // namespace
 
 TEST(ShmNameTest, PrefixDetectsPosixNames) {
     EXPECT_TRUE(isPosixShmName("/mooncake_1234_abcdefgh"));
     EXPECT_TRUE(isPosixShmName("mooncake_1234_abcdefgh"));
+    EXPECT_TRUE(isPosixShmName("/dev/hugepages/mooncake_1234_abcdefgh"));
+    EXPECT_TRUE(isFilesystemShmPath("/dev/hugepages/mooncake_1234_abcdefgh"));
+    EXPECT_FALSE(isFilesystemShmPath("/mooncake_1234_abcdefgh"));
     EXPECT_FALSE(isPosixShmName(""));
     EXPECT_FALSE(isPosixShmName("/mooncake_"));
     EXPECT_FALSE(isPosixShmName("mooncake_"));
     EXPECT_FALSE(isPosixShmName("cuda-ipc-handle"));
+    EXPECT_FALSE(isPosixShmName("/dev/hugepages/other_file"));
 }
 
 TEST(ShmTransportTest, SharesRelocationAcrossThreads) {
@@ -700,6 +759,182 @@ TEST(ShmTransportTest, RegisterBatchSkipsMallocAndExportsShm) {
     }
     EXPECT_EQ(posix_buffers, 1);
     ASSERT_EQ(transport.freeSharedMemory(base), 0);
+}
+
+TEST(ShmTransportTest, Hugepage2MBAllocateAndExport) {
+    auto mount = FindHugetlbfs2MBMount();
+    if (!mount) {
+        GTEST_SKIP() << "No writable 2MB hugetlbfs mount "
+                        "(set MC_HUGETLBFS_PATH or mount one)";
+    }
+
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugetlbfs_path = *mount;
+    opt.populate = false;
+
+    const size_t length = SharedMemoryOptions::kHugepage2MB;
+    void* base = transport.allocateSharedMemory(length, opt);
+    ASSERT_NE(base, nullptr);
+    std::string shm_name;
+    ASSERT_TRUE(transport.getShmName(base, &shm_name));
+    EXPECT_TRUE(isFilesystemShmPath(shm_name));
+    EXPECT_TRUE(isPosixShmName(shm_name));
+    EXPECT_EQ(shm_name.rfind(*mount, 0), 0u);
+
+    ASSERT_EQ(ShmTransportTestPeer::registerLocalMemory(transport, base, length),
+              0);
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_TRUE(desc);
+    ASSERT_FALSE(desc->buffers.empty());
+    EXPECT_TRUE(isPosixShmName(desc->buffers[0].shm_name));
+    EXPECT_TRUE(isFilesystemShmPath(desc->buffers[0].shm_name));
+    EXPECT_EQ(desc->buffers[0].length, length);
+
+    // Peer-side open must not create; relocate should mmap the absolute path.
+    addPeerSegment(*metadata, shm_name, kRemoteAddress, length);
+    uint64_t relocated = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, relocated, length,
+                                               kPeerSegmentId)
+                    .ok());
+    EXPECT_NE(relocated, kRemoteAddress);
+    auto* mapped = reinterpret_cast<char*>(relocated);
+    mapped[0] = 0x5a;
+    EXPECT_EQ(static_cast<char*>(base)[0], 0x5a);
+
+    ASSERT_EQ(transport.freeSharedMemory(base), 0);
+    EXPECT_EQ(access(shm_name.c_str(), F_OK), -1);
+}
+
+TEST(ShmTransportTest, Hugepage512MBAllocateAndExport) {
+    auto mount = FindHugetlbfs512MBMount();
+    if (!mount) {
+        GTEST_SKIP() << "No writable 512MB hugetlbfs mount "
+                        "(set MC_HUGETLBFS_PATH_512M or mount one)";
+    }
+
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage512MB;
+    opt.hugetlbfs_path = *mount;
+    opt.populate = false;
+
+    const size_t length = SharedMemoryOptions::kHugepage512MB;
+    void* base = transport.allocateSharedMemory(length, opt);
+    if (!base) {
+        GTEST_SKIP() << "512MB hugetlbfs mount present but allocation failed "
+                        "(no free 512MB hugepages?)";
+    }
+    std::string shm_name;
+    ASSERT_TRUE(transport.getShmName(base, &shm_name));
+    EXPECT_TRUE(isFilesystemShmPath(shm_name));
+
+    ASSERT_EQ(ShmTransportTestPeer::registerLocalMemory(transport, base, length),
+              0);
+    addPeerSegment(*metadata, shm_name, kRemoteAddress, length);
+    uint64_t relocated = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, relocated, length,
+                                               kPeerSegmentId)
+                    .ok());
+    auto* mapped = reinterpret_cast<char*>(relocated);
+    mapped[0] = 0x5c;
+    EXPECT_EQ(static_cast<char*>(base)[0], 0x5c);
+
+    ASSERT_EQ(transport.freeSharedMemory(base), 0);
+    EXPECT_EQ(access(shm_name.c_str(), F_OK), -1);
+}
+
+TEST(ShmTransportTest, Hugepage1GBAllocateAndExport) {
+    auto mount = FindHugetlbfs1GBMount();
+    if (!mount) {
+        GTEST_SKIP() << "No writable 1GB hugetlbfs mount "
+                        "(set MC_HUGETLBFS_PATH_1G or mount one)";
+    }
+
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    ShmTransport transport;
+    std::string local = "127.0.0.1:19000";
+    ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
+
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage1GB;
+    opt.hugetlbfs_path = *mount;
+    opt.populate = false;
+
+    const size_t length = SharedMemoryOptions::kHugepage1GB;
+    void* base = transport.allocateSharedMemory(length, opt);
+    if (!base) {
+        GTEST_SKIP() << "1GB hugetlbfs mount present but allocation failed "
+                        "(no free 1GB hugepages?)";
+    }
+    std::string shm_name;
+    ASSERT_TRUE(transport.getShmName(base, &shm_name));
+    EXPECT_TRUE(isFilesystemShmPath(shm_name));
+    EXPECT_TRUE(isPosixShmName(shm_name));
+
+    ASSERT_EQ(ShmTransportTestPeer::registerLocalMemory(transport, base, length),
+              0);
+    addPeerSegment(*metadata, shm_name, kRemoteAddress, length);
+    uint64_t relocated = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, relocated, length,
+                                               kPeerSegmentId)
+                    .ok());
+    auto* mapped = reinterpret_cast<char*>(relocated);
+    mapped[0] = 0x5b;
+    EXPECT_EQ(static_cast<char*>(base)[0], 0x5b);
+
+    ASSERT_EQ(transport.freeSharedMemory(base), 0);
+    EXPECT_EQ(access(shm_name.c_str(), F_OK), -1);
+}
+
+TEST(ShmTransportTest, HugepageRejectsUnsupportedSize) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = 64ULL * 1024;  // not a Store/TE hugepage size
+    opt.hugetlbfs_path = "/tmp/mooncake_hugepages_2m";
+    EXPECT_EQ(transport.allocateSharedMemory(opt.hugepage_size, opt), nullptr);
+}
+
+TEST(ShmTransportTest, HugepageRejectsPageSizeMismatch) {
+    auto mount_2m = FindHugetlbfs2MBMount();
+    if (!mount_2m) {
+        GTEST_SKIP() << "No writable 2MB hugetlbfs mount";
+    }
+    // Request 1GB against a 2MB mount → must fail (no tmpfs fallback).
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage1GB;
+    opt.hugetlbfs_path = *mount_2m;
+    opt.populate = false;
+    EXPECT_EQ(
+        transport.allocateSharedMemory(SharedMemoryOptions::kHugepage1GB, opt),
+        nullptr);
+}
+
+TEST(ShmTransportTest, HugepageDoesNotFallbackToTmpfs) {
+    ShmTransport transport;
+    SharedMemoryOptions opt;
+    opt.use_hugepage = true;
+    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugetlbfs_path = "/tmp/mooncake_not_a_hugetlbfs_mount";
+    opt.populate = false;
+    EXPECT_EQ(
+        transport.allocateSharedMemory(SharedMemoryOptions::kHugepage2MB, opt),
+        nullptr);
 }
 
 #ifndef ENABLE_MULTI_PROTOCOL

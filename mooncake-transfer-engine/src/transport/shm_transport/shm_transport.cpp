@@ -16,8 +16,10 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/magic.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <unistd.h>
 
 #include <cassert>
@@ -35,9 +37,29 @@
 namespace mooncake {
 namespace {
 
+size_t alignUp(size_t value, size_t alignment) {
+    if (alignment == 0) return value;
+    const size_t rem = value % alignment;
+    if (rem == 0) return value;
+    if (value > std::numeric_limits<size_t>::max() - (alignment - rem)) {
+        return 0;
+    }
+    return value + (alignment - rem);
+}
+
 std::string randomShmName() {
     std::string result = std::string(kPosixShmNamePrefix) +
                          std::to_string(static_cast<long>(getpid())) + "_";
+    for (int i = 0; i < 8; ++i) result += 'a' + SimpleRandom::Get().next(26);
+    return result;
+}
+
+std::string randomHugetlbfsName(const std::string& dir) {
+    std::string result = dir;
+    if (!result.empty() && result.back() == '/') result.pop_back();
+    result += "/mooncake_";
+    result += std::to_string(static_cast<long>(getpid()));
+    result += "_";
     for (int i = 0; i < 8; ++i) result += 'a' + SimpleRandom::Get().next(26);
     return result;
 }
@@ -49,8 +71,13 @@ bool rangeContains(uint64_t start, uint64_t span, uint64_t addr,
     return offset <= span && span - offset >= length;
 }
 
-bool posixShmObjectExists(const std::string& shm_name) {
-    int fd = shm_open(shm_name.c_str(), O_RDWR, 0);
+bool shmObjectExists(const std::string& shm_name) {
+    int fd = -1;
+    if (isFilesystemShmPath(shm_name)) {
+        fd = open(shm_name.c_str(), O_RDWR);
+    } else {
+        fd = shm_open(shm_name.c_str(), O_RDWR, 0);
+    }
     if (fd < 0) return false;
     close(fd);
     return true;
@@ -78,8 +105,15 @@ bool protocolListContains(const std::string& protocol,
     return false;
 }
 
-Status mapPosixShm(const std::string& shm_name, uint64_t length, void** out) {
-    int shm_fd = shm_open(shm_name.c_str(), O_RDWR, 0600);
+Status mapSharedMemory(const std::string& shm_name, uint64_t length,
+                       void** out) {
+    int shm_fd = -1;
+    if (isFilesystemShmPath(shm_name)) {
+        // Peer must never create the owner's hugetlbfs object.
+        shm_fd = open(shm_name.c_str(), O_RDWR);
+    } else {
+        shm_fd = shm_open(shm_name.c_str(), O_RDWR, 0600);
+    }
     if (shm_fd < 0) {
         return Status::Memory(std::string("Failed to open shared memory ") +
                               shm_name);
@@ -123,9 +157,53 @@ bool posixBufferAddrListed(const TransferMetadata::SegmentDesc& desc,
     return false;
 }
 
+bool validateHugetlbfsMount(const std::string& dir, size_t hugepage_size,
+                            std::string* err) {
+    struct statfs sfs;
+    if (statfs(dir.c_str(), &sfs) != 0) {
+        if (err) {
+            *err = "statfs(" + dir + ") failed: " + std::strerror(errno);
+        }
+        return false;
+    }
+    if (sfs.f_type != HUGETLBFS_MAGIC) {
+        if (err) {
+            *err = dir + " is not a hugetlbfs mount";
+        }
+        return false;
+    }
+    if (static_cast<size_t>(sfs.f_bsize) != hugepage_size) {
+        if (err) {
+            *err = dir + " hugepage size is " + std::to_string(sfs.f_bsize) +
+                   ", expected " + std::to_string(hugepage_size);
+        }
+        return false;
+    }
+    return true;
+}
+
+void populateMapping(void* addr, size_t length, size_t page_size) {
+    if (!addr || length == 0 || page_size == 0) return;
+    auto* bytes = static_cast<volatile char*>(addr);
+    for (size_t off = 0; off < length; off += page_size) {
+        bytes[off] = 0;
+    }
+}
+
 }  // namespace
 
 ShmTransport::ShmTransport() = default;
+
+void ShmTransport::unlinkShmEntry(const AllocatedShmEntry& entry) {
+    if (entry.name.empty()) return;
+    if (entry.backing == ShmBacking::kHugetlbfs) {
+        if (unlink(entry.name.c_str()) != 0 && errno != ENOENT) {
+            PLOG(WARNING) << "Failed to unlink hugetlbfs shm " << entry.name;
+        }
+    } else if (shm_unlink(entry.name.c_str()) != 0 && errno != ENOENT) {
+        PLOG(WARNING) << "Failed to shm_unlink " << entry.name;
+    }
+}
 
 ShmTransport::~ShmTransport() {
     PendingUnmap pending;
@@ -152,9 +230,7 @@ ShmTransport::~ShmTransport() {
             if (entry.first && entry.second.length) {
                 munmap(entry.first, entry.second.length);
             }
-            if (!entry.second.name.empty()) {
-                shm_unlink(entry.second.name.c_str());
-            }
+            unlinkShmEntry(entry.second);
         }
         shm_path_map_.clear();
     }
@@ -235,15 +311,110 @@ void* ShmTransport::createSharedMemory(const std::string& path, size_t size,
 
     close(shm_fd);
     std::lock_guard<std::mutex> lock(shm_path_mutex_);
-    shm_path_map_[mapped_addr] = AllocatedShmEntry{path, size};
+    shm_path_map_[mapped_addr] = AllocatedShmEntry{
+        path, size, ShmBacking::kPosixShm, /*hugepage_size=*/0};
     if (error) *error = 0;
     return mapped_addr;
 }
 
+void* ShmTransport::createHugetlbfsShm(size_t length,
+                                       const SharedMemoryOptions& opt,
+                                       int* error) {
+    auto fail = [&](int err) -> void* {
+        if (error) *error = err;
+        return nullptr;
+    };
+
+    const size_t hp = opt.hugepage_size == 0 ? SharedMemoryOptions::kHugepage2MB
+                                             : opt.hugepage_size;
+    if (!SharedMemoryOptions::isSupportedHugepageSize(hp)) {
+        LOG(ERROR) << "ShmTransport hugepage SHM supports only 2MB, 512MB, or "
+                      "1GB, got "
+                   << hp;
+        return fail(EINVAL);
+    }
+    const size_t map_len = alignUp(length, hp);
+    if (map_len == 0) {
+        LOG(ERROR) << "ShmTransport hugepage allocation size overflow: "
+                   << length;
+        return fail(EOVERFLOW);
+    }
+
+    const std::string dir =
+        opt.hugetlbfs_path.empty()
+            ? SharedMemoryOptions::defaultHugetlbfsPathFor(hp)
+            : opt.hugetlbfs_path;
+    std::string mount_err;
+    if (!validateHugetlbfsMount(dir, hp, &mount_err)) {
+        LOG(ERROR) << "ShmTransport hugetlbfs allocate failed: " << mount_err
+                   << " (no tmpfs fallback)";
+        return fail(ENODEV);
+    }
+
+    for (int attempt = 0; attempt < kShmCreateMaxRetries; ++attempt) {
+        const std::string path = randomHugetlbfsName(dir);
+        int fd = open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+        if (fd < 0) {
+            const int err = errno;
+            if (err == EEXIST) continue;
+            PLOG(ERROR) << "Failed to create hugetlbfs file " << path;
+            return fail(err);
+        }
+
+        if (ftruncate(fd, static_cast<off_t>(map_len)) == -1) {
+            const int err = errno;
+            PLOG(ERROR) << "Failed to truncate hugetlbfs file " << path
+                        << " size=" << map_len;
+            close(fd);
+            unlink(path.c_str());
+            return fail(err);
+        }
+
+        void* mapped_addr =
+            mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (mapped_addr == MAP_FAILED) {
+            const int err = errno;
+            PLOG(ERROR) << "Failed to mmap hugetlbfs file " << path;
+            close(fd);
+            unlink(path.c_str());
+            return fail(err);
+        }
+        close(fd);
+
+        if (opt.populate) {
+            populateMapping(mapped_addr, map_len, hp);
+        }
+
+        std::lock_guard<std::mutex> lock(shm_path_mutex_);
+        shm_path_map_[mapped_addr] = AllocatedShmEntry{
+            path, map_len, ShmBacking::kHugetlbfs, hp};
+        if (error) *error = 0;
+        return mapped_addr;
+    }
+
+    LOG(ERROR) << "Failed to allocate hugetlbfs shared memory of size "
+               << map_len << " under " << dir;
+    return fail(EEXIST);
+}
+
 void* ShmTransport::allocateSharedMemory(size_t length) {
+    return allocateSharedMemory(length, SharedMemoryOptions{});
+}
+
+void* ShmTransport::allocateSharedMemory(size_t length,
+                                         const SharedMemoryOptions& opt) {
     if (length == 0) {
         LOG(ERROR) << "ShmTransport does not support zero-length allocation";
         return nullptr;
+    }
+    if (opt.use_hugepage) {
+        int error = 0;
+        void* addr = createHugetlbfsShm(length, opt, &error);
+        if (!addr) {
+            LOG(ERROR) << "Failed to allocate hugetlbfs shared memory of size "
+                       << length << " errno=" << error;
+        }
+        return addr;
     }
     for (int attempt = 0; attempt < kShmCreateMaxRetries; ++attempt) {
         const std::string name = randomShmName();
@@ -263,7 +434,7 @@ int ShmTransport::freeSharedMemory(void* addr) {
         return ERR_INVALID_ARGUMENT;
     }
     munmap(addr, it->second.length);
-    shm_unlink(it->second.name.c_str());
+    unlinkShmEntry(it->second);
     shm_path_map_.erase(it);
     return 0;
 }
@@ -316,7 +487,7 @@ int ShmTransport::registerLocalMemory(void* addr, size_t length,
     if (!exact_base) return 0;
     if (length > alloc_length) {
         LOG(ERROR) << "registerLocalMemory length " << length
-                   << " exceeds POSIX shm allocation " << alloc_length << " at "
+                   << " exceeds shm allocation " << alloc_length << " at "
                    << addr;
         return ERR_INVALID_ARGUMENT;
     }
@@ -581,7 +752,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         if (hit) {
             // Cached mmap stays valid after shm_unlink. Probe the name so a
             // peer free+realloc cannot silently write into the orphaned object.
-            if (posixShmObjectExists(buffer->shm_name)) {
+            if (shmObjectExists(buffer->shm_name)) {
                 dest_addr = requested_addr - buffer->addr +
                             reinterpret_cast<uint64_t>(hit->shm_addr);
                 adoptPin(hit, pin);
@@ -618,7 +789,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
         }
         flushUnmaps(pending);
 
-        if (reused && posixShmObjectExists(buffer->shm_name)) {
+        if (reused && shmObjectExists(buffer->shm_name)) {
             dest_addr = requested_addr - buffer->addr +
                         reinterpret_cast<uint64_t>(reused->shm_addr);
             adoptPin(reused, pin);
@@ -643,7 +814,7 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t& dest_addr,
 
         void* shm_addr = nullptr;
         Status mapped =
-            mapPosixShm(buffer->shm_name, buffer->length, &shm_addr);
+            mapSharedMemory(buffer->shm_name, buffer->length, &shm_addr);
         if (!mapped.ok()) return mapped;
         LOG(INFO) << "Original shared memory: " << (void*)buffer->addr << "--"
                   << (void*)(buffer->addr + buffer->length);

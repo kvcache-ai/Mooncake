@@ -35,6 +35,7 @@
 #include <mutex>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
@@ -76,6 +77,34 @@ static inline std::string getHostname() {
     }
     return hostname;
 }
+
+// Options for TransferEngine::allocateSharedMemory / ShmTransport.
+// Default path stays POSIX /dev/shm. Store production sets use_hugepage with
+// hugepage_size matching MC_STORE_HUGEPAGE_SIZE (2MB / 512MB / 1GB).
+struct SharedMemoryOptions {
+    bool use_hugepage = false;
+    size_t hugepage_size = 0;  // 0 → 2MB when use_hugepage
+    std::string hugetlbfs_path;  // empty → size-specific default mount
+    bool populate = true;        // Store passes false and populates itself
+
+    static constexpr size_t kHugepage2MB = 2ULL << 20;
+    static constexpr size_t kHugepage512MB = 512ULL << 20;
+    static constexpr size_t kHugepage1GB = 1ULL << 30;
+    static constexpr const char *kDefaultHugetlbfsPath = "/dev/hugepages";
+    static constexpr const char *kDefaultHugetlbfsPath512M = "/dev/hugepages-512M";
+    static constexpr const char *kDefaultHugetlbfsPath1G = "/dev/hugepages-1G";
+
+    static bool isSupportedHugepageSize(size_t size) {
+        return size == kHugepage2MB || size == kHugepage512MB ||
+               size == kHugepage1GB;
+    }
+
+    static const char *defaultHugetlbfsPathFor(size_t hugepage_size) {
+        if (hugepage_size == kHugepage1GB) return kDefaultHugetlbfsPath1G;
+        if (hugepage_size == kHugepage512MB) return kDefaultHugetlbfsPath512M;
+        return kDefaultHugetlbfsPath;
+    }
+};
 
 // True when the variable is set to anything other than 0/false/no/off.
 // Used by MC_FORCE_SHM.
