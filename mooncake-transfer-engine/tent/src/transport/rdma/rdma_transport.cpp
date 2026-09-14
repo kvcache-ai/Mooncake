@@ -970,9 +970,21 @@ int RdmaTransport::processNotifyCompletions() {
                 }
             }
 
-            // Whatever it says, this WR has left the notify QP; the
-            // endpoint's destruction waits for that count to reach zero.
-            if (endpoint) endpoint->noteNotifyCompletion();
+            // Released only once this completion has been consumed: the
+            // recv payload copied out of its slot, or the send / error path
+            // finished. finishDestroy() waits for this count and
+            // deconstructUnlocked() then frees the recv MR, so releasing it
+            // earlier would let the buffers go while the CQE is still in
+            // this batch. The ring depth and the CQ's completion order keep
+            // that from happening today; this makes it hold by construction,
+            // the way acknowledge() releases wr_depth on the data QPs only
+            // after the completion is handled.
+            struct NotifyInflightRelease {
+                RdmaEndPoint* ep;
+                ~NotifyInflightRelease() {
+                    if (ep) ep->noteNotifyCompletion();
+                }
+            } inflight_release{endpoint.get()};
 
             if (wc[i].status != IBV_WC_SUCCESS) {
                 // A failed completion leaves this notify QP unusable for good
