@@ -65,8 +65,9 @@ class SpdkWrapper {
      * PHYSICAL pages must be 2MB-aligned too, which only HugeTLB pages satisfy.
      * 4KB page-aligned memory always fails with -EINVAL. Callers must pass
      * 2MB-aligned, hugepage-backed memory (ShmHelper forces this under
-     * MC_STORE_REGISTER_SPDK=1); a failed registration leaves SPDK's
-     * g_mem_reg_map half-marked, so callers should UnregisterMemory() on error.
+     * MC_STORE_REGISTER_SPDK=1) and check IsRegistrableRange() first: a failure
+     * past that check may leave SPDK's g_mem_reg_map marked, so callers must
+     * attempt UnregisterMemory() and keep the mapping unless it returns 0.
      *
      * @param addr Start of the region; must be 2MB-aligned (hugepage-backed).
      * @param size Region length; must be a multiple of 2MB.
@@ -76,9 +77,27 @@ class SpdkWrapper {
 
     /** @brief Unregister memory previously registered via RegisterMemory().
      *
+     * Only a 0 return proves the range is clean. A non-zero return does NOT
+     * prove that nothing was ever registered: -EINVAL is also what SPDK
+     * returns for a half-registered range, so callers must keep the mapping
+     * alive (and retry) unless this returns 0. See the definition.
+     *
      * @return 0 on success, non-zero on failure.
      */
     int UnregisterMemory(void *addr, size_t size);
+
+    /** @brief Whether RegisterMemory() can be attempted for this range at all.
+     *
+     * spdk_mem_register() rejects a range it cannot represent or that is not
+     * 2MB-aligned before it has marked anything (SPDK v23.01.1,
+     * lib/env_dpdk/memory.c:339-348), so a caller that skips the registration
+     * for such a range still munmaps normally. Any failure past this check may
+     * have left translation state behind and must be treated as such, with one
+     * exception the caller handles separately: -EBUSY means another owner
+     * already holds the range, so nothing new was marked and rolling back would
+     * clear their registration instead.
+     */
+    static bool IsRegistrableRange(void *addr, size_t size);
 
    private:
     struct ProbeBuffer {

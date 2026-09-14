@@ -2552,38 +2552,61 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal_with_device(
     // error-returning paths above so no failure path leaves a dangling SPDK
     // registration (the unregister below is symmetric on every teardown path).
     if (register_spdk) {
-        if (SpdkWrapper::GetInstance().RegisterMemory(shm.shm_buffer,
-                                                      shm.shm_size) != 0) {
-            LOG(WARNING) << "Failed to register received shm with SPDK: "
+        if (!SpdkWrapper::IsRegistrableRange(shm.shm_buffer, shm.shm_size)) {
+            // Reached by the fallback mmap above when it cannot place the
+            // mapping at a 2MB-aligned base (e.g. a non-hugetlb fd). SPDK
+            // rejects such a range before marking anything (memory.c:344), so
+            // skipping the attempt keeps the teardown below able to munmap.
+            LOG(WARNING) << "Received shm is not 2MB-aligned; not registering "
+                            "with SPDK: "
                          << shm.shm_buffer << ", size=" << shm.shm_size
                          << "; NoF zero-copy transfers to this buffer will be "
                             "unavailable";
-            // spdk_mem_register() marks g_mem_reg_map REGISTERED before running
-            // its notify callbacks and does NOT roll back on failure (SPDK
-            // v23.01.1, lib/env_dpdk/memory.c). Unregister the range so a later
-            // registration of the same virtual address (e.g. mmap reuse after
-            // munmap) does not return -EBUSY. Mirrors ShmHelper::allocate. The
-            // unregister path tolerates ranges that were never fully
-            // registered.
-            const int rollback_rc = SpdkWrapper::GetInstance().UnregisterMemory(
-                shm.shm_buffer, shm.shm_size);
-            // -EINVAL is the documented benign no-op for a range that never
-            // reached g_mem_reg_map (see SpdkWrapper::UnregisterMemory). Any
-            // other failure means SPDK may still retain (partial) registration
-            // state for this range, so mark it registered: the teardown paths
-            // will then attempt the unregister again and quarantine the mapping
-            // instead of munmapping while SPDK still holds a translation to it.
-            if (rollback_rc != 0 && rollback_rc != -EINVAL) {
-                LOG(ERROR)
-                    << "Failed to roll back incomplete SPDK registration: "
-                    << shm.shm_buffer << ", size: " << shm.shm_size
-                    << ", rc: " << rollback_rc
-                    << "; treating the range as registered so teardown "
-                       "unregisters or quarantines it";
-                shm.spdk_registered = true;
-            }
         } else {
-            shm.spdk_registered = true;
+            const int register_rc = SpdkWrapper::GetInstance().RegisterMemory(
+                shm.shm_buffer, shm.shm_size);
+            if (register_rc == 0) {
+                shm.spdk_registered = true;
+            } else if (register_rc == -EBUSY) {
+                // Already registered, so SPDK marked nothing new for us. Do NOT
+                // roll back: the unregister below would clear the existing
+                // registration (memory.c:358-366 detects it, 445-466 clears
+                // it). Retain the mapping and let teardown retry.
+                LOG(ERROR) << "Received shm is already registered with SPDK: "
+                           << shm.shm_buffer << ", size=" << shm.shm_size
+                           << "; retaining mapping";
+                shm.spdk_registered = true;
+            } else {
+                LOG(WARNING) << "Failed to register received shm with SPDK: "
+                             << shm.shm_buffer << ", size=" << shm.shm_size
+                             << "; NoF zero-copy transfers to this buffer will "
+                                "be unavailable";
+                // spdk_mem_register() marks the range in g_mem_reg_map before
+                // running its notify callbacks and does NOT roll back on
+                // failure (SPDK v23.01.1, memory.c:370-384), and in iova=va it
+                // can already have installed the IOMMU mapping when a later
+                // step fails (memory.c:1092-1107). This unregister is the only
+                // chance to undo that, and only a 0 return proves it worked:
+                // -EINVAL is also returned for a half-marked range
+                // (memory.c:426) and, in iova=va, for an incomplete translation
+                // before the IOMMU is unmapped (memory.c:1216-1224); it covers
+                // a failure before anything was mapped as well, and the two
+                // cannot be told apart, so retaining a clean mapping is the
+                // accepted cost. Mirrors ShmHelper::allocate.
+                const int rollback_rc =
+                    SpdkWrapper::GetInstance().UnregisterMemory(shm.shm_buffer,
+                                                                shm.shm_size);
+                if (rollback_rc != 0) {
+                    LOG(ERROR)
+                        << "Failed to roll back incomplete SPDK registration: "
+                        << shm.shm_buffer << ", size: " << shm.shm_size
+                        << ", rc: " << rollback_rc
+                        << "; treating the range as registered so teardown "
+                           "retries the unregister and quarantines the mapping "
+                           "instead of munmapping";
+                    shm.spdk_registered = true;
+                }
+            }
         }
     }
 #endif
