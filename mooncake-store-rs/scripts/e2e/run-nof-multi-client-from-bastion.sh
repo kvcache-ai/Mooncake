@@ -8,6 +8,7 @@ BUILD_ROOT="${NOF_BUILD_ROOT:-/tmp/mooncake-nof-build}"
 SPDK_PREFIX="${MOONCAKE_SPDK_PREFIX:-/opt/spdk-26.05}"
 INITIATOR_HOST="${NOF_INITIATOR_HOST:-root@localhost}"
 INITIATOR_IP="${NOF_BIND_IP:-127.0.0.1}"
+INITIATORS_SPEC="${NOF_INITIATORS:-${INITIATOR_HOST}|${INITIATOR_IP}|${NOF_CLIENT_IDS:-client-0,client-1,client-2,client-3}}"
 INITIATOR_DIR="${NOF_INITIATOR_DIR:-/tmp/mooncake-nof-multi-client}"
 SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-/opt/spdk-26.05/install/lib}"
 REDIS_URL="${NOF_REDIS_URL:-redis://127.0.0.1:6379/0}"
@@ -31,6 +32,7 @@ TEST_PREFIX="${NOF_TEST_PREFIX:-nof-multi-client}"
 ROUTE_CONTROL="${NOF_ROUTE_CONTROL:-EmbeddedWrh}"
 CLIENT_IDS_SPEC="${NOF_CLIENT_IDS:-client-0,client-1,client-2,client-3}"
 TARGETS_SPEC="${NOF_TARGETS:-127.0.0.1|127.0.0.1|nof-local|nqn.2026-09.io.mooncake:nof-local|4420}"
+BARRIER_REDIS_URL="${NOF_BARRIER_REDIS_URL:-${REDIS_URL}}"
 BUILD_PROFILE="${NOF_BUILD_PROFILE:-debug}"
 RUN_UNIT_TESTS="${NOF_RUN_UNIT_TESTS:-0}"
 RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
@@ -54,6 +56,15 @@ for target in "${TARGETS[@]}"; do
   IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
   [[ -n "${public_ip}" && -n "${lan_ip}" && -n "${target_id}" && -n "${subnqn}" && -n "${port}" ]] || {
     echo "NOF_TARGETS entries must be public_ip|traddr|target_id|subnqn|port: ${target}" >&2
+    exit 1
+  }
+done
+IFS=';' read -r -a INITIATORS <<<"${INITIATORS_SPEC}"
+[[ "${#INITIATORS[@]}" -gt 0 ]] || { echo "NOF_INITIATORS must not be empty" >&2; exit 1; }
+for initiator in "${INITIATORS[@]}"; do
+  IFS='|' read -r initiator_host initiator_ip initiator_clients <<<"${initiator}"
+  [[ -n "${initiator_host}" && -n "${initiator_ip}" && -n "${initiator_clients}" ]] || {
+    echo "NOF_INITIATORS entries must be host|bind_ip|client_ids: ${initiator}" >&2
     exit 1
   }
 done
@@ -81,25 +92,31 @@ rsync -a -e 'ssh -o BatchMode=yes' \
   "${STAGE_DIR}/run-nof-multi-client.sh"
 chmod 755 "${STAGE_DIR}/nof_multi_client" "${STAGE_DIR}/run-nof-multi-client.sh"
 sha256sum "${STAGE_DIR}/nof_multi_client" | tee "${STAGE_DIR}/binary.sha256"
-ssh -o BatchMode=yes -o ConnectTimeout=8 "${INITIATOR_HOST}" "mkdir -p -- '${INITIATOR_DIR}'"
-rsync -a -e 'ssh -o BatchMode=yes' "${STAGE_DIR}/" "${INITIATOR_HOST}:${INITIATOR_DIR}/"
 local_hash="$(awk '{print $1}' "${STAGE_DIR}/binary.sha256")"
-remote_hash="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "${INITIATOR_HOST}" \
-  "sha256sum '${INITIATOR_DIR}/nof_multi_client' | awk '{print \$1}'")"
-[[ "${local_hash}" == "${remote_hash}" ]] || {
-  echo "staged binary hash mismatch: local=${local_hash} remote=${remote_hash}" >&2
-  exit 1
-}
+pids=()
+for initiator in "${INITIATORS[@]}"; do
+  IFS='|' read -r initiator_host initiator_ip initiator_clients <<<"${initiator}"
+  echo "staging to ${initiator_host} (${initiator_ip}); local_clients=${initiator_clients}"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "${initiator_host}" "mkdir -p -- '${INITIATOR_DIR}'"
+  rsync -a -e 'ssh -o BatchMode=yes' "${STAGE_DIR}/" "${initiator_host}:${INITIATOR_DIR}/"
+  remote_hash="$(ssh -o BatchMode=yes -o ConnectTimeout=8 "${initiator_host}" \
+    "sha256sum '${INITIATOR_DIR}/nof_multi_client' | awk '{print \$1}'")"
+  [[ "${local_hash}" == "${remote_hash}" ]] || {
+    echo "staged binary hash mismatch on ${initiator_host}: local=${local_hash} remote=${remote_hash}" >&2
+    exit 1
+  }
 
-echo "running on ${INITIATOR_HOST} (${INITIATOR_IP})"
-ssh -o BatchMode=yes -o ConnectTimeout=8 "${INITIATOR_HOST}" \
-  "NOF_BINARY='${INITIATOR_DIR}/nof_multi_client' \
+  echo "running on ${initiator_host} (${initiator_ip})"
+  ssh -o BatchMode=yes -o ConnectTimeout=8 "${initiator_host}" \
+    "NOF_BINARY='${INITIATOR_DIR}/nof_multi_client' \
    NOF_LOG_DIR='${INITIATOR_DIR}/logs' \
    NOF_SPDK_LIB_DIR='${SPDK_LIB_DIR}' \
    NOF_REDIS_URL='${REDIS_URL}' \
-   NOF_BIND_IP='${INITIATOR_IP}' \
+   NOF_BARRIER_REDIS_URL='${BARRIER_REDIS_URL}' \
+   NOF_BIND_IP='${initiator_ip}' \
    NOF_TARGETS='${TARGETS_SPEC}' \
    NOF_CLIENT_IDS='${CLIENT_IDS_SPEC}' \
+   NOF_LOCAL_CLIENT_IDS='${initiator_clients}' \
    NOF_RESET_TARGETS=0 \
    NOF_SKIP_TARGET_SSH_CHECK=1 \
    NOF_CLIENT_TIMEOUT_SECONDS='${TIMEOUT_SECONDS}' \
@@ -120,6 +137,19 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 "${INITIATOR_HOST}" \
    NOF_STARTUP_SETTLE_SECONDS='${STARTUP_SETTLE_SECONDS}' \
    NOF_ROUTE_CONTROL='${ROUTE_CONTROL}' \
    NOF_RUN_TAG='${RUN_TAG}' \
-   '${INITIATOR_DIR}/run-nof-multi-client.sh'"
+   '${INITIATOR_DIR}/run-nof-multi-client.sh'" &
+  pids+=("$!")
+done
 
-echo "multi-client NoF run completed; stage=${STAGE_DIR} initiator=${INITIATOR_HOST}:${INITIATOR_DIR}"
+status=0
+for pid in "${pids[@]}"; do
+  if ! wait "${pid}"; then
+    status=1
+  fi
+done
+if [[ "${status}" != 0 ]]; then
+  echo "multi-initiator NoF run failed; stage=${STAGE_DIR}" >&2
+  exit "${status}"
+fi
+
+echo "multi-client NoF run completed; stage=${STAGE_DIR} initiators=${INITIATORS_SPEC}"

@@ -11,7 +11,7 @@ LOG_DIR="${NOF_LOG_DIR:-${ROOT_DIR}/target/nof-multi-client}"
 RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 KEYSPACE="${NOF_KEYSPACE:-mc/store-rs/nof-multi-client/${RUN_TAG}}"
 REDIS_URL="${NOF_REDIS_URL:-redis://127.0.0.1:6379/0}"
-BIND_IP="${NOF_BIND_IP:-192.168.22.80}"
+BIND_IP="${NOF_BIND_IP:-127.0.0.1}"
 SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-/opt/spdk-26.05/install/lib}"
 RESET_TARGETS="${NOF_RESET_TARGETS:-1}"
 SKIP_TARGET_SSH_CHECK="${NOF_SKIP_TARGET_SSH_CHECK:-0}"
@@ -22,6 +22,7 @@ TEST_IMAGE_BYTES="${NOF_TEST_IMAGE_BYTES:-16G}"
 ROUTE_CONTROL="${NOF_ROUTE_CONTROL:-EmbeddedWrh}"
 RPC_BASE_PORT="${NOF_RPC_BASE_PORT:-21000}"
 CLIENT_IDS_SPEC="${NOF_CLIENT_IDS:-client-0,client-1,client-2,client-3}"
+LOCAL_CLIENT_IDS_SPEC="${NOF_LOCAL_CLIENT_IDS:-${CLIENT_IDS_SPEC}}"
 TARGETS_SPEC="${NOF_TARGETS:-127.0.0.1|127.0.0.1|nof-local|nqn.2026-09.io.mooncake:nof-local|4420}"
 BARRIER_DIR="${NOF_BARRIER_DIR:-${LOG_DIR}/${RUN_TAG}/barrier}"
 
@@ -45,6 +46,8 @@ for target in "${TARGETS[@]}"; do
 done
 IFS=',' read -r -a clients <<<"${CLIENT_IDS_SPEC}"
 [[ "${#clients[@]}" -gt 0 && -n "${clients[0]}" ]] || { echo "NOF_CLIENT_IDS must not be empty" >&2; exit 1; }
+IFS=',' read -r -a local_clients <<<"${LOCAL_CLIENT_IDS_SPEC}"
+[[ "${#local_clients[@]}" -gt 0 && -n "${local_clients[0]}" ]] || { echo "NOF_LOCAL_CLIENT_IDS must not be empty" >&2; exit 1; }
 
 RUNTIME_LIB_DIR="${NOF_RUNTIME_LIB_DIR:-${TMPDIR:-/tmp}/nof-multi-client-runtime}"
 mkdir -p "${RUNTIME_LIB_DIR}"
@@ -128,8 +131,8 @@ mkdir -p "${BARRIER_DIR}"
   sha256sum "${BINARY}"
   printf 'run_tag=%s\nkeyspace=%s\nbind_ip=%s\nredis_url=%s\n' \
     "${RUN_TAG}" "${KEYSPACE}" "${BIND_IP}" "${REDIS_URL}"
-  printf 'target_inventory=%s\nclient_ids=%s\nroute_control=%s\n' \
-    "${TARGETS_SPEC}" "${CLIENT_IDS_SPEC}" "${ROUTE_CONTROL}"
+  printf 'target_inventory=%s\nclient_ids=%s\nlocal_client_ids=%s\nroute_control=%s\n' \
+    "${TARGETS_SPEC}" "${CLIENT_IDS_SPEC}" "${LOCAL_CLIENT_IDS_SPEC}" "${ROUTE_CONTROL}"
   printf 'startup_settle_seconds=%s read_protocol=parallel_batch_get_into\n' \
     "${STARTUP_SETTLE_SECONDS}"
   printf 'hostname=%s\n' "$(hostname)"
@@ -149,10 +152,13 @@ export NOF_ROUTE_CONTROL="${ROUTE_CONTROL}"
 export NOF_STARTUP_SETTLE_SECONDS="${STARTUP_SETTLE_SECONDS}"
 export MC_STORE_RS_ENABLE_COLD_TIER="${MC_STORE_RS_ENABLE_COLD_TIER:-1}"
 export NOF_BARRIER_DIR="${BARRIER_DIR}"
+if [[ -n "${NOF_BARRIER_REDIS_URL:-}" ]]; then
+  export NOF_BARRIER_REDIS_URL
+fi
 
 pids=()
-for index in "${!clients[@]}"; do
-  client_id="${clients[${index}]}"
+for index in "${!local_clients[@]}"; do
+  client_id="${local_clients[${index}]}"
   [[ -n "${client_id}" ]] || { echo "NOF_CLIENT_IDS contains an empty id" >&2; exit 1; }
   log_file="${LOG_DIR}/${RUN_TAG}/${client_id}.log"
   echo "starting ${client_id}; log=${log_file}"
@@ -169,7 +175,7 @@ for pid in "${pids[@]}"; do
   fi
 done
 
-for client_id in "${clients[@]}"; do
+for client_id in "${local_clients[@]}"; do
   log_file="${LOG_DIR}/${RUN_TAG}/${client_id}.log"
   echo "===== ${client_id} ====="
   cat "${log_file}"
@@ -180,4 +186,4 @@ if [[ "${status}" != 0 ]]; then
   exit "${status}"
 fi
 
-echo "multi-client NoF test passed: clients=${#clients[@]} targets=${#TARGETS[@]} keyspace=${KEYSPACE} logs=${LOG_DIR}/${RUN_TAG}"
+echo "multi-client NoF test passed: local_clients=${#local_clients[@]} global_clients=${#clients[@]} targets=${#TARGETS[@]} keyspace=${KEYSPACE} logs=${LOG_DIR}/${RUN_TAG}"

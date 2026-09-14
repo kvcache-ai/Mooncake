@@ -649,11 +649,11 @@ library resolution. The test artifact is `target/debug/nof_multi_client` (or the
 directory, and writes hostname, kernel, interface inventory, binary hash, and runtime-library
 status to `run-manifest.txt`. A run is not started when a shared library or symbol is unresolved.
 
-The canonical four-node command runs on the bastion. It builds in the container, resets
-only the provisioned NoF image on all four targets, stages the exact binary and runner with
-`rsync`, verifies the binary SHA256 on the initiator, and runs the test on the reserved initiator.
-The initiator cannot reliably SSH to target public addresses, so target cleanup is deliberately
-performed from the bastion:
+The multi-node command runs on the bastion. It builds in the container, resets only the
+provisioned NoF image on every configured target, stages the exact binary and runner with `rsync`,
+verifies the binary SHA256 on each initiator, and runs the configured client subset on each
+initiator. Initiators do not need to SSH to target public addresses, so target cleanup is
+deliberately performed from the bastion:
 
 ```shell
 # On 11.158.240.229.
@@ -663,18 +663,28 @@ rsync -a -e 'ssh -o BatchMode=yes' \
 bash /tmp/run-nof-multi-client-from-bastion.sh
 ```
 
-The default topology is fixed in the script: build container `root@10.88.0.5`, initiator
-`root@182.92.21.56` / `192.168.22.80`, and Redis `redis://192.168.22.78:6382/0`. Override
-`NOF_BUILD_HOST`, `NOF_BUILD_ROOT`, `NOF_INITIATOR_HOST`, `NOF_BIND_IP`, `NOF_REDIS_URL`,
-`NOF_SPDK_LIB_DIR`, or `NOF_CLIENT_TIMEOUT_SECONDS` only for an explicitly different test
-reservation. Every reset stops `mooncake-nvmf.service`, removes and recreates
-`/var/lib/mooncake-nof/nof.img` at exactly 16 GiB, verifies the size, and restarts the service;
-it never touches the system NVMe disk. Run logs and the manifest are left under
-`/tmp/mooncake-nof-multi-client/logs/<run-tag>/` on the initiator.
+The script defaults are localhost-safe placeholders. A real reservation must pass the topology
+explicitly:
+
+- `NOF_TARGETS` is a comma-separated target list. Each entry is
+  `public_host|traddr|target_id|subnqn|port`. The number of NoF targets is the number of entries.
+- `NOF_CLIENT_IDS` is the global client list used by the test binary for barriers and read
+  verification.
+- `NOF_INITIATORS` is a semicolon-separated initiator list. Each entry is
+  `ssh_host|bind_ip|local_client_ids`; the number of initiator machines is the number of entries.
+  `local_client_ids` is the comma-separated subset started on that initiator.
+- `NOF_BARRIER_REDIS_URL` controls the cross-initiator barrier. It defaults to `NOF_REDIS_URL`.
+
+Every reset stops `mooncake-nvmf.service`, removes and recreates `/var/lib/mooncake-nof/nof.img`
+at `NOF_TEST_IMAGE_BYTES`, and restarts the service; it never touches the system NVMe disk. Run
+logs and the manifest are left under `/tmp/mooncake-nof-multi-client/logs/<run-tag>/` on each
+initiator.
 
 For a manually staged run, use `scripts/e2e/run-nof-multi-client.sh` with
-`NOF_RESET_TARGETS=0`, `NOF_SKIP_TARGET_SSH_CHECK=1`, `NOF_BIND_IP=192.168.22.80`, and the
-same Redis/SPDK settings after performing the reset from the bastion. Do not use `scp`.
+`NOF_RESET_TARGETS=0`, `NOF_SKIP_TARGET_SSH_CHECK=1`, the local `NOF_BIND_IP`, and the same
+Redis/SPDK settings after performing the reset from the bastion. `NOF_LOCAL_CLIENT_IDS` can be
+used to start only the client subset that belongs on the current machine while keeping
+`NOF_CLIENT_IDS` as the global client set. Do not use `scp`.
 
 The runner sets `MC_STORE_RS_ENABLE_COLD_TIER=1`, creates per-run registration, write/offload,
 and read-start barriers, and starts the client IDs from `NOF_CLIENT_IDS` with
@@ -684,18 +694,10 @@ finish offload and the routes report materialized Managed NoF backing, then all 
 `NoopTransport` for the local hot segment, so it does not claim to validate remote hot-memory
 transfers; the cross-client assertion is the managed NoF read path. A passing run must contain the
 configured write/offload and read verification counts in each client log. The target list is
-configured by `NOF_TARGETS`, client IDs by `NOF_CLIENT_IDS`, and the image size by
+configured by `NOF_TARGETS`, client IDs by `NOF_CLIENT_IDS`, local client subset by
+`NOF_LOCAL_CLIENT_IDS`, initiator machines by `NOF_INITIATORS`, and the image size by
 `NOF_TEST_IMAGE_BYTES`; the reset operation removes and recreates only
 `/var/lib/mooncake-nof/nof.img` and never touches the system NVMe disk.
-
-The default runner target inventory is the four-host validation topology, but it is not fixed:
-
-| public host | NoF LAN endpoint |
-| --- | --- |
-| `8.141.27.180` | `192.168.22.78:4420` |
-| `182.92.21.56` | `192.168.22.80:4420` |
-| `47.93.122.112` | `192.168.22.81:4420` |
-| `59.110.29.176` | `192.168.22.82:4420` |
 
 ## Validation
 
