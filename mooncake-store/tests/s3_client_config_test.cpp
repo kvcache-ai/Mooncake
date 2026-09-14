@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <mutex>
 #include <optional>
@@ -67,8 +68,8 @@ TEST_F(S3ClientConfigTest, UsesExistingDefaults) {
     EXPECT_TRUE(config.use_https);
     EXPECT_TRUE(config.request_checksum_calculation.empty());
     EXPECT_TRUE(config.response_checksum_validation.empty());
-    EXPECT_EQ(config.connect_timeout_ms, 10000);
-    EXPECT_EQ(config.request_timeout_ms, 30000);
+    EXPECT_EQ(config.connect_timeout, std::chrono::milliseconds(10000));
+    EXPECT_EQ(config.request_timeout, std::chrono::milliseconds(30000));
 }
 
 TEST_F(S3ClientConfigTest, ReadsAllExistingSettings) {
@@ -94,8 +95,8 @@ TEST_F(S3ClientConfigTest, ReadsAllExistingSettings) {
     EXPECT_FALSE(config.use_https);
     EXPECT_EQ(config.request_checksum_calculation, "when_required");
     EXPECT_EQ(config.response_checksum_validation, "when_supported");
-    EXPECT_EQ(config.connect_timeout_ms, 5000);
-    EXPECT_EQ(config.request_timeout_ms, 6000);
+    EXPECT_EQ(config.connect_timeout, std::chrono::milliseconds(5000));
+    EXPECT_EQ(config.request_timeout, std::chrono::milliseconds(6000));
 }
 
 TEST_F(S3ClientConfigTest, PreservesExplicitlyEmptyStrings) {
@@ -129,8 +130,8 @@ TEST_F(S3ClientConfigTest, InvalidTypedValuesUseExistingDefaultsAndWarn) {
 
     EXPECT_TRUE(config.use_virtual_addressing);
     EXPECT_TRUE(config.use_https);
-    EXPECT_EQ(config.connect_timeout_ms, 10000);
-    EXPECT_EQ(config.request_timeout_ms, 30000);
+    EXPECT_EQ(config.connect_timeout, std::chrono::milliseconds(10000));
+    EXPECT_EQ(config.request_timeout, std::chrono::milliseconds(30000));
     EXPECT_NE(diagnostics.find("MOONCAKE_AWS_USE_VIRTUAL_ADDRESSING"),
               std::string::npos);
     EXPECT_NE(diagnostics.find("MOONCAKE_AWS_USE_HTTPS"), std::string::npos);

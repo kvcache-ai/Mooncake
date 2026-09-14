@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cstdint>
+#include <chrono>
 #include <string>
 
 namespace mooncake {
@@ -15,8 +15,8 @@ struct S3ClientConfig {
     bool use_https = true;
     std::string request_checksum_calculation;
     std::string response_checksum_validation;
-    int64_t connect_timeout_ms = 10000;
-    int64_t request_timeout_ms = 30000;
+    std::chrono::milliseconds connect_timeout{10000};
+    std::chrono::milliseconds request_timeout{30000};
 
     static S3ClientConfig FromEnvironment();
 };

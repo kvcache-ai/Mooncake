@@ -97,8 +97,8 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
     const auto &env = GetS3ClientConfig();
     Aws::Client::ClientConfiguration config(true);
 
-    config.connectTimeoutMs = env.connect_timeout_ms;
-    config.requestTimeoutMs = env.request_timeout_ms;
+    config.connectTimeoutMs = static_cast<long>(env.connect_timeout.count());
+    config.requestTimeoutMs = static_cast<long>(env.request_timeout.count());
     config.scheme =
         env.use_https ? Aws::Http::Scheme::HTTPS : Aws::Http::Scheme::HTTP;
     if (auto request_checksum =
