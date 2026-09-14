@@ -1,6 +1,8 @@
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <gtest/gtest.h>
+#include <cstdlib>
+#include <filesystem>
 
 #include <map>
 #include <string_view>
@@ -59,12 +61,23 @@ class EmptyBackend final : public HaKvBackend {
     std::map<std::string, std::string> values_;
 };
 
+class BatchOpLogSnapshotProviderTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        char pattern[] = "/tmp/mooncake-provider-XXXXXX";
+        const char* root = mkdtemp(pattern);
+        ASSERT_NE(nullptr, root);
+        root_ = root;
+    }
+    void TearDown() override { std::filesystem::remove_all(root_); }
+    std::string root_;
+};
+
 }  // namespace
 
-TEST(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
+TEST_F(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
     EmptyBackend backend;
-    LocalFileSnapshotObjectStore object_store(
-        "/tmp/mooncake-n05-provider-all-absent");
+    LocalFileSnapshotObjectStore object_store(root_);
     BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
                                         "snapshots");
     StandbyMetadataStore metadata;
@@ -81,13 +94,25 @@ TEST(BatchOpLogSnapshotProviderTest, AllAbsentNamespaceIsAnEmptyBaseline) {
     EXPECT_EQ(EncodeDurablePrefix({.batch_id = 0, .last_seq = 0}), prefix);
 }
 
-TEST(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
+TEST_F(BatchOpLogSnapshotProviderTest, RestoreHonorsCancellation) {
+    EmptyBackend backend;
+    LocalFileSnapshotObjectStore object_store(root_);
+    BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
+                                        "snapshots");
+    StandbyMetadataStore metadata;
+    StandbySegmentRegistry registry;
+    auto result = provider.RestoreBaseline(metadata, registry, nullptr, 0,
+                                           [] { return true; });
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_CTX_CANCELLED, result.error());
+}
+
+TEST_F(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
     EmptyBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
                           EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
-    LocalFileSnapshotObjectStore object_store(
-        "/tmp/mooncake-n05-provider-test");
+    LocalFileSnapshotObjectStore object_store(root_);
     BatchOpLogSnapshotProvider provider("clusterA", backend, object_store,
                                         "snapshots");
     StandbyMetadataStore metadata;
@@ -102,9 +127,8 @@ TEST(BatchOpLogSnapshotProviderTest, EmptyCompleteHistoryIsAValidBaseline) {
     EXPECT_TRUE(registry.GetAllSegments().empty());
 }
 
-TEST(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
-    const std::string root = "/tmp/mooncake-n05-provider-fallback";
-    LocalFileSnapshotObjectStore object_store(root);
+TEST_F(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
+    LocalFileSnapshotObjectStore object_store(root_);
     EmptyBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
@@ -156,9 +180,8 @@ TEST(BatchOpLogSnapshotProviderTest, UsesFallbackWhenLatestIsCorrupt) {
     EXPECT_EQ(0u, metadata.GetKeyCount());
 }
 
-TEST(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
-    const std::string root = "/tmp/mooncake-n05-provider-suffix";
-    LocalFileSnapshotObjectStore object_store(root);
+TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
+    LocalFileSnapshotObjectStore object_store(root_);
     EmptyBackend backend;
 
     OpLogBatchRecord suffix_batch;
@@ -227,10 +250,9 @@ TEST(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
     EXPECT_EQ(2u, result->last_applied_batch_id);
 }
 
-TEST(BatchOpLogSnapshotProviderTest,
-     ReplaysCompleteHistoryAfterBothPointersAreInvalid) {
-    const std::string root = "/tmp/mooncake-n05-provider-complete-oplog";
-    LocalFileSnapshotObjectStore object_store(root);
+TEST_F(BatchOpLogSnapshotProviderTest,
+       ReplaysCompleteHistoryAfterBothPointersAreInvalid) {
+    LocalFileSnapshotObjectStore object_store(root_);
     EmptyBackend backend;
     ASSERT_EQ(
         ErrorCode::OK,
