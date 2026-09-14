@@ -220,6 +220,7 @@ jobs:
           -DUSE_CXL=ON \
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
+          -DUSE_REDIS=ON \
           -DUSE_CUDA=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
