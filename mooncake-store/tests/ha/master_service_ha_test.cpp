@@ -2304,6 +2304,132 @@ TEST_F(MasterServiceHATest, RestoreDiscardsTransitivelyOverlappingGroup) {
               1);
 }
 
+TEST_F(MasterServiceHATest, RestoreDropsObjectWithOnlyTerminalReplicas) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_terminal_replica_segment";
+    auto dead_removed = MakeStandbyObject("standby_terminal_removed", endpoint);
+    dead_removed.metadata.replicas.front().status = ReplicaStatus::REMOVED;
+    dead_removed.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto dead_failed = MakeStandbyObject("standby_terminal_failed", endpoint);
+    dead_failed.metadata.replicas.front().status = ReplicaStatus::FAILED;
+    dead_failed.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 2048;
+    auto clean = MakeStandbyObject("standby_terminal_clean", endpoint);
+    clean.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
+
+    // An object whose replicas are all REMOVED/FAILED has no readable copy:
+    // restore drops it explicitly (same durable REMOVE path as overlap
+    // casualties) instead of retaining metadata with zero servable replicas.
+    auto result = service.RestoreFromStandbySnapshot(
+        {dead_removed, dead_failed, clean}, 7,
+        {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_terminal_removed"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_terminal_failed"),
+              0);
+    EXPECT_EQ(
+        ReplicaCountForTesting(service, kDefaultTenant, "standby_terminal_clean"),
+        1);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
+    const std::string cluster_id = "test_restore_repair_durable";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    ASSERT_TRUE(HasOpLogWriter(service));
+
+    const std::string endpoint = "standby_repair_durable_segment";
+    auto survivor = MakeStandbyObject("standby_repair_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+    ASSERT_TRUE(result.has_value());
+
+    // The dropped object must leave a durable REMOVE so a later promotion
+    // cannot replay its discarded descriptor; the partial survivor gets a
+    // canonical PUT_END. One record per batch (max_entries=1): REMOVE first,
+    // then the canonical rewrite.
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord remove_batch;
+    ReadRemoveBatchEventually(storage, 1, "standby_repair_lost", remove_batch);
+    OpLogBatchRecord canonical_batch;
+    ReadBatchEventually(storage, 2, canonical_batch);
+    ASSERT_EQ(1u, canonical_batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, canonical_batch.entries[0].op_type);
+    EXPECT_EQ("standby_repair_survivor",
+              canonical_batch.entries[0].object_key);
+}
+
+TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
+    const std::string cluster_id = "test_restore_repair_rejected";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    auto* writer = InstallRejectingWriter(service, backend);
+    writer->RejectCommitsWith(ErrorCode::ETCD_OPERATION_ERROR);
+
+    const std::string endpoint = "standby_repair_reject_segment";
+    auto survivor = MakeStandbyObject("standby_repair_reject_survivor", endpoint);
+    auto lost = MakeStandbyObject("standby_repair_reject_lost", endpoint);
+    survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
+    survivor.metadata.replicas[1].id = 2;
+    survivor.metadata.replicas[0]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    survivor.metadata.replicas[1]
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 8192;
+    lost.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+
+    // Fail-closed: when the repair records cannot be made durable, the
+    // restore must not complete with an index whose discards could replay.
+    auto result = service.RestoreFromStandbySnapshot(
+        {survivor, lost}, 7, {MakeStandbyMemorySegment(endpoint)});
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR, result.error());
+    EXPECT_GE(writer->rejected_commits(), 1u);
+}
+
 TEST_F(MasterServiceHATest, RestoreRejectionLeavesNoStaleRange) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

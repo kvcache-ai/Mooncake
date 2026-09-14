@@ -3677,11 +3677,10 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
     }
     for (size_t owner = 0; owner < ctx.accepted.size(); ++owner) {
         auto& accepted_entry = ctx.accepted[owner];
-        const auto discarded_it = ctx.discarded_replicas.find(owner);
-        if (accepted_entry.entry == nullptr ||
-            discarded_it == ctx.discarded_replicas.end()) {
+        if (accepted_entry.entry == nullptr) {
             continue;
         }
+        const auto discarded_it = ctx.discarded_replicas.find(owner);
         size_t reliable = 0;
         for (size_t desc_idx = 0;
              desc_idx < accepted_entry.entry->metadata.replicas.size();
@@ -3690,18 +3689,24 @@ tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
                 accepted_entry.entry->metadata.replicas[desc_idx];
             if (desc.status == ReplicaStatus::REMOVED ||
                 desc.status == ReplicaStatus::FAILED ||
-                discarded_it->second.contains(desc_idx)) {
+                (discarded_it != ctx.discarded_replicas.end() &&
+                 discarded_it->second.contains(desc_idx))) {
                 continue;
             }
             ++reliable;
         }
         if (reliable == 0) {
+            // Covers both overlap casualties and objects that arrived with
+            // every replica already REMOVED/FAILED: an object with no
+            // readable replica is dropped instead of lingering as
+            // metadata-only, and the durable REMOVE below stops a later
+            // promotion from replaying it.
             NoteLegacyStandbyRejection(ctx, *accepted_entry.entry,
                                        "no_reliable_replica");
             ctx.repair_remove_keys.emplace_back(accepted_entry.tenant_id,
                                                 accepted_entry.user_key);
             accepted_entry.entry = nullptr;
-        } else {
+        } else if (discarded_it != ctx.discarded_replicas.end()) {
             // Survives with some descriptors discarded: the canonical
             // repair record carries only the survivors.
             ctx.repair_canonical_keys.emplace_back(accepted_entry.tenant_id,
