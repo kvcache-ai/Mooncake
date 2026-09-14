@@ -567,8 +567,8 @@ tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     }};
 }
 
-tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
-                                                        size_t length) {
+tl::expected<void, ErrorCode> CheckRegisterMemoryParams(
+    const void* addr, size_t length, bool enforce_max_mr_size) {
     if (addr == nullptr) {
         LOG(ERROR) << "addr is nullptr";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -578,8 +578,13 @@ tl::expected<void, ErrorCode> CheckRegisterMemoryParams(const void* addr,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     // Tcp is not limited by max_mr_size, but we ignore it for now.
+    // Callers that pre-split their buffer to <= max_mr_size (MountSegment) pass
+    // enforce_max_mr_size=true to keep that invariant checked. RegisterLocalMemory
+    // passes false: the transfer engine auto-chunks oversized buffers itself
+    // (Mooncake#2017), so rejecting here would break callers that legitimately
+    // register one large buffer, e.g. an sglang hicache host pool.
     auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
-    if (length > max_mr_size) {
+    if (enforce_max_mr_size && length > max_mr_size) {
         LOG(ERROR) << "length " << length
                    << " is larger than max_mr_size: " << max_mr_size;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3140,7 +3145,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
-    auto check_result = CheckRegisterMemoryParams(buffer, size);
+    // Segments are pre-split to <= max_mr_size by the caller, so enforce it.
+    auto check_result = CheckRegisterMemoryParams(buffer, size, true);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
@@ -3325,7 +3331,8 @@ void Client::OnGracefulUnmountTimer(const UUID& segment_id, int retry_left) {
 tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     void* addr, size_t length, const std::string& location,
     bool remote_accessible, bool update_metadata) {
-    auto check_result = CheckRegisterMemoryParams(addr, length);
+    // Oversized buffers are auto-chunked by the transfer engine (Mooncake#2017).
+    auto check_result = CheckRegisterMemoryParams(addr, length, false);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
