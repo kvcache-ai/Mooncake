@@ -408,9 +408,9 @@ OssObjectStorageAdapter::Request(
         add_header(name + ": " + value);
     }
     if (!anonymous_)
-        add_header("Authorization: " +
-                   BuildAuthorization(method, physical_key, query, timestamp,
-                                      oss_headers));
+        add_header("Authorization: " + BuildAuthorization(method, physical_key,
+                                                          query, timestamp,
+                                                          oss_headers));
     add_header("Expect:");
     add_header("Content-Type:");
     if (!range.empty()) add_header("Range: " + range);

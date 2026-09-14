@@ -163,13 +163,12 @@ class ScriptedOssServer {
                     response.status == 204   ? "No Content"
                     : response.status == 206 ? "Partial Content"
                                              : "OK";
-                response_data =
-                    "HTTP/1.1 " + std::to_string(response.status) + " " +
-                    status_text +
-                    "\r\nContent-Type: application/xml\r\n"
-                    "Content-Length: " +
-                    std::to_string(response.body.size()) +
-                    "\r\nConnection: close\r\n\r\n" + response.body;
+                response_data = "HTTP/1.1 " + std::to_string(response.status) +
+                                " " + status_text +
+                                "\r\nContent-Type: application/xml\r\n"
+                                "Content-Length: " +
+                                std::to_string(response.body.size()) +
+                                "\r\nConnection: close\r\n\r\n" + response.body;
             }
             if (!SendAll(client, response_data)) error_ = "send failed";
             close(client);
@@ -265,8 +264,7 @@ TEST(OssObjectStorageAdapterTest, RejectsIgnoredRangeResponse) {
     ASSERT_TRUE(server.error().empty()) << server.error();
 
     ASSERT_EQ(server.requests().size(), 1U);
-    EXPECT_NE(server.requests()[0].find("Range: bytes=2-5"),
-              std::string::npos);
+    EXPECT_NE(server.requests()[0].find("Range: bytes=2-5"), std::string::npos);
     EXPECT_NE(server.requests()[0].find("x-oss-range-behavior: standard"),
               std::string::npos);
 }
