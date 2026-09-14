@@ -160,7 +160,7 @@ struct OffloadMetadata {
         : total_keys(keys), total_size(size) {}
 };
 
-enum class FileMode { Read, Write };
+enum class FileMode { Read, Write, WriteExclusive };
 
 enum class StorageBackendType {
     kFilePerKey,
