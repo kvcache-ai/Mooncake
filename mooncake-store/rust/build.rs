@@ -237,7 +237,14 @@ fn main() {
             .display()
     );
 
+    // LocalSsdManager is built as a separate static library.
+    println!(
+        "cargo:rustc-link-search=native={}",
+        lib_path.join("local_ssd").display()
+    );
+
     println!("cargo:rustc-link-lib=mooncake_store");
+    println!("cargo:rustc-link-lib=mooncake_local_ssd");
 
     // Dependencies of mooncake_store that must be satisfied at link time.
     // The list mirrors what mooncake-store/src/CMakeLists.txt links against.
@@ -274,6 +281,7 @@ fn main() {
         push_cmake_cache_library_dirs(&mut search_dirs, &build_dir);
         for dir in [
             build_dir.join("mooncake-store/src"),
+            build_dir.join("mooncake-store/src/local_ssd"),
             build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
@@ -288,6 +296,7 @@ fn main() {
     push_cmake_cache_library_dirs(&mut search_dirs, &default_build_dir);
     for dir in [
         default_build_dir.join("mooncake-store/src"),
+        default_build_dir.join("mooncake-store/src/local_ssd"),
         default_build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
         default_build_dir.join("mooncake-transfer-engine/src"),
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
@@ -348,6 +357,7 @@ fn main() {
 
     for library in [
         "mooncake_store",
+        "mooncake_local_ssd",
         "cachelib_memory_allocator",
         "transfer_engine",
         "base",

@@ -74,7 +74,7 @@ inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig(
         config.reconnect_wait_time = std::chrono::milliseconds{0};
         config.client_config.connect_timeout_duration = std::chrono::seconds{1};
     }
-    
+
     if (RpcProtocolConfig::FromEnvironment().use_rdma) {
         MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
     }
@@ -104,6 +104,7 @@ class MasterClient {
           client_id_(client_id),
           tenant_id_(std::move(tenant_id)),
           metrics_(metrics) {}
+    // Drains in-flight RPCs before the pool member is released (#3909).
     ~MasterClient();
 
     void EnableHaConnectionPolicy();
@@ -727,6 +728,7 @@ class MasterClient {
     RpcClientPool client_accessor_;
     RpcClientPool ha_control_client_accessor_;
     RpcClientPool ha_probe_client_accessor_;
+    RpcDrainGuard rpc_drain_;
 
     // The client identification.
     const UUID client_id_;

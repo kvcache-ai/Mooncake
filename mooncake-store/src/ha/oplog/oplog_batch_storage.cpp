@@ -9,6 +9,7 @@
 
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/metadata.h"
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 #include "ha_metric_manager.h"
 #endif
@@ -169,6 +170,21 @@ ErrorCode OpLogBatchStorage::ReadProducerView(
         LOG(ERROR) << "Invalid producer view value: cluster=" << cluster_id_;
         return ErrorCode::INTERNAL_ERROR;
     }
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::ReadCompactionFloor(uint64_t& floor) const {
+    if (!IsValidClusterId()) return ErrorCode::INVALID_PARAMS;
+    std::string value;
+    const auto err = backend_.Get(
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey(cluster_id_), value);
+    if (err != ErrorCode::OK) return err;
+    uint64_t parsed = 0;
+    const auto result =
+        std::from_chars(value.data(), value.data() + value.size(), parsed);
+    if (result.ec != std::errc() || result.ptr != value.data() + value.size())
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    floor = parsed;
     return ErrorCode::OK;
 }
 

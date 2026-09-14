@@ -189,6 +189,8 @@ target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
                                              gtest_main)
 add_test(NAME local_ssd_test COMMAND local_ssd_test)
 add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
+add_store_test(store_resource_snapshot_codec_test
+               ha/snapshot/store_resource_snapshot_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(byte_size_test byte_size_test.cpp)
 add_store_test(network_test network_test.cpp)
@@ -259,6 +261,8 @@ add_ha_test(batch_oplog_snapshot_coordinator_test
             ha/snapshot/batch_oplog/coordinator_test.cpp)
 add_ha_test(batch_oplog_snapshot_promotion_test
             ha/snapshot/batch_oplog/promotion_test.cpp)
+add_ha_test(batch_oplog_snapshot_rebootstrap_test
+            ha/snapshot/batch_oplog/rebootstrap_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)

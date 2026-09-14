@@ -4,6 +4,7 @@
 #include <xxhash.h>
 
 #include <map>
+#include <functional>
 #include <string_view>
 #include <string>
 #include <vector>
@@ -37,6 +38,10 @@ class FakeHaKvBackend : public HaKvBackend {
     }
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        if (before_range) {
+            auto callback = std::move(before_range);
+            callback();
+        }
         if (next_range_error_ != ErrorCode::OK) {
             auto error = next_range_error_;
             next_range_error_ = ErrorCode::OK;
@@ -56,6 +61,7 @@ class FakeHaKvBackend : public HaKvBackend {
     ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
 
     int range_calls() const { return range_calls_; }
+    std::function<void()> before_range;
     void Erase(std::string_view key) { values_.erase(std::string(key)); }
     void FailNextGet(ErrorCode error) { next_get_error_ = error; }
     void FailNextRange(ErrorCode error) { next_range_error_ = error; }
@@ -93,6 +99,96 @@ OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
 }
 
 }  // namespace
+
+TEST(OpLogBatchStandbyReaderTest, CompactionFloorBoundariesAndDeletion) {
+    FakeHaKvBackend backend;
+    const std::string floor_key = "/oplog/clusterA/snapshot/compaction_floor";
+    backend.Put(BuildDurablePrefixKey("clusterA"),
+                EncodeDurablePrefix({.batch_id = 2, .last_seq = 2}));
+    backend.Put(BuildBatchRecordKey("clusterA", 2),
+                EncodeOpLogBatchRecord(MakeBatch(2, 2, 2)));
+    MockMetadataStore metadata;
+    OpLogApplier applier(&metadata, "clusterA");
+    applier.Recover(2);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    ASSERT_EQ(ErrorCode::OK,
+              reader.SetBaselineCursor({.batch_id = 2, .last_seq = 2}));
+    EXPECT_EQ(ErrorCode::OK, reader.PollOnce().error);
+    for (const auto* value : {"1", "2", "3", "18446744073709551615"}) {
+        backend.Put(floor_key, value);
+        if (std::string(value) == "2") {
+            backend.Erase(BuildBatchRecordKey("clusterA", 2));
+        }
+        const auto poll = reader.PollOnce();
+        if (std::string(value) == "1" || std::string(value) == "2") {
+            EXPECT_EQ(OpLogBatchStandbyPollDisposition::OK, poll.disposition);
+        } else {
+            EXPECT_EQ(OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED,
+                      poll.disposition);
+            EXPECT_EQ(0u, poll.applied_entries);
+        }
+        EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    }
+    backend.Erase(floor_key);
+    backend.Put(BuildBatchRecordKey("clusterA", 2),
+                EncodeOpLogBatchRecord(MakeBatch(2, 2, 2)));
+    EXPECT_EQ(ErrorCode::OK, reader.PollOnce().error);
+}
+
+TEST(OpLogBatchStandbyReaderTest, InvalidFloorFailsClosed) {
+    for (const auto* value :
+         {"", "-1", "+1", " 1", "1 ", "1x", "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        FakeHaKvBackend backend;
+        backend.Put("/oplog/clusterA/snapshot/compaction_floor", value);
+        MockMetadataStore metadata;
+        OpLogApplier applier(&metadata, "clusterA");
+        OpLogBatchStandbyReader reader("clusterA", backend, applier);
+        EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL,
+                  reader.PollOnce().disposition);
+    }
+}
+
+TEST(OpLogBatchStandbyReaderTest, FloorAdvancingDuringPollRequiresRebootstrap) {
+    FakeHaKvBackend backend;
+    backend.Put(BuildDurablePrefixKey("clusterA"),
+                EncodeDurablePrefix({.batch_id = 3, .last_seq = 3}));
+    backend.Put(BuildBatchRecordKey("clusterA", 3),
+                EncodeOpLogBatchRecord(MakeBatch(3, 3, 3)));
+    backend.before_range = [&] {
+        backend.Put("/oplog/clusterA/snapshot/compaction_floor", "2");
+    };
+    MockMetadataStore metadata;
+    OpLogApplier applier(&metadata, "clusterA");
+    applier.Recover(1);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    ASSERT_EQ(ErrorCode::OK,
+              reader.SetBaselineCursor({.batch_id = 1, .last_seq = 1}));
+    const auto result = reader.PollOnce();
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED,
+              result.disposition);
+    EXPECT_EQ(2u, result.compaction_floor);
+    EXPECT_EQ(0u, result.applied_entries);
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+}
+
+TEST(OpLogBatchStandbyReaderTest, FloorDoesNotHideUnknownSuffixGap) {
+    FakeHaKvBackend backend;
+    backend.Put("/oplog/clusterA/snapshot/compaction_floor", "1");
+    backend.Put(BuildDurablePrefixKey("clusterA"),
+                EncodeDurablePrefix({.batch_id = 3, .last_seq = 3}));
+    backend.Put(BuildBatchRecordKey("clusterA", 3),
+                EncodeOpLogBatchRecord(MakeBatch(3, 3, 3)));
+    MockMetadataStore metadata;
+    OpLogApplier applier(&metadata, "clusterA");
+    applier.Recover(1);
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+    ASSERT_EQ(ErrorCode::OK,
+              reader.SetBaselineCursor({.batch_id = 1, .last_seq = 1}));
+    EXPECT_EQ(OpLogBatchStandbyPollDisposition::FATAL,
+              reader.PollOnce().disposition);
+    EXPECT_EQ(2u, applier.GetExpectedSequenceId());
+}
 
 TEST(OpLogBatchStandbyReaderTest, MissingPrefixWaitsWithoutLegacyFallback) {
     FakeHaKvBackend backend;
