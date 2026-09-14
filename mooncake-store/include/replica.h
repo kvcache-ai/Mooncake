@@ -477,7 +477,8 @@ class Replica {
             return false;
         }
         // Allocator import rebuilds address ownership; the replica keeps the
-        // transfer protocol advertised before remount.
+        // transfer protocol advertised before remount (the transfer default,
+        // for replicas restored from a snapshot that carried none).
         memory.buffer = std::move(buffer);
         return true;
     }
