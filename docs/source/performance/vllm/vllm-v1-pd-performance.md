@@ -78,12 +78,17 @@ VLLM_LOGGING_LEVEL=DEBUG CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 **Proxy (Decoder Node):**
 
 ```bash
-# From a vLLM repository checkout.
-python examples/disaggregated/mooncake_connector/mooncake_connector_proxy.py \
+python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --host 0.0.0.0 --port 8000 \
-  --prefill http://10.0.28.193:8010 8998 \
-  --decode http://10.0.28.202:8020
+  --prefiller-host 10.0.28.193 --prefiller-port 8010 \
+  --decoder-host 10.0.28.202 --decoder-port 8020
 ```
+
+> NOTE: These commands reproduce the benchmark on vLLM 0.11.2.dev358, which
+> predates the bootstrap contract
+> ([vllm-project/vllm#31034](https://github.com/vllm-project/vllm/pull/31034)).
+> For current vLLM, see the
+> [PD disaggregation deployment guide](../../deployment/integrations/vllm/disagg-prefill-decode.md).
 
 ### Benchmark Script
 
