@@ -6,6 +6,7 @@ namespace mooncake {
 
 namespace {
 
+#ifndef MOONCAKE_WITH_ISAL
 constexpr uint64_t kCrc64EcmaPolynomial = 0x42F0E1EBA9EA3693ULL;
 
 // Advance the register by one byte with a zero input byte. Feeding one message
@@ -61,12 +62,25 @@ inline uint64_t UpdateByteAtATime(uint64_t crc, const uint8_t* bytes,
     }
     return crc;
 }
+#endif  // !MOONCAKE_WITH_ISAL
 
 }  // namespace
+
+#ifdef MOONCAKE_WITH_ISAL
+// Intel ISA-L crc64_ecma_norm_by8 (PCLMULQDQ folding, built only when
+// WITH_ISAL=ON). ISA-L's convention is rem = ~seed on entry and ~rem on
+// return, so negate on both ends to keep CrcChecksum's own convention
+// (init 0, no trailing negation) unchanged for callers and on-disk values.
+extern "C" uint64_t crc64_ecma_norm_by8(uint64_t init_crc,
+                                        const unsigned char* buf, uint64_t len);
+#endif
 
 void CrcChecksum::Update(const void* data, size_t size) {
     const auto* bytes = static_cast<const uint8_t*>(data);
 
+#ifdef MOONCAKE_WITH_ISAL
+    crc_ = ~crc64_ecma_norm_by8(~crc_, bytes, size);
+#else
     // The byte-at-a-time loop is latency bound: every table index depends on
     // the previous iteration's register value. Slicing-by-8 folds eight byte
     // steps into one, and the eight lookups are independent, so the CPU can
@@ -87,6 +101,7 @@ void CrcChecksum::Update(const void* data, size_t size) {
         size -= 8;
     }
     crc_ = UpdateByteAtATime(crc, bytes, size);
+#endif  // MOONCAKE_WITH_ISAL
 }
 
 uint64_t ComputeCrcChecksum(const void* data, size_t size) {

@@ -54,3 +54,11 @@ target_link_libraries(
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_common DESTINATION lib)
 endif()
+
+# Optional Intel ISA-L CRC-64 acceleration. The isal_crc64 target is defined in
+# cmake/isal/CMakeLists.txt, added as a subdirectory from the top-level
+# CMakeLists when WITH_ISAL=ON.
+if(WITH_ISAL)
+  target_compile_definitions(mooncake_common PRIVATE MOONCAKE_WITH_ISAL)
+  target_link_libraries(mooncake_common PUBLIC isal_crc64)
+endif()

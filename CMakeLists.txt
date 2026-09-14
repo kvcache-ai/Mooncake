@@ -38,6 +38,9 @@ endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
 
+option(WITH_ISAL
+       "Accelerate CRC-64 object checksum with Intel ISA-L (requires nasm)" OFF)
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 if(SKBUILD)
   set(PYBIND11_FINDPYTHON ON)
@@ -115,6 +118,12 @@ endif()
 
 # Define ASIO macros before building targets that include ASIO headers.
 add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
+
+# Build the optional ISA-L CRC-64 acceleration target before the consumers that
+# link it (mooncake_common). No-op unless WITH_ISAL=ON.
+if(WITH_ISAL)
+  add_subdirectory(cmake/isal)
+endif()
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
