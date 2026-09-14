@@ -26,8 +26,11 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <thread>
+#include <vector>
 #include <optional>
 #include <string>
 
@@ -154,6 +157,44 @@ TEST_F(RpcTimeoutEnvTest, RpcTimesOutAgainstUnresponsiveMaster) {
                                 "timeout still active?)";
 }
 
+// #3909: tearing a client down while timeout-backed requests are in flight
+// used to release the pool under suspended coroutines (intermittent segfault).
+// The destructor now drains first; this loop used to crash within a few rounds
+// when the race lost, and must run clean with the guard.
+TEST_F(RpcTimeoutEnvTest, TeardownDrainsInFlightTimeoutRequests) {
+    // Long request timeout so teardown lands squarely inside the call window.
+    ASSERT_EQ(::setenv("MC_RPC_TIMEOUT_MS", "3000", /*overwrite=*/1), 0);
+    ASSERT_EQ(::setenv("MC_RPC_CONNECT_TIMEOUT_MS", "100", /*overwrite=*/1), 0);
+
+    BlackHoleServer server;
+
+    for (int round = 0; round < 10; ++round) {
+        auto client = std::make_unique<MasterClient>(generate_uuid());
+        // ServiceReady inside Connect times out against the black hole; the
+        // pool exists by then either way.
+        (void)client->Connect(server.address());
+
+        // Each worker issues exactly one ExistKey and never touches the
+        // client again, which is the owner's actual shape: a torn-down client
+        // is never invoked after teardown. `entered` plus the 500ms sleep put
+        // every call squarely inside its 3s timeout window at reset time.
+        std::atomic<int> entered{0};
+        std::vector<std::thread> workers;
+        for (int i = 0; i < 16; ++i) {
+            workers.emplace_back([&] {
+                entered.fetch_add(1);
+                (void)client->ExistKey("never-there");
+            });
+        }
+        while (entered.load() < 16) {
+            std::this_thread::yield();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        client.reset();  // teardown with 16 requests suspended mid-flight
+        for (auto& w : workers) {
+            w.join();
+        }
+    }
 // During failover the heartbeat can still be connecting to the deleted
 // leader's pod IP. It must return promptly so the HA loop can use the newly
 // published view instead of spending the default retry budget on a stale

@@ -17,6 +17,7 @@
 #include "client_metric.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
+#include "rpc_client_io_context.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
@@ -72,6 +73,12 @@ class QueryResult {
 class Client {
    public:
     virtual ~Client();
+
+    // Wait for in-flight Get/Put/... before TE/master teardown (#3909).
+    // Safe to call more than once; tearDownAll should call this before
+    // unregister/reset so TransferEngine is not freed under TransferRead.
+    bool DrainInflightOperations(
+        std::chrono::seconds timeout = std::chrono::seconds(30));
 
     using WriteBufferStager =
         std::function<tl::expected<std::vector<Slice>, ErrorCode>(
@@ -933,6 +940,10 @@ class Client {
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
+    // Covers full Client API including TransferEngine paths (not just master
+    // RPC). MasterClient::rpc_drain_ alone is insufficient when Get has left
+    // the master RPC and is still in TransferRead (#3909 concurrent close).
+    RpcDrainGuard api_drain_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_

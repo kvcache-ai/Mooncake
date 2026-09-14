@@ -22,6 +22,7 @@
 #include "mutex.h"
 #include "common/network.h"
 #include "pyclient.h"
+#include "rpc_client_io_context.h"
 #include "rpc_types.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
@@ -1075,6 +1076,9 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Covers get_buffer for the full call including post-Get observe (#3909).
+    RpcDrainGuard client_op_drain_;
 
     // Counts every LOCAL_DISK read served via peer offload-RPC.
     std::atomic<int64_t> offload_rpc_read_count_{0};

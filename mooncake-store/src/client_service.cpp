@@ -426,7 +426,25 @@ Client::Client(const std::string& local_hostname,
     }
 }
 
+bool Client::DrainInflightOperations(std::chrono::seconds timeout) {
+    if (!api_drain_.drain_for(timeout)) {
+        LOG(ERROR) << "Client teardown: API calls still in flight after "
+                   << timeout.count() << "s drain";
+        return false;
+    }
+    return true;
+}
+
 Client::~Client() {
+    // Never free TransferEngine / master pool under an in-flight Get/Put.
+    // On timeout keep waiting rather than destroying under flight (#3909 review).
+    if (!DrainInflightOperations()) {
+        LOG(ERROR) << "Client dtor: drain timed out; waiting until idle";
+        while (!DrainInflightOperations()) {
+            LOG(ERROR) << "Client dtor: still waiting for in-flight API calls";
+        }
+    }
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -1111,6 +1129,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
     auto batched_query_results = BatchQuery(object_keys);
 
     // If any queries failed, return error results immediately for failed
@@ -1315,6 +1339,11 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -1392,6 +1421,11 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices,
                                           uint64_t src_offset) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
     if (err != ErrorCode::OK) {
@@ -1587,6 +1621,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<QueryResult>& query_results,
     std::unordered_map<std::string, std::vector<Slice>>& slices,
     bool prefer_alloc_in_same_node) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            object_keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -1875,6 +1914,11 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::unexpected(ErrorCode::RPC_FAIL);
+    }
+
     std::optional<uint64_t> object_checksum;
     if (object_checksum_enabled_) {
         auto checksum_result = ComputeObjectChecksumForSlices(
@@ -3534,6 +3578,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config, const WriteBufferStager& stager) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::RPC_FAIL));
+    }
+
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -4090,6 +4140,11 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
     OffloadBufferAccess buffer_access) {
+    RpcDrainGuard::ScopedCall inflight(api_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
+
     auto future = transfer_submitter_->submit_batch_get_offload_object(
         transfer_engine_addr, keys, pointers, batch_slices, buffer_access);
     if (!future) {
