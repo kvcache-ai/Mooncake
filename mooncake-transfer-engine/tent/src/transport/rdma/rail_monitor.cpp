@@ -62,8 +62,8 @@ bool sameRailLayout(const Topology* a, const Topology* b) {
 
 Status RailMonitor::load(std::shared_ptr<const Topology> local,
                          std::shared_ptr<const Topology> remote,
-                         const std::string& rail_topo_json,
-                         const Config* conf, uint64_t remote_snapshot_key) {
+                         const std::string& rail_topo_json, const Config* conf,
+                         uint64_t remote_snapshot_key) {
     const bool first_load = !ready_;
     auto snapshot = remote_snapshots_.find(remote_snapshot_key);
     if (snapshot == remote_snapshots_.end() &&
@@ -233,8 +233,7 @@ void RailMonitor::cancelProbe(int local_nic, int remote_nic) {
 }
 
 bool RailMonitor::tryRecoveryProbe(int local_nic, int remote_nic,
-                                   uint64_t& token,
-                                   bool* probe_in_progress) {
+                                   uint64_t& token, bool* probe_in_progress) {
     if (probe_in_progress) *probe_in_progress = false;
     if (!recovery_probe_enabled_) return false;
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
@@ -254,8 +253,7 @@ bool RailMonitor::tryRecoveryProbe(int local_nic, int remote_nic,
         return false;
     }
     if (st.last_probe_generation == metadata_generation_) {
-        if (probe_in_progress)
-            *probe_in_progress = st.active_probe_token != 0;
+        if (probe_in_progress) *probe_in_progress = st.active_probe_token != 0;
         return false;
     }
 
@@ -271,10 +269,12 @@ bool RailMonitor::tryRecoveryProbe(int local_nic, int remote_nic,
     return true;
 }
 
-void RailMonitor::abandonRecoveryProbe(int local_nic, int remote_nic,
-                                       uint64_t token) {
+void RailMonitor::abandonRecoveryProbe(uint64_t token) {
     if (token == 0) return;
-    auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
+    auto it = std::find_if(rail_states_.begin(), rail_states_.end(),
+                           [token](const auto& entry) {
+                               return entry.second.active_probe_token == token;
+                           });
     if (it == rail_states_.end()) return;
     auto& st = it->second;
     if (st.active_probe_token != token) return;
@@ -289,6 +289,18 @@ void RailMonitor::abandonRecoveryProbe(int local_nic, int remote_nic,
 void RailMonitor::markFailed(int local_nic, int remote_nic,
                              uint64_t probe_token) {
     auto it = rail_states_.find(std::make_pair(local_nic, remote_nic));
+    if (probe_token != 0 && (it == rail_states_.end() ||
+                             it->second.active_probe_token != probe_token)) {
+        auto owner = std::find_if(rail_states_.begin(), rail_states_.end(),
+                                  [probe_token](const auto& entry) {
+                                      return entry.second.active_probe_token ==
+                                             probe_token;
+                                  });
+        // A late WC may arrive after the token was already cleared by
+        // cooldown or another success. In that case the reported pair still
+        // receives the real failure, matching the token-free path.
+        if (owner != rail_states_.end()) it = owner;
+    }
     if (it == rail_states_.end()) return;
     auto& st = it->second;
     if (probe_token != 0 && probe_token == st.active_probe_token)

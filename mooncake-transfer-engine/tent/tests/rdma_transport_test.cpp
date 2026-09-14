@@ -3719,9 +3719,9 @@ TEST_F(RdmaWorkersSharedQpTest, SliceResolvedWhileQueuedIsDroppedNotPosted) {
 }
 
 TEST(RdmaWorkersRecoveryProbeTest, CancelledOwnerReleasesProbeToSibling) {
-    auto local = topologyWithRdmaNics(1);
-    auto remote_initial = topologyWithRdmaNics(1);
-    auto remote_refreshed = topologyWithRdmaNics(1);
+    auto local = topologyWithRdmaNics(2);
+    auto remote_initial = topologyWithRdmaNics(2);
+    auto remote_refreshed = topologyWithRdmaNics(2);
     RailMonitor rail;
     ASSERT_TRUE(rail.load(local, remote_initial).ok());
     for (int i = 0; i < 3; ++i) rail.markFailed(0, 0);
@@ -3746,13 +3746,15 @@ TEST(RdmaWorkersRecoveryProbeTest, CancelledOwnerReleasesProbeToSibling) {
     auto* slice = RdmaSliceStorage::Get().allocate();
     slice->task = task;
     slice->word = PENDING;
-    slice->source_dev_id = 0;
-    slice->target_dev_id = 0;
+    // A fallback may inspect another pair before cancellation. Probe
+    // ownership remains token-based and must return to the original pair.
+    slice->source_dev_id = 1;
+    slice->target_dev_id = 1;
     slice->rail_monitor = &rail;
     slice->rail_probe_token = owner_token;
 
-    EXPECT_TRUE(RdmaTransportTestPeer::dropUnpostableSlice(*workers, worker,
-                                                           slice));
+    EXPECT_TRUE(
+        RdmaTransportTestPeer::dropUnpostableSlice(*workers, worker, slice));
     EXPECT_EQ(slice->rail_probe_token, 0u);
 
     uint64_t sibling_token = 0;
