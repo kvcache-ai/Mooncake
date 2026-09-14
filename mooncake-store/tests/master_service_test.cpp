@@ -1760,8 +1760,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     const std::string live_segment_name = "clear_shrink_live_segment";
     const auto stale_segment = PrepareSimpleSegment(
         *service, stale_segment_name, 0x300000000, kSegmentSize);
-    const auto live_segment = PrepareSimpleSegment(
-        *service, live_segment_name, 0x400000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
+                                                   0x400000000, kSegmentSize);
 
     // Gather keys on one shard so its metadata map grows past the shrink
     // floor; spreading them across all 1024 shards would leave each map tiny.
@@ -1774,8 +1774,7 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
-    for (size_t i = 0;
-         stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
+    for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
         ASSERT_LT(i, 5000000u)
             << "could not gather enough keys on shard " << target_shard;
         const std::string key = "clear_shrink_key_" + std::to_string(i);
@@ -1792,10 +1791,9 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
         config.replica_num = 1;
         config.preferred_segments = {segment_name};
 
-        ASSERT_TRUE(service
-                        ->PutStart(client_id, key, TenantId::Default(), 1024,
-                                   config)
-                        .has_value())
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
+                .has_value())
             << "key=" << key;
         ASSERT_TRUE(service
                         ->PutEnd(client_id, key, TenantId::Default(),
@@ -1806,26 +1804,24 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     }
     ASSERT_GT(stale_keys.size(), live_keys.size());
 
-    const size_t buckets_before =
-        MetadataBucketCount(*service, target_shard);
+    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
     // Unmount the stale segment, then sweep inline. The tenant survives
     // because the live segment still holds keys, so the metadata map is only
     // partially drained — exactly the case that leaks bucket memory without
     // the shrink.
-    ASSERT_TRUE(service
-                    ->UnmountSegment(stale_segment.segment_id,
-                                     stale_segment.client_id)
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
     ClearInvalidHandlesForTest(*service);
 
     // GetKeyCount counts physical metadata, so it distinguishes "swept" from
     // "merely hidden by the unmount".
     EXPECT_EQ(live_keys.size(), service->GetKeyCount());
 
-    const size_t buckets_after =
-        MetadataBucketCount(*service, target_shard);
+    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
     ASSERT_GT(buckets_after, 0u);
     // Without the post-sweep shrink the bucket array would stay at its
     // high-water mark and this assertion would fail.
