@@ -865,6 +865,17 @@ TEST_P(HighPerformanceTcpLaneDistributionTest,
         SegmentID target = 0;
         ASSERT_TRUE(
             client_metadata->segmentManager().openRemote(target, name).ok());
+        // The process-wide RPC client pool outlives these test-scoped RPC
+        // servers. If a random port is reused, the first lookup discards the
+        // stale pooled connection and the retry establishes a fresh one.
+        SegmentDescRef remote_desc;
+        Status resolved = client_metadata->segmentManager().getRemoteCached(
+            remote_desc, target);
+        if (resolved.IsRpcServiceError()) {
+            resolved = client_metadata->segmentManager().getRemoteCached(
+                remote_desc, target);
+        }
+        ASSERT_TRUE(resolved.ok()) << resolved.ToString();
         targets.push_back(target);
     }
     BufferDesc buffer;
@@ -890,7 +901,9 @@ TEST_P(HighPerformanceTcpLaneDistributionTest,
             request.target_offset =
                 reinterpret_cast<uint64_t>(remote[peer].data());
             request.length = length;
-            ASSERT_TRUE(client.submitTransferTasks(batch, {request}).ok());
+            const Status submitted =
+                client.submitTransferTasks(batch, {request});
+            ASSERT_TRUE(submitted.ok()) << submitted.ToString();
             TransferStatus status{};
             ASSERT_TRUE(WaitForTransportResult(client, batch, status).ok());
             ASSERT_EQ(status.s, COMPLETED);
