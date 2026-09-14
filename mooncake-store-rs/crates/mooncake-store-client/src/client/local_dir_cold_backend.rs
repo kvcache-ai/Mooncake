@@ -439,8 +439,18 @@ impl LocalDirPersistentStorageBackend {
 fn route_from_recovered_cold_object(
     recovered: &RecoveredColdObject,
     owner: ClientRuntimeId,
+    backing_kind: RecoveredBackingKind,
 ) -> ObjectRoute {
-    ObjectRoute {
+    let recovered_backing = mooncake_store_core::ColdBackingRoute {
+        owner,
+        cold_tier_id: recovered.manifest.cold_tier_id.clone(),
+        object_locator: recovered.manifest.object_locator.clone(),
+        length: recovered.metadata.length,
+        checksum: recovered.metadata.checksum,
+        state: mooncake_store_core::ColdBackingState::Materialized,
+        replicas: Vec::new(),
+    };
+    let mut route = ObjectRoute {
         key: recovered.manifest.key.clone(),
         namespace: recovered.manifest.namespace.clone(),
         logical_key: recovered.manifest.logical_key.clone(),
@@ -451,17 +461,18 @@ fn route_from_recovered_cold_object(
         state: RouteState::Active,
         compatibility: CompatibilityDescriptor::default(),
         replicas: Vec::new(),
-        cold_backing: Some(mooncake_store_core::ColdBackingRoute {
-            owner,
-            cold_tier_id: recovered.manifest.cold_tier_id.clone(),
-            object_locator: recovered.manifest.object_locator.clone(),
-            length: recovered.metadata.length,
-            checksum: recovered.metadata.checksum,
-            state: mooncake_store_core::ColdBackingState::Materialized,
-            replicas: Vec::new(),
-        }),
+        cold_backing: None,
         nof_backing: None,
-    }
+    };
+    apply_recovered_backing(&mut route, &recovered_backing, backing_kind);
+    route
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RecoveredBackingKind {
+    Cold,
+    Nof,
+}
 
 pub(super) enum RecoveredObjectOutcome {
     Registered,
@@ -469,11 +480,82 @@ pub(super) enum RecoveredObjectOutcome {
     Superseded,
 }
 
+fn should_retry_recovered_route_locally(error: &StoreError) -> bool {
+    matches!(
+        error,
+        StoreError::NotFound(message) if message.contains("no reachable mirrored route authority")
+    )
+}
+
+fn compare_and_swap_recovered_route(
+    route_directory: &dyn RouteDirectory,
+    observer: &ClientLease,
+    key: &ObjectKey,
+    expected: Option<RouteVersion>,
+    next: &ObjectRoute,
+) -> Result<CasResult> {
+    match route_directory.compare_and_swap_object_route(observer, key, expected, Some(next)) {
+        Ok(cas) => Ok(cas),
+        Err(error) => {
+            if !should_retry_recovered_route_locally(&error) {
+                return Err(error);
+            }
+            tracing::warn!(
+                route_key = %key.0,
+                expected_version = ?expected.map(|version| version.0),
+                %error,
+                "startup cold-tier manifest recovery: distributed route CAS failed, retrying local authority"
+            );
+            route_directory.compare_and_swap_local_route(observer, key, expected, Some(next))
+        }
+    }
+}
+
+fn recovered_backing_is_consistent(
+    current: &ObjectRoute,
+    manifest_backing: &mooncake_store_core::ColdBackingRoute,
+    backing_kind: RecoveredBackingKind,
+) -> bool {
+    let current_backing = match backing_kind {
+        RecoveredBackingKind::Cold => current.cold_backing.clone(),
+        RecoveredBackingKind::Nof => current
+            .nof_backing
+            .as_ref()
+            .map(mooncake_store_core::NofBackingRoute::to_cold),
+    };
+    current_backing.as_ref().is_some_and(|backing| {
+        backing.cold_tier_id == manifest_backing.cold_tier_id
+            && backing.object_locator == manifest_backing.object_locator
+            && backing.owner == manifest_backing.owner
+            && backing.state == mooncake_store_core::ColdBackingState::Materialized
+    })
+}
+
+fn apply_recovered_backing(
+    route: &mut ObjectRoute,
+    manifest_backing: &mooncake_store_core::ColdBackingRoute,
+    backing_kind: RecoveredBackingKind,
+) {
+    match backing_kind {
+        RecoveredBackingKind::Cold => {
+            route.cold_backing = Some(manifest_backing.clone());
+            route.nof_backing = None;
+        }
+        RecoveredBackingKind::Nof => {
+            route.cold_backing = None;
+            route.nof_backing = Some(mooncake_store_core::NofBackingRoute::from_cold(
+                manifest_backing,
+            ));
+        }
+    }
+}
+
 pub(super) fn try_register_recovered_cold_object(
     metadata: &dyn MetadataBackend,
     route_directory: &dyn RouteDirectory,
     observer: &ClientLease,
     recovered: &RecoveredColdObject,
+    backing_kind: RecoveredBackingKind,
 ) -> Result<RecoveredObjectOutcome> {
     let manifest_backing = mooncake_store_core::ColdBackingRoute {
         owner: observer.runtime.clone(),
@@ -486,24 +568,19 @@ pub(super) fn try_register_recovered_cold_object(
     };
 
     let repair_current = |current: ObjectRoute| -> Result<RecoveredObjectOutcome> {
-        let already_consistent = current.cold_backing.as_ref().is_some_and(|backing| {
-            backing.cold_tier_id == recovered.manifest.cold_tier_id
-                && backing.object_locator == recovered.manifest.object_locator
-                && backing.owner == observer.runtime
-                && backing.state == mooncake_store_core::ColdBackingState::Materialized
-        });
-        if already_consistent {
+        if recovered_backing_is_consistent(&current, &manifest_backing, backing_kind) {
             return Ok(RecoveredObjectOutcome::AlreadyConsistent);
         }
 
         let mut next = current.clone();
         next.version = current.version.next();
-        next.cold_backing = Some(manifest_backing.clone());
-        let cas = route_directory.compare_and_swap_object_route(
+        apply_recovered_backing(&mut next, &manifest_backing, backing_kind);
+        let cas = compare_and_swap_recovered_route(
+            route_directory,
             observer,
             &recovered.manifest.key,
             Some(current.version),
-            Some(&next),
+            &next,
         )?;
         if cas.applied {
             tracing::info!(
@@ -513,6 +590,7 @@ pub(super) fn try_register_recovered_cold_object(
                 cold_tier_id = %recovered.manifest.cold_tier_id,
                 object_locator = %recovered.manifest.object_locator,
                 had_cold_backing = current.cold_backing.is_some(),
+                had_nof_backing = current.nof_backing.is_some(),
                 "startup cold-tier manifest recovery: repaired route from disk manifest"
             );
             Ok(RecoveredObjectOutcome::Registered)
@@ -532,12 +610,13 @@ pub(super) fn try_register_recovered_cold_object(
         return repair_current(current);
     }
 
-    let route = route_from_recovered_cold_object(recovered, observer.runtime.clone());
-    let cas = route_directory.compare_and_swap_object_route(
+    let route = route_from_recovered_cold_object(recovered, observer.runtime.clone(), backing_kind);
+    let cas = compare_and_swap_recovered_route(
+        route_directory,
         observer,
         &recovered.manifest.key,
         None,
-        Some(&route),
+        &route,
     )?;
     if cas.applied {
         tracing::info!(
@@ -596,8 +675,13 @@ pub(super) fn reconcile_cold_tier_startup(
         });
         let mut recovered_used_bytes = 0u64;
         for recovered in &recovered_objects {
-            match try_register_recovered_cold_object(metadata, route_directory, observer, recovered)
-            {
+            match try_register_recovered_cold_object(
+                metadata,
+                route_directory,
+                observer,
+                recovered,
+                RecoveredBackingKind::Cold,
+            ) {
                 Ok(RecoveredObjectOutcome::Registered) => {
                     live_final_paths.insert(recovered.path.clone());
                     recovered_used_bytes =
@@ -1468,6 +1552,74 @@ mod tests {
         assert_eq!(recovered[0].manifest.route_version, RouteVersion(4));
         assert_eq!(recovered[0].metadata.length, payload.len() as u64);
         assert_eq!(recovered[0].metadata.checksum, Some(checksum));
+    }
+
+    #[test]
+    fn recovered_nof_object_builds_nof_backing_without_cold_backing() {
+        let owner = mooncake_store_core::ClientRuntimeId::new(
+            "recover-nof",
+            mooncake_store_core::ClientEpoch(7),
+        );
+        let recovered = RecoveredColdObject {
+            manifest: ColdObjectManifest {
+                key: ObjectKey::new("recover-nof-key"),
+                namespace: Some(NamespaceScope {
+                    tenant: "tenant".to_string(),
+                    domain: "domain".to_string(),
+                    object_set: "set".to_string(),
+                }),
+                logical_key: Some("logical".to_string()),
+                canonical_key: Some("canonical".to_string()),
+                sharing_scope: Some("scope".to_string()),
+                qos_tier: Some("qos".to_string()),
+                route_version: RouteVersion(11),
+                cold_tier_id: "nof-target-a".to_string(),
+                object_locator: "abcdef".to_string(),
+                length: 128,
+                checksum: Some(42),
+            },
+            path: std::path::PathBuf::from("nof://nof-target-a/abcdef"),
+            metadata: ColdPayloadMetadata {
+                length: 128,
+                checksum: Some(42),
+            },
+        };
+
+        let route =
+            route_from_recovered_cold_object(&recovered, owner.clone(), RecoveredBackingKind::Nof);
+
+        assert!(route.cold_backing.is_none());
+        let nof = route
+            .nof_backing
+            .as_ref()
+            .expect("recovered NoF route should have nof_backing");
+        assert_eq!(nof.owner, owner);
+        assert_eq!(nof.target_id, "nof-target-a");
+        assert_eq!(nof.object_locator, "abcdef");
+        assert_eq!(nof.length, 128);
+        assert_eq!(nof.checksum, Some(42));
+        assert_eq!(
+            nof.state,
+            mooncake_store_core::ColdBackingState::Materialized
+        );
+        assert_eq!(route.namespace, recovered.manifest.namespace);
+        assert_eq!(route.logical_key, recovered.manifest.logical_key);
+    }
+
+    #[test]
+    fn recovered_route_local_retry_only_covers_unreachable_authority() {
+        assert!(should_retry_recovered_route_locally(&StoreError::NotFound(
+            "no reachable mirrored route authority for recover-key".to_string()
+        )));
+        assert!(!should_retry_recovered_route_locally(
+            &StoreError::NotFound("different missing object".to_string())
+        ));
+        assert!(!should_retry_recovered_route_locally(
+            &StoreError::InvalidState("route codec rejected manifest".to_string())
+        ));
+        assert!(!should_retry_recovered_route_locally(
+            &StoreError::Metadata("redis authentication failed".to_string())
+        ));
     }
 
     #[test]

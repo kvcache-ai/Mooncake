@@ -39,7 +39,9 @@ pub use physical::{
     NofPhysicalWriteRequest, NofStorageHealth,
 };
 pub use runtime::NofTargetConfig;
-pub(in crate::client) use runtime::{target_set_fingerprint, NofTargetManager};
+pub(in crate::client) use runtime::{
+    target_set_fingerprint, NofManagedRecoveryTarget, NofTargetManager,
+};
 
 pub use crate::client::cold_tier::layout::{
     derive_physical_key, OpaquePhysicalKey, PhysicalKeyInput,

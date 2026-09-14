@@ -84,6 +84,25 @@ used by local ExtentStore and Managed NoF: local ExtentStore removes fully dead 
 segments, while Managed NoF releases locators through the same route-safe owner path. Neither
 implementation moves a live route without a route CAS and locator update.
 
+Managed NoF maintenance is owner-scoped. Each background cleanup pass uses the current target owner
+assignment and only maintains targets owned by the local runtime. Logical delete and reclaim release
+locators through the existing managed owner/CAS path; there is no provider list scan. Watermark
+cleanup uses the same Cold Tier high/low thresholds: if a managed target reports capacity and
+available bytes and its used space reaches the high watermark, the owner selects bounded LRU victims
+and releases target copies until the target falls below the low watermark or no safe victim remains.
+A target copy is removable only when the object still has a hot replica or another materialized NoF
+target copy.
+
+Health is heartbeat based, not checked on every request. After short consecutive heartbeat failure,
+the owner publishes the target in `nof.unhealthy-targets`, so writers stop selecting it and readers
+fail over to other route copies. After a longer consecutive failure window, the owner performs
+route-only downline for safe objects: the bad target is removed from `ObjectRoute.nof_backing`
+without calling the unavailable executor. This makes the target disappear from read/write routing
+quickly while preserving data safety. When the target later comes back, metadata-backed routes
+restore allocator state directly; if metadata no longer has a healthy route but the managed
+ExtentStore record still has a recovery manifest, the same startup manifest-recovery path can
+recreate `ObjectRoute.nof_backing` for that object.
+
 Released NoF extents do not have a second persistent quarantine journal. Graceful owner handoff
 fences and flushes accepted writes before recovery, and recovery rebuilds the allocator only from
 materialized routes while stale locators are no longer published. Normal shutdown relies on
@@ -131,9 +150,11 @@ deletion succeeds, Mooncake removes the logical route and reclaims its hot or lo
 Retry is caller-driven through another remove call; there is no NoF delete worker or provider scan.
 This state records logical deletion progress, not KVCS target placement or provider metadata.
 
-Startup rebuilds persisted local Cold Tier work only. KVCS objects are discovered lazily by
-request-time metadata query; Mooncake neither downloads provider values nor scans active routes to
-reconstruct a NoF queue.
+Startup recovery is capability-specific. KVCS objects are discovered lazily by request-time
+metadata query; Mooncake neither downloads provider values nor scans KVCS active routes to
+reconstruct a NoF queue. Mooncake-managed ExtentStore targets are different: their executor stores
+the same cold-object manifest shape used by local Cold Tier recovery, so the current target owner
+can feed recovered objects into the existing Cold Tier manifest-recovery path.
 
 KVCS targets must therefore be configured consistently on clients that share a route namespace.
 Changing a target set does not create a metadata migration. Because KVCS 0.4.0 has no listing API,
@@ -179,13 +200,20 @@ the owner releases the locator after the normal drain/write ordering guarantees 
 Reads, deletes, replicas, load balancing, retries, and owner-scoped health reuse the existing Cold
 Tier runtime.
 
-The managed owner rebuilds ExtentStore state from materialized routes after an abnormal owner
-loss or when a target is brought back online. It lists routes filtered by `target_id` and
-`Materialized` state and passes their opaque locators to `NofManagedAllocator::recover`.
-ExtentStore rebuilds its free ranges from those routes; it does not keep a second allocation
-journal. Objects absent from the live route set are therefore reclaimable; unrecoverable records
-are skipped and warned about instead of fencing the whole target. This metadata scan is specific
-to managed executors and is never used for KVCS.
+The managed owner has two recovery inputs, both intentionally thin:
+
+- Owner handoff or restart with intact metadata lists materialized NoF routes filtered by
+  `target_id` and passes their opaque locators to `NofManagedAllocator::recover`. ExtentStore
+  rebuilds its free ranges from those routes; it does not keep a second allocation journal.
+- If metadata no longer has a healthy route for an object but the target still contains the
+  kvcache record, the owner uses the executor's optional recovery scan. The scan returns
+  `RecoveredColdObject` values backed by the shared cold-object manifest codec, then the existing
+  Cold Tier startup recovery CAS path creates or repairs `ObjectRoute.nof_backing`.
+
+This is not a NoF-specific rebuild queue and not a cold-copy planner. It is the same disk-manifest
+route recovery used by local Cold Tier, with the final backing field switched from
+`cold_backing` to `nof_backing`. KVCS does not use this path because KVCS owns its external
+metadata and has no provider list API in the current SDK.
 
 Normal shutdown uses the graceful-drain route-snapshot handoff described in
 [Ownership and health](#ownership-and-health). The replacement calls

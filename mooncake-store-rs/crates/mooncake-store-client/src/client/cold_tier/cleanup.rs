@@ -297,14 +297,24 @@ impl StorageOwnerState {
     ) -> Result<ColdTierCleanupResult> {
         let low_bytes = self.cold_tier_devices.low_bytes();
         let restored_before = self.restore_full_cold_tier_devices_below_low_watermark(low_bytes)?;
+        let mut nof_downline =
+            self.downline_unhealthy_managed_nof_targets(max_devices, max_victims_per_device)?;
         let Some(high_bytes) = self.cold_tier_devices.high_bytes() else {
-            return Ok(ColdTierCleanupResult {
-                restored_devices: restored_before,
-                reached_low_watermark: true,
-                ..ColdTierCleanupResult::default()
-            });
+            nof_downline.restored_devices = nof_downline
+                .restored_devices
+                .saturating_add(restored_before);
+            nof_downline.reached_low_watermark = true;
+            return Ok(nof_downline);
         };
         let low_bytes = low_bytes.unwrap_or(high_bytes);
+        let nof_watermark = self.free_managed_nof_targets_until_low_watermark(
+            high_bytes,
+            low_bytes,
+            max_devices,
+            max_victims_per_device,
+        )?;
+        Self::merge_cleanup_result(&mut nof_downline, nof_watermark);
+        let nof_result = nof_downline;
         let devices = self
             .metadata
             .as_ref()
@@ -323,6 +333,7 @@ impl StorageOwnerState {
             reached_low_watermark: devices.is_empty(),
             ..ColdTierCleanupResult::default()
         };
+        Self::merge_cleanup_result(&mut result, nof_result);
         for device in devices.into_iter().take(max_devices.max(1)) {
             if device.used_bytes.saturating_add(device.reserved_bytes) <= low_bytes {
                 result.reached_low_watermark = true;
@@ -337,21 +348,103 @@ impl StorageOwnerState {
                 low_bytes,
                 max_victims_per_device,
             )?;
-            result.attempted_victims = result
-                .attempted_victims
-                .saturating_add(device_result.attempted_victims);
-            result.freed_backings = result
-                .freed_backings
-                .saturating_add(device_result.freed_backings);
-            result.skipped_backings = result
-                .skipped_backings
-                .saturating_add(device_result.skipped_backings);
-            result.reached_low_watermark |= device_result.reached_low_watermark;
+            Self::merge_cleanup_result(&mut result, device_result);
         }
         result.restored_devices = result.restored_devices.saturating_add(
             self.restore_full_cold_tier_devices_below_low_watermark(Some(low_bytes))?,
         );
         Ok(result)
+    }
+
+    fn merge_cleanup_result(into: &mut ColdTierCleanupResult, add: ColdTierCleanupResult) {
+        into.scanned_devices = into.scanned_devices.saturating_add(add.scanned_devices);
+        into.attempted_victims = into.attempted_victims.saturating_add(add.attempted_victims);
+        into.freed_backings = into.freed_backings.saturating_add(add.freed_backings);
+        into.skipped_backings = into.skipped_backings.saturating_add(add.skipped_backings);
+        into.restored_devices = into.restored_devices.saturating_add(add.restored_devices);
+        into.reached_low_watermark |= add.reached_low_watermark;
+    }
+
+    fn free_managed_nof_targets_until_low_watermark(
+        &self,
+        high_bytes: u64,
+        low_bytes: u64,
+        max_targets: usize,
+        max_victims_per_target: usize,
+    ) -> Result<ColdTierCleanupResult> {
+        let mut targets = self
+            .cold_tier_devices
+            .nof_targets
+            .locally_owned_managed_target_ids()
+            .into_iter()
+            .filter_map(|target_id| match self.managed_nof_used_bytes(&target_id) {
+                Ok(Some(used_bytes)) if used_bytes >= high_bytes => {
+                    Some(Ok((target_id, used_bytes)))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        targets.sort_by_key(|(_, used_bytes)| std::cmp::Reverse(*used_bytes));
+        let mut result = ColdTierCleanupResult {
+            scanned_devices: targets.len(),
+            reached_low_watermark: targets.is_empty(),
+            ..ColdTierCleanupResult::default()
+        };
+        for (target_id, _) in targets.into_iter().take(max_targets.max(1)) {
+            let Some(_guard) = self.cold_tier_cleanup.try_start_device(&target_id) else {
+                result.skipped_backings = result.skipped_backings.saturating_add(1);
+                continue;
+            };
+            let target_result = self.free_managed_nof_target_until_low_watermark(
+                &target_id,
+                low_bytes,
+                max_victims_per_target,
+            )?;
+            Self::merge_cleanup_result(&mut result, target_result);
+        }
+        Ok(result)
+    }
+
+    fn free_managed_nof_target_until_low_watermark(
+        &self,
+        target_id: &str,
+        low_bytes: u64,
+        max_victims: usize,
+    ) -> Result<ColdTierCleanupResult> {
+        let mut result = ColdTierCleanupResult::default();
+        for _ in 0..max_victims.max(1) {
+            let Some(used_bytes) = self.managed_nof_used_bytes(target_id)? else {
+                result.reached_low_watermark = true;
+                break;
+            };
+            if used_bytes <= low_bytes {
+                result.reached_low_watermark = true;
+                break;
+            }
+            result.attempted_victims = result.attempted_victims.saturating_add(1);
+            if self.free_one_managed_nof_backing_lru(target_id)? {
+                result.freed_backings = result.freed_backings.saturating_add(1);
+            } else {
+                result.skipped_backings = result.skipped_backings.saturating_add(1);
+                break;
+            }
+        }
+        Ok(result)
+    }
+
+    fn managed_nof_used_bytes(&self, target_id: &str) -> Result<Option<u64>> {
+        let Some(health) = self
+            .cold_tier_devices
+            .nof_targets
+            .managed_target_health(target_id)?
+        else {
+            return Ok(None);
+        };
+        Ok(match (health.capacity_bytes, health.available_bytes) {
+            (Some(capacity), Some(available)) => Some(capacity.saturating_sub(available)),
+            _ => None,
+        })
     }
 
     pub(crate) fn manual_free_cold_tier_device_bounded(
@@ -759,6 +852,163 @@ impl StorageOwnerState {
         Ok(false)
     }
 
+    fn free_one_managed_nof_backing_lru(&self, target_id: &str) -> Result<bool> {
+        for rebuild in 0..=1usize {
+            let budget = self.hot_replicas.eviction_budget().max(1);
+            for _ in 0..budget {
+                let victim = self.hot_replicas.pick_victim(
+                    None,
+                    self.offload_priority.eviction_policy,
+                    self.offload_priority.eviction_scan_limit,
+                );
+                let Some(victim) = victim else {
+                    break;
+                };
+                if self.free_managed_nof_candidate(&victim, target_id)? {
+                    return Ok(true);
+                }
+            }
+            if rebuild == 0 {
+                self.rebuild_clock()?;
+            }
+        }
+        Ok(false)
+    }
+
+    fn free_managed_nof_candidate(&self, victim: &ClockEntryId, target_id: &str) -> Result<bool> {
+        let Some(route) = self.route_ops.load_route(&victim.route_key)? else {
+            self.hot_replicas.remove_id(victim);
+            return Ok(false);
+        };
+        if route.state != RouteState::Active {
+            self.hot_replicas.remove_id(victim);
+            return Ok(false);
+        }
+        let Some(backing) = route.nof_backing.as_ref() else {
+            self.sync_route(&route);
+            return Ok(false);
+        };
+        if backing.state != mooncake_store_core::ColdBackingState::Materialized
+            || !managed_nof_backing_contains_target(backing, target_id)
+            || !managed_nof_target_removal_is_safe(&route, backing)
+        {
+            self.sync_route(&route);
+            return Ok(false);
+        }
+        match self
+            .cold_tier_devices
+            .nof_targets
+            .release_managed_target(target_id, route.clone())
+        {
+            Ok(next) => {
+                info!(
+                    runtime = %self.runtime,
+                    key = %route.key.0,
+                    target_id,
+                    nof_backing_length = backing.length,
+                    "managed_nof_backing_released_for_watermark"
+                );
+                self.sync_route(&next);
+                Ok(true)
+            }
+            Err(StoreError::Conflict(_)) => {
+                if let Some(current) = self.route_ops.load_route(&route.key)? {
+                    self.sync_route(&current);
+                } else {
+                    self.hot_replicas.remove_key(&route.key);
+                }
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn downline_unhealthy_managed_nof_targets(
+        &self,
+        max_targets: usize,
+        max_routes_per_target: usize,
+    ) -> Result<ColdTierCleanupResult> {
+        let targets = self
+            .cold_tier_devices
+            .nof_targets
+            .managed_downline_ready_target_ids();
+        let mut result = ColdTierCleanupResult {
+            scanned_devices: targets.len(),
+            reached_low_watermark: targets.is_empty(),
+            ..ColdTierCleanupResult::default()
+        };
+        for target_id in targets.into_iter().take(max_targets.max(1)) {
+            let Some(_guard) = self.cold_tier_cleanup.try_start_device(&target_id) else {
+                result.skipped_backings = result.skipped_backings.saturating_add(1);
+                continue;
+            };
+            let target_result =
+                self.downline_managed_nof_target(&target_id, max_routes_per_target)?;
+            Self::merge_cleanup_result(&mut result, target_result);
+        }
+        Ok(result)
+    }
+
+    fn downline_managed_nof_target(
+        &self,
+        target_id: &str,
+        max_routes: usize,
+    ) -> Result<ColdTierCleanupResult> {
+        let routes = self.metadata.as_ref().list_object_routes_by_nof_backing(
+            &mooncake_store_core::NofBackingRouteFilter {
+                target_id: Some(target_id.to_string()),
+                state: Some(mooncake_store_core::ColdBackingState::Materialized),
+                limit: Some(max_routes.max(1)),
+            },
+        )?;
+        let mut result = ColdTierCleanupResult::default();
+        for route in routes {
+            result.attempted_victims = result.attempted_victims.saturating_add(1);
+            let Some(backing) = route.nof_backing.as_ref() else {
+                continue;
+            };
+            if !managed_nof_target_removal_is_safe(&route, backing) {
+                result.skipped_backings = result.skipped_backings.saturating_add(1);
+                self.sync_route(&route);
+                continue;
+            }
+            match self
+                .cold_tier_devices
+                .nof_targets
+                .forget_managed_target_route(target_id, route.clone())
+            {
+                Ok(next) => {
+                    result.freed_backings = result.freed_backings.saturating_add(1);
+                    self.sync_route(&next);
+                    info!(
+                        runtime = %self.runtime,
+                        key = %route.key.0,
+                        target_id,
+                        "managed_nof_target_downlined"
+                    );
+                }
+                Err(StoreError::Conflict(_)) => {
+                    result.skipped_backings = result.skipped_backings.saturating_add(1);
+                    if let Some(current) = self.route_ops.load_route(&route.key)? {
+                        self.sync_route(&current);
+                    } else {
+                        self.hot_replicas.remove_key(&route.key);
+                    }
+                }
+                Err(error) => {
+                    result.skipped_backings = result.skipped_backings.saturating_add(1);
+                    tracing::warn!(
+                        target_id,
+                        key = %route.key.0,
+                        error = %error,
+                        "managed NoF target downline failed"
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
     pub(in super::super) fn materialize_pending_offloads(&self) -> Result<usize> {
         self.materialize_pending_offloads_bounded(DEFAULT_OFFLOAD_MATERIALIZE_BATCH)
     }
@@ -909,4 +1159,26 @@ impl StorageOwnerState {
         self.cold_tier_devices
             .release_nof_ownership_on_shutdown(control_client);
     }
+}
+
+fn managed_nof_backing_contains_target(
+    backing: &mooncake_store_core::NofBackingRoute,
+    target_id: &str,
+) -> bool {
+    backing.target_id == target_id
+        || backing
+            .replicas
+            .iter()
+            .any(|replica| replica.target_id == target_id)
+}
+
+fn managed_nof_target_removal_is_safe(
+    route: &ObjectRoute,
+    backing: &mooncake_store_core::NofBackingRoute,
+) -> bool {
+    !route.replicas.is_empty() || managed_nof_target_count(backing) > 1
+}
+
+fn managed_nof_target_count(backing: &mooncake_store_core::NofBackingRoute) -> usize {
+    1 + backing.replicas.len()
 }

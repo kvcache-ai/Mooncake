@@ -63,33 +63,33 @@ const COLD_OBJECT_MANIFEST_SCHEMA_VERSION: u16 = 1;
 
 /// Metadata extracted from a cold payload header (length + optional xxh3 checksum).
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ColdPayloadMetadata {
-    pub(super) length: u64,
-    pub(super) checksum: Option<u64>,
+pub(in crate::client) struct ColdPayloadMetadata {
+    pub(in crate::client) length: u64,
+    pub(in crate::client) checksum: Option<u64>,
 }
 
 /// Route metadata embedded in a version-2 cold payload for reverse recovery.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct ColdObjectManifest {
-    pub(super) key: ObjectKey,
-    pub(super) namespace: Option<NamespaceScope>,
-    pub(super) logical_key: Option<String>,
-    pub(super) canonical_key: Option<String>,
-    pub(super) sharing_scope: Option<String>,
-    pub(super) qos_tier: Option<String>,
-    pub(super) route_version: RouteVersion,
-    pub(super) cold_tier_id: String,
-    pub(super) object_locator: String,
-    pub(super) length: u64,
-    pub(super) checksum: Option<u64>,
+pub(in crate::client) struct ColdObjectManifest {
+    pub(in crate::client) key: ObjectKey,
+    pub(in crate::client) namespace: Option<NamespaceScope>,
+    pub(in crate::client) logical_key: Option<String>,
+    pub(in crate::client) canonical_key: Option<String>,
+    pub(in crate::client) sharing_scope: Option<String>,
+    pub(in crate::client) qos_tier: Option<String>,
+    pub(in crate::client) route_version: RouteVersion,
+    pub(in crate::client) cold_tier_id: String,
+    pub(in crate::client) object_locator: String,
+    pub(in crate::client) length: u64,
+    pub(in crate::client) checksum: Option<u64>,
 }
 
 /// A cold object recovered from disk during startup scan.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(super) struct RecoveredColdObject {
-    pub(super) manifest: ColdObjectManifest,
-    pub(super) path: std::path::PathBuf,
-    pub(super) metadata: ColdPayloadMetadata,
+pub struct RecoveredColdObject {
+    pub(in crate::client) manifest: ColdObjectManifest,
+    pub(in crate::client) path: std::path::PathBuf,
+    pub(in crate::client) metadata: ColdPayloadMetadata,
 }
 
 pub(super) fn write_backend_payload_atomically(
@@ -264,7 +264,9 @@ fn read_optional_namespace(cursor: &mut &[u8]) -> Result<Option<NamespaceScope>>
     }
 }
 
-pub(super) fn encode_cold_object_manifest(manifest: &ColdObjectManifest) -> Result<Vec<u8>> {
+pub(in crate::client) fn encode_cold_object_manifest(
+    manifest: &ColdObjectManifest,
+) -> Result<Vec<u8>> {
     let mut encoded = Vec::new();
     encoded.extend_from_slice(&COLD_OBJECT_MANIFEST_SCHEMA_VERSION.to_le_bytes());
     write_len_prefixed_string(&mut encoded, &manifest.key.0)?;
@@ -287,7 +289,9 @@ pub(super) fn encode_cold_object_manifest(manifest: &ColdObjectManifest) -> Resu
     Ok(encoded)
 }
 
-pub(super) fn decode_cold_object_manifest(mut encoded: &[u8]) -> Result<ColdObjectManifest> {
+pub(in crate::client) fn decode_cold_object_manifest(
+    mut encoded: &[u8],
+) -> Result<ColdObjectManifest> {
     if encoded.len() < 2 {
         return Err(StoreError::InvalidState(
             "cold object manifest is missing schema version".to_string(),
@@ -373,7 +377,7 @@ pub(super) fn decode_cold_object_manifest(mut encoded: &[u8]) -> Result<ColdObje
     })
 }
 
-pub(super) fn manifest_from_route(
+pub(in crate::client) fn manifest_from_route(
     route: &ObjectRoute,
     cold_backing: &mooncake_store_core::ColdBackingRoute,
 ) -> ColdObjectManifest {
@@ -794,8 +798,11 @@ pub(crate) use local_dir_cold_backend::LocalDirPersistentStorageBackend;
 pub(crate) use local_dir_cold_backend::{decode_backend_payload, encode_backend_payload};
 pub(super) use local_dir_cold_backend::{read_file_optional, remove_file_optional};
 use local_dir_cold_backend::{
-    reconcile_cold_tier_startup, try_register_recovered_cold_object, RecoveredObjectOutcome,
+    reconcile_cold_tier_startup, try_register_recovered_cold_object, RecoveredBackingKind,
+    RecoveredObjectOutcome,
 };
+
+use cold_tier::nof::NofManagedRecoveryTarget;
 
 fn reconcile_extent_store_startup(
     metadata: &dyn MetadataBackend,
@@ -818,8 +825,13 @@ fn reconcile_extent_store_startup(
 
         let mut recovered_used_bytes = 0u64;
         for recovered in &recovered_objects {
-            match try_register_recovered_cold_object(metadata, route_directory, observer, recovered)
-            {
+            match try_register_recovered_cold_object(
+                metadata,
+                route_directory,
+                observer,
+                recovered,
+                RecoveredBackingKind::Cold,
+            ) {
                 Ok(
                     RecoveredObjectOutcome::Registered | RecoveredObjectOutcome::AlreadyConsistent,
                 ) => {
@@ -902,12 +914,50 @@ fn reconcile_extent_store_startup(
     Ok(())
 }
 
+fn reconcile_nof_managed_startup(
+    metadata: &dyn MetadataBackend,
+    route_directory: &dyn RouteDirectory,
+    observer: &ClientLease,
+    targets: &[NofManagedRecoveryTarget],
+) -> Result<()> {
+    for target in targets {
+        let Some(recovery) = target.backend.backing.managed_recovery() else {
+            continue;
+        };
+        let mut recovered_objects = recovery.scan_recovered_objects(&target.target_id)?;
+        recovered_objects.sort_by(|a, b| {
+            a.manifest
+                .key
+                .cmp(&b.manifest.key)
+                .then(b.manifest.route_version.cmp(&a.manifest.route_version))
+        });
+        for recovered in &recovered_objects {
+            if let Err(error) = try_register_recovered_cold_object(
+                metadata,
+                route_directory,
+                observer,
+                recovered,
+                RecoveredBackingKind::Nof,
+            ) {
+                tracing::warn!(
+                    route_key = %recovered.manifest.key.0,
+                    target_id = %target.target_id,
+                    %error,
+                    "managed NoF startup recovery: skipping object due to error"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) enum DeferredColdTierReconcile {
     ExtentStore(Arc<ExtentStoreStorageBackend>, Vec<ResolvedColdTierTarget>),
     LocalDir(
         Arc<LocalDirPersistentStorageBackend>,
         Vec<ResolvedColdTierTarget>,
     ),
+    NofManaged(Vec<NofManagedRecoveryTarget>),
 }
 
 pub(super) fn run_deferred_cold_tier_reconciles(
@@ -939,6 +989,9 @@ pub(super) fn run_deferred_cold_tier_reconciles(
                 backend.as_ref(),
                 devices,
             ),
+            DeferredColdTierReconcile::NofManaged(targets) => {
+                reconcile_nof_managed_startup(metadata, route_directory, lease, targets)
+            }
         };
         if let Err(error) = result {
             tracing::warn!(

@@ -622,6 +622,10 @@ impl StoreClientBuilder {
             ),
             control_client.clone(),
         );
+        let nof_recovery_targets = nof_targets.managed_recovery_targets();
+        if !nof_recovery_targets.is_empty() {
+            deferred_reconciles.push(DeferredColdTierReconcile::NofManaged(nof_recovery_targets));
+        }
         for target_id in nof_targets.target_ids() {
             if cold_tier_resolver.has_backend(target_id) {
                 return Err(StoreError::InvalidState(format!(

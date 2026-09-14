@@ -2,7 +2,9 @@
 
 use mooncake_store_core::{ColdBackingRoute, Result, StoreError};
 
-use super::managed::{NofManagedAllocator, NofManagedLimits, NofManagedRead, NofManagedWrite};
+use super::managed::{
+    NofManagedAllocator, NofManagedLimits, NofManagedRead, NofManagedRecovery, NofManagedWrite,
+};
 use super::object::{
     NofObjectDelete, NofObjectLimits, NofObjectQuery, NofObjectRead, NofObjectWrite,
 };
@@ -30,6 +32,10 @@ pub trait NofBacking: Send + Sync {
     }
 
     fn managed_read(&self) -> Option<&dyn NofManagedRead> {
+        None
+    }
+
+    fn managed_recovery(&self) -> Option<&dyn NofManagedRecovery> {
         None
     }
 
