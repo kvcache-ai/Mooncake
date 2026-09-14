@@ -1776,7 +1776,7 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     std::vector<std::string> live_keys;
     for (size_t i = 0;
          stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
-        ASSERT_LT(i, 1000000u)
+        ASSERT_LT(i, 5000000u)
             << "could not gather enough keys on shard " << target_shard;
         const std::string key = "clear_shrink_key_" + std::to_string(i);
         if (MetadataShardIndex(*service, key) != target_shard) {
