@@ -1198,6 +1198,16 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
     if (!engine_) return -1;
     pybind11::gil_scoped_release release;
+
+    if (engine_->isUsingTent()) {
+        auto handle = engine_->openSegment(peer_server_name);
+        if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
+            return -1;
+        auto liveness = engine_->probePeerAliveByID(handle);
+        engine_->closeSegment(handle);
+        return static_cast<int>(liveness);
+    }
+
     return engine_->getMetadata()->sendProbe(peer_server_name);
 }
 
