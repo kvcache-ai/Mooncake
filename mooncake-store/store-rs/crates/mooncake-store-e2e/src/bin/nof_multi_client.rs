@@ -17,6 +17,7 @@ use mooncake_store_core::{ClientLifecycleState, ColdBackingState, Result, StoreE
 use mooncake_transport::{
     SegmentBuffer, SegmentInfo, SegmentKind, TransferProgress, TransferRequest,
 };
+use redis::Commands;
 
 struct NoopTransport {
     segment_name: String,
@@ -152,6 +153,7 @@ struct TestConfig {
     keyspace: String,
     bind_ip: String,
     barrier_dir: PathBuf,
+    barrier_redis_url: Option<String>,
     barrier_timeout: Duration,
     read_retries: usize,
     read_retry_delay: Duration,
@@ -296,6 +298,7 @@ impl TestConfig {
             barrier_dir: env::var("NOF_BARRIER_DIR")
                 .map(PathBuf::from)
                 .map_err(|_| invalid("NOF_BARRIER_DIR is required"))?,
+            barrier_redis_url: env::var("NOF_BARRIER_REDIS_URL").ok(),
             barrier_timeout: Duration::from_secs(parse_env(
                 "NOF_BARRIER_TIMEOUT_SECONDS",
                 DEFAULT_BARRIER_TIMEOUT_SECONDS,
@@ -333,7 +336,58 @@ fn logical_mib_per_sec(bytes: usize, elapsed: Duration) -> f64 {
     bytes as f64 / (1024.0 * 1024.0) / seconds
 }
 
+fn barrier_key(config: &TestConfig, name: &str) -> String {
+    format!("{}:barrier:{name}", config.keyspace)
+}
+
+fn redis_connection(config: &TestConfig) -> Result<Option<redis::Connection>> {
+    let Some(url) = config.barrier_redis_url.as_ref() else {
+        return Ok(None);
+    };
+    let client = redis::Client::open(url.as_str()).map_err(|error| {
+        StoreError::Transport(format!("failed to open NoF barrier Redis {url}: {error}"))
+    })?;
+    client.get_connection().map(Some).map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to connect NoF barrier Redis {url}: {error}"
+        ))
+    })
+}
+
 fn wait_for_phase(config: &TestConfig, client_id: &str, phase: &str) -> Result<()> {
+    if let Some(mut connection) = redis_connection(config)? {
+        let _: () = connection
+            .set(
+                barrier_key(config, &format!("{phase}-{client_id}.ready")),
+                client_id,
+            )
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to publish NoF {phase} Redis barrier for {client_id}: {error}"
+                ))
+            })?;
+        let deadline = Instant::now() + config.barrier_timeout;
+        while Instant::now() < deadline {
+            let all_ready = config.client_ids.iter().try_fold(true, |ready, client| {
+                let exists: bool = connection
+                    .exists(barrier_key(config, &format!("{phase}-{client}.ready")))
+                    .map_err(|error| {
+                        StoreError::Transport(format!(
+                            "failed to read NoF {phase} Redis barrier for {client}: {error}"
+                        ))
+                    })?;
+                Ok::<_, StoreError>(ready && exists)
+            })?;
+            if all_ready {
+                return Ok(());
+            }
+            sleep(Duration::from_millis(100));
+        }
+        return Err(StoreError::Transport(format!(
+            "timed out waiting for {phase} Redis barrier"
+        )));
+    }
+
     std::fs::create_dir_all(&config.barrier_dir).map_err(|error| {
         mooncake_store_core::StoreError::Transport(format!(
             "failed to create NoF test barrier {}: {error}",
@@ -367,6 +421,17 @@ fn wait_for_phase(config: &TestConfig, client_id: &str, phase: &str) -> Result<(
 }
 
 fn signal_phase_done(config: &TestConfig, phase: &str) -> Result<()> {
+    if let Some(mut connection) = redis_connection(config)? {
+        let _: () = connection
+            .set(barrier_key(config, &format!("{phase}.done")), now_ms())
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to publish NoF {phase} Redis completion barrier: {error}"
+                ))
+            })?;
+        return Ok(());
+    }
+
     std::fs::write(
         config.barrier_dir.join(format!("{phase}.done")),
         now_ms().to_string(),
@@ -379,6 +444,19 @@ fn signal_phase_done(config: &TestConfig, phase: &str) -> Result<()> {
 }
 
 fn phase_done_timestamp(config: &TestConfig, phase: &str) -> Result<u64> {
+    if let Some(mut connection) = redis_connection(config)? {
+        let value: Option<u64> = connection
+            .get(barrier_key(config, &format!("{phase}.done")))
+            .map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to read NoF {phase} Redis completion barrier: {error}"
+                ))
+            })?;
+        return value.ok_or_else(|| {
+            StoreError::Transport(format!("NoF {phase} Redis completion barrier is missing"))
+        });
+    }
+
     let path = config.barrier_dir.join(format!("{phase}.done"));
     let contents = std::fs::read_to_string(&path).map_err(|error| {
         mooncake_store_core::StoreError::Transport(format!(
@@ -397,6 +475,20 @@ fn phase_done_timestamp(config: &TestConfig, phase: &str) -> Result<u64> {
 fn wait_for_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
     let deadline = Instant::now() + config.barrier_timeout;
     while Instant::now() < deadline {
+        if let Some(mut connection) = redis_connection(config)? {
+            let exists: bool = connection
+                .exists(barrier_key(config, &format!("{phase}.done")))
+                .map_err(|error| {
+                    StoreError::Transport(format!(
+                        "failed to read NoF {phase} Redis completion barrier: {error}"
+                    ))
+                })?;
+            if exists {
+                return phase_done_timestamp(config, phase);
+            }
+            sleep(Duration::from_millis(100));
+            continue;
+        }
         if config.barrier_dir.join(format!("{phase}.done")).is_file() {
             return phase_done_timestamp(config, phase);
         }
@@ -459,6 +551,31 @@ fn wait_for_cold_only_routes(
 fn wait_for_all_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
     let deadline = Instant::now() + config.barrier_timeout;
     while Instant::now() < deadline {
+        if let Some(mut connection) = redis_connection(config)? {
+            let mut latest = 0;
+            let mut all_done = true;
+            for client in &config.client_ids {
+                let client_phase = format!("{phase}-{client}");
+                let key = barrier_key(config, &format!("{client_phase}.done"));
+                let value: Option<u64> = connection.get(key).map_err(|error| {
+                    StoreError::Transport(format!(
+                        "failed to read NoF {client_phase} Redis completion barrier: {error}"
+                    ))
+                })?;
+                match value {
+                    Some(timestamp) => latest = latest.max(timestamp),
+                    None => {
+                        all_done = false;
+                        break;
+                    }
+                }
+            }
+            if all_done {
+                return Ok(latest);
+            }
+            sleep(Duration::from_millis(100));
+            continue;
+        }
         if config.client_ids.iter().all(|client| {
             config
                 .barrier_dir
