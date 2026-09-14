@@ -105,7 +105,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     hot_standby_service.cpp
     metadata_store.cpp
     standby_state_machine.cpp
-    ha_metric_manager.cpp)
+    ha_metric_manager.cpp
+    tracing.cpp)
 
 set(MOONCAKE_STORE_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
@@ -635,6 +636,10 @@ if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+  target_compile_definitions(mooncake_store_master_objects
+                             PRIVATE MOONCAKE_ENABLE_OTEL_TRACING)
+endif()
 if(STORE_USE_REDIS)
   target_link_libraries(mooncake_store_master_objects PRIVATE Mooncake::hiredis)
 endif()
@@ -671,6 +676,10 @@ target_link_libraries(
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_ENABLE_OTEL_TRACING)
 endif()
 if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
@@ -751,6 +760,21 @@ if(USE_NOF)
   # SPDK-backed initiator.
   target_link_libraries(mooncake_store_master PRIVATE mooncake_nof_spdk)
 endif()
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+  target_link_libraries(
+    mooncake_store_master
+    PRIVATE opentelemetry-cpp::trace
+            opentelemetry-cpp::resources
+            opentelemetry-cpp::otlp_recordable
+            opentelemetry-cpp::otlp_http_exporter
+            opentelemetry-cpp::otlp_http_client
+            opentelemetry-cpp::otlp_grpc_exporter)
+  if(TARGET opentelemetry-cpp::otlp_grpc_client)
+    target_link_libraries(
+      mooncake_store_master PRIVATE opentelemetry-cpp::otlp_grpc_client)
+  endif()
+  endif()
+endif()
 
 # Complete public Store library.
 add_library(
@@ -829,6 +853,20 @@ if(BUILD_UNIT_TESTS AND USE_MLU)
                         PUBLIC ${mlu_test_store_dependencies})
 endif()
 
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+  target_link_libraries(
+    mooncake_store
+    PRIVATE opentelemetry-cpp::trace
+            opentelemetry-cpp::resources
+            opentelemetry-cpp::otlp_recordable
+            opentelemetry-cpp::otlp_http_exporter
+            opentelemetry-cpp::otlp_http_client
+            opentelemetry-cpp::otlp_grpc_exporter)
+  if(TARGET opentelemetry-cpp::otlp_grpc_client)
+    target_link_libraries(mooncake_store
+                          PRIVATE opentelemetry-cpp::otlp_grpc_client)
+  endif()
+endif()
 if(BUILD_SHARED_LIBS)
   set_target_properties(mooncake_store PROPERTIES INSTALL_RPATH "$ORIGIN")
   install(TARGETS mooncake_store DESTINATION lib)
