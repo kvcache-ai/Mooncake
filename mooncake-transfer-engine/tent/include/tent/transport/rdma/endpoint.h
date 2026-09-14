@@ -156,6 +156,19 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
         return notify_inflight_.load(std::memory_order_acquire);
     }
 
+    // Whether a consumed notify RECV slot is posted again. Only while the
+    // endpoint is ready and its notify QP connected: a retiring endpoint's
+    // QP is in ERR, and so is the QP of an endpoint whose notifications were
+    // disabled, because the local completion error that disables them has
+    // already moved the RC QP to ERR. A post on either is wasted work - this
+    // provider accepts it and flushes it straight back, one that checks the
+    // state rejects it and logs - and the initial posting in connect() /
+    // accept() does not go through here.
+    static bool shouldRearmNotifyRecv(EndPointStatus status,
+                                      bool notify_connected) {
+        return status == EP_READY && notify_connected;
+    }
+
     // Turns notifications off after a fault confined to the notify QP,
     // leaving the data QPs and the endpoint lifecycle untouched.
     // Notifications stay off for the remaining lifetime of the endpoint. The
@@ -235,6 +248,9 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     void resetInflightSlices();
 
     void postNotifyRecv(size_t idx);
+    // postNotifyRecv() for a slot that has just been consumed, subject to
+    // shouldRearmNotifyRecv().
+    void rearmNotifyRecv(size_t idx);
     void repostAllNotifyRecvs();
 
     static char* notifySlotPtr(char* base, size_t idx);

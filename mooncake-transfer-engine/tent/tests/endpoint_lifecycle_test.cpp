@@ -373,6 +373,33 @@ TEST(EndpointLifecycleTest, FinishDestroyWaitsForNotifyCompletions) {
     EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYED);
 }
 
+// A consumed notify RECV slot is posted again only while the endpoint is
+// ready and its notify QP connected. Retirement moves the QP to ERR, and so
+// does the local fault that disables notifications, so neither may re-arm.
+TEST(EndpointLifecycleTest, NotifyRecvIsRearmedOnlyWhileReady) {
+    using S = RdmaEndPoint;
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(S::EP_READY, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_READY, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYING, true));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_DESTROYED, false));
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(S::EP_HANDSHAKING, true));
+
+    // The states the endpoint actually passes through.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+    EndpointTestAccess::markNotifyConnected(endpoint);
+    EXPECT_TRUE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                         endpoint.notifyConnected()));
+    endpoint.disableNotification("test");
+    EXPECT_EQ(endpoint.status(), S::EP_READY);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
+    EndpointTestAccess::beginDestroy(endpoint);
+    EXPECT_FALSE(S::shouldRearmNotifyRecv(endpoint.status(),
+                                          endpoint.notifyConnected()));
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

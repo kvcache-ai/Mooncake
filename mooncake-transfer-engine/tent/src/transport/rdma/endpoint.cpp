@@ -1127,6 +1127,10 @@ void RdmaEndPoint::postNotifyRecv(size_t idx) {
     notify_inflight_.fetch_add(1, std::memory_order_release);
 }
 
+void RdmaEndPoint::rearmNotifyRecv(size_t idx) {
+    if (shouldRearmNotifyRecv(status(), notifyConnected())) postNotifyRecv(idx);
+}
+
 void RdmaEndPoint::repostAllNotifyRecvs() {
     for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
         postNotifyRecv(i);
@@ -1293,7 +1297,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
 
     // Silent retry for byte_len == 0
     if (byte_len == 0) {
-        postNotifyRecv(buffer_idx);
+        rearmNotifyRecv(buffer_idx);
         return false;
     }
 
@@ -1303,7 +1307,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     if (!decodeNotifyPayload(data, byte_len, &name, &msg)) {
         LOG(ERROR) << "Invalid notification message size or format: "
                    << byte_len;
-        postNotifyRecv(buffer_idx);
+        rearmNotifyRecv(buffer_idx);
         return false;
     }
 
@@ -1311,7 +1315,7 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     context_->transport_.addNotificationToQueue(name, msg);
 
     // Repost recv buffer
-    postNotifyRecv(buffer_idx);
+    rearmNotifyRecv(buffer_idx);
     return true;
 }
 
