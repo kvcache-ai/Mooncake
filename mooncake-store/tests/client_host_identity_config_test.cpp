@@ -44,27 +44,25 @@ TEST_F(ClientHostIdentityConfigTest, UsesLocalHostnameAndRejectsLoopback) {
               "hostB");
     EXPECT_EQ(ClientHostIdentityConfig::FromEnvironment("hostB:5001").host_id,
               "hostB");
-    EXPECT_EQ(ClientHostIdentityConfig::FromEnvironment("[2001:db8::1]:5000")
-                  .host_id,
-              "2001:db8::1");
-    EXPECT_TRUE(
-        ClientHostIdentityConfig::FromEnvironment("localhost:5000")
-            .host_id.empty());
-    EXPECT_TRUE(
-        ClientHostIdentityConfig::FromEnvironment("127.0.0.1:5000")
-            .host_id.empty());
+    EXPECT_EQ(
+        ClientHostIdentityConfig::FromEnvironment("[2001:db8::1]:5000").host_id,
+        "2001:db8::1");
+    EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("localhost:5000")
+                    .host_id.empty());
+    EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("127.0.0.1:5000")
+                    .host_id.empty());
     EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("0.0.0.0:5000")
                     .host_id.empty());
-    EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("::1")
-                    .host_id.empty());
+    EXPECT_TRUE(
+        ClientHostIdentityConfig::FromEnvironment("::1").host_id.empty());
     EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("[::1]:5000")
                     .host_id.empty());
     EXPECT_TRUE(
         ClientHostIdentityConfig::FromEnvironment("::").host_id.empty());
-    EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("[::]")
-                    .host_id.empty());
-    EXPECT_TRUE(ClientHostIdentityConfig::FromEnvironment("[::]:5000")
-                    .host_id.empty());
+    EXPECT_TRUE(
+        ClientHostIdentityConfig::FromEnvironment("[::]").host_id.empty());
+    EXPECT_TRUE(
+        ClientHostIdentityConfig::FromEnvironment("[::]:5000").host_id.empty());
 }
 
 TEST_F(ClientHostIdentityConfigTest, PrefersDeploymentOverride) {

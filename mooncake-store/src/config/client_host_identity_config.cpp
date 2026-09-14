@@ -13,18 +13,16 @@ namespace {
 bool IsUsableHostId(std::string_view host_id) {
     return !host_id.empty() &&
            !AsciiCaseInsensitiveEquals(host_id, "localhost") &&
-           host_id != "127.0.0.1" && host_id != "0.0.0.0" &&
-           host_id != "::1" && host_id != "[::1]" && host_id != "::" &&
-           host_id != "[::]";
+           host_id != "127.0.0.1" && host_id != "0.0.0.0" && host_id != "::1" &&
+           host_id != "[::1]" && host_id != "::" && host_id != "[::]";
 }
 
 std::string NormalizeHostId(std::string_view value) {
     const std::string hostname(TrimAsciiWhitespace(value));
-    const std::string host_id =
-        (hostname == "::1" || hostname == "::")
-            ? hostname
-            : std::string(
-                  TrimAsciiWhitespace(getHostNameWithoutPort(hostname)));
+    const std::string host_id = (hostname == "::1" || hostname == "::")
+                                    ? hostname
+                                    : std::string(TrimAsciiWhitespace(
+                                          getHostNameWithoutPort(hostname)));
     return IsUsableHostId(host_id) ? host_id : "";
 }
 
