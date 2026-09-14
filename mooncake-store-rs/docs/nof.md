@@ -495,7 +495,7 @@ transport is required. Install [SPDK](https://spdk.io/doc/getting_started.html) 
 an installed prefix or an SPDK build tree:
 
 ```shell
-export MOONCAKE_SPDK_PREFIX=/opt/spdk-26.05
+export MOONCAKE_SPDK_PREFIX=<spdk-prefix>
 cargo build -p mooncake-store-client --features nof-spdk --offline
 ```
 
@@ -623,9 +623,8 @@ build therefore requires the SPDK shared libraries and keeps their directory in
 The reproducible commands are:
 
 ```shell
-# Run inside the canonical Mooncake Store-RS container.
-source /root/.cargo/env
-export MOONCAKE_SPDK_PREFIX=/nvme/cruz.zxp/spdk-26.05-host
+# Run from the Mooncake Store-RS repository root on the build host.
+export MOONCAKE_SPDK_PREFIX=<spdk-prefix>
 # The reserved initiator and NoF hosts are CPU-only.
 export MOONCAKE_ENABLE_CUDA=0
 scripts/e2e/build-nof-multi-client.sh
@@ -649,22 +648,27 @@ library resolution. The test artifact is `target/debug/nof_multi_client` (or the
 directory, and writes hostname, kernel, interface inventory, binary hash, and runtime-library
 status to `run-manifest.txt`. A run is not started when a shared library or symbol is unresolved.
 
-The multi-node command runs on the bastion. It builds in the container, resets only the
+The multi-node command runs on the bastion. It builds in the container, optionally resets the
 provisioned NoF image on every configured target, stages the exact binary and runner with `rsync`,
 verifies the binary SHA256 on each initiator, and runs the configured client subset on each
-initiator. Initiators do not need to SSH to target public addresses, so target cleanup is
-deliberately performed from the bastion:
+initiator. Initiators do not need to SSH to target public addresses, so target cleanup, when
+enabled, is deliberately performed from the bastion:
 
 ```shell
-# On 11.158.240.229.
-rsync -a -e 'ssh -o BatchMode=yes' \
-  root@10.88.0.5:/nvme/cruz.zxp/Mooncake-Store-RS-nof-pr2-integrated/scripts/e2e/run-nof-multi-client-from-bastion.sh \
-  /tmp/run-nof-multi-client-from-bastion.sh
-bash /tmp/run-nof-multi-client-from-bastion.sh
+# On the bastion, from a checked-out Mooncake Store-RS repository.
+NOF_BUILD_HOST='<build-ssh-host>' \
+NOF_BUILD_ROOT='<repo-path-on-build-host>' \
+MOONCAKE_SPDK_PREFIX='<spdk-prefix-on-build-host-and-initiators>' \
+NOF_TARGETS='<target-ssh-host-a>|<target-traddr-a>|<target-id-a>|<target-subnqn-a>|<target-port-a>,<target-ssh-host-b>|<target-traddr-b>|<target-id-b>|<target-subnqn-b>|<target-port-b>' \
+NOF_CLIENT_IDS='<client-id-a>,<client-id-b>' \
+NOF_INITIATORS='<initiator-ssh-host-a>|<initiator-bind-ip-a>|<client-id-a>;<initiator-ssh-host-b>|<initiator-bind-ip-b>|<client-id-b>' \
+NOF_REDIS_URL='redis://<redis-host>:<redis-port>/<redis-db>' \
+NOF_REPLICA_COUNT='<replica-count>' \
+scripts/e2e/run-nof-multi-client-from-bastion.sh
 ```
 
-The script defaults are localhost-safe placeholders. A real reservation must pass the topology
-explicitly:
+The multi-node script intentionally has no target, initiator, Redis, build-host, or client-list
+defaults. A real reservation must pass the topology explicitly:
 
 - `NOF_TARGETS` is a comma-separated target list. Each entry is
   `public_host|traddr|target_id|subnqn|port`. The number of NoF targets is the number of entries.
@@ -673,12 +677,16 @@ explicitly:
 - `NOF_INITIATORS` is a semicolon-separated initiator list. Each entry is
   `ssh_host|bind_ip|local_client_ids`; the number of initiator machines is the number of entries.
   `local_client_ids` is the comma-separated subset started on that initiator.
+- `MOONCAKE_SPDK_PREFIX` or `NOF_SPDK_LIB_DIR` points each initiator at the SPDK shared
+  libraries used by the staged binary.
 - `NOF_BARRIER_REDIS_URL` controls the cross-initiator barrier. It defaults to `NOF_REDIS_URL`.
+- `NOF_RESET_TARGETS=1` enables target image reset from the bastion. When it is enabled,
+  `NOF_NVMF_SERVICE` and `NOF_TARGET_IMAGE` must also be set explicitly.
 
-Every reset stops `mooncake-nvmf.service`, removes and recreates `/var/lib/mooncake-nof/nof.img`
-at `NOF_TEST_IMAGE_BYTES`, and restarts the service; it never touches the system NVMe disk. Run
-logs and the manifest are left under `/tmp/mooncake-nof-multi-client/logs/<run-tag>/` on each
-initiator.
+Every reset stops `NOF_NVMF_SERVICE`, removes and recreates `NOF_TARGET_IMAGE` at
+`NOF_TEST_IMAGE_BYTES`, and restarts the service; it never touches the system NVMe disk unless the
+operator explicitly points `NOF_TARGET_IMAGE` there. Run logs and the manifest are left under
+`NOF_INITIATOR_DIR/logs/<run-tag>/` on each initiator.
 
 For a manually staged run, use `scripts/e2e/run-nof-multi-client.sh` with
 `NOF_RESET_TARGETS=0`, `NOF_SKIP_TARGET_SSH_CHECK=1`, the local `NOF_BIND_IP`, and the same
@@ -696,8 +704,7 @@ transfers; the cross-client assertion is the managed NoF read path. A passing ru
 configured write/offload and read verification counts in each client log. The target list is
 configured by `NOF_TARGETS`, client IDs by `NOF_CLIENT_IDS`, local client subset by
 `NOF_LOCAL_CLIENT_IDS`, initiator machines by `NOF_INITIATORS`, and the image size by
-`NOF_TEST_IMAGE_BYTES`; the reset operation removes and recreates only
-`/var/lib/mooncake-nof/nof.img` and never touches the system NVMe disk.
+`NOF_TEST_IMAGE_BYTES`; the reset operation removes and recreates only `NOF_TARGET_IMAGE`.
 
 ## Validation
 
