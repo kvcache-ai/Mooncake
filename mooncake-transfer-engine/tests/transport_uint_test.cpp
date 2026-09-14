@@ -26,15 +26,46 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
+#ifdef USE_TENT
+#include "tent/common/config.h"
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
+#endif
 
 using namespace mooncake;
 
 namespace mooncake {
+
+#ifdef USE_TENT
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* old_value = std::getenv(name);
+        if (old_value) old_value_ = old_value;
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_)
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        else
+            unsetenv(name_.c_str());
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+#endif
 
 class TransferEngineImplTestPeer {
    public:
@@ -82,6 +113,13 @@ class TransferEngineImplTestPeer {
         const std::function<void()>& before_delete) {
         return engine.multi_transports_->freeBatchID(batch_id, before_delete);
     }
+
+#ifdef USE_TENT
+    static const tent::Config* tentConfig(const TransferEngine& engine) {
+        if (!engine.impl_tent_ || !engine.impl_tent_->impl_) return nullptr;
+        return engine.impl_tent_->impl_->conf_.get();
+    }
+#endif
 };
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
@@ -114,6 +152,57 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
 }
+
+#ifdef USE_TENT
+// RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
+// still comes up with RDMA selected. forceTcp() must flip both flags.
+constexpr const char* kTentConfPrefersRdma =
+    R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true},"shm":{"enable":false},"hp_tcp":{"enable":false},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})";
+
+void expectForcedTcpConstraint(const tent::Config& config) {
+    EXPECT_TRUE(config.get("transports/force_tcp", false));
+    EXPECT_TRUE(config.get("transports/tcp/enable", false));
+    EXPECT_FALSE(config.get("transports/rdma/enable", true));
+}
+
+TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-protocol-tcp", "", 0, "tcp"),
+              0);
+    const auto* protocol_config =
+        TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(protocol_config, nullptr);
+    expectForcedTcpConstraint(*protocol_config);
+
+    std::array<char, 4096> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+
+TEST(TransferEngineTentCompatibilityTest, ForceTcpEnvForcesTcpTransport) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-force-tcp"), 0);
+    const auto* env_config = TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(env_config, nullptr);
+    expectForcedTcpConstraint(*env_config);
+
+    std::array<char, 4096> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+#endif
 
 class BatchResultTransport : public Transport {
    public:

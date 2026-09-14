@@ -171,6 +171,66 @@ TEST(TransportSelectorTest, DefaultPoliciesMemorySegment) {
         << "Should use first in buffer_transports";
 }
 
+TEST(TransportSelectorTest, ForceTcpOverridesBufferTransportOrder) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"prefer-rdma","segment_type":"memory","transports":["rdma"]}]})")
+            .ok());
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+
+    auto* rdma = static_cast<FakeTransport*>(transports[RDMA].get());
+    rdma->setDramToDram(true);
+    auto* tcp = static_cast<FakeTransport*>(transports[TCP].get());
+    tcp->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, TCP};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
+    EXPECT_EQ(selector.select(ctx, transports, 1).transport, UNSPEC);
+    EXPECT_EQ(selector.select(ctx, transports, 0, RDMA).transport, UNSPEC);
+}
+
+TEST(TransportSelectorTest, ForceTcpDoesNotOverrideFileTransportPolicy) {
+    auto conf = std::make_shared<Config>();
+    ASSERT_TRUE(
+        conf->load(
+                R"({"policy":[{"name":"file","segment_type":"file","transports":["gds"]}]})")
+            .ok());
+    conf->set("transports/force_tcp", true);
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[GDS] = std::make_shared<FakeTransport>(GDS);
+    static_cast<FakeTransport*>(transports[GDS].get())->setDramToFile(true);
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::File;
+    ctx.same_machine = true;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = 0;
+    ctx.buffer_transports = nullptr;
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, GDS);
+}
+
 // ---------------------------------------------------------------------------
 // Test transport type name parsing
 // ---------------------------------------------------------------------------
