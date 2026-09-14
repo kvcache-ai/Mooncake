@@ -262,25 +262,45 @@ HA leadership and metadata replication are configured separately:
 
 - The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
 - The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+- The optional standby-generated batch OpLog snapshot path is enabled with `--enable_oplog_snapshot=true` together with `--enable_oplog=true`. It uses the batch snapshot provider/coordinator and does not use the legacy catalog snapshot manager. Startup fails when the required etcd, cluster ID, object-store, or chunk configuration is invalid; a temporary upload failure leaves OpLog apply running for a later attempt.
 
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
+- `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
 - `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
 
-For snapshot-based standby bootstrap, also configure:
+For legacy catalog snapshot-based standby bootstrap, configure:
 
 - `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
 - `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
 - `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
 
+For the new batch OpLog snapshot path, configure:
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+enable_oplog: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
+snapshot_object_store_type: "local"
+```
+
+The new path stores immutable artifacts below a cluster-specific batch OpLog
+snapshot root. It restores `latest`, then `fallback`, then a proven complete
+OpLog and replays only the suffix after the snapshot cursor. It remains
+non-serving if recovery cannot prove a complete state.
+
 ### Standby Bootstrap
 
 When a Standby starts, it follows this sequence:
 
-1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
-   - Load the latest snapshot from the configured catalog and object store.
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true` for legacy catalog snapshots, or `enable_oplog_snapshot=true` for batch OpLog snapshots):
+   - Legacy mode loads the latest snapshot from the configured catalog and object store. Batch OpLog mode loads the latest/fallback descriptor and manifest directly from the batch snapshot control keys.
    - Rebuild object metadata and segment state from the snapshot baseline.
 2. **OpLog Catch-up**:
    - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
@@ -322,9 +342,10 @@ cluster_id: "mooncake_cluster"
 enable_oplog: true
 oplog_poll_interval_ms: 1000
 oplog_batch_max_entries: 1024
-enable_snapshot: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
-snapshot_catalog_store_type: "embedded"
 rpc_port: 50051
 ```
 
@@ -338,9 +359,10 @@ cluster_id: "mooncake_cluster"
 enable_oplog: true
 oplog_poll_interval_ms: 1000
 oplog_batch_max_entries: 1024
-enable_snapshot_restore: true
+enable_oplog_snapshot: true
+snapshot_chunk_object_count: 1000000
+snapshot_interval_seconds: 600
 snapshot_object_store_type: "local"
-snapshot_catalog_store_type: "embedded"
 rpc_port: 50052
 ```
 
@@ -612,6 +634,7 @@ mooncake_master \
 | `--enable_multi_tenants` | `false` | Enable strict tenant registration and per-tenant memory quota admission |
 | `--tenant_quota_connector_type` | `file` | Tenant quota policy connector type: `file` or `etcd` when built with `STORE_USE_ETCD=ON` |
 | `--tenant_quota_connector_uri` | empty | Connector URI; for `file`, the writable YAML policy path; for `etcd`, the endpoints string |
+| `--tenant_eviction_high_watermark_ratio` | `0.90` | Usage ratio of a tenant's own effective quota that triggers background eviction for that tenant; `0` disables it |
 
 ### High Availability
 
@@ -624,6 +647,8 @@ mooncake_master \
 | `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 | `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--enable_oplog_snapshot` | `false` | Enable standby-generated batch OpLog snapshots; requires batch OpLog, HA/etcd, valid object-store configuration, and persistent local snapshot storage when applicable |
+| `--snapshot_chunk_object_count` | `1000000` | Maximum objects per batch OpLog snapshot chunk; must be positive when the new snapshot path is enabled |
 | `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
 | `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
 | `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
@@ -1184,7 +1209,7 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 |----------|---------|-------------|
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
 | `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for client→master RPCs and for store→store SSD offload reads. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
-| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
+| `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` initially; `1000` during HA runtime | Connection-establishment timeout (ms) for the master RPC client and for the store→store SSD offload client. HA clients retain the normal retry budget during initial discovery and configuration, then use one bounded attempt per runtime reconnect because their monitor and heartbeat loops own the retry schedule. An explicit value overrides both defaults. Worth lowering when SSD offload is enabled: an offload read that picks a store which has gone away without deregistering waits this long on each of 3 connect attempts (91 s at the default) before returning a clean miss |
 | `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
 | `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
 | `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |

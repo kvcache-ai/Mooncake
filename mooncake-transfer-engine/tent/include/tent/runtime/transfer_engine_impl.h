@@ -80,6 +80,7 @@ struct TaskInfo {
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
+    size_t public_length{0};  // Original API request; request may be merged.
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
@@ -118,6 +119,7 @@ struct TaskInfo {
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
           request(other.request),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -142,6 +144,7 @@ struct TaskInfo {
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -167,6 +170,7 @@ struct TaskInfo {
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
             request = other.request;
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -197,6 +201,7 @@ struct TaskInfo {
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -388,6 +393,8 @@ class TransferEngineImpl {
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
+
+    void deregisterRemovedBuffer(BufferDesc& desc);
 
     Status resubmitTransferTask(Batch* batch, size_t task_id);
 

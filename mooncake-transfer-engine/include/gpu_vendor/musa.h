@@ -129,6 +129,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaGetDeviceProperties musaGetDeviceProperties
 #define cudaMemcpyDeviceToDevice musaMemcpyDeviceToDevice
 #define cudaDevAttrClockRate musaDevAttrClockRate
+#define cudaDevAttrMultiProcessorCount musaDevAttrMultiProcessorCount
 #define cudaDevAttrMaxSharedMemoryPerBlockOptin \
     musaDevAttrMaxSharedMemoryPerBlockOptin
 #define cudaEventCreate musaEventCreate

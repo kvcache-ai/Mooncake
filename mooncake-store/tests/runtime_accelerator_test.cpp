@@ -110,5 +110,65 @@ TEST(RuntimeAcceleratorTest, CopyFromHostUsesHostToDeviceCopy) {
     EXPECT_EQ(device.last_direction(), CopyDirection::kHostToDevice);
 }
 
+TEST(RuntimeAcceleratorTest, CopyAutoFallsBackToMemcpyForHostPointers) {
+    char src[] = "abc";
+    char dst[sizeof(src)] = {};
+    RuntimeAccelerator runtime_accelerator;
+
+    EXPECT_TRUE(runtime_accelerator.CopyAuto(dst, src, sizeof(src)));
+
+    EXPECT_STREQ(dst, src);
+}
+
+TEST(RuntimeAcceleratorTest, CopyAutoUsesDestinationDeviceContext) {
+    char src[] = "abc";
+    char dst[sizeof(src)] = {};
+    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, dst, 5);
+    RuntimeAccelerator runtime_accelerator({&device});
+
+    EXPECT_TRUE(runtime_accelerator.CopyAuto(dst, src, sizeof(src)));
+
+    EXPECT_STREQ(dst, src);
+    EXPECT_EQ(device.current_device_id(), 5);
+    EXPECT_EQ(device.last_direction(), CopyDirection::kAuto);
+}
+
+TEST(RuntimeAcceleratorTest, CopyAutoUsesSourceDeviceForDeviceToHost) {
+    char src[] = "abc";
+    char dst[sizeof(src)] = {};
+    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, src, 6);
+    RuntimeAccelerator runtime_accelerator({&device});
+
+    EXPECT_TRUE(runtime_accelerator.CopyAuto(dst, src, sizeof(src)));
+
+    EXPECT_STREQ(dst, src);
+    EXPECT_EQ(device.current_device_id(), 6);
+    EXPECT_EQ(device.last_direction(), CopyDirection::kAuto);
+}
+
+TEST(RuntimeAcceleratorTest, CopyAutoReportsDeviceCopyFailure) {
+    char src[] = "abc";
+    char dst[sizeof(src)] = {};
+    FakeAcceleratorDevice device(AcceleratorVendor::kNvidia, dst, 5);
+    device.set_copy_succeeds(false);
+    RuntimeAccelerator runtime_accelerator({&device});
+
+    EXPECT_FALSE(runtime_accelerator.CopyAuto(dst, src, sizeof(src)));
+}
+
+TEST(RuntimeAcceleratorTest, CopyAutoRejectsCrossRuntimeDevicePairs) {
+    char src[] = "abc";
+    char dst[sizeof(src)] = {};
+    FakeAcceleratorDevice src_device(AcceleratorVendor::kNvidia, src, 1);
+    FakeAcceleratorDevice dst_device(AcceleratorVendor::kAscend, dst, 2);
+    RuntimeAccelerator runtime_accelerator({&src_device, &dst_device});
+
+    EXPECT_FALSE(runtime_accelerator.CopyAuto(dst, src, sizeof(src)));
+
+    // Neither device was asked to copy across runtimes.
+    EXPECT_EQ(src_device.current_device_id(), -1);
+    EXPECT_EQ(dst_device.current_device_id(), -1);
+}
+
 }  // namespace
 }  // namespace mooncake::device

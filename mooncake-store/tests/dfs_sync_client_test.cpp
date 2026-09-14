@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -8,6 +9,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -146,6 +148,7 @@ class DfsSyncClientTest : public ::testing::Test {
     void ExpectDfsValue(const std::string& key, const std::string& expected) {
         auto query = QueryDfsOnly(key);
         ASSERT_TRUE(query.has_value());
+        last_read_lease_deadline_ = query->lease_timeout;
         std::vector<char> output(expected.size());
         const auto& descriptor = query->replicas[0].get_dfs_descriptor();
         auto results = backend_->BatchRead(
@@ -154,6 +157,13 @@ class DfsSyncClientTest : public ::testing::Test {
         ASSERT_TRUE(results[0].has_value());
         EXPECT_EQ(std::memcmp(output.data(), expected.data(), expected.size()),
                   0);
+    }
+
+    void WaitForReadLeaseExpiry() {
+        // The verification read holds a lease too. Allow the master's deadline
+        // to pass before testing the successful synchronous write path.
+        std::this_thread::sleep_until(last_read_lease_deadline_ +
+                                      std::chrono::milliseconds(100));
     }
 
     static std::vector<std::vector<Slice>> MakeSlices(
@@ -194,6 +204,7 @@ class DfsSyncClientTest : public ::testing::Test {
     void* segment_ = nullptr;
     size_t segment_size_ = 0;
     std::string root_;
+    std::chrono::steady_clock::time_point last_read_lease_deadline_{};
     std::vector<std::pair<std::string, std::optional<std::string>>> saved_env_;
 };
 
@@ -206,6 +217,10 @@ TEST_F(DfsSyncClientTest, PutAndUpsertReturnAfterDfsWrite) {
 
     std::string updated(4096, 'B');
     std::vector<Slice> updated_slices{{updated.data(), updated.size()}};
+    auto leased_upsert = writer_->Upsert(key, updated_slices, DfsConfig());
+    ASSERT_FALSE(leased_upsert.has_value());
+    EXPECT_EQ(leased_upsert.error(), ErrorCode::OBJECT_HAS_LEASE);
+    WaitForReadLeaseExpiry();
     ASSERT_TRUE(writer_->Upsert(key, updated_slices, DfsConfig()).has_value());
     ExpectDfsValue(key, updated);
 }
@@ -225,6 +240,14 @@ TEST_F(DfsSyncClientTest, BatchPutAndBatchUpsertReturnAfterDfsWrite) {
     std::vector<std::string> updated{std::string(4096, 'E'),
                                      std::string(4096, 'F')};
     auto updated_slices = MakeSlices(updated);
+    auto leased_upserts =
+        writer_->BatchUpsert(keys, updated_slices, DfsConfig());
+    ASSERT_EQ(leased_upserts.size(), keys.size());
+    for (const auto& result : leased_upserts) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::OBJECT_HAS_LEASE);
+    }
+    WaitForReadLeaseExpiry();
     auto upsert_results =
         writer_->BatchUpsert(keys, updated_slices, DfsConfig());
     ASSERT_EQ(upsert_results.size(), keys.size());

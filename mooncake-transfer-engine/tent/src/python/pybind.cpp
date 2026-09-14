@@ -97,6 +97,7 @@ static void ThrowStatus(const Status& s, const char* where) {
         case Status::Code::kMetadataError:
             throw MetadataError(full_msg);
         case Status::Code::kRpcServiceError:
+        case Status::Code::kRpcConnectionError:
             throw RpcServiceError(full_msg);
         case Status::Code::kNotImplemented:
             throw NotImplementedError(full_msg);
@@ -421,7 +422,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](MemoryGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     py::class_<BatchGuard>(m, "BatchGuard")
@@ -433,7 +433,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](BatchGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     // -------------------------------------------------------------------------

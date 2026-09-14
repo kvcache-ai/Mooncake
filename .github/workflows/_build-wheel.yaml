@@ -111,6 +111,7 @@ jobs:
               exit 1
               ;;
           esac
+          cmake_args="$cmake_args -DENABLE_KV_EVENTS=ON"
 
           {
             echo "VARIANT_FLAG=$variant_flag"
