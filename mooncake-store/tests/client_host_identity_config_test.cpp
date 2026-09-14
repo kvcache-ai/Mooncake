@@ -93,12 +93,10 @@ TEST_F(ClientHostIdentityConfigTest, FallsBackForEmptyOverride) {
 
 TEST_F(ClientHostIdentityConfigTest, RejectsInvalidOverrideWithoutFallback) {
     const std::vector<const char*> invalid_host_ids = {
-        "localhost",  "localhost:5000",
-        "127.0.0.1",  "127.0.0.1:5000",
-        "0.0.0.0",    "0.0.0.0:5000",
-        "::1",        "[::1]",
-        "[::1]:5000", "::",
-        "[::]",       "[::]:5000"};
+        "localhost", "localhost:5000", "LOCALHOST",  "LoCaLhOsT:5000",
+        "127.0.0.1", "127.0.0.1:5000", "0.0.0.0",    "0.0.0.0:5000",
+        "::1",       "[::1]",          "[::1]:5000", "::",
+        "[::]",      "[::]:5000"};
     for (const char* invalid_host_id : invalid_host_ids) {
         SCOPED_TRACE(invalid_host_id);
         Set(invalid_host_id);
