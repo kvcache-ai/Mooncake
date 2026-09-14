@@ -1662,6 +1662,33 @@ std::shared_ptr<Lease> MasterService::RegisterGroupMember(
     return it->second.lease;
 }
 
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::BeginWeightImport(const BeginWeightImportRequest& request) {
+    return weight_manager_.BeginWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::CommitWeightImport(const CommitWeightImportRequest& request) {
+    return weight_manager_.CommitWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionMetadata>
+MasterService::AbortWeightImport(const AbortWeightImportRequest& request) {
+    return weight_manager_.AbortWeightImport(request);
+}
+
+WeightMetadataStore::Result<WeightRevisionView>
+MasterService::GetWeightRevision(
+    const GetWeightRevisionRequest& request) const {
+    return weight_manager_.GetWeightRevision(request);
+}
+
+WeightMetadataStore::Result<ListWeightRevisionsResponse>
+MasterService::ListWeightRevisions(
+    const ListWeightRevisionsRequest& request) const {
+    return weight_manager_.ListWeightRevisions(request);
+}
+
 void MasterService::UnregisterGroupMember(const TenantId& tenant_id,
                                           const std::string& key,
                                           const std::string& group_id) {
