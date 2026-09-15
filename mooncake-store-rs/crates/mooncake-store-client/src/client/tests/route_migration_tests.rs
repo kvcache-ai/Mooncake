@@ -358,9 +358,9 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
                 priority: 1,
             },
         ],
+        nof_backing: None,
         ..current.clone()
-
-        nof_backing: None,};
+    };
     let existing_target = StoreClient::build_explicit_copy_route_delta(
         &current_with_existing_target,
         &SegmentName::new("seg-a"),

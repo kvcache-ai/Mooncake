@@ -1647,9 +1647,9 @@ fn metadata_route_cas_rejects_stale_restore_after_reconnect() {
             length: b"new-authoritative-payload".len() as u64,
             ..cold_backing.clone()
         }),
+        nof_backing: None,
         ..original.clone()
-
-        nof_backing: None,};
+    };
     assert!(
         inner
             .compare_and_swap_object_route(&key, Some(original.version), Some(&reconnected_route))
