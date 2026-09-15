@@ -298,6 +298,16 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     return impl_->getTransferStatus(batch_id, task_id, status);
 }
 
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
                                               TransferStatus& status) {
     return impl_->getBatchTransferStatus(batch_id, status);
@@ -1049,6 +1059,32 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         return impl_->getTransferStatus(batch_id, task_id, status);
     }
+}
+
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    if (use_tent_) {
+        auto status =
+            impl_tent_->getTaskCongestionState(batch_id, task_id, state);
+        if (status.ok()) return Status::OK();
+        return status.IsInvalidArgument()
+                   ? Status::InvalidArgument(status.ToString())
+                   : Status::Context(status.ToString());
+    }
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    if (use_tent_) {
+        auto status =
+            impl_tent_->getTaskCongestionDetail(batch_id, task_id, detail);
+        if (status.ok()) return Status::OK();
+        return status.IsInvalidArgument()
+                   ? Status::InvalidArgument(status.ToString())
+                   : Status::Context(status.ToString());
+    }
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
 }
 
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
