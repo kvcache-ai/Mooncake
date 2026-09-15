@@ -57,8 +57,8 @@ TEST(TentAdaptiveCongestionControlTest,
      LogicalTaskTracksWindowDeferAndReadmission) {
     adaptive_congestion_control::DomainState device(testConfig(), 3);
     TentRdmaCongestionControlRoute route(testConfig());
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(2, 1);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(2, 1);
     RdmaTask task{};
     task.congestion_observation = observation;
     task.congestion_attempt_id = 1;
@@ -70,9 +70,11 @@ TEST(TentAdaptiveCongestionControlTest,
     second.length = 128;
     adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
 
-    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path, first.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path,
+                                                  first.length, 7),
               adaptive_congestion_control::Decision::kAllow);
-    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path,
+                                                  second.length, 7),
               adaptive_congestion_control::Decision::kDefer);
     EXPECT_EQ(observation->state(), TaskCongestionState::kCongested);
     auto detail = observation->detail();
@@ -80,24 +82,25 @@ TEST(TentAdaptiveCongestionControlTest,
     EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
     EXPECT_EQ(detail.slice_id.value, 1);
 
-    ASSERT_TRUE(completeTentCongestionControlAttempt(first,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
-    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+    ASSERT_TRUE(completeTentCongestionControlAttempt(
+        first, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
+    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path,
+                                                  second.length, 7),
               adaptive_congestion_control::Decision::kAllow);
     EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
     EXPECT_TRUE(observation->detail().resolved);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(second,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        second, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
 }
 
 TEST(TentAdaptiveCongestionControlTest,
      PartiallyFilledWindowStillReportsDeferredTask) {
     adaptive_congestion_control::DomainState device(testConfig(), 3);
     TentRdmaCongestionControlRoute route(testConfig());
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(2, 1);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(2, 1);
     RdmaTask task{};
     task.congestion_observation = observation;
     task.congestion_attempt_id = 1;
@@ -109,24 +112,27 @@ TEST(TentAdaptiveCongestionControlTest,
     second.length = 600;
     adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
 
-    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path, first.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path,
+                                                  first.length, 7),
               adaptive_congestion_control::Decision::kAllow);
-    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path,
+                                                  second.length, 7),
               adaptive_congestion_control::Decision::kDefer);
     EXPECT_EQ(observation->state(), TaskCongestionState::kCongested);
     auto detail = observation->detail();
     ASSERT_TRUE(detail.reason.observed);
     EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
 
-    ASSERT_TRUE(completeTentCongestionControlAttempt(first,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
-    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+    ASSERT_TRUE(completeTentCongestionControlAttempt(
+        first, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
+    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path,
+                                                  second.length, 7),
               adaptive_congestion_control::Decision::kAllow);
     EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(second,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        second, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
 }
 
 TEST(TentAdaptiveCongestionControlTest, QuarantineAvoidsCurrentSliceOnly) {
@@ -141,8 +147,8 @@ TEST(TentAdaptiveCongestionControlTest, QuarantineAvoidsCurrentSliceOnly) {
     ASSERT_EQ(adaptive_congestion_control::snapshot(route.domain).state,
               adaptive_congestion_control::PathState::kQuarantined);
 
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(2, 1);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(2, 1);
     RdmaTask task{};
     task.congestion_observation = observation;
     task.congestion_attempt_id = 1;
@@ -151,7 +157,8 @@ TEST(TentAdaptiveCongestionControlTest, QuarantineAvoidsCurrentSliceOnly) {
     slice.slice_idx = 1;
     slice.length = 128;
     adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
-    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, path, slice.length, 7),
+    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
+                                                  slice.length, 7),
               adaptive_congestion_control::Decision::kAvoid);
     EXPECT_EQ(observation->state(), TaskCongestionState::kLongUnavailable);
     auto detail = observation->detail();
@@ -190,8 +197,8 @@ TEST(TentAdaptiveCongestionControlTest,
      OldControllerGenerationDoesNotRecordTaskFeedback) {
     adaptive_congestion_control::DomainState device(testConfig(), 3);
     TentRdmaCongestionControlRoute route(testConfig());
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(1, 1);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(1, 1);
     RdmaTask task{};
     task.congestion_observation = observation;
     task.congestion_attempt_id = 1;
@@ -199,7 +206,8 @@ TEST(TentAdaptiveCongestionControlTest,
     slice.task = &task;
     slice.length = 128;
     adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
-    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path, slice.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
+                                                  slice.length, 7),
               adaptive_congestion_control::Decision::kAllow);
 
     adaptive_congestion_control::resetGeneration(route.domain, 2);
@@ -214,8 +222,8 @@ TEST(TentAdaptiveCongestionControlTest,
      ActivePermitDeferDoesNotRecordTaskCongestion) {
     adaptive_congestion_control::DomainState device(testConfig(), 3);
     TentRdmaCongestionControlRoute route(testConfig());
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(1, 1);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(1, 1);
     RdmaTask task{};
     task.congestion_observation = observation;
     task.congestion_attempt_id = 1;
@@ -223,32 +231,36 @@ TEST(TentAdaptiveCongestionControlTest,
     slice.task = &task;
     slice.length = 128;
     adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
-    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path, slice.length, 7),
+    ASSERT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
+                                                  slice.length, 7),
               adaptive_congestion_control::Decision::kAllow);
-    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, path, slice.length, 7),
+    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, path,
+                                                  slice.length, 7),
               adaptive_congestion_control::Decision::kDefer);
     EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
     EXPECT_FALSE(observation->detail().reason.observed);
-    EXPECT_TRUE(completeTentCongestionControlAttempt(slice,
-                                      adaptive_congestion_control::OutcomeClass::kSuccess,
-                                      adaptive_congestion_control::FailureScope::kOperation));
+    EXPECT_TRUE(completeTentCongestionControlAttempt(
+        slice, adaptive_congestion_control::OutcomeClass::kSuccess,
+        adaptive_congestion_control::FailureScope::kOperation));
 }
 
 TEST(TentAdaptiveCongestionControlTest,
      GenerationRaceAvoidDoesNotClaimPathQuarantine) {
     adaptive_congestion_control::DomainState device(testConfig(), 3);
     TentRdmaCongestionControlRoute route(testConfig());
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(1, 1);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(1, 1);
     RdmaTask task{};
     task.congestion_observation = observation;
     task.congestion_attempt_id = 1;
     RdmaSlice slice{};
     slice.task = &task;
     slice.length = 128;
-    adaptive_congestion_control::PathHandle stale_path{&device, &route.domain, 3, 1};
+    adaptive_congestion_control::PathHandle stale_path{&device, &route.domain,
+                                                       3, 1};
     adaptive_congestion_control::resetGeneration(route.domain, 2);
-    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, stale_path, slice.length, 7),
+    EXPECT_EQ(acquireTentCongestionControlAttempt(slice, &route, stale_path,
+                                                  slice.length, 7),
               adaptive_congestion_control::Decision::kAvoid);
     EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
     EXPECT_FALSE(observation->detail().reason.observed);

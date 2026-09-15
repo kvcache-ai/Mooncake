@@ -124,7 +124,8 @@ class Transport {
 
     virtual void setTaskCongestionObservation(
         SubBatchRef, size_t,
-        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>, uint64_t) {}
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>,
+        uint64_t) {}
 #endif
 
     virtual Status retryTransferTask(SubBatchRef batch, int task_id,

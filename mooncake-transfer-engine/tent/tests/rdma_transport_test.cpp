@@ -3442,8 +3442,8 @@ TEST_F(RdmaWorkersAvoidTest, UnpostedAvoidDoesNotPauseRailAndProbeRecovers) {
     request.target_id = target_;
     request.target_offset = kTarget;
     request.length = source_.size();
-    auto observation =
-        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+    auto observation = std::make_shared<
+        adaptive_congestion_control::TaskCongestionObservation>(0, 0);
     transport_.setTaskCongestionObservation(batch_, 0, observation, 1);
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
     auto* batch = static_cast<RdmaSubBatch*>(batch_);

@@ -50,19 +50,19 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& batch = Transport::toBatchDesc(batch_id);
-    auto& task = batch.task_list.emplace_back();
+    auto &batch = Transport::toBatchDesc(batch_id);
+    auto &task = batch.task_list.emplace_back();
     task.batch_id = batch_id;
-    auto* deferred = new Transport::Slice{};
+    auto *deferred = new Transport::Slice{};
     deferred->length = 64;
     deferred->task = &task;
     task.slice_list.push_back(deferred);
     task.slice_count = 1;
     Transport::Slice first{};
     first.length = 64;
-    std::vector<Transport::Slice*> first_queue{&first};
-    std::vector<Transport::Slice*> target_queue{deferred};
-    std::vector<Transport::Slice*> avoided;
+    std::vector<Transport::Slice *> first_queue{&first};
+    std::vector<Transport::Slice *> target_queue{deferred};
+    std::vector<Transport::Slice *> avoided;
     adapter.prepare(&first, "peer@nic");
     adapter.prepare(deferred, "peer@nic");
     ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
@@ -90,18 +90,18 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& batch = Transport::toBatchDesc(batch_id);
-    auto& task = batch.task_list.emplace_back();
+    auto &batch = Transport::toBatchDesc(batch_id);
+    auto &task = batch.task_list.emplace_back();
     task.batch_id = batch_id;
-    auto* slice = new Transport::Slice{};
+    auto *slice = new Transport::Slice{};
     slice->length = 64;
     slice->task = &task;
     task.slice_list.push_back(slice);
     task.slice_count = 1;
-    auto* endpoint = reinterpret_cast<RdmaEndPoint*>(uintptr_t{1});
+    auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     adapter.prepare(slice, "peer@nic");
     adapter.bindEndpoint(slice, endpoint);
-    std::vector<Transport::Slice*> queued{slice}, avoided;
+    std::vector<Transport::Slice *> queued{slice}, avoided;
     ASSERT_EQ(adapter.gate(queued, avoided), 1u);
     EXPECT_FALSE(slice->rdma_congestion_control_observed_blocked.load());
     adapter.complete(slice, IBV_WC_RNR_RETRY_EXC_ERR);
@@ -111,11 +111,9 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kCongested);
     ASSERT_TRUE(detail.reason.observed);
-    EXPECT_EQ(detail.reason.value,
-              TaskCongestionReason::kReceiverPressure);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kReceiverPressure);
     ASSERT_TRUE(detail.failure_scope.observed);
-    EXPECT_EQ(detail.failure_scope.value,
-              TaskCongestionFailureScope::kQp);
+    EXPECT_EQ(detail.failure_scope.value, TaskCongestionFailureScope::kQp);
 
     task.is_finished = true;
     EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
@@ -129,18 +127,19 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
-    auto* slice = new Transport::Slice{};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    auto *slice = new Transport::Slice{};
     slice->length = 64;
     slice->task = &task;
     task.slice_list.push_back(slice);
     task.slice_count = 1;
-    auto* endpoint = reinterpret_cast<RdmaEndPoint*>(uintptr_t{1});
+    auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     adapter.prepare(slice, "peer@nic");
     adapter.bindEndpoint(slice, endpoint);
-    std::vector<Transport::Slice*> queued{slice}, avoided;
+    std::vector<Transport::Slice *> queued{slice}, avoided;
     ASSERT_EQ(adapter.gate(queued, avoided), 1u);
     adapter.complete(slice, IBV_WC_RETRY_EXC_ERR);
 
@@ -159,9 +158,10 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
 
     TaskCongestionState state = TaskCongestionState::kUnknown;
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
@@ -170,7 +170,8 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
     EXPECT_EQ(state, TaskCongestionState::kUnknown);
     task.failed_slice_count = 0;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kOff};
+    task.rdma_congestion_control_mode = {true,
+                                         TaskCongestionControllerMode::kOff};
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
     EXPECT_EQ(state, TaskCongestionState::kUnknown);
 
@@ -188,10 +189,11 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
-    auto* slice = new Transport::Slice{};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    auto *slice = new Transport::Slice{};
     slice->task = &task;
     slice->length = 64;
     task.slice_list.push_back(slice);
@@ -200,7 +202,7 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.prepare(slice, path);
     adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
     adapter.tick(1);
-    std::vector<Transport::Slice*> queued{slice}, avoided;
+    std::vector<Transport::Slice *> queued{slice}, avoided;
     ASSERT_EQ(adapter.gate(queued, avoided), 0u);
     EXPECT_TRUE(slice->rdma_congestion_control_observed_blocked.load());
 
@@ -208,8 +210,7 @@ TEST(ClassicRdmaCongestionControlTest,
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
     ASSERT_TRUE(detail.reason.observed);
-    EXPECT_EQ(detail.reason.value,
-              TaskCongestionReason::kPathQuarantined);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
     ASSERT_TRUE(detail.affected_path.observed);
     EXPECT_EQ(detail.affected_path.value, path);
     EXPECT_FALSE(detail.resolved);
@@ -239,15 +240,16 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
-    auto* deferred = new Transport::Slice{};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    auto *deferred = new Transport::Slice{};
     deferred->task = &task;
     deferred->length = 64;
     deferred->rdma_congestion_control_slice_ordinal = 0;
     task.slice_list.push_back(deferred);
-    auto* unavailable = new Transport::Slice{};
+    auto *unavailable = new Transport::Slice{};
     unavailable->task = &task;
     unavailable->length = 64;
     unavailable->rdma_congestion_control_slice_ordinal = 1;
@@ -261,9 +263,9 @@ TEST(ClassicRdmaCongestionControlTest,
     const std::string unavailable_path = "peer-b@nic";
     adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &unavailable_path);
     adapter.tick(1);
-    std::vector<Transport::Slice*> first_queue{&first}, queued{deferred,
-                                                                unavailable};
-    std::vector<Transport::Slice*> avoided;
+    std::vector<Transport::Slice *> first_queue{&first},
+        queued{deferred, unavailable};
+    std::vector<Transport::Slice *> avoided;
     ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
     ASSERT_EQ(adapter.gate(queued, avoided), 0u);
 
@@ -298,18 +300,19 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
-    auto* slice = new Transport::Slice{};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    auto *slice = new Transport::Slice{};
     slice->task = &task;
     slice->length = 64;
     task.slice_list.push_back(slice);
     task.slice_count = 1;
-    auto* endpoint = reinterpret_cast<RdmaEndPoint*>(uintptr_t{1});
+    auto *endpoint = reinterpret_cast<RdmaEndPoint *>(uintptr_t{1});
     adapter.prepare(slice, "peer@nic");
     adapter.bindEndpoint(slice, endpoint);
-    std::vector<Transport::Slice*> queued{slice}, avoided;
+    std::vector<Transport::Slice *> queued{slice}, avoided;
     ASSERT_EQ(adapter.gate(queued, avoided), 1u);
     adapter.resetDevice();
     adapter.complete(slice, IBV_WC_RNR_RETRY_EXC_ERR);
@@ -327,14 +330,16 @@ TEST(ClassicRdmaCongestionControlTest,
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.hard_error_threshold = 1;
-    ClassicRdmaCongestionControl failed_adapter(config), healthy_adapter(config);
+    ClassicRdmaCongestionControl failed_adapter(config),
+        healthy_adapter(config);
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
-    auto* slice = new Transport::Slice{};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    auto *slice = new Transport::Slice{};
     slice->task = &task;
     slice->length = 64;
     task.slice_list.push_back(slice);
@@ -343,7 +348,7 @@ TEST(ClassicRdmaCongestionControlTest,
     failed_adapter.prepare(slice, path);
     failed_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
     failed_adapter.tick(1);
-    std::vector<Transport::Slice*> queued{slice}, avoided;
+    std::vector<Transport::Slice *> queued{slice}, avoided;
     ASSERT_EQ(failed_adapter.gate(queued, avoided), 0u);
     TaskCongestionState state;
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
@@ -369,14 +374,16 @@ TEST(ClassicRdmaCongestionControlTest,
     adaptive_congestion_control::Config config;
     config.mode = adaptive_congestion_control::Mode::kEnforce;
     config.hard_error_threshold = 1;
-    ClassicRdmaCongestionControl first_adapter(config), replacement_adapter(config);
+    ClassicRdmaCongestionControl first_adapter(config),
+        replacement_adapter(config);
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
-    auto* slice = new Transport::Slice{};
+    task.rdma_congestion_control_mode = {
+        true, TaskCongestionControllerMode::kEnforce};
+    auto *slice = new Transport::Slice{};
     slice->task = &task;
     slice->length = 64;
     task.slice_list.push_back(slice);
@@ -385,7 +392,7 @@ TEST(ClassicRdmaCongestionControlTest,
     first_adapter.prepare(slice, path);
     first_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
     first_adapter.tick(1);
-    std::vector<Transport::Slice*> queued{slice}, avoided;
+    std::vector<Transport::Slice *> queued{slice}, avoided;
     ASSERT_EQ(first_adapter.gate(queued, avoided), 0u);
     TaskCongestionState state;
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
@@ -418,9 +425,9 @@ TEST(ClassicRdmaCongestionControlTest,
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
     const auto batch_id = transports.allocateBatchID(1);
-    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    auto &task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
     task.batch_id = batch_id;
-    auto* deferred = new Transport::Slice{};
+    auto *deferred = new Transport::Slice{};
     deferred->task = &task;
     deferred->length = 64;
     task.slice_list.push_back(deferred);
@@ -429,7 +436,7 @@ TEST(ClassicRdmaCongestionControlTest,
     first.length = 64;
     adapter.prepare(&first, "peer@nic");
     adapter.prepare(deferred, "peer@nic");
-    std::vector<Transport::Slice*> first_queue{&first}, avoided;
+    std::vector<Transport::Slice *> first_queue{&first}, avoided;
     ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
 
     std::atomic<bool> writing{false};
@@ -437,16 +444,17 @@ TEST(ClassicRdmaCongestionControlTest,
     std::thread writer([&] {
         writing.store(true, std::memory_order_release);
         for (size_t i = 0; i < 10000; ++i) {
-            auto* slice = new Transport::Slice{};
+            auto *slice = new Transport::Slice{};
             slice->task = &task;
-            slice->rdma_congestion_control_slice_ordinal = task.slice_list.size();
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
             task.slice_list.push_back(slice);
             __atomic_add_fetch(&task.slice_count, 1, __ATOMIC_RELEASE);
         }
         done.store(true, std::memory_order_release);
     });
     while (!writing.load(std::memory_order_acquire)) std::this_thread::yield();
-    std::vector<Transport::Slice*> deferred_queue{deferred};
+    std::vector<Transport::Slice *> deferred_queue{deferred};
     do {
         adapter.gate(deferred_queue, avoided);
     } while (!done.load(std::memory_order_acquire));

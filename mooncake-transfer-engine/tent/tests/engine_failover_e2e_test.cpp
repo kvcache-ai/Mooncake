@@ -270,7 +270,8 @@ class ObservedRdmaTransport : public FakeTransport {
 
     void setTaskCongestionObservation(
         SubBatchRef, size_t,
-        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation> observation,
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+            observation,
         uint64_t attempt_id) override {
         observation_ = std::move(observation);
         attempt_id_ = attempt_id;
@@ -297,10 +298,13 @@ class ObservedRdmaTransport : public FakeTransport {
         second_.target_machine_id = &target_machine_id_;
         first_.length = first_length_;
         second_.length = second_length_;
-        adaptive_congestion_control::PathHandle path{&device_, &route_.domain, 3, 1};
-        if (acquireTentCongestionControlAttempt(first_, &route_, path, first_.length, 7) !=
+        adaptive_congestion_control::PathHandle path{&device_, &route_.domain,
+                                                     3, 1};
+        if (acquireTentCongestionControlAttempt(first_, &route_, path,
+                                                first_.length, 7) !=
                 adaptive_congestion_control::Decision::kAllow ||
-            acquireTentCongestionControlAttempt(second_, &route_, path, second_.length, 7) !=
+            acquireTentCongestionControlAttempt(second_, &route_, path,
+                                                second_.length, 7) !=
                 adaptive_congestion_control::Decision::kDefer) {
             return Status::InvalidArgument(
                 "window did not defer slice" LOC_MARK);
@@ -309,17 +313,20 @@ class ObservedRdmaTransport : public FakeTransport {
     }
 
     bool readmitBlockedSlice() {
-        if (!completeTentCongestionControlAttempt(first_, adaptive_congestion_control::OutcomeClass::kSuccess,
-                                   adaptive_congestion_control::FailureScope::kOperation)) {
+        if (!completeTentCongestionControlAttempt(
+                first_, adaptive_congestion_control::OutcomeClass::kSuccess,
+                adaptive_congestion_control::FailureScope::kOperation)) {
             return false;
         }
-        adaptive_congestion_control::PathHandle path{&device_, &route_.domain, 3, 1};
-        const bool allowed =
-            acquireTentCongestionControlAttempt(second_, &route_, path, second_.length, 7) ==
-            adaptive_congestion_control::Decision::kAllow;
+        adaptive_congestion_control::PathHandle path{&device_, &route_.domain,
+                                                     3, 1};
+        const bool allowed = acquireTentCongestionControlAttempt(
+                                 second_, &route_, path, second_.length, 7) ==
+                             adaptive_congestion_control::Decision::kAllow;
         if (allowed) {
-            completeTentCongestionControlAttempt(second_, adaptive_congestion_control::OutcomeClass::kSuccess,
-                                  adaptive_congestion_control::FailureScope::kOperation);
+            completeTentCongestionControlAttempt(
+                second_, adaptive_congestion_control::OutcomeClass::kSuccess,
+                adaptive_congestion_control::FailureScope::kOperation);
             submitted_batch_->statuses[0] = {COMPLETED, 4096};
         }
         return allowed;
@@ -330,7 +337,8 @@ class ObservedRdmaTransport : public FakeTransport {
    private:
     adaptive_congestion_control::DomainState device_;
     TentRdmaCongestionControlRoute route_;
-    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation> observation_;
+    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+        observation_;
     uint64_t attempt_id_ = 0;
     RdmaTask task_{};
     RdmaSlice first_{}, second_{};
@@ -342,7 +350,8 @@ class ObservedRdmaTransport : public FakeTransport {
 
 class RejectingCongestionControlRdmaTransport : public FakeTransport {
    public:
-    RejectingCongestionControlRdmaTransport() : FakeTransport(RDMA, {}, {}, true) {}
+    RejectingCongestionControlRdmaTransport()
+        : FakeTransport(RDMA, {}, {}, true) {}
 
     bool taskCongestionEnabled() const override { return true; }
 };
@@ -627,9 +636,9 @@ TEST(EngineFailoverE2E, TaskCongestionQueryDoesNotPollUnsupportedTask) {
     EXPECT_EQ(c_state, TASK_CONGESTION_UNKNOWN);
     task_congestion_detail_t c_detail{};
     size_t required_path_length = 1;
-    EXPECT_EQ(tent_task_congestion_detail(
-                  static_cast<tent_engine_t>(&engine), batch.batch_id, 0,
-                  &c_detail, nullptr, 0, &required_path_length),
+    EXPECT_EQ(tent_task_congestion_detail(static_cast<tent_engine_t>(&engine),
+                                          batch.batch_id, 0, &c_detail, nullptr,
+                                          0, &required_path_length),
               0);
     EXPECT_EQ(c_detail.state, c_state);
     EXPECT_EQ(c_detail.attempt_kind, TASK_CONGESTION_ATTEMPT_OTHER);
@@ -701,9 +710,9 @@ TEST(EngineFailoverE2E, LogicalRdmaTaskProjectsWorkerAdmissionWithoutPolling) {
     EXPECT_EQ(c_state, TASK_CONGESTION_CONGESTED);
     task_congestion_detail_t c_detail{};
     size_t required_path_length = 0;
-    EXPECT_EQ(tent_task_congestion_detail(
-                  static_cast<tent_engine_t>(&engine), batch_id, 0, &c_detail,
-                  nullptr, 0, &required_path_length),
+    EXPECT_EQ(tent_task_congestion_detail(static_cast<tent_engine_t>(&engine),
+                                          batch_id, 0, &c_detail, nullptr, 0,
+                                          &required_path_length),
               0);
     EXPECT_EQ(c_detail.state, c_state);
     EXPECT_NE(c_detail.observed_fields & TASK_CONGESTION_HAS_AFFECTED_PATH, 0u);
@@ -718,9 +727,9 @@ TEST(EngineFailoverE2E, LogicalRdmaTaskProjectsWorkerAdmissionWithoutPolling) {
               -1);
     EXPECT_EQ(short_path, std::vector<char>(short_path.size(), '#'));
     std::vector<char> path(required_path_length);
-    EXPECT_EQ(tent_task_congestion_detail(
-                  static_cast<tent_engine_t>(&engine), batch_id, 0, &c_detail,
-                  path.data(), path.size(), &required_path_length),
+    EXPECT_EQ(tent_task_congestion_detail(static_cast<tent_engine_t>(&engine),
+                                          batch_id, 0, &c_detail, path.data(),
+                                          path.size(), &required_path_length),
               0);
     EXPECT_EQ(std::string(path.data()), detail.affected_path.value);
     EXPECT_EQ(rdma->status_calls.load(), 0);
@@ -773,10 +782,12 @@ TEST(EngineFailoverE2E, PartialWindowDeferAppearsOnPublicTaskQuery) {
     ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
     EXPECT_EQ(state, TaskCongestionState::kNormal);
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
-    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(EngineFailoverE2E, FailedRdmaSubmitWithoutCongestionControlEvidenceIsUnknown) {
+TEST(EngineFailoverE2E,
+     FailedRdmaSubmitWithoutCongestionControlEvidenceIsUnknown) {
     auto config = makeMinimalP2PConfig();
     TransferEngineImpl engine(config);
     ASSERT_TRUE(engine.available());
@@ -811,7 +822,8 @@ TEST(EngineFailoverE2E, FailedRdmaSubmitWithoutCongestionControlEvidenceIsUnknow
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
-TEST(EngineFailoverE2E, FailedLogicalTaskRetainsCongestionControlEvidenceUntilBatchFree) {
+TEST(EngineFailoverE2E,
+     FailedLogicalTaskRetainsCongestionControlEvidenceUntilBatchFree) {
     auto config = makeMinimalP2PConfig();
     config->set("max_failover_attempts", 0);
     TransferEngineImpl engine(config);

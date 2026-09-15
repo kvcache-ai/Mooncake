@@ -2311,8 +2311,10 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 for (const auto physical_task_id : group) {
                     auto& owner_task = batch->task_list[physical_task_id];
                     if (!owner_task.congestion_observation) {
-                        owner_task.congestion_observation = std::make_shared<
-                            adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+                        owner_task.congestion_observation =
+                            std::make_shared<adaptive_congestion_control::
+                                                 TaskCongestionObservation>(0,
+                                                                            0);
                     }
                     if (!owner_task.congestion_current_type) {
                         owner_task.congestion_current_type =
@@ -2653,8 +2655,8 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     if (task.type == RDMA && transport->taskCongestionEnabled()) {
         if (!task.congestion_observation) {
-            task.congestion_observation =
-                std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+            task.congestion_observation = std::make_shared<
+                adaptive_congestion_control::TaskCongestionObservation>(0, 0);
         }
         if (!task.congestion_current_type) {
             task.congestion_current_type =
@@ -3050,8 +3052,8 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     if (type == RDMA && transport->taskCongestionEnabled() &&
         !task.congestion_observation) {
-        task.congestion_observation =
-            std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+        task.congestion_observation = std::make_shared<
+            adaptive_congestion_control::TaskCongestionObservation>(0, 0);
         task.congestion_current_type =
             std::make_shared<std::atomic<TransportType>>(RDMA);
         if (prev_type != UNSPEC) {

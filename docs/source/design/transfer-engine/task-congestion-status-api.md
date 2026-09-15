@@ -9,7 +9,7 @@ Classic TE 和 TENT 为已提交的逻辑传输任务提供两套独立接口：
 | `NORMAL` | 当前 RDMA task 没有未解决的拥塞证据，或已成功完成。 |
 | `CONGESTED` | 至少一个当前 slice 因窗口、接收端压力等短时原因等待。 |
 | `LONG_UNAVAILABLE` | 当前候选路径持续隔离、探测失败或暂时没有可用路径。它不证明远端或网卡永久失效。 |
-| `UNKNOWN` | 控制器关闭、非 RDMA attempt，或任务没有可用的 拥塞控制 证据。不要将它当成正常。 |
+| `UNKNOWN` | 控制器关闭、非 RDMA attempt，或任务没有可用的拥塞控制证据。不要将它当成正常。 |
 
 多 slice 任务以尚未解决的最严重情况为准：`LONG_UNAVAILABLE` 高于 `CONGESTED`。详细结果的 `resolved` 表示所保留异常已经解决；其窗口、在途字节和控制器数据是异常发生时的 best-effort 记录，不是查询时刻的实时读数。未观测字段在 C++ 中有 `observed=false`，在 C 中没有对应 bit，在 Python 中为 `None`。首版只记录 RDMA 拥塞证据，接口名称和类型不限定后续 transport。
 

@@ -504,7 +504,8 @@ class Transport {
         std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
             congestion_observation;
         // Captured once per logical task from its actual Classic RDMA workers.
-        TaskCongestionObserved<TaskCongestionControllerMode> rdma_congestion_control_mode;
+        TaskCongestionObserved<TaskCongestionControllerMode>
+            rdma_congestion_control_mode;
 #endif
 
 #ifdef WITH_METRICS

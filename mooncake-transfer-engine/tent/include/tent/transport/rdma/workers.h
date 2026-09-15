@@ -104,7 +104,8 @@ class Workers {
 
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     bool taskCongestionEnabled() const {
-        return congestion_control_config_.mode != adaptive_congestion_control::Mode::kOff;
+        return congestion_control_config_.mode !=
+               adaptive_congestion_control::Mode::kOff;
     }
 #endif
 

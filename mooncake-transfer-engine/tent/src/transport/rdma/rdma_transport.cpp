@@ -704,7 +704,8 @@ bool RdmaTransport::taskCongestionEnabled() const {
 
 void RdmaTransport::setTaskCongestionObservation(
     SubBatchRef batch, size_t task_id,
-    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation> observation,
+    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+        observation,
     uint64_t attempt_id) {
     auto* rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch) return;

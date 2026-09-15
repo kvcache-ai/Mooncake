@@ -190,9 +190,11 @@ RdmaTransport::RdmaTransport() {
 }
 
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-void RdmaTransport::recordClassicCongestionControlMode(adaptive_congestion_control::Mode mode) {
+void RdmaTransport::recordClassicCongestionControlMode(
+    adaptive_congestion_control::Mode mode) {
     const int next_mode = static_cast<int>(mode);
-    int current = classic_congestion_control_mode_.load(std::memory_order_acquire);
+    int current =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
     while (current == -1) {
         if (classic_congestion_control_mode_.compare_exchange_weak(
                 current, next_mode, std::memory_order_acq_rel,
@@ -957,11 +959,13 @@ Status RdmaTransport::submitTransfer(
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    const int congestion_control_mode = classic_congestion_control_mode_.load(std::memory_order_acquire);
+    const int congestion_control_mode =
+        classic_congestion_control_mode_.load(std::memory_order_acquire);
     if (congestion_control_mode >= 0 && congestion_control_mode <= 2) {
-        for (auto* task : task_list) {
+        for (auto *task : task_list) {
             task->rdma_congestion_control_mode = {
-                true, static_cast<TaskCongestionControllerMode>(congestion_control_mode)};
+                true, static_cast<TaskCongestionControllerMode>(
+                          congestion_control_mode)};
         }
     }
 #endif
@@ -1004,7 +1008,8 @@ Status RdmaTransport::submitTransferTask(
             slice->task = &task;
             slice->status = Slice::PENDING;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-            slice->rdma_congestion_control_slice_ordinal = task.slice_list.size();
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
 #endif
             task.slice_list.push_back(slice);
             __sync_fetch_and_add(&task.slice_count, 1);
@@ -1109,7 +1114,8 @@ Status RdmaTransport::submitTransferTask(
             slice->status = Slice::PENDING;
             slice->ts = 0;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-            slice->rdma_congestion_control_slice_ordinal = task.slice_list.size();
+            slice->rdma_congestion_control_slice_ordinal =
+                task.slice_list.size();
 #endif
             task.slice_list.push_back(slice);
 
@@ -1194,8 +1200,8 @@ Status RdmaTransport::submitTransferTask(
                     &task.congestion_observation, std::memory_order_acquire);
                 if (observation)
                     observation->extendAttempt(
-                        1, __atomic_load_n(&task.slice_count,
-                                           __ATOMIC_ACQUIRE));
+                        1,
+                        __atomic_load_n(&task.slice_count, __ATOMIC_ACQUIRE));
 #endif
                 for (auto &entry : slices_to_post)
                     entry.first->submitPostSend(entry.second);
@@ -1208,7 +1214,7 @@ Status RdmaTransport::submitTransferTask(
     }
 
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    for (auto* task : task_list) {
+    for (auto *task : task_list) {
         auto observation = std::atomic_load_explicit(
             &task->congestion_observation, std::memory_order_acquire);
         if (observation)

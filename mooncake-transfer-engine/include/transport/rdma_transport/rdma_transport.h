@@ -135,7 +135,8 @@ class RdmaTransport : public Transport {
     int initializeRdmaResources();
 
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    void recordClassicCongestionControlMode(adaptive_congestion_control::Mode mode);
+    void recordClassicCongestionControlMode(
+        adaptive_congestion_control::Mode mode);
 #endif
 
     int startHandshakeDaemon(std::string &local_server_name);

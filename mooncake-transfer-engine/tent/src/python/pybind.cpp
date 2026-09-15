@@ -881,8 +881,7 @@ PYBIND11_MODULE(tent, m) {
                 result["attempt_kind"] = detail.attempt_kind;
                 result["attempt_id"] =
                     ObservedTaskCongestionValue(detail.attempt_id);
-                result["reason"] =
-                    ObservedTaskCongestionValue(detail.reason);
+                result["reason"] = ObservedTaskCongestionValue(detail.reason);
                 result["failure_scope"] =
                     ObservedTaskCongestionValue(detail.failure_scope);
                 result["slice_id"] =

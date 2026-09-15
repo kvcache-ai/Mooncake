@@ -473,8 +473,8 @@ Status MultiTransport::getTaskCongestionState(
     state = TaskCongestionState::kUnknown;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
     const auto& task = batch_desc.task_list[task_id];
-    auto observation = std::atomic_load_explicit(
-        &task.congestion_observation, std::memory_order_acquire);
+    auto observation = std::atomic_load_explicit(&task.congestion_observation,
+                                                 std::memory_order_acquire);
     if (observation) {
         state = observation->state();
         if (state == TaskCongestionState::kNormal &&
@@ -483,8 +483,8 @@ Status MultiTransport::getTaskCongestionState(
     } else if (task.rdma_congestion_control_mode.observed &&
                task.rdma_congestion_control_mode.value !=
                    TaskCongestionControllerMode::kOff &&
-               __atomic_load_n(&task.failed_slice_count,
-                               __ATOMIC_ACQUIRE) == 0) {
+               __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE) ==
+                   0) {
         state = TaskCongestionState::kNormal;
     }
 #endif
@@ -501,8 +501,8 @@ Status MultiTransport::getTaskCongestionDetail(
     const auto& task = batch_desc.task_list[task_id];
     detail = TaskCongestionDetail{};
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    auto observation = std::atomic_load_explicit(
-        &task.congestion_observation, std::memory_order_acquire);
+    auto observation = std::atomic_load_explicit(&task.congestion_observation,
+                                                 std::memory_order_acquire);
     if (observation) {
         detail = observation->detail();
         if (detail.state == TaskCongestionState::kNormal &&

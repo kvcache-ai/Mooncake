@@ -204,9 +204,9 @@ int getTaskCongestionState(transfer_engine_t engine, batch_id_t batch_id,
                            size_t task_id, int *state) {
     if (!engine || !state) return (int)Status::Code::kInvalidArgument;
     TaskCongestionState native_state;
-    Status status = ((TransferEngine *)engine)
-                        ->getTaskCongestionState(batch_id, task_id,
-                                                 native_state);
+    Status status =
+        ((TransferEngine *)engine)
+            ->getTaskCongestionState(batch_id, task_id, native_state);
     if (status.ok()) *state = taskCongestionCState(native_state);
     return (int)status.code();
 }
@@ -219,9 +219,9 @@ int getTaskCongestionDetail(transfer_engine_t engine, batch_id_t batch_id,
         (path_capacity && !path_buf))
         return (int)Status::Code::kInvalidArgument;
     TaskCongestionDetail native_detail;
-    Status status = ((TransferEngine *)engine)
-                        ->getTaskCongestionDetail(batch_id, task_id,
-                                                  native_detail);
+    Status status =
+        ((TransferEngine *)engine)
+            ->getTaskCongestionDetail(batch_id, task_id, native_detail);
     if (!status.ok()) return (int)status.code();
     projectTaskCongestionDetail(native_detail, *detail);
     if (!copyTaskCongestionPath(native_detail, path_buf, path_capacity,

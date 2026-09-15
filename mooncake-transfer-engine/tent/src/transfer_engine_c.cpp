@@ -331,9 +331,8 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
     return 0;
 }
 
-int tent_task_congestion_state(tent_engine_t engine,
-                               tent_batch_id_t batch_id, size_t task_id,
-                               int* state) {
+int tent_task_congestion_state(tent_engine_t engine, tent_batch_id_t batch_id,
+                               size_t task_id, int* state) {
     CHECK_POINTER(engine);
     CHECK_POINTER(state);
     if (!batch_id) return -1;
@@ -345,8 +344,8 @@ int tent_task_congestion_state(tent_engine_t engine,
     return 0;
 }
 
-int tent_task_congestion_detail(tent_engine_t engine,
-                                tent_batch_id_t batch_id, size_t task_id,
+int tent_task_congestion_detail(tent_engine_t engine, tent_batch_id_t batch_id,
+                                size_t task_id,
                                 task_congestion_detail_t* detail,
                                 char* path_buf, size_t path_capacity,
                                 size_t* required_path_length) {
@@ -360,8 +359,7 @@ int tent_task_congestion_detail(tent_engine_t engine,
     if (!status.ok()) return -1;
     mooncake::projectTaskCongestionDetail(native_detail, *detail);
     if (!mooncake::copyTaskCongestionPath(native_detail, path_buf,
-                                          path_capacity,
-                                          *required_path_length))
+                                          path_capacity, *required_path_length))
         return -1;
     return 0;
 }

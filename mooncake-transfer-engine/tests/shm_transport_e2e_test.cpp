@@ -144,9 +144,9 @@ void ExpectShmWriteAndRead(TransferEngine& owner, TransferEngine& peer,
         EXPECT_EQ(c_state, TASK_CONGESTION_UNKNOWN);
         task_congestion_detail_t c_detail{};
         size_t required_path_length = 1;
-        EXPECT_EQ(getTaskCongestionDetail(
-                      static_cast<transfer_engine_t>(&peer), batch, 0, &c_detail,
-                      nullptr, 0, &required_path_length),
+        EXPECT_EQ(getTaskCongestionDetail(static_cast<transfer_engine_t>(&peer),
+                                          batch, 0, &c_detail, nullptr, 0,
+                                          &required_path_length),
                   0);
         EXPECT_EQ(c_detail.state, c_state);
         EXPECT_EQ(required_path_length, 0u);
@@ -287,16 +287,17 @@ TEST(ShmTransportE2E, CongestionQueryRejectsInvalidBatch) {
     auto engine = MakeEngine(UniqueServerName(20), false);
     ASSERT_TRUE(engine);
     TaskCongestionState state = TaskCongestionState::kNormal;
-    EXPECT_TRUE(engine->getTaskCongestionState(0, 0, state).IsInvalidArgument());
+    EXPECT_TRUE(
+        engine->getTaskCongestionState(0, 0, state).IsInvalidArgument());
     TaskCongestionDetail detail;
     EXPECT_TRUE(
         engine->getTaskCongestionDetail(0, 0, detail).IsInvalidArgument());
-    EXPECT_TRUE(engine->getTaskCongestionState(static_cast<BatchID>(-1), 0,
-                                               state)
-                    .IsInvalidArgument());
-    EXPECT_TRUE(engine->getTaskCongestionDetail(static_cast<BatchID>(-1), 0,
-                                                detail)
-                     .IsInvalidArgument());
+    EXPECT_TRUE(
+        engine->getTaskCongestionState(static_cast<BatchID>(-1), 0, state)
+            .IsInvalidArgument());
+    EXPECT_TRUE(
+        engine->getTaskCongestionDetail(static_cast<BatchID>(-1), 0, detail)
+            .IsInvalidArgument());
 }
 
 TEST(ShmTransportE2E, WriteAndRead4K) {

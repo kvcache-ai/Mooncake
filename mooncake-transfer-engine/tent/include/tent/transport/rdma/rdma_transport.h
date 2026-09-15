@@ -50,7 +50,8 @@ struct RdmaSubBatch : public Transport::SubBatch {
     std::vector<RdmaTask*> task_list;
     std::vector<RdmaSlice*> slice_chain;
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
-    std::vector<std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>>
+    std::vector<
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>>
         congestion_observations;
     std::vector<uint64_t> congestion_attempt_ids;
 #endif
@@ -91,7 +92,8 @@ class RdmaTransport : public Transport {
     bool taskCongestionEnabled() const override;
     void setTaskCongestionObservation(
         SubBatchRef batch, size_t task_id,
-        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation> observation,
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+            observation,
         uint64_t attempt_id) override;
 #endif
 

@@ -123,8 +123,7 @@ Status RailMonitor::load(std::shared_ptr<const Topology> local,
                       << " error_window=" << error_window_.count() << "s"
                       << " cooldown=" << cooldown_.count() << "s"
                       << " probe_interval=" << probe_interval_.count() << "s"
-                      << " recovery_probe_enabled="
-                      << recovery_probe_enabled_;
+                      << " recovery_probe_enabled=" << recovery_probe_enabled_;
         }
     }
     if (same_layout) return Status::OK();

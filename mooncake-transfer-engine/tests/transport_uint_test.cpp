@@ -688,14 +688,12 @@ TEST(TaskCongestionQueryTest, UnknownAndInvalidTaskDoNotPollTransport) {
     EXPECT_FALSE(transports.getTaskCongestionDetail(batch_id, 1, detail).ok());
     EXPECT_FALSE(transports.getTaskCongestionState(0, 0, state).ok());
     EXPECT_FALSE(transports.getTaskCongestionDetail(0, 0, detail).ok());
-    EXPECT_FALSE(transports
-                     .getTaskCongestionState(static_cast<BatchID>(-1), 0,
-                                             state)
-                     .ok());
-    EXPECT_FALSE(transports
-                     .getTaskCongestionDetail(static_cast<BatchID>(-1), 0,
-                                              detail)
-                     .ok());
+    EXPECT_FALSE(
+        transports.getTaskCongestionState(static_cast<BatchID>(-1), 0, state)
+            .ok());
+    EXPECT_FALSE(
+        transports.getTaskCongestionDetail(static_cast<BatchID>(-1), 0, detail)
+            .ok());
 
     task.is_finished = true;
     EXPECT_TRUE(transports.freeBatchID(batch_id).ok());

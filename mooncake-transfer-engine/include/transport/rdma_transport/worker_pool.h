@@ -36,13 +36,17 @@ class ClassicRdmaCongestionControl {
    public:
     using SliceList = std::vector<Transport::Slice *>;
 
-    explicit ClassicRdmaCongestionControl(adaptive_congestion_control::Config config);
+    explicit ClassicRdmaCongestionControl(
+        adaptive_congestion_control::Config config);
     ~ClassicRdmaCongestionControl();
 
     ClassicRdmaCongestionControl(const ClassicRdmaCongestionControl &) = delete;
-    ClassicRdmaCongestionControl &operator=(const ClassicRdmaCongestionControl &) = delete;
+    ClassicRdmaCongestionControl &operator=(
+        const ClassicRdmaCongestionControl &) = delete;
 
-    bool enabled() const { return mode_ != adaptive_congestion_control::Mode::kOff; }
+    bool enabled() const {
+        return mode_ != adaptive_congestion_control::Mode::kOff;
+    }
     adaptive_congestion_control::Mode mode() const { return mode_; }
     void prepare(Transport::Slice *slice, const std::string &peer_nic_path);
     void prepare(SliceList &slices, const std::string &peer_nic_path);

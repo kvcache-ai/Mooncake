@@ -23,13 +23,13 @@ Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
                                TaskCongestionDetail& detail) const;
 ```
 
-`TaskCongestionState` 为 `Normal / Congested / LongUnavailable / Unknown`。`Unknown` 表示控制器关闭、非 RDMA attempt、尚无可用证据，或任务因非 拥塞控制 原因终止；不能将它伪装成正常。无效 task ID 返回原有风格的错误。和现有 `getTransferStatus` 一样，调用方必须在 `freeBatch` 前查询；释放后的 batch handle 不可使用。
+`TaskCongestionState` 为 `Normal / Congested / LongUnavailable / Unknown`。`Unknown` 表示控制器关闭、非 RDMA attempt、尚无可用证据，或任务因非拥塞控制原因终止；不能将它伪装成正常。无效 task ID 返回原有风格的错误。和现有 `getTransferStatus` 一样，调用方必须在 `freeBatch` 前查询；释放后的 batch handle 不可使用。
 
 判定针对任务内尚未解决的 slice/attempt：
 
 1. 存在因持续隔离、恢复探测失败或所有当前候选路径不可用而被阻住的部分，则为 `LongUnavailable`。
 2. 否则存在受 byte window、接收端压力等短时原因延迟的部分，则为 `Congested`。
-3. 否则进行中的 RDMA 任务为 `Normal`；成功终止也为 `Normal`。失败终止且没有 拥塞控制 证据为 `Unknown`。
+3. 否则进行中的 RDMA 任务为 `Normal`；成功终止也为 `Normal`。失败终止且没有拥塞控制证据为 `Unknown`。
 
 重新 admission、可用路径 failover、探测成功或新 attempt 会消除旧 attempt 的当前受阻状态；详细接口可保留最后一条已解决异常供诊断，但标明 `resolved`。旧 generation/attempt 的反馈不能覆盖新任务状态。提交前整批 admission 拒绝没有已提交的 task；该情况仍使用 `submitTransfer` 的可重试返回值。
 
@@ -41,7 +41,7 @@ C ABI 的极简函数输出枚举；详细函数输出固定数值字段，并�
 
 异常记录属于逻辑 task，直到 batch 释放；不能引用可回收的 slice/RdmaTask 裸指针。TENT failover 为每个 attempt 标记代数，避免旧数据污染新 attempt。多 slice 只更新有变化的异常项，极简查询读取有界摘要，详细查询按需取更丰富证据。
 
-编译关闭或 runtime off 不创建 拥塞控制 记录、不改变既有传输行为；公开查询返回 `Unknown`。健康提交/成功 completion 不增加新的 per-slice 原子写入、锁、RPC 或 verbs 调用。只在显式查询和异常转换路径增加工作。性能只能通过相同初态的 congestion-control-on/off 基准证实，不预先承诺零百分比回归。
+编译关闭或 runtime off 不创建拥塞控制记录、不改变既有传输行为；公开查询返回 `Unknown`。健康提交/成功 completion 不增加新的 per-slice 原子写入、锁、RPC 或 verbs 调用。只在显式查询和异常转换路径增加工作。性能只能通过相同初态的 congestion-control-on/off 基准证实，不预先承诺零百分比回归。
 
 ## 验收
 
