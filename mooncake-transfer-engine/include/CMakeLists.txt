@@ -17,6 +17,8 @@ install(FILES multi_transport.h DESTINATION include
         COMPONENT ${MOONCAKE_TRANSFER_ENGINE_HEADERS_COMPONENT})
 install(FILES topology.h DESTINATION include
         COMPONENT ${MOONCAKE_TRANSFER_ENGINE_HEADERS_COMPONENT})
+install(FILES task_congestion_status.h DESTINATION include
+        COMPONENT ${MOONCAKE_TRANSFER_ENGINE_HEADERS_COMPONENT})
 install(FILES transfer_engine.h DESTINATION include
         COMPONENT ${MOONCAKE_TRANSFER_ENGINE_HEADERS_COMPONENT})
 install(FILES transfer_metadata.h DESTINATION include

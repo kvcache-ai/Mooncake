@@ -1,6 +1,19 @@
 set(WORKSPACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_executable(task_congestion_observation_test
+                 ${WORKSPACE}/task_congestion_observation_test.cpp)
+  target_include_directories(
+    task_congestion_observation_test
+    PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control
+      ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  target_link_libraries(
+    task_congestion_observation_test PRIVATE adaptive_congestion_control_core
+                                             gtest gtest_main)
+  add_test(NAME task_congestion_observation_test
+           COMMAND task_congestion_observation_test)
+
   add_executable(adaptive_congestion_control_test
                  ${WORKSPACE}/adaptive_congestion_control_test.cpp)
   target_link_libraries(
