@@ -419,6 +419,12 @@ target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
 add_test(NAME rdma_transport_submit_task_test
          COMMAND rdma_transport_submit_task_test)
 
+add_executable(rdma_buffer_range_index_test
+               ${WORKSPACE}/rdma_buffer_range_index_test.cpp)
+target_link_libraries(rdma_buffer_range_index_test PUBLIC transfer_engine gtest
+                                                          gtest_main)
+add_test(NAME rdma_buffer_range_index_test COMMAND rdma_buffer_range_index_test)
+
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME topology_test COMMAND topology_test)
