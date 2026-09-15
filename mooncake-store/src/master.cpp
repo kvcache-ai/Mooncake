@@ -128,6 +128,13 @@ DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_string(metrics_host, "0.0.0.0",
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
+DEFINE_bool(enable_rpc_health_probe, true,
+            "Enable the loopback HealthCheck self-probe that drives /readyz "
+            "and the mooncake_master_rpc_responsive gauge");
+DEFINE_int32(rpc_probe_interval_seconds, 5,
+             "Interval between loopback HealthCheck probes in seconds");
+DEFINE_int32(rpc_probe_timeout_seconds, 3,
+             "Timeout for each loopback HealthCheck probe in seconds");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -1741,6 +1748,11 @@ int main(int argc, char* argv[]) {
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);
+        admin_server.ConfigureRpcProbe(
+            "127.0.0.1", static_cast<uint16_t>(master_config.rpc_port),
+            FLAGS_enable_rpc_health_probe,
+            std::chrono::seconds(FLAGS_rpc_probe_interval_seconds),
+            std::chrono::seconds(FLAGS_rpc_probe_timeout_seconds));
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

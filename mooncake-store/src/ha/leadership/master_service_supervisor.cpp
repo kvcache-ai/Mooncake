@@ -9,7 +9,14 @@
 #include <thread>
 
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+// Declared in master.cpp (DEFINE_*). Read here so the HA path shares the same
+// probe configuration as the non-HA path without duplicating the flags.
+DECLARE_bool(enable_rpc_health_probe);
+DECLARE_int32(rpc_probe_interval_seconds);
+DECLARE_int32(rpc_probe_timeout_seconds);
 
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
@@ -646,6 +653,15 @@ int MasterServiceSupervisor::Start() {
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
         config_.enable_metric_reporting, config_.metrics_host);
+    // Loopback probe target: always 127.0.0.1 (the RPC server listens on
+    // rpc_address, which may be 0.0.0.0, so use loopback explicitly) + the
+    // configured RPC port. Standby instances have service_available=false so
+    // the probe thread skips probing and /readyz returns 503 automatically.
+    admin_server.ConfigureRpcProbe(
+        "127.0.0.1", static_cast<uint16_t>(config_.rpc_port),
+        FLAGS_enable_rpc_health_probe,
+        std::chrono::seconds(FLAGS_rpc_probe_interval_seconds),
+        std::chrono::seconds(FLAGS_rpc_probe_timeout_seconds));
     if (!admin_server.Start()) {
         LOG(ERROR) << "Failed to start master admin server, metrics_port="
                    << config_.metrics_port;

@@ -72,6 +72,32 @@ struct PingResponse {
 YLT_REFL(PingResponse, view_version_id, client_status);
 
 /**
+ * @brief Response structure for HealthCheck operation.
+ *
+ * HealthCheck probes whether every metadata shard's read lock can be acquired
+ * within a bounded budget. It is used by the master's self-health probe to
+ * detect cases (e.g. a long-running ClearStaleHandles sweep holding a shard
+ * write lock) where the RPC plane is alive but data-plane RPCs are blocked.
+ */
+struct HealthCheckResponse {
+    bool ok{true};
+    uint64_t shards_checked{0};
+    uint64_t shards_blocked{0};
+
+    HealthCheckResponse() = default;
+    HealthCheckResponse(bool ok, uint64_t shards_checked, uint64_t shards_blocked)
+        : ok(ok), shards_checked(shards_checked), shards_blocked(shards_blocked) {}
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const HealthCheckResponse& response) noexcept {
+        return os << "HealthCheckResponse: { ok: " << response.ok
+                  << ", shards_checked: " << response.shards_checked
+                  << ", shards_blocked: " << response.shards_blocked << " }";
+    }
+};
+YLT_REFL(HealthCheckResponse, ok, shards_checked, shards_blocked);
+
+/**
  * @brief Response structure for GetReplicaList operation
  */
 struct GetReplicaListResponse {

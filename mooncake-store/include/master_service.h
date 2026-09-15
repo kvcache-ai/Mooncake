@@ -752,6 +752,20 @@ class MasterService {
     auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
 
     /**
+     * @brief Probe whether every metadata shard's read lock can be acquired
+     *        within a bounded budget.
+     *
+     * Used by the master self-health probe to detect a live-but-blocked RPC
+     * plane (e.g. a ClearStaleHandles sweep holding a shard write lock). No
+     * client_id, no mount, no OpLog, no side effects; HA and non-HA agnostic.
+     *
+     * @return HealthCheckResponse with ok=true if all shards were probed
+     *         within the budget, ok=false (with the first blocked shard index)
+     *         otherwise.
+     */
+    auto HealthCheck() -> tl::expected<HealthCheckResponse, ErrorCode>;
+
+    /**
      * @brief Get the master service cluster ID to use as subdirectory name
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if cluster ID
      * is not set

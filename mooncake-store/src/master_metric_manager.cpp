@@ -72,6 +72,14 @@ MasterMetricManager::MasterMetricManager()
       client_liveness_offline_clients_(
           "master_client_liveness_offline_clients",
           "Store Client liveness records currently Offline"),
+      rpc_responsive_("mooncake_master_rpc_responsive",
+                      "1 if the loopback HealthCheck probe succeeded within the "
+                      "timeout, 0 if it timed out or failed"),
+      rpc_probe_latency_ms_("mooncake_master_rpc_probe_latency_ms",
+                            "Latency of the most recent loopback HealthCheck "
+                            "probe in milliseconds"),
+      rpc_probe_failures_("mooncake_master_rpc_probe_failures_total",
+                          "Total number of failed loopback HealthCheck probes"),
       client_liveness_suspected_transitions_(
           "master_client_liveness_suspected_transitions_total",
           "Store Client Active to Suspected transitions"),
@@ -184,6 +192,10 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
+      healthcheck_requests_("master_healthcheck_requests_total",
+                             "Total number of HealthCheck RPC requests received"),
+      healthcheck_failures_("master_healthcheck_failures_total",
+                             "Total number of failed HealthCheck RPC requests"),
       nof_heartbeat_success_total_(
           "master_nof_heartbeat_success_total",
           "Total number of successful NoF heartbeat probes"),
@@ -538,6 +550,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
+    rpc_responsive_.update(1);
+    rpc_probe_latency_ms_.update(0);
+    rpc_probe_failures_.inc(0);
     client_liveness_active_clients_.update(0);
     client_liveness_suspected_clients_.update(0);
     client_liveness_offline_clients_.update(0);
@@ -597,6 +612,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     remount_segment_failures_.inc(0);
     ping_requests_.inc(0);
     ping_failures_.inc(0);
+    healthcheck_requests_.inc(0);
+    healthcheck_failures_.inc(0);
     create_copy_task_requests_.inc(0);
     create_copy_task_failures_.inc(0);
     create_move_task_requests_.inc(0);
@@ -1158,6 +1175,12 @@ void MasterMetricManager::inc_ping_requests(int64_t val) {
 void MasterMetricManager::inc_ping_failures(int64_t val) {
     ping_failures_.inc(val);
 }
+void MasterMetricManager::inc_healthcheck_requests(int64_t val) {
+    healthcheck_requests_.inc(val);
+}
+void MasterMetricManager::inc_healthcheck_failures(int64_t val) {
+    healthcheck_failures_.inc(val);
+}
 
 void MasterMetricManager::inc_nof_heartbeat_success_total(int64_t val) {
     nof_heartbeat_success_total_.inc(val);
@@ -1179,6 +1202,18 @@ void MasterMetricManager::inc_nof_segments_unmounted_by_heartbeat_total(
 void MasterMetricManager::observe_nof_heartbeat_probe_latency_ms(
     int64_t latency_ms) {
     nof_heartbeat_probe_latency_ms_.observe(latency_ms);
+}
+
+void MasterMetricManager::set_rpc_responsive(bool responsive) {
+    rpc_responsive_.update(responsive ? 1 : 0);
+}
+
+void MasterMetricManager::set_rpc_probe_latency_ms(int64_t latency_ms) {
+    rpc_probe_latency_ms_.update(latency_ms);
+}
+
+void MasterMetricManager::inc_rpc_probe_failures(int64_t val) {
+    rpc_probe_failures_.inc(val);
 }
 
 // Batch Operation Statistics (Counters)
@@ -1952,6 +1987,9 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(client_liveness_active_clients_);
     serialize_metric(client_liveness_suspected_clients_);
     serialize_metric(client_liveness_offline_clients_);
+    serialize_metric(rpc_responsive_);
+    serialize_metric(rpc_probe_latency_ms_);
+    serialize_metric(rpc_probe_failures_);
     serialize_metric(pending_client_offboarding_jobs_metric_);
 
     // Serialize Histogram
@@ -1999,6 +2037,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(remount_nof_segment_failures_);
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
+    serialize_metric(healthcheck_requests_);
+    serialize_metric(healthcheck_failures_);
     serialize_metric(nof_heartbeat_success_total_);
     serialize_metric(nof_heartbeat_failure_total_);
     serialize_metric(nof_heartbeat_timeout_total_);

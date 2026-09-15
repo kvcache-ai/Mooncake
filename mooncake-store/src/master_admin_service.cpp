@@ -18,6 +18,7 @@
 #include <json/json.h>
 #endif
 #include <ylt/coro_io/coro_io.hpp>
+#include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
 #include <ylt/reflection/user_reflect_macro.hpp>
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
@@ -27,6 +28,7 @@
 #include "ha_metric_manager.h"
 #include "master_metric_manager.h"
 #include "rpc_service.h"
+#include "rpc_types.h"
 #include "types.h"
 #include "version.h"
 
@@ -322,17 +324,94 @@ bool MasterAdminServer::Start() {
     }
 
     LOG(INFO) << "Master admin server started on port " << http_server_.port();
+
+    if (enable_rpc_probe_ && !rpc_probe_host_.empty() &&
+        rpc_probe_port_ != 0) {
+        rpc_probe_running_.store(true);
+        rpc_probe_thread_ = std::thread([this]() { RpcProbeThreadMain(); });
+        LOG(INFO) << "Master admin RPC health probe enabled against "
+                  << rpc_probe_host_ << ":" << rpc_probe_port_
+                  << " (interval=" << rpc_probe_interval_.count()
+                  << "s, timeout=" << rpc_probe_timeout_.count() << "s)";
+    }
     return true;
 }
 
 void MasterAdminServer::Stop() {
     metric_report_running_.store(false, std::memory_order_relaxed);
+    rpc_probe_running_.store(false, std::memory_order_relaxed);
     if (started_.exchange(false)) {
         http_server_.stop();
     }
     if (metric_report_thread_.joinable()) {
         metric_report_stop_sem_.release();
         metric_report_thread_.join();
+    }
+    if (rpc_probe_thread_.joinable()) {
+        rpc_probe_stop_sem_.release();
+        rpc_probe_thread_.join();
+    }
+}
+
+void MasterAdminServer::ConfigureRpcProbe(
+    std::string rpc_host, uint16_t rpc_port, bool enable_rpc_probe,
+    std::chrono::seconds rpc_probe_interval,
+    std::chrono::seconds rpc_probe_timeout) {
+    rpc_probe_host_ = std::move(rpc_host);
+    rpc_probe_port_ = rpc_port;
+    enable_rpc_probe_ = enable_rpc_probe;
+    rpc_probe_interval_ = rpc_probe_interval;
+    rpc_probe_timeout_ = rpc_probe_timeout;
+}
+
+bool MasterAdminServer::RunRpcProbeOnce() {
+    using clock = std::chrono::steady_clock;
+    const auto start = clock::now();
+    coro_rpc::coro_rpc_client client;
+    // Loopback TCP connect: even when the RPC server enables RDMA, the TCP
+    // listener remains on rpc_port. A short connect timeout keeps the probe
+    // bounded when the RPC plane is down.
+    auto connect_ec = async_simple::coro::syncAwait(client.connect(
+        rpc_probe_host_, std::to_string(rpc_probe_port_),
+        std::min(rpc_probe_timeout_, std::chrono::seconds(1))));
+    if (connect_ec) {
+        return false;
+    }
+    auto result = async_simple::coro::syncAwait(
+        client.call_for<&WrappedMasterService::HealthCheck>(
+            rpc_probe_timeout_));
+    if (!result.has_value()) {
+        return false;
+    }
+    const auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                clock::now() - start)
+                                .count();
+    rpc_probe_latency_ms_.store(latency_ms, std::memory_order_relaxed);
+    // HealthCheck returns ok=false when a shard write lock is held beyond the
+    // internal budget; treat that as not-responsive (data plane blocked).
+    return result.value().ok;
+}
+
+void MasterAdminServer::RpcProbeThreadMain() {
+    while (rpc_probe_running_.load(std::memory_order_relaxed)) {
+        const auto snapshot = SnapshotState();
+        bool ok = false;
+        if (snapshot.service_available && enable_rpc_probe_ &&
+            !rpc_probe_host_.empty() && rpc_probe_port_ != 0) {
+            ok = RunRpcProbeOnce();
+        }
+        rpc_probe_ok_.store(ok, std::memory_order_relaxed);
+        auto& metrics = MasterMetricManager::instance();
+        metrics.set_rpc_responsive(ok);
+        if (ok) {
+            metrics.set_rpc_probe_latency_ms(
+                rpc_probe_latency_ms_.load(std::memory_order_relaxed));
+        } else {
+            metrics.inc_rpc_probe_failures();
+        }
+        if (rpc_probe_stop_sem_.try_acquire_for(rpc_probe_interval_)) {
+            break;
+        }
     }
 }
 
@@ -513,6 +592,37 @@ void MasterAdminServer::HandleHealth(coro_http::coro_http_request&,
         payload.view_version = snapshot.leader_view->view_version;
     }
     WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+}
+
+struct HttpReadyzResponse {
+    std::string status;
+    bool rpc_responsive{false};
+    int64_t probe_latency_ms{0};
+    bool service_available{false};
+};
+YLT_REFL(HttpReadyzResponse, status, rpc_responsive, probe_latency_ms,
+         service_available);
+
+void MasterAdminServer::HandleReadyz(coro_http::coro_http_request&,
+                                      coro_http::coro_http_response& resp) {
+    const auto snapshot = SnapshotState();
+    const bool responsive =
+        snapshot.service_available &&
+        rpc_probe_ok_.load(std::memory_order_relaxed);
+    HttpReadyzResponse payload;
+    payload.status = responsive ? "ready" : "not ready";
+    payload.rpc_responsive = responsive;
+    payload.probe_latency_ms =
+        rpc_probe_latency_ms_.load(std::memory_order_relaxed);
+    payload.service_available = snapshot.service_available;
+    // 200 only when this instance is the serving leader AND the loopback
+    // HealthCheck probe succeeded. Standby/not-yet-probed/blocked-leader all
+    // return 503 so a readinessProbe removes the pod from Service endpoints.
+    WriteJsonResponse(
+        resp,
+        responsive ? coro_http::status_type::ok
+                   : coro_http::status_type::service_unavailable,
+        payload);
 }
 
 struct HttpVersionResponse {
@@ -1326,6 +1436,10 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHealth(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/readyz", [this](coro_http_request& req, coro_http_response& resp) {
+            HandleReadyz(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/version", [this](coro_http_request& req, coro_http_response& resp) {

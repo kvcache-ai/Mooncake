@@ -8106,6 +8106,44 @@ auto MasterService::Ping(const UUID& client_id)
     return PingResponse(view_version_, client_status);
 }
 
+auto MasterService::HealthCheck() -> tl::expected<HealthCheckResponse, ErrorCode> {
+    using clock = std::chrono::steady_clock;
+    // Global budget for probing all shards. Kept below the loopback probe
+    // timeout so a blocked sweep is reported as "not responsive" before the
+    // caller's RPC times out. Normal load completes in well under 1ms per
+    // shard-in-1024 try_lock; only a shard whose write lock is held for
+    // seconds causes this budget to be exhausted.
+    constexpr auto kShardLockBudget = std::chrono::seconds(2);
+    // Backoff between retry attempts on a single contended shard.
+    constexpr auto kRetryBackoff = std::chrono::milliseconds(10);
+
+    const auto deadline = clock::now() + kShardLockBudget;
+    uint64_t shards_checked = 0;
+    for (size_t i = 0; i < kNumShards; i++) {
+        auto& shard = metadata_shards_[i];
+        bool acquired = false;
+        while (true) {
+            if (shard.mutex.try_lock_shared()) {
+                shard.mutex.unlock_shared();
+                acquired = true;
+                break;
+            }
+            if (clock::now() >= deadline) {
+                break;
+            }
+            std::this_thread::sleep_for(kRetryBackoff);
+        }
+        if (!acquired) {
+            // A shard's write lock could not be acquired within the budget:
+            // the RPC plane is alive but a data-plane-blocking sweep is
+            // holding a shard exclusively. Report the first blocked shard.
+            return HealthCheckResponse(false, shards_checked, i);
+        }
+        shards_checked++;
+    }
+    return HealthCheckResponse(true, shards_checked, 0);
+}
+
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
