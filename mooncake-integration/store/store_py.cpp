@@ -2289,11 +2289,12 @@ PYBIND11_MODULE(store, m) {
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
                 uintptr_t base = 0x0, size_t size = 1024,
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string &master_server_addr = "127.0.0.1:50051",
+                uint32_t block_size = 0) {
                  self.register_ = std::make_shared<NoFRegisterClient>();
-                 return self.register_->set_register(nqn, nsid, traddr, trsvcid,
-                                                     base, size,
-                                                     master_server_addr);
+                 return self.register_->set_register(
+                     nqn, nsid, traddr, trsvcid, base, size, master_server_addr,
+                     block_size);
              })
         .def("real_unregister_by_endpoint",
              [](MooncakeDistributedNoFRegisterPyWrapper &self,

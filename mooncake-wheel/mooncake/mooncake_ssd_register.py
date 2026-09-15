@@ -191,7 +191,7 @@ class MooncakeNoFRegister:
                             continue
 
                         bdev = bdevs[0]
-                        block_size = bdev.get('block_size', 512)
+                        block_size = bdev['block_size']
                         num_blocks = bdev.get('num_blocks', 0)
                         size = block_size * num_blocks
 
@@ -203,12 +203,13 @@ class MooncakeNoFRegister:
                             'trsvcid': int(trsvcid),  # Ensure trsvcid is integer
                             'base': 0,
                             'size': size,
+                            'block_size': block_size,
                             'master_server_address': master_server_address,
                             'metadata_server': ''
                         }
 
                         ssd_configs.append(ssd_config)
-                        logging.info(f"Found SSD: nqn={nqn}, nsid={nsid}, traddr={traddr}, size={size}")
+                        logging.info(f"Found SSD: nqn={nqn}, nsid={nsid}, traddr={traddr}, size={size}, block_size={block_size}")
 
             except Exception as e:
                 logging.error(f"Failed to get SSD info from {ip}: {e}")
@@ -244,7 +245,8 @@ class MooncakeNoFRegister:
                     cfg["trsvcid"],
                     cfg["base"],
                     cfg["size"],
-                    cfg["master_server_address"]
+                    cfg["master_server_address"],
+                    cfg["block_size"]
                 )
 
                 if ret != 0:

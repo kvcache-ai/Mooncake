@@ -1270,11 +1270,24 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
                                                const UUID& client_id) {
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
+    const uint32_t block_size = segment.block_size;
+
+    if (block_size < 512 || (block_size & (block_size - 1)) != 0) {
+        LOG(ERROR) << "NoF segment mount: invalid block_size=" << block_size;
+        return ErrorCode::INVALID_PARAMS;
+    }
 
     // NoF segment base is an NVMe namespace offset, so 0 is valid.
     if (size == 0) {
         LOG(ERROR) << "NoF segment mount: buffer=" << buffer
                    << " or size=" << size << " is invalid";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    if (buffer % block_size != 0 || size % block_size != 0) {
+        LOG(ERROR) << "NoF segment mount: buffer=" << buffer
+                   << ", size=" << size
+                   << " is not aligned to block_size=" << block_size;
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -1319,7 +1332,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
 
     auto created = CreateBufferAllocator(
         nof_segment_manager_->memory_allocator_, segment.name, buffer, size,
-        segment.te_endpoint, ReplicaType::NOF_SSD);
+        segment.te_endpoint, ReplicaType::NOF_SSD, block_size);
     if (!created) {
         return created.error();
     }
