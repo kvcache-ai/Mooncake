@@ -717,8 +717,11 @@ void Workers::asyncPostSend() {
             }
             auto status = generatePostPath(slice);
             if (!status.ok()) {
-                LOG(ERROR) << "Failed to generate post path for slice " << slice
-                           << ": " << status.ToString();
+                VLOG(1) << "Failed to generate post path for slice " << slice
+                        << ": " << status.ToString();
+                LOG_EVERY_N(ERROR, 10000)
+                    << "Failed to generate post path for slice " << slice
+                    << ": " << status.ToString();
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
@@ -760,7 +763,9 @@ void Workers::asyncPostSend() {
                 releaseSliceQuota(slice, getCurrentTimeInNano());
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
+                    VLOG(1)
+                        << "Slice " << slice << " failed: retry count exceeded";
+                    LOG_EVERY_N(WARNING, 100)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
@@ -1562,9 +1567,13 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
 
     if (gdr_excluded ||
         !rail.available(slice->source_dev_id, slice->target_dev_id)) {
-        LOG(INFO) << "Optimal device pair not available: source_dev_id "
-                  << slice->source_dev_id << ", target_dev_id "
-                  << slice->target_dev_id;
+        VLOG(1) << "Optimal device pair not available: source_dev_id "
+                << slice->source_dev_id << ", target_dev_id "
+                << slice->target_dev_id;
+        LOG_EVERY_N(WARNING, 10000)
+            << "Optimal device pair not available: source_dev_id "
+            << slice->source_dev_id << ", target_dev_id "
+            << slice->target_dev_id;
         return selectFallbackDevice(source, target, slice);
     }
 
@@ -1607,7 +1616,11 @@ bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
-    LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
+    // Mirrors selectOptimalDevice: a rare WARNING sample so a sustained
+    // fallback storm is visible without flooding; VLOG(1) for debugging.
+    VLOG(1) << "fallback device selection for slice " << slice;
+    LOG_EVERY_N(WARNING, 10000)
+        << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 

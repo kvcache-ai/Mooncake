@@ -389,6 +389,91 @@ TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
            "from the previous cycle.";
 }
 
+// ---------------------------------------------------------------------------
+// Defect A: a burst of failures within one error window must not escalate the
+// cooldown. Previously cooldown doubled on every markFailed call, so N error
+// WQEs in 10s pushed a 1s pause to the 300s cap, forcing a multi-minute
+// TCP fallback after the peer had already recovered. Now the cooldown is set
+// once when a fresh pause arms; errors arriving while already paused are
+// no-ops.
+//
+// error_threshold=1, cooldown=1s. 8 rapid markFailed calls must arm resume_time
+// at now+1s, not now+256s.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorBurstTest, BurstFailuresDoNotEscalateCooldown) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    // A burst of 8 failures within the error window. With the old per-error
+    // doubling, cooldown would be 1->2->4->...->256s (capped 300). With the
+    // fix, only the first failure arms the pause at +1s; the rest are no-ops.
+    for (int i = 0; i < 8; ++i) rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+
+    // 1.5s > 1s initial cooldown, far below any escalated value. If the burst
+    // had escalated, the rail would still be paused here.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    EXPECT_TRUE(rail.available(0, 0))
+        << "A single failure burst must not escalate the cooldown past the "
+           "initial 1s; staying paused past 1.5s indicates per-error doubling.";
+}
+
+// ---------------------------------------------------------------------------
+// Defect A (cross-cycle): cooldown-expiry RETAINS the cooldown so a rail that
+// fails again right after expiry backs off harder. (cooldown is reset to 0
+// only by markRecovered, a proven-healthy recovery.) This is the escalation
+// path that the old "reset cooldown on expiry" behavior collapsed.
+//
+// Open-phase probing and Half-Open (admit one trial on expiry, escalate on
+// trial failure) are out of scope for this PR: available() is a mutating
+// admit used as a predicate across updateBestMapping / fallback / GDR, and
+// with default probe_interval=1s there is no in-flight tracking, so a second
+// probe can go out while the first is still on the wire. They land in a
+// follow-up once available() is split into a non-mutating predicate plus an
+// admit() with in-flight tracking.
+//
+// error_threshold=1, cooldown=1s. Cycle 1: pause 1s, expire. Cycle 2: re-fail
+// must escalate to 2s.
+// ---------------------------------------------------------------------------
+
+TEST(RailMonitorEscalationTest, ExpiryRetainsCooldownForNextCycle) {
+    auto local = makeSingleNicTopology("mlx5_0");
+    auto remote = makeSingleNicTopology("mlx5_1");
+
+    Config cfg;
+    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
+    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
+    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
+
+    RailMonitor rail;
+    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
+
+    // Cycle 1: single failure arms a 1s pause.
+    rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    ASSERT_TRUE(rail.available(0, 0)) << "Cycle 1 cooldown (1s) must expire";
+
+    // Cycle 2: fail again. Expiry retained cooldown=1s (not proven healthy),
+    // so markFailed escalates 1->2s.
+    rail.markFailed(0, 0);
+    EXPECT_FALSE(rail.available(0, 0));
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    EXPECT_FALSE(rail.available(0, 0))
+        << "Cycle 2 must use the escalated 2s cooldown; 1.1s is not enough.";
+    std::this_thread::sleep_for(std::chrono::milliseconds(1400));
+    EXPECT_TRUE(rail.available(0, 0)) << "Cycle 2 (2s) must expire by ~2.5s.";
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
