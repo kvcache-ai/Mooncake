@@ -85,11 +85,14 @@ struct HealthCheckResponse {
     uint64_t shards_blocked{0};
 
     HealthCheckResponse() = default;
-    HealthCheckResponse(bool ok, uint64_t shards_checked, uint64_t shards_blocked)
-        : ok(ok), shards_checked(shards_checked), shards_blocked(shards_blocked) {}
+    HealthCheckResponse(bool ok, uint64_t shards_checked,
+                        uint64_t shards_blocked)
+        : ok(ok),
+          shards_checked(shards_checked),
+          shards_blocked(shards_blocked) {}
 
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const HealthCheckResponse& response) noexcept {
+    friend std::ostream& operator<<(
+        std::ostream& os, const HealthCheckResponse& response) noexcept {
         return os << "HealthCheckResponse: { ok: " << response.ok
                   << ", shards_checked: " << response.shards_checked
                   << ", shards_blocked: " << response.shards_blocked << " }";

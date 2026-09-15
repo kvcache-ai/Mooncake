@@ -8106,7 +8106,8 @@ auto MasterService::Ping(const UUID& client_id)
     return PingResponse(view_version_, client_status);
 }
 
-auto MasterService::HealthCheck() -> tl::expected<HealthCheckResponse, ErrorCode> {
+auto MasterService::HealthCheck()
+    -> tl::expected<HealthCheckResponse, ErrorCode> {
     using clock = std::chrono::steady_clock;
     // Global budget for probing all shards. Kept below the loopback probe
     // timeout so a blocked sweep is reported as "not responsive" before the

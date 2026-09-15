@@ -325,8 +325,7 @@ bool MasterAdminServer::Start() {
 
     LOG(INFO) << "Master admin server started on port " << http_server_.port();
 
-    if (enable_rpc_probe_ && !rpc_probe_host_.empty() &&
-        rpc_probe_port_ != 0) {
+    if (enable_rpc_probe_ && !rpc_probe_host_.empty() && rpc_probe_port_ != 0) {
         rpc_probe_running_.store(true);
         rpc_probe_thread_ = std::thread([this]() { RpcProbeThreadMain(); });
         LOG(INFO) << "Master admin RPC health probe enabled against "
@@ -371,9 +370,9 @@ bool MasterAdminServer::RunRpcProbeOnce() {
     // Loopback TCP connect: even when the RPC server enables RDMA, the TCP
     // listener remains on rpc_port. A short connect timeout keeps the probe
     // bounded when the RPC plane is down.
-    auto connect_ec = async_simple::coro::syncAwait(client.connect(
-        rpc_probe_host_, std::to_string(rpc_probe_port_),
-        std::min(rpc_probe_timeout_, std::chrono::seconds(1))));
+    auto connect_ec = async_simple::coro::syncAwait(
+        client.connect(rpc_probe_host_, std::to_string(rpc_probe_port_),
+                       std::min(rpc_probe_timeout_, std::chrono::seconds(1))));
     if (connect_ec) {
         return false;
     }
@@ -383,13 +382,18 @@ bool MasterAdminServer::RunRpcProbeOnce() {
     if (!result.has_value()) {
         return false;
     }
-    const auto latency_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                clock::now() - start)
-                                .count();
+    const auto& health = result.value();
+    if (!health.has_value()) {
+        return false;
+    }
+    const auto latency_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() -
+                                                              start)
+            .count();
     rpc_probe_latency_ms_.store(latency_ms, std::memory_order_relaxed);
     // HealthCheck returns ok=false when a shard write lock is held beyond the
     // internal budget; treat that as not-responsive (data plane blocked).
-    return result.value().ok;
+    return health.value().ok;
 }
 
 void MasterAdminServer::RpcProbeThreadMain() {
@@ -604,11 +608,10 @@ YLT_REFL(HttpReadyzResponse, status, rpc_responsive, probe_latency_ms,
          service_available);
 
 void MasterAdminServer::HandleReadyz(coro_http::coro_http_request&,
-                                      coro_http::coro_http_response& resp) {
+                                     coro_http::coro_http_response& resp) {
     const auto snapshot = SnapshotState();
-    const bool responsive =
-        snapshot.service_available &&
-        rpc_probe_ok_.load(std::memory_order_relaxed);
+    const bool responsive = snapshot.service_available &&
+                            rpc_probe_ok_.load(std::memory_order_relaxed);
     HttpReadyzResponse payload;
     payload.status = responsive ? "ready" : "not ready";
     payload.rpc_responsive = responsive;
@@ -618,11 +621,10 @@ void MasterAdminServer::HandleReadyz(coro_http::coro_http_request&,
     // 200 only when this instance is the serving leader AND the loopback
     // HealthCheck probe succeeded. Standby/not-yet-probed/blocked-leader all
     // return 503 so a readinessProbe removes the pod from Service endpoints.
-    WriteJsonResponse(
-        resp,
-        responsive ? coro_http::status_type::ok
-                   : coro_http::status_type::service_unavailable,
-        payload);
+    WriteJsonResponse(resp,
+                      responsive ? coro_http::status_type::ok
+                                 : coro_http::status_type::service_unavailable,
+                      payload);
 }
 
 struct HttpVersionResponse {

@@ -2914,7 +2914,7 @@ TEST_F(MasterServiceTest, HealthCheckDetectsShardWriteLockHeld) {
 
     std::thread holder([&]() {
         MasterService::MetadataShardAccessorRW shard(service_.get(),
-                                                      kBlockedShard);
+                                                     kBlockedShard);
         lock_acquired.store(true);
         while (!release_now.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));

@@ -167,11 +167,11 @@ class MasterService {
     friend class test::LocalDiskUnmountInterleavingTest;
     // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
     friend class test::MasterServiceSSDTest;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
-                                           // members
+    friend class ha::MasterSnapshotCodec;      // Allow codec to access private
+                                               // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
     friend class test::MasterServiceHATest;
 

@@ -72,9 +72,10 @@ MasterMetricManager::MasterMetricManager()
       client_liveness_offline_clients_(
           "master_client_liveness_offline_clients",
           "Store Client liveness records currently Offline"),
-      rpc_responsive_("mooncake_master_rpc_responsive",
-                      "1 if the loopback HealthCheck probe succeeded within the "
-                      "timeout, 0 if it timed out or failed"),
+      rpc_responsive_(
+          "mooncake_master_rpc_responsive",
+          "1 if the loopback HealthCheck probe succeeded within the "
+          "timeout, 0 if it timed out or failed"),
       rpc_probe_latency_ms_("mooncake_master_rpc_probe_latency_ms",
                             "Latency of the most recent loopback HealthCheck "
                             "probe in milliseconds"),
@@ -192,10 +193,11 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
-      healthcheck_requests_("master_healthcheck_requests_total",
-                             "Total number of HealthCheck RPC requests received"),
+      healthcheck_requests_(
+          "master_healthcheck_requests_total",
+          "Total number of HealthCheck RPC requests received"),
       healthcheck_failures_("master_healthcheck_failures_total",
-                             "Total number of failed HealthCheck RPC requests"),
+                            "Total number of failed HealthCheck RPC requests"),
       nof_heartbeat_success_total_(
           "master_nof_heartbeat_success_total",
           "Total number of successful NoF heartbeat probes"),
