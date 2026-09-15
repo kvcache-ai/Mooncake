@@ -1482,6 +1482,24 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DoubleInit) {
     EXPECT_EQ(second_init.error(), ErrorCode::INTERNAL_ERROR);
 }
 
+#ifdef USE_URING
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_RejectsUnalignedCapacityWithUring) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    // 50 KiB is not a multiple of the 4 KiB O_DIRECT alignment.
+    config.total_size_limit = 50 * 1024;
+    config.total_keys_limit = 1000;
+    config.use_uring = true;
+
+    OffsetAllocatorStorageBackend storage_backend(config);
+    auto init = storage_backend.Init();
+    ASSERT_FALSE(init.has_value());
+    EXPECT_EQ(init.error(), ErrorCode::INVALID_PARAMS);
+}
+#endif
+
 //-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_BatchOffloadEmpty) {

@@ -412,6 +412,45 @@ TEST(TransferEngineConfigOverrideTest, CustomTopoJsonEnvLoadsPath) {
 }
 
 TEST(TransferEngineConfigOverrideTest,
+     ExplicitRdmaWhitelistOverridesLegacyFilterEnv) {
+    EnvVarGuard guard("MC_TE_FILTERS", "mlx5_from_env_0,mlx5_from_env_1");
+
+    auto config = std::make_shared<Config>();
+    const std::vector<std::string> explicit_filter{"mlx5_requested"};
+    config->set("topology/rdma_whitelist", explicit_filter);
+    config->set("rpc_server_hostname", kInvalidHostname);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              explicit_filter);
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     ExplicitRdmaWhitelistOverridesMcTentConf) {
+    TempConfigFile conf_file(R"({
+        "topology": {
+            "rdma_whitelist": ["mlx5_from_env_0", "mlx5_from_env_1"]
+        }
+    })");
+    EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
+
+    auto config = std::make_shared<Config>();
+    const std::vector<std::string> explicit_filter{"mlx5_requested"};
+    config->set("topology/rdma_whitelist", explicit_filter);
+    // Stop construction before platform probing; this test only needs the
+    // constructor's config merge and remains hardware-independent.
+    config->set("rpc_server_hostname", kInvalidHostname);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_FALSE(engine.available());
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              explicit_filter);
+}
+
+TEST(TransferEngineConfigOverrideTest,
      ExplicitMetadataOverridesDriveSuccessfulHttpInitialization) {
 #ifdef _WIN32
     GTEST_SKIP() << "Requires local HTTP metadata server support";
@@ -478,6 +517,39 @@ TEST(TransferEngineConfigOverrideTest,
 
     EXPECT_FALSE(metadata_server.getStoredValue(metadata_key).has_value());
 #endif
+}
+
+TEST(TransferEngineConfigOverrideTest,
+     NestedCallerTransportLeafSurvivesMcTentConf) {
+    TempConfigFile conf_file(R"({
+        "metadata_type": "p2p",
+        "metadata_servers": "127.0.0.1:2379",
+        "rpc_server_hostname": "256.256.256.256",
+        "rpc_server_port": 15014,
+        "transports": {
+            "ascend_direct": {
+                "agent_mode": false,
+                "fabric_mem": false,
+                "transfer_timeout_ms": 1234
+            }
+        }
+    })");
+    EnvVarGuard guard("MC_TENT_CONF", conf_file.path());
+
+    auto config = std::make_shared<Config>();
+    config->set("local_segment_name", "store-segment-C");
+    config->set("transports/ascend_direct/agent_mode", true);
+    config->set("transports/ascend_direct/store_te_init", true);
+
+    TransferEngineImpl engine(config);
+
+    EXPECT_TRUE(config->get("transports/ascend_direct/agent_mode", false));
+    EXPECT_TRUE(config->get("transports/ascend_direct/store_te_init", false));
+    EXPECT_FALSE(config->get("transports/ascend_direct/fabric_mem", true));
+    EXPECT_EQ(config->get("transports/ascend_direct/transfer_timeout_ms", 0),
+              1234);
+    EXPECT_EQ(config->get("local_segment_name", ""), "store-segment-C");
+    EXPECT_EQ(config->get("metadata_type", ""), "p2p");
 }
 
 TEST(TransferEngineConfigOverrideTest,

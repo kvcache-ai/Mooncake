@@ -95,6 +95,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     freeEngine();
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
+    tent_device_filter_ = std::move(other.tent_device_filter_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -360,6 +361,9 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#include "config.h"
+#endif
 
 #include <mutex>
 #include <utility>
@@ -423,7 +427,9 @@ TransferEngine::TransferEngine(bool auto_discover,
     if (getenv("MC_USE_TENT") || getenv("MC_USE_TEV1")) {
         use_tent_ = true;
     }
-    if (!use_tent_) {
+    if (use_tent_) {
+        tent_device_filter_ = filter;
+    } else {
         impl_ = std::make_shared<TransferEngineImpl>(auto_discover, filter);
     }
 }
@@ -432,6 +438,7 @@ TransferEngine::TransferEngine(TransferEngine&& other) noexcept
     : impl_(std::move(other.impl_)),
       impl_tent_(std::move(other.impl_tent_)),
       shutdown_token_(nullptr),
+      tent_device_filter_(std::move(other.tent_device_filter_)),
       use_tent_(other.use_tent_) {
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -446,6 +453,7 @@ TransferEngine& TransferEngine::operator=(TransferEngine&& other) noexcept {
     freeEngine();
     impl_ = std::move(other.impl_);
     impl_tent_ = std::move(other.impl_tent_);
+    tent_device_filter_ = std::move(other.tent_device_filter_);
     use_tent_ = other.use_tent_;
     const bool shutdown_enabled = static_cast<bool>(other.shutdown_token_);
     detachShutdownToken(other.shutdown_token_);
@@ -480,6 +488,26 @@ static std::pair<std::string, std::string> parseConnectionStringInternal(
     return result;
 }
 
+std::shared_ptr<mooncake::tent::Config> TransferEngine::buildTentConfig(
+    const std::string& metadata_conn_string,
+    const std::string& local_server_name) const {
+    auto config = std::make_shared<mooncake::tent::Config>();
+    if (!local_server_name.empty())
+        config->set("local_segment_name", local_server_name);
+    if (metadata_conn_string == P2PHANDSHAKE) {
+        config->set("metadata_type", "p2p");
+    } else {
+        auto [type, servers] =
+            parseConnectionStringInternal(metadata_conn_string);
+        if (!type.empty()) config->set("metadata_type", type);
+        if (!servers.empty()) config->set("metadata_servers", servers);
+    }
+    if (!tent_device_filter_.empty()) {
+        config->set("topology/rdma_whitelist", tent_device_filter_);
+    }
+    return config;
+}
+
 int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
                          const std::string& ip_or_host_name,
@@ -496,17 +524,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
         return impl_->init(metadata_conn_string, local_server_name,
                            ip_or_host_name, rpc_port);
     } else {
-        auto config = std::make_shared<mooncake::tent::Config>();
-        if (!local_server_name.empty())
-            config->set("local_segment_name", local_server_name);
-        if (metadata_conn_string == P2PHANDSHAKE) {
-            config->set("metadata_type", "p2p");
-        } else {
-            auto [type, servers] =
-                parseConnectionStringInternal(metadata_conn_string);
-            if (!type.empty()) config->set("metadata_type", type);
-            if (!servers.empty()) config->set("metadata_servers", servers);
-        }
+        auto config = buildTentConfig(metadata_conn_string, local_server_name);
         if (protocol == "tcp") {
             mooncake::tent::ConfigHelper::forceTcp(*config);
             if (!std::getenv("MC_FORCE_TCP")) {
@@ -514,6 +532,20 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                              "use TCP";
             }
         }
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+        // Store still constructs TENT through this classic init() shim, not
+        // tent::TransferEngine(Config) directly. Copy Dummy-real flags until
+        // Store creates the native engine itself.
+        if (globalConfig().ascend_agent_mode) {
+            config->set("transports/ascend_direct/agent_mode", true);
+        }
+        if (globalConfig().ascend_store_te_init) {
+            config->set("transports/ascend_direct/store_te_init", true);
+            if (globalConfig().ascend_use_fabric_mem) {
+                config->set("transports/ascend_direct/fabric_mem", true);
+            }
+        }
+#endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;
     }
@@ -553,6 +585,12 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
 
 std::string TransferEngine::getLocalIpAndPort() {
     if (use_tent_) {
+        // Store handshake and openSegment must use the advertised segment
+        // name, not a reconstructed host:port that can disagree with it.
+        auto name = impl_tent_->getSegmentName();
+        if (!name.empty()) {
+            return name;
+        }
         return impl_tent_->getRpcServerAddress() + ":" +
                std::to_string(impl_tent_->getRpcServerPort());
     } else
@@ -578,9 +616,20 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
 }
 
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
-    if (use_tent_)
-        return Status::OK();
-    else
+    if (use_tent_) {
+        // TENT owns its segment cache, so actively probe the peer instead of
+        // reporting OK unconditionally. Returning OK here left classic callers
+        // (e.g. the Python wrapper's handle_map_) holding a dead peer's cached
+        // handle forever, because they only evict the handle on a non-OK
+        // status. A stale/unknown handle or an unreachable peer makes
+        // probePeerAliveByID fail (invalid handle, empty RPC address, or RPC
+        // error); surface that as a non-OK status so the caller closes and
+        // re-opens the segment on the next transfer. Refs #3995
+        // (P0-stale-handle).
+        auto probe_status = impl_tent_->probePeerAliveByID(sid);
+        if (probe_status.ok()) return Status::OK();
+        return Status::Endpoint(std::string(probe_status.message()));
+    } else
         return impl_->CheckSegmentStatus(sid);
 }
 
@@ -910,7 +959,13 @@ void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
-    if (!use_tent_) impl_->setWhitelistFilters(std::move(filters));
+    if (!use_tent_) {
+        impl_->setWhitelistFilters(std::move(filters));
+    } else if (!impl_tent_) {
+        tent_device_filter_ = std::move(filters);
+    } else {
+        LOG(WARNING) << "Cannot change the TENT RDMA device filter after init";
+    }
 }
 
 int TransferEngine::numContexts() const {

@@ -16,6 +16,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/time.h>
+#ifdef USE_TENT
+#include <infiniband/verbs.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -119,8 +122,103 @@ class TransferEngineImplTestPeer {
         if (!engine.impl_tent_ || !engine.impl_tent_->impl_) return nullptr;
         return engine.impl_tent_->impl_->conf_.get();
     }
+
+    static std::shared_ptr<tent::Config> buildTentConfig(
+        const TransferEngine& engine, const std::string& metadata,
+        const std::string& segment) {
+        return engine.buildTentConfig(metadata, segment);
+    }
 #endif
 };
+
+#ifdef USE_TENT
+class ScopedUnsetEnvVar {
+   public:
+    explicit ScopedUnsetEnvVar(const char* name) : name_(name) {
+        if (const char* old = std::getenv(name)) old_value_ = old;
+        unsetenv(name);
+    }
+
+    ~ScopedUnsetEnvVar() {
+        if (old_value_.has_value())
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+
+TEST(TransferEngineTentCompatibilityTest,
+     ConstructorDeviceFilterIsForwardedToTentConfig) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    const std::vector<std::string> filter{"mlx5_0", "mlx5_2"};
+    TransferEngine engine(/*auto_discover=*/true, filter);
+    ASSERT_TRUE(engine.isUsingTent());
+
+    auto config = TransferEngineImplTestPeer::buildTentConfig(
+        engine, P2PHANDSHAKE, "local-segment");
+
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"), filter);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     SetterDeviceFilterIsForwardedBeforeInit) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine(/*auto_discover=*/true);
+    engine.setWhitelistFilters({"mlx5_1"});
+
+    auto config = TransferEngineImplTestPeer::buildTentConfig(
+        engine, P2PHANDSHAKE, "local-segment");
+
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              (std::vector<std::string>{"mlx5_1"}));
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     DeviceFilterSurvivesMoveConstructionAndAssignment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    const std::vector<std::string> filter{"mlx5_move"};
+    TransferEngine source(/*auto_discover=*/true, filter);
+    TransferEngine moved(std::move(source));
+
+    auto moved_config = TransferEngineImplTestPeer::buildTentConfig(
+        moved, P2PHANDSHAKE, "local-segment");
+    EXPECT_EQ(moved_config->getArray<std::string>("topology/rdma_whitelist"),
+              filter);
+
+    TransferEngine assigned(/*auto_discover=*/true);
+    assigned = std::move(moved);
+    auto assigned_config = TransferEngineImplTestPeer::buildTentConfig(
+        assigned, P2PHANDSHAKE, "local-segment");
+    EXPECT_EQ(assigned_config->getArray<std::string>("topology/rdma_whitelist"),
+              filter);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     ConstructorDeviceFilterRestrictsDiscoveredTopology) {
+    int count = 0;
+    ibv_device** devices = ibv_get_device_list(&count);
+    if (!devices || count < 2) {
+        if (devices) ibv_free_device_list(devices);
+        GTEST_SKIP() << "Requires at least two RDMA devices";
+    }
+    const std::string selected = ibv_get_device_name(devices[0]);
+    ibv_free_device_list(devices);
+
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedUnsetEnvVar tent_conf("MC_TENT_CONF");
+    ScopedUnsetEnvVar custom_topology("MC_CUSTOM_TOPO_JSON");
+    TransferEngine engine(/*auto_discover=*/true, {selected});
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, ""), 0);
+
+    const auto topology = engine.getLocalTopology();
+    ASSERT_NE(topology, nullptr);
+    EXPECT_EQ(topology->getHcaList(), (std::vector<std::string>{selected}));
+}
+
+#endif
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     TransferEngineImpl engine(false);
@@ -163,6 +261,27 @@ void expectForcedTcpConstraint(const tent::Config& config) {
     EXPECT_TRUE(config.get("transports/force_tcp", false));
     EXPECT_TRUE(config.get("transports/tcp/enable", false));
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
+}
+
+TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-stale-handle"), 0);
+
+    // Segment handles are handed out from 1 upward when a peer is opened, so a
+    // large handle that was never opened has no id->name mapping. That is the
+    // same "peer gone / handle stale" situation the eviction path must detect:
+    // probePeerAliveByID fails on it, so CheckSegmentStatus must report non-OK
+    // and let the caller close + re-open the segment. Before the fix the shim
+    // returned Status::OK() unconditionally under MC_USE_TENT, so the Python
+    // wrapper's handle_map_ never dropped a dead peer and kept reusing the same
+    // stale handle forever. Refs #3995 (P0-stale-handle).
+    EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
 }
 
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
