@@ -27,8 +27,11 @@
 #include "default_config.h"
 #include "shm_helper.h"
 #include "memory_location.h"
-#ifdef USE_ASCEND_DIRECT
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#include "ascend_allocator.h"
 #include "acl/acl_rt.h"
+#endif
+#ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
 
@@ -518,6 +521,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
+            uintptr_t physical_handle_hint = 0;
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+            if ((this->protocol == "ascend" || this->protocol == "ubshmem") &&
+                globalConfig().ascend_use_fabric_mem) {
+                auto handle = ascend_get_physical_handle_from_va(ptr);
+                if (handle != nullptr) {
+                    physical_handle_hint = reinterpret_cast<uintptr_t>(handle);
+                }
+            }
+#endif
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
@@ -530,7 +543,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 segment_ptrs_.emplace_back(ptr);
             }
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, mapped_size, protocol, seg_location,
+                                      physical_handle_hint);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());

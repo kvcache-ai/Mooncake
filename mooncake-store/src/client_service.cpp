@@ -27,6 +27,10 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#include "ascend_allocator.h"
+#include "acl/acl_rt.h"
+#endif
 
 namespace mooncake {
 
@@ -1785,7 +1789,7 @@ std::vector<int> Client::GetNicNumaNodes() const {
 
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol,
-    const std::string& location) {
+    const std::string& location, uintptr_t physical_handle_hint) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -1809,6 +1813,13 @@ tl::expected<void, ErrorCode> Client::MountSegment(
             }
         }
 
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+        if (physical_handle_hint != 0) {
+            ascend_record_physical_handle_for_va(
+                const_cast<void*>(buffer),
+                reinterpret_cast<aclrtDrvMemHandle>(physical_handle_hint), true);
+        }
+#endif
         int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
                                                        location, true, true);
         if (rc != 0) {

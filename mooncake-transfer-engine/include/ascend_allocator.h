@@ -24,5 +24,12 @@ void* ascend_allocate_vmm_memory_direct(size_t size);
 // or if the allocation was not done via direct ACL path.
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 aclrtDrvMemHandle ascend_get_physical_handle_from_va(void* va);
+
+// Seed/clear the VA-to-handle map when ownership is established outside the
+// allocator implementation (for example, when a mounted segment carries its
+// physical handle across the store/transport boundary).
+void ascend_record_physical_handle_for_va(void* va, aclrtDrvMemHandle handle,
+                                          bool is_direct_alloc = true);
+void ascend_forget_physical_handle_for_va(void* va);
 #endif
 }  // namespace mooncake

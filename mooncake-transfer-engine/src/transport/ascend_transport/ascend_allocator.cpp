@@ -1,5 +1,7 @@
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -7,14 +9,17 @@
 #include "config.h"
 #include "acl/acl.h"
 #include "transport/ascend_transport/ascend_direct_transport/adxl_compat.h"
+#ifdef USE_UBSHMEM
+#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
+#endif
 
 namespace mooncake {
 namespace {
 constexpr size_t kFabricMemPageSize = 1024 * 1024 * 1024;  // 1G
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
 struct AllocRecord {
-    aclrtDrvMemHandle handle;
-    bool is_direct_alloc;
+    aclrtDrvMemHandle handle = nullptr;
+    bool is_direct_alloc = false;
 };
 std::mutex g_vmm_alloc_mutex;
 std::unordered_map<void *, AllocRecord> g_vmm_alloc_records;
@@ -133,10 +138,63 @@ aclrtDrvMemHandle ascend_get_physical_handle_from_va(void *va) {
 #endif
 }
 
+void ascend_record_physical_handle_for_va(void *va,
+                                          aclrtDrvMemHandle handle,
+                                          bool is_direct_alloc) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    if (va == nullptr || handle == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    g_vmm_alloc_records[va] = AllocRecord{handle, is_direct_alloc};
+#else
+    (void)va;
+    (void)handle;
+    (void)is_direct_alloc;
+#endif
+}
+
+void ascend_forget_physical_handle_for_va(void *va) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+    if (va == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_vmm_alloc_mutex);
+    g_vmm_alloc_records.erase(va);
+#else
+    (void)va;
+#endif
+}
+
 void *ascend_allocate_memory(size_t total_size, const std::string &protocol) {
     if (globalConfig().ascend_use_fabric_mem) {
         void *va = nullptr;
 #ifdef ASCEND_SUPPORT_FABRIC_MEM
+#ifdef USE_UBSHMEM
+        // HDK 25.5 exposes aclrtMemRetainAllocationHandle in the headers but
+        // returns 207000 at runtime. UBShmem therefore allocates a VMM handle
+        // that can be exported directly instead of reverse-looking it up.
+        if (protocol == "ubshmem") {
+            const char *alloc_kind_env =
+                std::getenv("MC_UBSHMEM_FABRIC_ALLOC_KIND");
+            const std::string alloc_kind =
+                alloc_kind_env == nullptr ? "device" : alloc_kind_env;
+            if (alloc_kind == "device") {
+                va = UBShmemTransport::allocatePinnedLocalMemory(total_size);
+            } else if (alloc_kind == "host") {
+                va = allocate_vmm_memory_direct_impl(total_size);
+            } else {
+                LOG(ERROR) << "Unknown MC_UBSHMEM_FABRIC_ALLOC_KIND="
+                           << alloc_kind;
+                return nullptr;
+            }
+            if (va) {
+                std::lock_guard<std::mutex> store_lock(g_store_mem_mutex);
+                g_store_mem_ranges.push_back({va, total_size});
+            }
+            return va;
+        }
+#endif
         if (total_size % kFabricMemPageSize != 0) {
             LOG(ERROR) << "Local buffer size must be a multiple of 1GB";
             return nullptr;

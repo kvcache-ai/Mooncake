@@ -28,6 +28,7 @@
 #include "common.h"
 #include "common/serialization.h"
 #include "config.h"
+#include "ascend_allocator.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
@@ -80,7 +81,8 @@ static int openIPCHandle(const std::vector<unsigned char> &buffer,
 }
 
 static int openShareableHandle(const std::vector<unsigned char> &buffer,
-                               size_t length, void **shm_addr) {
+                               size_t length, void **shm_addr,
+                               aclrtDrvMemHandle *handle_out) {
     aclrtMemFabricHandle export_handle = {};
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
@@ -106,6 +108,10 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
         (void)aclrtReleaseMemAddress(*shm_addr);
         (void)aclrtFreePhysical(handle);
         return -1;
+    }
+
+    if (handle_out != nullptr) {
+        *handle_out = handle;
     }
 
     return 0;
@@ -246,7 +252,13 @@ UBShmemTransport::~UBShmemTransport() {
 
     if (use_fabric_mem_) {
         for (auto &entry : remap_entries_) {
-            freePinnedLocalMemory(entry.second.shm_addr);
+            if (entry.second.handle != nullptr) {
+                (void)aclrtUnmapMem(entry.second.shm_addr);
+                (void)aclrtReleaseMemAddress(entry.second.shm_addr);
+                (void)aclrtFreePhysical(entry.second.handle);
+            } else {
+                freePinnedLocalMemory(entry.second.shm_addr);
+            }
         }
     } else {
         for (auto &entry : remap_entries_) {
@@ -607,13 +619,19 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
 
     // Fabric memory registration
     else {
-        // Retain allocation handle
-        aclrtDrvMemHandle handle;
-        auto ret = aclrtMemRetainAllocationHandle(addr, &handle);
-        if (!checkAcl(
-                ret,
-                "UBShmemTransport: aclrtMemRetainAllocationHandle failed")) {
-            return -1;
+        // HDK 25.5 declares aclrtMemRetainAllocationHandle but returns
+        // 207000. Use a handle preserved for Mooncake-owned allocations;
+        // retain remains only as a compatibility fallback for external VAs.
+        aclrtDrvMemHandle handle = ascend_get_physical_handle_from_va(addr);
+        bool owns_handle = false;
+        if (handle == nullptr) {
+            auto ret = aclrtMemRetainAllocationHandle(addr, &handle);
+            if (!checkAcl(
+                    ret,
+                    "UBShmemTransport: aclrtMemRetainAllocationHandle failed")) {
+                return -1;
+            }
+            owns_handle = true;
         }
 
         // Export shareable handle
@@ -623,7 +641,9 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
                     handle, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
                     ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &export_handle_raw),
                 "UBShmemTransport: aclrtMemExportToShareableHandleV2 failed")) {
-            (void)aclrtFreePhysical(handle);
+            if (owns_handle) {
+                (void)aclrtFreePhysical(handle);
+            }
             return -1;
         }
 
@@ -669,6 +689,7 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 deserializeBinaryData(entry.shm_name, output_buffer);
 
                 void *shm_addr = nullptr;
+                aclrtDrvMemHandle imported_handle = nullptr;
                 int rc = -1;
 
                 if (!use_fabric_mem_) {
@@ -677,7 +698,7 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                sizeof(aclrtMemFabricHandle) &&
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
-                                             &shm_addr);
+                                             &shm_addr, &imported_handle);
                 } else {
                     LOG(ERROR) << "Mismatched UBShmem data transfer method";
                     return -1;
@@ -698,6 +719,7 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                            kIPCHandleKeyLength);
                 } else {
                     shm_entry.key = nullptr;
+                    shm_entry.handle = imported_handle;
                 }
 
                 remap_entries_[std::make_pair(target_id, entry.addr)] =
@@ -790,6 +812,8 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
         return nullptr;
     }
 
+    ascend_record_physical_handle_for_va(ptr, handle, true);
+
     return ptr;
 }
 
@@ -799,12 +823,15 @@ void UBShmemTransport::freePinnedLocalMemory(void *ptr) {
         return;
     }
 
-    aclrtDrvMemHandle handle;
-
-    if (!checkAcl(aclrtMemRetainAllocationHandle(ptr, &handle),
-                  "UBShmemTransport: aclrtMemRetainAllocationHandle failed")) {
-        return;
+    aclrtDrvMemHandle handle = ascend_get_physical_handle_from_va(ptr);
+    if (handle == nullptr) {
+        if (!checkAcl(aclrtMemRetainAllocationHandle(ptr, &handle),
+                      "UBShmemTransport: aclrtMemRetainAllocationHandle failed")) {
+            return;
+        }
     }
+
+    ascend_forget_physical_handle_for_va(ptr);
 
     (void)aclrtUnmapMem(ptr);
     (void)aclrtReleaseMemAddress(ptr);

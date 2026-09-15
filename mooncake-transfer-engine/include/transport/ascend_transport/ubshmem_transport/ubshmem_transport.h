@@ -81,9 +81,10 @@ class UBShmemTransport : public Transport {
 
    private:
     struct OpenedShmEntry {
-        void *shm_addr;
-        uint64_t length;
-        char *key;
+        void *shm_addr = nullptr;
+        uint64_t length = 0;
+        char *key = nullptr;
+        aclrtDrvMemHandle handle = nullptr;
     };
 
     void workerThread();

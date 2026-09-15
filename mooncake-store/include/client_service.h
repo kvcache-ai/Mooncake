@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
@@ -255,7 +256,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> MountSegment(
         const void* buffer, size_t size, const std::string& protocol = "tcp",
-        const std::string& location = kWildcardLocation);
+        const std::string& location = kWildcardLocation,
+        uintptr_t physical_handle_hint = 0);
 
     /**
      * @brief Unregisters a memory segment from master

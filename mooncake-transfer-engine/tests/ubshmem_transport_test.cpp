@@ -7,6 +7,7 @@
 #include <future>
 
 #include "cuda_alike.h"
+#include "ascend_allocator.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -83,32 +84,7 @@ static void* allocateAclBuffer(size_t size, int npu_id, MemoryType mem_type) {
         }
 
         case MemoryType::FABRIC_MEM_HOST: {
-            prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-            prop.memAttr = ACL_DDR_MEM_P2P_HUGE;
-            prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
-            prop.location.id = int(npu_id / 2);
-
-            if (!checkAcl(aclrtMallocPhysical(&handle, size, &prop, 0),
-                          "UBShmemTransport: Failed to allocate fabric host "
-                          "memory")) {
-                return nullptr;
-            }
-
-            uint64_t page_type = 1;
-            if (!checkAcl(
-                    aclrtReserveMemAddress(&ptr, size, 0, nullptr, page_type),
-                    "UBShmemTransport: aclrtReserveMemAddress failed")) {
-                (void)aclrtFreePhysical(handle);
-                return nullptr;
-            }
-
-            if (!checkAcl(aclrtMapMem(ptr, size, 0, handle, 0),
-                          "UBShmemTransport: aclrtMapMem failed")) {
-                (void)aclrtReleaseMemAddress(ptr);
-                (void)aclrtFreePhysical(handle);
-                return nullptr;
-            }
-            return ptr;
+            return ascend_allocate_vmm_memory_direct(size);
         }
 
         case MemoryType::IPC_MEM_DEVICE:
@@ -126,8 +102,19 @@ static void* allocateAclBuffer(size_t size, int npu_id, MemoryType mem_type) {
 
 static void freeAclBuffer(void* addr, MemoryType mem_type) {
     switch (mem_type) {
-        case MemoryType::FABRIC_MEM_DEVICE:
         case MemoryType::FABRIC_MEM_HOST: {
+            aclrtDrvMemHandle handle = ascend_get_physical_handle_from_va(addr);
+            if (handle == nullptr) {
+                LOG(ERROR) << "No preserved fabric handle for " << addr;
+                return;
+            }
+            ascend_forget_physical_handle_for_va(addr);
+            (void)aclrtUnmapMem(addr);
+            (void)aclrtReleaseMemAddress(addr);
+            (void)aclrtFreePhysical(handle);
+        } break;
+
+        case MemoryType::FABRIC_MEM_DEVICE: {
             aclrtDrvMemHandle handle;
             if (!checkAcl(aclrtMemRetainAllocationHandle(addr, &handle),
                           "UBShmemTransport: aclrtMemRetainAllocationHandle "
