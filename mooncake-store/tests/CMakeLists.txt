@@ -158,6 +158,15 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+if(USE_TENT)
+  add_test(
+    NAME transfer_task_tent_completion_test
+    COMMAND transfer_task_test
+            --gtest_filter=TransferTaskTest.RemoteTransferWaitCompletesCorrectly
+  )
+  set_tests_properties(transfer_task_tent_completion_test
+                       PROPERTIES ENVIRONMENT "MC_USE_TENT=1" TIMEOUT 30)
+endif()
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
 find_package(CUDAToolkit QUIET)
