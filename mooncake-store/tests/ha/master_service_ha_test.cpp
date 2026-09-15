@@ -2399,9 +2399,9 @@ TEST_F(MasterServiceHATest, RestoreDropsObjectWithOnlyTerminalReplicas) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_terminal_failed"),
               0);
-    EXPECT_EQ(
-        ReplicaCountForTesting(service, kDefaultTenant, "standby_terminal_clean"),
-        1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "standby_terminal_clean"),
+              1);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
@@ -2448,8 +2448,7 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairWritesDurableRecords) {
     ReadBatchEventually(storage, 2, canonical_batch);
     ASSERT_EQ(1u, canonical_batch.entries.size());
     EXPECT_EQ(OpType::PUT_END, canonical_batch.entries[0].op_type);
-    EXPECT_EQ("standby_repair_survivor",
-              canonical_batch.entries[0].object_key);
+    EXPECT_EQ("standby_repair_survivor", canonical_batch.entries[0].object_key);
 }
 
 TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
@@ -2467,7 +2466,8 @@ TEST_F(MasterServiceHATest, RestoreDiscardRepairFailureFailsRestore) {
     writer->RejectCommitsWith(ErrorCode::ETCD_OPERATION_ERROR);
 
     const std::string endpoint = "standby_repair_reject_segment";
-    auto survivor = MakeStandbyObject("standby_repair_reject_survivor", endpoint);
+    auto survivor =
+        MakeStandbyObject("standby_repair_reject_survivor", endpoint);
     auto lost = MakeStandbyObject("standby_repair_reject_lost", endpoint);
     survivor.metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint));
     survivor.metadata.replicas[1].id = 2;
