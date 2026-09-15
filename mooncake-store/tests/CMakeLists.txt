@@ -239,6 +239,7 @@ add_store_test(
 add_store_test(zstd_util_test zstd_util_test.cpp)
 add_store_test(local_file_snapshot_config_test
                local_file_snapshot_config_test.cpp)
+add_store_test(s3_client_config_test s3_client_config_test.cpp)
 add_store_test(
   local_file_snapshot_object_store_test
   ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
