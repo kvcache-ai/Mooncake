@@ -495,3 +495,6 @@ foreach(
 endforeach()
 
 add_store_test(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+
+add_store_test(read_plan_test read_plan_test.cpp)
+add_store_test(read_plan_pipeline_test read_plan_pipeline_test.cpp)

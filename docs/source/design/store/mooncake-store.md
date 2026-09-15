@@ -845,5 +845,6 @@ ssd-free-ratio-first-allocation
 nvme-kv-backend
 oss-backend
 engram
+read-plan
 
 :::
