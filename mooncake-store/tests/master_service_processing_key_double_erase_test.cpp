@@ -85,13 +85,10 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitPutStartFailed = 3;  // scenario setup broken
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
-    // Friend access: any second live key in the same tenant (Default) keeps
-    // the TenantCatalog non-empty. All of a tenant's keys live in a single
-    // TenantCatalog regardless of shard (there is no per-key shard to share),
-    // so a simple suffix suffices instead of a shard-index probe.
-    std::string FindKeyOnSameShard(MasterService& service,
-                                   const std::string& key) {
-        (void)service;
+    // Any second live key in the same tenant (Default) keeps the TenantCatalog
+    // non-empty. All of a tenant's keys live in that tenant's one catalog, so
+    // a plain suffix is enough.
+    std::string MakeKeepaliveKey(const std::string& key) const {
         return key + "_keepalive";
     }
 
@@ -124,9 +121,10 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutStartFailed);
         }
 
-        // 2b. A second, completed key on the SAME shard keeps the TenantCatalog
-        //     non-empty in step 4 (see file header for why this is required).
-        const std::string keepalive_key = FindKeyOnSameShard(service, key);
+        // 2b. A second, completed key in the same tenant keeps the
+        //     TenantCatalog non-empty in step 4 (see file header for why this
+        //     is required).
+        const std::string keepalive_key = MakeKeepaliveKey(key);
         if (!service
                  .PutStart(client_id, keepalive_key, TenantId::Default(), 1024,
                            config)

@@ -756,6 +756,151 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
     EXPECT_EQ(0u, service.GetKvClearedSuppressedForTesting());
 }
 
+// The other half of the same rule, pinned without any thread: a commit that
+// lands after the baseline read moves the tenant epoch, and the clear for that
+// tenant must then be withheld. Without this the suppression branch had no
+// coverage at all -- only its uncontended mirror above was tested.
+TEST_F(MasterServiceTest, ClearedIsSuppressedWhenACommitRacedTheScan) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const TenantId tenant = TenantId::Default();
+
+    // The baseline RemoveAll reads before it starts walking.
+    const uint64_t baseline = KvTenantEpochForTest(service, tenant);
+
+    // A writer commits into the same tenant after that baseline, so its
+    // `stored` is on the wire by the time the walk would decide.
+    ASSERT_TRUE(
+        service.PutStart(context.client_id, "raced_key", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(context.client_id, "raced_key", tenant, ReplicaType::MEMORY)
+            .has_value());
+
+    PublishKvClearedIfEpochUnchangedForTest(service, tenant, baseline);
+
+    auto exists = service.ExistKey("raced_key", tenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract raced_key, which was just announced";
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
+// The same rule through the real entry point. RemoveAll snapshots the tenant
+// keys and reads the epoch baseline before the walk; holding an entry lock
+// parks it between those two steps, so the commit below lands inside the
+// window the rule exists for. A run where the sweep had not yet snapshotted
+// fails the `raced_key` assertion rather than passing vacuously.
+TEST_F(MasterServiceTest, RemoveAllWithholdsClearWhenACommitRacesTheScan) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const TenantId tenant = TenantId::Default();
+
+    ASSERT_TRUE(
+        service.PutStart(context.client_id, "victim_key", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "victim_key", tenant,
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto victim = GetEntryForTest(service, tenant, "victim_key");
+    ASSERT_NE(victim, nullptr);
+    auto gate = victim->LockUnique();
+
+    auto remover = std::async(std::launch::async,
+                              [&] { (void)service.RemoveAll(/*force=*/true); });
+    // Let the sweep reach the gate. It snapshots the tenant's keys before the
+    // loop and blocks on the locked entry inside it, which is exactly the
+    // window this rule covers.
+    ASSERT_EQ(remover.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::timeout);
+
+    ASSERT_TRUE(
+        service.PutStart(context.client_id, "racer_key", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(context.client_id, "racer_key", tenant, ReplicaType::MEMORY)
+            .has_value());
+
+    gate.unlock();
+    remover.get();
+
+    auto racer = service.ExistKey("racer_key", tenant);
+    ASSERT_TRUE(racer.has_value());
+    EXPECT_TRUE(racer.value()) << "the raced commit must still be live";
+    auto swept = service.ExistKey("victim_key", tenant);
+    ASSERT_TRUE(swept.has_value());
+    EXPECT_FALSE(swept.value()) << "the sweep must have torn the victim down";
+
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract racer_key, which was just announced";
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
+// The tenant-scoped overload reads its epoch before the scan, not at first
+// sight of an object, so it needs its own coverage of the same ordering rule.
+TEST_F(MasterServiceTest,
+       TenantScopedRemoveAllWithholdsClearWhenACommitRacesTheScan) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const TenantId tenant = TenantId::Default();
+
+    ASSERT_TRUE(
+        service
+            .PutStart(context.client_id, "scoped_victim", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "scoped_victim", tenant,
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto victim = GetEntryForTest(service, tenant, "scoped_victim");
+    ASSERT_NE(victim, nullptr);
+    auto gate = victim->LockUnique();
+
+    auto remover = std::async(std::launch::async, [&] {
+        (void)service.RemoveAll(tenant, /*force=*/true);
+    });
+    ASSERT_EQ(remover.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::timeout);
+
+    ASSERT_TRUE(
+        service
+            .PutStart(context.client_id, "scoped_racer", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "scoped_racer", tenant,
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    gate.unlock();
+    remover.get();
+
+    auto racer = service.ExistKey("scoped_racer", tenant);
+    ASSERT_TRUE(racer.has_value());
+    EXPECT_TRUE(racer.value()) << "the raced commit must still be live";
+    auto swept = service.ExistKey("scoped_victim", tenant);
+    ASSERT_TRUE(swept.has_value());
+    EXPECT_FALSE(swept.value()) << "the sweep must have torn the victim down";
+
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract scoped_racer";
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     const TenantId tenant_a("tenant_restore_a");
     const TenantId tenant_b("tenant_restore_b");
@@ -933,6 +1078,16 @@ TEST_F(MasterServiceTest,
         EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value())
             << "stranded key=" << key;
     }
+}
+
+TEST_F(MasterServiceTest, AccessorCreateRebindsToRouteWinner) {
+    // Regression: MetadataAccessorRW::Create() used to ignore InsertObject()'s
+    // return value, so a concurrent writer that won the key left the accessor
+    // holding an orphan entry that no lookup could reach. It must re-resolve
+    // the route winner instead. The scenario lives on the fixture because the
+    // accessor is private to MasterService and friendship does not inherit.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    AccessorCreateRePinsWinnerEntry(*service_);
 }
 
 TEST_F(MasterServiceTest,
@@ -1709,8 +1864,8 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseObjectRoute) {
     const std::string live_segment_name = "clear_shrink_live_segment";
     const auto stale_segment = PrepareSimpleSegment(
         *service, stale_segment_name, 0x300000000, kSegmentSize);
-    const auto live_segment = PrepareSimpleSegment(
-        *service, live_segment_name, 0x400000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
+                                                   0x400000000, kSegmentSize);
 
     // A few live keys keep the shared tenant alive after the sweep (a partial
     // drain, not a full erase); the rest are swept and must trigger a shrink.

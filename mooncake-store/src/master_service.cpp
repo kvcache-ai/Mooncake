@@ -12536,9 +12536,8 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
-    // Migrate old-format snapshots: re-route objects to their hash(tenant, key)
-    // shards before rebuilding the group domain (which is derived from
-    // metadata).
+    // Rebuild the group domain (membership and shared-lease deadlines) from
+    // the restored metadata.
     service_->catalog_.RebuildGroupState();
     service_->ClearCandidatesForReload();
     return {};

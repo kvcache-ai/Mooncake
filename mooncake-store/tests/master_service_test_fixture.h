@@ -140,16 +140,43 @@ class MasterServiceTest : public ::testing::Test {
     // Test introspection: the bucket count of a tenant's object route.
     // erase() never returns bucket memory, so the post-sweep and post-eviction
     // shrink is only observable through this.
-    size_t RouteBucketCountForTesting(MasterService& service,
-                                      const TenantId& tenant_id =
-                                          TenantId::Default()) {
-        const TenantId normalized =
-            service.ResolveRequestTenantId(tenant_id);
+    size_t RouteBucketCountForTesting(
+        MasterService& service,
+        const TenantId& tenant_id = TenantId::Default()) {
+        const TenantId normalized = service.ResolveRequestTenantId(tenant_id);
         auto tenant_handle = service.catalog_.Lookup(normalized);
         if (!tenant_handle) {
             return 0;
         }
         return tenant_handle->RouteBucketCountForTesting();
+    }
+
+    // The pinned entry for a key, or nullptr when the tenant or key is absent.
+    std::shared_ptr<mooncake::metadata::ObjectEntry> GetEntryForTest(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        const TenantId normalized = service.ResolveRequestTenantId(tenant_id);
+        auto tenant_handle = service.catalog_.Lookup(normalized);
+        if (!tenant_handle) {
+            return nullptr;
+        }
+        return tenant_handle->Get(key);
+    }
+
+    // The tenant's `cleared`-ordering epoch, as RemoveAll reads it before its
+    // walk. Exposed so a test can pin the epoch-changed decision without
+    // racing threads.
+    uint64_t KvTenantEpochForTest(MasterService& service,
+                                  const TenantId& tenant_id) {
+        return service.ReadKvTenantEpoch(
+            service.ResolveRequestTenantId(tenant_id).value());
+    }
+
+    void PublishKvClearedIfEpochUnchangedForTest(MasterService& service,
+                                                 const TenantId& tenant_id,
+                                                 uint64_t expected_epoch) {
+        service.PublishKvClearedIfEpochUnchanged(
+            service.ResolveRequestTenantId(tenant_id), expected_epoch);
     }
 
     void CleanupExpiredSoftPinsAt(

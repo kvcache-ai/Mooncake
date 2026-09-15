@@ -1191,10 +1191,6 @@ class MasterService {
         const TenantId& tenant_id) const;
     bool IsTenantRegistered(const TenantId& tenant_id) const;
 
-    // Register a member key under a group and return the group's shared Lease
-    // (creating it on first member). Returns nullptr for empty group_id.
-    // Reads the member keys registered for `group_id`; empty if unregistered.
-
     // A single group member's eviction outcome, fed back by the
     // EvictGroupOrObject callback.
     struct EvictMemberOutcome {
@@ -1331,9 +1327,6 @@ class MasterService {
         const std::string& key, ObjectMetadata& metadata,
         const StaleHandleCleanupPlan& plan);
 
-    // Post-restore migration: re-route every object to its hash(tenant, key)
-    // shard, fixing snapshots that placed grouped objects on hash(group_id)
-    // shards. No-op for correctly-routed snapshots.
     static void ApplySoftPinMetricDelta(int metric_delta);
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,

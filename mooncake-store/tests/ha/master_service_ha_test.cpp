@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <atomic>
 #include <condition_variable>
 #include <filesystem>
 #include <fstream>
