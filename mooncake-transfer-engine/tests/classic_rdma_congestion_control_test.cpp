@@ -67,6 +67,7 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.prepare(deferred, "peer@nic");
     ASSERT_EQ(adapter.gate(first_queue, avoided), 1u);
     ASSERT_EQ(adapter.gate(target_queue, avoided), 0u);
+    EXPECT_TRUE(deferred->rdma_congestion_control_observed_blocked.load());
 
     TaskCongestionState state = TaskCongestionState::kUnknown;
     ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
@@ -102,7 +103,9 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.bindEndpoint(slice, endpoint);
     std::vector<Transport::Slice*> queued{slice}, avoided;
     ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    EXPECT_FALSE(slice->rdma_congestion_control_observed_blocked.load());
     adapter.complete(slice, IBV_WC_RNR_RETRY_EXC_ERR);
+    EXPECT_TRUE(slice->rdma_congestion_control_observed_blocked.load());
 
     TaskCongestionDetail detail;
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
@@ -199,6 +202,7 @@ TEST(ClassicRdmaCongestionControlTest,
     adapter.tick(1);
     std::vector<Transport::Slice*> queued{slice}, avoided;
     ASSERT_EQ(adapter.gate(queued, avoided), 0u);
+    EXPECT_TRUE(slice->rdma_congestion_control_observed_blocked.load());
 
     TaskCongestionDetail detail;
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
@@ -214,6 +218,7 @@ TEST(ClassicRdmaCongestionControlTest,
     queued = {slice};
     avoided.clear();
     ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    EXPECT_FALSE(slice->rdma_congestion_control_observed_blocked.load());
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
     EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
     EXPECT_TRUE(detail.resolved);

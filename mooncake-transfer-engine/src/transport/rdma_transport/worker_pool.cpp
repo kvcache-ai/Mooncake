@@ -82,7 +82,11 @@ congestionObservation(Transport::TransferTask* task) {
 }
 
 void resolveCongestion(Transport::Slice* slice) {
-    if (!slice || !slice->task) return;
+    if (!slice || !slice->task ||
+        !slice->rdma_congestion_control_observed_blocked.load(std::memory_order_acquire) ||
+        !slice->rdma_congestion_control_observed_blocked.exchange(
+            false, std::memory_order_acq_rel))
+        return;
     auto observation = std::atomic_load_explicit(
         &slice->task->congestion_observation, std::memory_order_acquire);
     if (!observation) return;
@@ -117,10 +121,12 @@ void recordCongestion(Transport::Slice* slice, adaptive_congestion_control::Snap
     auto observation = congestionObservation(slice->task);
     auto evidence = congestionEvidence(path, snapshot, reason);
     evidence.failure_scope = scope;
-    if (unavailable)
-        observation->avoid(*slice_id, 1, evidence);
-    else
-        observation->defer(*slice_id, 1, evidence);
+    const bool recorded = unavailable
+                              ? observation->avoid(*slice_id, 1, evidence)
+                              : observation->defer(*slice_id, 1, evidence);
+    if (recorded)
+        slice->rdma_congestion_control_observed_blocked.store(true,
+                                              std::memory_order_release);
 }
 
 }  // namespace

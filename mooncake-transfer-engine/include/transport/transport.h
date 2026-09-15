@@ -206,6 +206,7 @@ class Transport {
 #ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
         adaptive_congestion_control::Permit rdma_congestion_control_permit;
         size_t rdma_congestion_control_slice_ordinal = 0;
+        std::atomic<bool> rdma_congestion_control_observed_blocked{false};
         void *rdma_congestion_control_route = nullptr;
         RdmaEndPoint *rdma_congestion_control_endpoint = nullptr;
         uint64_t rdma_congestion_control_endpoint_generation = 0;
@@ -455,6 +456,10 @@ class Transport {
             slice->rdma_congestion_control_route = nullptr;
             slice->rdma_congestion_control_endpoint = nullptr;
             slice->rdma_congestion_control_endpoint_generation = 0;
+            if (slice->rdma_congestion_control_observed_blocked.load(
+                    std::memory_order_relaxed))
+                slice->rdma_congestion_control_observed_blocked.store(
+                    false, std::memory_order_relaxed);
 #endif
 
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
