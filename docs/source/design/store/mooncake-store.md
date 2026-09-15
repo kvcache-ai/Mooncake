@@ -670,6 +670,33 @@ Key differences from soft pin:
 - Hard-pinned objects are completely skipped during eviction. Soft-pinned objects may still be evicted when no other candidates are available.
 - Hard pin is immutable once set. Soft pin can be explicitly preserved, enabled, or disabled by write requests; reads do not refresh or reactivate it.
 
+## Store Agent Hints
+
+Mooncake Store accepts an optional agent retention hint through
+`ReplicateConfig::agent_hints`:
+
+```cpp
+struct AgentHints {
+    std::string reuse_hint{"neutral"};  // "keep", "discard", or "neutral"
+    int64_t cache_ttl_ms{0};
+};
+```
+
+The contract is intentionally narrow and soft: `reuse_hint="keep"` maps to the
+existing soft-pin retention path, and `cache_ttl_ms` raises the effective
+soft-pin timeout (clamped by the master's maximum soft-pin TTL). The engine
+owns the retention policy and may clamp or ignore hints; callers that need
+guaranteed protection should use hard pin. `reuse_hint="neutral"` and
+`reuse_hint="discard"` do not add retention by themselves, and they do not
+cancel an existing soft pin. On a same-size upsert, callers can clear
+AgentHints-based retention with `soft_pin_action=DISABLE`.
+
+Hints are validated (`reuse_hint` must be one of the three values,
+`cache_ttl_ms` non-negative) when a write resolves its soft-pin request, and
+are not stored as object metadata: only the materialized soft-pin state
+remains. Fields with no store-side consumer are deliberately not carried;
+add them when a consumer exists.
+
 ## Zombie Object Cleanup
 
 If a Client crashes or experiences a network failure after sending a `PutStart` request but before it can send the corresponding `PutEnd` or `PutRevoke` request to the Master, the object initiated by `PutStart` enters a "zombie" state—rendering it neither usable nor deletable. The existence of such "zombie objects" not only consumes storage space but also prevents subsequent `Put` operations on the same keys. To mitigate these issues, the Master records the start time of each `PutStart` request and employs two timeout thresholds—`put_start_discard_timeout` and `put_start_release_timeout`—to clean up zombie objects.
