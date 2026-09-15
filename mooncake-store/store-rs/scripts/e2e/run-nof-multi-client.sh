@@ -2,10 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel 2>/dev/null || pwd)"
-if [[ ! -f "${ROOT_DIR}/Cargo.toml" && -f "${ROOT_DIR}/mooncake-store/store-rs/Cargo.toml" ]]; then
-  ROOT_DIR="${ROOT_DIR}/mooncake-store/store-rs"
-fi
+ROOT_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 BINARY="${NOF_BINARY:-${ROOT_DIR}/target/debug/nof_multi_client}"
 LOG_DIR="${NOF_LOG_DIR:-${ROOT_DIR}/target/nof-multi-client}"
 RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
