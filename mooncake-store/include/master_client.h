@@ -16,7 +16,7 @@
 #include "config/rpc_protocol_config.h"
 #include "config/rpc_timeout_config.h"
 #include "replica.h"
-#include "segment.h"
+#include "nof_segment_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
