@@ -216,6 +216,13 @@ class FilereadOperationState : public OperationState {
  */
 class TransferEngineOperationState : public OperationState {
    public:
+    // Upper bound for a single transfer engine operation, measured from
+    // submission. wait_for_completion() reports failure once this elapses.
+    // The store client reuses it as the wait cap for a whole batch, whose
+    // transfers run concurrently and therefore never need to wait longer
+    // than one operation.
+    static constexpr int64_t kTimeoutMs = 60 * 1000;
+
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
         : engine_(engine),

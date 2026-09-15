@@ -2790,6 +2790,15 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    // Cap the whole batch at one operation timeout. Transfers in a batch run
+    // concurrently and each future already fails on its own
+    // TransferEngineOperationState::kTimeoutMs after submission, so blocking
+    // get() on every remaining future past that point only serializes their
+    // timeouts and delays PutEnd / PutRevoke at the master.
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(TransferEngineOperationState::kTimeoutMs);
+
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -2798,6 +2807,17 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
 
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
             auto& pending_transfer = op.pending_transfers[i];
+            // Past the deadline, record still-unready transfers as failed
+            // instead of blocking on them one by one.
+            if (std::chrono::steady_clock::now() >= deadline &&
+                !pending_transfer.future.isReady()) {
+                op.transfer_summary.RecordFailure(pending_transfer.replica_type,
+                                                  ErrorCode::TRANSFER_FAIL);
+                op.AppendFailureContext("Transfer " + std::to_string(i) +
+                                        " not completed before batch timeout");
+                continue;
+            }
+
             ErrorCode transfer_result = pending_transfer.future.get();
             if (transfer_result != ErrorCode::OK) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,

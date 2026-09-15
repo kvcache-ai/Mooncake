@@ -827,9 +827,6 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    // 60 seconds
-    constexpr int64_t timeout_milliseconds = 60 * 1000;
-
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
 
@@ -850,11 +847,10 @@ void TransferEngineOperationState::wait_for_completion() {
         std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
         const int64_t elapsed_milliseconds =
             getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
+        if (elapsed_milliseconds < kTimeoutMs) {
             completed = batch_desc.completion_cv.wait_for(
                 lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
+                std::chrono::milliseconds(kTimeoutMs - elapsed_milliseconds),
                 [&batch_desc] {
                     return batch_desc.is_finished.load(
                         std::memory_order_relaxed);
@@ -880,18 +876,16 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
                 << " with result: " << static_cast<int>(error_code);
     } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
+        LOG(ERROR) << "Failed to complete transfers after " << kTimeoutMs
+                   << " milliseconds for batch " << batch_id_;
     }
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
     while (true) {
-        if (getCurrentTimeInMilli() - start_ts_ > timeout_milliseconds) {
-            LOG(ERROR) << "Failed to complete transfers after "
-                       << timeout_milliseconds << " milliseconds for batch "
-                       << batch_id_;
+        if (getCurrentTimeInMilli() - start_ts_ > kTimeoutMs) {
+            LOG(ERROR) << "Failed to complete transfers after " << kTimeoutMs
+                       << " milliseconds for batch " << batch_id_;
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
