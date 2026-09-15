@@ -348,14 +348,14 @@ class PutAllocationFixture {
     bool expectAllocationFailure(uint64_t request_size) {
         ReplicaAllocationRequest request;
         request.replicas.size = request_size;
-        auto result = pool_.AllocateReplicas(request, RandomPlacementPolicy{});
+        auto result = pool_.AllocateReplicas(request);
         return !result.has_value();
     }
 
     bool allocateAndFree(uint64_t request_size) {
         ReplicaAllocationRequest request;
         request.replicas.size = request_size;
-        auto result = pool_.AllocateReplicas(request, RandomPlacementPolicy{});
+        auto result = pool_.AllocateReplicas(request);
         return result.has_value();
     }
 

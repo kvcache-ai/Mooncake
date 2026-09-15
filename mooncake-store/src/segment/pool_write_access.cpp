@@ -1,4 +1,5 @@
 #include "segment/pool_write_access.h"
+#include "pool_operations_internal.h"
 
 #include <algorithm>
 #include "master_metric_manager.h"
@@ -6,7 +7,9 @@
 
 namespace mooncake {
 SegmentPool::WriteAccess::WriteAccess(AccessKey, SegmentPool& segment_pool)
-    : segment_pool_(segment_pool),
+    : SegmentQueries(segment_pool.catalog_, segment_pool.placement_index_,
+                     segment_pool.allocation_.Kind()),
+      segment_pool_(segment_pool),
       lock_(segment_pool.pool_mutex_),
       catalog_(segment_pool.catalog_) {}
 
@@ -284,6 +287,10 @@ ErrorCode SegmentPool::WriteAccess::TransitionRegion(
 }
 
 void SegmentPool::WriteAccess::Clear() noexcept {
+    segment_pool_.ClearRecovery();
+    segment_pool_.unmounts_.clear();
+    segment_pool_.unmount_by_region_.clear();
+    segment_pool_.reserved_names_.clear();
     for (const auto& mounted : catalog_.Regions()) {
         if (auto* driver = segment_pool_.GetDriver(mounted.kind)) {
             (void)driver->Erase(mounted.segment.id);

@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "segment/pool_write_access.h"
 
 #include <atomic>
 #include <chrono>

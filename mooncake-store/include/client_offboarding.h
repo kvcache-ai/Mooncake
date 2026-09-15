@@ -29,6 +29,7 @@ struct PendingSegmentOffboarding {
 
 struct PreparedSegmentOffboarding {
     UUID segment_id;
+    UUID resource_operation_id;
     std::string segment_name;
     std::string transport_endpoint;
     size_t metrics_dec_capacity{0};

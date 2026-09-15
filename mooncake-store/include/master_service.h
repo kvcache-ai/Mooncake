@@ -37,7 +37,6 @@
 #include "nof_segment_manager.h"
 #include "placement/replica_allocator.h"
 #include "segment/pool.h"
-#include "segment/pool_write_access.h"
 #include "serialize/serializer.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
@@ -2816,8 +2815,6 @@ class MasterService {
     static constexpr double kDynamicReplicationTargetHighWatermark = 0.85;
 
     bool DynamicReplicationEnabled() const;
-    static uint64_t DynamicReplicationStableScore(const std::string& key,
-                                                  const std::string& segment);
     bool DynamicReplicationEnforce() const;
     uint32_t DynamicReplicationAdmissionMinHits() const;
     void CleanupDynamicReplicationWindowsLocked(
@@ -2903,32 +2900,10 @@ class MasterService {
     std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
-    SegmentPool segment_pool_;
-    // Process-local offboarding tokens, protected by the Pool write lock.
-    // The worker's pending-job barrier keeps them out of snapshots.
-    std::unordered_map<UUID, RegionUnmountTxn, boost::hash<UUID>>
-        client_offboarding_unmounts_;
-    // Names outlive resource removal until the terminal OpLog is accepted.
-    std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>>
-        client_offboarding_reserved_names_;
+    // Placement borrows LocalSSD metrics; the provider must outlive the Pool.
     LocalSsdManager local_ssd_manager_;
+    SegmentPool segment_pool_;
     NoFSegmentManager nof_segment_manager_;
-    BufferAllocatorType memory_allocator_type_;
-    const PlacementPolicyType memory_placement_policy_;
-
-    AllocationCandidateKind MemoryAllocationKind() const {
-        return memory_placement_policy_ == PlacementPolicyType::CXL
-                   ? AllocationCandidateKind::CXL
-                   : AllocationCandidateKind::NATIVE;
-    }
-    tl::expected<std::vector<Replica>, ErrorCode> AllocateMemoryReplicas(
-        const ReplicaAllocationRequest& request,
-        PlacementDiagnostics* diagnostics = nullptr);
-    tl::expected<Replica, ErrorCode> AllocateMemoryReplicaFrom(
-        size_t size, std::string_view segment_name);
-    tl::expected<std::vector<Replica>, ErrorCode> AllocateNoFReplicas(
-        const ReplicaAllocationRequest& request);
-
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
@@ -3012,13 +2987,6 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
-    tl::expected<void, ErrorCode> ValidateDrainTargets(
-        const CreateDrainJobRequest& request);
-    tl::expected<void, ErrorCode> ValidateDrainRequest(
-        const CreateDrainJobRequest& request);
-    tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
-        SegmentPool::WriteAccess& segment_access,
-        const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
@@ -3174,15 +3142,6 @@ class MasterService {
     // Standby-restored memory endpoints remain unreadable until the owning
     // Client has successfully remounted them.
     std::unordered_set<std::string> invalid_replica_endpoints_;
-
-    // Keep DummyBufferAllocator alive after standby restore.
-    // Key: transport_endpoint, Value: allocator.
-    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
-        standby_allocator_keepalive_;
-    std::vector<StandbySegmentInfo> standby_memory_segments_;
-    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
-
-    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;

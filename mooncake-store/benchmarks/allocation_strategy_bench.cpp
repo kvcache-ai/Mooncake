@@ -324,7 +324,7 @@ static void setupResourceLimits() {
  */
 class BenchmarkPlacement final {
    public:
-    explicit BenchmarkPlacement(PlacementPolicyType policy) : policy_(policy) {
+    explicit BenchmarkPlacement(PlacementPolicyType policy) {
         RegionDriverConfig config;
         config.memory_allocator = BufferAllocatorType::OFFSET;
         auto drivers = CreateRegionDrivers(config);
@@ -333,7 +333,7 @@ class BenchmarkPlacement final {
                 "failed to create benchmark region drivers: " +
                 toString(drivers.error()));
         }
-        pool_ = std::make_unique<SegmentPool>(std::move(*drivers));
+        pool_ = std::make_unique<SegmentPool>(std::move(*drivers), policy);
     }
     BenchmarkPlacement(BenchmarkPlacement&&) noexcept = default;
     BenchmarkPlacement& operator=(BenchmarkPlacement&&) = delete;
@@ -359,16 +359,7 @@ class BenchmarkPlacement final {
         ReplicaAllocationRequest request;
         request.replicas.size = size;
         request.replicas.count = replica_count;
-        switch (policy_) {
-            case PlacementPolicyType::RANDOM:
-                return pool_->AllocateReplicas(request,
-                                               RandomPlacementPolicy{});
-            case PlacementPolicyType::FREE_RATIO_FIRST:
-                return pool_->AllocateReplicas(request,
-                                               FreeRatioFirstPlacementPolicy{});
-            default:
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
+        return pool_->AllocateReplicas(request);
     }
 
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators()
@@ -380,7 +371,6 @@ class BenchmarkPlacement final {
     // SegmentPool itself is not movable; keep it stable when returning a
     // fixture.
     std::unique_ptr<SegmentPool> pool_;
-    PlacementPolicyType policy_;
     UUID client_id_ = generate_uuid();
     std::vector<std::shared_ptr<BufferAllocatorBase>> allocators_;
 };

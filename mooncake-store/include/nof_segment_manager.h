@@ -11,8 +11,10 @@
 #include <vector>
 
 #include "placement/index.h"
+#include "placement/replica_placement.h"
 #include "rpc_types.h"
 #include "segment/status.h"
+#include "segment/recovery.h"
 #include "segment/usage.h"
 #include "storage_usage.h"
 
@@ -60,9 +62,21 @@ class ScopedNoFSegmentWriteAccess final {
 class NoFSegmentManager final {
    public:
     explicit NoFSegmentManager(
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
-        : memory_allocator_(memory_allocator) {}
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB,
+        PlacementPolicyType policy = PlacementPolicyType::RANDOM)
+        : memory_allocator_(memory_allocator),
+          allocation_(policy, ReplicaPlacement::Backend::NoF) {}
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateReplicas(
+        const ReplicaAllocationRequest& request,
+        PlacementDiagnostics* diagnostics = nullptr) const {
+        auto access = AcquirePlacementAccess();
+        return allocation_.Allocate(access, request, diagnostics);
+    }
     ~NoFSegmentManager();
+    void InstallRecovery(std::unique_ptr<NoFBufferRecovery> recovery) {
+        std::unique_lock lock(manager_mutex_);
+        recovery_ = std::move(recovery);
+    }
 
     ScopedNoFSegmentWriteAccess AcquireWriteAccess();
     ScopedPlacementReadAccess AcquirePlacementAccess() const;
@@ -78,6 +92,8 @@ class NoFSegmentManager final {
    private:
     mutable std::shared_mutex manager_mutex_;
     const BufferAllocatorType memory_allocator_;
+    std::unique_ptr<NoFBufferRecovery> recovery_;
+    ReplicaPlacement allocation_;
     PlacementIndex placement_index_;
     std::unordered_map<UUID, MountedNoFSegment, boost::hash<UUID>>
         mounted_segments_;

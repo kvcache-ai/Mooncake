@@ -10,6 +10,11 @@ namespace mooncake {
 
 tl::expected<SegmentPoolSnapshot, ErrorCode> SegmentPool::CaptureSnapshot()
     const {
+    // Pending external acknowledgements and name reservations are deliberately
+    // process-local. Never produce a snapshot that silently drops them.
+    if (!unmounts_.empty()) {
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
     const auto* driver = GetDriver(RegionKind::HOST_MEMORY);
     if (!driver || driver->allocator_type() != BufferAllocatorType::OFFSET) {
         return tl::make_unexpected(ErrorCode::SERIALIZE_UNSUPPORTED);

@@ -445,7 +445,7 @@ TEST(SegmentPoolTest, AllocationKeepsReadLockAcrossAllocatorCall) {
 }
 
 TEST(SegmentPoolTest, LocalPlacementUsesMountedHostIdentity) {
-    SegmentPool pool(Drivers());
+    SegmentPool pool(Drivers(), PlacementPolicyType::LOCAL_FIRST);
     const UUID client = generate_uuid();
     auto local = MakeSegment(0, "local", "tcp", "writer");
     auto remote = MakeSegment(1, "remote", "tcp", "other-host");
@@ -457,7 +457,7 @@ TEST(SegmentPoolTest, LocalPlacementUsesMountedHostIdentity) {
     ReplicaAllocationRequest request;
     request.replicas.size = 4096;
     request.host_affinity = {"writer", "key"};
-    auto result = pool.AllocateReplicas(request, LocalFirstPlacementPolicy{});
+    auto result = pool.AllocateReplicas(request);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result->size(), 1U);
     EXPECT_EQ(ReplicaEndpoint(result->front()), local.te_endpoint);
@@ -1217,15 +1217,14 @@ TEST(SegmentPoolTest, SnapshotPreservesSsdPlacementOwnerRanking) {
 
     auto encoded = CaptureAndEncode(source, local_ssd.ExportPersistedState());
     ASSERT_TRUE(encoded.has_value());
-    SegmentPool restored(Drivers());
+    SegmentPool restored(Drivers(), PlacementPolicyType::SSD_FREE_RATIO_FIRST,
+                         &local_ssd);
     ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
     // SSD usage is a live metrics view. Restored placement must look it up by
     // the preserved owner rather than by segment name or insertion order.
     ReplicaAllocationRequest request;
     request.replicas.size = 4096;
-    auto allocated = restored.AllocateReplicas(
-        request,
-        SsdFreeRatioFirstPlacementPolicy{LocalSSDMetricsView(local_ssd)});
+    auto allocated = restored.AllocateReplicas(request);
     ASSERT_TRUE(allocated.has_value());
     ASSERT_EQ(allocated->size(), 1U);
     EXPECT_EQ(ReplicaEndpoint(allocated->front()), free.te_endpoint);

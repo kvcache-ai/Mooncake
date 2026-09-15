@@ -3,13 +3,14 @@
 #include <shared_mutex>
 
 #include "segment/pool.h"
+#include "segment/queries.h"
 #include "placement/index.h"
 #include "segment/catalog.h"
 #include "segment/region_driver.h"
 
 namespace mooncake {
 
-class SegmentPool::ReadAccess final {
+class SegmentPool::ReadAccess final : public SegmentQueries {
    public:
     ReadAccess(ReadAccess&&) noexcept = default;
     ReadAccess& operator=(ReadAccess&&) noexcept = delete;
@@ -18,6 +19,8 @@ class SegmentPool::ReadAccess final {
 
     const RegionCatalog& Catalog() const;
     const PlacementIndex& Placement() const;
+
+    StorageUsage GetResourceUsage(const UUID& region_id) const;
 
     std::shared_ptr<BufferAllocatorBase> GetAllocator(
         const UUID& region_id) const;

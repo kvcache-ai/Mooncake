@@ -11,10 +11,12 @@
 
 #include "segment/catalog.h"
 #include "segment/pool.h"
+#include "segment/queries.h"
+#include "segment/operations.h"
 
 namespace mooncake {
 
-class SegmentPool::WriteAccess final {
+class SegmentPool::WriteAccess final : public SegmentQueries {
     struct TransactionKey {
         explicit TransactionKey() = default;
     };
@@ -28,7 +30,21 @@ class SegmentPool::WriteAccess final {
 
     WriteAccess(AccessKey, SegmentPool& segment_pool);
 
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
+    ClientUnmountBatch BeginClientUnmount(const UUID& client_id);
+    tl::expected<SegmentUnmountOperation, ErrorCode> BeginUnmount(
+        const UUID& segment_id, const UUID& client_id);
+    ErrorCode ReleaseUnmountedResources(const UUID& operation_id);
+    ErrorCode AcknowledgeUnmount(const UUID& operation_id);
+    ErrorCode StartGracefulUnmount(const UUID& segment_id,
+                                   const UUID& client_id);
+    ErrorCode StartDrain(std::span<const std::string> sources,
+                         std::span<const std::string> targets);
+    void FinishDrain(std::string_view name);
+    void CancelDrain(std::span<const std::string> names);
+    bool IsNameReserved(std::string_view name) const;
+
+    ErrorCode MountSegment(const Segment& segment, const UUID& client_id,
+                           std::shared_ptr<ClientLivenessRecord> liveness = {});
     tl::expected<RegionMountTxn, ErrorCode> PrepareMount(const Segment& segment,
                                                          const UUID& client_id);
     // Descriptors must use the canonical transport endpoint. The recovery

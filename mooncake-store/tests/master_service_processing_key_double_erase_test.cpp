@@ -55,6 +55,7 @@
 // simply reports OBJECT_NOT_FOUND) and the test passes.
 
 #include "master_service.h"
+#include "segment/pool_write_access.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

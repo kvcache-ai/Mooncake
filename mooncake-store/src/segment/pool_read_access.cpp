@@ -13,6 +13,13 @@ const RegionResource* SegmentPool::ReadAccess::GetResource(
     return driver ? driver->GetResource(mounted.segment.id) : nullptr;
 }
 
+StorageUsage SegmentPool::ReadAccess::GetResourceUsage(
+    const UUID& region_id) const {
+    const auto allocator = GetAllocator(region_id);
+    return allocator ? StorageUsage{allocator->size(), allocator->capacity()}
+                     : StorageUsage{};
+}
+
 std::shared_ptr<BufferAllocatorBase> SegmentPool::ReadAccess::GetAllocator(
     const UUID& region_id) const {
     auto mounted = catalog_.Find(region_id);
@@ -73,7 +80,9 @@ bool SegmentPool::ReadAccess::IsInactive(
 }
 
 SegmentPool::ReadAccess::ReadAccess(AccessKey, const SegmentPool& segment_pool)
-    : lock_(segment_pool.pool_mutex_),
+    : SegmentQueries(segment_pool.catalog_, segment_pool.placement_index_,
+                     segment_pool.allocation_.Kind()),
+      lock_(segment_pool.pool_mutex_),
       catalog_(segment_pool.catalog_),
       drivers_(segment_pool.region_drivers_),
       placement_(segment_pool.placement_index_) {}

@@ -53,6 +53,9 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
     const Segment& segment, const UUID& client_id,
     const std::vector<LiveAllocation>& live_allocations,
     uint64_t imported_requested_bytes) {
+    if (IsNameReserved(segment.name)) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const RegionKind kind = ClassifyRegion(segment);
     RegionDriver* driver = segment_pool_.GetDriver(kind);
     if (!driver) {
@@ -199,21 +202,24 @@ ErrorCode SegmentPool::WriteAccess::PublishMount(
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentPool::WriteAccess::MountSegment(const Segment& segment,
-                                                 const UUID& client_id) {
+ErrorCode SegmentPool::WriteAccess::MountSegment(
+    const Segment& segment, const UUID& client_id,
+    std::shared_ptr<ClientLivenessRecord> liveness) {
+    if (IsNameReserved(segment.name)) return ErrorCode::INVALID_PARAMS;
     if (const auto* mounted = catalog_.Find(segment.id)) {
-        if (mounted->status != SegmentStatus::OK) {
+        if (mounted->client_id != client_id || mounted->segment != segment)
+            return ErrorCode::INVALID_PARAMS;
+        if (mounted->status != SegmentStatus::OK)
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        }
-        return mounted->client_id == client_id && mounted->segment == segment
-                   ? ErrorCode::SEGMENT_ALREADY_EXISTS
-                   : ErrorCode::INVALID_PARAMS;
+        if (liveness) BindClientLiveness(client_id, liveness);
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
     }
     auto prepared = PrepareMount(segment, client_id);
-    if (!prepared) {
-        return prepared.error();
-    }
-    return prepared->Commit(*this);
+    if (!prepared) return prepared.error();
+    const auto result = prepared->Commit(*this);
+    if (result == ErrorCode::OK && liveness)
+        BindClientLiveness(client_id, liveness);
+    return result;
 }
 
 }  // namespace mooncake

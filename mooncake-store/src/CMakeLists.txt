@@ -26,8 +26,12 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/region_driver.cpp
     placement/index.cpp
     placement/replica_allocator.cpp
+    placement/replica_placement.cpp
     segment/catalog.cpp
     segment/pool.cpp
+    segment/queries.cpp
+    segment/recovery.cpp
+    segment/pool_operations.cpp
     segment/pool_mount.cpp
     segment/snapshot.cpp
     ha/snapshot/allocator_snapshot_codec.cpp
