@@ -32,6 +32,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "common.h"
 #include "topology.h"
@@ -248,6 +249,12 @@ class TransferMetadata {
 
     int syncSegmentCache(const std::string &segment_name);
 
+    // Record a peer failure without network I/O or invalidating cache readers
+    // used for rail selection. Transfer submission/retry consumes the request.
+    void requestSegmentRefresh(SegmentID segment_id);
+    std::shared_ptr<SegmentDesc> getSegmentDescForTransfer(
+        SegmentID segment_id, bool force_update = false);
+
     int removeSegmentDesc(const std::string &segment_name);
 
     int addLocalMemoryBuffer(const BufferDesc &buffer_desc,
@@ -326,6 +333,9 @@ class TransferMetadata {
     // segment's backend fetch fails; reset to 0 on a successful fetch. Once it
     // reaches kStaleSegmentFailureThreshold the cached entry is invalidated.
     std::unordered_map<std::string, int> segment_failure_counts_;
+    // Guarded by segment_lock_. Consume before fetching so failures reported
+    // during the fetch remain pending for the next transfer.
+    std::unordered_set<SegmentID> segment_refresh_requests_;
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;
