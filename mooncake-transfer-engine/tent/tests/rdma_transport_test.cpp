@@ -3442,10 +3442,28 @@ TEST_F(RdmaWorkersAvoidTest, UnpostedAvoidDoesNotPauseRailAndProbeRecovers) {
     request.target_id = target_;
     request.target_offset = kTarget;
     request.length = source_.size();
+    auto observation =
+        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(0, 0);
+    transport_.setTaskCongestionObservation(batch_, 0, observation, 1);
     ASSERT_TRUE(transport_.submitTransferTasks(batch_, {request}).ok());
     auto* batch = static_cast<RdmaSubBatch*>(batch_);
     ASSERT_EQ(batch->task_list[0]->num_slices, 3u);
     RdmaTransportTestPeer::postTick(*active_);
+
+    EXPECT_EQ(observation->state(), TaskCongestionState::kLongUnavailable);
+    auto detail = observation->detail();
+    ASSERT_TRUE(detail.reason.observed);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kPathQuarantined);
+    ASSERT_TRUE(detail.affected_path.observed);
+    EXPECT_NE(detail.affected_path.value.find("avoid-remote-machine"),
+              std::string::npos);
+    ASSERT_TRUE(detail.controller_mode.observed);
+    EXPECT_EQ(detail.controller_mode.value,
+              TaskCongestionControllerMode::kEnforce);
+    EXPECT_TRUE(detail.controller_generation.observed);
+    EXPECT_TRUE(detail.window_bytes.observed);
+    EXPECT_TRUE(detail.inflight_bytes.observed);
+    EXPECT_FALSE(detail.resolved);
 
     EXPECT_TRUE(post_order.empty()) << "quarantine must not post any WR";
     auto* slice = batch->slice_chain[0];
@@ -3478,6 +3496,8 @@ TEST_F(RdmaWorkersAvoidTest, UnpostedAvoidDoesNotPauseRailAndProbeRecovers) {
     EXPECT_EQ(post_order.size(), 3u);
     EXPECT_EQ(adaptive_congestion_control::snapshot(route_->domain).state,
               adaptive_congestion_control::PathState::kHealthy);
+    EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
+    EXPECT_TRUE(observation->detail().resolved);
 }
 #endif
 

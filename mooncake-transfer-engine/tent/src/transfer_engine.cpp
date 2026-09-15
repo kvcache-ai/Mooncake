@@ -190,6 +190,16 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
     return impl_->getTransferStatus(batch_id, overall_status);
 }
 
+Status TransferEngine::getTaskCongestionState(
+    BatchID batch_id, size_t task_id, TaskCongestionState& state) const {
+    return impl_->getTaskCongestionState(batch_id, task_id, state);
+}
+
+Status TransferEngine::getTaskCongestionDetail(
+    BatchID batch_id, size_t task_id, TaskCongestionDetail& detail) const {
+    return impl_->getTaskCongestionDetail(batch_id, task_id, detail);
+}
+
 Status TransferEngine::progressBatch(BatchID batch_id,
                                      TransferStatus& overall_status) {
     return impl_->progressBatch(batch_id, overall_status);

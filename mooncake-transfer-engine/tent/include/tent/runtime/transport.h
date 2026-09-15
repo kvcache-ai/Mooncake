@@ -32,6 +32,9 @@
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/control_plane.h"
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+#include "task_congestion_observation.h"
+#endif
 
 namespace mooncake {
 namespace tent {
@@ -115,6 +118,14 @@ class Transport {
         return Status::NotImplemented(
             "getTransferStatus not implemented" LOC_MARK);
     }
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    virtual bool taskCongestionEnabled() const { return false; }
+
+    virtual void setTaskCongestionObservation(
+        SubBatchRef, size_t,
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>, uint64_t) {}
+#endif
 
     virtual Status retryTransferTask(SubBatchRef batch, int task_id,
                                      const Request& request) {

@@ -107,6 +107,10 @@ add_test(NAME bounded_mpsc_queue_test COMMAND bounded_mpsc_queue_test)
 
 add_executable(rdma_cancel_test rdma_cancel_test.cpp ../src/runtime/slab.cpp)
 target_link_libraries(rdma_cancel_test PRIVATE tent_common gtest gtest_main)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  target_link_libraries(rdma_cancel_test
+                        PRIVATE adaptive_congestion_control_core)
+endif()
 target_include_directories(rdma_cancel_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME rdma_cancel_test COMMAND rdma_cancel_test)

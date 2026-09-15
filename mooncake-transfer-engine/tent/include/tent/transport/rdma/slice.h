@@ -133,6 +133,11 @@ struct RdmaTask {
 
     // Reference counting for UAF protection
     std::atomic<int> ref_count{0};
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>
+        congestion_observation;
+    uint64_t congestion_attempt_id = 0;
+#endif
 
     void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
     void deref() {
@@ -150,6 +155,9 @@ struct RdmaSlice {
     size_t length = 0;
 
     RdmaTask* task = nullptr;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    uint64_t slice_idx = 0;
+#endif
     RdmaSlice* next = nullptr;
 
     uint32_t source_lkey = 0;
@@ -229,6 +237,7 @@ struct RdmaSlice {
     TentRdmaCongestionControlRoute* congestion_control_route = nullptr;
     adaptive_congestion_control::Permit congestion_control_permit;
     uint32_t congestion_control_endpoint_generation = 0;
+    std::atomic<bool> congestion_control_observed_blocked{false};
 #endif
     int priority = PRIO_HIGH;
 };
@@ -253,6 +262,12 @@ static inline void updateSliceStatus(RdmaSlice* slice,
                 ? COMPLETED
                 : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+        if (final_st != COMPLETED && task->congestion_observation) {
+            task->congestion_observation->terminalFailure(
+                task->congestion_attempt_id);
+        }
+#endif
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
     task->deref();

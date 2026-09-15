@@ -49,6 +49,11 @@ using RdmaContextSet = std::vector<std::shared_ptr<RdmaContext>>;
 struct RdmaSubBatch : public Transport::SubBatch {
     std::vector<RdmaTask*> task_list;
     std::vector<RdmaSlice*> slice_chain;
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    std::vector<std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation>>
+        congestion_observations;
+    std::vector<uint64_t> congestion_attempt_ids;
+#endif
     size_t max_size;
     virtual size_t size() const { return task_list.size(); }
 };
@@ -81,6 +86,14 @@ class RdmaTransport : public Transport {
 
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
                                      TransferStatus& status);
+
+#ifdef MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
+    bool taskCongestionEnabled() const override;
+    void setTaskCongestionObservation(
+        SubBatchRef batch, size_t task_id,
+        std::shared_ptr<adaptive_congestion_control::TaskCongestionObservation> observation,
+        uint64_t attempt_id) override;
+#endif
 
     bool supportsCancellation() const override { return true; }
 

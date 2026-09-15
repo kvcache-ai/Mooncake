@@ -243,6 +243,7 @@ int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
 
 #include "tent/common/status.h"
 #include "tent/common/types.h"
+#include "task_congestion_status.h"
 
 namespace mooncake {
 class TransferEngine;
@@ -351,6 +352,11 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getTaskCongestionState(BatchID batch_id, size_t task_id,
+                                  TaskCongestionState& state) const;
+    Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
+                                   TaskCongestionDetail& detail) const;
 
     // Drive one progress step on a batch and return its aggregated status.
     // Unlike getTransferStatus, this always allows internal failover/resubmit
