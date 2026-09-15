@@ -10,6 +10,7 @@
 #include "ha/kv/ha_kv_backend.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/batch_oplog/writer.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
@@ -415,12 +416,31 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     }
 
     BatchOpLogSnapshotPublisher publisher(backend_, cluster_id_);
-    ErrorCode publish_error = publisher.Publish(*lease, *descriptor);
+    std::optional<std::string> expected_fallback;
+    ErrorCode publish_error =
+        publisher.Publish(*lease, *descriptor, &expected_fallback);
     if (publish_error != ErrorCode::OK) {
         auto cleanup = object_store_.DeleteObjectsWithPrefix(artifact_prefix);
         if (!cleanup) {
             LOG(WARNING) << "Failed to clean unpublished snapshot candidate: "
                          << cleanup.error();
+        }
+    }
+    if (publish_error == ErrorCode::OK) {
+        BatchOpLogSnapshotGc gc(backend_, object_store_, cluster_id_,
+                                config_.snapshot_root);
+        try {
+            auto cancelled = [this] {
+                std::lock_guard<std::mutex> lock(mutex_);
+                return stop_requested_ || promotion_requested_;
+            };
+            if (gc.Run(*lease, *descriptor, expected_fallback, cancelled) !=
+                ErrorCode::OK)
+                LOG(WARNING) << "Batch snapshot object GC skipped or failed";
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Batch snapshot object GC threw: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "Batch snapshot object GC threw unknown exception";
         }
     }
     release_lease();
