@@ -713,6 +713,8 @@ Status TransferEngine::submitTransfer(
             req.target_offset = item.target_offset;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
+            req.intent_type =
+                static_cast<mooncake::tent::IntentType>(item.intent_type);
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -739,6 +741,8 @@ Status TransferEngine::submitTransferWithNotify(
             req.target_offset = item.target_offset;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
+            req.intent_type =
+                static_cast<mooncake::tent::IntentType>(item.intent_type);
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;
@@ -1258,7 +1262,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     continue;
                 }
 
-                requests_.push_back(TransferRequest{
+                TransferRequest req{
                     .opcode = range.opcode,
                     .source =
                         static_cast<char*>(range.local_buffer) + local_offset,
@@ -1266,7 +1270,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
                     .task_group_id = 1,
-                });
+                };
+                req.intent_type = range.intent_type;
+                requests_.push_back(req);
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
         }

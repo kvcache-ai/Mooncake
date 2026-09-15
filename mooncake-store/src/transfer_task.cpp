@@ -16,6 +16,9 @@
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+#ifdef USE_TENT
+#include "tent/transfer_engine.h"
+#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -734,6 +737,15 @@ void MemcpyWorkerPool::workerThread() {
 // TransferEngineOperationState Implementation
 // ============================================================================
 
+TransferEngineOperationState::~TransferEngineOperationState() {
+#ifdef USE_TENT
+    if (tent_engine_)
+        tent_engine_->freeBatch(batch_id_);
+    else
+#endif
+        engine_.freeBatchID(batch_id_);
+}
+
 bool TransferEngineOperationState::is_completed() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (result_.has_value()) {
@@ -755,13 +767,33 @@ void TransferEngineOperationState::check_task_status() {
 
     for (size_t i = 0; i < batch_size_; ++i) {
         TransferStatus status;
-        Status s = engine_.getTransferStatus(batch_id_, i, status);
-        if (!s.ok()) {
-            LOG(ERROR) << "Failed to get transfer status for batch "
-                       << batch_id_ << " task " << i << " with error "
-                       << s.message();
-            set_result_internal(ErrorCode::TRANSFER_FAIL);
-            return;
+        Status s;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::TransferStatus tent_status;
+            auto tent_s =
+                tent_engine_->getTransferStatus(batch_id_, i, tent_status);
+            if (!tent_s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << tent_s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            status.s = static_cast<TransferStatusEnum>(tent_status.s);
+            status.transferred_bytes = tent_status.transferred_bytes;
+            s = Status::OK();
+        } else
+#endif
+        {
+            s = engine_.getTransferStatus(batch_id_, i, status);
+            if (!s.ok()) {
+                LOG(ERROR) << "Failed to get transfer status for batch "
+                           << batch_id_ << " task " << i << " with error "
+                           << s.message();
+                set_result_internal(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
         }
 
         switch (status.s) {
@@ -948,6 +980,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                                      TransferMetric* transfer_metric,
                                      int numa_socket_id)
     : engine_(engine),
+      tent_engine_(engine.getTentEngine().get()),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
 #ifdef USE_NOF
@@ -977,7 +1010,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size, int intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -989,7 +1022,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         }
 
         if (op_code == TransferRequest::READ) {
-            future = submitMemoryReadOperation(handle, slices, 0);
+            future = submitMemoryReadOperation(handle, slices, 0, intent);
         } else {
             TransferStrategy strategy = selectStrategy(handle, slices);
 
@@ -998,8 +1031,8 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                     future = submitMemcpyOperation(handle, slices, op_code);
                     break;
                 case TransferStrategy::TRANSFER_ENGINE:
-                    future =
-                        submitTransferEngineOperation(handle, slices, op_code);
+                    future = submitTransferEngineOperation(handle, slices,
+                                                           op_code, 0, intent);
                     break;
                 default:
                     LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -1035,7 +1068,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, int intent) {
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice lists";
         return std::nullopt;
@@ -1075,11 +1108,27 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             continue;
         }
         uint64_t offset = 0;
-        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment "
-                       << handle.transport_endpoint_;
-            return std::nullopt;
+        SegmentHandle seg = 0;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(handle.transport_endpoint_);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment "
+                           << handle.transport_endpoint_;
+                return std::nullopt;
+            }
         }
         for (const auto& slice : slices) {
             TransferRequest request;
@@ -1094,7 +1143,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     }
     auto future = use_local_memcpy
                       ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests);
+                      : submitTransfer(requests, intent);
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1105,7 +1154,15 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 }
 
 TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
-    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    int intent) {
+    if (tent_engine_) {
+        auto mutable_transfers = transfers;
+        for (auto& range : mutable_transfers) {
+            range.intent_type = intent;
+        }
+        return engine_.submitScatter(mutable_transfers);
+    }
     return engine_.submitScatter(transfers);
 }
 
@@ -1114,7 +1171,7 @@ TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
-    OffloadBufferAccess buffer_access) {
+    OffloadBufferAccess buffer_access, int intent) {
     if (keys.size() != pointers.size()) {
         LOG(ERROR) << "Mismatched offload transfer argument counts";
         return std::nullopt;
@@ -1134,10 +1191,24 @@ TransferSubmitter::submit_batch_get_offload_object(
     SegmentHandle seg = 0;
     if (!use_local_memcpy) {
         // Open once: all keys share the same transfer endpoint.
-        seg = engine_.openSegment(transfer_engine_addr);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-            return std::nullopt;
+#ifdef USE_TENT
+        if (tent_engine_) {
+            tent::SegmentID seg_id;
+            auto status =
+                tent_engine_->openSegment(seg_id, transfer_engine_addr);
+            if (!status.ok()) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
+            seg = seg_id;
+        } else
+#endif
+        {
+            seg = engine_.openSegment(transfer_engine_addr);
+            if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+                LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+                return std::nullopt;
+            }
         }
     }
 
@@ -1174,7 +1245,7 @@ TransferSubmitter::submit_batch_get_offload_object(
         }
     }
     return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
-                            : submitTransfer(requests);
+                            : submitTransfer(requests, intent);
 }
 
 void TransferSubmitter::appendMemcpyOperations(
@@ -1224,34 +1295,57 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
-    // Allocate batch ID
+    std::vector<TransferRequest>& requests, int intent) {
     const size_t batch_size = requests.size();
-    BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == INVALID_BATCH_ID) {
-        LOG(ERROR) << "Failed to allocate batch ID";
-        return std::nullopt;
+
+    BatchID batch_id = INVALID_BATCH_ID;
+    Status s;
+
+#ifdef USE_TENT
+    if (tent_engine_) {
+        batch_id = tent_engine_->allocateBatch(batch_size);
+        if (batch_id == 0) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        std::vector<tent::Request> tent_reqs;
+        tent_reqs.reserve(requests.size());
+        for (auto& r : requests) {
+            tent::Request tr;
+            tr.opcode = static_cast<tent::Request::OpCode>(r.opcode);
+            tr.source = r.source;
+            tr.target_id = r.target_id;
+            tr.target_offset = r.target_offset;
+            tr.length = r.length;
+            tr.transport_hint =
+                mooncake::tent::c_to_transport_hint(r.transport_hint);
+            tr.intent_type = static_cast<mooncake::tent::IntentType>(intent);
+            tent_reqs.push_back(tr);
+        }
+        auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
+        if (!tent_status.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error: "
+                       << tent_status.ToString();
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
+    } else
+#endif
+    {
+        batch_id = engine_.allocateBatchID(batch_size);
+        if (batch_id == INVALID_BATCH_ID) {
+            LOG(ERROR) << "Failed to allocate batch ID";
+            return std::nullopt;
+        }
+        s = engine_.submitTransfer(batch_id, requests);
+        if (!s.ok()) {
+            LOG(ERROR) << "Failed to submit all transfers, error code is "
+                       << s.code();
+            engine_.freeBatchID(batch_id);
+            return std::nullopt;
+        }
     }
 
-    // Submit transfer
-    Status s = engine_.submitTransfer(batch_id, requests);
-    if (!s.ok()) {
-        LOG(ERROR) << "Failed to submit all transfers, error code is "
-                   << s.code();
-        // Note: batch_id will be freed by TransferEngineOperationState
-        // destructor if we create the state object, otherwise we need to free
-        // it here
-        engine_.freeBatchID(batch_id);
-        return std::nullopt;
-    }
-
-    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
-        LOG(ERROR) << "Invalid batch ID for transfer engine operation";
-        return std::nullopt;
-    }
-
-    // Create state with transfer engine context - no polling thread
-    // needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
 
@@ -1260,18 +1354,33 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset, int intent) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
         return std::nullopt;
     }
-    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
-
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment for endpoint='"
-                   << handle.transport_endpoint_ << "'";
-        return std::nullopt;
+    SegmentHandle seg = 0;
+#ifdef USE_TENT
+    if (tent_engine_) {
+        tent::SegmentID seg_id;
+        auto status =
+            tent_engine_->openSegment(seg_id, handle.transport_endpoint_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
+        seg = seg_id;
+    } else
+#endif
+    {
+        seg = engine_.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
     }
 
     // Create transfer requests
@@ -1294,12 +1403,12 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, intent);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, int intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1307,8 +1416,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
                                      src_offset);
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
-        return submitTransferEngineOperation(handle, slices,
-                                             TransferRequest::READ, src_offset);
+        return submitTransferEngineOperation(
+            handle, slices, TransferRequest::READ, src_offset, intent);
     }
 
     LOG(ERROR) << "Read only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1318,7 +1427,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, int intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1327,7 +1436,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     }
     if (strategy == TransferStrategy::TRANSFER_ENGINE) {
         return submitTransferEngineOperation(
-            handle, slices, TransferRequest::WRITE, dst_offset);
+            handle, slices, TransferRequest::WRITE, dst_offset, intent);
     }
 
     LOG(ERROR) << "Write only supports LOCAL_MEMCPY or TRANSFER_ENGINE, got: "
@@ -1337,7 +1446,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset) {
+    uint64_t src_offset, int intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1354,7 +1463,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
             return std::nullopt;
         }
 
-        future = submitMemoryReadOperation(handle, slices, src_offset);
+        future = submitMemoryReadOperation(handle, slices, src_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range read not supported for NoF replicas";
         return std::nullopt;
@@ -1373,7 +1482,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t dst_offset) {
+    uint64_t dst_offset, int intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1390,7 +1499,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
             return std::nullopt;
         }
 
-        future = submitMemoryWriteOperation(handle, slices, dst_offset);
+        future = submitMemoryWriteOperation(handle, slices, dst_offset, intent);
     } else if (replica.is_nof_replica()) {
         LOG(ERROR) << "Range write not supported for NoF replicas";
         return std::nullopt;

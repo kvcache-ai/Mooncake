@@ -341,14 +341,14 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
         TransferSubmitter submitter(engine, backend, endpoint);
         auto future = submitter.submit_batch_get_offload_object(
             endpoint, keys, pointers, slices,
-            OffloadBufferAccess::kLocalAddress);
+            OffloadBufferAccess::kLocalAddress, 2);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
         EXPECT_EQ(future->get(), ErrorCode::OK);
         EXPECT_FALSE(submitter.submit_batch_get_offload_object(
             endpoint, keys, {std::numeric_limits<uint64_t>::max() - 7},
             {{"key", {{destination.data(), 16}}}},
-            OffloadBufferAccess::kLocalAddress));
+            OffloadBufferAccess::kLocalAddress, 2));
     }
     EXPECT_EQ(destination, source);
 
@@ -356,7 +356,8 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     std::shared_ptr<StorageBackend> backend;
     TransferSubmitter submitter(engine, backend, endpoint);
     EXPECT_FALSE(submitter.submit_batch_get_offload_object(
-        endpoint, keys, pointers, slices, OffloadBufferAccess::kLocalAddress));
+        endpoint, keys, pointers, slices, OffloadBufferAccess::kLocalAddress,
+        2));
     EXPECT_EQ(engine.freeEngine(), 0);
 }
 
@@ -389,7 +390,7 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectCopiesPinnedHostToGpu) {
             {reinterpret_cast<uintptr_t>(static_cast<char*>(pinned_source) +
                                          kSourceOffset)},
             {{"gpu", {{gpu_destination, kSize}}}},
-            OffloadBufferAccess::kLocalAddress);
+            OffloadBufferAccess::kLocalAddress, 2);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->get(), ErrorCode::OK);
     }
@@ -461,8 +462,8 @@ TEST_F(TransferTaskTest, BatchWriteHonorsLocalMemcpySetting) {
                                     engine.getLocalIpAndPort());
         std::vector<std::vector<Slice>> slices{
             {{source.data(), source.size()}}};
-        auto future =
-            submitter.submit_batch({replica}, slices, TransferRequest::WRITE);
+        auto future = submitter.submit_batch({replica}, slices,
+                                             TransferRequest::WRITE, 1);
 
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
