@@ -114,6 +114,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    config/client_host_identity_config.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
     config/bucket_backend_config.cpp
