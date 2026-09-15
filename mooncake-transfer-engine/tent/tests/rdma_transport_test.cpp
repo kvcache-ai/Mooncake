@@ -200,6 +200,10 @@ class RdmaTransportTestPeer {
                                      uint64_t now_ns) {
         workers.expireTimedOutSlices(ctx, now_ns);
     }
+
+    static Status notifyStatusForEndpointFailure(const Status& failure) {
+        return RdmaTransport::notifyStatusForEndpointFailure(failure);
+    }
 };
 
 // Friend accessor for RdmaContext: TENT reaches libibverbs through a table of
@@ -468,6 +472,35 @@ TEST(RdmaNotifyFaultTriageTest, PathAndPeerFaultsRetireTheEndpoint) {
     // Nothing put this QP in ERR on our side, so the peer or the path did.
     EXPECT_EQ(classify(IBV_WC_WR_FLUSH_ERR, true, true),
               Action::RetireEndpoint);
+}
+
+// A bootstrap RPC that failed says the peer's control plane is not answering,
+// so a notification must not be handed to the RPC fallback: that would only
+// wait out a second RPC timeout on the thread that polls the batch.
+TEST(RdmaNotifyFaultTriageTest, BootstrapRpcFailureNotEligibleForFallback) {
+    const Status mapped = RdmaTransportTestPeer::notifyStatusForEndpointFailure(
+        Status::RpcServiceError("Failed to call RPC function"));
+    EXPECT_TRUE(mapped.IsRpcServiceError()) << mapped.ToString();
+    EXPECT_NE(mapped.message().find("Failed to call RPC function"),
+              std::string_view::npos);
+}
+
+// Every other reason getEndpoint() comes back empty - no enabled context,
+// allocation, QP setup, a stale segment - leaves the control plane reachable,
+// so the engine may still deliver over RPC.
+TEST(RdmaNotifyFaultTriageTest, OtherEndpointFailuresStayEligible) {
+    const Status failures[] = {
+        Status::InternalError("Failed to configure RDMA endpoint"),
+        Status::DeviceNotFound("No enabled RDMA context"),
+        Status::InvalidArgument("Missing peer GID in bootstrap"),
+        Status::NeedsRefreshCache("Empty target segment or device name"),
+    };
+    for (const auto& failure : failures) {
+        const Status mapped =
+            RdmaTransportTestPeer::notifyStatusForEndpointFailure(failure);
+        EXPECT_TRUE(mapped.IsDeviceNotFound())
+            << failure.ToString() << " -> " << mapped.ToString();
+    }
 }
 
 TEST(RdmaNotifyFaultTriageTest, TeardownFlushesStayQuiet) {

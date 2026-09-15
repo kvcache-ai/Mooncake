@@ -180,8 +180,23 @@ class RdmaTransport : public Transport {
     void registerNotifyQp(uint32_t qp_num,
                           const std::shared_ptr<RdmaEndPoint>& endpoint);
     void unregisterNotifyQp(uint32_t qp_num);
+    // Returns nullptr when no ready endpoint to the peer's device could be
+    // handed out; `failure`, when given, receives why (the segment lookup or
+    // connect() status as is, DeviceNotFound for no enabled context,
+    // InternalError for an allocation failure).
     std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
-                                              int device_id);
+                                              int device_id,
+                                              Status* failure = nullptr);
+
+    // Maps the reason getEndpoint() could not hand out a notify-capable
+    // endpoint to what sendNotification() reports. A bootstrap RPC that
+    // failed means the peer's control plane is unreachable, so the RPC
+    // fallback would only wait out a second timeout on the polling thread:
+    // report RpcServiceError, which TransferEngineImpl does not fall back
+    // on. Everything else (no context, allocation, QP setup) leaves the
+    // control plane reachable and stays DeviceNotFound, i.e. eligible for
+    // the RPC leg.
+    static Status notifyStatusForEndpointFailure(const Status& failure);
 
     // Notification worker thread
     void notifyWorkerThread();
