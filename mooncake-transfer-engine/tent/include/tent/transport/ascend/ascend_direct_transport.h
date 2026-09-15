@@ -1,4 +1,4 @@
-// Copyright 2025 KVCache.AI
+// Copyright 2026 KVCache.AI
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,121 +15,166 @@
 #ifndef ASCEND_DIRECT_TRANSPORT_H_
 #define ASCEND_DIRECT_TRANSPORT_H_
 
-#include <functional>
-#include <iostream>
+#include <atomic>
+#include <condition_variable>
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
-
-#include <acl/acl.h>
-#include <hixl/hixl.h>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
+#include "tent/transport/ascend/hixl_engine.h"
+#include "tent/transport/ascend/local_copy_engine.h"
+#include "tent/transport/ascend/resource_config.h"
 
 namespace mooncake {
 namespace tent {
 
 struct HixlTask {
     Request request;
-    volatile TransferStatusEnum status_word;
-    volatile size_t transferred_bytes;
-    uint64_t target_addr = 0;
-    hixl::TransferReq req_handle = nullptr;
+    volatile TransferStatusEnum status_word = TransferStatusEnum::PENDING;
+    volatile size_t transferred_bytes = 0;
+    void* req_handle = nullptr;
     uint64_t batch_size = 0;
     std::string remote_hixl;
-    uint64_t start_time = 0;
+    int64_t start_time_ns = 0;
+    size_t local_engine_idx = 0;
+    bool local_copy = false;
 };
 
 struct HixlSubBatch : public Transport::SubBatch {
     std::vector<HixlTask> task_list;
-    size_t max_size;
-    virtual size_t size() const { return task_list.size(); }
+    size_t max_size = 0;
+    size_t size() const override { return task_list.size(); }
 };
+
+class AscendDirectTransportTestPeer;
 
 class AscendDirectTransport : public Transport {
    public:
     AscendDirectTransport();
+    ~AscendDirectTransport() override;
 
-    ~AscendDirectTransport();
+    Status install(std::string& local_segment_name,
+                   std::shared_ptr<ControlService> metadata,
+                   std::shared_ptr<Topology> local_topology,
+                   std::shared_ptr<Config> conf = nullptr) override;
 
-    virtual Status install(std::string &local_segment_name,
-                           std::shared_ptr<ControlService> metadata,
-                           std::shared_ptr<Topology> local_topology,
-                           std::shared_ptr<Config> conf = nullptr);
+    Status uninstall() override;
+    Status quiesce() override;
 
-    virtual Status uninstall();
+    Status allocateSubBatch(SubBatchRef& batch, size_t max_size) override;
+    Status freeSubBatch(SubBatchRef& batch) override;
 
-    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
+    Status submitTransferTasks(
+        SubBatchRef batch, const std::vector<Request>& request_list) override;
 
-    virtual Status freeSubBatch(SubBatchRef &batch);
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override;
 
-    virtual Status submitTransferTasks(
-        SubBatchRef batch, const std::vector<Request> &request_list);
+    Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& options) override;
+    Status addMemoryBuffer(std::vector<BufferDesc>& desc_list,
+                           const MemoryOptions& options) override;
+    Status removeMemoryBuffer(BufferDesc& desc) override;
 
-    virtual Status getTransferStatus(SubBatchRef batch, int task_id,
-                                     TransferStatus &status);
-
-    virtual Status addMemoryBuffer(BufferDesc &desc,
-                                   const MemoryOptions &options);
-
-    virtual Status removeMemoryBuffer(BufferDesc &desc);
-
-    virtual const char *getName() const { return "ascend_direct"; }
-
-   private:
-    Status initHixl(const std::shared_ptr<Config> &conf);
-
-    Status checkAndConnect(const std::string &remote_hixl);
-
-    void disconnect(const std::string &remote_hixl, int32_t timeout_in_millis);
-
-    void forgetConnectedSegment(const std::string &remote_hixl);
-
-    void startTransfer(SegmentID target_id, Request::OpCode opcode,
-                       const std::vector<HixlTask *> &tasks);
-
-    void localCopy(Request::OpCode opcode,
-                   const std::vector<HixlTask *> &tasks);
-
-    aclError copyWithBatch(Request::OpCode opcode,
-                           const std::vector<HixlTask *> &tasks,
-                           aclrtMemcpyKind kind, size_t batch_num,
-                           size_t task_index) const;
-
-    static void copyWithSync(Request::OpCode opcode,
-                             const std::vector<HixlTask *> &tasks,
-                             aclrtMemcpyKind kind);
-
-    void copyWithAsync(Request::OpCode opcode,
-                       const std::vector<HixlTask *> &tasks,
-                       aclrtMemcpyKind kind);
+    const char* getName() const override { return "ascend_direct"; }
+    bool supportNotification() const override { return false; }
 
    private:
-    bool installed_;
+    struct PreparedRequest {
+        Request request;
+        size_t local_engine_idx = 0;
+        std::string remote_hixl;
+    };
+
+    struct GroupState {
+        TransferStatusEnum status = TransferStatusEnum::PENDING;
+        int remaining = 0;
+        size_t engine_idx = 0;
+        std::string remote;
+        bool counted = false;
+        bool local_copy = false;
+    };
+
+    Status initEngines();
+    void finalizeEngines();
+    Status publishLocalEngines();
+    size_t currentEngineIndex() const;
+    Status resolveRequest(const Request& request,
+                          PreparedRequest& prepared) const;
+    void startGroup(const std::string& remote_hixl, size_t local_engine_idx,
+                    bool write, const std::vector<HixlTask*>& tasks);
+    void startLocalCopy(size_t local_engine_idx, bool write,
+                        const std::vector<HixlTask*>& tasks);
+    void failLocalCopyStream(size_t engine_idx, TransferStatusEnum status);
+    void markGroupHandles(const std::vector<void*>& handles,
+                          TransferStatusEnum status);
+    void failEntireRoute(size_t engine_idx, const std::string& remote,
+                         TransferStatusEnum status, bool disconnect);
+    bool applyGroupStatus(HixlTask& task, GroupState& group);
+    bool finishTaskLocked(HixlTask& task, void** local_release_handle,
+                          size_t* local_release_engine);
+    void completePolledTask(HixlTask& task);
+    void releaseInflight(int n = 1);
+
+    friend class AscendDirectTransportTestPeer;
+
+    bool installed_{false};
     std::string local_segment_name_;
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
+    std::shared_ptr<Config> conf_;
+    AscendDirectOptions options_;
+    std::map<std::string, std::string> init_options_;
+    int64_t transfer_timeout_ns_{0};
 
-    int32_t device_logic_id_{};
-    aclrtContext rt_context_{nullptr};
-    std::unique_ptr<hixl::Hixl> hixl_;
-    bool auto_connect_{true};
-    uint64_t connect_timeout_;
-    uint64_t transfer_timeout_;
-    std::string local_hixl_name_{};
-    aclrtStream stream_{};
+    std::vector<std::unique_ptr<HixlEngine>> engines_;
+    std::vector<std::unique_ptr<LocalCopyEngine>> local_copies_;
 
     std::mutex req_mutex_;
-    std::unordered_map<hixl::TransferReq,
-                       std::pair<TransferStatusEnum, uint64_t>>
-        req_map_;
+    std::unordered_map<void*, GroupState> groups_;
+    std::map<std::pair<size_t, std::string>, std::vector<void*>> route_groups_;
 
-    // Connection management for segment connections
-    std::set<std::string> connected_segments_;
-    std::mutex connection_mutex_;
-
-    std::map<uint64_t, hixl::MemHandle> addr_to_mem_handle_;
-    std::mutex mem_handle_mutex_;
+    std::mutex inflight_mu_;
+    std::condition_variable inflight_cv_;
+    std::atomic<int> inflight_{0};
 };
+
+class AscendDirectTransportTestPeer {
+   public:
+    static const AscendDirectOptions& options(
+        const AscendDirectTransport& transport) {
+        return transport.options_;
+    }
+
+    static const std::map<std::string, std::string>& initOptions(
+        const AscendDirectTransport& transport) {
+        return transport.init_options_;
+    }
+
+    static size_t engineCount(const AscendDirectTransport& transport) {
+        return transport.engines_.size();
+    }
+
+    static const std::string& engineName(const AscendDirectTransport& transport,
+                                         size_t idx) {
+        return transport.engines_.at(idx)->name();
+    }
+
+    static int inflight(const AscendDirectTransport& transport) {
+        return transport.inflight_.load();
+    }
+
+    static bool installed(const AscendDirectTransport& transport) {
+        return transport.installed_;
+    }
+};
+
 }  // namespace tent
 }  // namespace mooncake
 
