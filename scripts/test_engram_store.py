@@ -576,9 +576,7 @@ class TestMultipleLayers(EngramStoreTestBase):
             table.populate(layer_id, arrays)
 
         ids_by_layer = {
-            layer_id: np.zeros(
-                (1, 2, len(cfg.table_vocab_sizes)), dtype=np.int64
-            )
+            layer_id: np.zeros((1, 2, len(cfg.table_vocab_sizes)), dtype=np.int64)
             for layer_id, cfg in configs.items()
         }
         outputs = {
@@ -601,8 +599,7 @@ class TestMultipleLayers(EngramStoreTestBase):
                 for head in range(output.shape[-2]):
                     self.assertTrue(
                         np.all(
-                            output[..., head, :]
-                            == head + 31 + (layer_id - first) * 50
+                            output[..., head, :] == head + 31 + (layer_id - first) * 50
                         )
                     )
 
@@ -626,9 +623,7 @@ class TestMultipleLayers(EngramStoreTestBase):
                 )
         finally:
             for output in outputs.values():
-                self.assertEqual(
-                    self.store.unregister_buffer(output.ctypes.data), 0
-                )
+                self.assertEqual(self.store.unregister_buffer(output.ctypes.data), 0)
 
         # A second handle reads the same keys without populating another copy.
         peer = self.EngramStore(configs, self.store)
