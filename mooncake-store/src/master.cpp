@@ -1745,7 +1745,8 @@ int main(int argc, char* argv[]) {
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);
         admin_server.ConfigureRpcProbe(
-            "127.0.0.1", static_cast<uint16_t>(master_config.rpc_port),
+            master_config.rpc_address,
+            static_cast<uint16_t>(master_config.rpc_port),
             FLAGS_enable_rpc_health_probe,
             std::chrono::seconds(FLAGS_rpc_probe_interval_seconds),
             std::chrono::seconds(FLAGS_rpc_probe_timeout_seconds));

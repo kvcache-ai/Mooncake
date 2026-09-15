@@ -356,6 +356,9 @@ void MasterAdminServer::ConfigureRpcProbe(
     std::string rpc_host, uint16_t rpc_port, bool enable_rpc_probe,
     std::chrono::seconds rpc_probe_interval,
     std::chrono::seconds rpc_probe_timeout) {
+    if (rpc_host == "0.0.0.0" || rpc_host == "::") {
+        rpc_host = "127.0.0.1";
+    }
     rpc_probe_host_ = std::move(rpc_host);
     rpc_probe_port_ = rpc_port;
     enable_rpc_probe_ = enable_rpc_probe;

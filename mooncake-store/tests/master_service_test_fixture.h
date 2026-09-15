@@ -63,13 +63,12 @@ class MasterServiceTest : public ::testing::Test {
         return service.FindClientRecord(client_id);
     }
 
-    // Expose the shard count for tests that need to assert HealthCheck coverage.
-    static size_t GetNumShardsForTest() {
-        return MasterService::kNumShards;
-    }
+    // Expose the shard count for tests that need to assert HealthCheck
+    // coverage.
+    static size_t GetNumShardsForTest() { return MasterService::kNumShards; }
 
     static SharedMutex& GetShardMutexForTest(MasterService& service,
-                                              size_t shard_idx) {
+                                             size_t shard_idx) {
         return service.metadata_shards_[shard_idx].mutex;
     }
 

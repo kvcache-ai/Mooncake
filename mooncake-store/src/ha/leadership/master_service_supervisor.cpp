@@ -655,12 +655,8 @@ int MasterServiceSupervisor::Start() {
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
         config_.enable_metric_reporting, config_.metrics_host);
-    // Loopback probe target: always 127.0.0.1 (the RPC server listens on
-    // rpc_address, which may be 0.0.0.0, so use loopback explicitly) + the
-    // configured RPC port. Standby instances have service_available=false so
-    // the probe thread skips probing and /readyz returns 503 automatically.
     admin_server.ConfigureRpcProbe(
-        "127.0.0.1", static_cast<uint16_t>(config_.rpc_port),
+        config_.rpc_address, static_cast<uint16_t>(config_.rpc_port),
         FLAGS_enable_rpc_health_probe,
         std::chrono::seconds(FLAGS_rpc_probe_interval_seconds),
         std::chrono::seconds(FLAGS_rpc_probe_timeout_seconds));
