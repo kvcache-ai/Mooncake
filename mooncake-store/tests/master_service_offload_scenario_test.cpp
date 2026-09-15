@@ -462,6 +462,112 @@ TEST(MasterServiceOffloadScenarioTest, UnmountLocalDiskKeepsReAdoptionWorking) {
                   .HasLocalDiskReplicas(1));
 }
 
+TEST(MasterServiceOffloadScenarioTest,
+     RestartedDiskOwnerCanRescanBeforeOldOwnerIsRemoved) {
+    // Model a crash/restart: the same files and RPC endpoint are reported by
+    // a new client UUID while the old UUID is still registered. No memory
+    // replica or second scan may be needed after the old owner is swept.
+    auto config = OffloadConfig();
+    config.client_active_ttl_sec = 3600;
+    MasterService service(config);
+    const UUID old_owner{1, 1};
+    const UUID new_owner{1, 2};
+    const auto tenant = TenantId::Default();
+    const std::string endpoint = "ssd-node:50052";
+    ASSERT_TRUE(service.MountLocalDiskSegment(old_owner, true));
+    ASSERT_TRUE(service.MountLocalDiskSegment(new_owner, true));
+
+    const std::vector<OffloadTaskItem> tasks{
+        {tenant.value(), "restart_a", 1024},
+        {tenant.value(), "restart_b", 2048}};
+    std::vector<StorageObjectMetadata> metadatas(tasks.size());
+    for (size_t i = 0; i < tasks.size(); ++i) {
+        metadatas[i].data_size = tasks[i].size;
+        metadatas[i].transport_endpoint = endpoint;
+    }
+    ASSERT_TRUE(service.NotifyOffloadSuccess(old_owner, tasks, metadatas));
+    ASSERT_TRUE(service.NotifyOffloadSuccess(new_owner, tasks, metadatas));
+    // Repeated scan batches are idempotent for the reporting owner.
+    ASSERT_TRUE(service.NotifyOffloadSuccess(new_owner, tasks, metadatas));
+    for (const auto& task : tasks) {
+        auto result = service.GetReplicaList(task.key, tenant);
+        ASSERT_TRUE(result);
+        EXPECT_EQ(result->replicas.size(), 2);
+    }
+
+    // This is the same owner-scoped SSD sweep used to remove an old owner;
+    // running it explicitly avoids a wall-clock heartbeat race in the test.
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(old_owner));
+    for (const auto& task : tasks) {
+        auto result = service.GetReplicaList(task.key, tenant);
+        ASSERT_TRUE(result);
+        ASSERT_EQ(result->replicas.size(), 1);
+        const auto& disk = result->replicas.front().get_local_disk_descriptor();
+        EXPECT_EQ(disk.client_id, new_owner);
+        EXPECT_EQ(disk.transport_endpoint, endpoint);
+        EXPECT_EQ(disk.object_size, task.size);
+    }
+    // A delayed message from the deregistered process cannot revive it.
+    auto late = service.NotifyOffloadSuccess(old_owner, tasks, metadatas);
+    ASSERT_FALSE(late);
+    EXPECT_EQ(late.error(), ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(new_owner));
+    for (const auto& task : tasks) {
+        auto exists = service.ExistKey(task.key, tenant);
+        ASSERT_TRUE(exists);
+        EXPECT_FALSE(exists.value());
+    }
+}
+
+TEST(MasterServiceOffloadScenarioTest,
+     OffloadCompletionRegistersOwnerDespiteAnotherDiskReplica) {
+    auto config = OffloadConfig();
+    config.client_active_ttl_sec = 3600;
+    MasterService service(config);
+    const UUID old_owner{2, 1};
+    const UUID new_owner{2, 2};
+    const auto tenant = TenantId::Default();
+    const std::string key = "restart_pending_offload";
+    ASSERT_TRUE(service.MountLocalDiskSegment(old_owner, true));
+    ASSERT_TRUE(service.MountLocalDiskSegment(new_owner, true));
+
+    Segment segment;
+    segment.id = UUID{2, 3};
+    segment.name = "offload-source";
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    segment.te_endpoint = "offload-source:12345";
+    ASSERT_TRUE(service.MountSegment(segment, new_owner));
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    ASSERT_TRUE(
+        service.PutStart(new_owner, key, tenant, 1024, replicate_config));
+    ASSERT_TRUE(service.PutEnd(new_owner, key, tenant, ReplicaType::MEMORY));
+
+    // AddReplica registers the pre-existing disk without completing the
+    // queued offload. NotifyOffloadSuccess must handle its task branch too.
+    Replica old_disk(old_owner, 1024, "ssd-node:50052",
+                     ReplicaStatus::COMPLETE);
+    ASSERT_TRUE(service.AddReplica(old_owner, key, tenant, old_disk));
+    const std::vector<OffloadTaskItem> tasks{{tenant.value(), key, 1024}};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "ssd-node:50052";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(new_owner, tasks, {metadata}));
+    ASSERT_TRUE(service.NotifyOffloadSuccess(new_owner, tasks, {metadata}));
+    auto result = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(result);
+    EXPECT_EQ(result->replicas.size(), 3);
+
+    ASSERT_TRUE(service.UnmountLocalDiskSegment(old_owner));
+    ASSERT_TRUE(service.UnmountSegment(segment.id, new_owner));
+    result = service.GetReplicaList(key, tenant);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->replicas.size(), 1);
+    EXPECT_EQ(result->replicas.front().get_local_disk_descriptor().client_id,
+              new_owner);
+}
+
 TEST(MasterServiceOffloadScenarioTest, CompleteOffloadAfterUnmountIsRefused) {
     // A registration that arrives after the deregistration -- an in-flight
     // rescan batch, or an offload completion racing the drain -- must be
