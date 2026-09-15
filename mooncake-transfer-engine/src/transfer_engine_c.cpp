@@ -19,6 +19,7 @@
 #include <memory>
 
 #include "transfer_engine.h"
+#include "common/adaptive_congestion_control/task_congestion_c_projection.h"
 #include "transport/transport.h"
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
@@ -197,6 +198,36 @@ int getTransferStatus(transfer_engine_t engine, batch_id_t batch_id,
         status->transferred_bytes = native_status.transferred_bytes;
     }
     return (int)s.code();
+}
+
+int getTaskCongestionState(transfer_engine_t engine, batch_id_t batch_id,
+                           size_t task_id, int *state) {
+    if (!engine || !state) return (int)Status::Code::kInvalidArgument;
+    TaskCongestionState native_state;
+    Status status = ((TransferEngine *)engine)
+                        ->getTaskCongestionState(batch_id, task_id,
+                                                 native_state);
+    if (status.ok()) *state = taskCongestionCState(native_state);
+    return (int)status.code();
+}
+
+int getTaskCongestionDetail(transfer_engine_t engine, batch_id_t batch_id,
+                            size_t task_id, task_congestion_detail_t *detail,
+                            char *path_buf, size_t path_capacity,
+                            size_t *required_path_length) {
+    if (!engine || !detail || !required_path_length ||
+        (path_capacity && !path_buf))
+        return (int)Status::Code::kInvalidArgument;
+    TaskCongestionDetail native_detail;
+    Status status = ((TransferEngine *)engine)
+                        ->getTaskCongestionDetail(batch_id, task_id,
+                                                  native_detail);
+    if (!status.ok()) return (int)status.code();
+    projectTaskCongestionDetail(native_detail, *detail);
+    if (!copyTaskCongestionPath(native_detail, path_buf, path_capacity,
+                                *required_path_length))
+        return (int)Status::Code::kInvalidArgument;
+    return 0;
 }
 
 notify_msg_t *getNotifsFromEngine(transfer_engine_t engine, int *size) {

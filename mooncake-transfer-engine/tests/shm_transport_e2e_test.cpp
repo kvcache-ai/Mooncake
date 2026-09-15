@@ -24,6 +24,7 @@
 #include "shm_hugepage_test_util.h"
 #include "task_congestion_status.h"
 #include "transfer_engine.h"
+#include "transfer_engine_c.h"
 #include "transfer_metadata.h"
 #include "transport/shm_transport/shm_transport.h"
 
@@ -136,6 +137,19 @@ void ExpectShmWriteAndRead(TransferEngine& owner, TransferEngine& peer,
             peer.getTaskCongestionDetail(batch, 0, congestion_detail).ok());
         EXPECT_EQ(congestion_detail.state, TaskCongestionState::kUnknown);
         EXPECT_FALSE(congestion_detail.reason.observed);
+        int c_state = TASK_CONGESTION_NORMAL;
+        EXPECT_EQ(getTaskCongestionState(static_cast<transfer_engine_t>(&peer),
+                                         batch, 0, &c_state),
+                  0);
+        EXPECT_EQ(c_state, TASK_CONGESTION_UNKNOWN);
+        task_congestion_detail_t c_detail{};
+        size_t required_path_length = 1;
+        EXPECT_EQ(getTaskCongestionDetail(
+                      static_cast<transfer_engine_t>(&peer), batch, 0, &c_detail,
+                      nullptr, 0, &required_path_length),
+                  0);
+        EXPECT_EQ(c_detail.state, c_state);
+        EXPECT_EQ(required_path_length, 0u);
         ASSERT_TRUE(peer.freeBatchID(batch).ok());
     }
 

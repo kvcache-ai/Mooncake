@@ -14,6 +14,8 @@
 
 #include "tent/transfer_engine.h"
 
+#include "../../src/common/adaptive_congestion_control/task_congestion_c_projection.h"
+
 #include <glog/logging.h>
 
 #include "tent/runtime/transfer_engine_impl.h"
@@ -326,6 +328,41 @@ int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
     }
     xfer_status->status = (int)internal_status.s;
     xfer_status->transferred_bytes = internal_status.transferred_bytes;
+    return 0;
+}
+
+int tent_task_congestion_state(tent_engine_t engine,
+                               tent_batch_id_t batch_id, size_t task_id,
+                               int* state) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(state);
+    if (!batch_id) return -1;
+    mooncake::TaskCongestionState native_state;
+    auto status =
+        CAST(engine)->getTaskCongestionState(batch_id, task_id, native_state);
+    if (!status.ok()) return -1;
+    *state = mooncake::taskCongestionCState(native_state);
+    return 0;
+}
+
+int tent_task_congestion_detail(tent_engine_t engine,
+                                tent_batch_id_t batch_id, size_t task_id,
+                                task_congestion_detail_t* detail,
+                                char* path_buf, size_t path_capacity,
+                                size_t* required_path_length) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(detail);
+    CHECK_POINTER(required_path_length);
+    if (!batch_id || (path_capacity && !path_buf)) return -1;
+    mooncake::TaskCongestionDetail native_detail;
+    auto status =
+        CAST(engine)->getTaskCongestionDetail(batch_id, task_id, native_detail);
+    if (!status.ok()) return -1;
+    mooncake::projectTaskCongestionDetail(native_detail, *detail);
+    if (!mooncake::copyTaskCongestionPath(native_detail, path_buf,
+                                          path_capacity,
+                                          *required_path_length))
+        return -1;
     return 0;
 }
 

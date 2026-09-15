@@ -292,6 +292,9 @@ class ObservedRdmaTransport : public FakeTransport {
         first_.task = second_.task = &task_;
         first_.slice_idx = 0;
         second_.slice_idx = 1;
+        second_.source_nic_name = "local-nic";
+        second_.target_nic_name = "remote-nic";
+        second_.target_machine_id = &target_machine_id_;
         first_.length = first_length_;
         second_.length = second_length_;
         adaptive_congestion_control::PathHandle path{&device_, &route_.domain, 3, 1};
@@ -334,6 +337,7 @@ class ObservedRdmaTransport : public FakeTransport {
     FakeSubBatch* submitted_batch_ = nullptr;
     uint64_t first_length_;
     uint64_t second_length_;
+    std::string target_machine_id_ = "remote-machine";
 };
 
 class RejectingCongestionControlRdmaTransport : public FakeTransport {
@@ -616,6 +620,20 @@ TEST(EngineFailoverE2E, TaskCongestionQueryDoesNotPollUnsupportedTask) {
     EXPECT_EQ(detail.state, state);
     EXPECT_EQ(detail.attempt_kind, TaskCongestionAttemptKind::kOther);
     EXPECT_FALSE(detail.reason.observed);
+    int c_state = TASK_CONGESTION_NORMAL;
+    EXPECT_EQ(tent_task_congestion_state(static_cast<tent_engine_t>(&engine),
+                                         batch.batch_id, 0, &c_state),
+              0);
+    EXPECT_EQ(c_state, TASK_CONGESTION_UNKNOWN);
+    task_congestion_detail_t c_detail{};
+    size_t required_path_length = 1;
+    EXPECT_EQ(tent_task_congestion_detail(
+                  static_cast<tent_engine_t>(&engine), batch.batch_id, 0,
+                  &c_detail, nullptr, 0, &required_path_length),
+              0);
+    EXPECT_EQ(c_detail.state, c_state);
+    EXPECT_EQ(c_detail.attempt_kind, TASK_CONGESTION_ATTEMPT_OTHER);
+    EXPECT_EQ(required_path_length, 0u);
     EXPECT_EQ(batch.hp_tcp->status_calls.load(), polls_before);
     EXPECT_FALSE(engine.getTaskCongestionState(batch.batch_id, 1, state).ok());
 
@@ -675,6 +693,36 @@ TEST(EngineFailoverE2E, LogicalRdmaTaskProjectsWorkerAdmissionWithoutPolling) {
     EXPECT_EQ(detail.attempt_kind, TaskCongestionAttemptKind::kRdma);
     EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
     EXPECT_EQ(detail.slice_id.value, 1);
+    ASSERT_TRUE(detail.affected_path.observed);
+    int c_state = TASK_CONGESTION_UNKNOWN;
+    EXPECT_EQ(tent_task_congestion_state(static_cast<tent_engine_t>(&engine),
+                                         batch_id, 0, &c_state),
+              0);
+    EXPECT_EQ(c_state, TASK_CONGESTION_CONGESTED);
+    task_congestion_detail_t c_detail{};
+    size_t required_path_length = 0;
+    EXPECT_EQ(tent_task_congestion_detail(
+                  static_cast<tent_engine_t>(&engine), batch_id, 0, &c_detail,
+                  nullptr, 0, &required_path_length),
+              0);
+    EXPECT_EQ(c_detail.state, c_state);
+    EXPECT_NE(c_detail.observed_fields & TASK_CONGESTION_HAS_AFFECTED_PATH, 0u);
+    EXPECT_NE(c_detail.observed_fields & TASK_CONGESTION_HAS_REASON, 0u);
+    EXPECT_EQ(c_detail.reason, TASK_CONGESTION_REASON_BYTE_WINDOW);
+    EXPECT_EQ(c_detail.controller_mode, TASK_CONGESTION_MODE_ENFORCE);
+    EXPECT_EQ(required_path_length, detail.affected_path.value.size() + 1);
+    std::vector<char> short_path(required_path_length - 1, '#');
+    EXPECT_EQ(tent_task_congestion_detail(
+                  static_cast<tent_engine_t>(&engine), batch_id, 0, &c_detail,
+                  short_path.data(), short_path.size(), &required_path_length),
+              -1);
+    EXPECT_EQ(short_path, std::vector<char>(short_path.size(), '#'));
+    std::vector<char> path(required_path_length);
+    EXPECT_EQ(tent_task_congestion_detail(
+                  static_cast<tent_engine_t>(&engine), batch_id, 0, &c_detail,
+                  path.data(), path.size(), &required_path_length),
+              0);
+    EXPECT_EQ(std::string(path.data()), detail.affected_path.value);
     EXPECT_EQ(rdma->status_calls.load(), 0);
 
     ASSERT_TRUE(rdma->readmitBlockedSlice());
