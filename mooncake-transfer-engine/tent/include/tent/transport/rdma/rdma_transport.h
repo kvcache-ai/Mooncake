@@ -171,7 +171,9 @@ class RdmaTransport : public Transport {
     };
 
     // Decides what a failed notification completion costs. Only defined for
-    // error completions; endpoint_ready means the endpoint is still EP_READY.
+    // error completions; endpoint_ready means the endpoint is still EP_READY
+    // and its notifications are still connected (a retiring or disabled
+    // notify QP only flushes from then on).
     static NotifyCompletionAction classifyNotifyCompletion(ibv_wc_status status,
                                                            bool endpoint_alive,
                                                            bool endpoint_ready);
