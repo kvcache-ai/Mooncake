@@ -762,6 +762,21 @@ TEST(AdaptiveCongestionControlTest, OldGenerationFeedbackIsIgnored) {
     EXPECT_EQ(generation(route), 2u);
 }
 
+TEST(AdaptiveCongestionControlTest, PermitGenerationValidityPrecedesRelease) {
+    DomainState device(testConfig());
+    DomainState route(testConfig());
+    Permit permit;
+    ASSERT_EQ(tryAcquire(pathFor(device, route), 16, permit), Decision::kAllow);
+    EXPECT_TRUE(isCurrentGeneration(permit));
+
+    resetGeneration(route, generation(route) + 1);
+    EXPECT_FALSE(isCurrentGeneration(permit));
+    EXPECT_TRUE(complete(permit, OutcomeClass::kFatal, FailureScope::kRoute));
+    EXPECT_FALSE(isCurrentGeneration(permit));
+    EXPECT_EQ(snapshot(device).inflight_bytes, 0u);
+    EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
+}
+
 TEST(AdaptiveCongestionControlTest, LateSignalsCarryTheirGeneration) {
     DomainState route(testConfig());
     const uint32_t old_generation = snapshot(route).generation;

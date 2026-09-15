@@ -466,6 +466,15 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit) {
     return Decision::kAllow;
 }
 
+bool isCurrentGeneration(const Permit& permit) {
+    if (!permit.active_.load(std::memory_order_acquire)) return false;
+    if (permit.device_ == nullptr && permit.route_ == nullptr) return false;
+    return (permit.device_ == nullptr ||
+            permit.device_generation_ == generation(*permit.device_)) &&
+           (permit.route_ == nullptr ||
+            permit.route_generation_ == generation(*permit.route_));
+}
+
 bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope) {
     bool expected = true;
     if (!permit.active_.compare_exchange_strong(expected, false,

@@ -161,6 +161,7 @@ class Permit {
    private:
     friend Decision tryAcquire(const PathHandle&, uint64_t, Permit&);
     friend bool complete(Permit&, OutcomeClass, FailureScope);
+    friend bool isCurrentGeneration(const Permit&);
 
     std::atomic<bool> active_{false};
     DomainState* device_ = nullptr;
@@ -180,6 +181,7 @@ class Permit {
 // exceeds the window (including probing). The full byte count is reserved;
 // transport-level static limits must still be enforced by the caller.
 Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit);
+bool isCurrentGeneration(const Permit& permit);
 bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope);
 void recordSignals(DomainState& state, uint32_t generation,
                    const Signals& signals);
