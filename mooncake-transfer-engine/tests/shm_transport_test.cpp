@@ -185,8 +185,7 @@ TEST(ShmNameTest, PrefixDetectsPosixNames) {
     EXPECT_TRUE(isFilesystemShmPath("/dev/hugepages/mooncake_1234_abcdefgh"));
     EXPECT_FALSE(isFilesystemShmPath("/mooncake_1234_abcdefgh"));
     EXPECT_TRUE(pathHasDotDotComponent("/dev/hugepages/../../tmp/mooncake_x"));
-    EXPECT_FALSE(
-        isFilesystemShmPath("/dev/hugepages/../../tmp/mooncake_x"));
+    EXPECT_FALSE(isFilesystemShmPath("/dev/hugepages/../../tmp/mooncake_x"));
     EXPECT_FALSE(pathHasDotDotComponent("/dev/hugepages/mooncake_x"));
     EXPECT_FALSE(isPosixShmName(""));
     EXPECT_FALSE(isPosixShmName("/mooncake_"));
@@ -783,8 +782,8 @@ TEST_P(ShmHugepageAllocateTest, AllocateRegisterAndRelocate) {
     EXPECT_TRUE(isPosixShmName(shm_name));
     EXPECT_EQ(shm_name.rfind(*mount, 0), 0u);
 
-    ASSERT_EQ(ShmTransportTestPeer::registerLocalMemory(transport, base, length),
-              0);
+    ASSERT_EQ(
+        ShmTransportTestPeer::registerLocalMemory(transport, base, length), 0);
     auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
     ASSERT_TRUE(desc);
     ASSERT_FALSE(desc->buffers.empty());
@@ -805,14 +804,13 @@ TEST_P(ShmHugepageAllocateTest, AllocateRegisterAndRelocate) {
     EXPECT_EQ(access(shm_name.c_str(), F_OK), -1);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    HugepageSizes, ShmHugepageAllocateTest,
-    ::testing::Values(SharedMemoryOptions::kHugepage2MB,
-                      SharedMemoryOptions::kHugepage512MB,
-                      SharedMemoryOptions::kHugepage1GB),
-    [](const testing::TestParamInfo<size_t>& info) {
-        return HugepageSizeTestName(info.param);
-    });
+INSTANTIATE_TEST_SUITE_P(HugepageSizes, ShmHugepageAllocateTest,
+                         ::testing::Values(SharedMemoryOptions::kHugepage2MB,
+                                           SharedMemoryOptions::kHugepage512MB,
+                                           SharedMemoryOptions::kHugepage1GB),
+                         [](const testing::TestParamInfo<size_t>& info) {
+                             return HugepageSizeTestName(info.param);
+                         });
 
 TEST(ShmTransportTest, HugepageRejectsUnsupportedSize) {
     ShmTransport transport;
@@ -896,9 +894,9 @@ TEST(ShmTransportTest, RelocateRejectsTraversalFilesystemPath) {
     ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
 
     uint64_t address = kRemoteAddress;
-    EXPECT_FALSE(ShmTransportTestPeer::relocate(transport, address, 4096,
-                                                kPeerSegmentId)
-                     .ok());
+    EXPECT_FALSE(
+        ShmTransportTestPeer::relocate(transport, address, 4096, kPeerSegmentId)
+            .ok());
 }
 
 TEST(ShmTransportTest, RelocateRejectsNonHugetlbfsFilesystemPath) {
@@ -916,9 +914,9 @@ TEST(ShmTransportTest, RelocateRejectsNonHugetlbfsFilesystemPath) {
     ASSERT_EQ(ShmTransportTestPeer::install(transport, local, metadata), 0);
 
     uint64_t address = kRemoteAddress;
-    EXPECT_FALSE(ShmTransportTestPeer::relocate(transport, address, 4096,
-                                                kPeerSegmentId)
-                     .ok());
+    EXPECT_FALSE(
+        ShmTransportTestPeer::relocate(transport, address, 4096, kPeerSegmentId)
+            .ok());
     unlink(tmpl);
 }
 

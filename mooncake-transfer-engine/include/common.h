@@ -92,7 +92,7 @@ static inline std::string getHostname() {
 //   rm /dev/hugepages/mooncake_<pid>_*
 struct SharedMemoryOptions {
     bool use_hugepage = false;
-    size_t hugepage_size = 0;  // 0 → 2MB when use_hugepage
+    size_t hugepage_size = 0;    // 0 → 2MB when use_hugepage
     std::string hugetlbfs_path;  // empty → size-specific default mount
     bool populate = true;        // Store passes false and populates itself
 

@@ -109,8 +109,7 @@ int openHugetlbfsPeerFd(const std::string& shm_name, std::string* err) {
     }
 
     struct statfs sfs;
-    if (statfs(resolved.c_str(), &sfs) != 0 ||
-        sfs.f_type != HUGETLBFS_MAGIC) {
+    if (statfs(resolved.c_str(), &sfs) != 0 || sfs.f_type != HUGETLBFS_MAGIC) {
         if (err) {
             *err = "resolved shm path is not on hugetlbfs: " + resolved;
         }
@@ -118,8 +117,7 @@ int openHugetlbfsPeerFd(const std::string& shm_name, std::string* err) {
         return -1;
     }
 
-    const int fd =
-        open(resolved.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    const int fd = open(resolved.c_str(), O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
         if (err) {
             *err = "open(" + resolved + ") failed: " + std::strerror(errno);
@@ -171,8 +169,8 @@ bool protocolListContains(const std::string& protocol,
     return false;
 }
 
-Status mapSharedMemory(const std::string& shm_name, uint64_t length,
-                       void** out, uint64_t* mapped_length) {
+Status mapSharedMemory(const std::string& shm_name, uint64_t length, void** out,
+                       uint64_t* mapped_length) {
     int shm_fd = -1;
     if (needsHugetlbfsPeerOpen(shm_name)) {
         std::string open_err;
@@ -297,10 +295,11 @@ bool prepareHugetlbfsAllocate(const SharedMemoryOptions& opt, size_t length,
             : opt.hugetlbfs_path;
     std::string mount_err;
     if (!resolveHugetlbfsMount(requested_dir, hp, dir, &mount_err)) {
-        const int err = (requested_dir.empty() || requested_dir.front() != '/' ||
-                         pathHasDotDotComponent(requested_dir))
-                            ? EINVAL
-                            : ENODEV;
+        const int err =
+            (requested_dir.empty() || requested_dir.front() != '/' ||
+             pathHasDotDotComponent(requested_dir))
+                ? EINVAL
+                : ENODEV;
         LOG(ERROR) << "ShmTransport hugetlbfs allocate failed: " << mount_err
                    << " (no tmpfs fallback)";
         return fail(err);
@@ -314,7 +313,8 @@ bool prepareHugetlbfsAllocate(const SharedMemoryOptions& opt, size_t length,
 ShmTransport::ShmTransport() = default;
 
 void ShmTransport::unlinkShmEntry(const AllocatedShmEntry& entry) {
-    // Not reached on SIGKILL; leftovers and manual cleanup: SharedMemoryOptions.
+    // Not reached on SIGKILL; leftovers and manual cleanup:
+    // SharedMemoryOptions.
     if (entry.name.empty()) return;
     if (isFilesystemShmPath(entry.name)) {
         if (unlink(entry.name.c_str()) != 0 && errno != ENOENT) {

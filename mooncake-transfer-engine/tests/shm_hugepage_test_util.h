@@ -37,7 +37,8 @@ inline const char* HugepageSizeLabel(size_t hugepage_size) {
 
 inline const char* HugepageSizeTestName(size_t hugepage_size) {
     if (hugepage_size == SharedMemoryOptions::kHugepage2MB) return "Size2MB";
-    if (hugepage_size == SharedMemoryOptions::kHugepage512MB) return "Size512MB";
+    if (hugepage_size == SharedMemoryOptions::kHugepage512MB)
+        return "Size512MB";
     if (hugepage_size == SharedMemoryOptions::kHugepage1GB) return "Size1GB";
     return "Unknown";
 }

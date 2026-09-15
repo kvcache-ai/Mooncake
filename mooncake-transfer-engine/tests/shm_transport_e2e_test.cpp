@@ -246,19 +246,18 @@ TEST_P(ShmHugepageE2ETest, WriteAndRead) {
     ASSERT_NE(remote_shm, nullptr);
     EXPECT_TRUE(isFilesystemShmPath(remote_shm->shm_name));
 
-    ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(
-        *engine_a, *engine_b, remote, remote_shm->addr, length));
+    ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(*engine_a, *engine_b, remote,
+                                                  remote_shm->addr, length));
     ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
 }
 
-INSTANTIATE_TEST_SUITE_P(
-    HugepageSizes, ShmHugepageE2ETest,
-    ::testing::Values(SharedMemoryOptions::kHugepage2MB,
-                      SharedMemoryOptions::kHugepage512MB,
-                      SharedMemoryOptions::kHugepage1GB),
-    [](const testing::TestParamInfo<size_t>& info) {
-        return HugepageSizeTestName(info.param);
-    });
+INSTANTIATE_TEST_SUITE_P(HugepageSizes, ShmHugepageE2ETest,
+                         ::testing::Values(SharedMemoryOptions::kHugepage2MB,
+                                           SharedMemoryOptions::kHugepage512MB,
+                                           SharedMemoryOptions::kHugepage1GB),
+                         [](const testing::TestParamInfo<size_t>& info) {
+                             return HugepageSizeTestName(info.param);
+                         });
 
 TEST(ShmTransportE2E, WriteAndRead4K) {
     const size_t length = 4096;

@@ -567,8 +567,8 @@ void* TransferEngineImpl::allocateSharedMemory(size_t length) {
     return allocateSharedMemory(length, SharedMemoryOptions{});
 }
 
-void* TransferEngineImpl::allocateSharedMemory(
-    size_t length, const SharedMemoryOptions& opt) {
+void* TransferEngineImpl::allocateSharedMemory(size_t length,
+                                               const SharedMemoryOptions& opt) {
     auto* shm =
         dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
     if (!shm) {
