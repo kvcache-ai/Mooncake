@@ -132,6 +132,7 @@ design/model-weight-reshard-planner
 design/model-weight-store-upload-planning
 design/tent/overview
 design/store/mooncake-store
+design/store/immutable-dfs-bucket-allocator
 design/kv-event/publisher-design
 design/kv-event/subscriber-guide
 design/nvme-kv-backend
