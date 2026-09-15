@@ -32,6 +32,7 @@
 #include <optional>
 #include <utility>
 
+#include "multi_transport.h"
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
@@ -261,6 +262,27 @@ void expectForcedTcpConstraint(const tent::Config& config) {
     EXPECT_TRUE(config.get("transports/force_tcp", false));
     EXPECT_TRUE(config.get("transports/tcp/enable", false));
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
+}
+
+TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-stale-handle"), 0);
+
+    // Segment handles are handed out from 1 upward when a peer is opened, so a
+    // large handle that was never opened has no id->name mapping. That is the
+    // same "peer gone / handle stale" situation the eviction path must detect:
+    // probePeerAliveByID fails on it, so CheckSegmentStatus must report non-OK
+    // and let the caller close + re-open the segment. Before the fix the shim
+    // returned Status::OK() unconditionally under MC_USE_TENT, so the Python
+    // wrapper's handle_map_ never dropped a dead peer and kept reusing the same
+    // stale handle forever. Refs #3995 (P0-stale-handle).
+    EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
 }
 
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
@@ -1019,6 +1041,87 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
     transport->addExtraSlice();
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
+}
+
+// Model the state left by completion events explicitly so these regressions
+// also run in default builds without USE_EVENT_DRIVEN_COMPLETION.
+TEST_F(TransportTest, FailedCompletionEventDoesNotReportSuccess) {
+    std::string server_name = "localhost";
+    MultiTransport transport(nullptr, server_name);
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    batch.task_list.resize(1);
+    auto& task = batch.task_list.front();
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    task.failed_slice_count = 1;
+    task.is_finished = true;
+    batch.has_failure.store(true);
+    batch.is_finished.store(true);
+    ASSERT_FALSE(batch.status_cached.load());
+
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_FALSE(batch.status_cached.load());
+}
+
+TEST_F(TransportTest, SuccessfulCompletionEventPreservesTransferredBytes) {
+    std::string server_name = "localhost";
+    MultiTransport transport(nullptr, server_name);
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    batch.task_list.resize(1);
+    auto& task = batch.task_list.front();
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    task.transferred_bytes = 65536;
+    task.success_slice_count = 1;
+    task.is_finished = true;
+    batch.is_finished.store(true);
+    ASSERT_FALSE(batch.has_failure.load());
+    ASSERT_FALSE(batch.status_cached.load());
+    ASSERT_EQ(batch.finished_transfer_bytes.load(), 0);
+
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, 65536);
+}
+
+TEST_F(TransportTest, RepeatedBatchQueryPreservesAggregatedBytes) {
+    std::string server_name = "localhost";
+    MultiTransport transport(nullptr, server_name);
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+    batch.task_list.resize(2);
+    const std::array<uint64_t, 2> task_bytes{65536, 131072};
+    for (size_t i = 0; i < batch.task_list.size(); ++i) {
+        auto& task = batch.task_list[i];
+        task.batch_id = batch.id;
+        task.slice_count = 1;
+        task.transferred_bytes = task_bytes[i];
+        task.success_slice_count = 1;
+    }
+    const auto total_bytes = task_bytes[0] + task_bytes[1];
+    ASSERT_FALSE(batch.is_finished.load());
+    ASSERT_FALSE(batch.status_cached.load());
+
+    Transport::TransferStatus status{};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, total_bytes);
+    EXPECT_TRUE(batch.is_finished.load());
+    ASSERT_TRUE(batch.status_cached.load());
+    EXPECT_EQ(batch.finished_transfer_bytes.load(), total_bytes);
+
+    status = {};
+    ASSERT_TRUE(transport.getBatchTransferStatus(batch.id, status).ok());
+    EXPECT_EQ(status.s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(status.transferred_bytes, total_bytes);
 }
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION

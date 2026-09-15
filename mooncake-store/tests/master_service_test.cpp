@@ -1824,6 +1824,103 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
+TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
+    // Regression for the lease-expire / client-offboarding delete path.
+    // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
+    // keys from a shared tenant; erase() never returns bucket memory, so a
+    // tenant that loses most (but not all) of its keys would keep its
+    // high-water bucket array forever and RSS would never drop. The shrink
+    // pass at the end of ClearStaleHandles mirrors the one in BatchEvict.
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const std::string stale_segment_name = "clear_shrink_stale_segment";
+    const std::string live_segment_name = "clear_shrink_live_segment";
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, stale_segment_name, 0x300000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
+                                                   0x400000000, kSegmentSize);
+
+    // Gather keys on one shard so its metadata map grows past the shrink
+    // floor; spreading them across all 1024 shards would leave each map tiny.
+    const size_t target_shard =
+        MetadataShardIndex(*service, "clear_shrink_key_0");
+    // A few live keys keep the shared tenant alive after the sweep (partial
+    // drain, not full erase); the rest are swept and must trigger a shrink.
+    constexpr size_t kLiveKeys = 128;
+    constexpr size_t kTotalKeys = 2 * kShrinkMinBucketCount;
+
+    std::vector<std::string> stale_keys;
+    std::vector<std::string> live_keys;
+    for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
+        ASSERT_LT(i, 5000000u)
+            << "could not gather enough keys on shard " << target_shard;
+        const std::string key = "clear_shrink_key_" + std::to_string(i);
+        if (MetadataShardIndex(*service, key) != target_shard) {
+            continue;
+        }
+
+        const bool on_live = live_keys.size() < kLiveKeys;
+        const UUID& client_id =
+            on_live ? live_segment.client_id : stale_segment.client_id;
+        const std::string& segment_name =
+            on_live ? live_segment_name : stale_segment_name;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
+                .has_value())
+            << "key=" << key;
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value())
+            << "key=" << key;
+        (on_live ? live_keys : stale_keys).push_back(key);
+    }
+    ASSERT_GT(stale_keys.size(), live_keys.size());
+
+    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
+    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
+
+    // Unmount the stale segment, then sweep inline. The tenant survives
+    // because the live segment still holds keys, so the metadata map is only
+    // partially drained — exactly the case that leaks bucket memory without
+    // the shrink.
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
+    // "merely hidden by the unmount".
+    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
+
+    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
+    ASSERT_GT(buckets_after, 0u);
+    // Without the post-sweep shrink the bucket array would stay at its
+    // high-water mark and this assertion would fail.
+    EXPECT_LT(buckets_after, buckets_before / 2);
+    // The shrunk map must still be large enough to hold every live key.
+    EXPECT_GE(buckets_after, live_keys.size());
+
+    for (const auto& key : live_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
+        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
+    }
+    for (const auto& key : stale_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
+            << "key=" << key;
+    }
+}
+
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     const uint64_t kv_lease_ttl = 200;
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
