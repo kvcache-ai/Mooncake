@@ -44,7 +44,7 @@
 //     Production had the same window: the expiry thread unmounts the ghost
 //     segment and only THEN slowly sweeps 23M keys in ClearInvalidHandles —
 //     any RPC landing in that window hits the buggy accessor cleanup first.
-//   * A second live key ON THE SAME METADATA SHARD must keep the TenantState
+//   * A second live key ON THE SAME METADATA SHARD must keep the TenantCatalog
 //     non-empty. Otherwise MaybeEraseEmptyTenant() erases the tenant and
 //     nulls tenant_state_, masking the bug (the buggy branch is guarded by
 //     tenant_state_ != nullptr). Production tenants hold millions of keys,
@@ -85,21 +85,11 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitPutStartFailed = 3;  // scenario setup broken
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
-    // Friend access: find a key that routes to the SAME metadata shard as
-    // `key` (getShardIndex hashes tenant+key, so a naive second key
-    // lands in a different shard's TenantState and cannot keep THIS shard's
-    // tenant non-empty).
-    std::string FindKeyOnSameShard(MasterService& service,
-                                   const std::string& key) {
-        const size_t target = service.getShardIndex(TenantId::Default(), key);
-        for (int i = 0; i < 100000; ++i) {
-            std::string candidate = key + "_keepalive_" + std::to_string(i);
-            if (service.getShardIndex(TenantId::Default(), candidate) ==
-                target) {
-                return candidate;
-            }
-        }
-        return key + "_keepalive_fallback";
+    // Any second live key in the same tenant (Default) keeps the TenantCatalog
+    // non-empty. All of a tenant's keys live in that tenant's one catalog, so
+    // a plain suffix is enough.
+    std::string MakeKeepaliveKey(const std::string& key) const {
+        return key + "_keepalive";
     }
 
     // Builds the incident state and fires the trigger. Only returns on
@@ -121,7 +111,7 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         }
 
         // 2. PutStart a key onto the segment and never complete it — the key
-        //    stays in TenantState::processing_keys (client "died" mid-put).
+        //    stays in TenantCatalog::processing_keys (client "died" mid-put).
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segment = segment.name;
@@ -131,9 +121,10 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
             ::_exit(kExitPutStartFailed);
         }
 
-        // 2b. A second, completed key on the SAME shard keeps the TenantState
-        //     non-empty in step 4 (see file header for why this is required).
-        const std::string keepalive_key = FindKeyOnSameShard(service, key);
+        // 2b. A second, completed key in the same tenant keeps the
+        //     TenantCatalog non-empty in step 4 (see file header for why this
+        //     is required).
+        const std::string keepalive_key = MakeKeepaliveKey(key);
         if (!service
                  .PutStart(client_id, keepalive_key, TenantId::Default(), 1024,
                            config)

@@ -224,6 +224,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(
             segment_manager_->mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator, registration};
             segment_manager_->client_by_name_[segment.name] = client_id;
+            segment_manager_->allocator_manager_.invalidateSnapshotCache();
             segment_manager_->segment_id_by_name_[segment.name] = segment.id;
             AddHostSegment(segment_manager_->segments_by_host_, segment);
 
@@ -513,6 +514,7 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
 
     segment_manager_->segment_id_by_name_.erase(indexed);
     segment_manager_->client_by_name_.erase(segment_name);
+    segment_manager_->allocator_manager_.invalidateSnapshotCache();
 
     const auto bind_remaining = [&](bool require_ok) {
         for (const auto& [candidate_id, mounted] :
@@ -529,6 +531,8 @@ void ScopedSegmentAccess::ReindexSegmentNameAfterRemoval(
                     segment_manager_->segment_id_by_name_[segment_name] =
                         candidate_id;
                     segment_manager_->client_by_name_[segment_name] = owner;
+                    segment_manager_->allocator_manager_
+                        .invalidateSnapshotCache();
                     return true;
                 }
             }
@@ -1139,6 +1143,7 @@ SegmentSerializer::Deserialize(const std::vector<uint8_t>& data) {
             if (it != segment_manager_->mounted_segments_.end()) {
                 segment_manager_->client_by_name_[it->second.segment.name] =
                     client_id;
+                segment_manager_->allocator_manager_.invalidateSnapshotCache();
                 segment_manager_->segment_id_by_name_[it->second.segment.name] =
                     segment_id;
                 if (it->second.status == SegmentStatus::OK &&
@@ -1333,6 +1338,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         segment, client_id, SegmentStatus::OK, std::move(allocator),
         registration};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
+    nof_segment_manager_->allocator_manager_.invalidateSnapshotCache();
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
     return ErrorCode::OK;
@@ -1422,6 +1428,7 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     if (segment_it != nof_segment_manager_->mounted_segments_.end()) {
         segment_name = segment_it->second.segment.name;
         nof_segment_manager_->client_by_name_.erase(segment_name);
+        nof_segment_manager_->allocator_manager_.invalidateSnapshotCache();
     }
 
     nof_segment_manager_->mounted_segments_.erase(segment_id);
