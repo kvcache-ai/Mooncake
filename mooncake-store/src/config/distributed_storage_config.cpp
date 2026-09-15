@@ -74,6 +74,16 @@ bool DistributedStorageConfig::ValidateForAllocator() const {
                    << eviction_check_interval.count();
         return false;
     }
+    if (metadata_checkpoint_interval.count() <= 0 ||
+        metadata_wal_compaction_threshold_bytes == 0 ||
+        metadata_wal_compaction_threshold_bytes >
+            kMaxAllowedMetadataWalCompactionThresholdBytes) {
+        LOG(ERROR) << "DistributedStorageConfig: DFS metadata checkpoint "
+                      "interval must be positive and WAL compaction threshold "
+                      "must be in [1, "
+                   << kMaxAllowedMetadataWalCompactionThresholdBytes << "]";
+        return false;
+    }
     return true;
 }
 
@@ -122,6 +132,12 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     config.eviction_check_interval = std::chrono::seconds(Environ::ReadOr(
         Variables::MOONCAKE_DFS_EVICTION_CHECK_INTERVAL,
         static_cast<int>(config.eviction_check_interval.count())));
+    config.metadata_checkpoint_interval = std::chrono::seconds(Environ::GetInt(
+        "MOONCAKE_DFS_METADATA_CHECKPOINT_INTERVAL_SECONDS",
+        static_cast<int>(config.metadata_checkpoint_interval.count())));
+    config.metadata_wal_compaction_threshold_bytes = Environ::GetUInt64(
+        "MOONCAKE_DFS_METADATA_WAL_COMPACTION_THRESHOLD_BYTES",
+        config.metadata_wal_compaction_threshold_bytes);
     return config;
 }
 
@@ -137,7 +153,11 @@ std::string DistributedStorageConfig::FormatStr() const {
         << ", eviction_low_watermark=" << eviction_low_watermark
         << ", deferred_free_seconds=" << deferred_free_duration.count()
         << ", eviction_check_interval_seconds="
-        << eviction_check_interval.count();
+        << eviction_check_interval.count()
+        << ", metadata_checkpoint_interval_seconds="
+        << metadata_checkpoint_interval.count()
+        << ", metadata_wal_compaction_threshold_bytes="
+        << metadata_wal_compaction_threshold_bytes;
     return oss.str();
 }
 
