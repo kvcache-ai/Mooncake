@@ -68,6 +68,7 @@ size_t get_hugepage_size_from_env(unsigned int *out_flags, bool use_memfd) {
     if (out_flags == nullptr) {
         return size;
     }
+#ifdef __linux__
     if (use_memfd) {
         *out_flags |= MFD_HUGETLB;
         *out_flags |= size == SZ_2MB     ? MFD_HUGE_2MB
@@ -83,6 +84,11 @@ size_t get_hugepage_size_from_env(unsigned int *out_flags, bool use_memfd) {
               << (size == SZ_2MB     ? "2MB"
                   : size == SZ_512MB ? "512MB"
                                      : "1GB");
+#else
+    (void)use_memfd;
+    LOG(WARNING) << "Hugepage flags are not supported on this platform; "
+                    "ignoring out_flags parameter.";
+#endif
     return size;
 }
 
