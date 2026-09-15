@@ -69,6 +69,8 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 
 class EtcdOpLogStore;
 class DfsGlobalAllocator;
+class GlobalAllocatorInterface;
+class ImmutableBucketAllocator;
 
 // Forward declarations
 class AllocationStrategy;
@@ -2206,6 +2208,10 @@ class MasterService {
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
     void RunDfsEviction();
+    void RunShardDfsEviction();
+    void RunBucketDfsEviction();
+    bool RunBucketDfsEvictionInternal(bool force_one);
+    bool TryRecoverDfsSpaceAfterAllocationFailure();
     void InitDfsAllocatorFromEnvironment(const MasterServiceConfig& config);
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -2896,7 +2902,9 @@ class MasterService {
 
     bool use_disk_replica_{false};
     bool enable_dfs_{false};
-    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
+    std::unique_ptr<GlobalAllocatorInterface> dfs_allocator_;
+    DfsGlobalAllocator* shard_allocator_{nullptr};
+    ImmutableBucketAllocator* bucket_allocator_{nullptr};
 
     // Segment management
     SegmentManager segment_manager_;
