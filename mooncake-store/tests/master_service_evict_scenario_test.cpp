@@ -28,6 +28,10 @@ namespace {
 
 class EvictFakeBatchHaKvBackend : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard lock(kvs_mutex_);
         auto it = kvs_.find(std::string(key));
