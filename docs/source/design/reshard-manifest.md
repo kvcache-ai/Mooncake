@@ -22,7 +22,7 @@ records.
 | `ResourceManifest` | structural protocol for resource identity and kind | shared public contract |
 | `PlacementManifest` | structural protocol for address-free placement identity and digest | serializable and reusable |
 | `RuntimeBindingManifest` | structural protocol for placement attestation, runtime instance, generation, and lease | one live runtime snapshot |
-| `ParallelTopology` | TP/PP/EP/DP sizes and the explicit participant-to-rank mapping | one logical placement |
+| `ParallelTopology` | TP/PP/EP/DP/CP sizes and the explicit participant-to-rank mapping | one logical placement |
 | `SplitAxis` | a parallel kind that shards one explicit logical dimension | one tensor descriptor |
 | `ReplicatedAxis` | a parallel kind whose ranks each hold a complete replica | one tensor descriptor |
 | `OwnershipAxis` | a parallel kind that assigns tensor or object ownership without splitting a dimension | one tensor descriptor |
@@ -45,9 +45,9 @@ type from parameter names.
 
 ## Global Placement Assembly
 
-`ParallelTopology` declares the runtime's TP, PP, EP, and DP sizes and the exact
+`ParallelTopology` declares the runtime's TP, PP, EP, DP, and CP sizes and the exact
 participants selected for this placement. Its `world_size` is the number of
-declared participants, not `tp_size * pp_size * ep_size * dp_size`. Frameworks
+declared participants, not `tp_size * pp_size * ep_size * dp_size * cp_size`. Frameworks
 may map axes such as TP and EP onto the same workers, and a placement may select
 one DP replica while retaining the runtime's declared `dp_size`.
 
