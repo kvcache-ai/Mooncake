@@ -12,11 +12,13 @@
 #include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-// Declared in master.cpp (DEFINE_*). Read here so the HA path shares the same
-// probe configuration as the non-HA path without duplicating the flags.
-DECLARE_bool(enable_rpc_health_probe);
-DECLARE_int32(rpc_probe_interval_seconds);
-DECLARE_int32(rpc_probe_timeout_seconds);
+DEFINE_bool(enable_rpc_health_probe, true,
+            "Enable the loopback HealthCheck self-probe that drives /readyz "
+            "and the mooncake_master_rpc_responsive gauge");
+DEFINE_int32(rpc_probe_interval_seconds, 5,
+             "Interval between loopback HealthCheck probes in seconds");
+DEFINE_int32(rpc_probe_timeout_seconds, 3,
+             "Timeout for each loopback HealthCheck probe in seconds");
 
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"

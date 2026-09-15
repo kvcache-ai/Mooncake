@@ -128,13 +128,9 @@ DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_string(metrics_host, "0.0.0.0",
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
-DEFINE_bool(enable_rpc_health_probe, true,
-            "Enable the loopback HealthCheck self-probe that drives /readyz "
-            "and the mooncake_master_rpc_responsive gauge");
-DEFINE_int32(rpc_probe_interval_seconds, 5,
-             "Interval between loopback HealthCheck probes in seconds");
-DEFINE_int32(rpc_probe_timeout_seconds, 3,
-             "Timeout for each loopback HealthCheck probe in seconds");
+DECLARE_bool(enable_rpc_health_probe);
+DECLARE_int32(rpc_probe_interval_seconds);
+DECLARE_int32(rpc_probe_timeout_seconds);
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
