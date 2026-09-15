@@ -110,6 +110,37 @@ TEST(BoundedMPSCQueueTest, PushStillAcceptsAndEmptyPushIsANoop) {
     EXPECT_EQ(queue.pop().num_slices, 0);
 }
 
+TEST(BoundedMPSCQueueTest, ReservationHidesEntryUntilCommit) {
+    Queue queue;
+    Queue::Reservation reservation;
+    ASSERT_TRUE(queue.try_reserve(reservation));
+
+    EXPECT_EQ(queue.pop().num_slices, 0);
+    auto item = entry(5);
+    queue.commit(reservation, item);
+    EXPECT_EQ(queue.pop().num_slices, 5);
+}
+
+TEST(BoundedMPSCQueueTest, CancelledReservationPublishesOnlyEmptyEntry) {
+    Queue first;
+    Queue full;
+    for (int i = 0; i < 8; ++i) {
+        auto item = entry(1);
+        ASSERT_TRUE(full.try_push(item));
+    }
+
+    Queue::Reservation first_reservation;
+    Queue::Reservation rejected_reservation;
+    ASSERT_TRUE(first.try_reserve(first_reservation));
+    ASSERT_FALSE(full.try_reserve(rejected_reservation));
+
+    // A failed later reservation rolls back the earlier queue without ever
+    // publishing the real batch entry.
+    first.cancel_reservation(first_reservation);
+    EXPECT_EQ(first.pop().num_slices, 0);
+    EXPECT_EQ(first.pop().num_slices, 0);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
