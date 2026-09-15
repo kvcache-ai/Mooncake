@@ -2314,7 +2314,7 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+std::unordered_map<std::string, ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2322,7 +2322,7 @@ MasterService::EraseMetadata(
     return EraseMetadata(tenant_state, it, tenant_id, QuotaEraseMode::kFull);
 }
 
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+std::unordered_map<std::string, ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2334,7 +2334,7 @@ MasterService::EraseMetadata(
 // associated per-key state: offloading_tasks (with dec_refcnt),
 // processing_keys, replication_tasks, and promotion tasks.
 // Callers no longer need to clean these up manually before calling.
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
+std::unordered_map<std::string, ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
@@ -2683,7 +2683,8 @@ auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
                            << ", error=ttl_requires_enable";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return ResolvedSoftPinRequest{config.soft_pin_action, 0};
+            return ResolvedSoftPinRequest{config.soft_pin_action,
+                                          std::chrono::milliseconds::zero()};
         case SoftPinAction::ENABLE: {
             const uint64_t ttl_ms =
                 config.soft_pin_ttl_ms.value_or(default_kv_soft_pin_ttl_);
@@ -2693,7 +2694,8 @@ auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
                            << ", error=soft_pin_ttl_exceeds_limit";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            return ResolvedSoftPinRequest{config.soft_pin_action, ttl_ms};
+            return ResolvedSoftPinRequest{config.soft_pin_action,
+                                          std::chrono::milliseconds(ttl_ms)};
         }
     }
     LOG(ERROR) << "soft_pin_action="
@@ -9593,7 +9595,7 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
              .dynamic_replication_version_epoch = version_epoch});
 }
 
-MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
+PromotionQueueResult MasterService::TryPushPromotionQueue(
     const ObjectIdentity& object_id, bool record_candidate) {
     if (!promotion_on_hit_ || !promotion_sketch_) {
         return PromotionQueueResult::kDisabled;
@@ -13076,8 +13078,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
 tl::expected<void, SerializationError>
 MasterService::MetadataSerializer::SerializeMetadata(
-    const MasterService::ObjectMetadata& metadata,
-    MsgpackPacker& packer) const {
+    const ObjectMetadata& metadata, MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
@@ -13141,7 +13142,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     return {};
 }
 
-tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
+tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
 MasterService::MetadataSerializer::DeserializeMetadata(
     const msgpack::object& obj) const {
     // Check if input is a valid array

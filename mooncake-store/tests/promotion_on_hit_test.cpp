@@ -143,7 +143,7 @@ class PromotionOnHitTest : public ::testing::Test {
         const auto result =
             service->TryPushPromotionQueue(MasterService::ObjectIdentity{
                 .tenant_id = tenant_id, .user_key = key});
-        return result == MasterService::PromotionQueueResult::kAlreadyInFlight;
+        return result == PromotionQueueResult::kAlreadyInFlight;
     }
 
     static void MarkReplicaCompleteForTesting(MasterService* service,
