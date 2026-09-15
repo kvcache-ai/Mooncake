@@ -16,6 +16,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <sys/time.h>
+#ifdef USE_TENT
+#include <infiniband/verbs.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -26,15 +29,46 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 #include "transfer_engine.h"
 #include "transfer_engine_impl.h"
 #include "transport/transport.h"
+#ifdef USE_TENT
+#include "tent/common/config.h"
+#include "tent/runtime/transfer_engine_impl.h"
+#include "tent/transfer_engine.h"
+#endif
 
 using namespace mooncake;
 
 namespace mooncake {
+
+#ifdef USE_TENT
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        const char* old_value = std::getenv(name);
+        if (old_value) old_value_ = old_value;
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+    }
+
+    ~ScopedEnvVar() {
+        if (old_value_)
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+        else
+            unsetenv(name_.c_str());
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+#endif
 
 class TransferEngineImplTestPeer {
    public:
@@ -71,7 +105,120 @@ class TransferEngineImplTestPeer {
     static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
         engine.use_barex_ = use_barex;
     }
+
+    static size_t pendingNotifyCount(TransferEngineImpl& engine) {
+        RWSpinlock::ReadGuard guard(engine.send_notifies_lock_);
+        return engine.notifies_to_send_.size();
+    }
+
+    static Status freeBatchWithCallback(
+        TransferEngineImpl& engine, BatchID batch_id,
+        const std::function<void()>& before_delete) {
+        return engine.multi_transports_->freeBatchID(batch_id, before_delete);
+    }
+
+#ifdef USE_TENT
+    static const tent::Config* tentConfig(const TransferEngine& engine) {
+        if (!engine.impl_tent_ || !engine.impl_tent_->impl_) return nullptr;
+        return engine.impl_tent_->impl_->conf_.get();
+    }
+
+    static std::shared_ptr<tent::Config> buildTentConfig(
+        const TransferEngine& engine, const std::string& metadata,
+        const std::string& segment) {
+        return engine.buildTentConfig(metadata, segment);
+    }
+#endif
 };
+
+#ifdef USE_TENT
+class ScopedUnsetEnvVar {
+   public:
+    explicit ScopedUnsetEnvVar(const char* name) : name_(name) {
+        if (const char* old = std::getenv(name)) old_value_ = old;
+        unsetenv(name);
+    }
+
+    ~ScopedUnsetEnvVar() {
+        if (old_value_.has_value())
+            setenv(name_.c_str(), old_value_->c_str(), 1);
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+
+TEST(TransferEngineTentCompatibilityTest,
+     ConstructorDeviceFilterIsForwardedToTentConfig) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    const std::vector<std::string> filter{"mlx5_0", "mlx5_2"};
+    TransferEngine engine(/*auto_discover=*/true, filter);
+    ASSERT_TRUE(engine.isUsingTent());
+
+    auto config = TransferEngineImplTestPeer::buildTentConfig(
+        engine, P2PHANDSHAKE, "local-segment");
+
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"), filter);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     SetterDeviceFilterIsForwardedBeforeInit) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    TransferEngine engine(/*auto_discover=*/true);
+    engine.setWhitelistFilters({"mlx5_1"});
+
+    auto config = TransferEngineImplTestPeer::buildTentConfig(
+        engine, P2PHANDSHAKE, "local-segment");
+
+    EXPECT_EQ(config->getArray<std::string>("topology/rdma_whitelist"),
+              (std::vector<std::string>{"mlx5_1"}));
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     DeviceFilterSurvivesMoveConstructionAndAssignment) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    const std::vector<std::string> filter{"mlx5_move"};
+    TransferEngine source(/*auto_discover=*/true, filter);
+    TransferEngine moved(std::move(source));
+
+    auto moved_config = TransferEngineImplTestPeer::buildTentConfig(
+        moved, P2PHANDSHAKE, "local-segment");
+    EXPECT_EQ(moved_config->getArray<std::string>("topology/rdma_whitelist"),
+              filter);
+
+    TransferEngine assigned(/*auto_discover=*/true);
+    assigned = std::move(moved);
+    auto assigned_config = TransferEngineImplTestPeer::buildTentConfig(
+        assigned, P2PHANDSHAKE, "local-segment");
+    EXPECT_EQ(assigned_config->getArray<std::string>("topology/rdma_whitelist"),
+              filter);
+}
+
+TEST(TransferEngineTentCompatibilityTest,
+     ConstructorDeviceFilterRestrictsDiscoveredTopology) {
+    int count = 0;
+    ibv_device** devices = ibv_get_device_list(&count);
+    if (!devices || count < 2) {
+        if (devices) ibv_free_device_list(devices);
+        GTEST_SKIP() << "Requires at least two RDMA devices";
+    }
+    const std::string selected = ibv_get_device_name(devices[0]);
+    ibv_free_device_list(devices);
+
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedUnsetEnvVar tent_conf("MC_TENT_CONF");
+    ScopedUnsetEnvVar custom_topology("MC_CUSTOM_TOPO_JSON");
+    TransferEngine engine(/*auto_discover=*/true, {selected});
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, ""), 0);
+
+    const auto topology = engine.getLocalTopology();
+    ASSERT_NE(topology, nullptr);
+    EXPECT_EQ(topology->getHcaList(), (std::vector<std::string>{selected}));
+}
+
+#endif
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     TransferEngineImpl engine(false);
@@ -103,6 +250,78 @@ TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
               "rdma");
 }
+
+#ifdef USE_TENT
+// RDMA is left enabled and TCP disabled so a regression that drops forceTcp()
+// still comes up with RDMA selected. forceTcp() must flip both flags.
+constexpr const char* kTentConfPrefersRdma =
+    R"({"transports":{"tcp":{"enable":false},"rdma":{"enable":true},"shm":{"enable":false},"hp_tcp":{"enable":false},"mpcomm":{"enable":false},"io_uring":{"enable":false}},"metrics":{"enabled":false}})";
+
+void expectForcedTcpConstraint(const tent::Config& config) {
+    EXPECT_TRUE(config.get("transports/force_tcp", false));
+    EXPECT_TRUE(config.get("transports/tcp/enable", false));
+    EXPECT_FALSE(config.get("transports/rdma/enable", true));
+}
+
+TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-stale-handle"), 0);
+
+    // Segment handles are handed out from 1 upward when a peer is opened, so a
+    // large handle that was never opened has no id->name mapping. That is the
+    // same "peer gone / handle stale" situation the eviction path must detect:
+    // probePeerAliveByID fails on it, so CheckSegmentStatus must report non-OK
+    // and let the caller close + re-open the segment. Before the fix the shim
+    // returned Status::OK() unconditionally under MC_USE_TENT, so the Python
+    // wrapper's handle_map_ never dropped a dead peer and kept reusing the same
+    // stale handle forever. Refs #3995 (P0-stale-handle).
+    EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
+}
+
+TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-protocol-tcp", "", 0, "tcp"),
+              0);
+    const auto* protocol_config =
+        TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(protocol_config, nullptr);
+    expectForcedTcpConstraint(*protocol_config);
+
+    std::array<char, 4096> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+
+TEST(TransferEngineTentCompatibilityTest, ForceTcpEnvForcesTcpTransport) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", "1");
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-force-tcp"), 0);
+    const auto* env_config = TransferEngineImplTestPeer::tentConfig(engine);
+    ASSERT_NE(env_config, nullptr);
+    expectForcedTcpConstraint(*env_config);
+
+    std::array<char, 4096> buffer{};
+    ASSERT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size()), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+}
+#endif
 
 class BatchResultTransport : public Transport {
    public:
@@ -269,6 +488,36 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
 
    private:
     bool extra_slice_ = false;
+};
+
+class TerminalFailureTransport : public BatchResultTransport {
+   public:
+    explicit TerminalFailureTransport(bool initially_finished)
+        : initially_finished_(initially_finished) {}
+
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        tasks_ = tasks;
+        for (auto* task : tasks_) {
+            task->is_finished = initially_finished_;
+        }
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::FAILED;
+        return Status::OK();
+    }
+
+    void finishTasks() {
+        for (auto* task : tasks_) {
+            task->is_finished = true;
+        }
+    }
+
+   private:
+    bool initially_finished_;
+    std::vector<TransferTask*> tasks_;
 };
 
 class TransportTest : public ::testing::Test {
@@ -646,6 +895,105 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
     EXPECT_EQ(
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
+}
+
+TEST_F(TransportTest, FreeBatchClearsPendingNotify) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<TerminalFailureTransport>(true);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"terminal-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "terminal-failure";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+    ASSERT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    TransferStatus status;
+    ASSERT_TRUE(engine.getBatchTransferStatus(batch_id, status).ok());
+    ASSERT_EQ(status.s, TransferStatusEnum::FAILED);
+    ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+}
+
+TEST_F(TransportTest, BusyBatchKeepsPendingNotify) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<TerminalFailureTransport>(false);
+    TransferEngineImplTestPeer::replaceTransports(
+        engine, {{"terminal-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "terminal-failure";
+    engine.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                          std::move(descriptor));
+
+    std::array<char, 1> buffer{};
+    TransferRequest request{.opcode = TransferRequest::READ,
+                            .source = buffer.data(),
+                            .target_id = kSegmentId,
+                            .target_offset = 0,
+                            .length = buffer.size()};
+    auto batch_id = engine.allocateBatchID(1);
+    ASSERT_TRUE(
+        engine
+            .submitTransferWithNotify(batch_id, {request}, {"name", "payload"})
+            .ok());
+
+    EXPECT_TRUE(engine.freeBatchID(batch_id).IsBatchBusy());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 1);
+
+    transport->finishTasks();
+    ASSERT_TRUE(engine.freeBatchID(batch_id).ok());
+    EXPECT_EQ(TransferEngineImplTestPeer::pendingNotifyCount(engine), 0);
+}
+
+TEST_F(TransportTest, BatchCleanupRunsAfterBeforeDeleteCallback) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+
+    bool before_delete_finished = false;
+    bool cleanup_observed_callback = false;
+    struct CleanupProbe {
+        bool* before_delete_finished;
+        bool* cleanup_observed_callback;
+    };
+    CleanupProbe probe{&before_delete_finished, &cleanup_observed_callback};
+
+    auto batch_id = engine.allocateBatchID(1);
+    auto& batch = Transport::toBatchDesc(batch_id);
+    auto& task = batch.task_list.emplace_back();
+    task.is_finished = true;
+    auto* slice = new Transport::Slice();
+    slice->source_addr = &probe;
+    slice->cleanup_callback = [](Transport::Slice* released) {
+        auto* probe = static_cast<CleanupProbe*>(released->source_addr);
+        *probe->cleanup_observed_callback = *probe->before_delete_finished;
+    };
+    task.slice_list.push_back(slice);
+
+    auto status = TransferEngineImplTestPeer::freeBatchWithCallback(
+        engine, batch_id, [&] { before_delete_finished = true; });
+
+    ASSERT_TRUE(status.ok());
+    EXPECT_TRUE(cleanup_observed_callback);
 }
 
 TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {

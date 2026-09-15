@@ -4,31 +4,41 @@
 // Do not edit by hand; see mooncake-store/rust/README.md to regenerate.
 
 pub type mooncake_store_t = *mut ::std::os::raw::c_void;
+pub const mooncake_soft_pin_action_MOONCAKE_SOFT_PIN_PRESERVE: mooncake_soft_pin_action = 0;
+pub const mooncake_soft_pin_action_MOONCAKE_SOFT_PIN_ENABLE: mooncake_soft_pin_action = 1;
+pub const mooncake_soft_pin_action_MOONCAKE_SOFT_PIN_DISABLE: mooncake_soft_pin_action = 2;
+pub type mooncake_soft_pin_action = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct mooncake_replicate_config {
     pub replica_num: usize,
-    pub with_soft_pin: ::std::os::raw::c_int,
     pub with_hard_pin: ::std::os::raw::c_int,
     pub preferred_segments: *mut *const ::std::os::raw::c_char,
     pub preferred_segments_count: usize,
+    pub soft_pin_action: ::std::os::raw::c_int,
+    pub has_soft_pin_ttl: ::std::os::raw::c_int,
+    pub soft_pin_ttl_ms: u64,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of mooncake_replicate_config"]
-        [::std::mem::size_of::<mooncake_replicate_config>() - 32usize];
+        [::std::mem::size_of::<mooncake_replicate_config>() - 48usize];
     ["Alignment of mooncake_replicate_config"]
         [::std::mem::align_of::<mooncake_replicate_config>() - 8usize];
     ["Offset of field: mooncake_replicate_config::replica_num"]
         [::std::mem::offset_of!(mooncake_replicate_config, replica_num) - 0usize];
-    ["Offset of field: mooncake_replicate_config::with_soft_pin"]
-        [::std::mem::offset_of!(mooncake_replicate_config, with_soft_pin) - 8usize];
     ["Offset of field: mooncake_replicate_config::with_hard_pin"]
-        [::std::mem::offset_of!(mooncake_replicate_config, with_hard_pin) - 12usize];
+        [::std::mem::offset_of!(mooncake_replicate_config, with_hard_pin) - 8usize];
     ["Offset of field: mooncake_replicate_config::preferred_segments"]
         [::std::mem::offset_of!(mooncake_replicate_config, preferred_segments) - 16usize];
     ["Offset of field: mooncake_replicate_config::preferred_segments_count"]
         [::std::mem::offset_of!(mooncake_replicate_config, preferred_segments_count) - 24usize];
+    ["Offset of field: mooncake_replicate_config::soft_pin_action"]
+        [::std::mem::offset_of!(mooncake_replicate_config, soft_pin_action) - 32usize];
+    ["Offset of field: mooncake_replicate_config::has_soft_pin_ttl"]
+        [::std::mem::offset_of!(mooncake_replicate_config, has_soft_pin_ttl) - 36usize];
+    ["Offset of field: mooncake_replicate_config::soft_pin_ttl_ms"]
+        [::std::mem::offset_of!(mooncake_replicate_config, soft_pin_ttl_ms) - 40usize];
 };
 pub type mooncake_replicate_config_t = mooncake_replicate_config;
 pub struct MooncakeStoreLib {

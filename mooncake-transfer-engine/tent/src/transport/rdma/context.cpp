@@ -35,6 +35,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include "ib_link_speed.h"
 #include "tent/common/status.h"
 #include "tent/transport/rdma/endpoint_store.h"
 
@@ -502,14 +503,32 @@ void RdmaContext::cleanupResources() {
 
 int RdmaContext::pause() {
     DeviceStatus expected = DEVICE_ENABLED;
-    status_.compare_exchange_strong(expected, DEVICE_PAUSED);
-    return (expected == DEVICE_PAUSED) ? 0 : -1;
+    if (status_.compare_exchange_strong(expected, DEVICE_PAUSED,
+                                        std::memory_order_acq_rel,
+                                        std::memory_order_acquire)) {
+        return 0;
+    }
+    // Pausing is idempotent. Other states (UNINIT/DISABLED) must not proceed
+    // into hardware reprobe or metadata publication.
+    return expected == DEVICE_PAUSED ? 0 : -1;
+}
+
+void RdmaContext::evictEndpoints() {
+    if (endpoint_store_) endpoint_store_->evictAll();
 }
 
 int RdmaContext::resume() {
+    if (status_.load(std::memory_order_acquire) != DEVICE_PAUSED) return -1;
+    // Keep the context paused while old QPs are retired. Publishing ENABLED
+    // first lets a concurrent bootstrap reuse an EP_READY endpoint from the
+    // previous address generation.
+    evictEndpoints();
     DeviceStatus expected = DEVICE_PAUSED;
-    status_.compare_exchange_strong(expected, DEVICE_ENABLED);
-    return (expected == DEVICE_ENABLED) ? 0 : -1;
+    return status_.compare_exchange_strong(expected, DEVICE_ENABLED,
+                                           std::memory_order_release,
+                                           std::memory_order_relaxed)
+               ? 0
+               : -1;
 }
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
@@ -649,15 +668,89 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     return 0;
 }
 
-std::string RdmaContext::gid() const {
-    std::string gid_str;
-    char buf[16] = {0};
-    const static size_t kGidLength = 16;
-    for (size_t i = 0; i < kGidLength; ++i) {
-        sprintf(buf, "%02x", gid_.raw[i]);
-        gid_str += i == 0 ? buf : std::string(":") + buf;
+RdmaAddressSnapshot RdmaContext::address() const {
+    std::lock_guard<std::mutex> guard(address_mutex_);
+    return {lid_, gidBytesToString(gid_.raw), gid_index_};
+}
+
+RdmaAddressRefreshResult RdmaContext::refreshAddress(
+    RdmaAddressSnapshot* previous, RdmaAddressSnapshot* current) {
+    std::lock_guard<std::mutex> refresh_guard(address_refresh_mutex_);
+    const auto old_address = address();
+    if (previous) *previous = old_address;
+    if (!native_context_ || !params_) return RdmaAddressRefreshResult::FAILED;
+
+    ibv_port_attr port_attr{};
+    const uint8_t port = params_->device.port;
+    if (verbs_.ibv_query_port_default(native_context_, port, &port_attr)) {
+        PLOG(WARNING) << "Failed to refresh RDMA address on " << device_name_
+                      << "/" << static_cast<int>(port);
+        return RdmaAddressRefreshResult::FAILED;
     }
-    return gid_str;
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        LOG(WARNING) << "Cannot refresh RDMA address on " << device_name_ << "/"
+                     << static_cast<int>(port) << " while port state is "
+                     << port_attr.state;
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    int next_gid_index = params_->device.gid_index;
+    if (next_gid_index < 0) {
+        if (getBestGidIndex(device_name_, native_context_, port_attr, port,
+                            next_gid_index) == GidNetworkState::GID_NOT_FOUND) {
+            LOG(WARNING) << "No suitable GID found while refreshing "
+                         << device_name_ << "/" << static_cast<int>(port);
+            return RdmaAddressRefreshResult::FAILED;
+        }
+    }
+    if (next_gid_index < 0 || next_gid_index >= port_attr.gid_tbl_len) {
+        LOG(WARNING) << "Refreshed GID index " << next_gid_index
+                     << " is out of range [0, " << port_attr.gid_tbl_len
+                     << ") for " << device_name_;
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    ibv_gid next_gid{};
+    if (verbs_.ibv_query_gid(native_context_, port, next_gid_index,
+                             &next_gid)) {
+        PLOG(WARNING) << "Failed to refresh GID " << next_gid_index << " on "
+                      << device_name_ << "/" << static_cast<int>(port);
+        return RdmaAddressRefreshResult::FAILED;
+    }
+    if (isNullGid(&next_gid)) {
+        LOG(WARNING) << "Refreshed GID " << next_gid_index << " on "
+                     << device_name_ << "/" << static_cast<int>(port)
+                     << " is empty";
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    RdmaAddressSnapshot next_address{
+        port_attr.lid, gidBytesToString(next_gid.raw), next_gid_index};
+    if (current) *current = next_address;
+    const bool changed = next_address.lid != old_address.lid ||
+                         next_address.gid != old_address.gid ||
+                         next_address.gid_index != old_address.gid_index;
+
+    // Publish even when the address is unchanged: a context whose port was
+    // down during setupLocalSegment() was omitted and must be inserted when
+    // it recovers.
+    auto status = transport_.refreshLocalDeviceDesc(
+        device_name_, next_address.lid, next_address.gid);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to publish refreshed RDMA address for "
+                   << device_name_ << ": " << status.ToString();
+        return RdmaAddressRefreshResult::FAILED;
+    }
+
+    if (!changed) return RdmaAddressRefreshResult::UNCHANGED;
+
+    {
+        std::lock_guard<std::mutex> guard(address_mutex_);
+        lid_ = next_address.lid;
+        gid_ = next_gid;
+        gid_index_ = next_address.gid_index;
+    }
+    return RdmaAddressRefreshResult::CHANGED;
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
@@ -840,7 +933,92 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
 
     native_context_ = context.release();
     lid_ = port_attr.lid;
+    recordPortSpeed(port_attr);
+    queryEffectiveSpeed();
     return 0;
+}
+
+void RdmaContext::recordPortSpeed(const ibv_port_attr& port_attr) {
+    int speed = port_attr.active_speed;
+#ifdef HAVE_IBV_ACTIVE_SPEED_EX
+    // XDR (encoding 256) overflows the uint8_t field above, which then
+    // reads 0; the extended field carries it on rdma-core builds that have
+    // one.
+    if (port_attr.active_speed_ex) speed = port_attr.active_speed_ex;
+#endif
+    active_speed_.store(speed, std::memory_order_relaxed);
+    active_width_.store(port_attr.active_width, std::memory_order_relaxed);
+}
+
+int RdmaContext::refreshPortAttributes() {
+    if (!native_context_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to re-query port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    recordPortSpeed(port_attr);
+    queryEffectiveSpeed();
+    return 0;
+}
+
+int RdmaContext::queryPortState(ibv_port_state* state) const {
+    if (!state || !native_context_ || !params_) return -1;
+    ibv_port_attr port_attr;
+    if (verbs_.ibv_query_port_default(native_context_, params_->device.port,
+                                      &port_attr)) {
+        PLOG(WARNING) << "Failed to query state of port "
+                      << static_cast<int>(params_->device.port) << " on "
+                      << device_name_;
+        return -1;
+    }
+    // No recordPortSpeed() here on purpose -- see the header.
+    *state = port_attr.state;
+    return 0;
+}
+
+void RdmaContext::queryEffectiveSpeed() {
+    if (!native_context_ || !verbs_.ibv_query_port_speed) {
+        effective_speed_mbps_.store(0, std::memory_order_relaxed);
+        return;
+    }
+    uint64_t speed = 0;
+    int rc = verbs_.ibv_query_port_speed(native_context_, params_->device.port,
+                                         &speed);
+    if (rc != 0) {
+        // Keep the last known value: on a degraded LAG, dropping to the
+        // encoded rate would overstate the port until the next successful
+        // query. Log once per failure episode, not per query.
+        effective_speed_query_failures_.fetch_add(1, std::memory_order_relaxed);
+        if (!effective_speed_query_failing_.exchange(
+                true, std::memory_order_relaxed)) {
+            LOG(WARNING) << "ibv_query_port_speed failed on " << device_name_
+                         << " (rc " << rc << "), keeping "
+                         << effective_speed_mbps_.load(
+                                std::memory_order_relaxed)
+                         << " Mb/s ("
+                         << effective_speed_query_failures_.load(
+                                std::memory_order_relaxed)
+                         << " failures so far)";
+        }
+        return;
+    }
+    if (effective_speed_query_failing_.exchange(false,
+                                                std::memory_order_relaxed)) {
+        LOG(INFO) << "ibv_query_port_speed recovered on " << device_name_;
+    }
+    // The verb reports 100 Mb/s units; store plain Mb/s.
+    effective_speed_mbps_.store(speed * 100, std::memory_order_relaxed);
+}
+
+double RdmaContext::linkSpeedGbps() const {
+    return ibPortSpeedGbps(
+        effective_speed_mbps_.load(std::memory_order_relaxed),
+        active_speed_.load(std::memory_order_relaxed),
+        active_width_.load(std::memory_order_relaxed));
 }
 }  // namespace tent
 }  // namespace mooncake

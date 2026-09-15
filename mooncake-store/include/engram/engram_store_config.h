@@ -15,7 +15,8 @@ namespace engram {
  */
 struct EngramStoreConfig {
     std::vector<int64_t> table_vocab_sizes = {1024};
-    int embedding_dim = 64;
+    // Required positive width of an opaque byte row; no dtype interpretation.
+    int row_bytes = 0;
 };
 
 }  // namespace engram

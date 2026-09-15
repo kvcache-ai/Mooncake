@@ -7,6 +7,10 @@ store:
   - changed-files:
     - any-glob-to-any-file: 'mooncake-store/**/*'
 
+Mooncake Conductor:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-conductor/**/*'
+
 Transfer Engine:
   - changed-files:
     - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
@@ -17,7 +21,12 @@ PyTorch Backend:
 
 Mooncake EP:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-ep/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-ep/**/*'
+      - 'python/mooncake/ep.py'
+      - 'python/mooncake/mooncake_elastic_buffer.py'
+      - 'python/mooncake/mooncake_ep_buffer.py'
+      - 'python/tests/ep/**/*'
 
 Installation:
   - changed-files:
@@ -57,6 +66,7 @@ Tests:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
       - 'mooncake-reshard/tests/**/*'
+      - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:

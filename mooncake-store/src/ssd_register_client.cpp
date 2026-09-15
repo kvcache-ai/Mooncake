@@ -1,7 +1,6 @@
 #include "ssd_register_client.h"
-#include <algorithm>
-#include <cctype>
-#include <cstdlib>
+
+#include "config/nof_register_config.h"
 
 namespace mooncake {
 
@@ -25,21 +24,12 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
         return OPERATION_FAILED;
     }
 
-    const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
-    std::string trtype = trtype_env ? trtype_env : "RDMA";
-    std::transform(
-        trtype.begin(), trtype.end(), trtype.begin(),
-        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (trtype != "RDMA" && trtype != "TCP") {
-        LOG(WARNING) << "Invalid MC_NOF_TRTYPE=" << trtype
-                     << ", fallback to RDMA";
-        trtype = "RDMA";
-    }
+    const auto config = NoFRegisterConfig::FromEnvironment();
 
-    std::string te_endpoint = "traddr:" + traddr +
-                              " trsvcid:" + std::to_string(trsvcid) +
-                              " subnqn:" + nqn + " trtype:" + trtype +
-                              " adrfam:IPv4 ns:" + std::to_string(nsid);
+    std::string te_endpoint =
+        "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
+        " subnqn:" + nqn + " trtype:" + config.transport_type +
+        " adrfam:IPv4 ns:" + std::to_string(nsid);
 
     NoFSegment segment;
     segment.base = base;
@@ -70,22 +60,13 @@ int NoFRegisterClient::set_unregister_by_endpoint(
         return OPERATION_FAILED;
     }
 
-    const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
-    std::string trtype = trtype_env ? trtype_env : "RDMA";
-    std::transform(
-        trtype.begin(), trtype.end(), trtype.begin(),
-        [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
-    if (trtype != "RDMA" && trtype != "TCP") {
-        LOG(WARNING) << "Invalid MC_NOF_TRTYPE=" << trtype
-                     << ", fallback to RDMA";
-        trtype = "RDMA";
-    }
+    const auto config = NoFRegisterConfig::FromEnvironment();
 
     // Build the te_endpoint string to match registered segments
-    std::string te_endpoint = "traddr:" + traddr +
-                              " trsvcid:" + std::to_string(trsvcid) +
-                              " subnqn:" + nqn + " trtype:" + trtype +
-                              " adrfam:IPv4 ns:" + std::to_string(nsid);
+    std::string te_endpoint =
+        "traddr:" + traddr + " trsvcid:" + std::to_string(trsvcid) +
+        " subnqn:" + nqn + " trtype:" + config.transport_type +
+        " adrfam:IPv4 ns:" + std::to_string(nsid);
 
     LOG(INFO) << "Built te_endpoint: " << te_endpoint;
 

@@ -63,6 +63,10 @@ class TEBenchRunner : public BenchRunner {
 
     size_t getTargetCount() const;
 
+    size_t getTargetIndex(int thread_id) const {
+        return targetIndex(thread_id);
+    }
+
     uint64_t getTargetSegmentId(int thread_id) const;
 
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
@@ -112,6 +116,7 @@ class TEBenchRunner : public BenchRunner {
    private:
     std::unique_ptr<mooncake::TransferEngine> engine_;
     std::vector<void*> pinned_buffer_list_;
+    std::vector<char> shm_backed_;
     std::vector<SegmentID> target_handles_;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> target_infos_;
 

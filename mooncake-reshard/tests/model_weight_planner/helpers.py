@@ -18,9 +18,11 @@ from mooncake.reshard.weight import (
     WeightPlacementManifest,
     WeightPlacementPart,
     WeightRuntimeBindingManifest,
+    bind_logical_transfer_plan,
     plan_placement_transfer,
     plan_placement_transfer_to_local_target,
 )
+from mooncake.reshard.weight._planner.contracts import BoundWeightFragment
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,89 @@ def _canonical_strides_bytes(shape: tuple[int, ...], itemsize: int) -> tuple[int
         strides.append(running)
         running *= extent
     return tuple(reversed(strides))
+
+
+def bound_fragment(
+    *,
+    fragment_id: str,
+    tensor_id: str,
+    global_offset: tuple[int, ...],
+    local_shape: tuple[int, ...],
+    address: int,
+    nbytes: int,
+    worker_id: str,
+    endpoint: str,
+    device: str = "cuda:0",
+    rank: ParallelRank = ParallelRank(),
+    lease_generation: int = 1,
+    aliases: tuple[str, ...] = (),
+    placement_fragment_id: str | None = None,
+    instance_id: str | None = None,
+    runtime_lease_id: str | None = None,
+    owner=None,
+) -> BoundWeightFragment:
+    placement_id = placement_fragment_id or f"{fragment_id}-placement"
+    placement = PlacementFragment(
+        placement_fragment_id=placement_id,
+        tensor_id=tensor_id,
+        global_offset=global_offset,
+        local_shape=local_shape,
+        nbytes=nbytes,
+        rank=rank,
+        aliases=aliases,
+    )
+    binding = RuntimeBindingFragment(
+        placement_fragment_id=placement_id,
+        fragment_id=fragment_id,
+        address=address,
+        nbytes=nbytes,
+        worker_id=worker_id,
+        endpoint=endpoint,
+        device=device,
+        itemsize=nbytes // prod(local_shape),
+        local_shape=local_shape,
+        strides_bytes=_canonical_strides_bytes(
+            local_shape,
+            nbytes // prod(local_shape),
+        ),
+        storage_address=address,
+        storage_nbytes=nbytes,
+        storage_offset_bytes=0,
+        owner=owner,
+    )
+    return BoundWeightFragment(
+        placement=placement,
+        binding=binding,
+        instance_id=instance_id or worker_id,
+        runtime_lease_id=runtime_lease_id or f"{worker_id}-lease",
+        lease_generation=lease_generation,
+        owner=owner,
+    )
+
+
+def bound_fragments(inputs: RuntimeInputs) -> tuple[BoundWeightFragment, ...]:
+    result = []
+    parts_by_participant = {
+        part.participant_id: part for part in inputs.placement.parts
+    }
+    for binding in inputs.bindings:
+        part = parts_by_participant[binding.participant_id]
+        runtime_by_id = {
+            fragment.placement_fragment_id: fragment for fragment in binding.fragments
+        }
+        for placement_fragment in part.fragments:
+            runtime_fragment = runtime_by_id[placement_fragment.placement_fragment_id]
+            result.append(
+                BoundWeightFragment(
+                    placement=placement_fragment,
+                    binding=runtime_fragment,
+                    instance_id=binding.instance_id,
+                    runtime_lease_id=binding.lease_id,
+                    lease_generation=binding.generation,
+                    owner=runtime_fragment.owner,
+                )
+            )
+    return tuple(result)
 
 
 def topology_for_participants(
@@ -332,7 +417,26 @@ def tp_manifests(
 
 
 def plan_transfer(source: RuntimeInputs, target: RuntimeInputs):
-    return plan_placement_transfer(source.placement, target.placement)
+    logical = plan_placement_transfer(source.placement, target.placement)
+    source_participants = {
+        executor.participant_id for executor in logical.source_executors
+    }
+    target_participants = {
+        executor.participant_id for executor in logical.target_executors
+    }
+    return bind_logical_transfer_plan(
+        logical,
+        tuple(
+            binding
+            for binding in target.bindings
+            if binding.participant_id in target_participants
+        ),
+        source_bindings=tuple(
+            binding
+            for binding in source.bindings
+            if binding.participant_id in source_participants
+        ),
+    )
 
 
 def plan_transfer_to_local_target(
@@ -342,10 +446,22 @@ def plan_transfer_to_local_target(
     target_index: int = 0,
 ):
     target_binding = target.bindings[target_index]
-    return plan_placement_transfer_to_local_target(
+    logical = plan_placement_transfer_to_local_target(
         source.placement,
         target.placement,
         target_binding.participant_id,
+    )
+    source_participants = {
+        executor.participant_id for executor in logical.source_executors
+    }
+    return bind_logical_transfer_plan(
+        logical,
+        (target_binding,),
+        source_bindings=tuple(
+            binding
+            for binding in source.bindings
+            if binding.participant_id in source_participants
+        ),
     )
 
 

@@ -20,15 +20,12 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
-#include <functional>
 #include <future>
-#include <limits>
 #include <set>
 #include <thread>
 
@@ -39,6 +36,7 @@
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/batch_registration.h"
 #include "transport/efa_transport/efa_context.h"
 #include "transport/efa_transport/efa_endpoint.h"
 
@@ -682,56 +680,6 @@ int EfaTransport::allocateLocalSegmentID() {
 // (99-128 s) since nothing queues. Largest-first being worst is backwards from
 // longest-processing-time scheduling and is unexplained, so no sort is applied
 // here yet -- another reason the cap stays opt-in rather than a default.
-static size_t maxConcurrentRegMr() {
-    size_t configured = globalConfig().max_concurrent_reg_mr;
-    // 0 (unset) means unbounded, i.e. one thread per buffer as before.
-    return configured > 0 ? configured : std::numeric_limits<size_t>::max();
-}
-
-// Run `fn(i)` for i in [0, count) on at most maxConcurrentRegMr() threads,
-// returning the first non-zero result (all items are still attempted).
-//
-// With no cap set this spawns count-1 threads and runs the caller as a worker,
-// which reproduces what both batch entry points did before: one
-// std::async(std::launch::async) per buffer, which libstdc++ honours literally
-// as one fresh thread each. Kimi-K3 registers ~1450 KV buffers at once, so a
-// 192-core node peaks at ~1400 runnable threads inside fi_mr_regattr, and the
-// per-buffer duration this logs inflates with the queueing delay of the ones
-// ahead of it -- on 2x p6-b300 the median reached 106 s while the whole batch
-// took 138 s. That inflation is not by itself a reason to cap: a badly chosen
-// cap is slower still, see maxConcurrentRegMr().
-//
-// A plain thread pool rather than a semaphore over std::async, because if a cap
-// is set the point is to avoid the thread *creation*, not just to gate entry
-// into the provider -- admission control after the thread already exists would
-// leave that cost in place.
-static int runBoundedParallel(size_t count,
-                              const std::function<int(size_t)>& fn) {
-    if (count == 0) return 0;
-
-    size_t workers = std::min(count, maxConcurrentRegMr());
-    std::atomic<size_t> next{0};
-    std::atomic<int> first_error{0};
-
-    auto worker = [&]() {
-        for (size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
-            int ret = fn(i);
-            if (ret) {
-                int expected = 0;
-                first_error.compare_exchange_strong(expected, ret);
-            }
-        }
-    };
-
-    std::vector<std::thread> threads;
-    threads.reserve(workers - 1);
-    for (size_t w = 1; w < workers; ++w) threads.emplace_back(worker);
-    worker();  // the caller is a worker too
-    for (auto& t : threads) t.join();
-
-    return first_error.load();
-}
-
 // Invert the topology's per-location preferred_hca lists into indices into the
 // NIC set the transport actually opened. `Topology::discover()` already
 // computes what matters here: for a "cuda:N" entry, preferred_hca holds the
@@ -772,7 +720,7 @@ int EfaTransport::registerLocalMemoryBatch(
     const std::string& location) {
     auto start = std::chrono::steady_clock::now();
 
-    int first_error = runBoundedParallel(buffer_list.size(), [&](size_t i) {
+    int first_error = runBoundedRegMrBatch(buffer_list.size(), [&](size_t i) {
         int ret = registerLocalMemoryInternal(buffer_list[i].addr,
                                               buffer_list[i].length, location,
                                               true, false, true);
@@ -799,7 +747,7 @@ int EfaTransport::registerLocalMemoryBatch(
 
 int EfaTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    int first_error = runBoundedParallel(addr_list.size(), [&](size_t i) {
+    int first_error = runBoundedRegMrBatch(addr_list.size(), [&](size_t i) {
         int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to unregister memory: addr "

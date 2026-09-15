@@ -54,6 +54,12 @@ assert not package_path.is_relative_to(repository_path), (package_path, reposito
 assert metadata.version("mooncake-transfer-engine") == {_project_version()!r}
 assert mooncake.BufferPool is mooncake.store.BufferPool
 assert mooncake.engine.TransferEngine is not None
+for ep_module in (
+    "ep.py",
+    "mooncake_ep_buffer.py",
+    "mooncake_elastic_buffer.py",
+):
+    assert (package_path.parent / ep_module).is_file(), ep_module
 """
     subprocess.run(
         [str(python), "-I", "-c", smoke_script],

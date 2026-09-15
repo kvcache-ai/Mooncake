@@ -28,13 +28,16 @@
 #include <vector>
 
 #include "tent/common/config.h"
+#include "tent/common/config_lifecycle.h"
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
+#include "tent/runtime/hp_tcp_transport_config.h"
 
 namespace mooncake {
+class TransferEngineImplTestPeer;
 namespace tent {
 
 class Batch;
@@ -60,15 +63,25 @@ std::chrono::microseconds nextPollDelay(uint64_t poll_count);
 // One backoff step: yields while nextPollDelay is zero, sleeps after that.
 void waitBeforeNextPoll(uint64_t poll_count);
 
+struct LogicalTransferRuntimePolicy {
+    uint64_t config_generation{0};
+    int max_failover_attempts{kDefaultMaxFailoverAttempts};
+    bool enable_auto_failover_on_poll{kDefaultAutoFailoverOnPoll};
+};
+
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
-    bool derived{false};          // merged by other tasks
-    int xport_priority{0};        // transport priority (for fallback)
-    int failover_count{0};        // number of failover attempts
+    bool derived{false};                  // merged by other tasks
+    int xport_priority{0};                // transport priority (for fallback)
+    int failover_count{0};                // number of failover attempts
+    int metadata_refresh_retry_count{0};  // same-transport stale-cache retries
+    bool suppress_failover{false};        // permanent transport result
+    LogicalTransferRuntimePolicy runtime_policy;
     uint64_t device_mask{~0ULL};  // Device mask for quota allocation
     std::string qp_pool;          // Named QP pool (RFC #2568 step 3), "" = none
     Request request;
+    size_t public_length{0};  // Original API request; request may be merged.
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
@@ -84,6 +97,14 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+    // Failure attribution for tent_task_failures_total (first failure wins):
+    // -1 = none, 0 = submit-stage, 1 = poll-stage. Set where the failure
+    // originates and never overwritten, so a poll-observed failure stays
+    // "poll" even when a later failover resubmit is synchronously rejected.
+    // Invariant for integrators: mark submit failures before any recovery
+    // attempt, so a task that recovers and later fails at poll still
+    // attributes its root cause to submit.
+    int8_t failure_stage{-1};
 
     TaskInfo() = default;
 
@@ -93,9 +114,13 @@ struct TaskInfo {
           derived(other.derived),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
+          metadata_refresh_retry_count(other.metadata_refresh_retry_count),
+          suppress_failover(other.suppress_failover),
+          runtime_policy(other.runtime_policy),
           device_mask(other.device_mask),
           qp_pool(other.qp_pool),
           request(other.request),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -105,7 +130,8 @@ struct TaskInfo {
           post_time(other.post_time),
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
-          attempt_active(other.attempt_active) {}
+          attempt_active(other.attempt_active),
+          failure_stage(other.failure_stage) {}
 
     TaskInfo(TaskInfo&& other) noexcept
         : type(other.type),
@@ -113,9 +139,13 @@ struct TaskInfo {
           derived(other.derived),
           xport_priority(other.xport_priority),
           failover_count(other.failover_count),
+          metadata_refresh_retry_count(other.metadata_refresh_retry_count),
+          suppress_failover(other.suppress_failover),
+          runtime_policy(other.runtime_policy),
           device_mask(other.device_mask),
           qp_pool(std::move(other.qp_pool)),
           request(std::move(other.request)),
+          public_length(other.public_length),
           staging(other.staging),
           cancel_requested(other.cancel_requested),
           status(other.status),
@@ -125,7 +155,8 @@ struct TaskInfo {
           post_time(other.post_time),
           attempt_post_time(other.attempt_post_time),
           attempt_type(other.attempt_type),
-          attempt_active(other.attempt_active) {}
+          attempt_active(other.attempt_active),
+          failure_stage(other.failure_stage) {}
 
     TaskInfo& operator=(const TaskInfo& other) {
         if (this != &other) {
@@ -134,9 +165,13 @@ struct TaskInfo {
             derived = other.derived;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
+            metadata_refresh_retry_count = other.metadata_refresh_retry_count;
+            suppress_failover = other.suppress_failover;
+            runtime_policy = other.runtime_policy;
             device_mask = other.device_mask;
             qp_pool = other.qp_pool;
             request = other.request;
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -149,6 +184,7 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+            failure_stage = other.failure_stage;
         }
         return *this;
     }
@@ -160,9 +196,13 @@ struct TaskInfo {
             derived = other.derived;
             xport_priority = other.xport_priority;
             failover_count = other.failover_count;
+            metadata_refresh_retry_count = other.metadata_refresh_retry_count;
+            suppress_failover = other.suppress_failover;
+            runtime_policy = other.runtime_policy;
             device_mask = other.device_mask;
             qp_pool = std::move(other.qp_pool);
             request = std::move(other.request);
+            public_length = other.public_length;
             staging = other.staging;
             cancel_requested = other.cancel_requested;
             status = other.status;
@@ -175,6 +215,7 @@ struct TaskInfo {
             attempt_post_time = other.attempt_post_time;
             attempt_type = other.attempt_type;
             attempt_active = other.attempt_active;
+            failure_stage = other.failure_stage;
         }
         return *this;
     }
@@ -182,6 +223,7 @@ struct TaskInfo {
 
 class TransferEngineImpl {
     friend class ProxyManager;
+    friend class ::mooncake::TransferEngineImplTestPeer;
 
    public:
     TransferEngineImpl();
@@ -307,6 +349,18 @@ class TransferEngineImpl {
         }
     }
 
+    Status publishRuntimeConfigForTest(
+        std::shared_ptr<const RuntimeConfigSnapshot> snapshot) {
+        if (!snapshot) {
+            return Status::InvalidArgument(
+                "Runtime config snapshot must not be null" LOC_MARK);
+        }
+        std::atomic_store_explicit(&runtime_config_snapshot_,
+                                   std::move(snapshot),
+                                   std::memory_order_release);
+        return Status::OK();
+    }
+
     // Test-only hook: how many batches are still alive. Lets a test assert
     // that a failed transfer released its batch rather than leaking it.
     size_t aliveBatchCountForTest() {
@@ -349,7 +403,18 @@ class TransferEngineImpl {
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
+    void deregisterRemovedBuffer(BufferDesc& desc);
+
     Status resubmitTransferTask(Batch* batch, size_t task_id);
+
+    // Submit-stage failover: recover a task whose synchronous
+    // submitTransferTasks() failed by walking the remaining candidate
+    // transports (bounded by the task's pinned limit), mirroring the poll-time
+    // failover in updateTaskStatusAfterPoll. Returns true when the task is
+    // PENDING again on a fallback transport; otherwise the task is
+    // terminally FAILED with task.type left at the last attempted transport
+    // so failure metrics attribute to a real transport instead of UNSPEC.
+    bool attemptSubmitStageFailover(Batch* batch, size_t task_id);
 
     Status retainBatch(BatchID batch_id, Batch*& batch);
 
@@ -419,7 +484,7 @@ class TransferEngineImpl {
                                    bool allow_failover);
 
     Status getBatchStatus(BatchID batch_id, TransferStatus& overall_status,
-                          bool allow_failover);
+                          bool force_failover);
 
     SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
@@ -489,6 +554,7 @@ class TransferEngineImpl {
 
    private:
     std::shared_ptr<Config> conf_;
+    HpTcpTransportConfig hp_tcp_transport_config_;
     std::shared_ptr<ControlService> metadata_;
     std::shared_ptr<Topology> topology_;
     std::unique_ptr<TransportSelector> transport_selector_;
@@ -501,6 +567,11 @@ class TransferEngineImpl {
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
 
+    // Self-targeted notifications (target == LOCAL_SEGMENT_ID) are delivered
+    // in-process rather than through a transport; see sendNotification().
+    std::mutex local_notifi_mutex_;
+    std::vector<Notification> local_notifi_list_;
+
     std::string hostname_;
     uint16_t port_;
     bool ipv6_;
@@ -508,8 +579,7 @@ class TransferEngineImpl {
 
     std::unique_ptr<ProxyManager> staging_proxy_;
     bool merge_requests_;
-    int max_failover_attempts_{3};
-    bool enable_auto_failover_on_poll_{true};
+    std::shared_ptr<const RuntimeConfigSnapshot> runtime_config_snapshot_;
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;

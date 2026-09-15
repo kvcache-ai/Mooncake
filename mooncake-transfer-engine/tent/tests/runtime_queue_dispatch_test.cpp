@@ -27,6 +27,7 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
+#include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 
@@ -634,39 +635,236 @@ TEST(RuntimeQueueDispatch, EarlyFreeReclaimsAfterQueuedCompletion) {
 }
 
 TEST(RuntimeQueueDispatch, PollingDerivedTaskCompletesMergedOwner) {
-    auto cfg = makeRuntimeQueueConfig(1, 1UL << 20, true);
-    TransferEngineImpl engine(cfg);
-    ASSERT_TRUE(engine.available());
+    for (bool queue : {false, true}) {
+        auto cfg = makeRuntimeQueueConfig(1, 1UL << 20, true);
+        cfg->set("enable_runtime_queue", queue);
+        cfg->set("enable_progress_worker", false);
+        TransferEngineImpl engine(cfg);
+        ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
-    installFakeRdma(engine, fake_rdma);
+        auto fake_rdma = std::make_shared<FakeTransport>(
+            RDMA, [](const Request& request, int) {
+                EXPECT_EQ(request.length, 32u);
+                return TransferStatus{COMPLETED, request.length};
+            });
+        installFakeRdma(engine, fake_rdma);
 
-    constexpr size_t kReqLen = 4096;
-    std::vector<uint8_t> buffer(kReqLen * 2, 0x44);
-    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+        constexpr size_t kReqLen = 16;
+        std::vector<uint8_t> buffer(kReqLen * 2, 0x44);
+        ASSERT_TRUE(
+            engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
 
-    BatchID batch = engine.allocateBatch(2);
-    ASSERT_NE(batch, (BatchID)0);
+        BatchID batch = engine.allocateBatch(2);
+        ASSERT_NE(batch, (BatchID)0);
 
-    ASSERT_TRUE(
-        engine
-            .submitTransfer(batch,
-                            {makeLocalWrite(buffer.data(), kReqLen),
-                             makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
-            .ok());
-    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+        ASSERT_TRUE(
+            engine
+                .submitTransfer(
+                    batch, {makeLocalWrite(buffer.data(), kReqLen),
+                            makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
+                .ok());
+        EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
 
-    TransferStatus derived{};
-    ASSERT_TRUE(engine.getTransferStatus(batch, 1, derived).ok());
-    EXPECT_EQ(derived.s, TransferStatusEnum::COMPLETED);
+        TransferStatus derived{};
+        ASSERT_TRUE(engine.getTransferStatus(batch, 1, derived).ok());
+        EXPECT_EQ(derived.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(derived.transferred_bytes, 16u);
 
-    TransferStatus owner{};
-    ASSERT_TRUE(engine.getTransferStatus(batch, 0, owner).ok());
-    EXPECT_EQ(owner.s, TransferStatusEnum::COMPLETED);
+        TransferStatus owner{};
+        ASSERT_TRUE(engine.getTransferStatus(batch, 0, owner).ok());
+        EXPECT_EQ(owner.s, TransferStatusEnum::COMPLETED);
+        EXPECT_EQ(owner.transferred_bytes, 16u);
+        for (int poll = 0; poll < 2; ++poll) {
+            std::vector<TransferStatus> tasks;
+            ASSERT_TRUE(engine.getTransferStatus(batch, tasks).ok());
+            ASSERT_EQ(tasks.size(), 2u);
+            for (const auto& status : tasks) {
+                EXPECT_EQ(status.s, COMPLETED);
+                EXPECT_EQ(status.transferred_bytes, 16u);
+            }
+            TransferStatus total{};
+            ASSERT_TRUE(engine.getTransferStatus(batch, total).ok());
+            EXPECT_EQ(total.s, COMPLETED);
+            EXPECT_EQ(total.transferred_bytes, 32u);
+        }
 
-    EXPECT_TRUE(engine.freeBatch(batch).ok());
-    EXPECT_TRUE(
-        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+        EXPECT_TRUE(engine.freeBatch(batch).ok());
+        EXPECT_TRUE(
+            engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+    }
+}
+
+TEST(RuntimeQueueDispatch, BatchNotificationsFollowSubmitIntervals) {
+    for (auto initial : {FAILED, PENDING}) {
+        for (bool same_submit : {false, true}) {
+            SCOPED_TRACE(testing::Message() << initial << "/" << same_submit);
+            auto cfg = makeRuntimeQueueConfig(4, 1024, true);
+            cfg->set("enable_runtime_queue", false);
+            cfg->set("enable_progress_worker", false);
+            cfg->set("enable_auto_failover_on_poll", false);
+            TransferEngineImpl engine(cfg);
+            std::vector<uint8_t> buffer(128);
+            auto second_status = initial;
+            auto fake = std::make_shared<FakeTransport>(
+                RDMA, [&](const Request& request, int) -> TransferStatus {
+                    if (request.source == buffer.data()) {
+                        EXPECT_EQ(request.length, 32u);
+                    }
+                    auto status = request.source == buffer.data() + 64
+                                      ? second_status
+                                      : COMPLETED;
+                    return {status, status == COMPLETED ? request.length : 0};
+                });
+            installFakeRdma(engine, fake);
+            ASSERT_TRUE(
+                engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+            std::vector<Request> first{makeLocalWrite(buffer.data(), 16),
+                                       makeLocalWrite(buffer.data() + 16, 16)};
+            auto second = makeLocalWrite(buffer.data() + 64, 16);
+            if (same_submit) first.push_back(second);
+            auto batch = engine.allocateBatch(3);
+            ASSERT_TRUE(
+                engine.submitTransfer(batch, first, {"first", "ready"}).ok());
+            if (!same_submit) {
+                ASSERT_TRUE(
+                    engine.submitTransfer(batch, {second}, {"second", "ready"})
+                        .ok());
+            }
+            for (int phase = 0; phase < 2; ++phase) {
+                size_t first_count = 0, second_count = 0;
+                for (int poll = 0; poll < 3; ++poll) {
+                    TransferStatus status{};
+                    ASSERT_TRUE(engine.getTransferStatus(batch, status).ok());
+                    EXPECT_EQ(status.s, second_status);
+                    std::vector<Notification> received;
+                    // No notification transport is installed; an empty poll
+                    // reports unsupported, but self notifications are
+                    // delivered.
+                    (void)engine.receiveNotification(received);
+                    for (const auto& item : received) {
+                        if (item.name == "first")
+                            ++first_count;
+                        else if (item.name == "second")
+                            ++second_count;
+                        else
+                            ADD_FAILURE() << item.name;
+                    }
+                }
+                EXPECT_EQ(first_count, phase == 0
+                                           ? !same_submit
+                                           : same_submit && initial == PENDING);
+                EXPECT_EQ(second_count,
+                          phase == 1 && !same_submit && initial == PENDING);
+                if (initial == PENDING) second_status = COMPLETED;
+            }
+            EXPECT_TRUE(engine.freeBatch(batch).ok());
+            EXPECT_TRUE(
+                engine.unregisterLocalMemory(buffer.data(), buffer.size())
+                    .ok());
+        }
+    }
+}
+
+class RangeOnlyRecordingTransport : public FakeTransport {
+   public:
+    explicit RangeOnlyRecordingTransport(TransportType type,
+                                         PollStatusFactory poll)
+        : FakeTransport(type, std::move(poll)) {}
+    static constexpr uint64_t kRange = uint64_t{1} << 34;
+    std::vector<Request> posted;
+
+    Status addMemoryBuffer(BufferDesc& desc,
+                           const MemoryOptions& options) override {
+        // Only the descriptor is large. The fake never accesses its payload.
+        desc.length = kRange;
+        return FakeTransport::addMemoryBuffer(desc, options);
+    }
+    Status submitTransferTasks(SubBatchRef batch,
+                               const std::vector<Request>& requests) override {
+        posted.insert(posted.end(), requests.begin(), requests.end());
+        return FakeTransport::submitTransferTasks(batch, requests);
+    }
+};
+
+TEST(RuntimeQueueDispatch, TcpCapsPreservePublicMappingAndOwnerBytes) {
+    for (auto type : {TCP, RDMA, HP_TCP}) {
+        for (auto hint : {UNSPEC, type}) {
+            for (auto opcode : {Request::READ, Request::WRITE}) {
+                SCOPED_TRACE(testing::Message()
+                             << type << "/" << hint << "/" << opcode);
+                const auto cap = tcpMaxTransferBytes(opcode);
+                auto cfg = makeRuntimeQueueConfig(3, 1024, true);
+                cfg->set("enable_runtime_queue", false);
+                cfg->set("enable_progress_worker", false);
+                TransferEngineImpl engine(cfg);
+                std::vector<uint8_t> buffer(64);
+                const auto addr = reinterpret_cast<uintptr_t>(buffer.data());
+                auto tail_status = PENDING;
+                auto fake = std::make_shared<RangeOnlyRecordingTransport>(
+                    type, [&](const Request& request, int) -> TransferStatus {
+                        auto status = reinterpret_cast<uintptr_t>(
+                                          request.source) == addr + cap
+                                          ? tail_status
+                                          : COMPLETED;
+                        return {status,
+                                status == COMPLETED ? request.length : 0};
+                    });
+                engine.swapTransportForTest(type, fake);
+                ASSERT_TRUE(
+                    engine.registerLocalMemory(buffer.data(), buffer.size())
+                        .ok());
+                std::vector<Request> requests;
+                uint64_t offset = 0;
+                for (size_t length : {cap - 1, size_t{1}, size_t{1}}) {
+                    auto request = makeLocalWrite(buffer.data(), length);
+                    request.source = reinterpret_cast<void*>(addr + offset);
+                    request.target_offset = addr + offset;
+                    request.opcode = opcode;
+                    request.transport_hint = hint;
+                    requests.push_back(request);
+                    offset += length;
+                }
+                auto batch = engine.allocateBatch(3);
+                ASSERT_TRUE(engine.submitTransfer(batch, requests).ok());
+                ASSERT_EQ(fake->posted.size(), type == TCP ? 2u : 1u);
+                EXPECT_EQ(fake->posted[0].length, type == TCP ? cap : cap + 1);
+                EXPECT_EQ(fake->posted[0].source, buffer.data());
+                EXPECT_EQ(fake->posted[0].target_offset, addr);
+                if (type == TCP) {
+                    EXPECT_EQ(fake->posted[1].length, 1u);
+                    EXPECT_EQ(
+                        reinterpret_cast<uintptr_t>(fake->posted[1].source),
+                        addr + cap);
+                    EXPECT_EQ(fake->posted[1].target_offset, addr + cap);
+                }
+                for (int poll = 0; poll < 3; ++poll) {
+                    for (size_t task = 0; task < requests.size(); ++task) {
+                        TransferStatus status{};
+                        ASSERT_TRUE(
+                            engine.getTransferStatus(batch, task, status).ok());
+                        const bool pending =
+                            type == TCP && poll == 0 && task == 2;
+                        EXPECT_EQ(status.s, pending ? PENDING : COMPLETED);
+                        EXPECT_EQ(status.transferred_bytes,
+                                  pending ? 0 : requests[task].length);
+                    }
+                    TransferStatus status{};
+                    ASSERT_TRUE(engine.getTransferStatus(batch, status).ok());
+                    EXPECT_EQ(status.s,
+                              type == TCP && poll == 0 ? PENDING : COMPLETED);
+                    EXPECT_EQ(status.transferred_bytes,
+                              type == TCP && poll == 0 ? cap : cap + 1);
+                    tail_status = COMPLETED;
+                }
+                EXPECT_TRUE(engine.freeBatch(batch).ok());
+                EXPECT_TRUE(
+                    engine
+                        .unregisterLocalMemory(
+                            buffer.data(), RangeOnlyRecordingTransport::kRange)
+                        .ok());
+            }
+        }
+    }
 }
 
 }  // namespace

@@ -213,7 +213,7 @@ class DynamicReplicationTest : public ::testing::Test {
     void DiscardExpiredProcessingReplicas(MasterService& service,
                                           const std::string& key) const {
         const size_t shard_idx =
-            service.getMetadataShardIndex(TenantId::Default(), key);
+            service.getShardIndex(TenantId::Default(), key);
         MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
         service.DiscardExpiredProcessingReplicas(
             shard, std::chrono::system_clock::now() + std::chrono::seconds(1));
