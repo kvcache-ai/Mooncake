@@ -10,8 +10,8 @@ use redis::{Commands, Script};
 use crate::cold_tier::cold_tier_device_matches_filter;
 
 use super::{
-    bounded_set_members, json_error, metadata_error, scan_keys, RedisMetadataBackend,
-    CAS_OBJECT_ROUTE_SCRIPT,
+    json_error, metadata_error, scan_keys, scan_set_members_bounded,
+    RedisMetadataBackend, CAS_OBJECT_ROUTE_SCRIPT, MAX_REDIS_LIST_ITEMS, MAX_REDIS_SCAN_PAGES,
 };
 
 const APPLY_COLD_TIER_USAGE_DELTA_SCRIPT: &str = r#"
@@ -154,10 +154,11 @@ impl RedisMetadataBackend {
         let keys = self.query_readonly(
             "redis list object routes by cold backing",
             |connection| {
-                bounded_set_members(
+                scan_set_members_bounded(
                     connection,
                     &index,
-                    "redis sscan cold backing route index",
+                    MAX_REDIS_LIST_ITEMS,
+                    MAX_REDIS_SCAN_PAGES,
                 )
             },
         )?;
@@ -234,10 +235,11 @@ impl RedisMetadataBackend {
         let keys = self.query_readonly(
             "redis list object routes by nof backing",
             |connection| {
-                bounded_set_members(
+                scan_set_members_bounded(
                     connection,
                     &index,
-                    "redis sscan nof backing route index",
+                    MAX_REDIS_LIST_ITEMS,
+                    MAX_REDIS_SCAN_PAGES,
                 )
             },
         )?;

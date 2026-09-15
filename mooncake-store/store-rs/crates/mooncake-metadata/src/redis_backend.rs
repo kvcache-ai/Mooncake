@@ -3395,6 +3395,7 @@ mod tests {
                 priority: 1,
             }],
             cold_backing: None,
+            nof_backing: None,
         }
 
 }
