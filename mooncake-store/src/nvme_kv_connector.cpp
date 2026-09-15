@@ -2,10 +2,12 @@
 
 #include <cstdlib>
 #include <filesystem>
+#include <string_view>
 #include <utility>
 
 #include <glog/logging.h>
 
+#include "config/nvme_kv_connector_config.h"
 #include "nvme_kv_executor_util.h"
 #include "storage_backend.h"
 
@@ -15,48 +17,6 @@ namespace mooncake {
 std::unique_ptr<NvmeKvCommandExecutor> CreateNvmeKvStubExecutor(
     std::filesystem::path storage_path);
 #endif
-
-namespace {
-
-std::string GetEnvString(const char *name) {
-    const char *value = std::getenv(name);
-    return value == nullptr ? std::string() : std::string(value);
-}
-
-enum class RuntimeTransport {
-    kAuto,
-    kIoUring,
-    kIoctl,
-};
-
-const char *RuntimeTransportName(RuntimeTransport transport) {
-    switch (transport) {
-        case RuntimeTransport::kAuto:
-            return "auto";
-        case RuntimeTransport::kIoUring:
-            return "io_uring";
-        case RuntimeTransport::kIoctl:
-            return "ioctl";
-    }
-    return "unknown";
-}
-
-tl::expected<RuntimeTransport, ErrorCode> ParseRuntimeTransport() {
-    const auto transport = GetEnvString("MOONCAKE_NVME_KV_TRANSPORT");
-    if (transport.empty() || transport == "auto") {
-        return RuntimeTransport::kAuto;
-    }
-    if (transport == "io_uring") {
-        return RuntimeTransport::kIoUring;
-    }
-    if (transport == "ioctl") {
-        return RuntimeTransport::kIoctl;
-    }
-    LOG(ERROR) << "Unknown MOONCAKE_NVME_KV_TRANSPORT: " << transport;
-    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-}
-
-}  // namespace
 
 NvmeKvConnector::NvmeKvConnector(const FileStorageConfig &config)
     : storage_path_(
@@ -68,7 +28,8 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Init() {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 #ifdef MOONCAKE_ENABLE_NVME_KV_TEST_STUB
-    if (GetEnvString("MOONCAKE_NVME_KV_DRIVER") == "stub") {
+    const char *driver = std::getenv("MOONCAKE_NVME_KV_DRIVER");
+    if (driver != nullptr && std::string_view(driver) == "stub") {
         std::error_code ec;
         std::filesystem::create_directories(storage_path_, ec);
         if (ec) {
@@ -84,33 +45,23 @@ tl::expected<void, ErrorCode> NvmeKvConnector::Init() {
 }
 
 tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
-    const auto device_path = GetEnvString("MOONCAKE_NVME_KV_DEVICE_PATH");
-    if (device_path.empty()) {
-        LOG(ERROR) << "MOONCAKE_NVME_KV_DEVICE_PATH must not be empty";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const uint32_t nsid = ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_NSID", 1);
-    const uint32_t queue_depth = ParseNvmeKvU32EnvOr(
-        "MOONCAKE_NVME_KV_QUEUE_DEPTH", kDefaultNvmeKvQueueDepth);
-    const uint32_t runtime_transfer_limit =
-        ParseNvmeKvU32EnvOr("MOONCAKE_NVME_KV_RUNTIME_TRANSFER_LIMIT",
-                            kDefaultNvmeKvRuntimeTransferLimit);
-    auto transport = ParseRuntimeTransport();
-    if (!transport) {
-        return tl::make_unexpected(transport.error());
+    auto config = NvmeKvConnectorConfig::FromEnvironment();
+    if (!config.has_value()) {
+        return tl::make_unexpected(config.error());
     }
 
     const auto create_executor =
-        [&](RuntimeTransport selected_transport) -> NvmeKvExecutorResult {
+        [&](NvmeKvTransport selected_transport) -> NvmeKvExecutorResult {
         switch (selected_transport) {
-            case RuntimeTransport::kIoUring:
+            case NvmeKvTransport::kIoUring:
                 return CreateNvmeKvIoUringExecutor(
-                    device_path, nsid, queue_depth, runtime_transfer_limit);
-            case RuntimeTransport::kIoctl:
-                return CreateNvmeKvIoctlExecutor(device_path, nsid, queue_depth,
-                                                 runtime_transfer_limit);
-            case RuntimeTransport::kAuto:
+                    config->device_path, config->nsid, config->queue_depth,
+                    config->runtime_transfer_limit);
+            case NvmeKvTransport::kIoctl:
+                return CreateNvmeKvIoctlExecutor(
+                    config->device_path, config->nsid, config->queue_depth,
+                    config->runtime_transfer_limit);
+            case NvmeKvTransport::kAuto:
                 break;
         }
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -118,9 +69,9 @@ tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
 
     NvmeKvExecutorResult executor_result =
         tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    if (transport.value() == RuntimeTransport::kAuto) {
+    if (config->transport == NvmeKvTransport::kAuto) {
 #ifdef MOONCAKE_HAVE_NVME_URING_CMD
-        executor_result = create_executor(RuntimeTransport::kIoUring);
+        executor_result = create_executor(NvmeKvTransport::kIoUring);
         if (!executor_result) {
             LOG(WARNING) << "NVMe KV io_uring init failed, falling back to "
                             "ioctl: "
@@ -128,15 +79,15 @@ tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
         }
 #endif
         if (!executor_result) {
-            executor_result = create_executor(RuntimeTransport::kIoctl);
+            executor_result = create_executor(NvmeKvTransport::kIoctl);
         }
     } else {
-        executor_result = create_executor(transport.value());
+        executor_result = create_executor(config->transport);
     }
 
     if (!executor_result) {
         LOG(ERROR) << "Failed to initialize NVMe KV "
-                   << RuntimeTransportName(transport.value()) << " executor";
+                   << NvmeKvTransportName(config->transport) << " executor";
         return tl::make_unexpected(executor_result.error());
     }
     executor_ = std::move(executor_result.value());

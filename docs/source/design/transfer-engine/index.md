@@ -11,7 +11,7 @@ Mooncake Transfer Engine is a high-performance, zero-copy data transfer library 
 
 As shown in the diagram, each specific client corresponds to a `TransferEngine`, which not only includes a RAM Segment but also integrates management for high-speed transfers across multiple threads and network cards. The RAM Segment, in principle, corresponds to the entire virtual address space of this `TransferEngine`, but in reality, only parts of it (known as a `Buffer`) are registered for (GPUDirect) RDMA Read/Write. Each Buffer can have separate permissions (corresponding to RDMA `rkey`, etc.) and network card affinity (e.g., preferred NICs for different types of memory).
 
-Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, and `HipTransport`.
+Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, `HipTransport`, and `ShmTransport`.
 
 (segment)=
 ### Segment
@@ -41,6 +41,7 @@ With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM rea
 | NVMe-of          | ✓    | ✓    |
 
 - Local memcpy: If the target Segment is actually in the local DRAM/VRAM, direct data copy interfaces such as memcpy, cudaMemcpy are used.
+- SHM: Same-host DRAM transfers of POSIX shm-backed buffers (`MC_FORCE_SHM=1`). With `-DENABLE_MULTI_PROTOCOL=ON` this installs SHM alongside RDMA/TCP; without it, SHM is the only transport. Objects are `0600` (same UID). Same hostname does not imply a shared `/dev/shm`. In-flight copies pin the cached mmap so prune/cap cannot unmap it.
 - TCP: Supports data transfer between local DRAM and remote DRAM.
 - RDMA: Supports data transfer between local DRAM/VRAM and remote DRAM. It supports multi-network card pooling and retry functions in implementation.
 - HIP: Supports intra-node data transfers between GPU VRAM and GPU VRAM, as well as between GPU VRAM and CPU DRAM, using IPC handles or Shareable handles for ROCm.
@@ -159,7 +160,7 @@ The following video shows a normal run as described above, with the Target on th
 ![transfer-engine-running](../../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
-Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
+Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), `HipTransport` (for AMD GPUs), and `ShmTransport` (POSIX shm for same-host DRAM).
 
 For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
@@ -507,7 +508,8 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_MUSA_IPC_OPEN_DEVICE` (`musa` transport only) Select the device context used to open imported IPC memory. The default `current` preserves the caller's context; `metadata` is an opt-in that uses the runtime-visible logical ordinal advertised by the remote buffer. With `metadata`, every peer must map each logical ordinal to the same physical GPU. `MTHREADS_VISIBLE_DEVICES` is a container-toolkit setting and is not used by Mooncake to infer this mapping.
 - `MC_MUSA_COPY_API` (`musa` transport only) Select `auto` (default), `transfer_batch`, or `default`. On MUSA SDK 5.2 or newer, `auto` uses `muMemoryTransferBatchAsync` when every copy in a batch meets `MC_MUSA_TRANSFER_BATCH_MIN_BYTES`; `default` uses per-slice CUDA-compatible copies.
 - `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` (`musa` transport only) Minimum copy size selected by `MC_MUSA_COPY_API=auto`. The default is 1048576 (1 MiB).
-- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed. Takes precedence over `MC_FORCE_SHM`.
+- `MC_FORCE_SHM` Opt in to POSIX SHM for same-host DRAM copies of buffers allocated with `allocateSharedMemory`. Default off. With `-DENABLE_MULTI_PROTOCOL=ON`, SHM is installed alongside RDMA/TCP (`rdma,shm` / `tcp,shm`). Without multi-protocol, SHM is the only transport (skip RDMA/TCP auto-install), like `MC_FORCE_TCP`. `MC_FORCE_TCP` is handled first in `init` and returns before SHM install. Alternative: `installTransport("shm")`, which logs a WARNING if it overwrites a non-empty rdma/tcp protocol. Objects are created `0600` (same UID). A peer `free`+`allocate` that reuses the same virtual address is remapped after the POSIX name disappears; a new address still needs a fresh `BufferDesc` (see `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS`).
 - `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.

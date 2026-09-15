@@ -86,16 +86,15 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
     static constexpr int kExitUnmountFailed = 4;   // scenario setup broken
 
     // Friend access: find a key that routes to the SAME metadata shard as
-    // `key` (getMetadataShardIndex hashes tenant+key, so a naive second key
+    // `key` (getShardIndex hashes tenant+key, so a naive second key
     // lands in a different shard's TenantState and cannot keep THIS shard's
     // tenant non-empty).
     std::string FindKeyOnSameShard(MasterService& service,
                                    const std::string& key) {
-        const size_t target =
-            service.getMetadataShardIndex(TenantId::Default(), key);
+        const size_t target = service.getShardIndex(TenantId::Default(), key);
         for (int i = 0; i < 100000; ++i) {
             std::string candidate = key + "_keepalive_" + std::to_string(i);
-            if (service.getMetadataShardIndex(TenantId::Default(), candidate) ==
+            if (service.getShardIndex(TenantId::Default(), candidate) ==
                 target) {
                 return candidate;
             }

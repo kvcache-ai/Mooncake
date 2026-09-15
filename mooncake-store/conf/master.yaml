@@ -16,6 +16,20 @@ eviction_ratio: 0.1
 # usage-ratio eviction; allocation-failure-triggered eviction remains enabled.
 eviction_high_watermark_ratio: 1.0
 
+# Per-tenant eviction watermark, as a fraction of each tenant's OWN effective
+# quota. Defaults to 0.9 in code, mirroring eviction_high_watermark_ratio; set
+# 0.0 to disable the pass and keep the historical behaviour.
+#
+# Only relevant with enable_multi_tenants. This pass is the only mechanism that
+# frees space for a tenant -- admission never evicts, it rejects with
+# TENANT_QUOTA_EXCEEDED and lets this pass build the headroom for the retry.
+#
+# Because effective quotas sum to exactly the pool capacity, at most one
+# tenant's share can exceed eviction_high_watermark_ratio; every other tenant
+# reaches its own ceiling before the pool crosses the pool-wide watermark, so
+# without this nothing ever reclaims on its behalf.
+tenant_eviction_high_watermark_ratio: 0.9
+
 # Dynamic MEMORY replica fanout is disabled by default. Replica removal is
 # driven by the existing memory eviction/reclaim path; when a dynamic replica
 # is evicted, Master records a short recreate cooldown so hot-read admission
@@ -34,10 +48,14 @@ etcd_endpoints: "http://localhost:2379"
 root_fs_dir: ""
 cluster_id: "mooncake_cluster"
 memory_allocator: "offset"
-client_live_ttl_sec: 60
+client_active_ttl_sec: 60
+client_suspicion_ttl_sec: 60
 
 # OpLog store configuration for HA hot-standby replication
 enable_oplog: false
+enable_oplog_snapshot: false
+# Maximum objects per standby batch OpLog snapshot chunk
+snapshot_chunk_object_count: 1000000
 # Batch standby base polling/retry delay in milliseconds
 oplog_poll_interval_ms: 1000
 # Maximum consecutive retryable batch-standby failure window in seconds

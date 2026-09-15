@@ -15,15 +15,20 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <functional>
 #include <unordered_map>
 
 #include "transport/transport.h"
 
 namespace mooncake {
+class TransferEngineImpl;
 class TransferEngineImplTestPeer;
+class MultiTransportTestPeer;
 
 class MultiTransport {
+    friend class TransferEngineImpl;
     friend class TransferEngineImplTestPeer;
+    friend class MultiTransportTestPeer;
 
    public:
     using BatchID = Transport::BatchID;
@@ -73,10 +78,11 @@ class MultiTransport {
     Transport *getTransport(const std::string &proto);
 
     /**
-     * @brief Check if TCP is the only installed transport.
+     * @brief Check if TCP is the only installed host transport.
      *
-     * When only TCP transport is available (no RDMA, NVLink, etc.),
-     * local memcpy is preferred over TCP loopback for same-host transfers.
+     * When only TCP is available (no RDMA, NVLink, etc.), local memcpy is
+     * preferred over TCP loopback for same-host transfers. POSIX SHM is
+     * intra-node only and does not change this classification.
      */
     bool isTcpOnly() const;
 
@@ -85,6 +91,9 @@ class MultiTransport {
     void *getBaseAddr();
 
    private:
+    Status freeBatchID(BatchID batch_id,
+                       const std::function<void()> &before_delete);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries,
                           std::vector<size_t> *task_sizes);

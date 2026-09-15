@@ -16,6 +16,8 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <stdexcept>
+
 #include "transfer_engine_rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -174,7 +176,10 @@ Status CoroRpcAgent::stop() {
 Lazy<void> CoroRpcAgent::process(int func_id) {
     auto* ctx = co_await coro_rpc::get_context_in_coro();
     auto it = func_map_.find(func_id);
-    if (it == func_map_.end()) co_return;
+    if (it == func_map_.end()) {
+        throw std::runtime_error("Unknown TENT RPC function: " +
+                                 std::to_string(func_id));
+    }
     const auto handler = it->second;
 
     auto request = ctx->get_request_attachment();
@@ -254,7 +259,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
             auto msg = "Failed to connect RPC server. server: " + server_addr +
                        ", func_id: " + std::to_string(func_id) +
                        ", message: " + std::string{conn_result.message()};
-            co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK),
+            co_return std::make_pair(Status::RpcConnectionError(msg + LOC_MARK),
                                      "");
         }
     }

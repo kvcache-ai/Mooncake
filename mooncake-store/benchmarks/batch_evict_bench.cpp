@@ -179,9 +179,9 @@ class BatchEvictBench {
                 for (auto& [key, metadata] : tenant_state.metadata) {
                     {
                         SpinLocker locker(&metadata.lock);
-                        metadata.lease_timeout =
+                        metadata.lease_->SetDeadline(
                             base_expiration +
-                            std::chrono::nanoseconds(ordinal++);
+                            std::chrono::nanoseconds(ordinal++));
                     }
 
                     ++stats.object_count;

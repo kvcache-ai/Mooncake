@@ -1650,6 +1650,90 @@ TEST(ProgressLockShard, PollRacesWithFreeSameBatch) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
+TEST(ProgressLockShard, DeferredFreeRegistryReadRacesWithAllocation) {
+    auto cfg = makeMinimalP2PConfig();
+    cfg->set("enable_runtime_queue", false);
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    std::atomic<bool> complete{false};
+    auto pending_poll = [&complete](const Request& request, int) {
+        if (complete.load(std::memory_order_acquire)) {
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        }
+        return TransferStatus{TransferStatusEnum::PENDING, 0};
+    };
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, FakeTransport::StatusFactory{}, pending_poll);
+    auto fake_tcp = std::make_shared<FakeTransport>(
+        TCP, FakeTransport::StatusFactory{}, pending_poll);
+    installFakeRdmaAndTcp(engine, fake_rdma, fake_tcp);
+
+    constexpr size_t kBufLen = 4096;
+    constexpr int kPendingBatches = 8;
+    constexpr int kRounds = 512;
+    constexpr int kAllocatorThreads = 4;
+    std::vector<uint8_t> buf(kBufLen, 0x33);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    std::vector<BatchID> pending_batches;
+    pending_batches.reserve(kPendingBatches);
+    for (int i = 0; i < kPendingBatches; ++i) {
+        BatchID batch_id = engine.allocateBatch(1);
+        ASSERT_NE(batch_id, (BatchID)0);
+        ASSERT_TRUE(engine
+                        .submitTransfer(
+                            batch_id, {makeLocalWriteReq(buf.data(), kBufLen)})
+                        .ok());
+        pending_batches.push_back(batch_id);
+    }
+
+    std::atomic<bool> start{false};
+    std::atomic<bool> stop{false};
+    std::atomic<int> allocator_failures{0};
+    std::vector<std::thread> allocators;
+    allocators.reserve(kAllocatorThreads);
+    for (int i = 0; i < kAllocatorThreads; ++i) {
+        allocators.emplace_back([&] {
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            while (!stop.load(std::memory_order_acquire)) {
+                // Empty batches complete immediately, so this thread mutates
+                // the shard registry without growing the deferred freelist.
+                BatchID batch_id = engine.allocateBatch(0);
+                if (!batch_id) {
+                    ++allocator_failures;
+                    return;
+                }
+                if (!engine.freeBatch(batch_id).ok()) ++allocator_failures;
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+
+    int free_failures = 0;
+    for (int round = 0; round < kRounds; ++round) {
+        for (BatchID batch_id : pending_batches) {
+            if (!engine.freeBatch(batch_id).ok()) ++free_failures;
+        }
+    }
+
+    stop.store(true, std::memory_order_release);
+    for (auto& allocator : allocators) allocator.join();
+
+    EXPECT_EQ(free_failures, 0);
+    EXPECT_EQ(allocator_failures.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(engine.aliveBatchCountForTest(), kPendingBatches);
+
+    // Let the deferred batches drain before the engine and registered memory
+    // are torn down.
+    complete.store(true, std::memory_order_release);
+    EXPECT_TRUE(engine.freeBatch(pending_batches.front()).ok());
+    EXPECT_EQ(engine.aliveBatchCountForTest(), 0);
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
 TEST(ProgressLockShard, RuntimeQueuePollAndFreeDoesNotDeadlock) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("enable_runtime_queue", true);

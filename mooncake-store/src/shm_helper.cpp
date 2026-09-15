@@ -10,8 +10,9 @@
 #include <unistd.h>
 #include <glog/logging.h>
 
-#include "utils.h"
+#include "common/client_buffer_allocation.h"
 #include "config.h"
+#include "config/hugepage_config.h"
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -78,8 +79,7 @@ ShmHelper::ShmHelper() {
     // `= default` and the env is only initialized lazily via InitializeEnv().
     SpdkWrapper::GetInstance();
 #endif
-    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
-    use_hugepage_ = (hp != nullptr);
+    use_hugepage_ = HugepageConfig::IsEnabledFromEnvironment();
     // Read once at construction (ShmHelper is a singleton). Opt-in only: with
     // MC_STORE_REGISTER_SPDK=1, ShmHelper mappings are registered with SPDK so
     // NoF zero-copy transfers can DMA to/from them; otherwise the previous
@@ -94,7 +94,8 @@ ShmHelper::ShmHelper() {
         // Virtual-address alignment alone (mmap_shm_2mb_aligned) is not
         // sufficient, so force hugepages here; if not enough are configured the
         // allocation below fails with a clear error instead of silently losing
-        // NoF zero-copy.
+        // NoF zero-copy. This is an override on top of
+        // HugepageConfig::IsEnabledFromEnvironment() above.
         use_hugepage_ = true;
 #endif
         LOG(INFO) << "MC_STORE_REGISTER_SPDK=1: shared memory will be "
@@ -213,7 +214,8 @@ void* ShmHelper::allocate(size_t size) {
     // When MC_STORE_REGISTER_SPDK=1 forces hugepages, the branch above already
     // aligned size to the hugepage size, and hugetlb mmap returns a
     // hugepage-aligned base, so no separate 2MB size padding or aligned base
-    // mapping (mmap_shm_2mb_aligned, utils.h) is needed on the sender side.
+    // mapping (mmap_shm_2mb_aligned, common/mmap_aligned.h) is needed on the
+    // sender side.
     // (The receiver maps the shared fd and aligns its own base in
     // RealClient::map_shm_internal_with_device.)
 
@@ -370,10 +372,10 @@ int ShmHelper::free(void* addr) {
 
 std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
+    const uintptr_t address = reinterpret_cast<uintptr_t>(addr);
     for (auto& shm : shms_) {
-        if (addr >= shm->base_addr &&
-            reinterpret_cast<uint8_t*>(addr) <
-                reinterpret_cast<uint8_t*>(shm->base_addr) + shm->size) {
+        const uintptr_t base = reinterpret_cast<uintptr_t>(shm->base_addr);
+        if (address >= base && address - base < shm->size) {
             return shm;
         }
     }

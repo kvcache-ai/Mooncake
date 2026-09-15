@@ -3,16 +3,35 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
-#include <sstream>
+#include <optional>
+#include <string_view>
 
-#include "environ.h"
-#include "storage/distributed/dfs_global_allocator.h"
 #include "types.h"
-#include "utils.h"
 
 namespace mooncake {
 
 namespace {
+
+std::optional<int> ParseShardFileName(std::string_view name) {
+    constexpr std::string_view prefix = "dfs_shard_";
+    constexpr std::string_view suffix = ".data";
+    if (!name.starts_with(prefix) || !name.ends_with(suffix)) {
+        return std::nullopt;
+    }
+    name.remove_prefix(prefix.size());
+    name.remove_suffix(suffix.size());
+    if (name.size() < 2) return std::nullopt;
+
+    int index = 0;
+    for (char digit : name) {
+        if (digit < '0' || digit > '9' ||
+            index > (std::numeric_limits<int>::max() - (digit - '0')) / 10) {
+            return std::nullopt;
+        }
+        index = index * 10 + (digit - '0');
+    }
+    return index;
+}
 
 bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
                                const DistributedStorageConfig& config) {
@@ -34,126 +53,6 @@ bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
 }
 
 }  // namespace
-
-bool DistributedStorageConfig::Validate() const {
-    if (fsdir.empty()) {
-        LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
-        return false;
-    }
-    if (!std::filesystem::path(fsdir).is_absolute()) {
-        LOG(ERROR)
-            << "DistributedStorageConfig: fsdir must be an absolute path: "
-            << fsdir;
-        return false;
-    }
-    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
-        LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
-                   << fs_adapter_type;
-        return false;
-    }
-    if (shard_count <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
-        return false;
-    }
-    if (shard_capacity == 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
-        return false;
-    }
-    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: alignment must be power of 2";
-        return false;
-    }
-    if (shard_capacity % alignment != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
-        return false;
-    }
-    if (!single_tenant) {
-        LOG(ERROR) << "DistributedStorageConfig: Currently, DFS requires "
-                      "single_tenant=true";
-        return false;
-    }
-    return true;
-}
-
-bool DistributedStorageConfig::ValidateForAllocator() const {
-    if (!Validate()) return false;
-
-    if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
-        eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||
-        eviction_low_watermark >= eviction_high_watermark) {
-        LOG(ERROR) << "DistributedStorageConfig: eviction watermarks must "
-                      "satisfy 0 <= low < high <= 1, low="
-                   << eviction_low_watermark
-                   << ", high=" << eviction_high_watermark;
-        return false;
-    }
-    if (deferred_free_duration.count() < 0) {
-        LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
-                      "be non-negative, seconds="
-                   << deferred_free_duration.count();
-        return false;
-    }
-    if (eviction_enabled && eviction_check_interval.count() <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
-                      "be positive when eviction is enabled, seconds="
-                   << eviction_check_interval.count();
-        return false;
-    }
-    return true;
-}
-
-DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
-    DistributedStorageConfig config;
-    config.fsdir = Environ::GetString(
-        "MOONCAKE_DFS_ROOT_DIR",
-        Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir));
-    if (!std::filesystem::path(config.fsdir).is_absolute()) {
-        config.fsdir = std::filesystem::absolute(config.fsdir).string();
-    }
-    config.fs_adapter_type =
-        Environ::GetString("MOONCAKE_DFS_FS_ADAPTER",
-                           Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE",
-                                              config.fs_adapter_type));
-    config.enable_health_check =
-        Environ::GetBool("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
-    config.shard_count =
-        Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
-    config.shard_capacity = Environ::GetUInt64("MOONCAKE_DFS_SHARD_CAPACITY",
-                                               config.shard_capacity);
-    config.alignment =
-        Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", config.alignment);
-    config.single_tenant =
-        Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", config.single_tenant);
-    config.eviction_enabled = Environ::GetBool("MOONCAKE_DFS_EVICTION_ENABLED",
-                                               config.eviction_enabled);
-    config.eviction_high_watermark = Environ::GetDouble(
-        "MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", config.eviction_high_watermark);
-    config.eviction_low_watermark = Environ::GetDouble(
-        "MOONCAKE_DFS_EVICTION_LOW_WATERMARK", config.eviction_low_watermark);
-    config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
-        "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
-        static_cast<int>(config.deferred_free_duration.count())));
-    config.eviction_check_interval = std::chrono::seconds(Environ::GetInt(
-        "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
-        static_cast<int>(config.eviction_check_interval.count())));
-    return config;
-}
-
-std::string DistributedStorageConfig::FormatStr() const {
-    std::ostringstream oss;
-    oss << "fsdir=" << fsdir << ", fs_adapter_type=" << fs_adapter_type
-        << ", enable_health_check=" << enable_health_check
-        << ", shard_count=" << shard_count
-        << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
-        << ", single_tenant=" << single_tenant
-        << ", eviction_enabled=" << eviction_enabled
-        << ", eviction_high_watermark=" << eviction_high_watermark
-        << ", eviction_low_watermark=" << eviction_low_watermark
-        << ", deferred_free_seconds=" << deferred_free_duration.count()
-        << ", eviction_check_interval_seconds="
-        << eviction_check_interval.count();
-    return oss.str();
-}
 
 DistributedStorageBackend::DistributedStorageBackend(
     const FileStorageConfig& file_storage_config,
@@ -180,7 +79,7 @@ DistributedStorageBackend::DistributedStorageBackend(
 }
 
 DistributedStorageBackend::~DistributedStorageBackend() {
-    for (auto& shard : shard_files_) {
+    for (auto& [_, shard] : shard_files_) {
         if (shard && shard->fd >= 0 && fs_adapter_) {
             fs_adapter_->CloseFile(shard->fd);
             shard->fd = -1;
@@ -198,6 +97,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (UsesObjectStorage()) {
         auto init_result = object_storage_adapter_->Init();
         if (!init_result) return init_result;
+        if (distributed_config_.enable_health_check) {
+            auto health_result = object_storage_adapter_->CheckHealth();
+            if (!health_result) {
+                LOG(ERROR) << "Object storage health check failed, adapter="
+                           << object_storage_adapter_->GetName() << ", error="
+                           << static_cast<int>(health_result.error());
+                return health_result;
+            }
+        }
         initialized_ = true;
         LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
                   << object_storage_adapter_->GetName();
@@ -215,26 +123,75 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     auto init_result = fs_adapter_->Init(root_dir_);
     if (!init_result) return init_result;
 
-    shard_files_.reserve(distributed_config_.shard_count);
-    for (int i = 0; i < distributed_config_.shard_count; ++i) {
-        std::string path = root_dir_ + "/dfs_shard_" +
-                           DfsGlobalAllocator::FormatShardIdx(
-                               i, distributed_config_.shard_count) +
-                           ".data";
-        auto fd_result = fs_adapter_->OpenFile(path);
-        if (!fd_result) {
-            LOG(ERROR) << "Failed to open DFS shard " << path << ": "
-                       << fd_result.error();
-            return tl::make_unexpected(fd_result.error());
-        }
-        auto shard = std::make_unique<ShardFile>();
-        shard->path = std::move(path);
-        shard->fd = *fd_result;
-        shard_files_.push_back(std::move(shard));
-    }
-
+    // Only descriptors returned by the master identify published shards.
+    // Opening files from the configured count or a directory scan can retain
+    // handles to staged shards that a failed expansion subsequently unlinks.
     initialized_ = true;
     return {};
+}
+
+tl::expected<DistributedStorageBackend::ShardFile*, ErrorCode>
+DistributedStorageBackend::GetOrOpenShard(
+    const DistributedFSDescriptor& descriptor) {
+    const auto path =
+        std::filesystem::path(descriptor.file_path).lexically_normal();
+    auto root = std::filesystem::path(root_dir_).lexically_normal();
+    if (root.filename().empty()) root = root.parent_path();
+    auto parent = path.parent_path();
+    if (parent.empty()) parent = ".";
+    const auto index = ParseShardFileName(path.filename().string());
+    if (descriptor.shard_idx < 0 || !index || *index != descriptor.shard_idx ||
+        parent != root) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ShardFile* shard;
+    {
+        std::lock_guard cache_lock(shard_files_mutex_);
+        auto existing = shard_files_.find(descriptor.shard_idx);
+        if (existing == shard_files_.end()) {
+            existing = shard_files_
+                           .emplace(descriptor.shard_idx,
+                                    std::make_unique<ShardFile>())
+                           .first;
+        }
+        shard = existing->second.get();
+    }
+
+    // File validation and opening may block. Serialize them only with this
+    // shard's initialization and I/O, leaving other cached shards available.
+    std::lock_guard shard_lock(shard->mutex);
+    auto file_path = path.string();
+    if (shard->fd >= 0) {
+        if (shard->path != file_path) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return shard;
+    }
+
+    // The master prepares new shards before publishing their descriptors.
+    // OpenFile may create a file, so reject missing/unprepared shards first.
+    auto file_size = fs_adapter_->GetFileSize(file_path);
+    if (!file_size) return tl::make_unexpected(file_size.error());
+    if (*file_size != distributed_config_.shard_capacity) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::error_code ec;
+    const auto canonical_root = std::filesystem::canonical(root, ec);
+    if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    const auto canonical_path = std::filesystem::canonical(path, ec);
+    if (ec) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    if (canonical_path.parent_path() != canonical_root ||
+        canonical_path.filename() != path.filename()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto fd = fs_adapter_->OpenFile(file_path);
+    if (!fd) return tl::make_unexpected(fd.error());
+    // Failed attempts keep fd == -1 so a later request can retry
+    // initialization.
+    shard->path = std::move(file_path);
+    shard->fd = *fd;
+    return shard;
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
@@ -326,24 +283,6 @@ DistributedStorageBackend::BatchWrite(
 
     for (const auto& request : requests) {
         const auto& desc = request.descriptor;
-        if (desc.shard_idx < 0 ||
-            desc.shard_idx >= static_cast<int>(shard_files_.size())) {
-            LOG(ERROR) << "Invalid DFS shard_idx " << desc.shard_idx
-                       << " for key " << request.key;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-
-        auto& shard = *shard_files_[desc.shard_idx];
-        if (desc.file_path != shard.path) {
-            LOG(ERROR) << "DFS path mismatch for key " << request.key
-                       << ", descriptor=" << desc.file_path
-                       << ", configured=" << shard.path;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
         if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
             LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
                        << ", offset=" << desc.offset
@@ -379,6 +318,14 @@ DistributedStorageBackend::BatchWrite(
             continue;
         }
 
+        auto shard_result = GetOrOpenShard(desc);
+        if (!shard_result) {
+            LOG(ERROR) << "Failed to open DFS shard for key " << request.key
+                       << ": " << shard_result.error();
+            results.emplace_back(tl::make_unexpected(shard_result.error()));
+            continue;
+        }
+        auto& shard = **shard_result;
         std::lock_guard lock(shard.mutex);
         auto write_result =
             fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
@@ -421,24 +368,6 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 
     for (const auto& request : requests) {
         const auto& desc = request.descriptor;
-        if (desc.shard_idx < 0 ||
-            desc.shard_idx >= static_cast<int>(shard_files_.size())) {
-            LOG(ERROR) << "Invalid DFS shard_idx " << desc.shard_idx
-                       << " for key " << request.key;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
-
-        auto& shard = *shard_files_[desc.shard_idx];
-        if (desc.file_path != shard.path) {
-            LOG(ERROR) << "DFS path mismatch for key " << request.key
-                       << ", descriptor=" << desc.file_path
-                       << ", configured=" << shard.path;
-            results.emplace_back(
-                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
-            continue;
-        }
         if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
             LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
                        << ", offset=" << desc.offset
@@ -453,6 +382,9 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
         if (desc.object_size > std::numeric_limits<size_t>::max() ||
             request.slices.size() >
                 static_cast<size_t>(std::numeric_limits<int>::max())) {
+            LOG(ERROR) << "DFS read request exceeds platform limits for key "
+                       << request.key << ", object_size=" << desc.object_size
+                       << ", slice_count=" << request.slices.size();
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
@@ -482,6 +414,14 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
             continue;
         }
 
+        auto shard_result = GetOrOpenShard(desc);
+        if (!shard_result) {
+            LOG(ERROR) << "Failed to open DFS shard for key " << request.key
+                       << ": " << shard_result.error();
+            results.emplace_back(tl::make_unexpected(shard_result.error()));
+            continue;
+        }
+        auto& shard = **shard_result;
         std::lock_guard lock(shard.mutex);
         auto read_result = fs_adapter_->ReadAt(
             shard.fd, iovs.data(), static_cast<int>(iovs.size()),

@@ -52,6 +52,10 @@ target_link_libraries(
   batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
 
+add_executable(batch_oplog_promotion_bench batch_oplog_promotion_bench.cpp)
+target_link_libraries(batch_oplog_promotion_bench PRIVATE mooncake_store
+                                                          gflags::gflags)
+
 if(STORE_USE_ETCD)
   add_executable(oplog_batch_bench oplog_batch_bench.cpp)
   target_link_libraries(

@@ -2,10 +2,11 @@
 #include "nvme_kv_object_layout.h"
 
 #include <algorithm>
-#include <cerrno>
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
+
+#include "config/nvme_kv_u32_parser.h"
 
 namespace mooncake {
 namespace {
@@ -30,17 +31,10 @@ uint32_t ReadLe32(const uint8_t *p) {
 
 uint32_t ParseNvmeKvU32EnvOr(const char *name, uint32_t fallback) {
     const char *value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') {
+    if (value == nullptr) {
         return fallback;
     }
-    char *end = nullptr;
-    errno = 0;
-    unsigned long parsed = std::strtoul(value, &end, 0);
-    if (errno != 0 || end == value || *end != '\0' ||
-        parsed > std::numeric_limits<uint32_t>::max()) {
-        return fallback;
-    }
-    return static_cast<uint32_t>(parsed);
+    return TryParseNvmeKvU32(value).value_or(fallback);
 }
 
 NvmeKvAlignedBuffer AllocateNvmeKvAlignedBuffer(size_t size) {
