@@ -6,6 +6,7 @@
 #include <chrono>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
@@ -13,6 +14,7 @@
 #include <thread>
 #include "config/spdk_controller_config.h"
 #include "spdk/spdk_wrapper.h"
+#include "types.h"
 
 namespace mooncake {
 namespace {
@@ -492,6 +494,66 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     }
 
     return ok;
+}
+
+bool SpdkWrapper::QueryNamespaceInfo(const std::string &endpoint,
+                                     NoFNamespaceInfo &info,
+                                     std::string *error_reason) {
+    auto fail = [error_reason](const std::string &reason) {
+        if (error_reason) {
+            *error_reason = reason;
+        }
+        return false;
+    };
+    tr_info tr;
+    if (ParseTransPortStr(endpoint, &tr) != 0) {
+        return fail("invalid NVMe-oF endpoint");
+    }
+    if (!InitializeEnv()) {
+        return fail("SPDK environment initialization failed");
+    }
+
+    // Serialize probe/detach with OpenNofSegment and keep cached controllers
+    // alive while their namespace information is being copied.
+    std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+    std::unique_ptr<spdk_nvme_ctrlr, decltype(&spdk_nvme_detach)> temporary(
+        nullptr, spdk_nvme_detach);
+    spdk_nvme_ctrlr *ctrlr = nullptr;
+    auto it = connected_ctrlrs.find(tr.ctrlr_key);
+    if (it != connected_ctrlrs.end()) {
+        ctrlr = it->second->ctrlr;
+    } else {
+        ctrlr_info connection{};
+        int ret = ConnectController(&tr.trid, &connection);
+        temporary.reset(connection.ctrlr);
+        if (ret != 0) {
+            return fail("NVMe-oF controller connection failed: " +
+                        std::to_string(ret));
+        }
+        ctrlr = connection.ctrlr;
+    }
+    if (!ctrlr) {
+        return fail("NVMe-oF controller was not found");
+    }
+    if (!spdk_nvme_ctrlr_is_active_ns(ctrlr, tr.ns)) {
+        return fail("namespace is not active: " + std::to_string(tr.ns));
+    }
+    auto *ns = spdk_nvme_ctrlr_get_ns(ctrlr, tr.ns);
+    if (!ns) {
+        return fail("namespace was not found: " + std::to_string(tr.ns));
+    }
+
+    NoFNamespaceInfo result;
+    result.block_size = spdk_nvme_ns_get_sector_size(ns);
+    result.num_blocks = spdk_nvme_ns_get_num_sectors(ns);
+    if (result.block_size == 0 || result.num_blocks == 0 ||
+        result.num_blocks >
+            std::numeric_limits<uint64_t>::max() / result.block_size) {
+        return fail("invalid namespace size");
+    }
+    result.size = result.num_blocks * result.block_size;
+    info = result;
+    return true;
 }
 
 }  // namespace mooncake
