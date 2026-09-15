@@ -308,8 +308,7 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
         {key}, {{first.data()}}, {{first.size()}}, {{127}});
     ASSERT_EQ(results, std::vector<int>{static_cast<int>(
                            toInt(ErrorCode::NO_AVAILABLE_HANDLE))});
-    py_client_->client_buffer_allocator_ =
-        std::move(client_buffer_allocator);
+    py_client_->client_buffer_allocator_ = std::move(client_buffer_allocator);
 
     results = py_client_->batch_get_into_multi_buffer_ranges(
         {key}, {{first.data(), second.data()}}, {{first.size(), second.size()}},
