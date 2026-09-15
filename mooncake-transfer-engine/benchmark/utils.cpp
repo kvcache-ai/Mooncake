@@ -101,6 +101,17 @@ DEFINE_string(xport_type, "",
               "rdma|tcp|hp_tcp|shm|mnnvl|nvlink|gds|iouring|ub|sunrise_link|"
               "mpcomm|flagcx");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
+DEFINE_bool(use_hugepage, false,
+            "classic DRAM: SHM allocates on hugetlbfs; RDMA allocates with "
+            "MAP_HUGETLB so ibv_reg_mr does not explode NIC PTEs on 4K pages. "
+            "Length must be a multiple of hugepage_size. No 4K fallback.");
+DEFINE_uint64(hugepage_size, 0,
+              "Hugepage size in bytes: 2MB, 512MB, or 1GB. "
+              "0 defaults to 2MB when --use_hugepage is set.");
+DEFINE_string(
+    hugetlbfs_path, "",
+    "classic shm hugepage mount. Empty uses the size-specific "
+    "default (/dev/hugepages, /dev/hugepages-512M, /dev/hugepages-1G).");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
 DEFINE_string(tent_transport_hint, "unspec",
@@ -147,6 +158,9 @@ std::string XferBenchConfig::metadata_url_list;
 int XferBenchConfig::rpc_server_port = 0;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
+bool XferBenchConfig::use_hugepage = false;
+size_t XferBenchConfig::hugepage_size = 0;
+std::string XferBenchConfig::hugetlbfs_path;
 bool XferBenchConfig::notifi = false;
 std::string XferBenchConfig::tent_transport_hint;
 std::string XferBenchConfig::tent_intent_type;
@@ -189,6 +203,9 @@ void XferBenchConfig::loadFromFlags() {
 
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
+    use_hugepage = FLAGS_use_hugepage;
+    hugepage_size = FLAGS_hugepage_size;
+    hugetlbfs_path = FLAGS_hugetlbfs_path;
     notifi = FLAGS_notifi;
     tent_transport_hint = FLAGS_tent_transport_hint;
     tent_intent_type = FLAGS_tent_intent_type;

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "utils.h"
+#include "common.h"
 
 #include "bench_runner.h"
 #include "qos_metrics_adapter.h"
@@ -306,6 +307,27 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
+    if (XferBenchConfig::use_hugepage) {
+        if (XferBenchConfig::backend != "classic" ||
+            (XferBenchConfig::xport_type != "shm" &&
+             XferBenchConfig::xport_type != "rdma")) {
+            LOG(ERROR) << "--use_hugepage requires --backend=classic and "
+                          "--xport_type=shm or rdma";
+            return EXIT_FAILURE;
+        }
+        const size_t hp = XferBenchConfig::hugepage_size == 0
+                              ? mooncake::SharedMemoryOptions::kHugepage2MB
+                              : XferBenchConfig::hugepage_size;
+        if (!mooncake::SharedMemoryOptions::isSupportedHugepageSize(hp)) {
+            LOG(ERROR) << "--hugepage_size must be 2MB, 512MB, or 1GB";
+            return EXIT_FAILURE;
+        }
+        if (XferBenchConfig::total_buffer_size % hp != 0) {
+            LOG(ERROR) << "--total_buffer_size must be a multiple of "
+                          "hugepage_size";
+            return EXIT_FAILURE;
+        }
+    }
     std::vector<WorkloadClassConfig> workload_classes;
     std::vector<QosClassConfig> qos_classes;
     if (!XferBenchConfig::workload_classes_json.empty() &&

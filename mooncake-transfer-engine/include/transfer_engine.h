@@ -135,11 +135,14 @@ class TransferEngine {
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
-    // Allocate POSIX shm that ShmTransport can export to same-host peers.
+    // Allocate shared memory that ShmTransport can export to same-host peers.
     // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
     // Caller must registerLocalMemory before remote access. Returns nullptr
-    // on failure.
+    // on failure. Default: POSIX /dev/shm. With
+    // SharedMemoryOptions.use_hugepage and hugepage_size 2MB/512MB/1GB:
+    // matching hugetlbfs (no silent tmpfs fallback).
     void* allocateSharedMemory(size_t length);
+    void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 
     int freeSharedMemory(void* addr);
 

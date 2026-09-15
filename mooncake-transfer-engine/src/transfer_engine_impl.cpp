@@ -564,6 +564,11 @@ int TransferEngineImpl::uninstallTransport(const std::string& proto) {
 }
 
 void* TransferEngineImpl::allocateSharedMemory(size_t length) {
+    return allocateSharedMemory(length, SharedMemoryOptions{});
+}
+
+void* TransferEngineImpl::allocateSharedMemory(size_t length,
+                                               const SharedMemoryOptions& opt) {
     auto* shm =
         dynamic_cast<ShmTransport*>(multi_transports_->getTransport("shm"));
     if (!shm) {
@@ -571,7 +576,7 @@ void* TransferEngineImpl::allocateSharedMemory(size_t length) {
                       "(set MC_FORCE_SHM=1 or installTransport(\"shm\"))";
         return nullptr;
     }
-    return shm->allocateSharedMemory(length);
+    return shm->allocateSharedMemory(length, opt);
 }
 
 int TransferEngineImpl::freeSharedMemory(void* addr) {

@@ -179,6 +179,11 @@ void* TransferEngine::allocateSharedMemory(size_t length) {
     return impl_->allocateSharedMemory(length);
 }
 
+void* TransferEngine::allocateSharedMemory(size_t length,
+                                           const SharedMemoryOptions& opt) {
+    return impl_->allocateSharedMemory(length, opt);
+}
+
 int TransferEngine::freeSharedMemory(void* addr) {
     return impl_->freeSharedMemory(addr);
 }
@@ -676,6 +681,16 @@ void* TransferEngine::allocateSharedMemory(size_t length) {
         return nullptr;
     }
     return impl_->allocateSharedMemory(length);
+}
+
+void* TransferEngine::allocateSharedMemory(size_t length,
+                                           const SharedMemoryOptions& opt) {
+    if (use_tent_) {
+        LOG(WARNING) << "allocateSharedMemory is classic TE only; use TENT "
+                        "allocateLocalMemory with SHM enabled";
+        return nullptr;
+    }
+    return impl_->allocateSharedMemory(length, opt);
 }
 
 int TransferEngine::freeSharedMemory(void* addr) {
