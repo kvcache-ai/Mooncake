@@ -43,6 +43,7 @@ pip install torch numpy
 python -c "import mooncake._fast_copy"
 python tests/test_fast_copy.py
 python tests/test_import_structure.py
+python tests/test_transfer_engine_gil.py
 
 echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
