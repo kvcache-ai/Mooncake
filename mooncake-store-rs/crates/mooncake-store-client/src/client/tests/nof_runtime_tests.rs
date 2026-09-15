@@ -967,28 +967,42 @@ fn logical_object_nof_runtime_keeps_provider_owned_replication() {
         .expect("object NoF route query should succeed")
         .expect("object NoF route should exist");
     assert!(route.cold_backing.is_none());
+    assert!(route.nof_backing.is_none());
+    assert_eq!(provider.objects.lock().len(), 1);
 
     let updated_payload = b"provider-owned-object-v2";
-    let error = client
+    let updated_route = client
         .put("object-nof-key", updated_payload)
-        .expect_err("object NoF duplicate put must preserve StoreClient semantics");
-    assert!(matches!(error, StoreError::Conflict(_)));
-    assert_eq!(provider.objects.lock().len(), 1);
-    client
-        .remove("object-nof-key", false)
-        .expect("object NoF remove before reinsert should succeed");
-    client
-        .put("object-nof-key", updated_payload)
-        .expect("object NoF reinsert should succeed");
-    client
-        .storage_owner
-        .materialize_pending_offloads_bounded(32)
-        .expect("object NoF reinsert offload should run");
-    let route = client
+        .expect("object NoF overwrite should succeed");
+    assert!(
+        updated_route.version > route.version,
+        "object NoF overwrite should advance the route version"
+    );
+    assert!(updated_route.cold_backing.is_none());
+    assert!(updated_route.nof_backing.is_none());
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .expect("object NoF overwrite offload should run"),
+        1
+    );
+    let updated_route_from_metadata = client
         .query_route("object-nof-key")
         .expect("updated object NoF route query should succeed")
         .expect("updated object NoF route should exist");
-    assert!(route.cold_backing.is_none());
+    assert!(updated_route_from_metadata.cold_backing.is_none());
+    assert!(updated_route_from_metadata.nof_backing.is_none());
+    assert_eq!(updated_route_from_metadata.version, updated_route.version);
+    assert_eq!(provider.objects.lock().len(), 1);
+    assert_eq!(
+        provider.objects.lock().values().next().map(Vec::as_slice),
+        Some(updated_payload.as_slice())
+    );
+    assert_eq!(
+        client.get("object-nof-key").expect("updated object NoF read should succeed"),
+        updated_payload
+    );
     assert!(wait_for_nof_reclaims(&client, || provider.objects.lock().len() == 1));
 
     force_cold_only_route(&client, "object-nof-key");
