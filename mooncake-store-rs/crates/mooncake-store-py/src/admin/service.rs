@@ -3536,7 +3536,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3603,7 +3602,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         shared
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -3777,8 +3775,8 @@ mod tests {
                     canonical_key: None,
                     sharing_scope: None,
                     qos_tier: None,
-            version: RouteVersion(1),
-            state: RouteState::Active,
+                    version: RouteVersion(1),
+                    state: RouteState::Active,
                     compatibility: CompatibilityDescriptor::default(),
                     replicas: vec![ReplicaRoute {
                         owner: ClientRuntimeId::new("storage-a", ClientEpoch(1)),
@@ -3790,8 +3788,8 @@ mod tests {
                         tier: ReplicaTier::Nvme,
                         priority: 0,
                     }],
-            nof_backing: None,
-            cold_backing: None,
+                    nof_backing: None,
+                    cold_backing: None,
                 }),
             )
             .expect("route cas should succeed");

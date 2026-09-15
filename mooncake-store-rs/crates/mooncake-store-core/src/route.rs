@@ -4,13 +4,13 @@ use std::fmt;
 use std::marker::PhantomData;
 
 use crate::cold_tier::ColdBackingRoute;
-use crate::nof::NofBackingRoute;
 use crate::compat::CompatibilityDescriptor;
 use crate::identity::{
     ClientEndpointSet, ClientRuntimeId, LogicalObjectId, NamespaceScope, DEFAULT_DOMAIN,
     DEFAULT_OBJECT_SET,
 };
 use crate::lifecycle::ClientLifecycleState;
+use crate::nof::NofBackingRoute;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub struct ObjectKey(pub String);

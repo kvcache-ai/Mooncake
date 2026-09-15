@@ -3204,9 +3204,8 @@ mod tests {
         ObjectKey, ObjectRoute, ReplicaRoute, ReplicaTier, RouteControlMode, RoutePolicy,
         RoutePolicyDomain, RouteState, RouteVersion, SegmentAnnouncement, SegmentLifecycleState,
         SegmentName, StoreError, TenantObjectAccountingState, TenantPolicy, TenantPolicyScope,
-        TenantPolicySpec,
-        TenantQuotaFinalizeRequest, TenantQuotaPolicy, TenantQuotaReservationRequest,
-        TenantQuotaReservationState,
+        TenantPolicySpec, TenantQuotaFinalizeRequest, TenantQuotaPolicy,
+        TenantQuotaReservationRequest, TenantQuotaReservationState,
     };
     use redis::Commands;
 
@@ -3397,8 +3396,7 @@ mod tests {
             cold_backing: None,
             nof_backing: None,
         }
-
-}
+    }
 
     struct EnvLockGuard;
 
