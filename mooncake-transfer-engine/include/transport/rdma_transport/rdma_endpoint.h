@@ -180,16 +180,21 @@ class RdmaEndPoint {
 
     int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
+                          uint8_t peer_max_dest_rd_atomic,
                           Status connected_status = CONNECTED,
                           std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
     int doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
-                          int local_gid_index, std::string *reply_msg = nullptr,
+                          int local_gid_index, uint8_t peer_max_dest_rd_atomic,
+                          std::string *reply_msg = nullptr,
                           SetupConnectionFailureInfo *failure_info = nullptr);
 
    private:
+    static bool reserveCompletionSlots(std::atomic<int> *outstanding,
+                                       size_t budget, int count);
+
     static constexpr uint64_t kWaitExistingHandshakeTimeoutNano =
         10 * 1000000000ull;  // 10 seconds
     static constexpr uint64_t kReadyAckTimeoutNano =

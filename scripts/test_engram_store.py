@@ -574,6 +574,57 @@ class TestMultipleLayers(EngramStoreTestBase):
                 for h, n in enumerate(cfg.table_vocab_sizes)
             ]
             table.populate(layer_id, arrays)
+
+        ids_by_layer = {
+            layer_id: np.zeros((1, 2, len(cfg.table_vocab_sizes)), dtype=np.int64)
+            for layer_id, cfg in configs.items()
+        }
+        outputs = {
+            layer_id: np.empty(
+                (*ids_by_layer[layer_id].shape, cfg.row_bytes), dtype=np.uint8
+            )
+            for layer_id, cfg in configs.items()
+        }
+        for output in outputs.values():
+            self.assertEqual(
+                self.store.register_buffer(output.ctypes.data, output.nbytes), 0
+            )
+        try:
+            table.lookup_many_into(
+                [first, second],
+                [ids_by_layer[first], ids_by_layer[second]],
+                [outputs[first], outputs[second]],
+            )
+            for layer_id, output in outputs.items():
+                for head in range(output.shape[-2]):
+                    self.assertTrue(
+                        np.all(
+                            output[..., head, :] == head + 31 + (layer_id - first) * 50
+                        )
+                    )
+
+            bad_second_ids = ids_by_layer[second].copy()
+            bad_second_ids[0, 0, 0] = configs[second].table_vocab_sizes[0]
+            for output in outputs.values():
+                output.fill(99)
+            with self.assertRaisesRegex(RuntimeError, "lookup_many_into failed"):
+                table.lookup_many_into(
+                    [first, second],
+                    [ids_by_layer[first], bad_second_ids],
+                    [outputs[first], outputs[second]],
+                )
+            for output in outputs.values():
+                self.assertFalse(output.any())
+            with self.assertRaisesRegex(RuntimeError, "lookup_many_into failed"):
+                table.lookup_many_into(
+                    [first, first],
+                    [ids_by_layer[first], ids_by_layer[first]],
+                    [outputs[first], outputs[first]],
+                )
+        finally:
+            for output in outputs.values():
+                self.assertEqual(self.store.unregister_buffer(output.ctypes.data), 0)
+
         # A second handle reads the same keys without populating another copy.
         peer = self.EngramStore(configs, self.store)
         for layer_id, cfg in configs.items():

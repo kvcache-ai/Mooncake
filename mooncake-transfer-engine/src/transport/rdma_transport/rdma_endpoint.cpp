@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <cerrno>
+#include <climits>
 #include <cstddef>
 #include <chrono>
 #include <thread>
@@ -35,6 +36,7 @@ namespace mooncake {
 constexpr uint8_t kMaxHopLimit = 16;
 constexpr uint8_t kTimeout = 14;
 constexpr uint8_t kRetryCount = 7;
+constexpr uint8_t kLegacyMaxRdAtomic = 16;
 
 static GidSelectionSnapshot fillLocalHandshakeDesc(
     RdmaContext &context, const std::string &peer_nic,
@@ -48,8 +50,16 @@ static GidSelectionSnapshot fillLocalHandshakeDesc(
     local_desc.qp_num = qp_num;
     local_desc.ready_ack = false;
     local_desc.ready_ack_supported = true;
+    local_desc.rdma_max_dest_rd_atomic = context.maxQpRdAtomic();
+    local_desc.rdma_read_depth_supported = true;
     local_desc.reply_msg.clear();
     return gid_selection;
+}
+
+static uint8_t peerMaxDestRdAtomic(
+    const RdmaEndPoint::HandShakeDesc &peer_desc) {
+    if (!peer_desc.rdma_read_depth_supported) return kLegacyMaxRdAtomic;
+    return static_cast<uint8_t>(peer_desc.rdma_max_dest_rd_atomic);
 }
 
 static void rememberAutoGidSelection(
@@ -380,8 +390,9 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            int ret =
-                doSetupConnection(context_.gid(), context_.lid(), qpNum());
+            int ret = doSetupConnection(context_.gid(), context_.lid(), qpNum(),
+                                        std::min(context_.maxQpInitRdAtomic(),
+                                                 context_.maxQpRdAtomic()));
             if (ret == 0) {
                 ready_wait_start_ts_.store(0, std::memory_order_relaxed);
             }
@@ -601,10 +612,10 @@ int RdmaEndPoint::setupConnectionsByActive() {
                                             ? CONNECTED_WAIT_READY_ACK
                                             : CONNECTED;
                 if (!peer_desc.local_gid.empty()) {
-                    ret = doSetupConnection(peer_desc.local_gid,
-                                            peer_desc.local_lid,
-                                            peer_desc.qp_num, connected_status,
-                                            &failure_message, &failure_info);
+                    ret = doSetupConnection(
+                        peer_desc.local_gid, peer_desc.local_lid,
+                        peer_desc.qp_num, peerMaxDestRdAtomic(peer_desc),
+                        connected_status, &failure_message, &failure_info);
                 } else {
                     auto segment_desc =
                         context_.engine().meta()->getSegmentDescByName(
@@ -614,6 +625,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
                             if (nic.name == peer_nic_name) {
                                 ret = doSetupConnection(
                                     nic.gid, nic.lid, peer_desc.qp_num,
+                                    peerMaxDestRdAtomic(peer_desc),
                                     connected_status, &failure_message,
                                     &failure_info);
                                 break;
@@ -804,6 +816,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                         ? CONNECTED_WAIT_READY_ACK
                                         : CONNECTED;
             int ret = doSetupConnection(peer_gid, peer_lid, peer_desc.qp_num,
+                                        peerMaxDestRdAtomic(peer_desc),
                                         connected_status, &local_desc.reply_msg,
                                         &failure_info);
             if (ret == 0) {
@@ -977,6 +990,21 @@ const std::string RdmaEndPoint::toString() const {
         return "EndPoint: local " + context_.nicPath() + " (unconnected)";
 }
 
+bool RdmaEndPoint::reserveCompletionSlots(std::atomic<int> *outstanding,
+                                          size_t budget, int count) {
+    if (!outstanding || count <= 0 || budget > INT_MAX) return false;
+
+    int current = outstanding->load(std::memory_order_acquire);
+    do {
+        if (current < 0 || static_cast<size_t>(current) > budget ||
+            static_cast<size_t>(count) > budget - current)
+            return false;
+    } while (!outstanding->compare_exchange_weak(current, current + count,
+                                                 std::memory_order_acq_rel,
+                                                 std::memory_order_acquire));
+    return true;
+}
+
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
@@ -999,9 +1027,14 @@ int RdmaEndPoint::submitPostSend(
     // not the entire requested slice count. Each QP iteration reuses the
     // wr_list/sge_list from index 0, so we only need max_wr_depth_ entries.
     size_t max_postable_per_qp =
-        std::min({(size_t)max_wr_depth_, (size_t)cq_remaining, requested});
-    std::vector<ibv_send_wr> wr_list(max_postable_per_qp, ibv_send_wr{});
-    std::vector<ibv_sge> sge_list(max_postable_per_qp);
+        std::min({static_cast<size_t>(max_wr_depth_),
+                  static_cast<size_t>(cq_remaining), requested});
+    thread_local std::vector<ibv_send_wr> wr_list;
+    thread_local std::vector<ibv_sge> sge_list;
+    if (wr_list.size() < max_postable_per_qp)
+        wr_list.resize(max_postable_per_qp);
+    if (sge_list.size() < max_postable_per_qp)
+        sge_list.resize(max_postable_per_qp);
     size_t total_posted = 0;
     size_t cursor = 0;
 
@@ -1017,56 +1050,66 @@ int RdmaEndPoint::submitPostSend(
         size_t chunk = (remaining_slices + remaining_qps - 1) / remaining_qps;
         size_t start = cursor;
         size_t end = std::min(start + chunk, requested);
-        int assigned_count = (int)(end - start);
-
+        int assigned_count = static_cast<int>(end - start);
         int wr_count = std::min(assigned_count, qp_avail);
         wr_count = std::min(wr_count, cq_remaining);
 
         for (int i = 0; i < wr_count; ++i) {
             auto *slice = slice_list[start + i];
             auto &sge = sge_list[i];
-            sge.addr = (uint64_t)slice->source_addr;
+            sge.addr = reinterpret_cast<uint64_t>(slice->source_addr);
             sge.length = slice->length;
             sge.lkey = slice->rdma.source_lkey;
 
             auto &wr = wr_list[i];
             memset(&wr, 0, sizeof(ibv_send_wr));
-            wr.wr_id = (uint64_t)slice;
+            wr.wr_id = reinterpret_cast<uint64_t>(slice);
             wr.opcode = slice->opcode == Transport::TransferRequest::READ
                             ? IBV_WR_RDMA_READ
                             : IBV_WR_RDMA_WRITE;
             wr.num_sge = 1;
             wr.sg_list = &sge;
             wr.send_flags = IBV_SEND_SIGNALED;
-            wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
+            wr.next = i + 1 == wr_count ? nullptr : &wr_list[i + 1];
             wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
-            slice->ts = getCurrentTimeInNano();
-            slice->status = Transport::Slice::POSTED;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
         }
 
+        // Multiple posting workers may share one CQ. Reserve its completion
+        // budget atomically before publishing any WRs so concurrent endpoints
+        // cannot both consume the same apparent capacity.
+        if (!reserveCompletionSlots(cq_outstanding_, globalConfig().max_cqe,
+                                    wr_count))
+            break;
+
+        for (int i = 0; i < wr_count; ++i) {
+            auto *slice = slice_list[start + i];
+            slice->ts = getCurrentTimeInNano();
+            slice->status = Transport::Slice::POSTED;
+        }
         ibv_send_wr *bad_wr = nullptr;
         wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
-        cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
         context_.trackPostedSlices(slice_list, start, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
-            LOG(ERROR) << "Failed to ibv_post_send: " << strerror(rc);
+            const int error_number = rc < 0 ? -rc : rc;
+            LOG(ERROR) << "Failed to ibv_post_send: " << strerror(error_number)
+                       << " (rc=" << rc << ")";
             const size_t first_failed =
                 bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0;
             context_.untrackPostedSlices(slice_list, start + first_failed,
                                          wr_count - first_failed);
-            while (bad_wr) {
-                int i = bad_wr - wr_list.data();
+            for (int i = static_cast<int>(first_failed); i < wr_count; ++i) {
                 failed_slice_list.push_back(slice_list[start + i]);
-                wr_depth_list_[qp_index].fetch_sub(1,
-                                                   std::memory_order_acq_rel);
-                cq_outstanding_->fetch_sub(1, std::memory_order_acq_rel);
-                bad_wr = bad_wr->next;
             }
+            const int failed_wr_count = wr_count - (int)first_failed;
+            wr_depth_list_[qp_index].fetch_sub(failed_wr_count,
+                                               std::memory_order_acq_rel);
+            cq_outstanding_->fetch_sub(failed_wr_count,
+                                       std::memory_order_acq_rel);
             total_posted += wr_count;
             cursor += wr_count;
             break;
@@ -1130,6 +1173,7 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
+                                    uint8_t peer_max_dest_rd_atomic,
                                     Status connected_status,
                                     std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
@@ -1162,9 +1206,9 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 
     int local_gid_index = context_.gidIndex();
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
-        int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
-                                    peer_qp_num_list[qp_index], local_gid_index,
-                                    reply_msg, failure_info);
+        int ret = doSetupConnection(
+            qp_index, peer_gid_raw, peer_lid, peer_qp_num_list[qp_index],
+            local_gid_index, peer_max_dest_rd_atomic, reply_msg, failure_info);
         if (ret) return ret;
     }
 
@@ -1176,7 +1220,9 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
 
 int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
-                                    int local_gid_index, std::string *reply_msg,
+                                    int local_gid_index,
+                                    uint8_t peer_max_dest_rd_atomic,
+                                    std::string *reply_msg,
                                     SetupConnectionFailureInfo *failure_info) {
     if (qp_index < 0 || qp_index >= (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
@@ -1247,7 +1293,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     attr.ah_attr.port_num = context_.portNum();
     attr.dest_qp_num = peer_qp_num;
     attr.rq_psn = 0;
-    attr.max_dest_rd_atomic = 16;
+    attr.max_dest_rd_atomic = context_.maxQpRdAtomic();
     attr.min_rnr_timer = 12;  // 12 in previous implementation
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_MIN_RNR_TIMER |
@@ -1282,7 +1328,8 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     attr.retry_cnt = kRetryCount;
     attr.rnr_retry = 7;  // or 7,RNR error
     attr.sq_psn = 0;
-    attr.max_rd_atomic = 16;
+    attr.max_rd_atomic =
+        std::min(context_.maxQpInitRdAtomic(), peer_max_dest_rd_atomic);
     ret = ibv_modify_qp(qp, &attr,
                         IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
                             IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
@@ -1297,6 +1344,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         }
         return ERR_ENDPOINT;
     }
+
+    VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+            << " read_depth=" << static_cast<int>(attr.max_rd_atomic)
+            << ", responder_depth="
+            << static_cast<int>(context_.maxQpRdAtomic());
 
     // Optional: pin QP to a specific LAG port for even traffic distribution
     // across bonded physical ports. num_lag_ports is queried from hardware at

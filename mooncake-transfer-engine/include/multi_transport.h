@@ -36,6 +36,8 @@ class MultiTransport {
     using TransferStatus = Transport::TransferStatus;
     using TransferStatusEnum = Transport::TransferStatusEnum;
     using BatchDesc = Transport::BatchDesc;
+    using SegmentDesc = Transport::SegmentDesc;
+    using SegmentID = Transport::SegmentID;
 
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                    std::string &local_server_name);
@@ -99,6 +101,10 @@ class MultiTransport {
                           std::vector<size_t> *task_sizes);
 
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
+
+    Status selectTransport(const TransferRequest &entry,
+                           const std::shared_ptr<SegmentDesc> &segment_desc,
+                           Transport *&transport);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,

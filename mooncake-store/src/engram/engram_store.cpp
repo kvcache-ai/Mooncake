@@ -1,7 +1,8 @@
 #include "engram/engram_store.h"
 
-#include <cstring>
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -13,6 +14,7 @@ namespace mooncake {
 namespace engram {
 
 struct EngramStore::QueryCacheEntry {
+    std::vector<int> layer_ids;
     mooncake::PyClient::RangedReadSnapshot snapshot;
 };
 
@@ -55,30 +57,41 @@ const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
 }
 
 std::shared_ptr<const EngramStore::QueryCacheEntry>
-EngramStore::get_query_cache(int layer_id,
+EngramStore::get_query_cache(const std::vector<int>& layer_ids,
                              const std::vector<std::string>& keys) const {
+    if (layer_ids.empty()) return nullptr;
+
     const auto now = std::chrono::steady_clock::now();
-    {
-        std::lock_guard<std::mutex> lock(query_cache_mutex_);
-        auto it = query_cache_.find(layer_id);
-        if (it != query_cache_.end() && it->second &&
-            it->second->snapshot.reusable(now)) {
-            return it->second;
-        }
+    std::lock_guard<std::mutex> lock(query_cache_mutex_);
+    std::shared_ptr<QueryCacheEntry>* cache_entry;
+    if (layer_ids.size() == 1) {
+        cache_entry = &query_cache_[layer_ids.front()];
+    } else {
+        cache_entry = &multi_layer_query_cache_;
+    }
+    if (*cache_entry && (*cache_entry)->layer_ids == layer_ids &&
+        (*cache_entry)->snapshot.reusable(now)) {
+        return *cache_entry;
     }
 
     auto entry = std::make_shared<QueryCacheEntry>();
+    entry->layer_ids = layer_ids;
     entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
     if (!entry->snapshot.reusable(now)) return nullptr;
 
-    std::lock_guard<std::mutex> lock(query_cache_mutex_);
-    query_cache_[layer_id] = entry;
+    *cache_entry = entry;
     return entry;
 }
 
 void EngramStore::invalidate_query_cache(int layer_id) const {
     std::lock_guard<std::mutex> lock(query_cache_mutex_);
     query_cache_.erase(layer_id);
+    if (multi_layer_query_cache_ &&
+        std::find(multi_layer_query_cache_->layer_ids.begin(),
+                  multi_layer_query_cache_->layer_ids.end(),
+                  layer_id) != multi_layer_query_cache_->layer_ids.end()) {
+        multi_layer_query_cache_.reset();
+    }
 }
 
 int EngramStore::bind_local(int layer_id,
@@ -101,122 +114,178 @@ int EngramStore::bind_local(int layer_id,
 
 int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                              void* output_buffer, size_t output_size) const {
-    const auto& layer = get_layer(layer_id);
-    const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
-    const auto& embed_keys = layer.keys;
-    if ((!store_ && layer.local_tables.empty()) || row_ids == nullptr ||
-        output_buffer == nullptr || B <= 0 || L <= 0) {
-        return -1;
-    }
+    return lookup_many_into(
+        {LookupRequest{layer_id, row_ids, B, L, output_buffer, output_size}});
+}
 
-    const int num_heads = static_cast<int>(table_vocab_sizes.size());
-    const size_t row_bytes = layer.config.row_bytes;
+int EngramStore::lookup_many_into(
+    const std::vector<LookupRequest>& requests) const {
+    if (requests.empty()) return 0;
+
+    struct LookupPlan {
+        const LookupRequest* request;
+        const Layer* layer;
+        size_t token_count;
+        size_t expected_size;
+        uintptr_t output_begin;
+        uintptr_t output_end;
+    };
+
+    std::vector<LookupPlan> plans;
+    plans.reserve(requests.size());
+    size_t key_count = 0;
     const size_t max_size = std::numeric_limits<size_t>::max();
-    if (static_cast<size_t>(B) > max_size / static_cast<size_t>(L)) {
-        return -1;
-    }
-    const size_t token_count = static_cast<size_t>(B) * static_cast<size_t>(L);
-    if (token_count > max_size / static_cast<size_t>(num_heads) ||
-        token_count * static_cast<size_t>(num_heads) > max_size / row_bytes) {
-        return -1;
-    }
-    const size_t expected_size =
-        token_count * static_cast<size_t>(num_heads) * row_bytes;
-    if (output_size < expected_size) {
-        return -1;
+    for (const auto& request : requests) {
+        const auto& layer = get_layer(request.layer_id);
+        if ((!store_ && layer.local_tables.empty()) ||
+            request.row_ids == nullptr || request.output == nullptr ||
+            request.batch_size <= 0 || request.sequence_length <= 0) {
+            return -1;
+        }
+
+        const size_t batch_size = static_cast<size_t>(request.batch_size);
+        const size_t sequence_length =
+            static_cast<size_t>(request.sequence_length);
+        const size_t num_heads = layer.config.table_vocab_sizes.size();
+        const size_t row_bytes = layer.config.row_bytes;
+        if (batch_size > max_size / sequence_length) return -1;
+        const size_t token_count = batch_size * sequence_length;
+        if (token_count > max_size / num_heads ||
+            token_count * num_heads > max_size / row_bytes) {
+            return -1;
+        }
+        const size_t expected_size = token_count * num_heads * row_bytes;
+        if (request.output_size < expected_size) return -1;
+
+        const uintptr_t output_begin =
+            reinterpret_cast<uintptr_t>(request.output);
+        if (expected_size >
+            std::numeric_limits<uintptr_t>::max() - output_begin) {
+            return -1;
+        }
+        const uintptr_t output_end = output_begin + expected_size;
+        for (const auto& plan : plans) {
+            if (output_begin < plan.output_end &&
+                plan.output_begin < output_end) {
+                return -1;
+            }
+        }
+
+        plans.push_back(LookupPlan{&request, &layer, token_count, expected_size,
+                                   output_begin, output_end});
+        key_count += layer.keys.size();
     }
 
-    auto fail_lookup = [&]() {
-        std::memset(output_buffer, 0, expected_size);
+    auto fail_lookups = [&]() {
+        for (const auto& plan : plans)
+            std::memset(plan.request->output, 0, plan.expected_size);
         return -1;
     };
 
-    if (!layer.local_tables.empty()) {
-        // Validate all IDs before touching output. No metadata or transfer
-        // work.
-        for (size_t t = 0; t < token_count; ++t) {
-            for (int h = 0; h < num_heads; ++h) {
-                const auto id = row_ids[t * num_heads + h];
-                if (id < 0 || id >= table_vocab_sizes[h]) return fail_lookup();
+    // Validate every layer before touching any output or starting a transfer.
+    for (const auto& plan : plans) {
+        const auto& vocab_sizes = plan.layer->config.table_vocab_sizes;
+        const size_t num_heads = vocab_sizes.size();
+        for (size_t token = 0; token < plan.token_count; ++token) {
+            for (size_t head = 0; head < num_heads; ++head) {
+                const int64_t id =
+                    plan.request->row_ids[token * num_heads + head];
+                if (id < 0 || id >= vocab_sizes[head]) return fail_lookups();
             }
         }
-        auto* dst = static_cast<char*>(output_buffer);
-        for (size_t t = 0; t < token_count; ++t) {
-            for (int h = 0; h < num_heads; ++h) {
-                const size_t index = t * num_heads + h;
-                const auto* src =
-                    static_cast<const char*>(layer.local_tables[h]);
-                std::memcpy(
-                    dst + index * row_bytes,
-                    src + static_cast<size_t>(row_ids[index]) * row_bytes,
-                    row_bytes);
+    }
+
+    if (!store_) {
+        for (const auto& plan : plans) {
+            const size_t num_heads =
+                plan.layer->config.table_vocab_sizes.size();
+            const size_t row_bytes = plan.layer->config.row_bytes;
+            auto* output = static_cast<char*>(plan.request->output);
+            for (size_t token = 0; token < plan.token_count; ++token) {
+                for (size_t head = 0; head < num_heads; ++head) {
+                    const size_t index = token * num_heads + head;
+                    const auto* table = static_cast<const char*>(
+                        plan.layer->local_tables[head]);
+                    std::memcpy(output + index * row_bytes,
+                                table + static_cast<size_t>(
+                                            plan.request->row_ids[index]) *
+                                            row_bytes,
+                                row_bytes);
+                }
             }
         }
         return 0;
     }
 
-    std::vector<void*> buffers{output_buffer};
-    std::vector<std::vector<std::string>> all_keys(1);
-    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets(1);
-    std::vector<std::vector<std::vector<size_t>>> all_src_offsets(1);
-    std::vector<std::vector<std::vector<size_t>>> all_sizes(1);
+    std::vector<void*> buffers;
+    std::vector<std::vector<std::string>> all_keys;
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_sizes;
+    std::vector<std::string> query_keys;
+    std::vector<int> query_layer_ids;
+    buffers.reserve(plans.size());
+    all_keys.reserve(plans.size());
+    all_dst_offsets.reserve(plans.size());
+    all_src_offsets.reserve(plans.size());
+    all_sizes.reserve(plans.size());
+    query_keys.reserve(key_count);
+    query_layer_ids.reserve(plans.size());
 
-    all_keys[0].reserve(static_cast<size_t>(num_heads));
-    all_dst_offsets[0].reserve(static_cast<size_t>(num_heads));
-    all_src_offsets[0].reserve(static_cast<size_t>(num_heads));
-    all_sizes[0].reserve(static_cast<size_t>(num_heads));
+    for (const auto& plan : plans) {
+        const auto& layer = *plan.layer;
+        const size_t num_heads = layer.config.table_vocab_sizes.size();
+        const size_t row_bytes = layer.config.row_bytes;
+        buffers.push_back(plan.request->output);
+        query_layer_ids.push_back(plan.request->layer_id);
+        all_keys.push_back(layer.keys);
+        query_keys.insert(query_keys.end(), layer.keys.begin(),
+                          layer.keys.end());
+        all_dst_offsets.emplace_back(num_heads);
+        all_src_offsets.emplace_back(num_heads);
+        all_sizes.emplace_back(num_heads);
 
-    for (int h = 0; h < num_heads; ++h) {
-        all_keys[0].push_back(embed_keys[h]);
-        all_dst_offsets[0].emplace_back();
-        all_src_offsets[0].emplace_back();
-        all_sizes[0].emplace_back();
-        all_dst_offsets[0].back().reserve(static_cast<size_t>(B) * L);
-        all_src_offsets[0].back().reserve(static_cast<size_t>(B) * L);
-        all_sizes[0].back().reserve(static_cast<size_t>(B) * L);
-    }
-
-    for (int b = 0; b < B; ++b) {
-        for (int l = 0; l < L; ++l) {
-            const size_t token_index = static_cast<size_t>(b) * L + l;
-            const size_t row_offset =
-                token_index * static_cast<size_t>(num_heads);
-            for (int h = 0; h < num_heads; ++h) {
-                const int64_t idx =
-                    row_ids[row_offset + static_cast<size_t>(h)];
-                if (idx < 0 || idx >= table_vocab_sizes[h]) {
-                    return fail_lookup();
-                }
-                all_dst_offsets[0][h].push_back(
-                    (row_offset + static_cast<size_t>(h)) * row_bytes);
-                all_src_offsets[0][h].push_back(static_cast<size_t>(idx) *
-                                                row_bytes);
-                all_sizes[0][h].push_back(row_bytes);
+        auto& dst_offsets = all_dst_offsets.back();
+        auto& src_offsets = all_src_offsets.back();
+        auto& sizes = all_sizes.back();
+        for (size_t head = 0; head < num_heads; ++head) {
+            dst_offsets[head].reserve(plan.token_count);
+            src_offsets[head].reserve(plan.token_count);
+            sizes[head].reserve(plan.token_count);
+        }
+        for (size_t token = 0; token < plan.token_count; ++token) {
+            const size_t row_offset = token * num_heads;
+            for (size_t head = 0; head < num_heads; ++head) {
+                const size_t index = row_offset + head;
+                dst_offsets[head].push_back(index * row_bytes);
+                src_offsets[head].push_back(
+                    static_cast<size_t>(plan.request->row_ids[index]) *
+                    row_bytes);
+                sizes[head].push_back(row_bytes);
             }
         }
     }
 
-    auto query_cache = get_query_cache(layer_id, embed_keys);
-    if (!query_cache) return fail_lookup();
+    auto query_cache = get_query_cache(query_layer_ids, query_keys);
+    if (!query_cache) return fail_lookups();
 
     auto results = store_->get_into_ranges_from_snapshot(
         buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
         query_cache->snapshot);
-    if (results.size() != 1 ||
-        results[0].size() != static_cast<size_t>(num_heads)) {
-        return fail_lookup();
-    }
-    for (int h = 0; h < num_heads; ++h) {
-        if (results[0][h].size() != all_sizes[0][h].size()) {
-            return fail_lookup();
-        }
-        for (int64_t bytes_read : results[0][h]) {
-            if (bytes_read != static_cast<int64_t>(row_bytes)) {
-                return fail_lookup();
+    if (results.size() != plans.size()) return fail_lookups();
+    for (size_t i = 0; i < plans.size(); ++i) {
+        const size_t num_heads = plans[i].layer->keys.size();
+        const size_t row_bytes = plans[i].layer->config.row_bytes;
+        if (results[i].size() != num_heads) return fail_lookups();
+        for (size_t head = 0; head < num_heads; ++head) {
+            if (results[i][head].size() != all_sizes[i][head].size())
+                return fail_lookups();
+            for (int64_t bytes_read : results[i][head]) {
+                if (bytes_read != static_cast<int64_t>(row_bytes))
+                    return fail_lookups();
             }
         }
     }
-
     return 0;
 }
 

@@ -1549,6 +1549,10 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         if (attr.active_speed_ex) active_speed_ = attr.active_speed_ex;
 #endif
         active_width_ = attr.active_width;
+        max_qp_rd_atomic_ = static_cast<uint8_t>(std::clamp(
+            device_attr.max_qp_rd_atom, 0, static_cast<int>(UINT8_MAX)));
+        max_qp_init_rd_atomic_ = static_cast<uint8_t>(std::clamp(
+            device_attr.max_qp_init_rd_atom, 0, static_cast<int>(UINT8_MAX)));
         {
             std::lock_guard<std::mutex> guard(gid_lock_);
             gid_index_ = gid_index;

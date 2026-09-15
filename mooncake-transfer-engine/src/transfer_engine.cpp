@@ -18,6 +18,8 @@
 #include <thread>
 #include <unordered_map>
 
+#include "common.h"
+
 #ifndef USE_TENT
 #include "transfer_engine.h"
 #include "show_links.h"
@@ -1086,9 +1088,10 @@ class TransferEngine::ScatterTransferOperation::Impl {
     ~Impl() { wait(); }
 
     Status wait() {
+        PollBackoff backoff;
         while (!completed_) {
             poll();
-            if (!completed_) std::this_thread::sleep_for(kPollInterval);
+            if (!completed_) backoff.pause();
         }
         return aggregate_status_;
     }
@@ -1105,17 +1108,46 @@ class TransferEngine::ScatterTransferOperation::Impl {
                            ? std::chrono::steady_clock::time_point::max()
                            : now + timeout;
         }
+        PollBackoff backoff;
         while (!completed_) {
             poll();
             if (completed_) break;
             if (std::chrono::steady_clock::now() >= deadline)
                 return Status::Clock("scatter transfer wait timed out");
-            std::this_thread::sleep_for(kPollInterval);
+            backoff.pause();
         }
         return aggregate_status_;
     }
 
    private:
+    class PollBackoff {
+       public:
+        void pause() {
+            if (!active_polling_) {
+                std::this_thread::sleep_for(kPollInterval);
+                return;
+            }
+            PAUSE();
+            if (++poll_count_ < kPollsBeforeDeadlineCheck) return;
+
+            poll_count_ = 0;
+            if (std::chrono::steady_clock::now() < active_poll_deadline_)
+                return;
+            active_polling_ = false;
+            std::this_thread::sleep_for(kPollInterval);
+        }
+
+       private:
+        // Small scatter transfers normally complete inside this window. Avoid
+        // scheduler-scale sleeps on their latency path, then back off for
+        // larger transfers and stalled peers.
+        static constexpr uint32_t kPollsBeforeDeadlineCheck = 64;
+        std::chrono::steady_clock::time_point active_poll_deadline_ =
+            std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+        uint32_t poll_count_ = 0;
+        bool active_polling_ = true;
+    };
+
     static constexpr auto kPollInterval = std::chrono::microseconds(10);
 
     bool useTent() const {

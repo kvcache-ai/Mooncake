@@ -29,6 +29,15 @@ namespace engram {
  */
 class EngramStore {
    public:
+    struct LookupRequest {
+        int layer_id;
+        const int64_t* row_ids;
+        int batch_size;
+        int sequence_length;
+        void* output;
+        size_t output_size;
+    };
+
     EngramStore(const std::map<int, EngramStoreConfig>& layers,
                 std::shared_ptr<PyClient> store = nullptr);
 
@@ -50,6 +59,12 @@ class EngramStore {
      */
     int lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                     void* output, size_t output_size) const;
+
+    /**
+     * Lookup several layers through one Store ranged-read submission.
+     * Each output must be registered for Store-backed lookup.
+     */
+    int lookup_many_into(const std::vector<LookupRequest>& requests) const;
 
     std::vector<int> get_layer_ids() const;
     std::vector<int64_t> get_table_vocab_sizes(int layer_id) const;
@@ -84,11 +99,13 @@ class EngramStore {
     };
     const Layer& get_layer(int layer_id) const;
     std::shared_ptr<const QueryCacheEntry> get_query_cache(
-        int layer_id, const std::vector<std::string>& keys) const;
+        const std::vector<int>& layer_ids,
+        const std::vector<std::string>& keys) const;
     void invalidate_query_cache(int layer_id) const;
     std::map<int, Layer> layers_;
     mutable std::mutex query_cache_mutex_;
     mutable std::map<int, std::shared_ptr<QueryCacheEntry>> query_cache_;
+    mutable std::shared_ptr<QueryCacheEntry> multi_layer_query_cache_;
 };
 
 }  // namespace engram
