@@ -1,0 +1,103 @@
+#ifndef MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_H
+#define MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_H
+
+#include <array>
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+
+#include "common_types.h"
+#include "control_plane/control_types.h"
+#include "device_comm/device_collective/device_collective_recovery.h"
+#include "device_comm/device_collective/device_collective_types.cuh"
+#include "device_comm/device_transfer/transfer_service.h"
+#include "error_types.h"
+#include "gpu_runtime.h"
+
+namespace mooncake {
+
+class DeviceCollectiveWorkspace;
+class RingAllReduceProtocol;
+class StrongStream;
+
+// Protocol-independent lifecycle facade. It owns communicator view epoch
+// synchronization, invocation and recovery state, stream ordering,
+// control-update publication, and graph references. The selected protocol owns
+// topology, protocol resources, and kernel launch policy.
+class DeviceCollectiveRuntime {
+   public:
+    using FailureRecoveryCallback = std::function<PGResult<void>(InGroupRank)>;
+
+    static PGResult<std::unique_ptr<DeviceCollectiveRuntime>> create(
+        DeviceTransferService& transfer_service,
+        DeviceCollectiveWorkspace& workspace, StrongStream& strong_stream,
+        int device_index, InGroupRank self_rank, uint32_t max_group_size,
+        int32_t* active_ranks_mirror, size_t collective_timeout_us);
+
+    ~DeviceCollectiveRuntime() noexcept;
+
+    DeviceCollectiveRuntime(const DeviceCollectiveRuntime&) = delete;
+    DeviceCollectiveRuntime& operator=(const DeviceCollectiveRuntime&) = delete;
+
+    [[nodiscard]] DeviceGroupEndpoint localEndpoint() const;
+
+    PGResult<void> useLocalOnly(uint64_t view_epoch);
+    PGResult<void> applyGroupView(const GroupView& view);
+
+    PGResult<void> enableRecovery(DeviceCollectiveRecoveryWorker& worker,
+                                  FailureRecoveryCallback callback);
+
+    PGResult<void> enqueueAllReduce(const void* send_buffer, void* recv_buffer,
+                                    size_t count, DataType datatype,
+                                    ReduceOp op,
+                                    cudaStream_t user_stream_handle,
+                                    int32_t* failed_ranks_hint);
+
+    PGResult<void> shutdown();
+
+   private:
+    friend class MooncakeCommunicator;
+
+    DeviceCollectiveRuntime(DeviceTransferService& transfer_service,
+                            int device_index, InGroupRank self_rank,
+                            uint32_t max_group_size,
+                            int32_t* active_ranks_mirror,
+                            RegionSlice view_epoch_signals,
+                            StrongStream& strong_stream,
+                            GpuEvent handoff_event);
+
+    PGResult<void> attachGraphUse(const GpuCaptureInfo& capture);
+    [[nodiscard]] bool hasPendingRecovery() const noexcept;
+    PGResult<void> publishControlState(bool pinned,
+                                       bool include_active_ranks_mirror);
+    PGResult<void> prepareFailureResume();
+    void releaseState() noexcept;
+
+    DeviceTransferService& transfer_service_;
+    int device_index_ = -1;
+    InGroupRank self_rank_ = kInvalidInGroupRank;
+    RegionSlice view_epoch_signals_;
+    InvocationState* invocation_state_ = nullptr;
+    std::unique_ptr<RingAllReduceProtocol> all_reduce_;
+    StrongStream& strong_stream_;
+    ControlMailbox* control_mailbox_ = nullptr;
+    int32_t* active_ranks_mirror_ = nullptr;
+    size_t active_ranks_count_ = 0;
+    std::array<int32_t, kMaxNumRanks> host_active_ranks_{};
+    FailureRecoveryCallback failure_recovery_callback_;
+    DeviceCollectiveRecoveryWorker* recovery_worker_ = nullptr;
+
+    GpuEvent handoff_event_;
+    mutable std::mutex mutex_;
+    std::atomic<size_t> live_graph_uses_{0};
+    uint64_t view_epoch_ = kInvalidViewEpoch;
+    bool shutdown_requested_ = false;
+    bool shutdown_complete_ = false;
+};
+
+}  // namespace mooncake
+
+#endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_COLLECTIVE_DEVICE_COLLECTIVE_H
