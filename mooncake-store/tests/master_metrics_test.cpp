@@ -136,6 +136,21 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
+TEST_F(MasterMetricsTest, ClientOffboardingMetricsAreExported) {
+    auto& metrics = MasterMetricManager::instance();
+    metrics.inc_client_offboarding_alert();
+    const auto serialized = metrics.serialize_metrics();
+
+    EXPECT_NE(serialized.find("master_client_liveness_active_clients"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_queue_depth"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_retries_total"),
+              std::string::npos);
+    EXPECT_NE(serialized.find("master_client_offboarding_alerts_total"),
+              std::string::npos);
+}
+
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
@@ -320,9 +335,11 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     segment.base = 0x300000000;
     segment.size = 1024 * 1024 * 16;
     UUID client_id = generate_uuid();
-    ASSERT_EQ(
-        source_manager.getSegmentAccess().MountSegment(segment, client_id),
-        ErrorCode::OK);
+    ASSERT_EQ(source_manager.getSegmentAccess().MountSegment(
+                  segment, client_id,
+                  std::make_shared<ClientLivenessRecord>(
+                      ClientLivenessRecord::Clock::now())),
+              ErrorCode::OK);
     const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));

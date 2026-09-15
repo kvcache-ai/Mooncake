@@ -4,7 +4,6 @@
 #include <array>
 #include <atomic>
 #include <boost/functional/hash.hpp>
-#include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -29,6 +28,8 @@
 
 #include "allocation_strategy.h"
 #include "background_worker.h"
+#include "client_liveness.h"
+#include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "lease.h"
@@ -168,6 +169,7 @@ class MasterService {
     friend class test::MasterServiceSSDTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
+    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
@@ -219,6 +221,14 @@ class MasterService {
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
     void RunDfsEvictionForTesting();
+
+    /**
+     * @brief Test-only wrapper around EvictTenantsOverWatermark, the background
+     *        pass that drains any tenant over its own quota watermark. Lets a
+     *        test drive one pass synchronously instead of racing the periodic
+     *        eviction thread's 1 Hz tick.
+     */
+    void RunTenantEvictForTesting();
 
     /**
      * @brief Enables the tenant-epoch bookkeeping that decides whether
@@ -911,6 +921,11 @@ class MasterService {
                                                  const std::string& source,
                                                  const std::string& target);
 
+    // Admin-only, grow-only DFS capacity management. Existing placements remain
+    // valid.
+    tl::expected<int, ErrorCode> GetDfsShardCount() const;
+    tl::expected<int, ErrorCode> ExpandDfsShards(int shard_count);
+
     /**
      * @brief Create a drain job to gracefully evacuate one or more segments.
      */
@@ -1006,6 +1021,8 @@ class MasterService {
     // Restore master state
     void RestoreState();
     void ResetStateAfterFailedRestoreAttempt();
+    tl::expected<void, SerializationError>
+    RebuildClientLivenessAfterSnapshotRestore();
 
     /**
      * @brief Apply decoded snapshot state to running master service
@@ -1034,13 +1051,30 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
+    // Background pass: evict any tenant that is over its own watermark down to
+    // (watermark - eviction_ratio) of its effective quota. Called from
+    // EvictionThreadFunc, and a no-op unless multi-tenancy and
+    // tenant_eviction_high_watermark_ratio are both enabled.
+    void EvictTenantsOverWatermark();
+
+    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
+        const UUID& client_id) const;
+    // Caller holds the Replica owner's retaining guard.
+    auto AddReplicaForRetainedClient(const UUID& client_id,
+                                     const std::string& key,
+                                     const TenantId& tenant_id,
+                                     Replica& replica)
+        -> tl::expected<bool, ErrorCode>;
+    // Caller must hold client_mutex_.
+    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
+        const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients);
     // Clear completed LOCAL_DISK replicas owned by exactly this client, in
     // all shards. Owner-targeted on purpose: a liveness-complement sweep
     // classifies by absence from a point-in-time set, so an owner that
@@ -1049,8 +1083,18 @@ class MasterService {
     // misclassify a concurrent mount, whatever the interleaving.
     void ClearLocalDiskHandlesOwnedBy(const UUID& owner);
     // Shard walk shared by the two sweeps above; removes completed replicas
-    // matching is_stale, erasing a key when no valid replica remains.
-    void ClearStaleHandles(const std::function<bool(const Replica&)>& is_stale);
+    // matching is_stale, erasing a key when no valid replica remains. Each
+    // shard is first scanned under its shared lock to pick the keys that
+    // match, and only those are cleaned, in bounded batches under the write
+    // lock: a mass client expiry marks handles stale table-wide, and walking
+    // a whole shard while holding it exclusively blocked every RPC for that
+    // shard until the sweep moved on.
+    tl::expected<void, ErrorCode> ClearStaleHandles(
+        const std::function<bool(const Replica&)>& is_stale);
+    bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    bool ShouldSkipSnapshotForClientOffboarding() const {
+        return client_offboarding_worker_.HasPending();
+    }
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -2032,9 +2076,8 @@ class MasterService {
                                         const TenantId& tenant_id);
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const;
-    tl::expected<void, ErrorCode> ChargeTenantQuota(
-        TenantQuotaHandle account, uint64_t bytes,
-        uint64_t* deficit_bytes = nullptr);
+    tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,
+                                                    uint64_t bytes);
     void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
@@ -2069,7 +2112,8 @@ class MasterService {
     };
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) const;
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients)
+        const;
     StaleHandleCleanupPlan BuildStaleHandleCleanupPlan(
         const ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& is_stale) const;
@@ -2096,11 +2140,11 @@ class MasterService {
         -> tl::expected<ResolvedSoftPinRequest, ErrorCode>;
 
     // Helper to clean up stale handles pointing to unmounted segments
-    // or local_disk replicas whose owner client is no longer alive.
+    // or local_disk replicas whose owner client no longer retains resources.
     bool CleanupStaleHandles(
         const std::string& key, const TenantId& tenant_id,
         TenantState& tenant_state, ObjectMetadata& metadata,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
+        const std::unordered_set<UUID, boost::hash<UUID>>& retaining_clients,
         MetadataShardAccessorRW* shard = nullptr);
     // Predicate form, so the owner-targeted LOCAL_DISK sweep can reuse the
     // accounting (quota release, promotion-task cancellation, disk-replica
@@ -2120,6 +2164,26 @@ class MasterService {
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
+    // Allocate the physical replicas without changing object metadata.  This
+    // is used by leased upserts to prove that replacement storage is available
+    // before the old metadata is removed.
+    auto AllocateReplicas(const std::string& key, uint64_t value_length,
+                          const ReplicateConfig& config,
+                          const std::string& writer_host_id)
+        -> tl::expected<std::vector<Replica>, ErrorCode>;
+
+    auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
+                        const std::string& key, uint64_t value_length,
+                        const ReplicateConfig& config,
+                        const std::string& group_id, const TenantId& tenant_id,
+                        const std::chrono::system_clock::time_point& now,
+                        const ResolvedSoftPinRequest& soft_pin_request,
+                        std::vector<Replica>&& replicas,
+                        uint64_t pending_quota_charge,
+                        std::optional<std::chrono::system_clock::time_point>
+                            committed_soft_pin_timeout = std::nullopt)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
@@ -2129,7 +2193,6 @@ class MasterService {
         const std::string& group_id, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
-        uint64_t& quota_deficit_bytes,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -2258,6 +2321,11 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
+    // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
+    // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
+    // sufficient once quotas partition the pool.
+    const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
@@ -2266,6 +2334,12 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // The eviction thread wakes every 10 ms, but the tenant pass has to walk
+    // every registered tenant and lock every quota shard, so it is throttled
+    // rather than run on each tick. Quota pressure builds over seconds, not
+    // milliseconds, and admission still has its own synchronous fallback in
+    // between.
+    static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;
@@ -2597,23 +2671,20 @@ class MasterService {
 
     // Client related members
     mutable std::shared_mutex client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        client_liveness_records_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
+    ClientOffboardingWorker client_offboarding_worker_{this};
     void ClientMonitorFunc();
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};
     static constexpr uint64_t kClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
-    };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
-    const int64_t client_live_ttl_sec_;
+    const int64_t client_active_ttl_sec_;
+    const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
@@ -2705,6 +2776,7 @@ class MasterService {
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
+        std::shared_ptr<ClientLivenessRecord> source_liveness;
     };
 
     DynamicReplicationMode dynamic_replication_mode_{
@@ -3074,7 +3146,8 @@ class MasterService {
         const std::string& tenant_id, const std::string& key,
         const std::string& payload, DurableFinalizeCallback callback);
 
-    // Invalid endpoints from standby that don't exist locally
+    // Standby-restored memory endpoints remain unreadable until the owning
+    // Client has successfully remounted them.
     std::unordered_set<std::string> invalid_replica_endpoints_;
 
     // Keep DummyBufferAllocator alive after standby restore.
@@ -3086,6 +3159,10 @@ class MasterService {
 
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
+    bool TryGetReadableReplicaDescriptor(const Replica& replica,
+                                         Replica::Descriptor& descriptor) const;
+    std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
+        const ObjectMetadata& metadata) const;
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
     bool IsEvictableMemoryReplica(const Replica& replica) const;

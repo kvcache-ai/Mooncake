@@ -9,34 +9,32 @@
 namespace mooncake {
 namespace {
 
-using RegionResourceMap = std::map<UUID, std::unique_ptr<RegionResource>>;
-
 bool IsValidSpec(const RegionResourceSpec& spec) {
     return spec.id != UUID{0, 0} && !spec.name.empty() && spec.base != 0 &&
            spec.size != 0 &&
            spec.base <= std::numeric_limits<uintptr_t>::max() - spec.size;
 }
 
-class NativePlacementTarget final : public PlacementTarget {
+class NativeAllocationCandidate final : public AllocationCandidate {
    public:
-    explicit NativePlacementTarget(
+    explicit NativeAllocationCandidate(
         std::shared_ptr<BufferAllocatorBase> allocator)
-        : PlacementTarget(std::move(allocator)) {}
+        : AllocationCandidate(std::move(allocator)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
         return allocator().allocate(size);
     }
 
-    PlacementTargetKind Kind() const noexcept override {
-        return PlacementTargetKind::NATIVE;
+    AllocationCandidateKind Kind() const noexcept override {
+        return AllocationCandidateKind::NATIVE;
     }
 };
 
-class CxlPlacementTarget final : public PlacementTarget {
+class CxlAllocationCandidate final : public AllocationCandidate {
    public:
-    CxlPlacementTarget(std::shared_ptr<BufferAllocatorBase> allocator,
-                       std::string binding_name)
-        : PlacementTarget(std::move(allocator)),
+    CxlAllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator,
+                           std::string binding_name)
+        : AllocationCandidate(std::move(allocator)),
           cxl_binding_name_(std::move(binding_name)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
@@ -47,8 +45,8 @@ class CxlPlacementTarget final : public PlacementTarget {
         return buffer;
     }
 
-    PlacementTargetKind Kind() const noexcept override {
-        return PlacementTargetKind::CXL;
+    AllocationCandidateKind Kind() const noexcept override {
+        return AllocationCandidateKind::CXL;
     }
 
    private:
@@ -57,16 +55,17 @@ class CxlPlacementTarget final : public PlacementTarget {
 
 std::unique_ptr<RegionResource> MakeNativeResource(
     std::shared_ptr<BufferAllocatorBase> allocator) {
-    auto target = std::make_unique<NativePlacementTarget>(std::move(allocator));
-    return std::make_unique<RegionResource>(std::move(target));
+    auto candidate =
+        std::make_unique<NativeAllocationCandidate>(std::move(allocator));
+    return std::make_unique<RegionResource>(std::move(candidate));
 }
 
 std::unique_ptr<RegionResource> MakeCxlResource(
     const RegionResourceSpec& spec,
     std::shared_ptr<BufferAllocatorBase> allocator) {
-    auto target =
-        std::make_unique<CxlPlacementTarget>(std::move(allocator), spec.name);
-    return std::make_unique<RegionResource>(std::move(target));
+    auto candidate = std::make_unique<CxlAllocationCandidate>(
+        std::move(allocator), spec.name);
+    return std::make_unique<RegionResource>(std::move(candidate));
 }
 
 class MemoryRegionDriver final : public RegionDriver {
@@ -102,27 +101,27 @@ class CxlRegionDriver final : public RegionDriver {
 }  // namespace
 
 RegionResource::RegionResource(
-    std::unique_ptr<PlacementTarget> placement_target)
-    : target(std::move(placement_target)) {}
+    std::unique_ptr<AllocationCandidate> allocation_candidate)
+    : candidate(std::move(allocation_candidate)) {}
 
 struct PreparedRegionResource::State {
     State(RegionDriver& resource_driver, const UUID& id,
           std::unique_ptr<RegionResource> staged_resource,
           std::vector<std::unique_ptr<AllocatedBuffer>> buffers)
         : driver(resource_driver), imported_buffers(std::move(buffers)) {
-        RegionResourceMap staged;
+        ResourceMap staged;
         auto inserted = staged.emplace(id, std::move(staged_resource));
         resource = staged.extract(inserted.first);
     }
 
     RegionDriver& driver;
-    RegionResourceMap::node_type resource;
+    ResourceMap::node_type resource;
     std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers;
     std::unique_ptr<RegionResource> replaced_resource;
 };
 
 PreparedRegionResource::PreparedRegionResource(
-    RegionDriver& driver, const UUID& id,
+    StageKey, RegionDriver& driver, const UUID& id,
     std::unique_ptr<RegionResource> resource,
     std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers)
     : state_(std::make_unique<State>(driver, id, std::move(resource),
@@ -154,7 +153,19 @@ void PreparedRegionResource::Commit() noexcept {
     if (!state_ || state_->resource.empty()) {
         return;
     }
-    state_->driver.CommitPrepared(*this);
+    state_->replaced_resource = state_->driver.CommitPrepared(state_->resource);
+}
+
+std::unique_ptr<RegionResource> RegionDriver::CommitPrepared(
+    ResourceMap::node_type& resource) noexcept {
+    auto existing = resources_.extract(resource.key());
+    std::unique_ptr<RegionResource> replaced;
+    if (!existing.empty()) {
+        replaced = std::move(existing.mapped());
+    }
+    resource.mapped()->active = true;
+    resources_.insert(std::move(resource));
+    return replaced;
 }
 
 RegionResource* RegionDriver::GetResource(const UUID& id) {
@@ -190,17 +201,8 @@ bool RegionDriver::Erase(const UUID& id) { return resources_.erase(id) != 0; }
 PreparedRegionResource RegionDriver::Stage(
     const UUID& id, std::unique_ptr<RegionResource> resource,
     std::vector<std::unique_ptr<AllocatedBuffer>> imported_buffers) {
-    return PreparedRegionResource(*this, id, std::move(resource),
+    return PreparedRegionResource(StageKey{}, *this, id, std::move(resource),
                                   std::move(imported_buffers));
-}
-
-void RegionDriver::CommitPrepared(PreparedRegionResource& prepared) noexcept {
-    auto existing = resources_.extract(prepared.state_->resource.key());
-    if (!existing.empty()) {
-        prepared.state_->replaced_resource = std::move(existing.mapped());
-    }
-    prepared.state_->resource.mapped()->active = true;
-    resources_.insert(std::move(prepared.state_->resource));
 }
 
 namespace {

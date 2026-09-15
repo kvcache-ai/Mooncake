@@ -37,6 +37,7 @@
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/quota.h"
+#include "tent/transport/rdma/slice.h"
 
 namespace mooncake {
 namespace tent {
@@ -128,6 +129,65 @@ TEST(QuotaAccounting, ATrailingShortSliceIsChargedItsRealLength) {
         ASSERT_TRUE(sel->release(dev_ids[i], i == 3 ? 100 : 300, 0.0).ok());
     EXPECT_EQ(InflightOf(*sel, "mlx5_0"), 0u);
     EXPECT_EQ(InflightOf(*sel, "mlx5_1"), 0u);
+}
+
+// A folded tail makes the last slice longer than a block. It has to be
+// charged what it carries: release() returns the slice's real length, and
+// inflight_bytes is unsigned, so charging a block would wrap it around
+// rather than merely under-report it.
+TEST(QuotaAccounting, ALongLastSliceIsChargedItsRealLength) {
+    auto sel = MakeSelector(/*smart=*/true);
+    std::vector<int> dev_ids;
+    // 1000 bytes in 300-byte blocks over three slices: 300, 300 and a last
+    // one of 400 -- a 100-byte tail folded into it.
+    ASSERT_TRUE(sel->allocate(1000, /*num_slices=*/3, /*slice_bytes=*/300,
+                              "cpu:0", dev_ids)
+                    .ok());
+    ASSERT_EQ(dev_ids.size(), 3u);
+    EXPECT_EQ(TotalInflight(*sel), 1000u);  // not 3 * 300
+
+    for (size_t i = 0; i < dev_ids.size(); ++i)
+        ASSERT_TRUE(sel->release(dev_ids[i], i == 2 ? 400 : 300, 0.0).ok());
+    EXPECT_EQ(InflightOf(*sel, "mlx5_0"), 0u);
+    EXPECT_EQ(InflightOf(*sel, "mlx5_1"), 0u);
+}
+
+// The plan and the charging are two pieces of one rule, in two translation
+// units: planRdmaSlices() decides how a request is cut, allocate() has to
+// charge each device the same lengths the transport will hand its slices,
+// and release() returns those lengths. Walk real plans through all three and
+// the inflight bytes must come back to zero -- the folded tail is exactly
+// where the two used to disagree.
+TEST(QuotaAccounting, PlannedSlicesChargeAndReleaseBalance) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t max_slices : {32ul, 64ul}) {
+        const uint64_t lengths[] = {
+            kBase + 1,  8 * kBase + 8192, 8 * kBase + kBase / 2,
+            3ull << 20, 10ull << 20,      100 * kBase + 7};
+        for (uint64_t length : lengths) {
+            const auto plan = planRdmaSlices(length, kBase, max_slices);
+            auto sel = MakeSelector(/*smart=*/true);
+            std::vector<int> dev_ids;
+            SCOPED_TRACE("length=" + std::to_string(length) +
+                         " max=" + std::to_string(max_slices));
+            ASSERT_TRUE(sel->allocate(length, static_cast<uint32_t>(plan.count),
+                                      plan.block_size, "cpu:0", dev_ids)
+                            .ok());
+            ASSERT_EQ(dev_ids.size(), plan.count);
+            EXPECT_EQ(TotalInflight(*sel), length);
+
+            uint64_t offset = 0;
+            for (size_t i = 0; i < dev_ids.size(); ++i) {
+                const uint64_t bytes = (i + 1 == dev_ids.size())
+                                           ? length - offset
+                                           : plan.block_size;
+                offset += bytes;
+                ASSERT_TRUE(sel->release(dev_ids[i], bytes, 0.0).ok());
+            }
+            EXPECT_EQ(offset, length);
+            EXPECT_EQ(TotalInflight(*sel), 0u);
+        }
+    }
 }
 
 // ---- chargeDevice / release are a matched pair on the device named ----

@@ -21,6 +21,7 @@
 #include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
 
@@ -52,6 +53,7 @@ struct TcpTask {
     std::function<void(BatchID)> notify_progress;
     std::atomic<TransferStatusEnum> status_word{TransferStatusEnum::PENDING};
     std::atomic<size_t> transferred_bytes{0};
+    bool non_replayable_failure{false};  // Published by status_word.
     uint64_t target_addr = 0;
 
     TcpTask() = default;
@@ -62,6 +64,7 @@ struct TcpTask {
           status_word(other.status_word.load(std::memory_order_relaxed)),
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
+          non_replayable_failure(other.non_replayable_failure),
           target_addr(other.target_addr) {}
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;
@@ -87,6 +90,8 @@ class TcpTransport : public Transport {
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
+
+    virtual Status quiesce() override;
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
 
@@ -126,6 +131,7 @@ class TcpTransport : public Transport {
     std::shared_ptr<Topology> local_topology_;
     std::shared_ptr<ControlService> metadata_;
     TcpParams params_;
+    std::mutex lifecycle_mutex_;
     std::unique_ptr<ThreadPool> thread_pool_;
     std::atomic<bool> shutting_down_{false};
 

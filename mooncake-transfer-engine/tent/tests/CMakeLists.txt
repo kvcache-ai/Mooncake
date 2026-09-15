@@ -181,6 +181,13 @@ target_include_directories(request_merge_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
 
+add_executable(local_notification_test local_notification_test.cpp)
+target_link_libraries(local_notification_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(local_notification_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME local_notification_test COMMAND local_notification_test)
+
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
@@ -200,6 +207,16 @@ target_link_libraries(tent_tcp_transport_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
+
+add_executable(tent_tcp_regression_test tcp_regression_test.cpp)
+target_link_libraries(tent_tcp_regression_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_tcp_regression_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_tcp_regression_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_tcp_regression_test COMMAND tent_tcp_regression_test)
 
 add_executable(tent_hp_tcp_transport_config_test
                hp_tcp_transport_config_test.cpp)
@@ -266,7 +283,8 @@ target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
 target_include_directories(tent_tcp_datapath_roundtrip_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 # Each case runs in its own process: the test forks a server child, which must
-# happen before the client process initializes any engine state.
+# happen before the client process initializes any engine state. The CUDA case
+# is built into the same binary but run manually on a GPU host.
 add_test(
   NAME tent_tcp_datapath_roundtrip_test_single_threaded
   COMMAND tent_tcp_datapath_roundtrip_test
@@ -695,6 +713,21 @@ if(USE_TPU)
   add_test(NAME tent_tpu_transport_test COMMAND tent_tpu_transport_test)
 endif()
 
+# XPU SYCL platform test: exercises XpuPlatform (device allocation, pointer
+# classification, VRAM<->host staging copy) against the real oneAPI SYCL
+# backend. USE_XPU is a direct-link build, so the test links libsycl (via
+# platform_xpu inside tent_link_group) and is compiled with -fsycl. It falls
+# back to the OpenCL CPU device when no Intel GPU is present, and skips itself
+# when no SYCL device is visible at all.
+if(USE_XPU)
+  add_executable(tent_xpu_platform_test xpu/xpu_platform_test.cpp)
+  target_link_libraries(tent_xpu_platform_test PRIVATE gtest gtest_main
+                                                       tent_link_group)
+  target_include_directories(tent_xpu_platform_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_xpu_platform_test COMMAND tent_xpu_platform_test)
+endif()
+
 # NOT registered via add_test: the test needs a real CUDA device (it exports a
 # real CUDA IPC handle), so it must be run manually on a GPU host. Only built
 # when CUDA is enabled: the test includes CUDA headers directly.
@@ -718,3 +751,19 @@ endif()
 target_include_directories(tent_rpc_reconnect_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_rpc_reconnect_test COMMAND tent_rpc_reconnect_test)
+
+if(USE_ASCEND OR USE_ASCEND_DIRECT)
+  add_executable(tent_ascend_direct_transport_test
+                 ascend_direct_transport_test.cpp)
+  target_link_libraries(tent_ascend_direct_transport_test
+                        PRIVATE gtest gtest_main tent_link_group)
+  if(TARGET asio_shared)
+    target_link_libraries(tent_ascend_direct_transport_test PRIVATE asio_shared)
+  endif()
+  target_include_directories(tent_ascend_direct_transport_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  set_target_properties(tent_ascend_direct_transport_test
+                        PROPERTIES LINK_FLAGS "-Wl,--allow-shlib-undefined")
+  add_test(NAME tent_ascend_direct_transport_test
+           COMMAND tent_ascend_direct_transport_test)
+endif()

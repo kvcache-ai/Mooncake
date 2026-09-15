@@ -3,41 +3,14 @@
 // Wraps mlx5gda_qp_devctx and issues RDMA writes/atomics via
 // device-side WQE construction.
 //
-// On MUSA: BF (Blue Flame) doorbell is not available (musaHostRegisterIoMemory
-// doesn't support MMIO), so qp->bf is NULL and the kernel uses DBR-only mode.
-// All other IBGDA logic (WQE construction, CQ polling, DBR write) is shared.
+// WQE construction and CQ polling are shared across CUDA, MUSA and MACA.
+// Platform memory operations publish the DBR and mapped BF doorbell.
 #pragma once
 
 #include <cstdint>
 #include "transport/device/device_ops.cuh"
 
-#ifdef MOONCAKE_EP_USE_MACA
-
-namespace mooncake {
-namespace device {
-
-struct IbgdaContext {
-    void* qp_devctxs;
-    const uint64_t* raddrs;
-    const uint32_t* rkeys;
-    const void* local_atomic_base;
-    const void* remote_atomic_base;
-};
-
-__device__ __forceinline__ void mc_ibgda_put(const IbgdaContext&, int, int, int,
-                                             int, const void*, uint64_t,
-                                             uint32_t) {}
-
-__device__ __forceinline__ void mc_ibgda_red_add(const IbgdaContext&, int, int,
-                                                 int, int, uint64_t, uint64_t,
-                                                 int32_t) {}
-
-}  // namespace device
-}  // namespace mooncake
-
-#else  // !MOONCAKE_EP_USE_MACA
-
-#ifndef MOONCAKE_EP_USE_MUSA
+#if !defined(MOONCAKE_EP_USE_MUSA) && !defined(MOONCAKE_EP_USE_MACA)
 #include <cuda/atomic>
 #endif
 #include <transport/device/ibgda/mlx5gda.h>
@@ -76,7 +49,7 @@ __device__ __forceinline__ mlx5gda_qp_devctx* mc_ibgda_channel(
 }
 
 __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
     uint32_t old;
     do {
         old = atomicCAS(&qp->mutex, 0u, 1u);
@@ -88,7 +61,7 @@ __device__ __forceinline__ void mc_ibgda_lock(mlx5gda_qp_devctx* qp) {
 }
 
 __device__ __forceinline__ void mc_ibgda_unlock(mlx5gda_qp_devctx* qp) {
-#ifdef MOONCAKE_EP_USE_MUSA
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
     mc_st_release_u32(&qp->mutex, 0u);
 #else
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(qp->mutex);
@@ -104,8 +77,8 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
             *reinterpret_cast<volatile uint16_t*>(&qp->cq->wqe_counter);
         uint8_t opcode = qp->cq->op_own >> 4;
         if (opcode == 0xD)
-            printf("[EP IBGDA] Requester error: syndrome=0x%lx\n",
-                   qp->cq->timestamp >> 56);
+            printf("[EP IBGDA] Requester error: syndrome=0x%llx\n",
+                   static_cast<unsigned long long>(qp->cq->timestamp >> 56));
         if (!(opcode == 0x0 || opcode == 0xF)) {
             printf("[EP IBGDA] Unexpected CQE opcode=0x%x, trapping\n", opcode);
             __trap();
@@ -255,5 +228,3 @@ __device__ __forceinline__ void mc_ibgda_red_add(
 
 }  // namespace device
 }  // namespace mooncake
-
-#endif  // MOONCAKE_EP_USE_MACA
