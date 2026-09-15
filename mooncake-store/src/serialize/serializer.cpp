@@ -36,8 +36,8 @@ Serializer<offset_allocator::__Allocator>::serialize(
 
     // usedBins array
     packer.pack_array(offset_allocator::NUM_TOP_BINS);
-    for (unsigned char m_usedBin : allocator.m_usedBins) {
-        packer.pack(m_usedBin);
+    for (uint16_t used_bin : allocator.m_usedBins) {
+        packer.pack(used_bin);
     }
 
     // binIndex array
@@ -160,9 +160,12 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                         valid.error())));
     }
 
-    std::array<uint8_t, offset_allocator::NUM_TOP_BINS> used_bins{};
+    std::array<uint16_t, offset_allocator::NUM_TOP_BINS> used_bins{};
     std::array<offset_allocator::NodeIndex, offset_allocator::NUM_LEAF_BINS>
         bin_indices{};
+    uint32_t serialized_bin_count = 0;
+    bool legacy_format = false;
+    std::vector<offset_allocator::NodeIndex> serialized_bin_indices;
     try {
         // Deserialize usedBins array
         const auto &used_bins_array = array_items[index++];
@@ -184,7 +187,7 @@ Serializer<offset_allocator::__Allocator>::deserialize(
         }
 
         for (uint32_t i = 0; i < offset_allocator::NUM_TOP_BINS; i++) {
-            used_bins[i] = used_bins_array.via.array.ptr[i].as<uint8_t>();
+            used_bins[i] = used_bins_array.via.array.ptr[i].as<uint16_t>();
         }
 
         // Deserialize binIndices array
@@ -196,18 +199,23 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                                    "binIndices is not an array"));
         }
 
-        if (bin_indices_array.via.array.size !=
-            offset_allocator::NUM_LEAF_BINS) {
+        serialized_bin_count = bin_indices_array.via.array.size;
+        legacy_format =
+            serialized_bin_count == offset_allocator::LEGACY_NUM_LEAF_BINS;
+        if (!legacy_format &&
+            serialized_bin_count != offset_allocator::NUM_LEAF_BINS) {
             return tl::unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
                 fmt::format(
                     "deserialize offset_allocator::__Allocator binIndices "
-                    "invalid size: expected {}, got {}",
+                    "invalid size: expected {} or {}, got {}",
                     offset_allocator::NUM_LEAF_BINS,
-                    bin_indices_array.via.array.size)));
+                    offset_allocator::LEGACY_NUM_LEAF_BINS,
+                    serialized_bin_count)));
         }
 
-        for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
+        serialized_bin_indices.resize(serialized_bin_count);
+        for (uint32_t i = 0; i < serialized_bin_count; ++i) {
             const uint32_t bin_index =
                 bin_indices_array.via.array.ptr[i].as<uint32_t>();
             if (bin_index != offset_allocator::__Allocator::Node::unused &&
@@ -218,7 +226,10 @@ Serializer<offset_allocator::__Allocator>::deserialize(
                                 "index {} is out of range for capacity {}",
                                 bin_index, current_capacity)));
             }
-            bin_indices[i] = bin_index;
+            serialized_bin_indices[i] = bin_index;
+            if (!legacy_format) {
+                bin_indices[i] = bin_index;
+            }
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
@@ -313,8 +324,10 @@ Serializer<offset_allocator::__Allocator>::deserialize(
         for (uint32_t i = 0; i < offset_allocator::NUM_TOP_BINS; i++) {
             allocator->m_usedBins[i] = used_bins[i];
         }
-        for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
-            allocator->m_binIndices[i] = bin_indices[i];
+        if (!legacy_format) {
+            for (uint32_t i = 0; i < offset_allocator::NUM_LEAF_BINS; i++) {
+                allocator->m_binIndices[i] = bin_indices[i];
+            }
         }
 
         // Deserialize nodes array in standardized format
@@ -351,6 +364,15 @@ Serializer<offset_allocator::__Allocator>::deserialize(
         }
         for (uint32_t i = 0; i < current_capacity; i++) {
             allocator->m_freeNodes[i] = free_nodes[i];
+        }
+
+        if (legacy_format &&
+            !allocator->rebuildFreeBins(serialized_bin_indices.data(),
+                                        serialized_bin_count)) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize offset_allocator::__Allocator "
+                                   "invalid legacy bins"));
         }
 
         return allocator;
