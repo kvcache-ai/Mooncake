@@ -5324,9 +5324,19 @@ ErrorCode Client::InitLocalHotCache() {
             return ErrorCode::INVALID_PARAMS;
         }
 
+        // For shm-backed (HugeTLB) hot caches, ShmHelper::allocate rounds the
+        // mapping up to hugepage granularity while GetTotalSize() reports the
+        // logical size, so registering the logical size could end an MR inside
+        // the last huge page (madvise MADV_DONTFORK then fails with EINVAL).
+        // Register the full segment instead, same rule as
+        // RealClient::register_buffer_internal.
+        size_t hot_cache_reg_size = hot_cache_->GetTotalSize();
+        if (auto shm_seg = hot_cache_->GetShmSegment()) {
+            hot_cache_reg_size = shm_seg->size;
+        }
         int rc = transfer_engine_->registerLocalMemory(
-            hot_cache_->GetBaseAddress(), hot_cache_->GetTotalSize(),
-            kWildcardLocation, true, true);
+            hot_cache_->GetBaseAddress(), hot_cache_reg_size, kWildcardLocation,
+            true, true);
         if (rc != 0) {
             LOG(ERROR)
                 << "Failed to register local hot cache memory with transfer "
