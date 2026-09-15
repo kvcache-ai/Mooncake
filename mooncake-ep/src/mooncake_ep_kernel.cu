@@ -21,7 +21,6 @@ using mooncake::device::mc_grid_sync;
 using mooncake::device::mc_ld_nc;
 using mooncake::device::mc_ld_nc_s32;
 using mooncake::device::mc_ld_nc_f32;
-
 using mooncake::device::mc_st_na;
 using mooncake::device::mc_ld_acquire;
 using mooncake::device::mc_st_release;
@@ -435,10 +434,11 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     int device = 0;
     CUDA_CHECK(cudaGetDevice(&device));
     CUDA_CHECK(cudaGetDeviceProperties(&device_prop, device));
+    num_warp_groups = cell_div(num_experts, device_prop.multiProcessorCount);
     // Select the group count from the device shape. The S5000's 56 SMs select
     // six groups for 288 experts and five groups for the 256-expert shape.
     // Five is the minimum valid value for the kNumMaxTopK capacity check.
-    num_warp_groups = max(5, min(8, cell_div(num_experts, device_prop.multiProcessorCount)));
+    num_warp_groups = max(5, min(8, num_warp_groups));
 #endif
     EP_HOST_ASSERT(kNumMaxTopK + 1 <= num_warp_groups * kNumWarpsPerGroup &&
                    "Too many top-k selections");
@@ -797,13 +797,8 @@ combine(void* combined_x, int32_t* active_ranks,
                 combined_bf16[j] = __float2bfloat16(combined_values[j]);
 #endif
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
-#ifdef MOONCAKE_EP_USE_MUSA
         }
-#endif
     }
-#ifndef MOONCAKE_EP_USE_MUSA
-    }
-#endif
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
