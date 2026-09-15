@@ -1304,6 +1304,7 @@ dependencies = [
  "mooncake-store-client",
  "mooncake-store-core",
  "mooncake-transport",
+ "redis",
 ]
 
 [[package]]
