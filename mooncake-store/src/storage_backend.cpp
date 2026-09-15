@@ -3601,6 +3601,22 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
+#ifdef USE_URING
+        // O_DIRECT vector I/O rounds writes up to 4 KiB. An unaligned capacity
+        // can let an end-of-file write grow the data file past capacity_, after
+        // which recovery's exact size check rejects the file.
+        constexpr uint64_t kDirectIoAlignment = 4096;
+        if (file_storage_config_.use_uring &&
+            (capacity_ % kDirectIoAlignment) != 0) {
+            LOG(ERROR)
+                << "Invalid capacity for OffsetAllocatorStorageBackend with "
+                   "uring/O_DIRECT: "
+                << capacity_ << ". Capacity must be a multiple of "
+                << kDirectIoAlignment;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#endif
+
         // Ensure storage path exists
         {
             std::error_code ec;
