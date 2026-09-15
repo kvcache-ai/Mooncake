@@ -11,15 +11,19 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <gflags/gflags.h>
 
-#include "allocation_strategy.h"
 #include "allocator.h"
 #include "offset_allocator/offset_allocator.h"
+#include "placement/replica_allocator.h"
+#include "segment/pool.h"
+#include "segment/pool_read_access.h"
+#include "segment/pool_write_access.h"
 
 DEFINE_uint32(threads, 16, "Number of concurrent worker threads");
 DEFINE_uint64(iterations, 100000, "Measured operations per worker and phase");
@@ -47,10 +51,17 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 using mooncake::AllocatedBuffer;
-using mooncake::AllocatorManager;
+using mooncake::BufferAllocatorType;
+using mooncake::CreateRegionDrivers;
+using mooncake::ErrorCode;
+using mooncake::generate_uuid;
 using mooncake::OffsetBufferAllocator;
-using mooncake::RandomAllocationStrategy;
-using mooncake::ReplicaType;
+using mooncake::RandomPlacementPolicy;
+using mooncake::RegionDriverConfig;
+using mooncake::RegionDriverRegistry;
+using mooncake::ReplicaAllocationRequest;
+using mooncake::Segment;
+using mooncake::SegmentPool;
 using mooncake::offset_allocator::OffsetAllocationHandle;
 using mooncake::offset_allocator::OffsetAllocator;
 using mooncake::offset_allocator::OffsetAllocStorageReport;
@@ -296,44 +307,78 @@ class OffsetAllocatorFixture {
 class PutAllocationFixture {
    public:
     PutAllocationFixture(uint64_t capacity, uint64_t /* unused */)
-        : capacity_(capacity),
-          allocator_(std::make_shared<OffsetBufferAllocator>(
-              kSegmentName, kBenchmarkBaseAddress, capacity,
-              "benchmark-endpoint", ReplicaType::MEMORY)) {
-        allocator_manager_.addAllocator(kSegmentName, allocator_);
+        : capacity_(capacity), pool_(CreateDrivers()) {
+        Segment segment;
+        segment.id = generate_uuid();
+        segment.name = kSegmentName;
+        segment.base = kBenchmarkBaseAddress;
+        segment.size = capacity;
+        segment.te_endpoint = "benchmark-endpoint";
+        segment.protocol = "tcp";
+        {
+            auto access = pool_.AcquireWriteAccess();
+            auto error = access.MountSegment(segment, generate_uuid());
+            if (error != ErrorCode::OK) {
+                throw std::runtime_error("failed to mount benchmark segment: " +
+                                         mooncake::toString(error));
+            }
+        }
+        buffer_allocator_ = std::dynamic_pointer_cast<OffsetBufferAllocator>(
+            pool_.AcquireReadAccess().GetAllocator(segment.id));
+        if (!buffer_allocator_) {
+            throw std::runtime_error(
+                "benchmark requires OffsetBufferAllocator");
+        }
     }
 
     bool prepareCapacityPressure(double used_ratio) {
         return fillCapacityPressure(
             capacity_, used_ratio,
-            [&](uint64_t size) { return allocator_->allocate(size); }, held_);
+            [&](uint64_t size) { return buffer_allocator_->allocate(size); },
+            held_);
     }
 
     bool prepareFragmentation(uint64_t block_size, uint32_t stride) {
         return createFragmentation(
             block_size, stride,
-            [&](uint64_t size) { return allocator_->allocate(size); }, held_);
+            [&](uint64_t size) { return buffer_allocator_->allocate(size); },
+            held_);
     }
 
     bool expectAllocationFailure(uint64_t request_size) {
-        auto result = strategy_.Allocate(allocator_manager_, request_size, 1);
+        ReplicaAllocationRequest request;
+        request.replicas.size = request_size;
+        auto result = pool_.AllocateReplicas(request, RandomPlacementPolicy{});
         return !result.has_value();
     }
 
     bool allocateAndFree(uint64_t request_size) {
-        auto result = strategy_.Allocate(allocator_manager_, request_size, 1);
+        ReplicaAllocationRequest request;
+        request.replicas.size = request_size;
+        auto result = pool_.AllocateReplicas(request, RandomPlacementPolicy{});
         return result.has_value();
     }
 
     OffsetAllocStorageReport report() const {
-        return allocator_->getOffsetAllocator()->storageReport();
+        return buffer_allocator_->getOffsetAllocator()->storageReport();
     }
 
    private:
+    static RegionDriverRegistry CreateDrivers() {
+        RegionDriverConfig config;
+        config.memory_allocator = BufferAllocatorType::OFFSET;
+        auto drivers = CreateRegionDrivers(config);
+        if (!drivers) {
+            throw std::runtime_error(
+                "failed to create benchmark region drivers: " +
+                mooncake::toString(drivers.error()));
+        }
+        return std::move(*drivers);
+    }
+
     uint64_t capacity_;
-    std::shared_ptr<OffsetBufferAllocator> allocator_;
-    AllocatorManager allocator_manager_;
-    RandomAllocationStrategy strategy_;
+    SegmentPool pool_;
+    std::shared_ptr<OffsetBufferAllocator> buffer_allocator_;
     std::vector<std::unique_ptr<AllocatedBuffer>> held_;
 };
 

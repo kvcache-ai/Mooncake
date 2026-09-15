@@ -40,7 +40,7 @@ TEST(MasterServicePlacementScenarioTest, PutWithPreferredSegments) {
 TEST(MasterServicePlacementScenarioTest, LocalFirstPutPrefersWriterHost) {
     auto config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterScenario("local-first placement prefers the writer host",
                    std::move(config))
@@ -67,7 +67,7 @@ TEST(MasterServicePlacementScenarioTest,
 TEST(MasterServicePlacementScenarioTest, LocalFirstPutFallsBackToNextHost) {
     auto config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterScenario("local-first falls back to the next ordered host",
                    std::move(config))
@@ -83,7 +83,7 @@ TEST(MasterServicePlacementScenarioTest,
      LocalFirstPutFallsBackWhenLocalSegmentIsFull) {
     auto config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterScenario("local-first falls back once the local node is full",
                    std::move(config))
@@ -104,7 +104,7 @@ TEST(MasterServicePlacementScenarioTest,
      ExplicitPreferredSegmentOverridesLocalFirst) {
     auto config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterScenario("an explicit preferred node overrides local-first",
                    std::move(config))
@@ -121,7 +121,7 @@ TEST(MasterServicePlacementScenarioTest,
      ExplicitPreferredSegmentFallsBackToLocalFirst) {
     auto config =
         MasterServiceConfig::builder()
-            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .set_allocation_strategy_type(PlacementPolicyType::LOCAL_FIRST)
             .build();
     MasterScenario("a full preferred node falls back to local-first",
                    std::move(config))
