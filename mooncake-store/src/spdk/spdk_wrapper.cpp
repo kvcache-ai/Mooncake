@@ -73,7 +73,7 @@ struct tr_info {
 struct ctrlr_info {
     struct spdk_nvme_ctrlr *ctrlr;
     std::map<uint32_t, std::unique_ptr<nof_seg_handle>> ns_seg;
-    std::mutex ns_mutex;
+    mutable std::mutex ns_mutex;
 };
 
 SpdkWrapper::SpdkWrapper() = default;
@@ -142,6 +142,8 @@ bool SpdkWrapper::InitializeEnv() {
 
 void SpdkWrapper::Cleanup() {
     if (initialized.load(std::memory_order_acquire)) {
+        // Exclude concurrent Probe/Close while tearing down cached resources.
+        std::lock_guard<std::mutex> lifecycle_lock(probe_lifecycle_mutex_);
         {
             std::lock_guard<std::mutex> lock(ctrlrs_mutex);
             for (auto &[_, info] : connected_ctrlrs) {
@@ -243,7 +245,8 @@ int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
     return spdk_nvme_qpair_process_completions(seg->qpair, complete_per_seg);
 }
 
-int SpdkWrapper::ParseTransPortStr(const std::string &tr_str, tr_info *info) {
+int SpdkWrapper::ParseTransPortStr(const std::string &tr_str,
+                                   tr_info *info) const {
     std::memset(&info->trid, 0, sizeof(info->trid));
     info->ns = 1;
 
@@ -369,6 +372,98 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     return seg_handle;
 }
 
+void SpdkWrapper::CloseNofSegment(const std::string &tr_str) {
+    if (tr_str.empty()) {
+        return;
+    }
+
+    // Serialize against in-flight ProbeNofSegment calls.
+    std::lock_guard<std::mutex> lifecycle_lock(probe_lifecycle_mutex_);
+
+    tr_info tr;
+    if (ParseTransPortStr(tr_str, &tr) != 0) {
+        LOG(WARNING) << "CloseNofSegment: failed to parse transport string";
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+        auto ctrlr_it = connected_ctrlrs.find(tr.ctrlr_key);
+        if (ctrlr_it != connected_ctrlrs.end() && ctrlr_it->second) {
+            ctrlr_info *info = ctrlr_it->second.get();
+            {
+                std::lock_guard<std::mutex> ns_lock(info->ns_mutex);
+                auto ns_it = info->ns_seg.find(tr.ns);
+                if (ns_it != info->ns_seg.end()) {
+                    if (ns_it->second && ns_it->second->qpair) {
+                        spdk_nvme_ctrlr_free_io_qpair(ns_it->second->qpair);
+                        ns_it->second->qpair = nullptr;
+                    }
+                    info->ns_seg.erase(ns_it);
+                }
+
+                if (!info->ns_seg.empty()) {
+                    // Other namespaces on this controller are still mounted /
+                    // probed; keep the shared controller attached.
+                    info = nullptr;
+                }
+            }
+
+            if (info != nullptr) {
+                if (info->ctrlr) {
+                    spdk_nvme_detach(info->ctrlr);
+                    info->ctrlr = nullptr;
+                }
+                connected_ctrlrs.erase(ctrlr_it);
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+        auto buf_it = probe_buffers_.find(tr_str);
+        if (buf_it != probe_buffers_.end()) {
+            if (buf_it->second && buf_it->second->ptr) {
+                spdk_free(buf_it->second->ptr);
+                buf_it->second->ptr = nullptr;
+                buf_it->second->size = 0;
+            }
+            probe_buffers_.erase(buf_it);
+        }
+    }
+}
+
+size_t SpdkWrapper::GetConnectedControllerCountForTesting() const {
+    std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+    return connected_ctrlrs.size();
+}
+
+size_t SpdkWrapper::GetProbeBufferCountForTesting() const {
+    std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+    return probe_buffers_.size();
+}
+
+bool SpdkWrapper::HasNamespaceHandleForTesting(
+    const std::string &tr_str) const {
+    tr_info tr;
+    if (ParseTransPortStr(tr_str, &tr) != 0) {
+        return false;
+    }
+    std::lock_guard<std::mutex> lock(ctrlrs_mutex);
+    auto ctrlr_it = connected_ctrlrs.find(tr.ctrlr_key);
+    if (ctrlr_it == connected_ctrlrs.end() || !ctrlr_it->second) {
+        return false;
+    }
+    std::lock_guard<std::mutex> ns_lock(ctrlr_it->second->ns_mutex);
+    return ctrlr_it->second->ns_seg.find(tr.ns) !=
+           ctrlr_it->second->ns_seg.end();
+}
+
+bool SpdkWrapper::HasProbeBufferForTesting(const std::string &tr_str) const {
+    std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+    return probe_buffers_.find(tr_str) != probe_buffers_.end();
+}
+
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     if (!seg_handle || !seg_handle->ns) {
         return INVALID_BLOCK_SIZE;
@@ -430,6 +525,10 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
 bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                                   uint32_t timeout_ms,
                                   std::string *error_reason) {
+    // Hold for the whole probe so CloseNofSegment cannot free resources
+    // mid-I/O (e.g. concurrent UnmountNoFSegment on Master).
+    std::lock_guard<std::mutex> lifecycle_lock(probe_lifecycle_mutex_);
+
     if (!InitializeEnv()) {
         if (error_reason) {
             *error_reason = "spdk_env_init_fail";
