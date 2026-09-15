@@ -110,6 +110,28 @@ bool RestoreAgentModeDeviceZero() {
     }
     return true;
 }
+
+void *AllocateAscendStoreSegment(size_t segment_size,
+                                 const std::string &protocol, bool use_hugepage,
+                                 bool defer_hugetlb, size_t *mapped_size) {
+    size_t actual_size = 0;
+    AscendHostAllocFn host_alloc = nullptr;
+    size_t host_align = 0;
+    size_t alloc_size = segment_size;
+    if (use_hugepage && !globalConfig().ascend_use_fabric_mem) {
+        host_align = get_hugepage_size_from_env();
+        alloc_size = align_up(segment_size, host_align);
+        host_alloc =
+            static_cast<AscendHostAllocFn>(allocate_buffer_mmap_memory);
+    }
+    void *ptr = ascend_allocate_memory_best_effort(alloc_size, protocol,
+                                                   &actual_size, host_alloc,
+                                                   host_align, defer_hugetlb);
+    if (ptr != nullptr) {
+        *mapped_size = actual_size;
+    }
+    return ptr;
+}
 #endif
 
 std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
@@ -285,6 +307,23 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
+}
+
+// DummyClient copy RPCs do not carry device_id; setup_dummy already stored it
+// on each mapped SHM. Use that so the RPC thread has an ACL context before TE
+// submitTransfer / aclrtGetDevice.
+template <typename MappedShms>
+tl::expected<void, ErrorCode> set_context_from_dummy_shms(
+    const std::string &protocol, const MappedShms &mapped_shms,
+    const char *action) {
+    int32_t device_id = kInvalidPhysicalDeviceId;
+    for (const auto &shm : mapped_shms) {
+        if (shm.device_id != kInvalidPhysicalDeviceId) {
+            device_id = shm.device_id;
+            break;
+        }
+    }
+    return set_context_if_needed(protocol, device_id, action);
 }
 #endif
 
@@ -770,8 +809,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-    const bool should_use_hugepage =
-        use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && globalConfig().ascend_agent_mode) {
         auto ascend_setup = setup_ascend_internal(local_buffer_size);
@@ -879,7 +916,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     use_spdk_dma_for_client_buffer = true;
 #endif
     client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage,
+        local_buffer_size, this->protocol,
+        use_hugepage_ && !globalConfig().ascend_use_fabric_mem,
         use_spdk_dma_for_client_buffer);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
@@ -965,7 +1003,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
         const bool parallel_hugetlb_population =
-            protocol == "rdma" && should_use_hugepage;
+            protocol == "rdma" && use_hugepage_;
 
         while (global_segment_size > 0) {
             size_t segment_size =
@@ -983,7 +1021,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
             if (!seg_numa_nodes.empty()) {
                 // NUMA-segmented allocation: contiguous VMA, per-region binding
-                size_t page_sz = should_use_hugepage
+                size_t page_sz = use_hugepage_
                                      ? get_hugepage_size_from_env()
                                      : static_cast<size_t>(getpagesize());
                 mapped_size =
@@ -991,22 +1029,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_numa_segments(mapped_size, seg_numa_nodes,
                                                     page_sz);
                 seg_location = buildSegmentsLocation(page_sz, seg_numa_nodes);
-            } else if (should_use_hugepage) {
+#ifdef USE_ASCEND_DIRECT
+            } else if (protocol == "ascend" || protocol == "ubshmem") {
+                ptr = AllocateAscendStoreSegment(
+                    segment_size, this->protocol, use_hugepage_,
+                    parallel_hugetlb_population, &mapped_size);
+#endif
+            } else if (use_hugepage_) {
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
-#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
-            } else if ((protocol == "ascend" || protocol == "ubshmem") &&
-                       globalConfig().ascend_use_fabric_mem) {
-                size_t actual_size = 0;
-                ptr = ascend_allocate_memory_best_effort(
-                    segment_size, this->protocol, &actual_size);
-                if (ptr) {
-                    mapped_size = actual_size;
-                }
-#endif
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -1023,8 +1057,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                       << current_glbseg_size << " of " << total_glbseg_size;
 
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
-                ascend_segment_ptrs_.emplace_back(
-                    ptr, AscendSegmentDeleter{this->protocol});
+                if (use_hugepage_ && !globalConfig().ascend_use_fabric_mem) {
+                    hugepage_segment_ptrs_.emplace_back(
+                        ptr, HugepageSegmentDeleter{mapped_size});
+                } else {
+                    ascend_segment_ptrs_.emplace_back(
+                        ptr, AscendSegmentDeleter{this->protocol});
+                }
             } else if (this->protocol == "sunrise_link") {
 #if defined(USE_SUNRISE)
                 sunrise_segment_ptrs_.emplace_back(ptr,
@@ -1037,7 +1076,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else if (this->protocol == "ub") {
                 ub_segment_ptrs_.emplace_back(ptr,
                                               UbSegmentDeleter{mapped_size});
-            } else if (!seg_numa_nodes.empty() || should_use_hugepage) {
+            } else if (!seg_numa_nodes.empty() || use_hugepage_) {
                 // NUMA-segmented or hugepage: track as mmap allocation for
                 // munmap cleanup
                 hugepage_segment_ptrs_.emplace_back(
@@ -2014,6 +2053,13 @@ tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_internal(key, value, config, context.client_buffer_allocator);
 }
@@ -2116,6 +2162,13 @@ tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put_batch");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_batch_internal(keys, values, config,
                               context.client_buffer_allocator);
@@ -2212,6 +2265,13 @@ tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result =
+        set_context_from_dummy_shms(protocol, context.mapped_shms, "put_parts");
+    if (!context_result) {
+        return context_result;
+    }
+#endif
 
     return put_parts_internal(key, values, config,
                               context.client_buffer_allocator);
@@ -2994,6 +3054,13 @@ RealClient::acquire_buffer_dummy(const std::string &key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &context = it->second;
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_from_dummy_shms(
+        protocol, context.mapped_shms, "get_buffer");
+    if (!context_result) {
+        return tl::unexpected(context_result.error());
+    }
+#endif
 
     auto buffer_handle =
         get_buffer_internal(key, context.client_buffer_allocator);
@@ -3119,6 +3186,16 @@ RealClient::batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
             r = tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         return results;
     }
+#ifdef USE_ASCEND_DIRECT
+    auto context_result = set_context_from_dummy_shms(
+        protocol, ctx_it->second.mapped_shms, "batch_get_buffer");
+    if (!context_result) {
+        for (auto &r : results) {
+            r = tl::unexpected(context_result.error());
+        }
+        return results;
+    }
+#endif
 
     // Use batch_get_buffer_internal with dummy's allocator
     lock.unlock();
@@ -3214,7 +3291,7 @@ RealClient::batch_get_buffer_internal(
             continue;
         }
 
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             continue;
@@ -5359,7 +5436,7 @@ RealClient::batch_get_into_internal(
         }
 
         // Validate replica list
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -5785,7 +5862,7 @@ std::vector<int> RealClient::batch_get_session_start(
             continue;
         }
 
-        auto query_result = query_results[i].value();
+        const auto &query_result = query_results[i].value();
         if (query_result.IsLeaseExpired()) {
             results[i] = static_cast<int>(toInt(ErrorCode::LEASE_EXPIRED));
             get_sessions_.erase(keys[i]);
@@ -6507,7 +6584,7 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Validate replica list
-        auto query_result_values = query_results[i].value();
+        const auto &query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
@@ -7370,6 +7447,19 @@ ClientRequester::ClientRequester() {
             pool_conf, GetStoreRpcClientIoContextPool());
 }
 
+ClientRequester::~ClientRequester() {
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "ClientRequester teardown: offload RPCs still in "
+                      "flight after 30s drain; those calls lose their "
+                      "responses, but the pools stay alive so no late resume "
+                      "touches freed state";
+    }
+    // The pools host ylt reconnect coroutines that reference pool storage
+    // whether or not a user call is in flight (#3909), so the collection is
+    // never freed (#3943 review).
+    detail::KeepClientPoolsAlive(std::move(client_pools_));
+}
+
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
 ClientRequester::batch_get_offload_object(const std::string &client_addr,
                                           const std::vector<std::string> &keys,
@@ -7405,6 +7495,10 @@ void ClientRequester::release_offload_buffer(const std::string &client_addr,
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
     const std::string &client_addr, Args &&...args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto client_pool = client_pools_->at(client_addr);
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
