@@ -32,10 +32,13 @@
 #include <cstdlib>
 #include <deque>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <random>
+#include <sstream>
 #include <type_traits>
 #include <vector>
 
@@ -311,10 +314,27 @@ bool validateTcpAddress(const std::shared_ptr<TransferMetadata>& metadata,
     }
     return false;
 }
+
+std::string generateTcpInstanceId() {
+    std::random_device random_device;
+    std::array<std::uint32_t, 8> entropy{};
+    std::generate(entropy.begin(), entropy.end(),
+                  [&random_device] { return random_device(); });
+    std::seed_seq seed(entropy.begin(), entropy.end());
+    std::mt19937_64 generator(seed);
+    const uint64_t high = generator();
+    const uint64_t low = generator();
+
+    std::ostringstream result;
+    result << std::hex << std::setfill('0') << std::setw(16) << high
+           << std::setw(16) << low;
+    return result.str();
+}
 }  // namespace
 
 TcpTransport::TcpTransport()
-    : context_(nullptr),
+    : tcp_instance_id_(generateTcpInstanceId()),
+      context_(nullptr),
       running_(false),
       lane_state_(std::make_shared<ConnectionLaneState>()) {
     if (getenv("MC_TCP_ENABLE_CONNECTION_POOL") != nullptr) {
@@ -456,6 +476,7 @@ int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
 #endif
     desc->tcp_data_host = metadata_->localRpcMeta().ip_or_host_name;
     desc->tcp_data_port = tcp_data_port;
+    desc->tcp_instance_id = tcp_instance_id_;
     // Advertise acknowledged framing (#2086); initiators fall back to v1
     // against descriptors that do not carry the field.
     desc->tcp_proto_version = 2;
@@ -751,7 +772,8 @@ void TcpTransport::startTransfer(Slice* slice,
     }
 
     const ConnectionKey key{desc->tcp_data_host,
-                            static_cast<uint16_t>(desc->tcp_data_port)};
+                            static_cast<uint16_t>(desc->tcp_data_port),
+                            desc->tcp_instance_id};
     const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
     TcpWorkItem work(slice, use_v2, std::move(continuation));
 
