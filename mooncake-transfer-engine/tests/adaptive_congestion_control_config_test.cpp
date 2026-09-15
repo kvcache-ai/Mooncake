@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdlib>
 #include <limits>
 #include <string>
@@ -33,6 +34,11 @@ class AdaptiveCongestionControlConfigTest : public ::testing::Test {
         unsetenv("MC_ADAPTIVE_CC_MIN_WINDOW_BYTES");
         unsetenv("MC_ADAPTIVE_CC_MAX_WINDOW_BYTES");
         unsetenv("MC_ADAPTIVE_CC_TARGET_DRAIN_US");
+        unsetenv("MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS");
+        unsetenv("MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS");
+        unsetenv("MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD");
+        unsetenv("MC_ADAPTIVE_CC_COOLDOWN_MS");
+        unsetenv("MC_ADAPTIVE_CC_PROBE_WINDOW_BYTES");
     }
 };
 
@@ -99,6 +105,89 @@ TEST_F(AdaptiveCongestionControlConfigTest, DrainTimeOverflowFailsClosed) {
     EXPECT_FALSE(result.valid);
     EXPECT_EQ(result.config.mode, Mode::kOff);
     EXPECT_EQ(result.error, "MC_ADAPTIVE_CC_TARGET_DRAIN_US");
+}
+
+TEST_F(AdaptiveCongestionControlConfigTest, LoadsRecoveryThresholdOverrides) {
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MODE", "enforce", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS", "4", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS", "5", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD", "6", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_COOLDOWN_MS", "1500", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_PROBE_WINDOW_BYTES", "131072", 1), 0);
+
+    const ConfigLoadResult result = loadConfigFromEnvironment();
+    ASSERT_TRUE(result.valid) << result.error;
+    EXPECT_EQ(result.config.high_pressure_epochs, 4u);
+    EXPECT_EQ(result.config.low_pressure_epochs, 5u);
+    EXPECT_EQ(result.config.hard_error_threshold, 6u);
+    EXPECT_EQ(result.config.cooldown_ns, 1'500'000'000u);
+    EXPECT_EQ(result.config.probe_window_bytes, 131'072u);
+}
+
+TEST_F(AdaptiveCongestionControlConfigTest,
+       RejectsInvalidRecoveryThresholdOverrides) {
+    constexpr std::array<const char*, 5> names = {
+        "MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS",
+        "MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS",
+        "MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD", "MC_ADAPTIVE_CC_COOLDOWN_MS",
+        "MC_ADAPTIVE_CC_PROBE_WINDOW_BYTES"};
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MODE", "enforce", 1), 0);
+    for (const char* name : names) {
+        for (const char* invalid_value : {"0", "-1", "not-a-number"}) {
+            SCOPED_TRACE(std::string(name) + "=" + invalid_value);
+            ASSERT_EQ(setenv(name, invalid_value, 1), 0);
+            const ConfigLoadResult result = loadConfigFromEnvironment();
+            EXPECT_FALSE(result.valid);
+            EXPECT_EQ(result.config.mode, Mode::kOff);
+            EXPECT_EQ(result.error, name);
+            ASSERT_EQ(unsetenv(name), 0);
+        }
+    }
+}
+
+TEST_F(AdaptiveCongestionControlConfigTest, RejectsEpochCounterOverflow) {
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MODE", "enforce", 1), 0);
+    constexpr std::array<const char*, 3> names = {
+        "MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS",
+        "MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS",
+        "MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD"};
+    for (const char* name : names) {
+        SCOPED_TRACE(name);
+        ASSERT_EQ(setenv(name, "4294967296", 1), 0);
+        const ConfigLoadResult result = loadConfigFromEnvironment();
+        EXPECT_FALSE(result.valid);
+        EXPECT_EQ(result.error, name);
+        ASSERT_EQ(unsetenv(name), 0);
+    }
+}
+
+TEST_F(AdaptiveCongestionControlConfigTest, RejectsCooldownOverflow) {
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MODE", "enforce", 1), 0);
+    const std::string value =
+        std::to_string(std::numeric_limits<uint64_t>::max());
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_COOLDOWN_MS", value.c_str(), 1), 0);
+    const ConfigLoadResult result = loadConfigFromEnvironment();
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "MC_ADAPTIVE_CC_COOLDOWN_MS");
+}
+
+TEST_F(AdaptiveCongestionControlConfigTest, RejectsOversizedProbeWindow) {
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MODE", "enforce", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MIN_WINDOW_BYTES", "4096", 1), 0);
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_PROBE_WINDOW_BYTES", "8192", 1), 0);
+    const ConfigLoadResult result = loadConfigFromEnvironment();
+    EXPECT_FALSE(result.valid);
+    EXPECT_EQ(result.error, "adaptive congestion probe window range");
+}
+
+TEST_F(AdaptiveCongestionControlConfigTest,
+       SmallMinWindowWithoutProbeOverrideRemainsValid) {
+    ASSERT_EQ(setenv("MC_ADAPTIVE_CC_MIN_WINDOW_BYTES", "4096", 1), 0);
+    const ConfigLoadResult result = loadConfigFromEnvironment();
+    ASSERT_TRUE(result.valid);
+    EXPECT_EQ(result.config.probe_window_bytes, 64u << 10);
+    DomainState domain(result.config);
+    EXPECT_EQ(snapshot(domain).window_bytes, 4096u);
 }
 
 }  // namespace

@@ -44,6 +44,16 @@ bool parsePositive(const char* name, uint64_t& output) {
     return true;
 }
 
+bool parsePositiveCount(const char* name, uint32_t& output) {
+    uint64_t parsed = output;
+    if (!parsePositive(name, parsed) ||
+        parsed > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    output = static_cast<uint32_t>(parsed);
+    return true;
+}
+
 }  // namespace
 
 ConfigLoadResult loadConfigFromEnvironment() {
@@ -79,6 +89,36 @@ ConfigLoadResult loadConfigFromEnvironment() {
         return invalid("MC_ADAPTIVE_CC_TARGET_DRAIN_US");
     }
     result.config.target_drain_time_ns = target_drain_us * 1000;
+
+    if (!parsePositiveCount("MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS",
+                            result.config.high_pressure_epochs)) {
+        return invalid("MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS");
+    }
+    if (!parsePositiveCount("MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS",
+                            result.config.low_pressure_epochs)) {
+        return invalid("MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS");
+    }
+    if (!parsePositiveCount("MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD",
+                            result.config.hard_error_threshold)) {
+        return invalid("MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD");
+    }
+
+    uint64_t cooldown_ms = result.config.cooldown_ns / 1'000'000;
+    if (!parsePositive("MC_ADAPTIVE_CC_COOLDOWN_MS", cooldown_ms) ||
+        cooldown_ms > std::numeric_limits<uint64_t>::max() / 1'000'000) {
+        return invalid("MC_ADAPTIVE_CC_COOLDOWN_MS");
+    }
+    result.config.cooldown_ns = cooldown_ms * 1'000'000;
+
+    constexpr const char* probe_name = "MC_ADAPTIVE_CC_PROBE_WINDOW_BYTES";
+    const bool probe_override = std::getenv(probe_name) != nullptr;
+    if (!parsePositive(probe_name, result.config.probe_window_bytes)) {
+        return invalid(probe_name);
+    }
+    if (probe_override &&
+        result.config.probe_window_bytes > result.config.min_window_bytes) {
+        return invalid("adaptive congestion probe window range");
+    }
     return result;
 }
 
