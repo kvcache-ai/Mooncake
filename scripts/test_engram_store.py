@@ -276,12 +276,16 @@ class EngramStoreTestBase(unittest.TestCase):
         cfg = self.create_config()
         self.layer_id = layer_id
         if store_marker is Ellipsis:
-            engram_store = self.EngramStore(layers={layer_id: cfg}, store=self.store)
+            engram_store = self.EngramStore(
+                layers={layer_id: cfg}, store_client=self.store
+            )
             self._created_engram_stores.append(engram_store)
         elif store_marker is None:
             engram_store = self.EngramStore(layers={layer_id: cfg})
         else:
-            engram_store = self.EngramStore(layers={layer_id: cfg}, store=store_marker)
+            engram_store = self.EngramStore(
+                layers={layer_id: cfg}, store_client=store_marker
+            )
             self._created_engram_stores.append(engram_store)
         return cfg, engram_store
 
@@ -324,38 +328,114 @@ class EngramStoreTestBase(unittest.TestCase):
 
 
 class TestEngramStoreMetadata(EngramStoreTestBase):
-    def test_local_tables_lifetime_and_bounds(self):
+    def test_local_tables_own_copies_and_reopen(self):
         import gc
         import weakref
 
         cfg = self.create_config()
         cfg.row_bytes = 264
-        table = self.EngramStore({1: cfg, 14: cfg})
+        with tempfile.TemporaryDirectory() as directory:
+            table = self.EngramStore({1: cfg, 14: cfg}, local_dir=directory)
+            # A reader can be constructed before population, without attach.
+            reader = self.EngramStore({1: cfg, 14: cfg}, local_dir=directory)
+            arrays = [
+                np.arange(n * 264, dtype=np.uint32).astype(np.uint8).reshape(n, 264)
+                for n in cfg.table_vocab_sizes
+            ]
+            expected = np.stack([a[-1].copy() for a in arrays])
+            refs = [weakref.ref(a) for a in arrays]
+            ids = (np.array(cfg.table_vocab_sizes, dtype=np.int64) - 1)[None, None]
+            output = np.empty((1, 1, len(cfg.table_vocab_sizes), 264), dtype=np.uint8)
+            with self.assertRaises(RuntimeError):
+                reader.lookup_into(1, ids, output)
+            table.populate(1, arrays)
+            # populate owns a copy, not a retained reference to the inputs.
+            for array in arrays:
+                array.fill(0)
+            del array, arrays, table
+            gc.collect()
+            self.assertTrue(all(ref() is None for ref in refs))
+            for handle in (reader, self.EngramStore({1: cfg}, local_dir=directory)):
+                handle.lookup_into(1, ids, output)
+                np.testing.assert_array_equal(output[0, 0], expected)
+            with self.assertRaises(RuntimeError):
+                reader.lookup_into(14, ids, output)
+            ids[0, 0, 0] += 1
+            with self.assertRaises(RuntimeError):
+                reader.lookup_into(1, ids, output)
+            self.assertFalse(output.any())
+
+    def test_local_publish_validation_and_recovery(self):
+        cfg = self.create_config()
         arrays = [
-            np.arange(n * 264, dtype=np.uint32).astype(np.uint8).reshape(n, 264)
-            for n in cfg.table_vocab_sizes
+            np.full((n, cfg.row_bytes), h, np.uint8)
+            for h, n in enumerate(cfg.table_vocab_sizes)
         ]
-        expected = np.stack([a[-1].copy() for a in arrays])
-        refs = [weakref.ref(a) for a in arrays]
-        for a in arrays:
-            a.flags.writeable = False
-        table.bind_local(1, arrays)
-        del arrays, a
-        gc.collect()
-        assert all(ref() is not None for ref in refs)
-        ids = (np.array(cfg.table_vocab_sizes, dtype=np.int64) - 1)[None, None]
-        output = np.empty((1, 1, len(cfg.table_vocab_sizes), 264), dtype=np.uint8)
-        table.lookup_into(1, ids, output)  # No Store or registered output.
-        np.testing.assert_array_equal(output[0, 0], expected)
-        with self.assertRaises(RuntimeError):
-            table.lookup_into(14, ids, output)
-        ids[0, 0, 0] += 1
-        with self.assertRaises(RuntimeError):
-            table.lookup_into(1, ids, output)
-        assert not output.any()
-        del table
-        gc.collect()
-        assert all(ref() is None for ref in refs)
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ValueError):
+                self.EngramStore({1: cfg}, self.store, local_dir=directory)
+            table = self.EngramStore({1: cfg}, local_dir=directory)
+            with self.assertRaises(RuntimeError):
+                table.populate(1, arrays[:-1])
+            self.assertFalse((Path(directory) / "layer-1").exists())
+            # A failed writer's incomplete directory is never readable, and
+            # the next writer recovers it while holding the per-layer lock.
+            temporary = Path(directory) / "layer-1.tmp"
+            temporary.mkdir()
+            (temporary / "head-0.bin").write_bytes(b"incomplete")
+            table.populate(1, arrays)
+            with self.assertRaises(RuntimeError):
+                table.populate(1, arrays)
+            self.assertFalse(temporary.exists())
+            wrong = self.create_config()
+            wrong.row_bytes += 1
+            with self.assertRaises(RuntimeError):
+                self.EngramStore({1: wrong}, local_dir=directory)
+            # A corrupted published table must fail during construction.
+            head = Path(directory) / "layer-1/head-0.bin"
+            head.chmod(0o600)
+            head.write_bytes(b"short")
+            with self.assertRaises(RuntimeError):
+                self.EngramStore({1: cfg}, local_dir=directory)
+
+    def test_local_cross_process_publication(self):
+        cfg = self.create_config()
+        # Two independent writers compete; only one may publish the layer.
+        script = """
+import sys
+import numpy as np
+sys.path.insert(0, sys.argv[1])
+from store import EngramStore, EngramStoreConfig
+cfg = EngramStoreConfig()
+cfg.table_vocab_sizes = [17, 19, 23, 29]
+cfg.row_bytes = 32
+table = EngramStore({1: cfg}, local_dir=sys.argv[2])
+try:
+    table.populate(1, [np.full((n, 32), int(sys.argv[3]), np.uint8)
+                       for n in cfg.table_vocab_sizes])
+except RuntimeError:
+    sys.exit(3)
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            reader = self.EngramStore({1: cfg}, local_dir=directory)
+            processes = [
+                subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        script,
+                        str(BUILD_STORE),
+                        directory,
+                        str(value),
+                    ]
+                )
+                for value in (11, 22)
+            ]
+            codes = [process.wait(timeout=30) for process in processes]
+            self.assertEqual(sorted(codes), [0, 3])
+            output = np.empty((1, 1, 4, 32), np.uint8)
+            reader.lookup_into(1, np.zeros((1, 1, 4), np.int64), output)
+            np.testing.assert_array_equal(output, (11, 22)[codes.index(0)])
 
     def test_creation_and_metadata(self):
         cfg, engram_store = self.create_engram_store()

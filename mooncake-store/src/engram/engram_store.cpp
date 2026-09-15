@@ -1,19 +1,153 @@
 #include "engram/engram_store.h"
 
+#include <atomic>
 #include <cstring>
+#include <fcntl.h>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
+#include <sys/file.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <system_error>
+#include <unistd.h>
 #include <vector>
 
+#include "client_buffer.h"
 #include "pyclient.h"
 
 namespace mooncake {
 namespace engram {
 
+// Local table mappings use the same RAII buffer handle as Store client buffers.
+// A layer directory is published atomically, after all heads have been copied.
+// Published files are immutable; removing them is an explicit deployment
+// action.
+struct EngramStore::LocalTables {
+    std::vector<BufferHandle> heads;
+
+    struct File {
+        int fd;
+        File(const std::filesystem::path& path, int flags)
+            : fd(::open(path.c_str(), flags | O_CLOEXEC, 0600)) {
+            if (fd < 0)
+                throw std::system_error(errno, std::generic_category(),
+                                        path.string());
+        }
+        ~File() { ::close(fd); }
+        File(const File&) = delete;
+        File& operator=(const File&) = delete;
+    };
+
+    static std::filesystem::path path(const std::string& root, int layer_id) {
+        return std::filesystem::path(root) /
+               ("layer-" + std::to_string(layer_id));
+    }
+
+    static std::string layout(const EngramStoreConfig& cfg) {
+        std::ostringstream out;
+        out << "mooncake-engram-v1\n" << cfg.row_bytes << '\n';
+        for (auto rows : cfg.table_vocab_sizes) out << rows << '\n';
+        return out.str();
+    }
+
+    static BufferHandle map(int fd, size_t size, bool writable) {
+        void* ptr =
+            ::mmap(nullptr, size, PROT_READ | (writable ? PROT_WRITE : 0),
+                   MAP_SHARED | (writable ? 0 : MAP_POPULATE), fd, 0);
+        if (ptr == MAP_FAILED)
+            throw std::system_error(errno, std::generic_category(),
+                                    "Engram mmap");
+        return BufferHandle(ptr, size, [ptr, size] { ::munmap(ptr, size); });
+    }
+
+    static std::shared_ptr<LocalTables> open(const std::filesystem::path& dir,
+                                             const EngramStoreConfig& cfg) {
+        if (!std::filesystem::exists(dir)) return nullptr;
+        std::ifstream manifest(dir / "layout");
+        std::string actual((std::istreambuf_iterator<char>(manifest)), {});
+        if (!manifest || actual != layout(cfg))
+            throw std::runtime_error("Local Engram layout mismatch: " +
+                                     dir.string());
+        auto tables = std::make_shared<LocalTables>();
+        tables->heads.reserve(cfg.table_vocab_sizes.size());
+        for (size_t h = 0; h < cfg.table_vocab_sizes.size(); ++h) {
+            const size_t size =
+                static_cast<size_t>(cfg.table_vocab_sizes[h]) * cfg.row_bytes;
+            File file(dir / ("head-" + std::to_string(h) + ".bin"), O_RDONLY);
+            struct stat statbuf{};
+            if (::fstat(file.fd, &statbuf) != 0 || statbuf.st_size < 0 ||
+                static_cast<uint64_t>(statbuf.st_size) != size)
+                throw std::runtime_error("Local Engram table size mismatch: " +
+                                         dir.string());
+            tables->heads.push_back(map(file.fd, size, false));
+        }
+        return tables;
+    }
+
+    static std::shared_ptr<LocalTables> populate(
+        const std::filesystem::path& dir, const EngramStoreConfig& cfg,
+        const std::vector<void*>& buffers, const std::vector<size_t>& sizes) {
+        File lock(dir.string() + ".lock", O_CREAT | O_RDWR);
+        if (::flock(lock.fd, LOCK_EX) != 0)
+            throw std::system_error(errno, std::generic_category(),
+                                    "Engram populate lock");
+        if (std::filesystem::exists(dir))
+            throw std::runtime_error(
+                "Local Engram populate requires an absent layer: " +
+                dir.string());
+        const std::filesystem::path temporary = dir.string() + ".tmp";
+        // Only a writer holding this layer's lock may recover an interrupted
+        // load.
+        std::filesystem::remove_all(temporary);
+        std::filesystem::create_directory(temporary);
+        try {
+            for (size_t h = 0; h < buffers.size(); ++h) {
+                File file(temporary / ("head-" + std::to_string(h) + ".bin"),
+                          O_CREAT | O_EXCL | O_RDWR);
+                if (sizes[h] >
+                    static_cast<uint64_t>(std::numeric_limits<off_t>::max()))
+                    throw std::runtime_error(
+                        "Local Engram table exceeds file offset range");
+                // Reserve space before memcpy so an exhausted tmpfs reports an
+                // error here instead of delivering SIGBUS during a mapped
+                // write.
+                int rc =
+                    ::posix_fallocate(file.fd, 0, static_cast<off_t>(sizes[h]));
+                if (rc != 0)
+                    throw std::system_error(rc, std::generic_category(),
+                                            "Engram allocation");
+                auto mapping = map(file.fd, sizes[h], true);
+                std::memcpy(mapping.ptr(), buffers[h], sizes[h]);
+                if (::fchmod(file.fd, 0400) != 0)
+                    throw std::system_error(errno, std::generic_category(),
+                                            "Engram read-only table");
+            }
+            std::ofstream manifest(temporary / "layout");
+            manifest << layout(cfg);
+            manifest.close();
+            if (!manifest)
+                throw std::runtime_error("Failed to write local Engram layout");
+            auto tables = open(temporary, cfg);
+            std::filesystem::rename(temporary, dir);
+            return tables;
+        } catch (...) {
+            std::filesystem::remove_all(temporary);
+            throw;
+        }
+    }
+};
+
 EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
-                         std::shared_ptr<PyClient> store)
-    : store_(std::move(store)) {
+                         std::shared_ptr<PyClient> store,
+                         const std::string& local_dir)
+    : store_(std::move(store)), local_dir_(local_dir) {
+    if (store_ && !local_dir_.empty()) {
+        throw std::invalid_argument(
+            "store_client and local_dir are mutually exclusive");
+    }
     if (layers.empty()) {
         throw std::invalid_argument("EngramStore requires at least one layer");
     }
@@ -38,6 +172,14 @@ EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
         }
         layers_.emplace(layer_id, std::move(layer));
     }
+    if (!local_dir_.empty()) {
+        local_dir_ = std::filesystem::absolute(local_dir_).string();
+        std::filesystem::create_directories(local_dir_);
+        for (auto& [id, layer] : layers_) {
+            layer.local_tables = LocalTables::open(
+                LocalTables::path(local_dir_, id), layer.config);
+        }
+    }
 }
 
 const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
@@ -49,30 +191,12 @@ const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
     return it->second;
 }
 
-int EngramStore::bind_local(int layer_id,
-                            const std::vector<const void*>& buffers,
-                            const std::vector<size_t>& sizes) {
-    const auto& layer = get_layer(layer_id);
-    if (store_ || !layer.local_tables.empty() ||
-        buffers.size() != layer.keys.size() || sizes.size() != buffers.size()) {
-        return -1;
-    }
-    for (size_t h = 0; h < buffers.size(); ++h) {
-        if (!buffers[h] ||
-            sizes[h] != static_cast<size_t>(layer.config.table_vocab_sizes[h]) *
-                            layer.config.row_bytes)
-            return -1;
-    }
-    layers_.at(layer_id).local_tables = buffers;
-    return 0;
-}
-
 int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
                              void* output_buffer, size_t output_size) const {
     const auto& layer = get_layer(layer_id);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
-    if ((!store_ && layer.local_tables.empty()) || row_ids == nullptr ||
+    if ((!store_ && local_dir_.empty()) || row_ids == nullptr ||
         output_buffer == nullptr || B <= 0 || L <= 0) {
         return -1;
     }
@@ -99,7 +223,17 @@ int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
         return -1;
     };
 
-    if (!layer.local_tables.empty()) {
+    if (!local_dir_.empty()) {
+        auto tables = std::atomic_load(&layer.local_tables);
+        if (!tables) {
+            // Also support a reader constructed before the writer publishes.
+            // Only the first successful lookup opens files; subsequent reads
+            // use the retained mappings, including after the writer exits.
+            tables = LocalTables::open(LocalTables::path(local_dir_, layer_id),
+                                       layer.config);
+            if (!tables) return fail_lookup();
+            std::atomic_store(&layer.local_tables, tables);
+        }
         // Validate all IDs before touching output. No metadata or transfer
         // work.
         for (size_t t = 0; t < token_count; ++t) {
@@ -113,7 +247,7 @@ int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
             for (int h = 0; h < num_heads; ++h) {
                 const size_t index = t * num_heads + h;
                 const auto* src =
-                    static_cast<const char*>(layer.local_tables[h]);
+                    static_cast<const char*>(tables->heads[h].ptr());
                 std::memcpy(
                     dst + index * row_bytes,
                     src + static_cast<size_t>(row_ids[index]) * row_bytes,
@@ -252,7 +386,7 @@ int EngramStore::populate(int layer_id,
     const auto& layer = get_layer(layer_id);
     const auto& table_vocab_sizes = layer.config.table_vocab_sizes;
     const auto& embed_keys = layer.keys;
-    if (store_ == nullptr) {
+    if (store_ == nullptr && local_dir_.empty()) {
         return -1;
     }
     if (embedding_buffers.size() != embed_keys.size() ||
@@ -266,6 +400,14 @@ int EngramStore::populate(int layer_id,
         if (embedding_buffers[i] == nullptr || buffer_sizes[i] != expected) {
             return -1;
         }
+    }
+
+    if (!local_dir_.empty()) {
+        auto tables = LocalTables::populate(
+            LocalTables::path(local_dir_, layer_id), layer.config,
+            embedding_buffers, buffer_sizes);
+        std::atomic_store(&layer.local_tables, tables);
+        return 0;
     }
 
     std::vector<int> exists_results = store_->batchIsExist(embed_keys);

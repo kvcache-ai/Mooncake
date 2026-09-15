@@ -102,31 +102,6 @@ void bind_engram_store(py::module& m) {
         .def_readwrite("row_bytes", &EngramStoreConfig::row_bytes);
 
     py::class_<EngramStore>(m, "EngramStore")
-        .def(
-            "bind_local",
-            [](EngramStore& self, int layer_id, py::list buffers) {
-                const auto rows = self.get_table_vocab_sizes(layer_id);
-                if (py::len(buffers) != rows.size())
-                    throw std::runtime_error(
-                        "Local table count must match heads");
-                std::vector<const void*> pointers;
-                std::vector<size_t> sizes;
-                for (size_t h = 0; h < rows.size(); ++h) {
-                    auto arr = require_embedding_buffer(
-                        buffers[h], rows[h], self.get_row_bytes(layer_id));
-                    pointers.push_back(arr.data());
-                    sizes.push_back(arr.nbytes());
-                }
-                if (self.bind_local(layer_id, pointers, sizes) != 0)
-                    throw std::runtime_error(
-                        "bind_local requires an unbound layer and no Store "
-                        "client");
-            },
-            py::arg("layer_id"), py::arg("embedding_buffers"),
-            py::keep_alive<1, 3>(),
-            "Bind immutable uint8 tables before lookup. Retains the arrays "
-            "without "
-            "copying; do not modify, resize or unmap them while bound.")
         .def("get_layer_ids", &EngramStore::get_layer_ids)
         .def("get_table_vocab_sizes", &EngramStore::get_table_vocab_sizes)
         .def("get_store_keys", &EngramStore::get_store_keys)
@@ -147,11 +122,13 @@ void bind_engram_store(py::module& m) {
             "Returns the number of removed head tables; missing keys are "
             "ignored.")
         .def(py::init([](const std::map<int, EngramStoreConfig>& layers,
-                         py::object store_obj) {
+                         py::object store_obj, const std::string& local_dir) {
                  std::shared_ptr<PyClient> store = unwrap_store(store_obj);
-                 return new EngramStore(layers, store);
+                 py::gil_scoped_release release;
+                 return new EngramStore(layers, store, local_dir);
              }),
-             py::arg("layers"), py::arg("store") = py::none())
+             py::arg("layers"), py::arg("store_client") = py::none(),
+             py::arg("local_dir") = "")
         .def(
             "lookup_into",
             [](EngramStore& self, int layer_id,
@@ -190,7 +167,7 @@ void bind_engram_store(py::module& m) {
             py::arg("output").noconvert(),
             "Read into caller-owned uint8 memory. The caller must keep the "
             "output registered with this Store for Store-backed reads. "
-            "Local bound tables do not require output registration. "
+            "Local tables do not require output registration. "
             "This method does not allocate, register, or unregister output.")
         .def(
             "populate",
@@ -226,7 +203,12 @@ void bind_engram_store(py::module& m) {
                 }
             },
             py::arg("layer_id"), py::arg("embedding_buffers"),
-            py::arg("config") = ReplicateConfig{});
+            py::arg("config") = ReplicateConfig{},
+            "Create a layer from per-head uint8 arrays. Copies into owned "
+            "local "
+            "tables or uploads to Store; inputs may be released after return. "
+            "Local layers are published atomically and must not already "
+            "exist.");
 }
 
 }  // namespace engram
