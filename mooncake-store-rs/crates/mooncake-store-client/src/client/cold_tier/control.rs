@@ -219,17 +219,18 @@ impl ColdTierControlService for LocalAllocatorAdapter {
         route: ObjectRoute,
         length: u64,
         checksum: Option<u64>,
+        payload: Vec<u8>,
     ) -> mooncake_store_core::Result<ObjectRoute> {
         self.storage_owner
             .cold_tier_devices
             .nof_targets
             .manage_managed_route(
-                &self.storage_owner.route_ops,
                 &target_id,
                 action,
                 route,
                 length,
                 checksum,
+                Some(payload.as_slice()),
             )
     }
 

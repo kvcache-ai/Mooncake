@@ -159,8 +159,8 @@ impl ExtentStoreExecutor {
                 "managed ExtentStore locator is outside configured device range".to_string(),
             ));
         }
-        if locator.offset % self.config.alignment != 0
-            || locator.record_len % self.config.alignment != 0
+        if !locator.offset.is_multiple_of(self.config.alignment)
+            || !locator.record_len.is_multiple_of(self.config.alignment)
         {
             return Err(StoreError::InvalidState(
                 "managed ExtentStore locator is not aligned".to_string(),
@@ -376,9 +376,12 @@ impl NofManagedRecovery for ExtentStoreExecutor {
     fn scan_recovered_objects(&self, target_id: &str) -> Result<Vec<RecoveredColdObject>> {
         let mut recovered = Vec::new();
         let mut offset = self.config.start_offset;
+        let probe_len = usize::try_from(self.config.alignment).map_err(|_| {
+            StoreError::InvalidState("managed ExtentStore alignment is too large".to_string())
+        })?;
         while offset + RECORD_HEADER_LEN as u64 <= self.config.device_bytes {
-            let mut header_bytes = [0u8; RECORD_HEADER_LEN];
-            match self.device.read_exact(offset, &mut header_bytes) {
+            let mut header_block = vec![0u8; probe_len];
+            match self.device.read_exact(offset, &mut header_block) {
                 Ok(()) => {}
                 Err(StoreError::NotFound(_)) => {
                     offset += self.config.alignment;
@@ -386,7 +389,7 @@ impl NofManagedRecovery for ExtentStoreExecutor {
                 }
                 Err(error) => return Err(error),
             }
-            let header = match decode_header(&header_bytes) {
+            let header = match decode_header(&header_block[..RECORD_HEADER_LEN]) {
                 Ok(header) => header,
                 Err(StoreError::NotFound(_)) => {
                     offset += self.config.alignment;
@@ -405,10 +408,17 @@ impl NofManagedRecovery for ExtentStoreExecutor {
                 offset += header.record_len;
                 continue;
             }
-            let mut manifest_bytes = vec![0u8; header.manifest_len];
-            self.device
-                .read_exact(offset + RECORD_HEADER_LEN as u64, &mut manifest_bytes)?;
-            let manifest = decode_cold_object_manifest(&manifest_bytes)?;
+            let record_len = usize::try_from(header.record_len).map_err(|_| {
+                StoreError::InvalidState("managed ExtentStore record is too large".to_string())
+            })?;
+            let manifest_end = payload_offset(header.manifest_len)?;
+            if manifest_end > record_len {
+                offset += self.config.alignment;
+                continue;
+            }
+            let mut record = vec![0u8; record_len];
+            self.device.read_exact(offset, &mut record)?;
+            let manifest = decode_cold_object_manifest(&record[RECORD_HEADER_LEN..manifest_end])?;
             if manifest.cold_tier_id == target_id {
                 recovered.push(RecoveredColdObject {
                     metadata: ColdPayloadMetadata {
@@ -427,6 +437,7 @@ impl NofManagedRecovery for ExtentStoreExecutor {
 
 impl NofHealth for ExtentStoreExecutor {
     fn health(&self) -> Result<NofStorageHealth> {
+        self.device.health()?;
         let state = self.state.lock();
         Ok(NofStorageHealth {
             capacity_bytes: Some(self.config.device_bytes - self.config.start_offset),
@@ -573,8 +584,24 @@ fn decode_header(src: &[u8]) -> Result<RecordHeader> {
     })
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SpdkNofTransport {
+    Tcp,
+    Rdma,
+}
+
+impl SpdkNofTransport {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "TCP",
+            Self::Rdma => "RDMA",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SpdkNofBlockDeviceConfig {
+    pub transport: SpdkNofTransport,
     pub traddr: String,
     pub port: String,
     pub subnqn: String,
@@ -586,7 +613,16 @@ pub struct SpdkNofBlockDeviceConfig {
 
 impl SpdkNofBlockDeviceConfig {
     pub fn tcp(traddr: &str, port: &str, subnqn: &str, nsid: u32) -> Self {
+        Self::new(SpdkNofTransport::Tcp, traddr, port, subnqn, nsid)
+    }
+
+    pub fn rdma(traddr: &str, port: &str, subnqn: &str, nsid: u32) -> Self {
+        Self::new(SpdkNofTransport::Rdma, traddr, port, subnqn, nsid)
+    }
+
+    fn new(transport: SpdkNofTransport, traddr: &str, port: &str, subnqn: &str, nsid: u32) -> Self {
         Self {
+            transport,
             traddr: traddr.to_string(),
             port: port.to_string(),
             subnqn: subnqn.to_string(),
@@ -610,6 +646,7 @@ unsafe impl Sync for SpdkNofBlockDevice {}
 
 impl SpdkNofBlockDevice {
     pub fn connect(config: SpdkNofBlockDeviceConfig) -> Result<Self> {
+        let transport = cstring("transport", config.transport.as_str())?;
         let traddr = cstring("traddr", &config.traddr)?;
         let port = cstring("port", &config.port)?;
         let subnqn = cstring("subnqn", &config.subnqn)?;
@@ -622,7 +659,8 @@ impl SpdkNofBlockDevice {
         let mut sector_size = 0u32;
         let mut error = vec![0 as c_char; 256];
         let raw = unsafe {
-            mc_nof_connect_tcp(
+            mc_nof_connect(
+                transport.as_ptr(),
                 traddr.as_ptr(),
                 port.as_ptr(),
                 subnqn.as_ptr(),
@@ -659,6 +697,16 @@ impl SpdkNofBlockDevice {
         self.sector_size
     }
 
+    fn health(&self) -> Result<()> {
+        let mut error = vec![0 as c_char; 256];
+        let rc = unsafe { mc_nof_health(self.raw.as_ptr(), error.as_mut_ptr(), error.len()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(StoreError::Transport(read_error(&error)))
+        }
+    }
+
     fn write_all(&self, offset: u64, src: &[u8]) -> Result<()> {
         self.for_each_chunk(offset, src.len() as u64, |chunk_offset, chunk_len| {
             let start = (chunk_offset - offset) as usize;
@@ -690,7 +738,9 @@ impl SpdkNofBlockDevice {
         len: u64,
         mut f: impl FnMut(u64, u64) -> Result<()>,
     ) -> Result<()> {
-        if offset % self.sector_size as u64 != 0 || len % self.sector_size as u64 != 0 {
+        if !offset.is_multiple_of(self.sector_size as u64)
+            || !len.is_multiple_of(self.sector_size as u64)
+        {
             return Err(StoreError::InvalidState(
                 "SPDK NoF I/O must be sector aligned".to_string(),
             ));
@@ -769,7 +819,8 @@ fn read_error(buffer: &[c_char]) -> String {
 }
 
 extern "C" {
-    fn mc_nof_connect_tcp(
+    fn mc_nof_connect(
+        transport: *const c_char,
         traddr: *const c_char,
         trsvcid: *const c_char,
         subnqn: *const c_char,
@@ -782,6 +833,7 @@ extern "C" {
         err_len: usize,
     ) -> *mut c_void;
     fn mc_nof_close(device: *mut c_void);
+    fn mc_nof_health(device: *mut c_void, err: *mut c_char, err_len: usize) -> c_int;
     fn mc_nof_write(
         device: *mut c_void,
         offset: u64,

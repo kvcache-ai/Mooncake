@@ -1,11 +1,14 @@
+#define _POSIX_C_SOURCE 200809L
 
 #include <errno.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "spdk/env.h"
 #include "spdk/nvme.h"
@@ -18,6 +21,10 @@ struct mc_nof_device {
     uint32_t sector_size;
     uint64_t sector_count;
     pthread_mutex_t lock;
+    pthread_t admin_thread;
+    atomic_bool stop_admin_thread;
+    atomic_bool transport_failed;
+    bool admin_thread_started;
 };
 
 struct mc_nof_connect_ctx { struct spdk_nvme_ctrlr *ctrlr; const char *hostnqn; };
@@ -28,6 +35,19 @@ static bool g_env_ready = false;
 static pthread_mutex_t g_probe_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static int mc_nof_copy_string(char *dst, size_t dst_len, const char *src, const char *field, char *err, size_t err_len);
+
+static void *mc_nof_poll_admin(void *arg) {
+    struct mc_nof_device *device = (struct mc_nof_device *)arg;
+    const struct timespec interval = { .tv_sec = 0, .tv_nsec = 10 * 1000 * 1000 };
+    while (!atomic_load_explicit(&device->stop_admin_thread, memory_order_acquire)) {
+        if (spdk_nvme_ctrlr_process_admin_completions(device->ctrlr) < 0) {
+            atomic_store_explicit(&device->transport_failed, true, memory_order_release);
+            break;
+        }
+        nanosleep(&interval, NULL);
+    }
+    return NULL;
+}
 
 static void mc_nof_set_error(char *err, size_t err_len, const char *message, int code) {
     if (err != NULL && err_len > 0) { snprintf(err, err_len, "%s: %d", message, code); }
@@ -54,6 +74,8 @@ static int mc_nof_init_env(int no_huge, char *err, size_t err_len) {
 static bool mc_nof_probe_cb(void *cb_ctx, const struct spdk_nvme_transport_id *trid, struct spdk_nvme_ctrlr_opts *opts) {
     (void)trid;
     struct mc_nof_connect_ctx *ctx = (struct mc_nof_connect_ctx *)cb_ctx;
+    opts->keep_alive_timeout_ms = 2000;
+    opts->admin_timeout_ms = 2000;
     if (ctx->hostnqn != NULL && ctx->hostnqn[0] != '\0') {
         if (mc_nof_copy_string(opts->hostnqn, sizeof(opts->hostnqn), ctx->hostnqn, "invalid hostnqn", NULL, 0) != 0) {
             return false;
@@ -75,7 +97,10 @@ static void mc_nof_complete(void *arg, const struct spdk_nvme_cpl *completion) {
 static int mc_nof_wait(struct mc_nof_device *device, struct mc_nof_io_ctx *ctx) {
     while (!ctx->done) {
         int rc = spdk_nvme_qpair_process_completions(device->qpair, 0);
-        if (rc < 0) { return rc; }
+        if (rc < 0) {
+            atomic_store_explicit(&device->transport_failed, true, memory_order_release);
+            return rc;
+        }
     }
     return ctx->status;
 }
@@ -88,13 +113,17 @@ static int mc_nof_copy_string(char *dst, size_t dst_len, const char *src, const 
     return 0;
 }
 
-struct mc_nof_device *mc_nof_connect_tcp(const char *traddr, const char *trsvcid, const char *subnqn, const char *hostnqn, uint32_t nsid, int no_huge, uint64_t *capacity_bytes, uint32_t *sector_size, char *err, size_t err_len) {
+struct mc_nof_device *mc_nof_connect(const char *transport, const char *traddr, const char *trsvcid, const char *subnqn, const char *hostnqn, uint32_t nsid, int no_huge, uint64_t *capacity_bytes, uint32_t *sector_size, char *err, size_t err_len) {
     if (nsid == 0) { nsid = 1; }
     if (mc_nof_init_env(no_huge, err, err_len) != 0) { return NULL; }
     struct spdk_nvme_transport_id trid;
     memset(&trid, 0, sizeof(trid));
-    if (spdk_nvme_transport_id_populate_trstring(&trid, "TCP") != 0) { mc_nof_set_error(err, err_len, "invalid SPDK transport", -EINVAL); return NULL; }
-    trid.trtype = SPDK_NVME_TRANSPORT_TCP;
+    if (transport == NULL || (strcmp(transport, "TCP") != 0 && strcmp(transport, "RDMA") != 0) ||
+        spdk_nvme_transport_id_populate_trstring(&trid, transport) != 0) {
+        mc_nof_set_error(err, err_len, "SPDK transport must be TCP or RDMA", -EINVAL);
+        return NULL;
+    }
+    trid.trtype = strcmp(transport, "TCP") == 0 ? SPDK_NVME_TRANSPORT_TCP : SPDK_NVME_TRANSPORT_RDMA;
     trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
     if (mc_nof_copy_string(trid.traddr, sizeof(trid.traddr), traddr, "invalid traddr", err, err_len) != 0 ||
         mc_nof_copy_string(trid.trsvcid, sizeof(trid.trsvcid), trsvcid, "invalid trsvcid", err, err_len) != 0 ||
@@ -120,14 +149,52 @@ struct mc_nof_device *mc_nof_connect_tcp(const char *traddr, const char *trsvcid
     device->qpair = qpair;
     device->sector_size = spdk_nvme_ns_get_sector_size(ns);
     device->sector_count = spdk_nvme_ns_get_num_sectors(ns);
-    pthread_mutex_init(&device->lock, NULL);
+    rc = pthread_mutex_init(&device->lock, NULL);
+    if (rc != 0) {
+        spdk_nvme_ctrlr_free_io_qpair(qpair);
+        spdk_nvme_detach(ctx.ctrlr);
+        free(device);
+        mc_nof_set_error(err, err_len, "initializing device lock failed", -rc);
+        return NULL;
+    }
+    atomic_init(&device->stop_admin_thread, false);
+    atomic_init(&device->transport_failed, false);
+    rc = pthread_create(&device->admin_thread, NULL, mc_nof_poll_admin, device);
+    if (rc != 0) {
+        pthread_mutex_destroy(&device->lock);
+        spdk_nvme_ctrlr_free_io_qpair(qpair);
+        spdk_nvme_detach(ctx.ctrlr);
+        free(device);
+        mc_nof_set_error(err, err_len, "starting SPDK admin poller failed", -rc);
+        return NULL;
+    }
+    device->admin_thread_started = true;
     if (capacity_bytes != NULL) { *capacity_bytes = device->sector_count * (uint64_t)device->sector_size; }
     if (sector_size != NULL) { *sector_size = device->sector_size; }
     return device;
 }
 
+int mc_nof_health(struct mc_nof_device *device, char *err, size_t err_len) {
+    if (device == NULL) {
+        mc_nof_set_error(err, err_len, "invalid SPDK device", -EINVAL);
+        return -EINVAL;
+    }
+    if (atomic_load_explicit(&device->transport_failed, memory_order_acquire) ||
+        spdk_nvme_ctrlr_is_failed(device->ctrlr) ||
+        spdk_nvme_ctrlr_get_admin_qp_failure_reason(device->ctrlr) != SPDK_NVME_QPAIR_FAILURE_NONE ||
+        !spdk_nvme_qpair_is_connected(device->qpair)) {
+        mc_nof_set_error(err, err_len, "SPDK controller transport failed", -ENODEV);
+        return -ENODEV;
+    }
+    return 0;
+}
+
 void mc_nof_close(struct mc_nof_device *device) {
     if (device == NULL) { return; }
+    if (device->admin_thread_started) {
+        atomic_store_explicit(&device->stop_admin_thread, true, memory_order_release);
+        pthread_join(device->admin_thread, NULL);
+    }
     pthread_mutex_lock(&g_probe_lock);
     pthread_mutex_lock(&device->lock);
     if (device->qpair != NULL) { spdk_nvme_ctrlr_free_io_qpair(device->qpair); device->qpair = NULL; }

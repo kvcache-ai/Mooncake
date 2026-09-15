@@ -81,6 +81,7 @@ impl StoreClient {
                 "tenant={tenant} key={logical_key} has no readable replica owner"
             )));
         }
+        let route_uses_nof_backing = route.nof_backing.is_some();
         let transient_nof_read = if materialized_cold_backing(&route).is_none() {
             self.storage_owner
                 .cold_tier_devices
@@ -168,7 +169,8 @@ impl StoreClient {
             route,
             replica: cold_backing_placeholder(&cold_backing),
             fallback_replicas: VecDeque::<ReplicaRoute>::new(),
-            transient_nof_read: transient_nof_read.map(|_| cold_backing),
+            transient_nof_read: (route_uses_nof_backing || transient_nof_read.is_some())
+                .then_some(cold_backing),
         })
     }
 }

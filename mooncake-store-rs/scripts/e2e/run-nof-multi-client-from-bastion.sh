@@ -71,18 +71,23 @@ done
 IFS=',' read -r -a TARGETS <<<"${TARGETS_SPEC}"
 [[ "${#TARGETS[@]}" -gt 0 ]] || { echo "NOF_TARGETS must not be empty" >&2; exit 1; }
 for target in "${TARGETS[@]}"; do
-  IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
+  IFS='|' read -r public_ip lan_ip target_id subnqn port transport <<<"${target}"
   [[ -n "${public_ip}" && -n "${lan_ip}" && -n "${target_id}" && -n "${subnqn}" && -n "${port}" ]] || {
-    echo "NOF_TARGETS entries must be public_ip|traddr|target_id|subnqn|port: ${target}" >&2
+    echo "NOF_TARGETS entries must be public_ip|traddr|target_id|subnqn|port[|transport]: ${target}" >&2
+    exit 1
+  }
+  transport="${transport:-tcp}"
+  [[ "${transport,,}" == tcp || "${transport,,}" == rdma ]] || {
+    echo "NOF_TARGETS transport must be tcp or rdma: ${target}" >&2
     exit 1
   }
 done
 IFS=';' read -r -a INITIATORS <<<"${INITIATORS_SPEC}"
 [[ "${#INITIATORS[@]}" -gt 0 ]] || { echo "NOF_INITIATORS must not be empty" >&2; exit 1; }
 for initiator in "${INITIATORS[@]}"; do
-  IFS='|' read -r initiator_host initiator_ip initiator_clients <<<"${initiator}"
+  IFS='|' read -r initiator_host initiator_ip initiator_clients initiator_host_nqn <<<"${initiator}"
   [[ -n "${initiator_host}" && -n "${initiator_ip}" && -n "${initiator_clients}" ]] || {
-    echo "NOF_INITIATORS entries must be host|bind_ip|client_ids: ${initiator}" >&2
+    echo "NOF_INITIATORS entries must be host|bind_ip|client_ids[|host_nqn]: ${initiator}" >&2
     exit 1
   }
 done
@@ -101,7 +106,7 @@ if [[ "${RESET_TARGETS}" == 1 ]]; then
   }
   echo "resetting provisioned NoF images"
   for target in "${TARGETS[@]}"; do
-    IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
+    IFS='|' read -r public_ip lan_ip target_id subnqn port transport <<<"${target}"
     ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${public_ip}" \
       "set -euo pipefail; systemctl stop '${NVMF_SERVICE}'; mkdir -p -- \"\$(dirname '${TARGET_IMAGE}')\"; rm -f '${TARGET_IMAGE}'; truncate -s '${TEST_IMAGE_BYTES}' '${TARGET_IMAGE}'; systemctl start '${NVMF_SERVICE}'; test \"\$(systemctl is-active '${NVMF_SERVICE}')\" = active"
   done
@@ -119,7 +124,10 @@ sha256sum "${STAGE_DIR}/nof_multi_client" | tee "${STAGE_DIR}/binary.sha256"
 local_hash="$(awk '{print $1}' "${STAGE_DIR}/binary.sha256")"
 pids=()
 for initiator in "${INITIATORS[@]}"; do
-  IFS='|' read -r initiator_host initiator_ip initiator_clients <<<"${initiator}"
+  IFS='|' read -r initiator_host initiator_ip initiator_clients initiator_host_nqn <<<"${initiator}"
+  if [[ -z "${initiator_host_nqn}" ]]; then
+    initiator_host_nqn="nqn.2026-09.io.mooncake:${initiator_clients%%,*}"
+  fi
   echo "staging to ${initiator_host} (${initiator_ip}); local_clients=${initiator_clients}"
   ssh -o BatchMode=yes -o ConnectTimeout=8 "${initiator_host}" "mkdir -p -- '${INITIATOR_DIR}'"
   rsync -a -e 'ssh -o BatchMode=yes' "${STAGE_DIR}/" "${initiator_host}:${INITIATOR_DIR}/"
@@ -138,6 +146,7 @@ for initiator in "${INITIATORS[@]}"; do
    NOF_REDIS_URL='${REDIS_URL}' \
    NOF_BARRIER_REDIS_URL='${BARRIER_REDIS_URL}' \
    NOF_BIND_IP='${initiator_ip}' \
+   NOF_HOST_NQN='${initiator_host_nqn}' \
    NOF_TARGETS='${TARGETS_SPEC}' \
    NOF_CLIENT_IDS='${CLIENT_IDS_SPEC}' \
    NOF_LOCAL_CLIENT_IDS='${initiator_clients}' \
@@ -162,6 +171,17 @@ for initiator in "${INITIATORS[@]}"; do
    NOF_TEST_PREFIX='${TEST_PREFIX}' \
    NOF_STARTUP_SETTLE_SECONDS='${STARTUP_SETTLE_SECONDS}' \
    NOF_ROUTE_CONTROL='${ROUTE_CONTROL}' \
+   NOF_EXPECT_NOF_COPIES='${NOF_EXPECT_NOF_COPIES:-}' \
+   NOF_EXPECT_POST_WAIT_NOF_COPIES='${NOF_EXPECT_POST_WAIT_NOF_COPIES:-}' \
+   NOF_EXPECT_POST_WAIT_TOTAL_NOF_COPIES='${NOF_EXPECT_POST_WAIT_TOTAL_NOF_COPIES:-}' \
+   NOF_EXPECT_ABSENT_TARGETS='${NOF_EXPECT_ABSENT_TARGETS:-}' \
+   NOF_POST_OFFLOAD_WAIT_SECONDS='${NOF_POST_OFFLOAD_WAIT_SECONDS:-0}' \
+   NOF_WATERMARK_HIGH_BYTES='${NOF_WATERMARK_HIGH_BYTES:-}' \
+   NOF_WATERMARK_LOW_BYTES='${NOF_WATERMARK_LOW_BYTES:-}' \
+   NOF_READ_ONLY='${NOF_READ_ONLY:-false}' \
+   NOF_DELETE_AND_REWRITE='${NOF_DELETE_AND_REWRITE:-false}' \
+   NOF_HANDOFF_DEPARTING_CLIENT='${NOF_HANDOFF_DEPARTING_CLIENT:-}' \
+   NOF_HANDOFF_WAIT_SECONDS='${NOF_HANDOFF_WAIT_SECONDS:-5}' \
    NOF_RUN_TAG='${RUN_TAG}' \
    '${INITIATOR_DIR}/run-nof-multi-client.sh'" &
   pids+=("$!")

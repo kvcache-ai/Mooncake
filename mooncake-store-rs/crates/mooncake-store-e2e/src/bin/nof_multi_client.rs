@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::c_void;
+use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
@@ -8,10 +9,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mooncake_metadata::{MetadataKeyspace, RedisMetadataBackend, RedisMetadataConfig};
 use mooncake_store_client::{
-    init_tracing_from_env, ColdTierOffloadMode, ExtentStoreExecutor, ExtentStoreExecutorConfig,
-    GetRequest, LocalMemoryConfig, MooncakeCompatibilityFacade, NofBackend, NofTargetConfig,
-    PutRequest, RouteControlMode, SpdkNofBlockDevice, SpdkNofBlockDeviceConfig, StoreClientBuilder,
-    StoreTransport,
+    init_tracing_from_env, ColdTierOffloadMode, ColdTierWatermarkConfig, DebugEvictAllResult,
+    ExtentStoreExecutor, ExtentStoreExecutorConfig, GetRequest, LocalMemoryConfig,
+    MooncakeCompatibilityFacade, NofBackend, NofTargetConfig, PutRequest, RouteControlMode,
+    SpdkNofBlockDevice, SpdkNofBlockDeviceConfig, SpdkNofTransport, StoreClient,
+    StoreClientBuilder, StoreTransport,
 };
 use mooncake_store_core::{ClientLifecycleState, ColdBackingState, Result, StoreError};
 use mooncake_transport::{
@@ -118,6 +120,30 @@ impl StoreTransport for NoopTransport {
 const DEFAULT_CLIENT_IDS: &str = "client-0";
 const DEFAULT_HOST_NQN: &str = "nqn.2026-09.io.mooncake:client-dev-5";
 const DEFAULT_DEVICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+
+struct TestClient(Option<StoreClient>);
+
+impl TestClient {
+    fn new(client: StoreClient) -> Self {
+        Self(Some(client))
+    }
+}
+
+impl Deref for TestClient {
+    type Target = StoreClient;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_ref().expect("test client already shut down")
+    }
+}
+
+impl Drop for TestClient {
+    fn drop(&mut self) {
+        if let Some(client) = self.0.take() {
+            client.shutdown();
+        }
+    }
+}
 const DEFAULT_OBJECTS_PER_CLIENT: usize = 16;
 const DEFAULT_VALUE_BYTES: usize = 64 * 1024;
 const DEFAULT_REPLICA_COUNT: usize = 1;
@@ -127,15 +153,16 @@ const DEFAULT_READ_RETRIES: usize = 20;
 const DEFAULT_READ_RETRY_DELAY_MS: u64 = 250;
 const DEFAULT_BATCH_SIZE: usize = 32;
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TargetSpec {
+    transport: SpdkNofTransport,
     traddr: String,
     target_id: String,
     subnqn: String,
     port: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct TestConfig {
     targets: Vec<TargetSpec>,
     client_ids: Vec<String>,
@@ -156,6 +183,17 @@ struct TestConfig {
     read_retries: usize,
     read_retry_delay: Duration,
     startup_settle: Duration,
+    post_offload_wait: Duration,
+    absent_targets: BTreeSet<String>,
+    expected_nof_copies: Option<usize>,
+    expected_post_wait_nof_copies: Option<usize>,
+    expected_post_wait_total_nof_copies: Option<usize>,
+    watermark_high_bytes: Option<u64>,
+    watermark_low_bytes: Option<u64>,
+    read_only: bool,
+    delete_and_rewrite: bool,
+    handoff_departing_client: Option<String>,
+    handoff_wait: Duration,
     route_control: RouteControlMode,
 }
 
@@ -181,14 +219,17 @@ fn parse_targets(raw: &str) -> Result<Vec<TargetSpec>> {
     let mut ids = BTreeSet::new();
     for (index, item) in raw.split(',').enumerate() {
         let fields = item.split('|').map(str::trim).collect::<Vec<_>>();
-        let (traddr, target_id, subnqn, port) = match fields.as_slice() {
-            [_public_host, traddr, target_id, subnqn, port] => {
-                (*traddr, *target_id, *subnqn, *port)
+        let (traddr, target_id, subnqn, port, transport) = match fields.as_slice() {
+            [_public_host, traddr, target_id, subnqn, port, transport] => {
+                (*traddr, *target_id, *subnqn, *port, *transport)
             }
-            [target_id, traddr, subnqn, port] => (*traddr, *target_id, *subnqn, *port),
+            [_public_host, traddr, target_id, subnqn, port] => {
+                (*traddr, *target_id, *subnqn, *port, "tcp")
+            }
+            [target_id, traddr, subnqn, port] => (*traddr, *target_id, *subnqn, *port, "tcp"),
             _ => {
                 return Err(invalid(format!(
-                    "NOF_TARGETS entry {index} must be public_ip|traddr|target_id|subnqn|port"
+                    "NOF_TARGETS entry {index} must be public_ip|traddr|target_id|subnqn|port[|transport]"
                 )))
             }
         };
@@ -203,7 +244,17 @@ fn parse_targets(raw: &str) -> Result<Vec<TargetSpec>> {
         if !ids.insert(target_id.to_string()) {
             return Err(invalid(format!("duplicate NoF target id {target_id}")));
         }
+        let transport = match transport.to_ascii_lowercase().as_str() {
+            "tcp" => SpdkNofTransport::Tcp,
+            "rdma" => SpdkNofTransport::Rdma,
+            _ => {
+                return Err(invalid(format!(
+                    "NOF_TARGETS entry {index} transport must be tcp or rdma"
+                )))
+            }
+        };
         targets.push(TargetSpec {
+            transport,
             traddr: traddr.to_string(),
             target_id: target_id.to_string(),
             subnqn: subnqn.to_string(),
@@ -308,6 +359,72 @@ impl TestConfig {
                 DEFAULT_READ_RETRY_DELAY_MS,
             )?),
             startup_settle: Duration::from_secs(parse_env("NOF_STARTUP_SETTLE_SECONDS", 2u64)?),
+            post_offload_wait: Duration::from_secs(parse_env(
+                "NOF_POST_OFFLOAD_WAIT_SECONDS",
+                0u64,
+            )?),
+            absent_targets: env::var("NOF_EXPECT_ABSENT_TARGETS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|target| !target.is_empty())
+                .map(str::to_string)
+                .collect(),
+            expected_nof_copies: env::var("NOF_EXPECT_NOF_COPIES")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        invalid(format!("NOF_EXPECT_NOF_COPIES must be valid: {error}"))
+                    })
+                })
+                .transpose()?,
+            expected_post_wait_nof_copies: env::var("NOF_EXPECT_POST_WAIT_NOF_COPIES")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        invalid(format!(
+                            "NOF_EXPECT_POST_WAIT_NOF_COPIES must be valid: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            expected_post_wait_total_nof_copies: env::var("NOF_EXPECT_POST_WAIT_TOTAL_NOF_COPIES")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        invalid(format!(
+                            "NOF_EXPECT_POST_WAIT_TOTAL_NOF_COPIES must be valid: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            watermark_high_bytes: env::var("NOF_WATERMARK_HIGH_BYTES")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        invalid(format!("NOF_WATERMARK_HIGH_BYTES must be valid: {error}"))
+                    })
+                })
+                .transpose()?,
+            watermark_low_bytes: env::var("NOF_WATERMARK_LOW_BYTES")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        invalid(format!("NOF_WATERMARK_LOW_BYTES must be valid: {error}"))
+                    })
+                })
+                .transpose()?,
+            read_only: parse_env("NOF_READ_ONLY", false)?,
+            delete_and_rewrite: parse_env("NOF_DELETE_AND_REWRITE", false)?,
+            handoff_departing_client: env::var("NOF_HANDOFF_DEPARTING_CLIENT")
+                .ok()
+                .filter(|value| !value.trim().is_empty()),
+            handoff_wait: Duration::from_secs(parse_env("NOF_HANDOFF_WAIT_SECONDS", 5)?),
             route_control,
         })
     }
@@ -499,17 +616,27 @@ fn wait_for_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
     )))
 }
 
-fn wait_for_cold_only_routes(
+fn evict_all(client: &StoreClient, client_id: &str, phase: &str) -> Result<DebugEvictAllResult> {
+    let result = client.debug_evict_all()?;
+    if !result.completed || result.remaining_hot_replicas != 0 || result.dropped_without_cold != 0 {
+        return Err(invalid(format!(
+            "{client_id}: {phase} eviction did not preserve all replicas: {result:?}"
+        )));
+    }
+    Ok(result)
+}
+
+fn wait_for_recovered_routes(
     config: &TestConfig,
-    client: &mooncake_store_client::StoreClient,
+    client: &StoreClient,
+    prefix: &str,
 ) -> Result<()> {
     let deadline = Instant::now() + config.barrier_timeout;
     let expected = config
         .client_ids
         .iter()
         .flat_map(|owner| {
-            (0..config.objects_per_client)
-                .map(move |index| format!("{}/{owner}/{index}", config.test_prefix))
+            (0..config.objects_per_client).map(move |index| format!("{prefix}/{owner}/{index}"))
         })
         .collect::<Vec<_>>();
 
@@ -530,7 +657,7 @@ fn wait_for_cold_only_routes(
         }
         if pending.is_empty() {
             println!(
-                "{}: all {} routes converged to Managed NoF cold-only state",
+                "{}: all {} Managed NoF routes were recovered",
                 env::var("NOF_CLIENT_ID").unwrap_or_else(|_| "client".to_string()),
                 expected.len(),
             );
@@ -538,13 +665,92 @@ fn wait_for_cold_only_routes(
         }
         if Instant::now() >= deadline {
             return Err(StoreError::Transport(format!(
-                "timed out waiting for {} routes to become Managed NoF cold-only; first pending keys: {:?}",
+                "timed out waiting for {} Managed NoF routes to recover; first pending keys: {:?}",
                 pending.len(),
                 pending.into_iter().take(8).collect::<Vec<_>>(),
             )));
         }
         sleep(Duration::from_millis(100));
     }
+}
+
+fn verify_absent_targets(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+) -> Result<()> {
+    if config.absent_targets.is_empty() {
+        return Ok(());
+    }
+    for owner in &config.client_ids {
+        for index in 0..config.objects_per_client {
+            let key = format!("{}/{owner}/{index}", config.test_prefix);
+            let route = client
+                .query_route(&key)?
+                .ok_or_else(|| invalid(format!("route disappeared for {key}")))?;
+            let backing = route
+                .nof_backing
+                .ok_or_else(|| invalid(format!("managed NoF backing disappeared for {key}")))?;
+            let targets = std::iter::once(backing.target_id.as_str())
+                .chain(
+                    backing
+                        .replicas
+                        .iter()
+                        .map(|replica| replica.target_id.as_str()),
+                )
+                .collect::<BTreeSet<_>>();
+            if let Some(target) = config
+                .absent_targets
+                .iter()
+                .find(|target| targets.contains(target.as_str()))
+            {
+                return Err(invalid(format!(
+                    "route {key} still contains expected-absent NoF target {target}"
+                )));
+            }
+        }
+    }
+    println!(
+        "verified expected-absent NoF targets {:?} were removed from every route",
+        config.absent_targets
+    );
+    Ok(())
+}
+
+fn verify_nof_copy_count(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+    expected_per_route: Option<usize>,
+    expected_total: Option<usize>,
+) -> Result<()> {
+    if expected_per_route.is_none() && expected_total.is_none() {
+        return Ok(());
+    }
+    let mut total = 0usize;
+    for owner in &config.client_ids {
+        for index in 0..config.objects_per_client {
+            let key = format!("{}/{owner}/{index}", config.test_prefix);
+            let route = client
+                .query_route(&key)?
+                .ok_or_else(|| invalid(format!("route disappeared for {key}")))?;
+            let backing = route
+                .nof_backing
+                .ok_or_else(|| invalid(format!("managed NoF backing disappeared for {key}")))?;
+            let actual = 1 + backing.replicas.len();
+            total = total.saturating_add(actual);
+            if expected_per_route.is_some_and(|expected| actual != expected) {
+                return Err(invalid(format!(
+                    "route {key} has {actual} NoF copies, expected {expected_per_route:?}"
+                )));
+            }
+        }
+    }
+    if expected_total.is_some_and(|expected| total != expected) {
+        return Err(invalid(format!(
+            "routes have {total} total NoF copies, expected {expected_total:?}"
+        )));
+    }
+    println!("verified Managed NoF copies: per_route={expected_per_route:?} total={total}");
+    Ok(())
 }
 
 fn wait_for_all_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
@@ -663,6 +869,49 @@ fn read_and_verify_all(
     Ok(read)
 }
 
+fn verify_handoff_survivor(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+    client_id: &str,
+    all_objects: &BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    sleep(config.handoff_wait);
+    for key in all_objects.keys() {
+        client.remove(key, true)?;
+    }
+
+    let rewrite_prefix = format!("{}-handoff", config.test_prefix);
+    let rewritten_objects = config
+        .client_ids
+        .iter()
+        .flat_map(|owner| (0..config.objects_per_client).map(move |index| (owner, index)))
+        .map(|(owner, index)| {
+            (
+                format!("{rewrite_prefix}/{owner}/{index}"),
+                value(owner, index, config.value_bytes),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let entries = rewritten_objects.iter().collect::<Vec<_>>();
+    for batch in entries.chunks(config.batch_size) {
+        let requests = batch
+            .iter()
+            .map(|(key, payload)| PutRequest::new(key.as_str(), payload.as_slice()))
+            .collect::<Vec<_>>();
+        client.batch_put(&requests)?;
+    }
+    evict_all(client, client_id, "post-handoff")?;
+    let mut rewritten_config = config.clone();
+    rewritten_config.test_prefix = rewrite_prefix;
+    verify_nof_copy_count(&rewritten_config, client, config.expected_nof_copies, None)?;
+    let read = read_and_verify_all(config, client, client_id, &rewritten_objects)?;
+    println!(
+        "{client_id}: owner handoff verified by deleting, rewriting, offloading, and reading {read}/{} objects",
+        rewritten_objects.len()
+    );
+    Ok(())
+}
+
 fn build_client(
     config: &TestConfig,
     client_id: &str,
@@ -674,8 +923,14 @@ fn build_client(
     )?);
     let mut targets = Vec::with_capacity(config.targets.len());
     for target in &config.targets {
-        let mut device_config =
-            SpdkNofBlockDeviceConfig::tcp(&target.traddr, &target.port, &target.subnqn, 1);
+        let mut device_config = match target.transport {
+            SpdkNofTransport::Tcp => {
+                SpdkNofBlockDeviceConfig::tcp(&target.traddr, &target.port, &target.subnqn, 1)
+            }
+            SpdkNofTransport::Rdma => {
+                SpdkNofBlockDeviceConfig::rdma(&target.traddr, &target.port, &target.subnqn, 1)
+            }
+        };
         device_config.hostnqn = Some(config.host_nqn.clone());
         device_config.no_huge = true;
         device_config.submit_chunk_bytes = config.submit_chunk_bytes;
@@ -702,6 +957,13 @@ fn build_client(
         .alignment(1)
         .reclaim_grace_ms(0)
         .eviction_poll_interval(Duration::ZERO);
+    let mut watermarks = ColdTierWatermarkConfig::default();
+    if let Some(high_bytes) = config.watermark_high_bytes {
+        watermarks = watermarks.high_bytes(high_bytes);
+    }
+    if let Some(low_bytes) = config.watermark_low_bytes {
+        watermarks = watermarks.low_bytes(low_bytes);
+    }
     let client = StoreClientBuilder::new(metadata, client_id.to_string())
         .state(ClientLifecycleState::Active)
         .tenant("default")
@@ -710,6 +972,7 @@ fn build_client(
         .local_memory(local_memory)
         .nof_targets(targets)
         .nof_replica_count(config.replica_count)
+        .cold_tier_watermarks(watermarks)
         .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
         .route_control(config.route_control)
         .build(now_ms() + 600_000)?;
@@ -731,6 +994,13 @@ fn run() -> Result<()> {
             config.client_ids
         )));
     }
+    if let Some(departing) = config.handoff_departing_client.as_ref() {
+        if config.client_ids.len() != 2 || !config.client_ids.contains(departing) {
+            return Err(invalid(
+                "NOF_HANDOFF_DEPARTING_CLIENT requires exactly two clients and must name one of them",
+            ));
+        }
+    }
     let rpc_port = env::var("NOF_RPC_PORT")
         .map_err(|_| invalid("NOF_RPC_PORT is required"))?
         .parse::<u16>()
@@ -741,7 +1011,7 @@ fn run() -> Result<()> {
         config.client_ids.len(),
         config.batch_size
     );
-    let client = build_client(&config, &client_id, rpc_port)?;
+    let client = TestClient::new(build_client(&config, &client_id, rpc_port)?);
     println!(
         "{client_id}: runtime={} local memory registered; waiting for all clients",
         client.runtime_id()
@@ -750,77 +1020,92 @@ fn run() -> Result<()> {
     if !config.startup_settle.is_zero() {
         sleep(config.startup_settle);
     }
-    println!("{client_id}: all clients registered; starting writes");
+    if config.read_only {
+        println!("{client_id}: all clients registered; validating recovered routes");
+    } else {
+        println!("{client_id}: all clients registered; starting writes");
 
-    let write_started = Instant::now();
-    for batch_start in (0..config.objects_per_client).step_by(config.batch_size) {
-        let batch = (batch_start..(batch_start + config.batch_size).min(config.objects_per_client))
-            .map(|index| {
-                (
-                    format!("{}/{client_id}/{index}", config.test_prefix),
-                    value(&client_id, index, config.value_bytes),
-                )
-            })
-            .collect::<Vec<_>>();
-        let requests = batch
-            .iter()
-            .map(|(key, payload)| PutRequest::new(key.as_str(), payload.as_slice()))
-            .collect::<Vec<_>>();
-        let routes = client.batch_put(&requests)?;
-        if routes.len() != requests.len() {
-            return Err(mooncake_store_core::StoreError::Transport(format!(
-                "{client_id}: batch_put returned {} routes for {} requests",
-                routes.len(),
-                requests.len()
-            )));
-        }
-        if batch_start == 0 {
-            let route = routes.first().ok_or_else(|| {
-                mooncake_store_core::StoreError::Transport(
-                    "batch_put returned no route for the first request".to_string(),
-                )
-            })?;
-            let placements = route
-                .replicas
-                .iter()
-                .map(|replica| format!("{}:{}", replica.owner, replica.segment_name.0))
+        let write_started = Instant::now();
+        for batch_start in (0..config.objects_per_client).step_by(config.batch_size) {
+            let batch = (batch_start
+                ..(batch_start + config.batch_size).min(config.objects_per_client))
+                .map(|index| {
+                    (
+                        format!("{}/{client_id}/{index}", config.test_prefix),
+                        value(&client_id, index, config.value_bytes),
+                    )
+                })
                 .collect::<Vec<_>>();
-            println!("{client_id}: first hot route placements={placements:?}");
+            let requests = batch
+                .iter()
+                .map(|(key, payload)| PutRequest::new(key.as_str(), payload.as_slice()))
+                .collect::<Vec<_>>();
+            let routes = client.batch_put(&requests)?;
+            if routes.len() != requests.len() {
+                return Err(mooncake_store_core::StoreError::Transport(format!(
+                    "{client_id}: batch_put returned {} routes for {} requests",
+                    routes.len(),
+                    requests.len()
+                )));
+            }
+            if batch_start == 0 {
+                let route = routes.first().ok_or_else(|| {
+                    mooncake_store_core::StoreError::Transport(
+                        "batch_put returned no route for the first request".to_string(),
+                    )
+                })?;
+                let placements = route
+                    .replicas
+                    .iter()
+                    .map(|replica| format!("{}:{}", replica.owner, replica.segment_name.0))
+                    .collect::<Vec<_>>();
+                println!("{client_id}: first hot route placements={placements:?}");
+            }
         }
+        let hot_write_elapsed = write_started.elapsed();
+        println!(
+            "{client_id}: batch-wrote {} objects; batch_size={}; hot_write_elapsed_ms={} logical_mib_per_sec={:.2}",
+            config.objects_per_client,
+            config.batch_size,
+            hot_write_elapsed.as_millis(),
+            logical_mib_per_sec(
+                config.objects_per_client * config.value_bytes,
+                hot_write_elapsed,
+            ),
+        );
+        let offload_started = Instant::now();
+        let evicted = evict_all(&client, &client_id, "initial")?;
+        println!(
+            "{client_id}: evicted {} local objects to Managed NoF; offload_elapsed_ms={} logical_mib_per_sec={:.2}",
+            evicted.evicted,
+            offload_started.elapsed().as_millis(),
+            logical_mib_per_sec(
+                config.objects_per_client * config.value_bytes,
+                offload_started.elapsed()
+            ),
+        );
+        wait_for_phase(&config, &client_id, "offloaded")?;
+        println!("{client_id}: all clients completed write/offload phase");
     }
-    let hot_write_elapsed = write_started.elapsed();
-    println!(
-        "{client_id}: batch-wrote {} objects; batch_size={}; hot_write_elapsed_ms={} logical_mib_per_sec={:.2}",
-        config.objects_per_client,
-        config.batch_size,
-        hot_write_elapsed.as_millis(),
-        logical_mib_per_sec(
-            config.objects_per_client * config.value_bytes,
-            hot_write_elapsed,
-        ),
-    );
-    let offload_started = Instant::now();
-    let evicted = client.debug_evict_all()?;
-    if !evicted.completed
-        || evicted.remaining_hot_replicas != 0
-        || evicted.dropped_without_cold != 0
-    {
-        return Err(mooncake_store_core::StoreError::Transport(format!(
-            "{client_id}: debug eviction did not preserve all local replicas: {evicted:?}"
-        )));
+    if config.read_only {
+        wait_for_recovered_routes(&config, &client, &config.test_prefix)?;
     }
-    println!(
-        "{client_id}: evicted {} local objects to Managed NoF; offload_elapsed_ms={} logical_mib_per_sec={:.2}",
-        evicted.evicted,
-        offload_started.elapsed().as_millis(),
-        logical_mib_per_sec(
-            config.objects_per_client * config.value_bytes,
-            offload_started.elapsed()
-        ),
-    );
-    wait_for_phase(&config, &client_id, "offloaded")?;
-    println!("{client_id}: all clients completed write/offload phase");
-    wait_for_cold_only_routes(&config, &client)?;
+    verify_nof_copy_count(&config, &client, config.expected_nof_copies, None)?;
+    if !config.post_offload_wait.is_zero() {
+        wait_for_phase(&config, &client_id, "fault-ready")?;
+        println!(
+            "{client_id}: fault window ready; waiting {} seconds",
+            config.post_offload_wait.as_secs()
+        );
+        sleep(config.post_offload_wait);
+        verify_absent_targets(&config, &client)?;
+        verify_nof_copy_count(
+            &config,
+            &client,
+            config.expected_post_wait_nof_copies,
+            config.expected_post_wait_total_nof_copies,
+        )?;
+    }
 
     let all_objects = config
         .client_ids
@@ -833,6 +1118,15 @@ fn run() -> Result<()> {
             )
         })
         .collect::<BTreeMap<_, _>>();
+
+    if let Some(departing) = config.handoff_departing_client.as_ref() {
+        wait_for_phase(&config, &client_id, "handoff-ready")?;
+        if &client_id == departing {
+            println!("{client_id}: leaving normally to hand off NoF target ownership");
+            return Ok(());
+        }
+        return verify_handoff_survivor(&config, &client, &client_id, &all_objects);
+    }
 
     // Every client issues batch_get_into concurrently. This matches the production batch-get
     // path: one API call per request batch, with the client grouping cold reads by owner and
@@ -870,14 +1164,47 @@ fn run() -> Result<()> {
         );
     }
 
-    let evicted = client.debug_evict_all()?;
-    if !evicted.completed
-        || evicted.remaining_hot_replicas != 0
-        || evicted.dropped_without_cold != 0
-    {
-        return Err(mooncake_store_core::StoreError::Transport(format!(
-            "{client_id}: post-read eviction did not preserve all replicas: {evicted:?}"
-        )));
+    evict_all(&client, &client_id, "post-read")?;
+    if config.delete_and_rewrite {
+        for index in 0..config.objects_per_client {
+            client.remove(&format!("{}/{client_id}/{index}", config.test_prefix), true)?;
+        }
+        wait_for_phase(&config, &client_id, "deleted")?;
+
+        let rewrite_prefix = format!("{}-rewrite", config.test_prefix);
+        let batch = (0..config.objects_per_client)
+            .map(|index| {
+                (
+                    format!("{rewrite_prefix}/{client_id}/{index}"),
+                    value(&client_id, index, config.value_bytes),
+                )
+            })
+            .collect::<Vec<_>>();
+        for batch in batch.chunks(config.batch_size) {
+            let requests = batch
+                .iter()
+                .map(|(key, payload)| PutRequest::new(key.as_str(), payload.as_slice()))
+                .collect::<Vec<_>>();
+            client.batch_put(&requests)?;
+        }
+        evict_all(&client, &client_id, "rewrite")?;
+        wait_for_phase(&config, &client_id, "rewritten")?;
+        let rewritten_objects = config
+            .client_ids
+            .iter()
+            .flat_map(|owner| (0..config.objects_per_client).map(move |index| (owner, index)))
+            .map(|(owner, index)| {
+                (
+                    format!("{rewrite_prefix}/{owner}/{index}"),
+                    value(owner, index, config.value_bytes),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let reread = read_and_verify_all(&config, &client, &client_id, &rewritten_objects)?;
+        println!(
+            "{client_id}: deleted, reclaimed, rewrote, and verified {reread}/{} objects",
+            all_objects.len()
+        );
     }
     Ok(())
 }
@@ -887,8 +1214,24 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("{error}");
-            // Let StoreClient drop and join SPDK workers before DPDK cleanup unmaps qpair memory.
             std::process::ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_transport_defaults_to_tcp_and_accepts_rdma() {
+        let targets = parse_targets(
+            "host-a|192.0.2.1|target-a|nqn.example:a|4420,\
+             host-b|192.0.2.2|target-b|nqn.example:b|4421|rdma",
+        )
+        .unwrap();
+
+        assert_eq!(targets[0].transport, SpdkNofTransport::Tcp);
+        assert_eq!(targets[1].transport, SpdkNofTransport::Rdma);
     }
 }
