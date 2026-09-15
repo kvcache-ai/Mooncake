@@ -36,8 +36,8 @@ Serializer<offset_allocator::__Allocator>::serialize(
 
     // usedBins array
     packer.pack_array(offset_allocator::NUM_TOP_BINS);
-    for (unsigned char m_usedBin : allocator.m_usedBins) {
-        packer.pack(m_usedBin);
+    for (uint16_t used_bin : allocator.m_usedBins) {
+        packer.pack(used_bin);
     }
 
     // binIndex array
@@ -369,9 +369,10 @@ Serializer<offset_allocator::__Allocator>::deserialize(
         if (legacy_format &&
             !allocator->rebuildFreeBins(serialized_bin_indices.data(),
                                         serialized_bin_count)) {
-            return tl::unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL,
-                "deserialize offset_allocator::__Allocator invalid legacy bins"));
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize offset_allocator::__Allocator "
+                                   "invalid legacy bins"));
         }
 
         return allocator;

@@ -846,6 +846,28 @@ TEST_F(OffsetAllocatorTest, FourBitPrecisionRoundsDsaSizes) {
     EXPECT_EQ(allocator->normalizedAllocationSize(658432), 688128);
 }
 
+TEST_F(OffsetAllocatorTest, MsgpackPreservesFourBitLeafBitmap) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    auto allocator = OffsetAllocator::create(0, ALLOCATOR_SIZE, 128, 128);
+    auto allocation = allocator->allocate(4096);
+    ASSERT_TRUE(allocation.has_value());
+
+    msgpack::sbuffer buffer;
+    MsgpackPacker packer(&buffer);
+    auto serialized =
+        Serializer<OffsetAllocator>::serialize(*allocator, packer);
+    ASSERT_TRUE(serialized.has_value());
+
+    const auto object = msgpack::unpack(buffer.data(), buffer.size());
+    auto restored_result =
+        Serializer<OffsetAllocator>::deserialize(object.get());
+    ASSERT_TRUE(restored_result.has_value());
+    auto restored = std::move(restored_result.value());
+
+    assertAllocatorEQ(allocator, restored);
+    EXPECT_TRUE(restored->CaptureSnapshot().Validate().has_value());
+}
+
 TEST_F(OffsetAllocatorTest, DeserializesLegacyThreeBitBinLayout) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
     auto allocator = OffsetAllocator::create(0, ALLOCATOR_SIZE, 128, 128);
@@ -2412,21 +2434,19 @@ TEST_F(OffsetAllocatorTest, SnapshotValidationAcceptsRoundingAndBoundsUsage) {
 
 #ifndef OFFSET_ALLOCATOR_NOT_ROUND_UP
         const auto candidate_snapshot = allocator->CaptureSnapshot();
-        const uint64_t unit_size =
-            uint64_t{1} << candidate_snapshot.multiplier_bits;
+        const uint64_t unit_size = uint64_t{1}
+                                   << candidate_snapshot.multiplier_bits;
         const uint32_t requested_units =
             static_cast<uint32_t>((4097 + unit_size - 1) / unit_size);
-        const auto rounded =
-            std::lower_bound(bin_sizes.begin(), bin_sizes.end(), requested_units);
+        const auto rounded = std::lower_bound(bin_sizes.begin(),
+                                              bin_sizes.end(), requested_units);
         ASSERT_NE(rounded, bin_sizes.end());
         ASSERT_NE(rounded, bin_sizes.begin());
-        const uint64_t min_requested =
-            (static_cast<uint64_t>(*(rounded - 1))
-             << candidate_snapshot.multiplier_bits) +
-            1;
-        const uint64_t max_requested =
-            static_cast<uint64_t>(*rounded)
-            << candidate_snapshot.multiplier_bits;
+        const uint64_t min_requested = (static_cast<uint64_t>(*(rounded - 1))
+                                        << candidate_snapshot.multiplier_bits) +
+                                       1;
+        const uint64_t max_requested = static_cast<uint64_t>(*rounded)
+                                       << candidate_snapshot.multiplier_bits;
         for (const uint64_t requested : {min_requested - 1, min_requested,
                                          max_requested, max_requested + 1}) {
             auto candidate = allocator->CaptureSnapshot();
