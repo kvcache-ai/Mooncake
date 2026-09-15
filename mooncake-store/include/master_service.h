@@ -167,11 +167,11 @@ class MasterService {
     friend class test::LocalDiskUnmountInterleavingTest;
     // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
     friend class test::MasterServiceSSDTest;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
-    friend class ha::MasterSnapshotCodec;  // Allow codec to access private
-                                           // members
+    friend class ha::MasterSnapshotCodec;      // Allow codec to access private
+                                               // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
     friend class test::MasterServiceHATest;
 
@@ -1014,6 +1014,26 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id);
+
+    // Tolerant legacy snapshot restore (#3760), one phase per method so each
+    // stays single-purpose.
+    struct LegacyRestoreContext;
+    void NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
+                                    const StandbyObjectEntry& entry,
+                                    const char* reason);
+    tl::expected<void, ErrorCode> ValidateLegacyStandbyEntries(
+        LegacyRestoreContext& ctx);
+    tl::expected<void, ErrorCode> ConstructLegacyStandbyReplicas(
+        LegacyRestoreContext& ctx);
+    tl::expected<size_t, ErrorCode> InstallLegacyStandbyObjects(
+        LegacyRestoreContext& ctx);
+
+    // A restored local-disk replica reads only while its owner has a liveness
+    // record; share the existing one or stage a fresh record for install.
+    std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(
+        std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                           boost::hash<UUID>>& new_known_owner_records,
+        const UUID& owner);
 
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
@@ -2319,15 +2339,15 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
     // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
     // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
     // sufficient once quotas partition the pool.
     const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
