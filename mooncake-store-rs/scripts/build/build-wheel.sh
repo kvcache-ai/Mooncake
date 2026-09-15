@@ -574,6 +574,9 @@ library_assets = {
         *env_candidate("MOONCAKE_TENT_SHARED_LIB_PATH"),
         upstream_build_dir / "mooncake-transfer-engine" / "tent" / "src" / "libtent_shared.so"
     ],
+    "libtent_metrics.so": [
+        upstream_build_dir / "mooncake-transfer-engine" / "tent" / "src" / "metrics" / "libtent_metrics.so"
+    ],
     "libmooncake_classic_shim.so": env_candidate("MOONCAKE_CLASSIC_SHIM_LIB_PATH")
     + [
         shim_dir / "libmooncake_classic_shim.so" for shim_dir in transport_shim_out_dirs
@@ -595,6 +598,7 @@ relative_rpath_assets = {
     "libtransfer_engine.so",
     "libmooncake_common.so",
     "libtent_shared.so",
+    "libtent_metrics.so",
     "libmooncake_classic_shim.so",
     "libmooncake_tent_shim.so",
 }
