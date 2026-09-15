@@ -33,7 +33,7 @@ Use this skill when users ask about:
 
 **Import:**
 ```python
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig, SoftPinAction
 ```
 
 **Basic Setup:**
@@ -118,7 +118,7 @@ shard = store.get_tensor_with_tp("model_weights", tp_rank=0, tp_size=4)
 ```python
 config = ReplicateConfig()
 config.replica_num = 3              # Number of replicas
-config.with_soft_pin = True         # Keep in memory longer
+config.soft_pin_action = SoftPinAction.ENABLE  # Keep in memory longer
 config.preferred_segment = "host:port"  # Preferred location
 
 store.put("key", b"value", config)
@@ -337,7 +337,7 @@ store.close()
 ### Pattern 2: High-Performance Tensor Storage
 ```python
 import torch
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig, SoftPinAction
 
 store = MooncakeDistributedStore()
 store.setup("localhost", "http://localhost:8080/metadata",
@@ -346,7 +346,7 @@ store.setup("localhost", "http://localhost:8080/metadata",
 # Configure replication
 config = ReplicateConfig()
 config.replica_num = 2
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 # Store tensor with replication
 tensor = torch.randn(1000, 1000)
@@ -500,7 +500,7 @@ curl http://localhost:8080/metadata
 2. **Register buffers for zero-copy**: Required for RDMA operations
 3. **Use batch operations**: Better throughput for multiple operations
 4. **Configure replication**: Use `ReplicateConfig` for important data
-5. **Use soft pinning**: For frequently accessed objects
+5. **Use soft pinning**: Give objects a fixed retention window via `SoftPinAction.ENABLE` + `soft_pin_ttl_ms` (omit the TTL to use the master default; reads do not extend it)
 6. **Choose protocol wisely**: TCP for dev/test, RDMA for production
 7. **Monitor leases**: Objects have TTL, renew if needed
 8. **Handle errors**: Check return codes and handle failures
