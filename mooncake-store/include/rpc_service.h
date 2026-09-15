@@ -344,6 +344,22 @@ class WrappedMasterService {
     bool KvEventsEnabled() const;
     KvEventPublisher::Stats GetKvEventStats() const;
 
+    // RFC #4017 PR1
+    tl::expected<BeginWeightImportResponse, ErrorCode> BeginWeightImport(
+        const BeginWeightImportRequest& request);
+    tl::expected<CommitWeightImportResponse, ErrorCode> CommitWeightImport(
+        const CommitWeightImportRequest& request);
+    tl::expected<GetWeightMetadataResponse, ErrorCode> GetWeightMetadata(
+        const GetWeightMetadataRequest& request);
+    ListWeightRevisionsResponse ListWeightRevisions(
+        const ListWeightRevisionsRequest& request);
+    tl::expected<UpdateWeightPolicyResponse, ErrorCode> UpdateWeightPolicy(
+        const UpdateWeightPolicyRequest& request);
+    tl::expected<AbortWeightImportResponse, ErrorCode> AbortWeightImport(
+        const AbortWeightImportRequest& request);
+    tl::expected<RemoveWeightRevisionResponse, ErrorCode> RemoveWeightRevision(
+        const RemoveWeightRevisionRequest& request);
+
    private:
     MasterService master_service_;
 };
