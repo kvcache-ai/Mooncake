@@ -55,7 +55,7 @@ RUN mkdir -p build/mooncake-transfer-engine/nvlink-allocator && \
     bash build.sh --use-mcc ../../build/mooncake-transfer-engine/nvlink-allocator/
 
 # Build the Python wheel from local sources
-RUN OUTPUT_DIR=dist ./scripts/build_wheel.sh
+RUN OUTPUT_DIR=dist python${PYTHON_VERSION} scripts/build_release_wheel.py
 
 ###############################################################################
 # Stage 2: install the freshly built wheel into a runtime image

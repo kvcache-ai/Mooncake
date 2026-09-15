@@ -96,41 +96,6 @@ jobs:
           sudo bash scripts/ascend/dependencies_ascend_installation.sh
           echo "PATH=/usr/local/go/bin:${PATH}" >> "$GITHUB_ENV"
 
-      - name: Configure project
-        shell: bash
-        run: |
-          set -eo pipefail
-          export PYTHONPATH="${PYTHONPATH:-}"
-          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
-          source /usr/local/Ascend/cann/set_env.sh
-          rm -rf build
-          mkdir build
-          cd build
-          cmake_args=(
-            -DUSE_ASCEND_DIRECT=ON
-            -DUSE_ETCD=ON
-            -DSTORE_USE_ETCD=ON
-            -DBUILD_UNIT_TESTS=OFF
-            -DCMAKE_BUILD_TYPE=Release
-            -DPython3_EXECUTABLE="${PYTHON_BIN}"
-            -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF
-            -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF
-            -DCMAKE_SKIP_INSTALL_RPATH=ON
-          )
-          cmake .. "${cmake_args[@]}"
-
-      - name: Build project
-        shell: bash
-        run: |
-          set -eo pipefail
-          export PYTHONPATH="${PYTHONPATH:-}"
-          export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
-          source /usr/local/Ascend/cann/set_env.sh
-          export PATH="/usr/local/go/bin:${PATH}"
-          cd build
-          cmake --build . -j"$(nproc)"
-          sudo cmake --install .
-
       - name: Generate Python version tag
         id: generate_tag_release
         shell: bash
@@ -138,6 +103,9 @@ jobs:
           echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
 
       - name: Build Python wheel
+        env:
+          CMAKE_ARGS: >-
+            -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DCMAKE_INSTALL_RPATH_USE_LINK_PATH=OFF -DCMAKE_BUILD_WITH_INSTALL_RPATH=OFF -DCMAKE_SKIP_INSTALL_RPATH=ON
         shell: bash
         run: |
           set -eo pipefail
@@ -145,7 +113,8 @@ jobs:
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
           source /usr/local/Ascend/cann/set_env.sh
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          NPU_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
+          NPU_BUILD=1 OUTPUT_DIR=dist-npu-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
+            python${{ matrix.python-version }} scripts/build_release_wheel.py
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4

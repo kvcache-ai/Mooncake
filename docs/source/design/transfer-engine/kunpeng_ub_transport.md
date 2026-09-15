@@ -87,13 +87,12 @@ make -j$(nproc)
 ### 3. Install Python Package
 
 ```bash
-# Copy built modules to wheel directory
-cp mooncake-integration/engine.cpython-*.so ../mooncake-wheel/mooncake/
-cp mooncake-integration/store.cpython-*.so ../mooncake-wheel/mooncake/
-cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
-
-# Install with pip
-pip install -e ../mooncake-wheel --no-build-isolation
+# From the build directory, use the root scikit-build-core backend.
+# Native modules are installed into the package without source-tree copies.
+pip install -e .. \
+    -Ccmake.define.USE_UB=ON \
+    -Ccmake.define.URMA_INCLUDE_DIR=/usr/include \
+    -Ccmake.define.URMA_LIBRARY=/usr/lib64/liburma.so
 ```
 
 ## Verification

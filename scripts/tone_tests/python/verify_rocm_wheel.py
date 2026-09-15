@@ -6,6 +6,7 @@ import base64
 import hashlib
 import importlib
 import importlib.metadata as metadata
+from importlib.machinery import EXTENSION_SUFFIXES
 from pathlib import Path
 
 
@@ -19,11 +20,18 @@ def main() -> None:
     package = importlib.import_module("mooncake")
     package_dir = Path(package.__file__).resolve().parent
     records = {str(item): item for item in distribution.files or ()}
-    expected_files = {
-        "mooncake/engine.so": "mooncake.engine",
-        "mooncake/store.so": "mooncake.store",
-        "mooncake/mooncake_master": None,
-    }
+    expected_files = {"mooncake/mooncake_master": None}
+    for name in ("engine", "store"):
+        candidates = [
+            f"mooncake/{name}{suffix}"
+            for suffix in EXTENSION_SUFFIXES
+            if f"mooncake/{name}{suffix}" in records
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                f"Expected exactly one wheel record for mooncake.{name}: {candidates}"
+            )
+        expected_files[candidates[0]] = f"mooncake.{name}"
 
     print("Mooncake package:", package.__file__)
     print("Mooncake ROCm distribution:", distribution.version)

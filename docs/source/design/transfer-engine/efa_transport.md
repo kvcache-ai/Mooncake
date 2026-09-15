@@ -93,42 +93,40 @@ make -j$(nproc)
 ### 2. Install Python Package
 
 ```bash
-# Copy built modules to wheel directory
-cp mooncake-integration/engine.cpython-*.so ../mooncake-wheel/mooncake/
-cp mooncake-integration/store.cpython-*.so ../mooncake-wheel/mooncake/
-cp mooncake-common/libasio.so ../mooncake-wheel/mooncake/
-
-# Install with pip
-pip install -e ../mooncake-wheel --no-build-isolation
+# From the build directory, install through the root scikit-build-core backend.
+# No copying into the source tree is needed. Use USE_CUDA=OFF for CPU-only builds.
+pip install -e .. -Ccmake.define.USE_EFA=ON -Ccmake.define.USE_CUDA=ON
 ```
 
 (efa-distributable-wheel)=
 ### 3. Building a Distributable Wheel (optional)
 
-To produce a relocatable wheel for distribution (instead of the editable install above), use `scripts/build_wheel.sh`, which runs `auditwheel repair` to bundle non-system dependencies:
+To produce a relocatable wheel for distribution (instead of the editable install above), use `scripts/build_release_wheel.py`. Invoke it with the Python interpreter targeted by the wheel; it prepares its build tools automatically. It builds through the same root scikit-build-core backend, reuses the CMake configuration in `BUILD_DIR`, and runs `scripts/repair_wheel.sh` to bundle non-system dependencies with `auditwheel repair`. The legacy `mooncake-wheel/setup.py` build entry point is no longer used.
 
 ```bash
-# After the cmake/make build above completes:
-PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
-pip install dist/mooncake_transfer_engine-*.whl
+# Return to the repository root after configuring CMake above.
+cd ..
+# GPU variant; use EFA_NON_CUDA_BUILD=1 for the CPU-only configuration.
+EFA_BUILD=1 BUILD_DIR=build OUTPUT_DIR=dist python3.13 scripts/build_release_wheel.py
+pip install mooncake-wheel/dist/*.whl
 ```
 
 To produce a wheel whose package name matches one of the published variants, set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
 
 ```bash
 # GPU build (cmake was configured with USE_CUDA=ON):
-EFA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+EFA_BUILD=1 BUILD_DIR=build OUTPUT_DIR=dist python3.13 scripts/build_release_wheel.py
 
 # CUDA 13 GPU build (cmake was configured with CUDA 13 and USE_CUDA=ON):
-EFA_CU13_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+EFA_CU13_BUILD=1 BUILD_DIR=build OUTPUT_DIR=dist python3.13 scripts/build_release_wheel.py
 
 # CPU build (cmake was configured with USE_CUDA=OFF):
-EFA_NON_CUDA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+EFA_NON_CUDA_BUILD=1 BUILD_DIR=build OUTPUT_DIR=dist python3.13 scripts/build_release_wheel.py
 ```
 
 > **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation), `.github/workflows/release-efa.yaml` (CUDA 12 release), `.github/workflows/release-efa-cuda13.yaml` (CUDA 13 release), and `.github/workflows/release-efa-non-cuda.yaml` (non-CUDA release). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner obtains from the distro `libfabric-dev` package.
 
-> **Important (EFA builds):** `auditwheel repair` excludes `libfabric` and `libefa` from the wheel so they resolve to the system EFA installation (`/opt/amazon/efa/lib`) at runtime. This is required because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the **same** system `libfabric`. If the wheel bundled its own copy, the process would load two independent libfabric instances — Mooncake's bundled one and NCCL's system one — and whichever initializes first claims the EFA device, leaving the other with an empty provider list (`fi_getinfo: provider efa output empty list`). NCCL then silently falls back to the TCP provider and cross-node collectives such as `all_gather_object` hang. Excluding libfabric/libefa (see `scripts/build_wheel.sh`) keeps a single shared libfabric in the process. If you are on an older Mooncake build whose wheel still bundles libfabric, force the system copy with `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
+> **Important (EFA builds):** `auditwheel repair` excludes `libfabric` and `libefa` from the wheel so they resolve to the system EFA installation (`/opt/amazon/efa/lib`) at runtime. This is required because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the **same** system `libfabric`. If the wheel bundled its own copy, the process would load two independent libfabric instances — Mooncake's bundled one and NCCL's system one — and whichever initializes first claims the EFA device, leaving the other with an empty provider list (`fi_getinfo: provider efa output empty list`). NCCL then silently falls back to the TCP provider and cross-node collectives such as `all_gather_object` hang. Excluding libfabric/libefa (see `scripts/repair_wheel.sh`) keeps a single shared libfabric in the process. If you are on an older Mooncake build whose wheel still bundles libfabric, force the system copy with `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
 
 ## Verification
 
