@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -217,6 +218,78 @@ class PyClient {
     using QueryResultCache =
         std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
 
+    // A caller-owned metadata snapshot for repeated ranged reads against the
+    // same key set. It is reusable until refresh_at; after that, callers should
+    // refresh it before submitting more transfers.
+    struct RangedReadSnapshot {
+        QueryResultCache query_result_cache;
+        std::chrono::steady_clock::time_point refresh_at{};
+
+        bool reset(QueryResultCache cache,
+                   std::chrono::steady_clock::time_point now =
+                       std::chrono::steady_clock::now()) {
+            query_result_cache = std::move(cache);
+            refresh_at = now;
+            if (query_result_cache.empty()) return false;
+
+            auto earliest_lease = std::chrono::steady_clock::time_point::max();
+            bool all_fresh = true;
+            for (const auto &[key, query_result] : query_result_cache) {
+                (void)key;
+                if (query_result && !query_result->IsLeaseExpired(now)) {
+                    earliest_lease =
+                        std::min(earliest_lease, query_result->lease_timeout);
+                } else {
+                    all_fresh = false;
+                }
+            }
+            if (all_fresh && earliest_lease > now) {
+                refresh_at = now + (earliest_lease - now) / 2;
+            }
+            return all_fresh;
+        }
+
+        bool reset(
+            const std::vector<std::string> &keys,
+            std::vector<tl::expected<QueryResult, ErrorCode>> query_results,
+            std::chrono::steady_clock::time_point now =
+                std::chrono::steady_clock::now()) {
+            query_result_cache.clear();
+            refresh_at = now;
+            if (query_results.size() != keys.size()) return false;
+
+            query_result_cache.reserve(keys.size());
+            auto earliest_lease = std::chrono::steady_clock::time_point::max();
+            bool all_fresh = true;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (query_results[i] &&
+                    !query_results[i]->IsLeaseExpired(now)) {
+                    earliest_lease = std::min(earliest_lease,
+                                              query_results[i]->lease_timeout);
+                } else {
+                    all_fresh = false;
+                }
+                query_result_cache.emplace(keys[i],
+                                           std::move(query_results[i]));
+            }
+
+            if (all_fresh && earliest_lease > now) {
+                refresh_at = now + (earliest_lease - now) / 2;
+            }
+            return all_fresh;
+        }
+
+        bool reusable(std::chrono::steady_clock::time_point now =
+                          std::chrono::steady_clock::now()) const {
+            return !query_result_cache.empty() && now < refresh_at;
+        }
+
+        bool should_refresh(std::chrono::steady_clock::time_point now =
+                                std::chrono::steady_clock::now()) const {
+            return !reusable(now);
+        }
+    };
+
     virtual ~PyClient() = 0;
     virtual int setup_real(
         const std::string &local_hostname, const std::string &metadata_server,
@@ -261,8 +334,45 @@ class PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const QueryResultCache *query_result_cache = nullptr) = 0;
 
+    // Read only from the supplied query-result snapshot. Implementations must
+    // not re-query keys or renew leases; an expired snapshot fails.
+    virtual std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache &query_result_cache) = 0;
+
+    std::vector<std::vector<std::vector<int64_t>>>
+    get_into_ranges_from_snapshot(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const RangedReadSnapshot &snapshot) {
+        return get_into_ranges_from_snapshot(buffers, all_keys, all_dst_offsets,
+                                             all_src_offsets, all_sizes,
+                                             snapshot.query_result_cache);
+    }
+
     virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
         const std::vector<std::string> &keys) = 0;
+
+    RangedReadSnapshot prepare_get_into_ranges_snapshot(
+        const std::vector<std::string> &keys) {
+        RangedReadSnapshot snapshot;
+        refresh_get_into_ranges_snapshot(snapshot, keys);
+        return snapshot;
+    }
+
+    bool refresh_get_into_ranges_snapshot(
+        RangedReadSnapshot &snapshot, const std::vector<std::string> &keys) {
+        auto query_results = batch_query(keys);
+        return snapshot.reset(keys, std::move(query_results));
+    }
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,

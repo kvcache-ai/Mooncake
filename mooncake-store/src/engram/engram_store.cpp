@@ -1,5 +1,7 @@
 #include "engram/engram_store.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <limits>
 #include <sstream>
@@ -10,6 +12,11 @@
 
 namespace mooncake {
 namespace engram {
+
+struct EngramStore::QueryCacheEntry {
+    std::vector<int> layer_ids;
+    mooncake::PyClient::RangedReadSnapshot snapshot;
+};
 
 EngramStore::EngramStore(const std::map<int, EngramStoreConfig>& layers,
                          std::shared_ptr<PyClient> store)
@@ -47,6 +54,44 @@ const EngramStore::Layer& EngramStore::get_layer(int layer_id) const {
                                     std::to_string(layer_id));
     }
     return it->second;
+}
+
+std::shared_ptr<const EngramStore::QueryCacheEntry>
+EngramStore::get_query_cache(const std::vector<int>& layer_ids,
+                             const std::vector<std::string>& keys) const {
+    if (layer_ids.empty()) return nullptr;
+
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(query_cache_mutex_);
+    std::shared_ptr<QueryCacheEntry>* cache_entry;
+    if (layer_ids.size() == 1) {
+        cache_entry = &query_cache_[layer_ids.front()];
+    } else {
+        cache_entry = &multi_layer_query_cache_;
+    }
+    if (*cache_entry && (*cache_entry)->layer_ids == layer_ids &&
+        (*cache_entry)->snapshot.reusable(now)) {
+        return *cache_entry;
+    }
+
+    auto entry = std::make_shared<QueryCacheEntry>();
+    entry->layer_ids = layer_ids;
+    entry->snapshot = store_->prepare_get_into_ranges_snapshot(keys);
+    if (!entry->snapshot.reusable(now)) return nullptr;
+
+    *cache_entry = entry;
+    return entry;
+}
+
+void EngramStore::invalidate_query_cache(int layer_id) const {
+    std::lock_guard<std::mutex> lock(query_cache_mutex_);
+    query_cache_.erase(layer_id);
+    if (multi_layer_query_cache_ &&
+        std::find(multi_layer_query_cache_->layer_ids.begin(),
+                  multi_layer_query_cache_->layer_ids.end(),
+                  layer_id) != multi_layer_query_cache_->layer_ids.end()) {
+        multi_layer_query_cache_.reset();
+    }
 }
 
 int EngramStore::bind_local(int layer_id,
@@ -178,18 +223,21 @@ int EngramStore::lookup_many_into(
     std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
     std::vector<std::vector<std::vector<size_t>>> all_sizes;
     std::vector<std::string> query_keys;
+    std::vector<int> query_layer_ids;
     buffers.reserve(plans.size());
     all_keys.reserve(plans.size());
     all_dst_offsets.reserve(plans.size());
     all_src_offsets.reserve(plans.size());
     all_sizes.reserve(plans.size());
     query_keys.reserve(key_count);
+    query_layer_ids.reserve(plans.size());
 
     for (const auto& plan : plans) {
         const auto& layer = *plan.layer;
         const size_t num_heads = layer.config.table_vocab_sizes.size();
         const size_t row_bytes = layer.config.row_bytes;
         buffers.push_back(plan.request->output);
+        query_layer_ids.push_back(plan.request->layer_id);
         all_keys.push_back(layer.keys);
         query_keys.insert(query_keys.end(), layer.keys.begin(),
                           layer.keys.end());
@@ -218,16 +266,12 @@ int EngramStore::lookup_many_into(
         }
     }
 
-    PyClient::QueryResultCache query_result_cache;
-    auto query_results = store_->batch_query(query_keys);
-    if (query_results.size() != query_keys.size()) return fail_lookups();
-    query_result_cache.reserve(query_keys.size());
-    for (size_t i = 0; i < query_keys.size(); ++i)
-        query_result_cache.emplace(query_keys[i], query_results[i]);
+    auto query_cache = get_query_cache(query_layer_ids, query_keys);
+    if (!query_cache) return fail_lookups();
 
-    auto results = store_->get_into_ranges(buffers, all_keys, all_dst_offsets,
-                                           all_src_offsets, all_sizes,
-                                           &query_result_cache);
+    auto results = store_->get_into_ranges_from_snapshot(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        query_cache->snapshot);
     if (results.size() != plans.size()) return fail_lookups();
     for (size_t i = 0; i < plans.size(); ++i) {
         const size_t num_heads = plans[i].layer->keys.size();
@@ -292,6 +336,7 @@ int EngramStore::remove_from_store(int layer_id, bool force) {
         }
     }
 
+    if (first_error == 0 && removed > 0) invalidate_query_cache(layer_id);
     return first_error != 0 ? first_error : removed;
 }
 
@@ -396,6 +441,7 @@ int EngramStore::populate(int layer_id,
         return -1;
     }
 
+    invalidate_query_cache(layer_id);
     return 0;
 }
 

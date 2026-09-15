@@ -127,8 +127,8 @@ output.shape == [B, L, H, row_bytes]
 
 `lookup_many_into(...)` accepts parallel sequences of layer IDs, row-ID arrays,
 and output arrays with the same per-layer contract. Output byte ranges must not
-overlap. Use it when multiple layers are ready together so their ranges share a
-single Store query and scatter transfer.
+overlap. Use it when multiple layers are ready together so their ranges reuse a
+combined metadata snapshot and share one scatter transfer.
 
 It writes output in place and returns `None`. Neither argument is implicitly
 converted. The explicit `layer_id` selects a configured layer; position
@@ -187,11 +187,16 @@ rows directly):
 3. query head-table locations with `batch_query(...)`
 4. issue one `get_into_ranges(...)` call to write the rows into the registered output buffer
 
-`lookup_many_into(...)` flattens all requested layers into the same
-`batch_query(...)` and `get_into_ranges(...)` calls. This keeps the optimization
-in the generic Store scatter path: Engram batches layers through this API, while
-resharding and other callers can batch their own keys directly through
-`get_into_ranges(...)`.
+`lookup_many_into(...)` flattens all requested layers into one reusable
+`RangedReadSnapshot` and one `get_into_ranges_from_snapshot(...)` call. The
+snapshot is refreshed before the midpoint of the earliest metadata lease, so
+the hot path skips `batch_query(...)` entirely. Engram keeps the existing
+per-layer snapshots and one most-recent multi-layer snapshot; populate and
+remove invalidate every affected snapshot.
+
+The snapshot and ranged-read APIs remain generic Store primitives. Resharding
+and other callers can prepare and reuse snapshots for their own key sets
+without depending on Engram.
 
 The binding builds ranges directly from contiguous NumPy row IDs.
 It rejects Python lists and implicit dtype or layout conversion.
