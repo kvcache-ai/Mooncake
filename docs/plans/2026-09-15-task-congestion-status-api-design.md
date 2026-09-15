@@ -1,6 +1,6 @@
 # TE/TENT 任务拥塞状态双接口设计
 
-日期：2026-09-15；状态：已确认，待实现。
+日期：2026-09-15；状态：实现中，待验收。
 
 ## 目标与边界
 
@@ -33,7 +33,7 @@ Status getTaskCongestionDetail(BatchID batch_id, size_t task_id,
 
 重新 admission、可用路径 failover、探测成功或新 attempt 会消除旧 attempt 的当前受阻状态；详细接口可保留最后一条已解决异常供诊断，但标明 `resolved`。旧 generation/attempt 的反馈不能覆盖新任务状态。提交前整批 admission 拒绝没有已提交的 task；该情况仍使用 `submitTransfer` 的可重试返回值。
 
-详细结果包括：极简状态、当前 attempt 类型、最近有效原因与错误范围、受影响路径标识、观测时间、是否已解决、控制器 mode/generation、窗口与在途字节、剩余隔离冷却时间。不存在的字段标明未观测，不补造默认原因。详细查询复制逻辑 task 的异常记录，再读取对应控制器的原子快照；不调用 verbs、metadata RPC、tick 或主动探测，返回的是 best-effort 快照而非多个路径同时刻的事务视图。
+详细结果包括：极简状态、当前已知的 attempt 类型、最近有效原因与错误范围、受影响路径标识、观测时间、是否已解决，以及异常发生时可取得的控制器 mode/generation、窗口与在途字节。剩余隔离冷却时间只有在适配层实际观测到时才返回；首版未读取该值，保持“未观测”。详细查询只复制逻辑 task 保存的异常证据，不读取当前控制器状态，也不调用 verbs、metadata RPC、tick 或主动探测。各字段是异常发生时的 best-effort 快照，不表示查询时刻的状态。
 
 C ABI 的极简函数输出枚举；详细函数输出固定数值字段，并用调用方长度参数两次读取变长路径文本，不截断路径。Python 返回同语义的枚举/字典。Classic `TransferEngine` 选择 TENT backend 时转发并转换同一语义。
 

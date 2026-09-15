@@ -78,7 +78,8 @@ Deferral leaves work with its existing queue owner. Avoiding an unhealthy route
 uses existing redispatch and failover machinery; the controller does not create
 a second retry queue or rebuild QPs itself. Old-generation feedback cannot
 update replacement-path health. Application completion/status APIs remain
-unchanged; this feature does not add a public per-request failure-detail API.
+unchanged. A separate [task congestion query](task-congestion-status-api.md)
+reads bounded evidence for one logical task without advancing progress.
 
 Failure evidence must retain its scope:
 
