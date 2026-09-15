@@ -15,16 +15,13 @@
 #include <gtest/gtest.h>
 
 #include <cstring>
-#include <cstdlib>
-#include <linux/magic.h>
 #include <memory>
-#include <optional>
 #include <string>
-#include <sys/vfs.h>
 #include <unistd.h>
 #include <vector>
 
 #include "common.h"
+#include "shm_hugepage_test_util.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transport/shm_transport/shm_transport.h"
@@ -161,53 +158,6 @@ const TransferMetadata::BufferDesc* FindPosixShmBuffer(
     return nullptr;
 }
 
-std::optional<std::string> FindHugetlbfsMount(size_t hugepage_size) {
-    std::vector<const char*> candidates;
-    if (const char* env = std::getenv("MC_HUGETLBFS_PATH_512M");
-        env && hugepage_size == SharedMemoryOptions::kHugepage512MB) {
-        candidates.push_back(env);
-    }
-    if (const char* env = std::getenv("MC_HUGETLBFS_PATH_1G");
-        env && hugepage_size == SharedMemoryOptions::kHugepage1GB) {
-        candidates.push_back(env);
-    }
-    if (const char* env = std::getenv("MC_HUGETLBFS_PATH"); env) {
-        candidates.push_back(env);
-    }
-    candidates.push_back(
-        SharedMemoryOptions::defaultHugetlbfsPathFor(hugepage_size));
-    if (hugepage_size == SharedMemoryOptions::kHugepage2MB) {
-        candidates.push_back("/tmp/mooncake_hugepages_2m");
-    } else if (hugepage_size == SharedMemoryOptions::kHugepage512MB) {
-        candidates.push_back("/tmp/mooncake_hugepages_512m");
-    } else if (hugepage_size == SharedMemoryOptions::kHugepage1GB) {
-        candidates.push_back("/tmp/mooncake_hugepages_1g");
-    }
-
-    for (const char* dir : candidates) {
-        if (!dir || !*dir) continue;
-        struct statfs sfs;
-        if (statfs(dir, &sfs) != 0) continue;
-        if (sfs.f_type != HUGETLBFS_MAGIC) continue;
-        if (static_cast<size_t>(sfs.f_bsize) != hugepage_size) continue;
-        if (access(dir, W_OK) != 0) continue;
-        return std::string(dir);
-    }
-    return std::nullopt;
-}
-
-std::optional<std::string> FindHugetlbfs2MBMount() {
-    return FindHugetlbfsMount(SharedMemoryOptions::kHugepage2MB);
-}
-
-std::optional<std::string> FindHugetlbfs512MBMount() {
-    return FindHugetlbfsMount(SharedMemoryOptions::kHugepage512MB);
-}
-
-std::optional<std::string> FindHugetlbfs1GBMount() {
-    return FindHugetlbfsMount(SharedMemoryOptions::kHugepage1GB);
-}
-
 }  // namespace
 
 TEST(ShmTransportE2E, WriteAndReadBetweenEngines) {
@@ -249,27 +199,37 @@ TEST(ShmTransportE2E, WriteAndReadBetweenEngines) {
     ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
 }
 
-TEST(ShmTransportE2E, WriteAndReadHugepage2MB) {
-    auto mount = FindHugetlbfs2MBMount();
+class ShmHugepageE2ETest : public ::testing::TestWithParam<size_t> {};
+
+TEST_P(ShmHugepageE2ETest, WriteAndRead) {
+    const size_t length = GetParam();
+    auto mount = FindHugetlbfsMount(length);
     if (!mount) {
-        GTEST_SKIP() << "No writable 2MB hugetlbfs mount "
-                        "(set MC_HUGETLBFS_PATH or mount one)";
+        GTEST_SKIP() << "No writable " << HugepageSizeLabel(length)
+                     << " hugetlbfs mount";
     }
 
-    const size_t length = SharedMemoryOptions::kHugepage2MB;
-    auto engine_a = MakeEngine(UniqueServerName(30));
-    auto engine_b = MakeEngine(UniqueServerName(31));
+    const uint16_t extra =
+        length == SharedMemoryOptions::kHugepage2MB
+            ? 30
+            : (length == SharedMemoryOptions::kHugepage512MB ? 34 : 32);
+    auto engine_a = MakeEngine(UniqueServerName(extra));
+    auto engine_b = MakeEngine(UniqueServerName(extra + 1));
     ASSERT_TRUE(engine_a);
     ASSERT_TRUE(engine_b);
 
     SharedMemoryOptions opt;
     opt.use_hugepage = true;
-    opt.hugepage_size = SharedMemoryOptions::kHugepage2MB;
+    opt.hugepage_size = length;
     opt.hugetlbfs_path = *mount;
     opt.populate = false;
 
     void* remote = engine_a->allocateSharedMemory(length, opt);
-    ASSERT_NE(remote, nullptr);
+    if (!remote) {
+        GTEST_SKIP() << HugepageSizeLabel(length)
+                     << " hugetlbfs mount present but allocation failed "
+                        "(no free hugepages?)";
+    }
     ASSERT_EQ(engine_a->registerLocalMemory(remote, length, "cpu:0"), 0);
 
     auto desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
@@ -291,91 +251,14 @@ TEST(ShmTransportE2E, WriteAndReadHugepage2MB) {
     ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
 }
 
-TEST(ShmTransportE2E, WriteAndReadHugepage512MB) {
-    auto mount = FindHugetlbfs512MBMount();
-    if (!mount) {
-        GTEST_SKIP() << "No writable 512MB hugetlbfs mount "
-                        "(set MC_HUGETLBFS_PATH_512M or mount one)";
-    }
-
-    const size_t length = SharedMemoryOptions::kHugepage512MB;
-    auto engine_a = MakeEngine(UniqueServerName(34));
-    auto engine_b = MakeEngine(UniqueServerName(35));
-    ASSERT_TRUE(engine_a);
-    ASSERT_TRUE(engine_b);
-
-    SharedMemoryOptions opt;
-    opt.use_hugepage = true;
-    opt.hugepage_size = SharedMemoryOptions::kHugepage512MB;
-    opt.hugetlbfs_path = *mount;
-    opt.populate = false;
-
-    void* remote = engine_a->allocateSharedMemory(length, opt);
-    if (!remote) {
-        GTEST_SKIP() << "512MB hugetlbfs mount present but allocation failed "
-                        "(no free 512MB hugepages?)";
-    }
-    ASSERT_EQ(engine_a->registerLocalMemory(remote, length, "cpu:0"), 0);
-
-    auto desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    ASSERT_TRUE(desc);
-    auto* shm_buffer = FindPosixShmBuffer(*desc);
-    ASSERT_NE(shm_buffer, nullptr);
-    EXPECT_TRUE(isFilesystemShmPath(shm_buffer->shm_name));
-
-    auto segment_id = engine_b->openSegment(engine_a->getLocalIpAndPort());
-    auto remote_desc = engine_b->getMetadata()->getSegmentDescByID(segment_id);
-    ASSERT_TRUE(remote_desc);
-    auto* remote_shm = FindPosixShmBuffer(*remote_desc);
-    ASSERT_NE(remote_shm, nullptr);
-
-    ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(
-        *engine_a, *engine_b, remote, remote_shm->addr, length));
-    ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
-}
-
-TEST(ShmTransportE2E, WriteAndReadHugepage1GB) {
-    auto mount = FindHugetlbfs1GBMount();
-    if (!mount) {
-        GTEST_SKIP() << "No writable 1GB hugetlbfs mount "
-                        "(set MC_HUGETLBFS_PATH_1G or mount one)";
-    }
-
-    const size_t length = SharedMemoryOptions::kHugepage1GB;
-    auto engine_a = MakeEngine(UniqueServerName(32));
-    auto engine_b = MakeEngine(UniqueServerName(33));
-    ASSERT_TRUE(engine_a);
-    ASSERT_TRUE(engine_b);
-
-    SharedMemoryOptions opt;
-    opt.use_hugepage = true;
-    opt.hugepage_size = SharedMemoryOptions::kHugepage1GB;
-    opt.hugetlbfs_path = *mount;
-    opt.populate = false;
-
-    void* remote = engine_a->allocateSharedMemory(length, opt);
-    if (!remote) {
-        GTEST_SKIP() << "1GB hugetlbfs mount present but allocation failed "
-                        "(no free 1GB hugepages?)";
-    }
-    ASSERT_EQ(engine_a->registerLocalMemory(remote, length, "cpu:0"), 0);
-
-    auto desc = engine_a->getMetadata()->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    ASSERT_TRUE(desc);
-    auto* shm_buffer = FindPosixShmBuffer(*desc);
-    ASSERT_NE(shm_buffer, nullptr);
-    EXPECT_TRUE(isFilesystemShmPath(shm_buffer->shm_name));
-
-    auto segment_id = engine_b->openSegment(engine_a->getLocalIpAndPort());
-    auto remote_desc = engine_b->getMetadata()->getSegmentDescByID(segment_id);
-    ASSERT_TRUE(remote_desc);
-    auto* remote_shm = FindPosixShmBuffer(*remote_desc);
-    ASSERT_NE(remote_shm, nullptr);
-
-    ASSERT_NO_FATAL_FAILURE(ExpectShmWriteAndRead(
-        *engine_a, *engine_b, remote, remote_shm->addr, length));
-    ASSERT_EQ(engine_a->freeSharedMemory(remote), 0);
-}
+INSTANTIATE_TEST_SUITE_P(
+    HugepageSizes, ShmHugepageE2ETest,
+    ::testing::Values(SharedMemoryOptions::kHugepage2MB,
+                      SharedMemoryOptions::kHugepage512MB,
+                      SharedMemoryOptions::kHugepage1GB),
+    [](const testing::TestParamInfo<size_t>& info) {
+        return HugepageSizeTestName(info.param);
+    });
 
 TEST(ShmTransportE2E, WriteAndRead4K) {
     const size_t length = 4096;

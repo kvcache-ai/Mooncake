@@ -19,13 +19,11 @@
 #include <sys/time.h>
 
 #include <algorithm>
-#include <cctype>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <set>
-#include <string>
 #include <thread>
 #include <utility>
 
@@ -44,40 +42,6 @@ namespace mooncake {
 
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
-
-// MR length alignment for ionic/AINIC (and hugepage-backed buffers).
-// Reads MC_STORE_HUGEPAGE_SIZE so TE matches Store allocation; default 2MB.
-// Unlike Store's get_hugepage_size_from_env(), this always returns a positive
-// align unit (does not gate on MC_STORE_USE_HUGEPAGE) because pre-touch /
-// ibv_reg_mr length alignment is needed whenever the NIC enforces it.
-static size_t ParseHugepageAlignFromEnv() {
-    constexpr size_t k2MB = 2ull * 1024 * 1024;
-    constexpr size_t k1GB = 1ull * 1024 * 1024 * 1024;
-
-    const char *env = std::getenv("MC_STORE_HUGEPAGE_SIZE");
-    if (env == nullptr || env[0] == '\0') {
-        return k2MB;
-    }
-
-    std::string normalized;
-    normalized.reserve(8);
-    for (const char *p = env; *p; ++p) {
-        unsigned char c = static_cast<unsigned char>(*p);
-        if (std::isspace(c)) continue;
-        normalized.push_back(static_cast<char>(std::toupper(c)));
-    }
-
-    if (normalized == "2MB" || normalized == "2M" || normalized == "2097152") {
-        return k2MB;
-    }
-    if (normalized == "1GB" || normalized == "1G" || normalized == "1073741824") {
-        return k1GB;
-    }
-
-    LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << env
-                 << "'. Supported: 2MB, 1GB. Fallback to 2MB for MR align.";
-    return k2MB;
-}
 
 static std::string resolveBufferLocation(
     const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
@@ -278,18 +242,9 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
     if (length > (size_t)globalConfig().max_mr_size) {
         length = (size_t)globalConfig().max_mr_size;
     }
-    // ionic/AINIC ibv_reg_mr rejects a length that is not hugepage-aligned with
-    // EINVAL 22, and pre-touch registers a transient MR per block. Integer-
-    // dividing the chunk (e.g. 1.4GiB / 16) yields unaligned blocks, so keep
-    // every block a multiple of the hugepage size.
-    const size_t kHugepageAlign = ParseHugepageAlignFromEnv();
     size_t block_size = length / num_threads;
-    block_size = (block_size / kHugepageAlign) * kHugepageAlign;
     if (block_size == 0) {
-        // Shorter than one hugepage per thread: pre-touch it in one go rather
-        // than skipping it (the upstream code returned 0 and touched nothing).
-        if (length == 0) return 0;
-        return context_list_[0]->preTouchMemory(addr, length);
+        return 0;
     }
 
     std::vector<std::thread> threads;
@@ -298,25 +253,9 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
 
     for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
         void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
-        size_t this_size = block_size;
-        if (thread_i + 1 == num_threads) {
-            // Let the last thread cover the remainder, which upstream dropped
-            // entirely by passing block_size here as well. Round the remainder
-            // DOWN so this MR keeps a length ionic accepts.
-            //
-            // Down, not up: `length` may end exactly at the end of the caller's
-            // buffer, so growing past it would register memory this process
-            // does not own. Leaving the sub-hugepage remainder un-touched only
-            // costs a few page faults later -- pre-touch is a latency
-            // optimisation, and the real MR registered afterwards still covers
-            // the full range.
-            const size_t tail = length - thread_i * block_size;
-            this_size = (tail / kHugepageAlign) * kHugepageAlign;
-            if (this_size == 0) continue;
-        }
-        threads.emplace_back([this, thread_i, block_addr, this_size,
+        threads.emplace_back([this, thread_i, block_addr, block_size,
                               &thread_results]() {
-            int ret = context_list_[0]->preTouchMemory(block_addr, this_size);
+            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
             thread_results[thread_i] = ret;
         });
     }

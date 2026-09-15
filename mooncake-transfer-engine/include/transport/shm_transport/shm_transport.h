@@ -48,10 +48,29 @@ inline bool isPosixShmName(const std::string& name) {
     return key.size() > bare.size() && key.substr(0, bare.size()) == bare;
 }
 
+inline bool pathHasDotDotComponent(const std::string& path) {
+    std::string_view rest = path;
+    while (!rest.empty()) {
+        if (rest.front() == '/') {
+            rest.remove_prefix(1);
+            continue;
+        }
+        const auto slash = rest.find('/');
+        const auto part = rest.substr(0, slash);
+        if (part == "..") return true;
+        if (slash == std::string_view::npos) break;
+        rest.remove_prefix(slash);
+    }
+    return false;
+}
+
 // Absolute filesystem path (hugetlbfs), not a POSIX shm object "/mooncake_...".
+// Rejects ".." so a poisoned name like /dev/hugepages/../../tmp/mooncake_x
+// is not treated as a valid export path.
 inline bool isFilesystemShmPath(const std::string& name) {
     return name.size() > 1 && name.front() == '/' &&
-           name.find('/', 1) != std::string::npos;
+           name.find('/', 1) != std::string::npos &&
+           !pathHasDotDotComponent(name);
 }
 
 class ShmTransport : public Transport {
@@ -72,6 +91,8 @@ class ShmTransport : public Transport {
     void* allocateSharedMemory(size_t length);
     void* allocateSharedMemory(size_t length, const SharedMemoryOptions& opt);
 
+    // Unlinks the POSIX or hugetlbfs object. SIGKILL skips this; leftovers
+    // are documented on SharedMemoryOptions.
     int freeSharedMemory(void* addr);
 
     bool getShmName(void* addr, std::string* name) const;
@@ -129,13 +150,9 @@ class ShmTransport : public Transport {
 
     friend class ShmTransportTestPeer;
 
-    enum class ShmBacking { kPosixShm, kHugetlbfs };
-
     struct AllocatedShmEntry {
         std::string name;
         size_t length = 0;
-        ShmBacking backing = ShmBacking::kPosixShm;
-        size_t hugepage_size = 0;
     };
 
     using RelocateMap =
@@ -143,9 +160,7 @@ class ShmTransport : public Transport {
     using PendingUnmap = std::vector<std::pair<void*, uint64_t>>;
 
     void* createSharedMemory(const std::string& path, size_t size,
-                             int* error = nullptr);
-    void* createHugetlbfsShm(size_t length, const SharedMemoryOptions& opt,
-                             int* error = nullptr);
+                             int* error = nullptr, bool populate = false);
     static void unlinkShmEntry(const AllocatedShmEntry& entry);
 
     Status relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
