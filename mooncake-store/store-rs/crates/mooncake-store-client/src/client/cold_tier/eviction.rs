@@ -362,6 +362,7 @@ impl StorageOwnerState {
                         self,
                         &route,
                         &cold_backing,
+                        false,
                         "debug_evict_all_cold_tier_disabled",
                         None,
                     )?;
@@ -373,6 +374,7 @@ impl StorageOwnerState {
                         self,
                         &route,
                         &cold_backing,
+                        false,
                         "debug_evict_all_backend_unavailable",
                         Some(&error),
                     )?;

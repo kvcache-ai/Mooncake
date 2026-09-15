@@ -294,7 +294,9 @@ fn provider_owned_physical_nof_keeps_placement_out_of_object_route() {
 
     let mut replaced_route = route.clone();
     replaced_route.replicas.clear();
-    client.schedule_route_storage_reclaim(&replaced_route);
+    client
+        .schedule_route_reclaim(&replaced_route)
+        .expect("storage-only reclaim should schedule");
     client
         .flush_due_reclaims()
         .expect("storage-only reclaim should flush");
