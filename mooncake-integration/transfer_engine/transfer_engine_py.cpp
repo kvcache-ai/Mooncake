@@ -1214,7 +1214,6 @@ int TransferEnginePy::sendProbe(const std::string& peer_server_name) {
         if (handle == static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT))
             return -1;
         auto liveness = engine_->probePeerAliveByID(handle);
-        engine_->closeSegment(handle);
         return static_cast<int>(liveness);
     }
 
