@@ -1,8 +1,9 @@
 name: _build-efa-wheel
 
 # Shared AWS EFA wheel build used by pull-request CI and release workflows.
-# EFA hardware is not required to build: the distro libfabric is used for
-# compilation, then auditwheel leaves libfabric/libefa to the system runtime.
+# EFA hardware is not required to build: libfabric is built from source purely
+# to compile against, then auditwheel leaves libfabric/libefa to the system
+# runtime -- so the wheel always uses the EFA installer's libfabric on the host.
 
 on:
   workflow_call:
@@ -96,15 +97,44 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt update -y
-          packages=(libfabric-dev libfabric1)
+          packages=()
           if [ "$BUILD_PROFILE" = ci ]; then
-            packages=(ninja-build "${packages[@]}")
+            packages=(ninja-build)
           fi
-          sudo apt install -y "${packages[@]}"
+          if [ ${#packages[@]} -gt 0 ]; then
+            sudo apt install -y "${packages[@]}"
+          fi
           sudo bash -x dependencies.sh -y
           if [ "$BUILD_PROFILE" = ci ]; then
             df -h
           fi
+        shell: bash
+
+        # Built from source instead of taken from apt because the EFA transport
+        # asks fi_getinfo() for FI_VERSION(1, 18) and needs FI_HMEM_NEURON
+        # (libfabric >= 1.15) to register Neuron HBM, while Ubuntu 22.04 -- the
+        # runner that fixes this wheel's glibc floor -- packages libfabric 1.11.
+        # Pinned at the minimum the code actually claims to support, so the
+        # headers cannot describe structures a supported runtime is too old to
+        # provide; hosts run whatever libfabric the EFA installer put there.
+        # Only headers and a link target are wanted, hence no providers.
+      - name: Build libfabric
+        env:
+          LIBFABRIC_VERSION: '1.18.2'
+        run: |
+          workdir=$(mktemp -d)
+          curl -fsSL -o "$workdir/libfabric.tar.bz2" \
+            "https://github.com/ofiwg/libfabric/releases/download/v${LIBFABRIC_VERSION}/libfabric-${LIBFABRIC_VERSION}.tar.bz2"
+          tar -xf "$workdir/libfabric.tar.bz2" -C "$workdir"
+          cd "$workdir/libfabric-${LIBFABRIC_VERSION}"
+          ./configure --prefix=/usr/local \
+            --disable-efa --disable-verbs --disable-psm2 --disable-psm3 \
+            --disable-opx --disable-shm --disable-rxm --disable-rxd \
+            --disable-tcp --disable-udp --disable-sockets --disable-usnic \
+            --disable-mrail
+          make -j"$(nproc)"
+          sudo make install
+          grep -q FI_HMEM_NEURON /usr/local/include/rdma/fi_domain.h
         shell: bash
 
       - name: Configure project
@@ -127,8 +157,8 @@ jobs:
           cd build
           cmake "${generator[@]}" .. \
             -DUSE_EFA=ON \
-            -DLIBFABRIC_INCLUDE_DIR=/usr/include \
-            -DLIBFABRIC_LIBRARY=/usr/lib/x86_64-linux-gnu/libfabric.so \
+            -DLIBFABRIC_INCLUDE_DIR=/usr/local/include \
+            -DLIBFABRIC_LIBRARY=/usr/local/lib/libfabric.so \
             -DENABLE_SCCACHE=ON \
             -DCMAKE_BUILD_TYPE=Release \
             "${profile_args[@]}" \
