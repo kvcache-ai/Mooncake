@@ -130,6 +130,7 @@ design/transfer-engine/index
 design/reshard-manifest
 design/model-weight-reshard-planner
 design/model-weight-store-upload-planning
+design/weight-management
 design/tent/overview
 design/store/mooncake-store
 design/kv-event/publisher-design
