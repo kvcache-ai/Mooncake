@@ -1588,6 +1588,18 @@ std::vector<std::vector<std::vector<int64_t>>> DummyClient::get_into_ranges(
     return results;
 }
 
+std::vector<std::vector<std::vector<int64_t>>>
+DummyClient::get_into_ranges_from_snapshot(
+    const std::vector<void*>& buffers,
+    const std::vector<std::vector<std::string>>& all_keys,
+    const std::vector<std::vector<std::vector<size_t>>>& all_dst_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_src_offsets,
+    const std::vector<std::vector<std::vector<size_t>>>& all_sizes,
+    const QueryResultCache& query_result_cache) {
+    return get_into_ranges(buffers, all_keys, all_dst_offsets, all_src_offsets,
+                           all_sizes, &query_result_cache);
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
     const std::vector<std::string>& keys) {
     auto cached_results =
