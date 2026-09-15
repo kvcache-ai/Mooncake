@@ -26,10 +26,12 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_set>
 
 #include "tent/transport/rdma/bw_arbitration.h"
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/transport/rdma/promotion_policy.h"
+#include "tent/transport/rdma/qp_pool_routing.h"
 #include "tent/transport/rdma/shared_quota.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
@@ -379,6 +381,7 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
     if (slice && slice->task) {
         priority = slice->priority;
     }
+    bool wake_worker = false;
     // This lane's queue and counter are about to account for the slice, so
     // move the count here before it is visible on the queue. With a shared
     // queue pair the lane re-queueing the slice is the one that polled the
@@ -393,14 +396,20 @@ void Workers::submitFromTick(WorkerContext& worker, RdmaSlice* slice) {
             slice->counted_lane.exchange(lane, std::memory_order_acq_rel);
         if (prev >= 0 && prev != lane && prev < (int)num_workers_)
             worker_context_[prev].inflight_slices.fetch_sub(1);
-        if (prev != lane) worker.inflight_slices.fetch_add(1);
+        if (prev != lane) wake_worker = !worker.inflight_slices.fetch_add(1);
     }
     // The worker must never block on its own queue (issue #3637): a full
-    // queue parks the slice in requeue_overflow and the next tick retries.
-    // Either way it stays counted as inflight, which keeps the worker from
-    // suspending while a parked flush is pending.
-    if (!worker.queues[priority].try_push(slice_list)) {
+    // local queue parks the slice in requeue_overflow and the next tick
+    // retries. A different worker is reached through the MPSC producer path
+    // and must not touch that worker's local overflow vector.
+    if (laneIndex(worker) != tl_wid) {
+        worker.queues[priority].push(slice_list);
+    } else if (!worker.queues[priority].try_push(slice_list)) {
         worker.requeue_overflow.emplace_back(priority, slice_list);
+    }
+    if (wake_worker) {
+        std::lock_guard<std::mutex> lock(worker.mutex);
+        if (worker.in_suspend) worker.cv.notify_all();
     }
 }
 
@@ -785,18 +794,8 @@ void Workers::asyncPostSend() {
                             getCurrentTimeInNano());
         }
 
-        // Everything a completion's poller must find is written before the
-        // work request can reach the wire: with a shared queue pair another
-        // lane may poll the completion before submitSlices returns, and a
-        // poller that finds no posted device on the slice would leave the
-        // device's backlog holding these bytes for good.
-        const uint64_t post_ts = getCurrentTimeInNano();
-        int num_submitted = endpoint->submitSlices(
-            slices, tl_wid,
-            [&](RdmaSlice* posted) { markPosted(worker, posted, post_ts); });
-        for (int id = 0; id < num_submitted; ++id) {
-            auto slice = slices[id];
-            if (!slice->failed) continue;
+        auto handle_rejected = [&](RdmaSlice* slice, uint64_t post_ts) {
+            if (!slice->failed) return;
             // Rejected by the hardware: it never went on the wire, so take
             // back what the hook put in place.
             worker.inflight_slice_set.erase(slice);
@@ -804,7 +803,7 @@ void Workers::asyncPostSend() {
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
                 updateSliceStatus(slice, CANCELED);
                 discountFromOwner(worker, slice);
-                continue;
+                return;
             }
             slice->retry_count++;
             if (slice->retry_count >=
@@ -817,10 +816,67 @@ void Workers::asyncPostSend() {
             } else {
                 submitFromTick(worker, slice);
             }
+        };
+
+        const bool qp_pool_routing = endpoint->qpPoolRoutingEnabled();
+        if (qp_pool_routing) {
+            std::vector<RdmaSlice*> retained;
+            retained.reserve(slices.size());
+            for (auto* slice : slices) {
+                const int owner = endpoint->selectQpOwnerWorker(
+                    rdmaSliceQpPoolName(slice), tl_wid, num_workers_);
+                if (owner >= 0 && owner < static_cast<int>(num_workers_) &&
+                    owner != tl_wid) {
+                    submitFromTick(worker_context_[owner], slice);
+                } else {
+                    retained.push_back(slice);
+                }
+            }
+            slices.swap(retained);
+            if (slices.empty()) continue;
         }
 
-        if (num_submitted) {
-            slices.erase(slices.begin(), slices.begin() + num_submitted);
+        // Everything a completion's poller must find is written before the
+        // work request can reach the wire: with a shared queue pair another
+        // lane may poll the completion before submitSlices returns, and a
+        // poller that finds no posted device on the slice would leave the
+        // device's backlog holding these bytes for good.
+        if (!qp_pool_routing) {
+            const uint64_t post_ts = getCurrentTimeInNano();
+            int num_submitted = endpoint->submitSlices(
+                slices, tl_wid, [&](RdmaSlice* posted) {
+                    markPosted(worker, posted, post_ts);
+                });
+            for (int id = 0; id < num_submitted; ++id) {
+                handle_rejected(slices[id], post_ts);
+            }
+
+            if (num_submitted) {
+                slices.erase(slices.begin(), slices.begin() + num_submitted);
+            }
+            continue;
+        }
+
+        std::unordered_set<RdmaSlice*> submitted;
+        auto groups = groupSlicesByQpPool(slices);
+        for (auto& group : groups) {
+            const uint64_t post_ts = getCurrentTimeInNano();
+            int num_submitted = endpoint->submitSlices(
+                group.slices, tl_wid, [&](RdmaSlice* posted) {
+                    markPosted(worker, posted, post_ts);
+                });
+            for (int id = 0; id < num_submitted; ++id) {
+                auto* slice = group.slices[id];
+                handle_rejected(slice, post_ts);
+                submitted.insert(slice);
+            }
+        }
+        if (!submitted.empty()) {
+            slices.erase(std::remove_if(slices.begin(), slices.end(),
+                                        [&](RdmaSlice* slice) {
+                                            return submitted.count(slice) > 0;
+                                        }),
+                         slices.end());
         }
     }
 }

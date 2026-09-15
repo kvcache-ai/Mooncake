@@ -175,6 +175,11 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int submitSlices(std::vector<RdmaSlice*>& slice_list, int qp_index,
                      const std::function<void(RdmaSlice*)>& on_post = {});
 
+    int selectQpOwnerWorker(const std::string& qp_pool, int candidate,
+                            size_t num_workers);
+
+    bool qpPoolRoutingEnabled();
+
     int submitRecvImmDataRequest(int qp_index, uint64_t id);
 
     // Pop `slice` and every slice queued before it on the same QP, giving
@@ -196,10 +201,6 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int setupOneQP(int qp_index, const std::string& peer_gid, uint16_t peer_lid,
                    uint32_t peer_qp_num, int local_gid_index,
                    std::string* reply_msg = nullptr);
-
-    // Returns the pool segment owning qp_index, or nullptr when no pools are
-    // configured (the default single-pool case). Read-only after construct().
-    const QpPoolSegment* poolForQp(int qp_index) const;
 
     bool reserveQuota(int qp_index, int num_entries);
 
