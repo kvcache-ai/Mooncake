@@ -1,6 +1,7 @@
 .cache
 .vscode
 build
+build-xpu
 build_ofed4
 old
 local_test
