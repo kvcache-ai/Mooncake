@@ -34,6 +34,7 @@ if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   install(
     FILES
       ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control/adaptive_congestion_control.h
+      ${CMAKE_CURRENT_SOURCE_DIR}/../src/common/adaptive_congestion_control/task_congestion_observation.h
     DESTINATION include
     COMPONENT ${MOONCAKE_TRANSFER_ENGINE_HEADERS_COMPONENT})
 endif()
