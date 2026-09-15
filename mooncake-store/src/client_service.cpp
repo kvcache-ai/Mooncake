@@ -2508,7 +2508,7 @@ void Client::healDanglingLocalDiskBatchStarts(
             }
             continue;
         }
-        op.replicas = retry_responses[r].value();
+        op.replicas = std::move(retry_responses[r].value());
         op.RecordAllocatedReplicas();
         if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
             op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2590,7 +2590,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2680,7 +2680,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start upsert operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,

@@ -436,6 +436,10 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# Bundle OpenSSL when required: the OSS adapter links libcrypto directly, and
+# target systems may not provide the OpenSSL ABI used by the wheel builder.
+# Keep libssl eligible too, so auditwheel can repair its libcrypto dependency.
+#
 # `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
 # its own wheel / CMake install and is upgraded independently of Mooncake, so
 # engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
@@ -460,8 +464,6 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude librtmp.so* \
     --exclude libssh.so* \
     --exclude libpsl.so* \
-    --exclude libssl.so* \
-    --exclude libcrypto.so* \
     --exclude libgssapi_krb5.so* \
     --exclude libldap.so* \
     --exclude liblber.so* \

@@ -555,7 +555,13 @@ int TransferEnginePy::transferSync(const char* target_hostname,
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
                 handle_map_.erase(target_hostname);
             }
             return -1;
@@ -665,7 +671,13 @@ int TransferEnginePy::batchTransferSync(
                     << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
-                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                // Under MC_USE_TENT there is no classic metadata object
+                // (getMetadata() returns nullptr); TENT invalidates its own
+                // segment cache inside closeSegment(). Guard the classic-only
+                // cleanup so evicting a dead peer's handle cannot dereference
+                // a null metadata pointer. Refs #3995 (P0-stale-handle).
+                if (auto metadata = engine_->getMetadata())
+                    metadata->removeSegmentDesc(target_hostname);
                 handle_map_.erase(target_hostname);
             }
             return -1;
@@ -1158,13 +1170,12 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
         getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
 #ifdef USE_TENT
     if (use_tent) {
-        // The classic shim (TransferEngine(true, filter)) silently drops the
-        // filter on the TENT path and builds its own Config in init(), so
-        // inject the whitelist via the per-instance Config that TENT's public
-        // constructor already accepts. Avoids touching the process-global
-        // MC_TE_FILTERS env var (racey under concurrent callers, leaked on
-        // throw). Note: if MC_TE_FILTERS is also set in env, loadFromEnv()
-        // inside TransferEngineImpl will override this — env takes priority.
+        // This helper only needs topology, so use the native TENT Config path
+        // directly instead of constructing the classic compatibility shim.
+        // Keep the filter per-instance and avoid the process-global
+        // MC_TE_FILTERS environment variable, which is unsafe for concurrent
+        // callers. Explicit Config values take precedence over environment
+        // defaults inside TransferEngineImpl.
         auto conf = std::make_shared<mooncake::tent::Config>();
         conf->set("metadata_type", "p2p");
         if (!device_name_safe.empty()) {

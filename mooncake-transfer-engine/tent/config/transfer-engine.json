@@ -105,6 +105,15 @@
         },
         "mnnvl": {
             "enable" : false
+        },
+        "ascend_direct": {
+            "enable": true,
+            "transfer_timeout_ms": 10000,
+            "rdma_tc": "",
+            "rdma_sl": "",
+            "fabric_mem": false,
+            "global_resource_config": "",
+            "agent_mode": false
         }
     },
     "policy": [
