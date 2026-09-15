@@ -93,7 +93,7 @@ def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext, destroyed) -> None:
     # Destroy WORLD group
     dist.destroy_process_group(dist.group.WORLD)
     # Reinitialization should start after every old communicator unregisters.
-    destroyed.wait(timeout=60)
+    destroyed.wait(timeout=10)
 
     # Re-init
     device = ctx.init_group()
