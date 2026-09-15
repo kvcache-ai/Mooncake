@@ -228,6 +228,8 @@ void CtrlChannel::fillLocalDesc(HandShakeDesc &local_desc) const {
     local_desc.local_nic_path = context_.nicPath();
     local_desc.local_lid = context_.lid();
     local_desc.local_gid = context_.gid();
+    local_desc.local_mtu_bytes =
+        mtuLengthToBytes(localPathMtu(context_.activeMTU()));
     local_desc.peer_nic_path = "__ctrl__";
     local_desc.ctrl_channel = true;
     local_desc.notify_qp_num = notifyQpNum();
@@ -235,7 +237,7 @@ void CtrlChannel::fillLocalDesc(HandShakeDesc &local_desc) const {
 }
 
 int CtrlChannel::connectQp(const std::string &peer_gid, uint16_t peer_lid,
-                           uint32_t peer_qp_num) {
+                           uint32_t peer_qp_num, uint32_t peer_mtu_bytes) {
     if (!qp_ || peer_qp_num == 0) return ERR_INVALID_ARGUMENT;
 
     ibv_gid peer_gid_raw{};
@@ -280,9 +282,10 @@ int CtrlChannel::connectQp(const std::string &peer_gid, uint16_t peer_lid,
 
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTR;
-    attr.path_mtu = context_.activeMTU();
-    if (globalConfig().mtu_length < attr.path_mtu)
-        attr.path_mtu = globalConfig().mtu_length;
+    // Both ends of this RC QP must agree on the path MTU, so take the smaller
+    // of ours and the one the peer advertised.
+    attr.path_mtu =
+        negotiatePathMtu(localPathMtu(context_.activeMTU()), peer_mtu_bytes);
     attr.ah_attr.is_global = 1;
     attr.ah_attr.grh.dgid = peer_gid_raw;
     attr.ah_attr.grh.sgid_index = context_.gidIndex();
@@ -355,7 +358,7 @@ int CtrlChannel::connectActive() {
     {
         std::lock_guard<std::mutex> lock(resource_mutex_);
         ret = connectQp(peer_desc.local_gid, peer_desc.local_lid,
-                        peer_desc.notify_qp_num);
+                        peer_desc.notify_qp_num, peer_desc.local_mtu_bytes);
     }
     if (ret == 0) {
         LOG(INFO) << "CtrlChannel: connected to " << peer_server_name_
@@ -389,7 +392,7 @@ int CtrlChannel::acceptPassive(const HandShakeDesc &peer_desc,
         std::lock_guard<std::mutex> lock(resource_mutex_);
         fillLocalDesc(local_desc);
         ret = connectQp(peer_desc.local_gid, peer_desc.local_lid,
-                        peer_desc.notify_qp_num);
+                        peer_desc.notify_qp_num, peer_desc.local_mtu_bytes);
     }
     if (ret) {
         local_desc.reply_msg = "CtrlChannel connectQp failed";
