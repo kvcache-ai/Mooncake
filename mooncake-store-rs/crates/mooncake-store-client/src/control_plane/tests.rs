@@ -2059,6 +2059,7 @@ fn control_plane_server_direct_paths_cover_validation_and_stream_dispatch() {
             sharing_scope: String::new(),
             qos_tier: String::new(),
             cold_backing: None,
+            nof_backing: None,
         };
 
         let cas_reply = service

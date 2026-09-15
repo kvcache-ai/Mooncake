@@ -303,17 +303,6 @@ impl StoreClient {
             .map(|_| ())
     }
 
-    fn delete_nof_content_best_effort(&self, route: &ObjectRoute) {
-        if let Err(error) = self.delete_nof_content(route) {
-            warn!(
-                runtime = %self.lease.runtime,
-                key = %route.key.0,
-                error = %error,
-                "request-local NoF delete failed"
-            );
-        }
-    }
-
     fn retry_route_delete_conflict(
         &self,
         previous: &ObjectRoute,
