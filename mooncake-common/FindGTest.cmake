@@ -2,10 +2,6 @@ include_guard(GLOBAL)
 
 include(FetchContent)
 
-if(POLICY CMP0135)
-  cmake_policy(SET CMP0135 NEW)
-endif()
-
 # Keep test builds independent of the host distribution and Python environment.
 # In particular, manylinux images may expose headers from /opt/conda while
 # dependencies.sh installs an incompatible system gtest library.
