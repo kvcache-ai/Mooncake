@@ -304,7 +304,6 @@ pub(super) async fn handle_manage_nof_backing(
         pb::ManagedNofRouteAction::Prepare => ManagedNofRouteAction::Prepare,
         pb::ManagedNofRouteAction::Publish => ManagedNofRouteAction::Publish,
         pb::ManagedNofRouteAction::Release => ManagedNofRouteAction::Release,
-        pb::ManagedNofRouteAction::Materialize => ManagedNofRouteAction::Materialize,
         pb::ManagedNofRouteAction::Unspecified => {
             return Err(Status::invalid_argument(
                 "manage_nof_backing requires a valid action",
@@ -314,9 +313,8 @@ pub(super) async fn handle_manage_nof_backing(
     let target_id = request.target_id;
     let length = request.length;
     let checksum = request.checksum;
-    let payload = request.payload;
     let reply = run_blocking_control("manage_nof_backing", move || {
-        match cold_tier.manage_nof_backing(target_id, action, route, length, checksum, payload) {
+        match cold_tier.manage_nof_backing(target_id, action, route, length, checksum) {
             Ok(route) => pb::ManageNofBackingReply {
                 route: Some(pb_object_route(&route)),
                 error: None,

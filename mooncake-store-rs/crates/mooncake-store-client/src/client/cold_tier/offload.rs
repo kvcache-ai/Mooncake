@@ -834,24 +834,11 @@ fn materialize_managed_nof_batch(
     pending: &[PendingOffloadMaterialization],
     first_error: &mut Option<StoreError>,
 ) -> Result<usize> {
+    let errors = write_pending_nof_targets(storage_owner, pending, "managed NoF");
     let mut materialized = 0usize;
-    for prepared in pending {
-        match storage_owner
-            .cold_tier_devices
-            .nof_targets
-            .materialize_managed_route(prepared.route.clone(), prepared.payload.as_slice())
-        {
-            Ok(route) => {
-                if let Some(permit) = prepared.permit.as_ref() {
-                    permit.complete_ok();
-                }
-                storage_owner.sync_route(&route);
-                storage_owner.pending_offloads.complete(&prepared.entry.key);
-                registry::record_cold_tier_operation("offload", "materialized", "none");
-                storage_owner.cold_tier_devices.pressure_decrement_pending();
-                materialized = materialized.saturating_add(1);
-            }
-            Err(error) => {
+    for (prepared, write_error) in pending.iter().zip(errors) {
+        match write_error {
+            Some(error) => {
                 if let Some(permit) = prepared.permit.as_ref() {
                     permit.complete_error();
                 }
@@ -865,6 +852,36 @@ fn materialize_managed_nof_batch(
                 }
                 storage_owner.pending_offloads.retry(prepared.entry.clone());
             }
+            None => match storage_owner
+                .cold_tier_devices
+                .nof_targets
+                .publish_managed_route(prepared.route.clone())
+            {
+                Ok(route) => {
+                    if let Some(permit) = prepared.permit.as_ref() {
+                        permit.complete_ok();
+                    }
+                    storage_owner.sync_route(&route);
+                    storage_owner.pending_offloads.complete(&prepared.entry.key);
+                    registry::record_cold_tier_operation("offload", "materialized", "none");
+                    storage_owner.cold_tier_devices.pressure_decrement_pending();
+                    materialized = materialized.saturating_add(1);
+                }
+                Err(error) => {
+                    if let Some(permit) = prepared.permit.as_ref() {
+                        permit.complete_error();
+                    }
+                    registry::record_cold_tier_operation(
+                        "offload",
+                        "error",
+                        registry::cold_tier_error_kind(&error),
+                    );
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
+                    storage_owner.pending_offloads.retry(prepared.entry.clone());
+                }
+            },
         }
     }
     if materialized > 0 {
@@ -884,7 +901,7 @@ fn materialize_transient_nof_batch(
             "NoF and local Cold Tier writes cannot share one backend batch".to_string(),
         ));
     }
-    let errors = write_pending_nof_targets(storage_owner, pending, "NoF")?;
+    let errors = write_pending_nof_targets(storage_owner, pending, "NoF");
     let mut completed = 0usize;
     for (prepared, error) in pending.iter().zip(errors) {
         match error {
@@ -917,7 +934,7 @@ fn write_pending_nof_targets(
     storage_owner: &StorageOwnerState,
     pending: &[PendingOffloadMaterialization],
     operation: &str,
-) -> Result<Vec<Option<StoreError>>> {
+) -> Vec<Option<StoreError>> {
     let mut target_writes =
         BTreeMap::<String, Vec<(usize, mooncake_store_core::ColdBackingRoute)>>::new();
     for (index, prepared) in pending.iter().enumerate() {
@@ -964,7 +981,7 @@ fn write_pending_nof_targets(
             }
         }
     }
-    Ok(errors)
+    errors
 }
 
 fn retry_pending_offload_batch(

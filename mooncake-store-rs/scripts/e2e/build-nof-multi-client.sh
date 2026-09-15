@@ -69,10 +69,8 @@ for library in libspdk_nvme.so libspdk_env_dpdk.so; do
   }
 done
 
-source "${HOME}/.cargo/env" 2>/dev/null || true
-# Keep the build contract explicit. The four-node test is intentionally
-# CPU-only and must be reproducible from the locked dependency graph.
-# The four NoF initiators are CPU-only. Do not let CUDA headers in the build
+# Keep the multi-node build reproducible from the locked dependency graph.
+# Initiators are CPU-only by default. Do not let CUDA headers in the build
 # container enable CUDA code paths that require a GPU at runtime. Set
 # MOONCAKE_ENABLE_CUDA=1 explicitly only for a GPU-capable validation host.
 export MOONCAKE_ENABLE_CUDA="${MOONCAKE_ENABLE_CUDA:-0}"

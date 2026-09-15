@@ -11,20 +11,16 @@ REDIS_URL="${NOF_REDIS_URL:-redis://127.0.0.1:6379/0}"
 BIND_IP="${NOF_BIND_IP:-127.0.0.1}"
 HOST_NQN="${NOF_HOST_NQN:-}"
 SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-${MOONCAKE_SPDK_PREFIX:+${MOONCAKE_SPDK_PREFIX}/install/lib}}"
-RESET_TARGETS="${NOF_RESET_TARGETS:-0}"
 SKIP_TARGET_SSH_CHECK="${NOF_SKIP_TARGET_SSH_CHECK:-1}"
 NVMF_SERVICE="${NOF_NVMF_SERVICE:-}"
-TARGET_IMAGE="${NOF_TARGET_IMAGE:-}"
 TIMEOUT_SECONDS="${NOF_CLIENT_TIMEOUT_SECONDS:-180}"
 ENABLE_CORES="${NOF_ENABLE_CORES:-0}"
 STARTUP_SETTLE_SECONDS="${NOF_STARTUP_SETTLE_SECONDS:-2}"
-TEST_IMAGE_BYTES="${NOF_TEST_IMAGE_BYTES:-16G}"
 ROUTE_CONTROL="${NOF_ROUTE_CONTROL:-EmbeddedWrh}"
 RPC_BASE_PORT="${NOF_RPC_BASE_PORT:-21000}"
 CLIENT_IDS_SPEC="${NOF_CLIENT_IDS:-client-0}"
 LOCAL_CLIENT_IDS_SPEC="${NOF_LOCAL_CLIENT_IDS:-${CLIENT_IDS_SPEC}}"
 TARGETS_SPEC="${NOF_TARGETS:-}"
-BARRIER_DIR="${NOF_BARRIER_DIR:-${LOG_DIR}/${RUN_TAG}/barrier}"
 
 [[ -x "${BINARY}" ]] || { echo "NOF_BINARY is not executable: ${BINARY}" >&2; exit 1; }
 [[ -n "${SPDK_LIB_DIR}" ]] || { echo "NOF_SPDK_LIB_DIR is required, or set MOONCAKE_SPDK_PREFIX" >&2; exit 1; }
@@ -63,24 +59,6 @@ if ! ldconfig -p 2>/dev/null | grep -q 'libaio.so.1 ('; then
   if [[ -n "${libaio_compat}" ]]; then
     ln -sfn "${libaio_compat}" "${RUNTIME_LIB_DIR}/libaio.so.1"
   fi
-fi
-
-reset_target() {
-  local public_ip="$1"
-  [[ -n "${NVMF_SERVICE}" && -n "${TARGET_IMAGE}" ]] || {
-    echo "NOF_NVMF_SERVICE and NOF_TARGET_IMAGE are required when NOF_RESET_TARGETS=1" >&2
-    exit 1
-  }
-  ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${public_ip}" \
-    "set -euo pipefail; systemctl stop '${NVMF_SERVICE}'; mkdir -p -- \"\$(dirname '${TARGET_IMAGE}')\"; rm -f '${TARGET_IMAGE}'; truncate -s '${TEST_IMAGE_BYTES}' '${TARGET_IMAGE}'; systemctl start '${NVMF_SERVICE}'; test \"\$(systemctl is-active '${NVMF_SERVICE}')\" = active"
-}
-
-if [[ "${RESET_TARGETS}" == 1 ]]; then
-  for target in "${TARGETS[@]}"; do
-    IFS='|' read -r public_ip lan_ip target_id subnqn port transport <<<"${target}"
-    echo "resetting NoF backing on ${public_ip} (${lan_ip}, ${target_id})"
-    reset_target "${public_ip}"
-  done
 fi
 
 check_target_endpoint() {
@@ -143,8 +121,6 @@ if grep -Eq 'not found|undefined symbol:' <<<"${RUNTIME_DEPS}"; then
   printf '%s\n' "${RUNTIME_DEPS}" >&2
   exit 1
 fi
-rm -rf "${BARRIER_DIR}"
-mkdir -p "${BARRIER_DIR}"
 {
   printf 'binary=%s\n' "${BINARY}"
   sha256sum "${BINARY}"
@@ -153,7 +129,7 @@ mkdir -p "${BARRIER_DIR}"
   printf 'host_nqn=%s\n' "${HOST_NQN:-<default>}"
   printf 'target_inventory=%s\nclient_ids=%s\nlocal_client_ids=%s\nroute_control=%s\n' \
     "${TARGETS_SPEC}" "${CLIENT_IDS_SPEC}" "${LOCAL_CLIENT_IDS_SPEC}" "${ROUTE_CONTROL}"
-  printf 'nvmf_service=%s\ntarget_image=%s\n' "${NVMF_SERVICE}" "${TARGET_IMAGE}"
+  printf 'nvmf_service=%s\n' "${NVMF_SERVICE}"
   printf 'startup_settle_seconds=%s read_protocol=parallel_batch_get_into\n' \
     "${STARTUP_SETTLE_SECONDS}"
   printf 'hostname=%s\n' "$(hostname)"
@@ -175,10 +151,7 @@ export NOF_CLIENT_IDS="${CLIENT_IDS_SPEC}"
 export NOF_ROUTE_CONTROL="${ROUTE_CONTROL}"
 export NOF_STARTUP_SETTLE_SECONDS="${STARTUP_SETTLE_SECONDS}"
 export MC_STORE_RS_ENABLE_COLD_TIER="${MC_STORE_RS_ENABLE_COLD_TIER:-1}"
-export NOF_BARRIER_DIR="${BARRIER_DIR}"
-if [[ -n "${NOF_BARRIER_REDIS_URL:-}" ]]; then
-  export NOF_BARRIER_REDIS_URL
-fi
+export NOF_BARRIER_REDIS_URL="${NOF_BARRIER_REDIS_URL:-${REDIS_URL}}"
 
 pids=()
 for index in "${!local_clients[@]}"; do

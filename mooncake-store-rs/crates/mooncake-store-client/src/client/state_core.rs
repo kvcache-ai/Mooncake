@@ -627,7 +627,7 @@ impl LocalAllocatorState {
 struct SegmentAllocator {
     announcement: SegmentAnnouncement,
     cursor_bytes: u64,
-    free_spans: Vec<FreeSpan>,
+    free_spans: FreeSpanSet,
     allocations: BTreeMap<u64, u64>,
 }
 
@@ -636,7 +636,7 @@ impl SegmentAllocator {
         Self {
             cursor_bytes: announcement.used_bytes,
             announcement,
-            free_spans: Vec::new(),
+            free_spans: FreeSpanSet::default(),
             allocations: BTreeMap::new(),
         }
     }
@@ -698,19 +698,7 @@ impl SegmentAllocator {
         let alignment = self.announcement.alignment_bytes.max(1);
         let reserved_len = align_up_u64(length_bytes, alignment);
 
-        if let Some(index) = self
-            .free_spans
-            .iter()
-            .position(|span| span.length_bytes >= reserved_len)
-        {
-            let span = self.free_spans.remove(index);
-            if span.length_bytes > reserved_len {
-                self.free_spans.push(FreeSpan {
-                    offset_bytes: span.offset_bytes + reserved_len,
-                    length_bytes: span.length_bytes - reserved_len,
-                });
-                self.free_spans.sort_by_key(|entry| entry.offset_bytes);
-            }
+        if let Some(offset_bytes) = self.free_spans.take_first_fit(reserved_len) {
             self.announcement.used_bytes = self
                 .announcement
                 .used_bytes
@@ -718,11 +706,11 @@ impl SegmentAllocator {
                 .ok_or_else(|| {
                 StoreError::Allocator("segment reservation overflow".to_string())
             })?;
-            self.allocations.insert(span.offset_bytes, length_bytes);
+            self.allocations.insert(offset_bytes, length_bytes);
             return Ok(mooncake_store_core::SegmentReservation {
                 owner: owner.clone(),
                 segment_name: segment_name.clone(),
-                offset_bytes: span.offset_bytes,
+                offset_bytes,
                 length_bytes,
             });
         }
@@ -785,7 +773,7 @@ impl SegmentAllocator {
                 owner, segment_name.0, offset_bytes, reserved, length_bytes
             )));
         }
-        self.insert_free_span(offset_bytes, reserved_len);
+        self.free_spans.insert(offset_bytes, reserved_len);
         self.announcement.used_bytes = self.announcement.used_bytes.saturating_sub(reserved_len);
         self.trim_tail();
         if self.announcement.used_bytes == 0 {
@@ -798,36 +786,11 @@ impl SegmentAllocator {
 
     fn trim_tail(&mut self) {
         loop {
-            let Some(last) = self.free_spans.last().cloned() else {
+            let Some(offset_bytes) = self.free_spans.take_tail_ending(self.cursor_bytes) else {
                 return;
             };
-            if last.offset_bytes + last.length_bytes != self.cursor_bytes {
-                return;
-            }
-            self.cursor_bytes = last.offset_bytes;
-            self.free_spans.pop();
+            self.cursor_bytes = offset_bytes;
         }
-    }
-
-    fn insert_free_span(&mut self, offset_bytes: u64, length_bytes: u64) {
-        self.free_spans.push(FreeSpan {
-            offset_bytes,
-            length_bytes,
-        });
-        self.free_spans.sort_by_key(|entry| entry.offset_bytes);
-        let mut merged: Vec<FreeSpan> = Vec::with_capacity(self.free_spans.len());
-        for span in self.free_spans.drain(..) {
-            if let Some(previous) = merged.last_mut() {
-                let prev_end = previous.offset_bytes + previous.length_bytes;
-                if prev_end >= span.offset_bytes {
-                    let merged_end = prev_end.max(span.offset_bytes + span.length_bytes);
-                    previous.length_bytes = merged_end - previous.offset_bytes;
-                    continue;
-                }
-            }
-            merged.push(span);
-        }
-        self.free_spans = merged;
     }
 }
 
@@ -835,6 +798,98 @@ impl SegmentAllocator {
 struct FreeSpan {
     offset_bytes: u64,
     length_bytes: u64,
+}
+
+/// Ordered free-space set shared by memory segments and managed block backends.
+#[derive(Default)]
+pub(in crate::client) struct FreeSpanSet {
+    spans: Vec<FreeSpan>,
+}
+
+impl FreeSpanSet {
+    #[cfg(feature = "nof-spdk")]
+    pub(in crate::client) fn from_range(offset_bytes: u64, length_bytes: u64) -> Self {
+        let mut set = Self::default();
+        set.insert(offset_bytes, length_bytes);
+        set
+    }
+
+    pub(in crate::client) fn take_first_fit(&mut self, length_bytes: u64) -> Option<u64> {
+        let index = self
+            .spans
+            .iter()
+            .position(|span| span.length_bytes >= length_bytes)?;
+        let offset_bytes = self.spans[index].offset_bytes;
+        self.spans[index].offset_bytes += length_bytes;
+        self.spans[index].length_bytes -= length_bytes;
+        if self.spans[index].length_bytes == 0 {
+            self.spans.remove(index);
+        }
+        Some(offset_bytes)
+    }
+
+    pub(in crate::client) fn insert(&mut self, offset_bytes: u64, length_bytes: u64) {
+        if length_bytes == 0 {
+            return;
+        }
+        self.spans.push(FreeSpan {
+            offset_bytes,
+            length_bytes,
+        });
+        self.spans.sort_by_key(|span| span.offset_bytes);
+        let mut merged: Vec<FreeSpan> = Vec::with_capacity(self.spans.len());
+        for span in self.spans.drain(..) {
+            if let Some(previous) = merged.last_mut() {
+                let previous_end = previous.offset_bytes.saturating_add(previous.length_bytes);
+                if previous_end >= span.offset_bytes {
+                    let span_end = span.offset_bytes.saturating_add(span.length_bytes);
+                    previous.length_bytes = previous_end.max(span_end) - previous.offset_bytes;
+                    continue;
+                }
+            }
+            merged.push(span);
+        }
+        self.spans = merged;
+    }
+
+    #[cfg(feature = "nof-spdk")]
+    pub(in crate::client) fn contains(&self, offset_bytes: u64, length_bytes: u64) -> bool {
+        let Some(end) = offset_bytes.checked_add(length_bytes) else {
+            return false;
+        };
+        self.spans.iter().any(|span| {
+            span.offset_bytes <= offset_bytes
+                && end <= span.offset_bytes.saturating_add(span.length_bytes)
+        })
+    }
+
+    #[cfg(feature = "nof-spdk")]
+    pub(in crate::client) fn overlaps(&self, offset_bytes: u64, length_bytes: u64) -> bool {
+        let Some(end) = offset_bytes.checked_add(length_bytes) else {
+            return true;
+        };
+        self.spans.iter().any(|span| {
+            offset_bytes < span.offset_bytes.saturating_add(span.length_bytes)
+                && span.offset_bytes < end
+        })
+    }
+
+    #[cfg(feature = "nof-spdk")]
+    pub(in crate::client) fn total_bytes(&self) -> u64 {
+        self.spans.iter().map(|span| span.length_bytes).sum()
+    }
+
+    fn take_tail_ending(&mut self, end: u64) -> Option<u64> {
+        let last = self.spans.last()?;
+        if last.offset_bytes.saturating_add(last.length_bytes) != end {
+            return None;
+        }
+        self.spans.pop().map(|span| span.offset_bytes)
+    }
+
+    fn clear(&mut self) {
+        self.spans.clear();
+    }
 }
 
 #[derive(Clone)]

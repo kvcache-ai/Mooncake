@@ -16,11 +16,14 @@ use std::thread::{self, JoinHandle};
 use io_uring::{opcode, squeue, types, IoUring};
 use parking_lot::Condvar;
 
-const EXTENT_STORE_LOCATOR_PREFIX: &str = "extent-store-v1";
-const EXTENT_STORE_MAGIC: u32 = 0x4d45_5354; // MEST
-const EXTENT_STORE_HEADER_LEN: usize = 64;
-const EXTENT_STORE_RECORD_KIND_SINGLE: u16 = 0;
-const EXTENT_STORE_RECORD_KIND_PACKED: u16 = 1;
+#[cfg(test)]
+use super::extent_store_format::{parse_locator_hex, EXTENT_STORE_MAGIC};
+use super::extent_store_format::{
+    scan_extent_store_headers, ExtentStoreLocator, ExtentStoreRecordHeader, EXTENT_STORE_ALIGNMENT,
+    EXTENT_STORE_HEADER_LEN, EXTENT_STORE_LOCATOR_PREFIX, EXTENT_STORE_RECORD_KIND_PACKED,
+    EXTENT_STORE_RECORD_KIND_SINGLE,
+};
+
 const EXTENT_STORE_DENSE_COALESCE_MAX_VALUE_LEN: u64 = 4 * 1024;
 const EXTENT_STORE_PACKED_BLOCK_TARGET_BYTES: u64 = 320 * 1024;
 const EXTENT_STORE_PACKED_BLOCK_MAX_ENTRIES: u64 = 64;
@@ -67,7 +70,6 @@ const EXTENT_STORE_IOURING_READS_ENV: &str = "MC_STORE_RS_EXTENT_IOURING_READS";
 const EXTENT_STORE_DELETE_JOURNAL_MAGIC: u32 = 0x4d45_5344; // MESD
 const EXTENT_STORE_DELETE_JOURNAL_VERSION: u16 = 1;
 const EXTENT_STORE_DELETE_JOURNAL_RECORD_LEN: usize = 64;
-const EXTENT_STORE_ALIGNMENT: u64 = 4096;
 const DEFAULT_EXTENT_STORE_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
 const DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_EXTENT_STORE_IO_WORKER_READ_PIPELINE_MAX_INFLIGHT_OPS: usize = 32;
@@ -153,82 +155,6 @@ struct ExtentStoreIoUringRsrcUpdate2 {
     tags: u64,
     nr: u32,
     resv2: u32,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExtentStoreLocator {
-    segment_id: u64,
-    offset: u64,
-    record_len: u64,
-    value_offset: u64,
-    value_len: u64,
-    generation: u64,
-}
-
-impl ExtentStoreLocator {
-    fn block_key(&self) -> (u64, u64, u64) {
-        (self.segment_id, self.offset, self.record_len)
-    }
-}
-
-impl ExtentStoreLocator {
-    fn encode(&self) -> String {
-        format!(
-            "{EXTENT_STORE_LOCATOR_PREFIX}:{:x}:{:x}:{:x}:{:x}:{:x}:{:x}",
-            self.segment_id,
-            self.offset,
-            self.record_len,
-            self.value_offset,
-            self.value_len,
-            self.generation
-        )
-    }
-
-    fn decode(value: &str) -> Result<Self> {
-        let mut parts = value.split(':');
-        let Some(prefix) = parts.next() else {
-            return Err(StoreError::InvalidState(
-                "empty extent store locator".to_string(),
-            ));
-        };
-        if prefix != EXTENT_STORE_LOCATOR_PREFIX {
-            return Err(StoreError::InvalidState(format!(
-                "invalid extent store locator prefix {prefix:?}"
-            )));
-        }
-        let segment_id = parse_locator_hex(parts.next(), "segment_id")?;
-        let offset = parse_locator_hex(parts.next(), "offset")?;
-        let record_len = parse_locator_hex(parts.next(), "record_len")?;
-        let value_offset = parse_locator_hex(parts.next(), "value_offset")?;
-        let value_len = parse_locator_hex(parts.next(), "value_len")?;
-        let generation = parse_locator_hex(parts.next(), "generation")?;
-        if parts.next().is_some() {
-            return Err(StoreError::InvalidState(format!(
-                "extent store locator has too many fields: {value}"
-            )));
-        }
-        Ok(Self {
-            segment_id,
-            offset,
-            record_len,
-            value_offset,
-            value_len,
-            generation,
-        })
-    }
-}
-
-fn parse_locator_hex(value: Option<&str>, field: &str) -> Result<u64> {
-    let Some(value) = value else {
-        return Err(StoreError::InvalidState(format!(
-            "extent store locator missing {field}"
-        )));
-    };
-    u64::from_str_radix(value, 16).map_err(|error| {
-        StoreError::InvalidState(format!(
-            "extent store locator field {field}={value:?} is not hex: {error}"
-        ))
-    })
 }
 
 struct ExtentStoreEngine {
@@ -772,6 +698,13 @@ impl Drop for ExtentStoreIoPriorityPermit<'_> {
 }
 
 impl ExtentStoreBufferPool {
+    pub(super) fn new_untracked(max_bytes: usize) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self::new_with_max_bytes(
+            std::sync::Arc::new(ExtentStoreIoCounters::default()),
+            max_bytes,
+        ))
+    }
+
     fn new(counters: std::sync::Arc<ExtentStoreIoCounters>) -> Self {
         Self::new_with_max_bytes(counters, EXTENT_STORE_RECORD_BUFFER_POOL_MAX_BYTES)
     }
@@ -790,7 +723,7 @@ impl ExtentStoreBufferPool {
         }
     }
 
-    fn lease(self: &std::sync::Arc<Self>, len: usize) -> Result<ExtentStoreBufferLease> {
+    pub(super) fn lease(self: &std::sync::Arc<Self>, len: usize) -> Result<ExtentStoreBufferLease> {
         if len > self.max_bytes {
             return Err(StoreError::Backpressure(format!(
                 "extent store record buffer {len} exceeds pool budget {}",
@@ -4080,14 +4013,15 @@ fn encode_extent_store_record<'a>(
     buffer_pool: &std::sync::Arc<ExtentStoreBufferPool>,
 ) -> Result<EncodedExtentStoreRecord<'a>> {
     let logical_locator = logical_locator.as_bytes();
-    let value_len = payload.len() as u64;
-    let minimum_value_offset = EXTENT_STORE_HEADER_LEN as u64 + logical_locator.len() as u64;
-    // Match the OffsetAllocator backend's on-disk contract: the value starts
-    // at an aligned file offset and the complete record occupies an aligned
-    // extent. Logical value_len remains unpadded in the header and locator;
-    // only record_len includes trailing zero padding.
-    let value_offset = align_up(minimum_value_offset, EXTENT_STORE_ALIGNMENT);
-    let record_len = align_up(value_offset + value_len, EXTENT_STORE_ALIGNMENT);
+    let record_header = ExtentStoreRecordHeader::single(
+        logical_locator.len(),
+        payload.len() as u64,
+        checksum.unwrap_or_else(|| payload_checksum(payload)),
+        EXTENT_STORE_ALIGNMENT,
+    )?;
+    let value_offset = record_header.value_offset;
+    let value_len = record_header.value_len;
+    let record_len = record_header.record_len;
     if record_len > usize::MAX as u64 {
         return Err(StoreError::InvalidState(format!(
             "extent store record length {record_len} exceeds addressable memory"
@@ -4096,15 +4030,7 @@ fn encode_extent_store_record<'a>(
     let value_offset_usize = value_offset as usize;
     let mut prefix = buffer_pool.lease(value_offset_usize)?;
     prefix[..value_offset_usize].fill(0);
-    encode_record_header(
-        &mut prefix[..EXTENT_STORE_HEADER_LEN],
-        EXTENT_STORE_RECORD_KIND_SINGLE,
-        logical_locator.len() as u64,
-        value_len,
-        checksum.unwrap_or_else(|| payload_checksum(payload)),
-        value_offset,
-        record_len,
-    );
+    record_header.encode_into(&mut prefix[..EXTENT_STORE_HEADER_LEN]);
     let key_start = EXTENT_STORE_HEADER_LEN;
     let key_end = key_start + logical_locator.len();
     prefix[key_start..key_end].copy_from_slice(logical_locator);
@@ -4156,15 +4082,15 @@ fn encode_record_header(
     value_offset: u64,
     record_len: u64,
 ) {
-    encode_record_header_without_checksum(
-        header,
+    ExtentStoreRecordHeader {
         record_kind,
         key_len,
         value_len,
+        checksum,
         value_offset,
         record_len,
-    );
-    header[24..32].copy_from_slice(&checksum.to_le_bytes());
+    }
+    .encode_into(header);
 }
 
 fn encode_record_header_without_checksum(
@@ -4175,15 +4101,15 @@ fn encode_record_header_without_checksum(
     value_offset: u64,
     record_len: u64,
 ) {
-    debug_assert!(header.len() >= EXTENT_STORE_HEADER_LEN);
-    header[0..4].copy_from_slice(&EXTENT_STORE_MAGIC.to_le_bytes());
-    header[4..6].copy_from_slice(&(EXTENT_STORE_HEADER_LEN as u16).to_le_bytes());
-    header[6..8].copy_from_slice(&record_kind.to_le_bytes());
-    header[8..16].copy_from_slice(&key_len.to_le_bytes());
-    header[16..24].copy_from_slice(&value_len.to_le_bytes());
-    header[24..32].fill(0);
-    header[32..40].copy_from_slice(&value_offset.to_le_bytes());
-    header[40..48].copy_from_slice(&record_len.to_le_bytes());
+    encode_record_header(
+        header,
+        record_kind,
+        key_len,
+        value_len,
+        0,
+        value_offset,
+        record_len,
+    );
 }
 
 include!("extent_store_cold_backend.rs");

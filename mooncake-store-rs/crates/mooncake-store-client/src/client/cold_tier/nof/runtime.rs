@@ -348,7 +348,6 @@ impl NofTargetManager {
         route: ObjectRoute,
         length: u64,
         checksum: Option<u64>,
-        payload: Option<&[u8]>,
     ) -> Result<ObjectRoute> {
         if !self.is_managed() {
             return Err(StoreError::Unsupported(
@@ -526,43 +525,6 @@ impl NofTargetManager {
                 self.mirror_managed_route(&next);
                 Ok(next)
             }
-            ManagedNofRouteAction::Materialize => {
-                let payload = payload.ok_or_else(|| {
-                    StoreError::InvalidState("managed NoF materialize requires payload".to_string())
-                })?;
-                if length != payload.len() as u64 {
-                    return Err(StoreError::InvalidState(format!(
-                        "managed NoF materialize length mismatch: route={length} payload={}",
-                        payload.len()
-                    )));
-                }
-                let backing = managed_target_cold_backing(&route, target_id)?;
-                let backend = self
-                    .managed_targets
-                    .get(target_id)
-                    .ok_or_else(|| {
-                        StoreError::NotFound(format!(
-                            "managed NoF target {target_id} is not registered"
-                        ))
-                    })
-                    .map(|backend| NofManagedStorageBackend::new(backend.clone()))?;
-                backend.put_object(&backing, payload)?;
-                if route
-                    .nof_backing
-                    .as_ref()
-                    .is_some_and(|backing| backing.target_id != target_id)
-                {
-                    return Ok(route);
-                }
-                self.manage_managed_route(
-                    target_id,
-                    ManagedNofRouteAction::Publish,
-                    route,
-                    length,
-                    checksum,
-                    None,
-                )
-            }
         }
     }
 
@@ -718,7 +680,6 @@ impl NofTargetManager {
                 managed_route,
                 length,
                 Some(checksum),
-                None,
             )?;
         }
         let backing = managed_route
@@ -746,7 +707,6 @@ impl NofTargetManager {
             route.clone(),
             backing.length,
             backing.checksum,
-            None,
         )
     }
 
@@ -766,7 +726,6 @@ impl NofTargetManager {
             route,
             length,
             checksum,
-            None,
         )
     }
 
@@ -813,66 +772,20 @@ impl NofTargetManager {
         route: ObjectRoute,
         length: u64,
         checksum: Option<u64>,
-        payload: Option<&[u8]>,
     ) -> Result<ObjectRoute> {
         let owner = self.state.owner_for(target_id).ok_or_else(|| {
             StoreError::Transport(format!("NoF target {target_id} has no live owner"))
         })?;
         if owner == self.state.local_runtime {
-            return self.manage_managed_route(target_id, action, route, length, checksum, payload);
+            return self.manage_managed_route(target_id, action, route, length, checksum);
         }
         let lease = self.state.owner_lease(target_id).ok_or_else(|| {
             StoreError::Transport(format!(
                 "NoF target {target_id} owner {owner} has no live lease"
             ))
         })?;
-        self.control_client.manage_nof_backing(
-            &lease,
-            target_id,
-            action,
-            &route,
-            (length, checksum),
-            payload,
-        )
-    }
-
-    pub(in crate::client) fn materialize_managed_route(
-        &self,
-        route: ObjectRoute,
-        payload: &[u8],
-    ) -> Result<ObjectRoute> {
-        let backing = route
-            .nof_backing
-            .as_ref()
-            .ok_or_else(|| StoreError::InvalidState("managed NoF route is missing".to_string()))?;
-        let primary_target = backing.target_id.clone();
-        let mut target_ids = backing
-            .replicas
-            .iter()
-            .map(|replica| replica.target_id.clone())
-            .collect::<Vec<_>>();
-        target_ids.push(primary_target);
-        let mut current = route;
-        for target_id in target_ids {
-            let (length, checksum) = current
-                .nof_backing
-                .as_ref()
-                .map(|backing| (backing.length, backing.checksum))
-                .ok_or_else(|| {
-                    StoreError::InvalidState(
-                        "managed NoF route disappeared during materialize".to_string(),
-                    )
-                })?;
-            current = self.dispatch_managed_route_action(
-                &target_id,
-                ManagedNofRouteAction::Materialize,
-                current,
-                length,
-                checksum,
-                Some(payload),
-            )?;
-        }
-        Ok(current)
+        self.control_client
+            .manage_nof_backing(&lease, target_id, action, &route, length, checksum)
     }
 
     fn transient_backing(&self, target_id: &str, object_locator: &str) -> ColdBackingRoute {

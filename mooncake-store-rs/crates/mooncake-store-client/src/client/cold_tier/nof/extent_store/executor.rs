@@ -10,9 +10,14 @@ use parking_lot::Mutex;
 
 use mooncake_store_core::{Result, StoreError};
 
+use crate::client::extent_store_engine::ExtentStoreBufferPool;
+use crate::client::extent_store_format::{
+    align_up_checked, scan_extent_store_headers, ExtentStoreLocator, ExtentStoreRecordHeader,
+    EXTENT_STORE_ALIGNMENT, EXTENT_STORE_HEADER_LEN, EXTENT_STORE_RECORD_KIND_SINGLE,
+};
 use crate::client::{
     decode_cold_object_manifest, encode_cold_object_manifest, payload_checksum, ColdObjectManifest,
-    ColdPayloadMetadata, RecoveredColdObject,
+    ColdPayloadMetadata, FreeSpanSet, RecoveredColdObject,
 };
 
 use super::super::backing::NofBacking;
@@ -23,10 +28,6 @@ use super::super::managed::{
 };
 use super::super::physical::{NofHealth, NofStorageHealth};
 
-const RECORD_MAGIC: &[u8; 8] = b"NOFEXT01";
-const LOCATOR_MAGIC: &[u8; 8] = b"NOFLOC01";
-const RECORD_HEADER_LEN: usize = 64;
-const DEFAULT_ALIGNMENT: u64 = 4096;
 const DEFAULT_MAX_BATCH_ITEMS: usize = 1024;
 
 #[derive(Clone, Debug)]
@@ -41,65 +42,20 @@ impl ExtentStoreExecutorConfig {
         Self {
             start_offset,
             device_bytes,
-            alignment: DEFAULT_ALIGNMENT,
+            alignment: EXTENT_STORE_ALIGNMENT,
         }
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExtentLocator {
-    offset: u64,
-    record_len: u64,
-    payload_len: u64,
-}
-
-impl ExtentLocator {
-    fn to_managed(self) -> Result<NofManagedLocator> {
-        let mut bytes = Vec::with_capacity(32);
-        bytes.extend_from_slice(LOCATOR_MAGIC);
-        bytes.extend_from_slice(&self.offset.to_le_bytes());
-        bytes.extend_from_slice(&self.record_len.to_le_bytes());
-        bytes.extend_from_slice(&self.payload_len.to_le_bytes());
-        NofManagedLocator::new(bytes)
-    }
-
-    fn from_managed(locator: &NofManagedLocator) -> Result<Self> {
-        let bytes = locator.as_bytes();
-        if bytes.len() != 32 || &bytes[..8] != LOCATOR_MAGIC {
-            return Err(StoreError::InvalidState(
-                "invalid managed ExtentStore locator".to_string(),
-            ));
-        }
-        Ok(Self {
-            offset: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            record_len: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            payload_len: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
-        })
-    }
-}
-
-#[derive(Clone, Copy)]
-struct FreeRange {
-    offset: u64,
-    len: u64,
 }
 
 struct AllocatorState {
-    free: Vec<FreeRange>,
+    free: FreeSpanSet,
     reserved: BTreeMap<Vec<u8>, ReservedRecord>,
 }
 
 #[derive(Clone)]
 struct ReservedRecord {
-    locator: ExtentLocator,
+    locator: ExtentStoreLocator,
     manifest: Option<ColdObjectManifest>,
-}
-
-struct RecordHeader {
-    payload_len: u64,
-    record_len: u64,
-    checksum: Option<u64>,
-    manifest_len: usize,
 }
 
 pub struct ExtentStoreExecutor {
@@ -107,12 +63,14 @@ pub struct ExtentStoreExecutor {
     config: ExtentStoreExecutorConfig,
     limits: NofManagedLimits,
     state: Mutex<AllocatorState>,
+    buffer_pool: Arc<ExtentStoreBufferPool>,
 }
 
 impl ExtentStoreExecutor {
     pub fn new(device: Arc<SpdkNofBlockDevice>, config: ExtentStoreExecutorConfig) -> Result<Self> {
         let config = validate_config(config, device.capacity_bytes())?;
         let free_len = config.device_bytes - config.start_offset;
+        let buffer_pool_bytes = usize::try_from(free_len).unwrap_or(usize::MAX);
         Ok(Self {
             device,
             limits: NofManagedLimits {
@@ -121,31 +79,32 @@ impl ExtentStoreExecutor {
             }
             .validate()?,
             state: Mutex::new(AllocatorState {
-                free: vec![FreeRange {
-                    offset: config.start_offset,
-                    len: free_len,
-                }],
+                free: FreeSpanSet::from_range(config.start_offset, free_len),
                 reserved: BTreeMap::new(),
             }),
+            buffer_pool: ExtentStoreBufferPool::new_untracked(buffer_pool_bytes),
             config,
         })
     }
 
-    fn record_len(&self, payload_len: u64, manifest_len: usize) -> Result<u64> {
-        let raw = (RECORD_HEADER_LEN as u64)
-            .checked_add(payload_len)
-            .and_then(|value| value.checked_add(manifest_len as u64))
-            .ok_or_else(|| {
-                StoreError::InvalidState("managed ExtentStore value is too large".to_string())
-            })?;
-        align_up_checked(raw, self.config.alignment)
+    fn record_header(
+        &self,
+        payload_len: u64,
+        manifest_len: usize,
+        checksum: u64,
+    ) -> Result<ExtentStoreRecordHeader> {
+        ExtentStoreRecordHeader::single(manifest_len, payload_len, checksum, self.config.alignment)
     }
 
-    fn validate_locator(&self, locator: ExtentLocator, expected_len: u64) -> Result<ExtentLocator> {
-        if locator.payload_len != expected_len {
+    fn validate_locator(
+        &self,
+        locator: ExtentStoreLocator,
+        expected_len: u64,
+    ) -> Result<ExtentStoreLocator> {
+        if locator.segment_id != 0 || locator.value_len != expected_len {
             return Err(StoreError::InvalidState(format!(
                 "managed ExtentStore locator length {} does not match expected {}",
-                locator.payload_len, expected_len
+                locator.value_len, expected_len
             )));
         }
         let end = locator
@@ -171,10 +130,9 @@ impl ExtentStoreExecutor {
 
     fn write_one(&self, request: &NofManagedWriteRequest<'_>) -> Result<()> {
         let locator = self.validate_locator(
-            ExtentLocator::from_managed(&request.locator)?,
+            locator_from_managed(&request.locator)?,
             request.value.len() as u64,
         )?;
-        let mut record = vec![0u8; locator.record_len as usize];
         let manifest = self
             .state
             .lock()
@@ -195,44 +153,61 @@ impl ExtentStoreExecutor {
             .map(encode_cold_object_manifest)
             .transpose()?
             .unwrap_or_default();
-        encode_header(
-            &mut record[..RECORD_HEADER_LEN],
-            RecordHeader {
-                payload_len: locator.payload_len,
-                record_len: locator.record_len,
-                checksum: request.checksum,
-                manifest_len: manifest_bytes.len(),
-            },
+        let header = self.record_header(
+            request.value.len() as u64,
+            manifest_bytes.len(),
+            request
+                .checksum
+                .unwrap_or_else(|| payload_checksum(request.value)),
         )?;
-        let payload_offset = payload_offset(manifest_bytes.len())?;
-        record[RECORD_HEADER_LEN..payload_offset].copy_from_slice(&manifest_bytes);
+        if header.value_offset != locator.value_offset || header.record_len != locator.record_len {
+            return Err(StoreError::InvalidState(
+                "managed ExtentStore record layout does not match its reservation".to_string(),
+            ));
+        }
+        let record_len = usize::try_from(locator.record_len).map_err(|_| {
+            StoreError::InvalidState("managed ExtentStore record is too large".to_string())
+        })?;
+        let mut record = self.buffer_pool.lease(record_len)?;
+        record.fill(0);
+        header.encode_into(&mut record[..EXTENT_STORE_HEADER_LEN]);
+        let manifest_end = EXTENT_STORE_HEADER_LEN + manifest_bytes.len();
+        record[EXTENT_STORE_HEADER_LEN..manifest_end].copy_from_slice(&manifest_bytes);
+        let payload_offset = locator.value_offset as usize;
         record[payload_offset..payload_offset + request.value.len()].copy_from_slice(request.value);
         self.device.write_all(locator.offset, &record)
     }
 
     fn read_one(&self, request: &NofManagedReadRequest) -> Result<Option<Vec<u8>>> {
-        let locator = self.validate_locator(
-            ExtentLocator::from_managed(&request.locator)?,
-            request.length,
-        )?;
-        let mut record = vec![0u8; locator.record_len as usize];
+        let locator =
+            self.validate_locator(locator_from_managed(&request.locator)?, request.length)?;
+        let record_len = usize::try_from(locator.record_len).map_err(|_| {
+            StoreError::InvalidState("managed ExtentStore record is too large".to_string())
+        })?;
+        let mut record = self.buffer_pool.lease(record_len)?;
         match self.device.read_exact(locator.offset, &mut record) {
             Ok(()) => {}
             Err(StoreError::NotFound(_)) => return Ok(None),
             Err(error) => return Err(error),
         }
-        let header = decode_header(&record[..RECORD_HEADER_LEN])?;
-        let payload_len = header.payload_len;
-        if payload_len != request.length {
+        let header = ExtentStoreRecordHeader::decode(&record[..EXTENT_STORE_HEADER_LEN])?
+            .ok_or_else(|| {
+                StoreError::NotFound("managed ExtentStore record is missing".to_string())
+            })?;
+        if header.record_kind != EXTENT_STORE_RECORD_KIND_SINGLE
+            || header.value_len != request.length
+            || header.value_offset != locator.value_offset
+            || header.record_len != locator.record_len
+        {
             return Err(StoreError::InvalidState(format!(
-                "managed ExtentStore record length {payload_len} does not match route length {}",
-                request.length
+                "managed ExtentStore record length {} does not match route length {}",
+                header.value_len, request.length
             )));
         }
-        let payload_offset = payload_offset(header.manifest_len)?;
-        let value = record[payload_offset..payload_offset + payload_len as usize].to_vec();
-        let expected = request.checksum.or(header.checksum);
-        if expected.is_some_and(|checksum| checksum != payload_checksum(&value)) {
+        let payload_offset = header.value_offset as usize;
+        let value = record[payload_offset..payload_offset + header.value_len as usize].to_vec();
+        let expected = request.checksum.unwrap_or(header.checksum);
+        if expected != payload_checksum(&value) {
             return Err(StoreError::InvalidState(
                 "managed ExtentStore checksum mismatch".to_string(),
             ));
@@ -246,15 +221,12 @@ impl NofManagedAllocator for ExtentStoreExecutor {
         let mut used = Vec::with_capacity(records.len());
         for record in records {
             used.push(
-                self.validate_locator(
-                    ExtentLocator::from_managed(&record.locator)?,
-                    record.length,
-                )?,
+                self.validate_locator(locator_from_managed(&record.locator)?, record.length)?,
             );
         }
         used.sort_by_key(|locator| locator.offset);
         let mut cursor = self.config.start_offset;
-        let mut free = Vec::new();
+        let mut free = FreeSpanSet::default();
         for locator in used {
             if locator.offset < cursor {
                 return Err(StoreError::InvalidState(
@@ -262,18 +234,12 @@ impl NofManagedAllocator for ExtentStoreExecutor {
                 ));
             }
             if locator.offset > cursor {
-                free.push(FreeRange {
-                    offset: cursor,
-                    len: locator.offset - cursor,
-                });
+                free.insert(cursor, locator.offset - cursor);
             }
             cursor = locator.offset + locator.record_len;
         }
         if cursor < self.config.device_bytes {
-            free.push(FreeRange {
-                offset: cursor,
-                len: self.config.device_bytes - cursor,
-            });
+            free.insert(cursor, self.config.device_bytes - cursor);
         }
         let mut state = self.state.lock();
         state.free = free;
@@ -294,7 +260,7 @@ impl NofManagedAllocator for ExtentStoreExecutor {
                     .as_ref()
                     .map(|identity| {
                         encode_cold_object_manifest(&identity.manifest(
-                            "0".repeat(64),
+                            "0".repeat(ExtentStoreLocator::BINARY_LEN * 2),
                             request.length,
                             request.checksum,
                         ))
@@ -302,18 +268,28 @@ impl NofManagedAllocator for ExtentStoreExecutor {
                     })
                     .transpose()?
                     .unwrap_or(0);
-                let record_len = self.record_len(request.length, manifest_len)?;
-                let offset = allocate(&mut state.free, record_len).ok_or_else(|| {
-                    StoreError::Transport(
-                        "managed ExtentStore target has no free extent".to_string(),
-                    )
-                })?;
-                let locator = ExtentLocator {
+                let header = self.record_header(
+                    request.length,
+                    manifest_len,
+                    request.checksum.unwrap_or(0),
+                )?;
+                let offset = state
+                    .free
+                    .take_first_fit(header.record_len)
+                    .ok_or_else(|| {
+                        StoreError::Transport(
+                            "managed ExtentStore target has no free extent".to_string(),
+                        )
+                    })?;
+                let locator = ExtentStoreLocator {
+                    segment_id: 0,
                     offset,
-                    record_len,
-                    payload_len: request.length,
+                    record_len: header.record_len,
+                    value_offset: header.value_offset,
+                    value_len: request.length,
+                    generation: 0,
                 };
-                let managed = locator.to_managed()?;
+                let managed = locator_to_managed(locator)?;
                 let manifest = request.route_identity.as_ref().map(|identity| {
                     identity.manifest(managed.to_hex(), request.length, request.checksum)
                 });
@@ -331,20 +307,18 @@ impl NofManagedAllocator for ExtentStoreExecutor {
         requests
             .iter()
             .map(|request| {
-                let locator = self.validate_locator(
-                    ExtentLocator::from_managed(&request.locator)?,
-                    request.length,
-                )?;
+                let locator =
+                    self.validate_locator(locator_from_managed(&request.locator)?, request.length)?;
                 state.reserved.remove(request.locator.as_bytes());
-                if range_is_free(&state.free, locator.offset, locator.record_len) {
+                if state.free.contains(locator.offset, locator.record_len) {
                     return Ok(());
                 }
-                if range_overlaps_free(&state.free, locator.offset, locator.record_len) {
+                if state.free.overlaps(locator.offset, locator.record_len) {
                     return Err(StoreError::InvalidState(
                         "managed ExtentStore release overlaps an existing free range".to_string(),
                     ));
                 }
-                release(&mut state.free, locator.offset, locator.record_len);
+                state.free.insert(locator.offset, locator.record_len);
                 Ok(())
             })
             .collect()
@@ -375,62 +349,59 @@ impl NofManagedRead for ExtentStoreExecutor {
 impl NofManagedRecovery for ExtentStoreExecutor {
     fn scan_recovered_objects(&self, target_id: &str) -> Result<Vec<RecoveredColdObject>> {
         let mut recovered = Vec::new();
-        let mut offset = self.config.start_offset;
         let probe_len = usize::try_from(self.config.alignment).map_err(|_| {
             StoreError::InvalidState("managed ExtentStore alignment is too large".to_string())
         })?;
-        while offset + RECORD_HEADER_LEN as u64 <= self.config.device_bytes {
-            let mut header_block = vec![0u8; probe_len];
-            match self.device.read_exact(offset, &mut header_block) {
-                Ok(()) => {}
-                Err(StoreError::NotFound(_)) => {
-                    offset += self.config.alignment;
-                    continue;
+        let mut header_block = self.buffer_pool.lease(probe_len)?;
+        scan_extent_store_headers(
+            self.config.start_offset,
+            self.config.device_bytes,
+            Some(self.config.alignment),
+            |offset| match self.device.read_exact(offset, &mut header_block) {
+                Ok(()) => Ok(Some(
+                    header_block[..EXTENT_STORE_HEADER_LEN]
+                        .try_into()
+                        .expect("extent store header slice length"),
+                )),
+                Err(StoreError::NotFound(_)) => Ok(None),
+                Err(error) => Err(error),
+            },
+            |offset, header| {
+                if header.record_kind != EXTENT_STORE_RECORD_KIND_SINGLE || header.key_len == 0 {
+                    return Ok(());
                 }
-                Err(error) => return Err(error),
-            }
-            let header = match decode_header(&header_block[..RECORD_HEADER_LEN]) {
-                Ok(header) => header,
-                Err(StoreError::NotFound(_)) => {
-                    offset += self.config.alignment;
-                    continue;
+                let record_len = usize::try_from(header.record_len).map_err(|_| {
+                    StoreError::InvalidState("managed ExtentStore record is too large".to_string())
+                })?;
+                let manifest_len = usize::try_from(header.key_len).map_err(|_| {
+                    StoreError::InvalidState(
+                        "managed ExtentStore manifest is too large".to_string(),
+                    )
+                })?;
+                let manifest_end = EXTENT_STORE_HEADER_LEN + manifest_len;
+                if manifest_end > header.value_offset as usize || manifest_end > record_len {
+                    return Ok(());
                 }
-                Err(error) => return Err(error),
-            };
-            if header.record_len == 0
-                || header.record_len % self.config.alignment != 0
-                || offset + header.record_len > self.config.device_bytes
-            {
-                offset += self.config.alignment;
-                continue;
-            }
-            if header.manifest_len == 0 {
-                offset += header.record_len;
-                continue;
-            }
-            let record_len = usize::try_from(header.record_len).map_err(|_| {
-                StoreError::InvalidState("managed ExtentStore record is too large".to_string())
-            })?;
-            let manifest_end = payload_offset(header.manifest_len)?;
-            if manifest_end > record_len {
-                offset += self.config.alignment;
-                continue;
-            }
-            let mut record = vec![0u8; record_len];
-            self.device.read_exact(offset, &mut record)?;
-            let manifest = decode_cold_object_manifest(&record[RECORD_HEADER_LEN..manifest_end])?;
-            if manifest.cold_tier_id == target_id {
-                recovered.push(RecoveredColdObject {
-                    metadata: ColdPayloadMetadata {
-                        length: manifest.length,
-                        checksum: manifest.checksum,
-                    },
-                    path: PathBuf::from(format!("nof://{target_id}/{}", manifest.object_locator)),
-                    manifest,
-                });
-            }
-            offset += header.record_len;
-        }
+                let mut record = self.buffer_pool.lease(record_len)?;
+                self.device.read_exact(offset, &mut record)?;
+                let manifest =
+                    decode_cold_object_manifest(&record[EXTENT_STORE_HEADER_LEN..manifest_end])?;
+                if manifest.cold_tier_id == target_id {
+                    recovered.push(RecoveredColdObject {
+                        metadata: ColdPayloadMetadata {
+                            length: manifest.length,
+                            checksum: manifest.checksum,
+                        },
+                        path: PathBuf::from(format!(
+                            "nof://{target_id}/{}",
+                            manifest.object_locator
+                        )),
+                        manifest,
+                    });
+                }
+                Ok(())
+            },
+        )?;
         Ok(recovered)
     }
 }
@@ -441,7 +412,7 @@ impl NofHealth for ExtentStoreExecutor {
         let state = self.state.lock();
         Ok(NofStorageHealth {
             capacity_bytes: Some(self.config.device_bytes - self.config.start_offset),
-            available_bytes: Some(state.free.iter().map(|range| range.len).sum()),
+            available_bytes: Some(state.free.total_bytes()),
         })
     }
 }
@@ -488,100 +459,12 @@ fn validate_config(
     Ok(config)
 }
 
-fn align_up_checked(value: u64, alignment: u64) -> Result<u64> {
-    value
-        .checked_add(alignment - 1)
-        .map(|value| value & !(alignment - 1))
-        .ok_or_else(|| {
-            StoreError::InvalidState("managed ExtentStore alignment overflow".to_string())
-        })
+fn locator_to_managed(locator: ExtentStoreLocator) -> Result<NofManagedLocator> {
+    NofManagedLocator::new(locator.encode_binary())
 }
 
-fn allocate(free: &mut Vec<FreeRange>, len: u64) -> Option<u64> {
-    let index = free.iter().position(|range| range.len >= len)?;
-    let offset = free[index].offset;
-    free[index].offset += len;
-    free[index].len -= len;
-    if free[index].len == 0 {
-        free.remove(index);
-    }
-    Some(offset)
-}
-
-fn release(free: &mut Vec<FreeRange>, offset: u64, len: u64) {
-    free.push(FreeRange { offset, len });
-    free.sort_by_key(|range| range.offset);
-    let mut merged: Vec<FreeRange> = Vec::with_capacity(free.len());
-    for range in free.drain(..) {
-        if let Some(last) = merged.last_mut() {
-            if last.offset + last.len >= range.offset {
-                let end = (last.offset + last.len).max(range.offset + range.len);
-                last.len = end - last.offset;
-                continue;
-            }
-        }
-        merged.push(range);
-    }
-    *free = merged;
-}
-
-fn range_is_free(free: &[FreeRange], offset: u64, len: u64) -> bool {
-    let Some(end) = offset.checked_add(len) else {
-        return false;
-    };
-    free.iter().any(|range| {
-        let range_end = range.offset.saturating_add(range.len);
-        range.offset <= offset && end <= range_end
-    })
-}
-
-fn range_overlaps_free(free: &[FreeRange], offset: u64, len: u64) -> bool {
-    let Some(end) = offset.checked_add(len) else {
-        return true;
-    };
-    free.iter().any(|range| {
-        let range_end = range.offset.saturating_add(range.len);
-        offset < range_end && range.offset < end
-    })
-}
-
-fn payload_offset(manifest_len: usize) -> Result<usize> {
-    RECORD_HEADER_LEN.checked_add(manifest_len).ok_or_else(|| {
-        StoreError::InvalidState("managed ExtentStore manifest is too large".to_string())
-    })
-}
-
-fn encode_header(dst: &mut [u8], header: RecordHeader) -> Result<()> {
-    dst.fill(0);
-    dst[..8].copy_from_slice(RECORD_MAGIC);
-    dst[8..16].copy_from_slice(&header.payload_len.to_le_bytes());
-    dst[32..40].copy_from_slice(&header.record_len.to_le_bytes());
-    let manifest_len = u32::try_from(header.manifest_len).map_err(|_| {
-        StoreError::InvalidState(format!(
-            "managed ExtentStore manifest is too large: {}",
-            header.manifest_len
-        ))
-    })?;
-    dst[40..44].copy_from_slice(&manifest_len.to_le_bytes());
-    if let Some(checksum) = header.checksum {
-        dst[16..24].copy_from_slice(&checksum.to_le_bytes());
-        dst[24] = 1;
-    }
-    Ok(())
-}
-
-fn decode_header(src: &[u8]) -> Result<RecordHeader> {
-    if src.len() < RECORD_HEADER_LEN || &src[..8] != RECORD_MAGIC {
-        return Err(StoreError::NotFound(
-            "managed ExtentStore record is missing".to_string(),
-        ));
-    }
-    Ok(RecordHeader {
-        payload_len: u64::from_le_bytes(src[8..16].try_into().unwrap()),
-        record_len: u64::from_le_bytes(src[32..40].try_into().unwrap()),
-        checksum: (src[24] == 1).then(|| u64::from_le_bytes(src[16..24].try_into().unwrap())),
-        manifest_len: u32::from_le_bytes(src[40..44].try_into().unwrap()) as usize,
-    })
+fn locator_from_managed(locator: &NofManagedLocator) -> Result<ExtentStoreLocator> {
+    ExtentStoreLocator::decode_binary(locator.as_bytes())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

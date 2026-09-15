@@ -65,7 +65,6 @@ pub(crate) enum ManagedNofRouteAction {
     Prepare,
     Publish,
     Release,
-    Materialize,
 }
 
 pub(crate) trait ColdTierControlService: Send + Sync {
@@ -133,7 +132,6 @@ pub(crate) trait ColdTierControlService: Send + Sync {
         route: ObjectRoute,
         length: u64,
         checksum: Option<u64>,
-        payload: Vec<u8>,
     ) -> Result<ObjectRoute>;
 
     fn pin_for_read(&self, _slots: &[(SegmentName, u64)]) -> u64 {
@@ -223,7 +221,6 @@ impl ColdTierControlService for UnsupportedColdTierControlService {
         _route: ObjectRoute,
         _length: u64,
         _checksum: Option<u64>,
-        _payload: Vec<u8>,
     ) -> Result<ObjectRoute> {
         Err(StoreError::Unsupported(
             "managed NoF route control is not wired yet".to_string(),
@@ -478,8 +475,8 @@ impl ControlPlaneClient {
         target_id: &str,
         action: ManagedNofRouteAction,
         route: &ObjectRoute,
-        payload_metadata: (u64, Option<u64>),
-        payload: Option<&[u8]>,
+        length: u64,
+        checksum: Option<u64>,
     ) -> Result<ObjectRoute> {
         let tracker = OperationTracker::new("control_manage_nof_backing");
         let request = pb::ManageNofBackingRequest {
@@ -489,11 +486,9 @@ impl ControlPlaneClient {
                 ManagedNofRouteAction::Prepare => pb::ManagedNofRouteAction::Prepare,
                 ManagedNofRouteAction::Publish => pb::ManagedNofRouteAction::Publish,
                 ManagedNofRouteAction::Release => pb::ManagedNofRouteAction::Release,
-                ManagedNofRouteAction::Materialize => pb::ManagedNofRouteAction::Materialize,
             } as i32,
-            length: payload_metadata.0,
-            checksum: payload_metadata.1,
-            payload: payload.unwrap_or_default().to_vec(),
+            length,
+            checksum,
         };
         let result = (|| {
             let channel = self.channel_for(lease)?;

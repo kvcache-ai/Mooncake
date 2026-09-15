@@ -25,6 +25,8 @@ struct mc_nof_device {
     atomic_bool stop_admin_thread;
     atomic_bool transport_failed;
     bool admin_thread_started;
+    void *dma_buffer;
+    size_t dma_buffer_len;
 };
 
 struct mc_nof_connect_ctx { struct spdk_nvme_ctrlr *ctrlr; const char *hostnqn; };
@@ -103,6 +105,16 @@ static int mc_nof_wait(struct mc_nof_device *device, struct mc_nof_io_ctx *ctx) 
         }
     }
     return ctx->status;
+}
+
+static int mc_nof_reserve_dma_buffer(struct mc_nof_device *device, size_t len) {
+    if (device->dma_buffer_len >= len) { return 0; }
+    void *buffer = spdk_dma_zmalloc(len, 4096, NULL);
+    if (buffer == NULL) { return -ENOMEM; }
+    if (device->dma_buffer != NULL) { spdk_dma_free(device->dma_buffer); }
+    device->dma_buffer = buffer;
+    device->dma_buffer_len = len;
+    return 0;
 }
 
 static int mc_nof_copy_string(char *dst, size_t dst_len, const char *src, const char *field, char *err, size_t err_len) {
@@ -197,6 +209,7 @@ void mc_nof_close(struct mc_nof_device *device) {
     }
     pthread_mutex_lock(&g_probe_lock);
     pthread_mutex_lock(&device->lock);
+    if (device->dma_buffer != NULL) { spdk_dma_free(device->dma_buffer); device->dma_buffer = NULL; }
     if (device->qpair != NULL) { spdk_nvme_ctrlr_free_io_qpair(device->qpair); device->qpair = NULL; }
     if (device->ctrlr != NULL) { spdk_nvme_detach(device->ctrlr); device->ctrlr = NULL; }
     pthread_mutex_unlock(&device->lock);
@@ -210,15 +223,13 @@ int mc_nof_write(struct mc_nof_device *device, uint64_t offset, const void *src,
     uint64_t lba = offset / device->sector_size;
     uint64_t lba_count64 = len / device->sector_size;
     if (lba + lba_count64 > device->sector_count || lba_count64 > UINT32_MAX) { mc_nof_set_error(err, err_len, "SPDK write out of range", -ERANGE); return -ERANGE; }
-    void *buf = spdk_dma_zmalloc((size_t)len, 4096, NULL);
-    if (buf == NULL) { mc_nof_set_error(err, err_len, "SPDK write DMA allocation failed", -ENOMEM); return -ENOMEM; }
-    memcpy(buf, src, (size_t)len);
     struct mc_nof_io_ctx io = { .done = false, .status = 0 };
     pthread_mutex_lock(&device->lock);
-    int rc = spdk_nvme_ns_cmd_write(device->ns, device->qpair, buf, lba, (uint32_t)lba_count64, mc_nof_complete, &io, 0);
+    int rc = mc_nof_reserve_dma_buffer(device, (size_t)len);
+    if (rc == 0) { memcpy(device->dma_buffer, src, (size_t)len); }
+    if (rc == 0) { rc = spdk_nvme_ns_cmd_write(device->ns, device->qpair, device->dma_buffer, lba, (uint32_t)lba_count64, mc_nof_complete, &io, 0); }
     if (rc == 0) { rc = mc_nof_wait(device, &io); }
     pthread_mutex_unlock(&device->lock);
-    spdk_dma_free(buf);
     if (rc != 0) { mc_nof_set_error(err, err_len, "SPDK write failed", rc); }
     return rc;
 }
@@ -228,15 +239,14 @@ int mc_nof_read(struct mc_nof_device *device, uint64_t offset, void *dst, uint64
     uint64_t lba = offset / device->sector_size;
     uint64_t lba_count64 = len / device->sector_size;
     if (lba + lba_count64 > device->sector_count || lba_count64 > UINT32_MAX) { mc_nof_set_error(err, err_len, "SPDK read out of range", -ERANGE); return -ERANGE; }
-    void *buf = spdk_dma_zmalloc((size_t)len, 4096, NULL);
-    if (buf == NULL) { mc_nof_set_error(err, err_len, "SPDK read DMA allocation failed", -ENOMEM); return -ENOMEM; }
     struct mc_nof_io_ctx io = { .done = false, .status = 0 };
     pthread_mutex_lock(&device->lock);
-    int rc = spdk_nvme_ns_cmd_read(device->ns, device->qpair, buf, lba, (uint32_t)lba_count64, mc_nof_complete, &io, 0);
+    int rc = mc_nof_reserve_dma_buffer(device, (size_t)len);
+    if (rc == 0) { rc = spdk_nvme_ns_cmd_read(device->ns, device->qpair, device->dma_buffer, lba, (uint32_t)lba_count64, mc_nof_complete, &io, 0); }
     if (rc == 0) { rc = mc_nof_wait(device, &io); }
+    if (rc == 0) { memcpy(dst, device->dma_buffer, (size_t)len); }
     pthread_mutex_unlock(&device->lock);
-    if (rc == 0) { memcpy(dst, buf, (size_t)len); } else { mc_nof_set_error(err, err_len, "SPDK read failed", rc); }
-    spdk_dma_free(buf);
+    if (rc != 0) { mc_nof_set_error(err, err_len, "SPDK read failed", rc); }
     return rc;
 }
 

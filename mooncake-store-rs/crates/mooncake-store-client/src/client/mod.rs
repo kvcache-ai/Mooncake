@@ -124,6 +124,8 @@ use cold_tier_storage_backend::*;
 
 #[allow(dead_code)]
 mod extent_store_engine;
+#[allow(dead_code)]
+mod extent_store_format;
 use extent_store_engine::ExtentStoreStorageBackend;
 
 /// Cold tier device management, admission control, offload pipeline, and cleanup.

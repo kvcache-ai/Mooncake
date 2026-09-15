@@ -173,58 +173,63 @@ fn recover_extent_store_segment_live_bytes(
     segment_size: u64,
     packed_blocks: &mut BTreeMap<(u64, u64), PackedBlockLiveState>,
 ) -> Result<u64> {
-    let mut offset = 0u64;
-    let mut header = [0u8; EXTENT_STORE_HEADER_LEN];
-    while offset + EXTENT_STORE_HEADER_LEN as u64 <= segment_size {
-        let read = file.read_at(&mut header, offset).map_err(|error| {
-            StoreError::Transport(format!(
-                "failed to read extent store segment {segment_id} header at {offset}: {error}"
-            ))
-        })?;
-        if read == 0 || header.iter().all(|byte| *byte == 0) {
-            break;
-        }
-        if read != EXTENT_STORE_HEADER_LEN {
-            return Err(StoreError::InvalidState(format!(
-                "extent store segment {segment_id} has partial header at offset {offset}"
-            )));
-        }
-        let Some(recovered) = decode_extent_store_recovery_record(&header, segment_id, offset)? else {
-            break;
-        };
-        let record_len = recovered.record_len;
-        if record_len == 0 || offset.saturating_add(record_len) > segment_size {
-            return Err(StoreError::InvalidState(format!(
-                "extent store segment {segment_id} has invalid recovered record length {record_len} at offset {offset}"
-            )));
-        }
-        if recovered.record_kind == EXTENT_STORE_RECORD_KIND_PACKED && recovered.key_len > 0 {
-            validate_recovered_packed_record_payload(RecoveredPackedRecordPayload {
-                file,
-                segment_id,
-                offset,
-                record_len,
-                value_offset: recovered.value_offset,
-                value_len: recovered.value_len,
-                checksum: recovered.checksum,
-                entry_count: recovered.key_len,
+    scan_extent_store_headers(
+        0,
+        segment_size,
+        None,
+        |offset| {
+            let mut header = [0u8; EXTENT_STORE_HEADER_LEN];
+            let read = file.read_at(&mut header, offset).map_err(|error| {
+                StoreError::Transport(format!(
+                    "failed to read extent store segment {segment_id} header at {offset}: {error}"
+                ))
             })?;
-        } else {
-            validate_extent_store_recovery_record_payload(
-                file,
-                segment_id,
-                offset,
-                recovered.value_offset,
-                recovered.value_len,
-                recovered.checksum,
-            )?;
-        }
-        if recovered.record_kind == EXTENT_STORE_RECORD_KIND_PACKED {
-            register_recovered_packed_block(packed_blocks, offset, &recovered)?;
-        }
-        offset = offset.saturating_add(record_len);
-    }
-    Ok(offset)
+            if read == 0 || header.iter().all(|byte| *byte == 0) {
+                return Ok(None);
+            }
+            if read != EXTENT_STORE_HEADER_LEN {
+                return Err(StoreError::InvalidState(format!(
+                    "extent store segment {segment_id} has partial header at offset {offset}"
+                )));
+            }
+            Ok(Some(header))
+        },
+        |offset, header| {
+            let recovered = ExtentStoreRecoveredRecordHeader {
+                record_len: header.record_len,
+                key_len: header.key_len,
+                value_offset: header.value_offset,
+                value_len: header.value_len,
+                checksum: Some(header.checksum),
+                record_kind: header.record_kind,
+            };
+            if recovered.record_kind == EXTENT_STORE_RECORD_KIND_PACKED && recovered.key_len > 0 {
+                validate_recovered_packed_record_payload(RecoveredPackedRecordPayload {
+                    file,
+                    segment_id,
+                    offset,
+                    record_len: recovered.record_len,
+                    value_offset: recovered.value_offset,
+                    value_len: recovered.value_len,
+                    checksum: recovered.checksum,
+                    entry_count: recovered.key_len,
+                })?;
+            } else {
+                validate_extent_store_recovery_record_payload(
+                    file,
+                    segment_id,
+                    offset,
+                    recovered.value_offset,
+                    recovered.value_len,
+                    recovered.checksum,
+                )?;
+            }
+            if recovered.record_kind == EXTENT_STORE_RECORD_KIND_PACKED {
+                register_recovered_packed_block(packed_blocks, offset, &recovered)?;
+            }
+            Ok(())
+        },
+    )
 }
 
 struct ExtentStoreRecoveredRecordHeader {
@@ -236,121 +241,26 @@ struct ExtentStoreRecoveredRecordHeader {
     record_kind: u16,
 }
 
-fn decode_extent_store_recovery_record(
-    header: &[u8; EXTENT_STORE_HEADER_LEN],
-    segment_id: u64,
-    offset: u64,
-) -> Result<Option<ExtentStoreRecoveredRecordHeader>> {
-    let magic = u32::from_le_bytes(header[0..4].try_into().expect("header magic slice length"));
-    if magic == 0 {
-        return Ok(None);
-    }
-    if magic != EXTENT_STORE_MAGIC {
-        return Err(StoreError::InvalidState(format!(
-            "extent store segment {segment_id} has invalid magic at offset {offset}"
-        )));
-    }
-    let header_len = u16::from_le_bytes(
-        header[4..6]
-            .try_into()
-            .expect("header length slice length"),
-    ) as u64;
-    if header_len != EXTENT_STORE_HEADER_LEN as u64 {
-        return Err(StoreError::InvalidState(format!(
-            "extent store segment {segment_id} has unsupported header at offset {offset}"
-        )));
-    }
-    let record_kind = u16::from_le_bytes(
-        header[6..8]
-            .try_into()
-            .expect("record kind slice length"),
-    );
-    if record_kind != EXTENT_STORE_RECORD_KIND_SINGLE
-        && record_kind != EXTENT_STORE_RECORD_KIND_PACKED
-    {
-        return Err(StoreError::InvalidState(format!(
-            "extent store segment {segment_id} has unsupported record kind {record_kind} at offset {offset}"
-        )));
-    }
-    let key_len = u64::from_le_bytes(header[8..16].try_into().expect("key length slice length"));
-    let value_len = u64::from_le_bytes(
-        header[16..24]
-            .try_into()
-            .expect("value length slice length"),
-    );
-    let checksum = Some(u64::from_le_bytes(
-        header[24..32]
-            .try_into()
-            .expect("payload checksum slice length"),
-    ));
-    let value_offset = u64::from_le_bytes(
-        header[32..40]
-            .try_into()
-            .expect("value offset slice length"),
-    );
-    let record_len = u64::from_le_bytes(
-        header[40..48]
-            .try_into()
-            .expect("record length slice length"),
-    );
-    if value_offset < EXTENT_STORE_HEADER_LEN as u64 + key_len
-        || value_offset.saturating_add(value_len) > record_len
-    {
-        return Err(StoreError::InvalidState(format!(
-            "extent store segment {segment_id} has invalid payload bounds at offset {offset}"
-        )));
-    }
-    Ok(Some(ExtentStoreRecoveredRecordHeader {
-        record_len,
-        key_len,
-        value_offset,
-        value_len,
-        checksum,
-        record_kind,
-    }))
-}
-
 fn validate_single_record_header(buffer: &[u8], locator: &ExtentStoreLocator) -> Result<()> {
     if buffer.len() != locator.record_len as usize || buffer.len() < EXTENT_STORE_HEADER_LEN {
         return Err(StoreError::InvalidState(
             "extent store single record bounds mismatch".to_string(),
         ));
     }
-    let magic = u32::from_le_bytes(buffer[0..4].try_into().expect("header magic slice length"));
-    let record_kind = u16::from_le_bytes(
-        buffer[6..8]
-            .try_into()
-            .expect("record kind slice length"),
-    );
-    let value_len = u64::from_le_bytes(
-        buffer[16..24]
-            .try_into()
-            .expect("value length slice length"),
-    );
-    let value_offset = u64::from_le_bytes(
-        buffer[32..40]
-            .try_into()
-            .expect("value offset slice length"),
-    );
-    let record_len = u64::from_le_bytes(
-        buffer[40..48]
-            .try_into()
-            .expect("record length slice length"),
-    );
-    if magic != EXTENT_STORE_MAGIC
-        || record_kind != EXTENT_STORE_RECORD_KIND_SINGLE
-        || value_offset != locator.value_offset
-        || value_len != locator.value_len
-        || record_len != locator.record_len
-        || value_offset.saturating_add(value_len) > record_len
+    let header = ExtentStoreRecordHeader::decode(&buffer[..EXTENT_STORE_HEADER_LEN])?
+        .ok_or_else(|| StoreError::InvalidState("extent store record is empty".to_string()))?;
+    if header.record_kind != EXTENT_STORE_RECORD_KIND_SINGLE
+        || header.value_offset != locator.value_offset
+        || header.value_len != locator.value_len
+        || header.record_len != locator.record_len
     {
         return Err(StoreError::InvalidState(
             "extent store single record header mismatch".to_string(),
         ));
     }
-    let value_start = value_offset as usize;
+    let value_start = header.value_offset as usize;
     let value_end = value_start
-        .checked_add(value_len as usize)
+        .checked_add(header.value_len as usize)
         .ok_or_else(|| StoreError::InvalidState("extent store single payload bounds overflow".to_string()))?;
     if value_end > buffer.len() {
         return Err(StoreError::InvalidState(
@@ -415,20 +325,10 @@ fn validate_packed_block_buffer(buffer: &[u8], locator: &ExtentStoreLocator) -> 
             "extent store packed block is smaller than header".to_string(),
         ));
     }
-    let magic = u32::from_le_bytes(buffer[0..4].try_into().expect("header magic slice length"));
-    let record_kind = u16::from_le_bytes(
-        buffer[6..8]
-            .try_into()
-            .expect("record kind slice length"),
-    );
-    let record_len = u64::from_le_bytes(
-        buffer[40..48]
-            .try_into()
-            .expect("record length slice length"),
-    );
-    if magic != EXTENT_STORE_MAGIC
-        || record_kind != EXTENT_STORE_RECORD_KIND_PACKED
-        || record_len != locator.record_len
+    let header = ExtentStoreRecordHeader::decode(&buffer[..EXTENT_STORE_HEADER_LEN])?
+        .ok_or_else(|| StoreError::InvalidState("extent store record is empty".to_string()))?;
+    if header.record_kind != EXTENT_STORE_RECORD_KIND_PACKED
+        || header.record_len != locator.record_len
     {
         return Err(StoreError::InvalidState(
             "extent store packed block header mismatch".to_string(),
