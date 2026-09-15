@@ -2895,9 +2895,15 @@ Typical flow:
 - Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
 - Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
 
-Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
-Range calls only check the cached lease locally (zero Master RPCs). Put sessions
-reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+Get sessions cache a filtered `QueryResult` (one complete MEMORY or DFS replica
+plus its lease). The MEMORY path remains zero-copy. DFS replicas are read into
+request-scoped host staging and then scattered to host or device destinations.
+For device destinations, DFS staging first uses the fixed-capacity pinned restore
+arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`; if that arena is
+unavailable or exhausted, it falls back to the regular client buffer allocator.
+Host-only reads use the regular client buffer allocator. Range calls only check
+the cached lease locally (zero Master RPCs). Put sessions reserve object space
+via Master `BatchPutStart` and finalize with `BatchPutEnd`.
 
 Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
 flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
@@ -2906,8 +2912,9 @@ Reliable multi-replica NoF configs are rejected at session start. `end` / `revok
 seal the session (no further range writes) and wait for in-flight range transfers
 before talking to Master.
 
-⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
-registered memory before ranged zero-copy operations.
+⚠️ **Store-managed Buffer Required**: All destination buffers must resolve to
+Store-managed registered memory. DFS session reads use temporary staging; the
+staging allocation is released after the synchronous read and scatter finish.
 
 #### batch_get_session_start()
 
