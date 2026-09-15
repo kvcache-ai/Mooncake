@@ -422,7 +422,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](MemoryGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     py::class_<BatchGuard>(m, "BatchGuard")
@@ -434,7 +433,6 @@ PYBIND11_MODULE(tent, m) {
         .def("__exit__", [](BatchGuard& self, py::args) {
             py::gil_scoped_release release;
             self.release();
-            return py::none();
         });
 
     // -------------------------------------------------------------------------
@@ -563,7 +561,8 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("location") = kWildcardLocation)
+            py::arg("size"), py::arg("location") = kWildcardLocation,
+            py::keep_alive<0, 1>())
 
         .def(
             "allocate_memory_guard_ex",
@@ -575,7 +574,7 @@ PYBIND11_MODULE(tent, m) {
                 ThrowStatus(s, "allocate_memory_guard_ex");
                 return std::make_unique<MemoryGuard>(&self, addr, size);
             },
-            py::arg("size"), py::arg("options"))
+            py::arg("size"), py::arg("options"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // register/unregister single
@@ -680,7 +679,7 @@ PYBIND11_MODULE(tent, m) {
                 }
                 return std::make_unique<BatchGuard>(&self, batch_id);
             },
-            py::arg("batch_size"))
+            py::arg("batch_size"), py::keep_alive<0, 1>())
 
         // ---------------------------------------------------------------------
         // submitTransfer overloads

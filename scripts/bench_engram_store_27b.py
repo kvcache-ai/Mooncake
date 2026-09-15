@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 
 import numpy as np
 
@@ -46,7 +47,7 @@ BATCH_SIZES = [1, 4, 16, 64, 128, 256]
 NUM_WARMUP = 10
 NUM_ITER = 50
 TABLE_VOCAB_SIZES = [50000] * 8
-EMBEDDING_DIM = 16
+ROW_BYTES = 64
 ALLOW_POPULATE_FALLBACK = (
     os.environ.get("ENGRAM_STORE_ALLOW_POPULATE_FALLBACK", "0") == "1"
 )
@@ -55,7 +56,7 @@ ALLOW_POPULATE_FALLBACK = (
 def create_engram_store_config():
     cfg = store.EngramStoreConfig()
     cfg.table_vocab_sizes = TABLE_VOCAB_SIZES
-    cfg.embedding_dim = EMBEDDING_DIM
+    cfg.row_bytes = ROW_BYTES
     return cfg
 
 
@@ -111,9 +112,7 @@ def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
             key = keys[head_idx]
             rc = store_obj.put_from(key, cursor, nbytes)
             if rc != 0:
-                raise RuntimeError(
-                    f"CXL put_from fallback failed for {key}, rc={rc}"
-                )
+                raise RuntimeError(f"CXL put_from fallback failed for {key}, rc={rc}")
             published_keys.append(key)
             cursor += aligned
     except Exception:
@@ -121,17 +120,22 @@ def populate_store_via_cxl_segment(store_obj, keys, embedding_buffers):
         raise
 
 
-def populate_store(engram_store, store_obj):
-    keys = engram_store.get_store_keys()
+def populate_store(engram_store, layer_id, store_obj):
+    keys = engram_store.get_store_keys(layer_id)
     embedding_buffers = []
-    for vocab_size in engram_store.get_table_vocab_sizes():
-        emb = np.random.randn(vocab_size, engram_store.get_embedding_dim()).astype(np.float32)
+    for vocab_size in engram_store.get_table_vocab_sizes(layer_id):
+        emb = np.random.randint(
+            0,
+            256,
+            size=(vocab_size, engram_store.get_row_bytes(layer_id)),
+            dtype=np.uint8,
+        )
         embedding_buffers.append(emb)
 
     t0 = time.perf_counter()
     mode = "engram_store.populate"
     try:
-        engram_store.populate(embedding_buffers)
+        engram_store.populate(layer_id, embedding_buffers)
     except RuntimeError:
         if not ALLOW_POPULATE_FALLBACK:
             raise
@@ -158,32 +162,49 @@ def populate_store(engram_store, store_obj):
     return embedding_buffers, populate_ms, mode
 
 
-def make_row_ids(engram_store, batch_size, seq_len):
+def make_row_ids(engram_store, layer_id, batch_size, seq_len):
     row_ids = []
     for b in range(batch_size):
         batch = []
-        for l in range(seq_len):
+        for pos in range(seq_len):
             token_rows = []
-            for head, vocab_size in enumerate(engram_store.get_table_vocab_sizes()):
-                token_rows.append((b * seq_len + l + head) % vocab_size)
+            for head, vocab_size in enumerate(
+                engram_store.get_table_vocab_sizes(layer_id)
+            ):
+                token_rows.append((b * seq_len + pos + head) % vocab_size)
             batch.append(token_rows)
         row_ids.append(batch)
-    return row_ids
+    return np.asarray(row_ids, dtype=np.int64)
 
 
-def run_benchmark(engram_store, batch_size, num_warmup, num_iter):
+@contextmanager
+def registered_output(store_obj, engram_store, layer_id, row_ids):
+    output = np.empty(
+        (*row_ids.shape, engram_store.get_row_bytes(layer_id)), dtype=np.uint8
+    )
+    if store_obj.register_buffer(output.ctypes.data, output.nbytes) != 0:
+        raise RuntimeError("Could not register benchmark output")
+    try:
+        yield output
+    finally:
+        if store_obj.unregister_buffer(output.ctypes.data) != 0:
+            raise RuntimeError("Could not unregister benchmark output")
+
+
+def run_benchmark(engram_store, layer_id, store_obj, batch_size, num_warmup, num_iter):
     seq_len = 1
-    row_ids = make_row_ids(engram_store, batch_size, seq_len)
+    row_ids = make_row_ids(engram_store, layer_id, batch_size, seq_len)
 
-    for _ in range(num_warmup):
-        engram_store.lookup(row_ids)
+    with registered_output(store_obj, engram_store, layer_id, row_ids) as output:
+        for _ in range(num_warmup):
+            engram_store.lookup_into(layer_id, row_ids, output)
 
-    total_ms_list = []
-    for _ in range(num_iter):
-        t0 = time.perf_counter()
-        engram_store.lookup(row_ids)
-        t1 = time.perf_counter()
-        total_ms_list.append((t1 - t0) * 1000)
+        total_ms_list = []
+        for _ in range(num_iter):
+            t0 = time.perf_counter()
+            engram_store.lookup_into(layer_id, row_ids, output)
+            t1 = time.perf_counter()
+            total_ms_list.append((t1 - t0) * 1000)
 
     total_ms = np.array(total_ms_list)
     mean_total = np.mean(total_ms)
@@ -194,9 +215,8 @@ def run_benchmark(engram_store, batch_size, num_warmup, num_iter):
     bytes_per_request = (
         batch_size
         * seq_len
-        * engram_store.get_num_heads()
-        * engram_store.get_embedding_dim()
-        * 4
+        * engram_store.get_num_heads(layer_id)
+        * engram_store.get_row_bytes(layer_id)
     )
     gbps = (bytes_per_request / 1e9) / (mean_total / 1000)
 
@@ -210,9 +230,10 @@ def run_benchmark(engram_store, batch_size, num_warmup, num_iter):
     }
 
 
-def validate_lookup_correctness(engram_store, embedding_buffers):
-    row_ids = make_row_ids(engram_store, batch_size=1, seq_len=1)
-    output = np.asarray(engram_store.lookup(row_ids))
+def validate_lookup_correctness(engram_store, layer_id, store_obj, embedding_buffers):
+    row_ids = make_row_ids(engram_store, layer_id, batch_size=1, seq_len=1)
+    with registered_output(store_obj, engram_store, layer_id, row_ids) as output:
+        engram_store.lookup_into(layer_id, row_ids, output)
 
     max_abs_err = 0.0
     for head_idx in range(output.shape[2]):
@@ -251,11 +272,15 @@ def main():
     try:
         cfg = create_engram_store_config()
         layer_id = uuid.uuid4().int & 0x7FFFFFFF
-        engram_store = store.EngramStore(layer_id=layer_id, config=cfg, store=store_obj)
-        embedding_buffers, populate_ms, mode = populate_store(engram_store, store_obj)
+        engram_store = store.EngramStore({layer_id: cfg}, store_obj)
+        embedding_buffers, populate_ms, mode = populate_store(
+            engram_store, layer_id, store_obj
+        )
         print(f"Populate mode: {mode}, took {populate_ms:.2f} ms")
 
-        max_abs_err = validate_lookup_correctness(engram_store, embedding_buffers)
+        max_abs_err = validate_lookup_correctness(
+            engram_store, layer_id, store_obj, embedding_buffers
+        )
         print(f"Max abs error: {max_abs_err:.6f}")
 
         print("\nResults:")
@@ -263,7 +288,9 @@ def main():
             f"{'Batch':>8} {'Mean(ms)':>10} {'P50(ms)':>10} {'P99(ms)':>10} {'Tok/s':>12} {'GB/s':>10}"
         )
         for batch_size in BATCH_SIZES:
-            result = run_benchmark(engram_store, batch_size, NUM_WARMUP, NUM_ITER)
+            result = run_benchmark(
+                engram_store, layer_id, store_obj, batch_size, NUM_WARMUP, NUM_ITER
+            )
             print(
                 f"{result['batch_size']:>8} {result['mean_total_ms']:>10.3f} {result['p50_ms']:>10.3f} "
                 f"{result['p99_ms']:>10.3f} {result['tokens_per_sec']:>12.1f} {result['gbps']:>10.3f}"
@@ -271,7 +298,7 @@ def main():
     finally:
         if engram_store is not None:
             try:
-                engram_store.remove_from_store(force=True)
+                engram_store.remove_from_store(layer_id, force=True)
             except Exception as exc:
                 print(f"Warning: failed to clean up benchmark layer: {exc}")
         store_obj.close()

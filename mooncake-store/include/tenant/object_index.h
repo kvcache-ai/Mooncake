@@ -14,6 +14,7 @@
 
 #include <boost/functional/hash.hpp>
 
+#include "common/shrink_buckets.h"
 #include "lease.h"
 #include "object_entry.h"
 #include "rpc_types.h"
@@ -95,10 +96,28 @@ class ObjectIndex {
         return route_.size();
     }
 
-    // True when the tenant holds no object route, no group membership, and no
-    // in-flight dynamic-replication lease. Callers hold no locks when invoking.
-    // Empty of in-flight dynamic-replication leases and routed objects. Group
-    // membership lives in TenantCatalog's GroupIndex.
+    // Rehash the route down to roughly twice its live size. erase() never
+    // returns bucket memory, so after a sweep that removed most of a tenant's
+    // objects the map would otherwise keep its high-water bucket array for the
+    // lifetime of the tenant. Callers invoke this only after a sweep or an
+    // eviction cycle that actually erased keys; see ShrinkBucketsIfSparse for
+    // the threshold. Takes the route lock exclusively.
+    void ShrinkRouteTableIfSparse() {
+        std::unique_lock<std::shared_mutex> lock(route_lock_);
+        ShrinkBucketsIfSparse(route_);
+    }
+
+    // Test introspection: the route's bucket count, observed under the route
+    // lock.
+    size_t RouteBucketCountForTesting() const {
+        std::shared_lock<std::shared_mutex> lock(route_lock_);
+        return route_.bucket_count();
+    }
+
+    // True when the tenant holds no routed object and no in-flight
+    // dynamic-replication lease. Group membership lives in TenantCatalog's
+    // GroupIndex, which contributes its own term. Callers hold no locks when
+    // invoking.
     bool Empty() const {
         std::shared_lock<std::shared_mutex> ll(leases_lock_);
         if (!dynamic_replication_leases.empty()) {

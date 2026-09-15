@@ -242,6 +242,15 @@ class TenantCatalog {
         return object_index.SnapshotObjects();
     }
 
+    // Rehash the object route down to its live size after a sweep or an
+    // eviction cycle removed most of this tenant's objects.
+    void ShrinkRouteTableIfSparse() { object_index.ShrinkRouteTableIfSparse(); }
+
+    // Test introspection: the object route's bucket count.
+    size_t RouteBucketCountForTesting() const {
+        return object_index.RouteBucketCountForTesting();
+    }
+
    private:
     // Primary per-tenant object index (key -> strong ObjectEntry handle) with
     // a per-object mutation boundary (ObjectEntry::mutex).

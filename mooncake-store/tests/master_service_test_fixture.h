@@ -137,6 +137,21 @@ class MasterServiceTest : public ::testing::Test {
         return entry->metadata().GetCommittedSoftPinTimeout();
     }
 
+    // Test introspection: the bucket count of a tenant's object route.
+    // erase() never returns bucket memory, so the post-sweep and post-eviction
+    // shrink is only observable through this.
+    size_t RouteBucketCountForTesting(MasterService& service,
+                                      const TenantId& tenant_id =
+                                          TenantId::Default()) {
+        const TenantId normalized =
+            service.ResolveRequestTenantId(tenant_id);
+        auto tenant_handle = service.catalog_.Lookup(normalized);
+        if (!tenant_handle) {
+            return 0;
+        }
+        return tenant_handle->RouteBucketCountForTesting();
+    }
+
     void CleanupExpiredSoftPinsAt(
         MasterService& service,
         const std::chrono::system_clock::time_point& now) {

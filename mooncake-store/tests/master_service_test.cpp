@@ -27,6 +27,7 @@
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "common/network.h"
+#include "common/shrink_buckets.h"
 #include "master_service_test_fixture.h"
 
 namespace mooncake::test {
@@ -1607,6 +1608,178 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
               << "Keys created: " << kNumKeys << "\n"
               << "Creation time: " << total_create_duration.count() << "ms\n"
               << "Unmount time: " << unmount_duration.count() << "ms\n";
+}
+
+TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
+    // Small containers stay untouched regardless of sparsity: their bucket
+    // memory is negligible and rehash churn is not worth it.
+    std::unordered_map<std::string, int> small;
+    small.emplace("small_key", 0);
+    const size_t small_buckets = small.bucket_count();
+    ASSERT_LE(small_buckets, kShrinkMinBucketCount);
+    ShrinkBucketsIfSparse(small);
+    EXPECT_EQ(small.bucket_count(), small_buckets);
+
+    // Grow a map well past the bucket floor, then erase most entries: the
+    // bucket array keeps its high-water size until explicitly shrunk.
+    std::unordered_map<std::string, int> map;
+    for (size_t i = 0; i < 4 * kShrinkMinBucketCount; ++i) {
+        map.emplace("key" + std::to_string(i), 0);
+    }
+    const size_t high_water = map.bucket_count();
+    ASSERT_GT(high_water, kShrinkMinBucketCount);
+
+    // At exactly a quarter full there is nothing to shrink yet.
+    while (map.size() > high_water / 4) {
+        map.erase(map.begin());
+    }
+    ShrinkBucketsIfSparse(map);
+    EXPECT_EQ(map.bucket_count(), high_water);
+
+    // One more erase crosses the threshold and triggers the shrink.
+    map.erase(map.begin());
+    ShrinkBucketsIfSparse(map);
+    EXPECT_LT(map.bucket_count(), high_water);
+    EXPECT_GE(map.bucket_count(), map.size());
+}
+
+TEST_F(MasterServiceTest, BatchEvictShrinksSparseObjectRoute) {
+    // Zero lease TTL so every committed object is immediately evictable.
+    auto service_config =
+        MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t object_size = 1024;
+    constexpr size_t object_count = 2 * kShrinkMinBucketCount;
+    // Size the segment with ample headroom so the background eviction
+    // thread never fires; only the explicit call below evicts.
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(
+        *service, "test_segment", buffer, object_size * object_count * 16);
+
+    // One tenant owns one object route, so these puts grow a single bucket
+    // array past the shrink floor.
+    std::vector<std::string> keys;
+    keys.reserve(object_count);
+    for (size_t i = 0; i < object_count; ++i) {
+        keys.push_back("shrink_key_" + std::to_string(i));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        // Hard-pin the first object: it is excluded from eviction, so the
+        // tenant (and its route) deterministically survives the full
+        // eviction below and the shrunk bucket count stays observable.
+        config.with_hard_pin = (&key == &keys.front());
+        ASSERT_TRUE(service
+                        ->PutStart(client_id, key, TenantId::Default(),
+                                   object_size, config)
+                        .has_value());
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value());
+    }
+
+    const size_t buckets_before = RouteBucketCountForTesting(*service);
+    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
+
+    service->RunBatchEvictForTesting(1.0, 1.0);
+
+    const size_t buckets_after = RouteBucketCountForTesting(*service);
+    ASSERT_GT(buckets_after, 0u);
+    // Without the post-eviction shrink the bucket array would still sit at
+    // its high-water mark and this assertion would fail.
+    EXPECT_LT(buckets_after, buckets_before / 2);
+}
+
+TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseObjectRoute) {
+    // Regression for the lease-expire / client-offboarding delete path.
+    // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
+    // keys from a shared tenant; erase() never returns bucket memory, so a
+    // tenant that loses most (but not all) of its keys would keep its
+    // high-water bucket array forever and RSS would never drop. The shrink
+    // pass at the end of ClearStaleHandles mirrors the one in BatchEvict.
+    auto service = std::make_unique<MasterService>();
+    PauseReplicaCleanup(*service);
+
+    constexpr size_t kSegmentSize = 1024 * 1024 * 128;
+    const std::string stale_segment_name = "clear_shrink_stale_segment";
+    const std::string live_segment_name = "clear_shrink_live_segment";
+    const auto stale_segment = PrepareSimpleSegment(
+        *service, stale_segment_name, 0x300000000, kSegmentSize);
+    const auto live_segment = PrepareSimpleSegment(
+        *service, live_segment_name, 0x400000000, kSegmentSize);
+
+    // A few live keys keep the shared tenant alive after the sweep (a partial
+    // drain, not a full erase); the rest are swept and must trigger a shrink.
+    constexpr size_t kLiveKeys = 128;
+    constexpr size_t kTotalKeys = 2 * kShrinkMinBucketCount;
+
+    std::vector<std::string> stale_keys;
+    std::vector<std::string> live_keys;
+    for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
+        const std::string key = "clear_shrink_key_" + std::to_string(i);
+
+        const bool on_live = live_keys.size() < kLiveKeys;
+        const UUID& client_id =
+            on_live ? live_segment.client_id : stale_segment.client_id;
+        const std::string& segment_name =
+            on_live ? live_segment_name : stale_segment_name;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.preferred_segments = {segment_name};
+
+        ASSERT_TRUE(
+            service->PutStart(client_id, key, TenantId::Default(), 1024, config)
+                .has_value())
+            << "key=" << key;
+        ASSERT_TRUE(service
+                        ->PutEnd(client_id, key, TenantId::Default(),
+                                 ReplicaType::MEMORY)
+                        .has_value())
+            << "key=" << key;
+        (on_live ? live_keys : stale_keys).push_back(key);
+    }
+    ASSERT_GT(stale_keys.size(), live_keys.size());
+
+    const size_t buckets_before = RouteBucketCountForTesting(*service);
+    ASSERT_GT(buckets_before, kShrinkMinBucketCount);
+
+    // Unmount the stale segment, then sweep inline. The tenant survives
+    // because the live segment still holds keys, so the object route is only
+    // partially drained — exactly the case that leaks bucket memory without
+    // the shrink.
+    ASSERT_TRUE(
+        service
+            ->UnmountSegment(stale_segment.segment_id, stale_segment.client_id)
+            .has_value());
+    ClearInvalidHandlesForTest(*service);
+
+    // GetKeyCount counts physical metadata, so it distinguishes "swept" from
+    // "merely hidden by the unmount".
+    EXPECT_EQ(live_keys.size(), service->GetKeyCount());
+
+    const size_t buckets_after = RouteBucketCountForTesting(*service);
+    ASSERT_GT(buckets_after, 0u);
+    // Without the post-sweep shrink the bucket array would stay at its
+    // high-water mark and this assertion would fail.
+    EXPECT_LT(buckets_after, buckets_before / 2);
+    // The shrunk map must still be large enough to hold every live key.
+    EXPECT_GE(buckets_after, live_keys.size());
+
+    for (const auto& key : live_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_TRUE(get_result.has_value()) << "key=" << key << " was swept";
+        ASSERT_EQ(1u, get_result->replicas.size()) << "key=" << key;
+    }
+    for (const auto& key : stale_keys) {
+        auto get_result = service->GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get_result.has_value()) << "key=" << key;
+        EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error())
+            << "key=" << key;
+    }
 }
 
 TEST_F(MasterServiceTest, RemoveSoftPinObject) {

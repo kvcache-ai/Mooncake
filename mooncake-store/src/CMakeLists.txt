@@ -17,6 +17,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
     config/local_file_snapshot_config.cpp
+    config/redis_connection_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
@@ -29,6 +30,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/catalog.cpp
     segment/pool.cpp
     segment/pool_mount.cpp
+    segment/snapshot.cpp
+    ha/snapshot/allocator_snapshot_codec.cpp
+    ha/snapshot/store_resource_snapshot_codec.cpp
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp

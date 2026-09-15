@@ -1192,6 +1192,11 @@ struct DfsEvictAction {};
 
 DfsEvictAction EvictDfs();
 
+// Drives one pass of the per-tenant quota watermark evictor.
+struct TenantEvictAction {};
+
+TenantEvictAction EvictTenants();
+
 struct WaitAction {
     std::chrono::milliseconds duration;
 };
@@ -2170,6 +2175,7 @@ class MasterScenario {
     MasterScenario& When(ExpireAtAction action);
     MasterScenario& When(MemoryEvictAction action);
     MasterScenario& When(DfsEvictAction action);
+    MasterScenario& When(TenantEvictAction action);
     MasterScenario& When(WaitAction action);
     MasterScenario& When(WaitForOpLogFailureAction action);
     MasterScenario& When(PingAction action);

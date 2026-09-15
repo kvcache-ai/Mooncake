@@ -84,6 +84,9 @@ class OrderedOpLogWriter {
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
     void SetTerminalCallback(TerminalCallback callback);
+    // Called by the service only after installing this writer. Older writers
+    // can no longer publish runtime metrics after this handoff.
+    void ActivateRuntimeMetrics();
     void Start();
     virtual void Stop();
 

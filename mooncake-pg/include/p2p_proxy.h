@@ -274,7 +274,7 @@ class P2PProxy {
    public:
     friend class P2PDeviceWorker;
 
-    enum class IssueResult : uint8_t { kIssued, kNoCredit, kTimeout };
+    enum class IssueResult : uint8_t { kIssued, kNoCredit, kFailed };
 
     struct Options {
         bool is_cpu = false;
@@ -398,6 +398,8 @@ class P2PProxy {
         // staging buffers.  When bytes_staged_ == total_bytes_ every chunk
         // has at least entered the Copy-In stage.
         uint64_t bytes_staged_ = 0;
+        // Epoch of the first accepted credit, used for all ACKs.
+        std::optional<uint32_t> credit_epoch_;
         int32_t* failed_ranks_hint_ = nullptr;
 
         std::chrono::steady_clock::time_point last_update_time_;
@@ -429,7 +431,7 @@ class P2PProxy {
     // kWaitAck -> kCopyOut -> kFinished).
     struct RecvOpContext {
         RecvOpContext() = default;
-        RecvOpContext(RecvOp&& op_in);
+        RecvOpContext(RecvOp&& op_in, uint32_t credit_epoch);
 
         std::deque<RecvTransferTask> tasks_;
         std::shared_ptr<std::promise<void>> completion_;
@@ -443,6 +445,8 @@ class P2PProxy {
         // CreditSlot has been sent to the peer.  When bytes_credited_ ==
         // total_bytes_ the entire buffer has been offered to the sender.
         uint64_t bytes_credited_ = 0;
+        // Epoch captured at enqueue, used for credits and ACK matching.
+        uint32_t credit_epoch_ = 0;
     };
 
     // Per-peer sender state.  The sender consumes CreditSlots that the
@@ -451,8 +455,11 @@ class P2PProxy {
         std::deque<SendOpContext> pending_send_ops_;
         std::optional<SendOpContext> active_send_op_;
         // Sequence number of the next CreditSlot to consume from this peer.
-        // Monotonically increases; wraps around the ring via modulo.
+        // Increases between resets; indexes the ring modulo its size.
         uint64_t credit_consume_seq_ = 0;
+        // Group epoch observed at the last reset; older credits are rejected.
+        // This cannot distinguish credits across resets within the same epoch.
+        uint32_t minimum_credit_epoch_ = 0;
         std::array<cudaEvent_t, kP2PControlRingSize> copy_ready_events_;
     };
 
@@ -510,7 +517,7 @@ class P2PProxy {
     // Clean up the active op on a lane
     void cleanupFailedSendOp(SendOpContext& op_ctx);
     void cleanupFailedRecvOp(RecvOpContext& op_ctx);
-    // Reset P2P session and push link event to Agent.
+    // Request a lane reset and report the link failure to the Agent.
     void reportPeerFailure(int peer_rank);
     // Clean up, mark kFailed, and report the failure.
     void handleFailedSendOp(SendOpContext& op_ctx);

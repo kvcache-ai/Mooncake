@@ -345,9 +345,8 @@ Status ProxyManager::submit(TaskInfo* task, BatchID batch,
 Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
     if (!task || !task->staging) return Status::InvalidArgument("Invalid task");
     task_status.s = task->staging_status.load(std::memory_order_acquire);
-    if (task_status.s == COMPLETED) {
-        task_status.transferred_bytes = task->request.length;
-    }
+    task_status.transferred_bytes =
+        task_status.s == COMPLETED ? task->request.length : 0;
     return Status::OK();
 }
 
