@@ -249,6 +249,36 @@ int closeSegment(SegmentHandle segment_id);
 - `segment_id`: The unique identifier of the segment.
 - Return value: If successful, returns 0; otherwise, returns a negative value.
 
+#### TransferEngine::getSegmentBuffers
+
+```cpp
+struct SegmentBufferInfo {
+    uint64_t addr;
+    uint64_t length;
+    std::string location;
+};
+
+int getSegmentBuffers(SegmentHandle handle,
+                      std::vector<SegmentBufferInfo>& buffers);
+```
+
+Returns a snapshot of the memory buffers published in a segment, using the
+selected classic or TENT backend. This supports buffer inspection without
+accessing `getMetadata()`, which is unavailable under TENT.
+
+- `handle`: A segment handle returned by `openSegment()`.
+- `buffers`: Replaces any existing contents with buffer addresses, lengths in
+  bytes, and backend-reported location labels. Classic copies `BufferDesc::name`
+  (some transports, such as TCP, use a server name); TENT copies the native
+  location. Entries preserve the backend descriptor's order, which is not
+  guaranteed to be sorted by address. TENT internal buffers are excluded.
+- Return value: `0` on success, including a segment with no memory buffers;
+  `ERR_METADATA` if the descriptor cannot be retrieved; `ERR_NOT_IMPLEMENTED`
+  for file segments. On error, `buffers` is empty.
+- The call may fetch remote metadata and block. It does not close the handle,
+  register memory, or keep the reported buffers alive; the caller must coordinate
+  buffer lifetime with the owning peer.
+
 #### TransferEngine::removeLocalSegment
 
 ```cpp

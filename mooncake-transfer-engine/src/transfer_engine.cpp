@@ -17,6 +17,7 @@
 #include <limits>
 #include <thread>
 #include <unordered_map>
+#include "error.h"
 
 #ifndef USE_TENT
 #include "transfer_engine.h"
@@ -1059,6 +1060,31 @@ std::string TransferEngine::showLinks(bool json) const {
 #endif
 
 namespace mooncake {
+
+int TransferEngine::getSegmentBuffers(SegmentHandle handle,
+                                      std::vector<SegmentBufferInfo>& buffers) {
+    buffers.clear();
+#ifdef USE_TENT
+    if (use_tent_) {
+        tent::SegmentInfo info;
+        if (!impl_tent_->getSegmentInfo(handle, info).ok()) return ERR_METADATA;
+        if (info.type != tent::SegmentInfo::Memory) return ERR_NOT_IMPLEMENTED;
+        buffers.reserve(info.buffers.size());
+        for (const auto& entry : info.buffers) {
+            buffers.push_back({entry.base, entry.length, entry.location});
+        }
+        return 0;
+    }
+#endif
+    auto desc = impl_->getMetadata()->getSegmentDescByID(handle);
+    if (!desc) return ERR_METADATA;
+    if (desc->protocol == "nvmeof") return ERR_NOT_IMPLEMENTED;
+    buffers.reserve(desc->buffers.size());
+    for (const auto& entry : desc->buffers) {
+        buffers.push_back({entry.addr, entry.length, entry.name});
+    }
+    return 0;
+}
 
 class TransferEngine::ScatterTransferOperation::Impl {
    public:
