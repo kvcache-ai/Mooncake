@@ -352,6 +352,11 @@ Build the Python wheel and stage the standalone client binary:
 ./scripts/build/build-wheel.sh
 ```
 
+The wheel stages the upstream Python helpers listed in
+`scripts/build/build-wheel.sh` under `mooncake_store_rs`. The release replacement
+script uses the same asset set. `python/tests/test_shim.py` checks that each
+helper exists in the selected upstream source tree and has an import redirect.
+
 If the host OS is missing wheel-build dependencies, use the Ubuntu Docker
 wrapper and pin the Python runtime explicitly:
 

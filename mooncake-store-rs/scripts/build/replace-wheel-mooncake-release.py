@@ -16,11 +16,9 @@ PYTHON_ASSETS = {
     "http_metadata_server.py",
     "mooncake_config.py",
     "mooncake_connector_v1.py",
-    "mooncake_ep_buffer.py",
     "mooncake_store_service.py",
     "transfer_engine_topology_dump.py",
     "vllm_v1_proxy_server.py",
-    "ep.py",
     "pg.py",
 }
 
@@ -165,11 +163,10 @@ def main() -> None:
     if not release_wheel.exists():
         raise FileNotFoundError(release_wheel)
 
-    with tempfile.TemporaryDirectory(
-        prefix="store-rs-wheel-"
-    ) as target_tmp, tempfile.TemporaryDirectory(
-        prefix="mooncake-release-wheel-"
-    ) as release_tmp:
+    with (
+        tempfile.TemporaryDirectory(prefix="store-rs-wheel-") as target_tmp,
+        tempfile.TemporaryDirectory(prefix="mooncake-release-wheel-") as release_tmp,
+    ):
         target_root = pathlib.Path(target_tmp)
         release_root = pathlib.Path(release_tmp)
         extract_wheel(target_wheel, target_root)

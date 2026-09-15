@@ -603,11 +603,9 @@ python_assets = [
     "http_metadata_server.py",
     "mooncake_config.py",
     "mooncake_connector_v1.py",
-    "mooncake_ep_buffer.py",
     "mooncake_store_service.py",
     "transfer_engine_topology_dump.py",
     "vllm_v1_proxy_server.py",
-    "ep.py",
     "pg.py",
 ]
 

@@ -50,11 +50,9 @@ _REDIRECTS = {
     "mooncake.cli_client": "mooncake_store_rs.cli_client",
     "mooncake.structured_object_store": "mooncake_store_rs.structured_object_store",
     "mooncake.engine": "mooncake_store_rs.engine",
-    "mooncake.ep": "mooncake_store_rs.ep",
     "mooncake.pg": "mooncake_store_rs.pg",
     "mooncake.mooncake_config": "mooncake_store_rs.mooncake_config",
     "mooncake.mooncake_connector_v1": "mooncake_store_rs.mooncake_connector_v1",
-    "mooncake.mooncake_ep_buffer": "mooncake_store_rs.mooncake_ep_buffer",
     "mooncake.mooncake_store_service": "mooncake_store_rs.mooncake_store_service",
     "mooncake.http_metadata_server": "mooncake_store_rs.http_metadata_server",
     "mooncake.transfer_engine_topology_dump": (
