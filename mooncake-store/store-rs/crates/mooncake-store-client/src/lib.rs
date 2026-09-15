@@ -27,10 +27,10 @@ pub use client::cold_tier::nof::extent_store::{
 pub use client::{
     stable_phase_spread_ms, BandwidthShaping, ColdTierKind, ColdTierOffloadMode,
     ColdTierShutdownMode, ColdTierSsdEngine, ColdTierTarget, ColdTierTargetConfig,
-    ColdTierTargetSpec, DebugEvictAllResult, ExecutionFairness, GetRequest, HealthChannel,
-    HealthUpdate, HeartbeatLease, MooncakeCompatibilityFacade, MultiBufferGetRequest,
-    MultiBufferPutRequest, NamespaceQuota, ObjectRef, PutFromRequest, PutRequest,
-    ReadQueryResultCache, ReplicationPolicy, StoreClient, StoreClientBuilder,
+    ColdTierTargetSpec, ColdTierWatermarkConfig, DebugEvictAllResult, ExecutionFairness,
+    GetRequest, HealthChannel, HealthUpdate, HeartbeatLease, MooncakeCompatibilityFacade,
+    MultiBufferGetRequest, MultiBufferPutRequest, NamespaceQuota, ObjectRef, PutFromRequest,
+    PutRequest, ReadQueryResultCache, ReplicationPolicy, StoreClient, StoreClientBuilder,
 };
 pub use control_plane::{pb as control_plane_pb, MigrationControlClient};
 pub use memory::{LocalMemoryConfig, ScratchReservation};
