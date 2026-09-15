@@ -158,8 +158,6 @@ void ClassicRdmaCongestionControl::prepare(Transport::Slice *slice,
                               adaptive_congestion_control::OutcomeClass::kDerivedFlush,
                               adaptive_congestion_control::FailureScope::kOperation);
     }
-    if (current_route != nullptr && current_route != next_route)
-        resolveCongestion(slice);
     slice->rdma_congestion_control_route = next_route;
 }
 
@@ -178,8 +176,6 @@ void ClassicRdmaCongestionControl::prepare(SliceList &slices,
                                   adaptive_congestion_control::OutcomeClass::kDerivedFlush,
                                   adaptive_congestion_control::FailureScope::kOperation);
         }
-        if (current_route != nullptr && current_route != next_route)
-            resolveCongestion(slice);
         slice->rdma_congestion_control_route = next_route;
     }
 }
@@ -329,7 +325,8 @@ void ClassicRdmaCongestionControl::complete(Transport::Slice *slice, ibv_wc_stat
     bool relevant_feedback =
         current_endpoint && status != IBV_WC_SUCCESS &&
         (result.outcome == adaptive_congestion_control::OutcomeClass::kCongestion ||
-         result.outcome == adaptive_congestion_control::OutcomeClass::kReceiverPressure) &&
+         result.outcome == adaptive_congestion_control::OutcomeClass::kReceiverPressure ||
+         result.outcome == adaptive_congestion_control::OutcomeClass::kRouteTimeout) &&
         adaptive_congestion_control::isCurrentGeneration(slice->rdma_congestion_control_permit);
     const auto device_before =
         relevant_feedback ? adaptive_congestion_control::snapshot(*device_)
@@ -351,12 +348,14 @@ void ClassicRdmaCongestionControl::complete(Transport::Slice *slice, ibv_wc_stat
         const auto device_after = adaptive_congestion_control::snapshot(*device_);
         if (route_before.generation == route_after.generation &&
             device_before.generation == device_after.generation) {
+            TaskCongestionReason reason =
+                TaskCongestionReason::kCongestionFeedback;
+            if (result.outcome == adaptive_congestion_control::OutcomeClass::kReceiverPressure)
+                reason = TaskCongestionReason::kReceiverPressure;
+            else if (result.outcome == adaptive_congestion_control::OutcomeClass::kRouteTimeout)
+                reason = TaskCongestionReason::kRouteTimeout;
             recordCongestion(
-                slice, route_after, state->peer_nic_path,
-                result.outcome == adaptive_congestion_control::OutcomeClass::kReceiverPressure
-                    ? TaskCongestionReason::kReceiverPressure
-                    : TaskCongestionReason::kCongestionFeedback,
-                false,
+                slice, route_after, state->peer_nic_path, reason, false,
                 static_cast<TaskCongestionFailureScope>(result.scope));
         }
     }

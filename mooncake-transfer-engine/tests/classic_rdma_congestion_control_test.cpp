@@ -119,6 +119,39 @@ TEST(ClassicRdmaCongestionControlTest,
 }
 
 TEST(ClassicRdmaCongestionControlTest,
+     RouteTimeoutFeedbackIsRecordedOnLogicalTask) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    ClassicRdmaCongestionControl adapter(config);
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    const auto batch_id = transports.allocateBatchID(1);
+    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
+    auto* slice = new Transport::Slice{};
+    slice->length = 64;
+    slice->task = &task;
+    task.slice_list.push_back(slice);
+    task.slice_count = 1;
+    auto* endpoint = reinterpret_cast<RdmaEndPoint*>(uintptr_t{1});
+    adapter.prepare(slice, "peer@nic");
+    adapter.bindEndpoint(slice, endpoint);
+    std::vector<Transport::Slice*> queued{slice}, avoided;
+    ASSERT_EQ(adapter.gate(queued, avoided), 1u);
+    adapter.complete(slice, IBV_WC_RETRY_EXC_ERR);
+
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.state, TaskCongestionState::kCongested);
+    ASSERT_TRUE(detail.reason.observed);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kRouteTimeout);
+
+    task.is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+TEST(ClassicRdmaCongestionControlTest,
      ActualRdmaModeControlsHealthyTaskClassification) {
     std::string local_name = "local";
     MultiTransport transports(nullptr, local_name);
@@ -314,12 +347,58 @@ TEST(ClassicRdmaCongestionControlTest,
     healthy_adapter.prepare(slice, path);
     TaskCongestionDetail detail;
     ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
-    EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
-    EXPECT_TRUE(detail.resolved);
+    EXPECT_EQ(detail.state, TaskCongestionState::kLongUnavailable);
     queued = {slice};
     avoided.clear();
     EXPECT_EQ(healthy_adapter.gate(queued, avoided), 1u);
+    ASSERT_TRUE(transports.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(detail.state, TaskCongestionState::kNormal);
+    EXPECT_TRUE(detail.resolved);
     healthy_adapter.releaseUnposted(slice);
+    task.is_finished = true;
+    EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
+}
+
+TEST(ClassicRdmaCongestionControlTest,
+     QuarantinedReplacementDoesNotClearUnavailableTask) {
+    adaptive_congestion_control::Config config;
+    config.mode = adaptive_congestion_control::Mode::kEnforce;
+    config.hard_error_threshold = 1;
+    ClassicRdmaCongestionControl first_adapter(config), replacement_adapter(config);
+    std::string local_name = "local";
+    MultiTransport transports(nullptr, local_name);
+    const auto batch_id = transports.allocateBatchID(1);
+    auto& task = Transport::toBatchDesc(batch_id).task_list.emplace_back();
+    task.batch_id = batch_id;
+    task.rdma_congestion_control_mode = {true, TaskCongestionControllerMode::kEnforce};
+    auto* slice = new Transport::Slice{};
+    slice->task = &task;
+    slice->length = 64;
+    task.slice_list.push_back(slice);
+    task.slice_count = 1;
+    const std::string path = "peer@nic";
+    first_adapter.prepare(slice, path);
+    first_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
+    first_adapter.tick(1);
+    std::vector<Transport::Slice*> queued{slice}, avoided;
+    ASSERT_EQ(first_adapter.gate(queued, avoided), 0u);
+    TaskCongestionState state;
+    ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
+    ASSERT_EQ(state, TaskCongestionState::kLongUnavailable);
+
+    Transport::Slice seed{};
+    replacement_adapter.prepare(&seed, path);
+    replacement_adapter.recordAsyncEvent(IBV_EVENT_QP_FATAL, &path);
+    replacement_adapter.tick(1);
+    replacement_adapter.prepare(slice, path);
+    ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kLongUnavailable);
+
+    queued = {slice};
+    avoided.clear();
+    EXPECT_EQ(replacement_adapter.gate(queued, avoided), 0u);
+    ASSERT_TRUE(transports.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kLongUnavailable);
     task.is_finished = true;
     EXPECT_TRUE(transports.freeBatchID(batch_id).ok());
 }
