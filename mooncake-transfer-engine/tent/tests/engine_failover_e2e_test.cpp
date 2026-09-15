@@ -257,11 +257,14 @@ adaptive_congestion_control::Config taskQueryCongestionControlConfig() {
 // RDMA adapter as worker posting, with hardware posting held by this test.
 class ObservedRdmaTransport : public FakeTransport {
    public:
-    ObservedRdmaTransport()
+    ObservedRdmaTransport(uint64_t first_length = 1024,
+                          uint64_t second_length = 128)
         : FakeTransport(
               RDMA, [](const Request&) { return TransferStatus{PENDING, 0}; }),
           device_(taskQueryCongestionControlConfig(), 3),
-          route_(taskQueryCongestionControlConfig()) {}
+          route_(taskQueryCongestionControlConfig()),
+          first_length_(first_length),
+          second_length_(second_length) {}
 
     bool taskCongestionEnabled() const override { return true; }
 
@@ -289,8 +292,8 @@ class ObservedRdmaTransport : public FakeTransport {
         first_.task = second_.task = &task_;
         first_.slice_idx = 0;
         second_.slice_idx = 1;
-        first_.length = 1024;
-        second_.length = 128;
+        first_.length = first_length_;
+        second_.length = second_length_;
         adaptive_congestion_control::PathHandle path{&device_, &route_.domain, 3, 1};
         if (acquireTentCongestionControlAttempt(first_, &route_, path, first_.length, 7) !=
                 adaptive_congestion_control::Decision::kAllow ||
@@ -329,6 +332,8 @@ class ObservedRdmaTransport : public FakeTransport {
     RdmaTask task_{};
     RdmaSlice first_{}, second_{};
     FakeSubBatch* submitted_batch_ = nullptr;
+    uint64_t first_length_;
+    uint64_t second_length_;
 };
 
 class RejectingCongestionControlRdmaTransport : public FakeTransport {
@@ -682,6 +687,45 @@ TEST(EngineFailoverE2E, LogicalRdmaTaskProjectsWorkerAdmissionWithoutPolling) {
     EXPECT_TRUE(engine.freeBatch(batch_id).ok());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(EngineFailoverE2E, PartialWindowDeferAppearsOnPublicTaskQuery) {
+    auto config = makeMinimalP2PConfig();
+    TransferEngineImpl engine(config);
+    ASSERT_TRUE(engine.available());
+    auto rdma = std::make_shared<ObservedRdmaTransport>(512, 600);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(rdma->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, rdma);
+
+    std::vector<uint8_t> buffer(4096, 0x5A);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+    const BatchID batch_id = engine.allocateBatch(1);
+    ASSERT_NE(batch_id, static_cast<BatchID>(0));
+    Request request{};
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+    request.transport_hint = RDMA;
+    ASSERT_TRUE(engine.submitTransfer(batch_id, {request}).ok());
+
+    TaskCongestionState state;
+    TaskCongestionDetail detail;
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    ASSERT_TRUE(engine.getTaskCongestionDetail(batch_id, 0, detail).ok());
+    EXPECT_EQ(state, TaskCongestionState::kCongested);
+    EXPECT_EQ(detail.state, state);
+    ASSERT_TRUE(detail.reason.observed);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+    EXPECT_EQ(rdma->status_calls.load(), 0);
+
+    ASSERT_TRUE(rdma->readmitBlockedSlice());
+    ASSERT_TRUE(engine.getTaskCongestionState(batch_id, 0, state).ok());
+    EXPECT_EQ(state, TaskCongestionState::kNormal);
+    EXPECT_TRUE(engine.freeBatch(batch_id).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
 }
 
 TEST(EngineFailoverE2E, FailedRdmaSubmitWithoutCongestionControlEvidenceIsUnknown) {

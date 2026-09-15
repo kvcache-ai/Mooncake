@@ -92,6 +92,43 @@ TEST(TentAdaptiveCongestionControlTest,
                                       adaptive_congestion_control::FailureScope::kOperation));
 }
 
+TEST(TentAdaptiveCongestionControlTest,
+     PartiallyFilledWindowStillReportsDeferredTask) {
+    adaptive_congestion_control::DomainState device(testConfig(), 3);
+    TentRdmaCongestionControlRoute route(testConfig());
+    auto observation =
+        std::make_shared<adaptive_congestion_control::TaskCongestionObservation>(2, 1);
+    RdmaTask task{};
+    task.congestion_observation = observation;
+    task.congestion_attempt_id = 1;
+    RdmaSlice first{}, second{};
+    first.task = second.task = &task;
+    first.slice_idx = 0;
+    second.slice_idx = 1;
+    first.length = 512;
+    second.length = 600;
+    adaptive_congestion_control::PathHandle path{&device, &route.domain, 3, 1};
+
+    ASSERT_EQ(acquireTentCongestionControlAttempt(first, &route, path, first.length, 7),
+              adaptive_congestion_control::Decision::kAllow);
+    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+              adaptive_congestion_control::Decision::kDefer);
+    EXPECT_EQ(observation->state(), TaskCongestionState::kCongested);
+    auto detail = observation->detail();
+    ASSERT_TRUE(detail.reason.observed);
+    EXPECT_EQ(detail.reason.value, TaskCongestionReason::kByteWindow);
+
+    ASSERT_TRUE(completeTentCongestionControlAttempt(first,
+                                      adaptive_congestion_control::OutcomeClass::kSuccess,
+                                      adaptive_congestion_control::FailureScope::kOperation));
+    ASSERT_EQ(acquireTentCongestionControlAttempt(second, &route, path, second.length, 7),
+              adaptive_congestion_control::Decision::kAllow);
+    EXPECT_EQ(observation->state(), TaskCongestionState::kNormal);
+    EXPECT_TRUE(completeTentCongestionControlAttempt(second,
+                                      adaptive_congestion_control::OutcomeClass::kSuccess,
+                                      adaptive_congestion_control::FailureScope::kOperation));
+}
+
 TEST(TentAdaptiveCongestionControlTest, QuarantineAvoidsCurrentSliceOnly) {
     auto config = testConfig();
     config.hard_error_threshold = 1;

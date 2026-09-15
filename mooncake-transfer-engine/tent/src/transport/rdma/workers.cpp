@@ -96,6 +96,12 @@ adaptive_congestion_control::TaskCongestionEvidence taskEvidence(
     return evidence;
 }
 
+bool capacityBlocksSlice(const adaptive_congestion_control::Snapshot& domain, uint64_t bytes) {
+    return domain.inflight_bytes != 0 &&
+           (bytes > domain.window_bytes ||
+            domain.inflight_bytes > domain.window_bytes - bytes);
+}
+
 void recordTaskFeedback(RdmaSlice& slice, adaptive_congestion_control::OutcomeClass outcome,
                         adaptive_congestion_control::FailureScope scope) {
     if (slice.word != PENDING) return;
@@ -166,17 +172,18 @@ adaptive_congestion_control::Decision acquireTentCongestionControlAttempt(RdmaSl
                 slice.congestion_control_observed_blocked = observation->avoid(
                     slice.slice_idx, slice.task->congestion_attempt_id,
                     evidence);
-            } else if (decision == adaptive_congestion_control::Decision::kDefer &&
-                       (device.inflight_bytes >= device.window_bytes ||
-                        route_state.inflight_bytes >=
-                            route_state.window_bytes)) {
-                const bool device_blocked =
-                    device.inflight_bytes >= device.window_bytes;
+            } else if (decision == adaptive_congestion_control::Decision::kDefer) {
+                const bool device_blocked = capacityBlocksSlice(device, bytes);
+                const bool route_blocked =
+                    capacityBlocksSlice(route_state, bytes);
+                std::optional<TaskCongestionFailureScope> blocked_scope;
+                if (device_blocked)
+                    blocked_scope = TaskCongestionFailureScope::kDevice;
+                else if (route_blocked)
+                    blocked_scope = TaskCongestionFailureScope::kRoute;
                 evidence = taskEvidence(
                     slice, TaskCongestionReason::kByteWindow,
-                    device_blocked ? device : route_state,
-                    device_blocked ? TaskCongestionFailureScope::kDevice
-                                   : TaskCongestionFailureScope::kRoute);
+                    device_blocked ? device : route_state, blocked_scope);
                 slice.congestion_control_observed_blocked = observation->defer(
                     slice.slice_idx, slice.task->congestion_attempt_id,
                     evidence);
