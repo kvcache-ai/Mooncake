@@ -1578,7 +1578,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         tenant_backend
             .compare_and_swap_object_route(&route.key, None, Some(&route))
@@ -1737,7 +1736,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         tenant_backend
             .compare_and_swap_object_route(&cold_only_route.key, None, Some(&cold_only_route))
@@ -1917,7 +1915,6 @@ mod tests {
                         state: ColdBackingState::Materialized,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("route should seed");
@@ -2016,7 +2013,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         service
             .backend()
@@ -2097,7 +2093,6 @@ mod tests {
                 state: ColdBackingState::Materialized,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         service
             .backend()
@@ -2125,7 +2120,6 @@ mod tests {
                 state: ColdBackingState::PendingOffload,
                 replicas: Vec::new(),
             }),
-            nof_backing: None,
         };
         service
             .backend()
@@ -2259,7 +2253,6 @@ mod tests {
                         state: ColdBackingState::Materialized,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("tenant-a route should store");
@@ -2288,7 +2281,6 @@ mod tests {
                         state: ColdBackingState::PendingOffload,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("tenant-b route should store");
@@ -3157,7 +3149,6 @@ mod tests {
                         state: ColdBackingState::Materialized,
                         replicas: Vec::new(),
                     }),
-                    nof_backing: None,
                 }),
             )
             .expect("route should seed");

@@ -1592,7 +1592,8 @@ mod tests {
             replicas: Vec::new(),
             cold_backing: Some(cold_backing.clone()),
 
-            nof_backing: None,};
+            nof_backing: None,
+        };
         backend
             .put_object_with_route(Some(&route), &cold_backing, payload)
             .unwrap();

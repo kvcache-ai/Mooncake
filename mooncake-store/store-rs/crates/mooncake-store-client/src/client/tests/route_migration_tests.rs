@@ -157,7 +157,8 @@ fn explicit_copy_route_delta_preserves_existing_replicas_and_appends_targets() {
         ],
         cold_backing: None,
 
-        nof_backing: None,};
+        nof_backing: None,
+    };
 
     let next = StoreClient::build_explicit_copy_route_delta(
         &current,
@@ -246,7 +247,8 @@ fn explicit_move_route_delta_replaces_source_replica_with_target() {
         ],
         cold_backing: None,
 
-        nof_backing: None,};
+        nof_backing: None,
+    };
 
     let next = StoreClient::build_explicit_move_route_delta(
         &current,
@@ -308,7 +310,8 @@ fn explicit_route_delta_rejects_missing_source_or_duplicate_targets() {
         }],
         cold_backing: None,
 
-        nof_backing: None,};
+        nof_backing: None,
+    };
 
     let missing_source = StoreClient::build_explicit_copy_route_delta(
         &current,
@@ -2375,7 +2378,8 @@ fn explicit_source_selector_resolves_route_replica_by_segment_and_owner() {
         ],
         cold_backing: None,
 
-        nof_backing: None,};
+        nof_backing: None,
+    };
 
     let by_segment = StoreClient::resolve_explicit_source_replica(
         &current,
@@ -2424,7 +2428,8 @@ fn explicit_source_selector_rejects_missing_or_owner_mismatched_replicas() {
         }],
         cold_backing: None,
 
-        nof_backing: None,};
+        nof_backing: None,
+    };
 
     let missing = StoreClient::resolve_explicit_source_replica(
         &current,

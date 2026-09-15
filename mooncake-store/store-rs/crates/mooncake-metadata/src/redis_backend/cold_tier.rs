@@ -10,8 +10,8 @@ use redis::{Commands, Script};
 use crate::cold_tier::cold_tier_device_matches_filter;
 
 use super::{
-    json_error, metadata_error, scan_keys, scan_set_members_bounded,
-    RedisMetadataBackend, CAS_OBJECT_ROUTE_SCRIPT, MAX_REDIS_LIST_ITEMS, MAX_REDIS_SCAN_PAGES,
+    json_error, metadata_error, scan_keys, scan_set_members_bounded, RedisMetadataBackend,
+    CAS_OBJECT_ROUTE_SCRIPT, MAX_REDIS_LIST_ITEMS, MAX_REDIS_SCAN_PAGES,
 };
 
 const APPLY_COLD_TIER_USAGE_DELTA_SCRIPT: &str = r#"
@@ -151,17 +151,15 @@ impl RedisMetadataBackend {
         let Some(index) = self.cold_backing_filter_index(filter) else {
             return MetadataBackend::list_object_routes_by_cold_backing(self, filter);
         };
-        let keys = self.query_readonly(
-            "redis list object routes by cold backing",
-            |connection| {
+        let keys =
+            self.query_readonly("redis list object routes by cold backing", |connection| {
                 scan_set_members_bounded(
                     connection,
                     &index,
                     MAX_REDIS_LIST_ITEMS,
                     MAX_REDIS_SCAN_PAGES,
                 )
-            },
-        )?;
+            })?;
         let entries =
             self.query_readonly("redis load cold backing object routes", |connection| {
                 let mut entries = Vec::with_capacity(keys.len());
@@ -232,20 +230,17 @@ impl RedisMetadataBackend {
         let Some(index) = self.nof_backing_filter_index(filter) else {
             return MetadataBackend::list_object_routes_by_nof_backing(self, filter);
         };
-        let keys = self.query_readonly(
-            "redis list object routes by nof backing",
-            |connection| {
+        let keys =
+            self.query_readonly("redis list object routes by nof backing", |connection| {
                 scan_set_members_bounded(
                     connection,
                     &index,
                     MAX_REDIS_LIST_ITEMS,
                     MAX_REDIS_SCAN_PAGES,
                 )
-            },
-        )?;
-        let entries = self.query_readonly(
-            "redis load nof backing object routes",
-            |connection| {
+            })?;
+        let entries =
+            self.query_readonly("redis load nof backing object routes", |connection| {
                 let mut entries = Vec::with_capacity(keys.len());
                 for key in &keys {
                     let payload: Option<String> = redis::cmd("HGET")
@@ -255,8 +250,7 @@ impl RedisMetadataBackend {
                     entries.push((key.clone(), payload));
                 }
                 Ok(entries)
-            },
-        )?;
+            })?;
         let mut stale_keys = Vec::new();
         let mut routes = Vec::new();
         for (key, payload) in entries {

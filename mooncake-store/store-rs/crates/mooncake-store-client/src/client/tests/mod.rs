@@ -6547,8 +6547,8 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
         key: "deadline-key".to_string(),
         route: mooncake_store_core::ObjectRoute {
             key: reader.scoped_key("default", "deadline-key"),
-        version: RouteVersion(1),
-        state: mooncake_store_core::RouteState::Active,
+            version: RouteVersion(1),
+            state: mooncake_store_core::RouteState::Active,
             namespace: Some(NamespaceScope::with_defaults(Some("default"), None, None)),
             logical_key: Some("deadline-key".to_string()),
             canonical_key: None,
@@ -6561,7 +6561,7 @@ fn request_deadline_failure_does_not_quarantine_remote_runtime() {
         },
         replica,
         fallback_replicas: VecDeque::new(),
-        transient_backing: None,
+        transient_nof_read: None,
     };
 
     reader.note_remote_read_failure(

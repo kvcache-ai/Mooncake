@@ -250,7 +250,8 @@ impl RecordingRouteDirectory {
             replicas: Vec::new(),
             cold_backing: None,
 
-            nof_backing: None,})
+            nof_backing: None,
+        })
     }
 }
 
