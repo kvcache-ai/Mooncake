@@ -359,6 +359,9 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "tent/common/types.h"
 #include "tent/runtime/topology.h"
 #include "topology.h"
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#include "config.h"
+#endif
 
 #include <mutex>
 #include <utility>
@@ -527,6 +530,20 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                              "use TCP";
             }
         }
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+        // Store still constructs TENT through this classic init() shim, not
+        // tent::TransferEngine(Config) directly. Copy Dummy-real flags until
+        // Store creates the native engine itself.
+        if (globalConfig().ascend_agent_mode) {
+            config->set("transports/ascend_direct/agent_mode", true);
+        }
+        if (globalConfig().ascend_store_te_init) {
+            config->set("transports/ascend_direct/store_te_init", true);
+            if (globalConfig().ascend_use_fabric_mem) {
+                config->set("transports/ascend_direct/fabric_mem", true);
+            }
+        }
+#endif
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
         return impl_tent_->available() ? 0 : 1;
     }
@@ -566,6 +583,12 @@ int TransferEngine::uninstallTransport(const std::string& proto) {
 
 std::string TransferEngine::getLocalIpAndPort() {
     if (use_tent_) {
+        // Store handshake and openSegment must use the advertised segment
+        // name, not a reconstructed host:port that can disagree with it.
+        auto name = impl_tent_->getSegmentName();
+        if (!name.empty()) {
+            return name;
+        }
         return impl_tent_->getRpcServerAddress() + ":" +
                std::to_string(impl_tent_->getRpcServerPort());
     } else
@@ -591,9 +614,20 @@ SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
 }
 
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
-    if (use_tent_)
-        return Status::OK();
-    else
+    if (use_tent_) {
+        // TENT owns its segment cache, so actively probe the peer instead of
+        // reporting OK unconditionally. Returning OK here left classic callers
+        // (e.g. the Python wrapper's handle_map_) holding a dead peer's cached
+        // handle forever, because they only evict the handle on a non-OK
+        // status. A stale/unknown handle or an unreachable peer makes
+        // probePeerAliveByID fail (invalid handle, empty RPC address, or RPC
+        // error); surface that as a non-OK status so the caller closes and
+        // re-opens the segment on the next transfer. Refs #3995
+        // (P0-stale-handle).
+        auto probe_status = impl_tent_->probePeerAliveByID(sid);
+        if (probe_status.ok()) return Status::OK();
+        return Status::Endpoint(std::string(probe_status.message()));
+    } else
         return impl_->CheckSegmentStatus(sid);
 }
 

@@ -27,6 +27,10 @@ class OpLogBatchStorage {
     ErrorCode ReadBatch(uint64_t batch_id, OpLogBatchRecord& batch);
     ErrorCode ReadBatchesAfter(uint64_t after_batch_id, size_t limit,
                                std::vector<OpLogBatchRecord>& batches);
+    // Idempotently delete records with id <= batch_id in this cluster only.
+    // Caller must first publish a reader-visible compaction floor covering
+    // this cutoff. Does not choose/validate the cutoff or retry backend errors.
+    ErrorCode DeleteBatchesThrough(uint64_t batch_id);
 
    private:
     bool IsValidClusterId() const;

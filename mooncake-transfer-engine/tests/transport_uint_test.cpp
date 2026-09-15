@@ -263,6 +263,27 @@ void expectForcedTcpConstraint(const tent::Config& config) {
     EXPECT_FALSE(config.get("transports/rdma/enable", true));
 }
 
+TEST(TransferEngineTentCompatibilityTest, CheckSegmentStatusRejectsDeadPeer) {
+    ScopedEnvVar use_tent("MC_USE_TENT", "1");
+    ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
+    ScopedEnvVar hostname("MOONCAKE_LOCAL_HOSTNAME", "127.0.0.1");
+    ScopedEnvVar conf("MC_TENT_CONF", kTentConfPrefersRdma);
+
+    TransferEngine engine(true);
+    ASSERT_TRUE(engine.isUsingTent());
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "compat-stale-handle"), 0);
+
+    // Segment handles are handed out from 1 upward when a peer is opened, so a
+    // large handle that was never opened has no id->name mapping. That is the
+    // same "peer gone / handle stale" situation the eviction path must detect:
+    // probePeerAliveByID fails on it, so CheckSegmentStatus must report non-OK
+    // and let the caller close + re-open the segment. Before the fix the shim
+    // returned Status::OK() unconditionally under MC_USE_TENT, so the Python
+    // wrapper's handle_map_ never dropped a dead peer and kept reusing the same
+    // stale handle forever. Refs #3995 (P0-stale-handle).
+    EXPECT_FALSE(engine.CheckSegmentStatus(1ull << 40).ok());
+}
+
 TEST(TransferEngineTentCompatibilityTest, TcpProtocolForcesTcpTransport) {
     ScopedEnvVar use_tent("MC_USE_TENT", "1");
     ScopedEnvVar force_tcp("MC_FORCE_TCP", nullptr);
