@@ -1088,6 +1088,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             request.target_id = seg;
             request.target_offset = handle.buffer_address_ + offset;
             request.length = slice.size;
+            request.device_id = slice.device_id;
             requests.emplace_back(request);
             offset += slice.size;
         }
@@ -1168,6 +1169,7 @@ TransferSubmitter::submit_batch_get_offload_object(
                     .target_id = seg,
                     .target_offset = pointers[i] + offset,
                     .length = slice.size,
+                    .device_id = slice.device_id,
                 });
             }
             offset += slice.size;
@@ -1290,6 +1292,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         request.target_id = seg;
         request.target_offset = base_address + offset;
         request.length = slice.size;
+        request.device_id = slice.device_id;
 
         offset += slice.size;
         requests.emplace_back(request);

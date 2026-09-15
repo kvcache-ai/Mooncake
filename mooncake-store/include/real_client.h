@@ -435,7 +435,7 @@ class RealClient : public PyClient {
     // Allocator-backed buffer acquire: allocates + fills, keeps handle alive.
     // Returns (dummy_addr, size).
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_buffer_dummy(
-        const std::string &key, const UUID &client_id);
+        const std::string &key, int32_t device_id, const UUID &client_id);
 
     // Allocator-backed buffer release: frees the handle held by acquire.
     tl::expected<void, ErrorCode> release_buffer_dummy(uint64_t dummy_addr,
@@ -445,14 +445,15 @@ class RealClient : public PyClient {
     // Returns vector of (dummy_addr, size) per key.
     std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
     batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
-                               const UUID &client_id);
+                               int32_t device_id, const UUID &client_id);
 
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
         size_t size, const UUID &client_id);
 
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
-        const ReplicateConfig &config, const UUID &client_id);
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
 
     tl::expected<void, ErrorCode> upsert_dummy_helper(
         const std::string &key, std::span<const char> value,
@@ -480,11 +481,13 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> put_batch_dummy_helper(
         const std::vector<std::string> &keys,
         const std::vector<std::span<const char>> &values,
-        const ReplicateConfig &config, const UUID &client_id);
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
 
     tl::expected<void, ErrorCode> put_parts_dummy_helper(
         const std::string &key, std::vector<std::span<const char>> values,
-        const ReplicateConfig &config, const UUID &client_id);
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
 
     async_simple::coro::Lazy<std::vector<tl::expected<int64_t, ErrorCode>>>
     batch_get_into_dummy_helper(const std::vector<std::string> &keys,
@@ -627,7 +630,8 @@ class RealClient : public PyClient {
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config = ReplicateConfig{},
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        int32_t device_id = kInvalidPhysicalDeviceId);
 
     tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
                                                            size_t size);
@@ -735,7 +739,8 @@ class RealClient : public PyClient {
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
-        const ReplicateConfig &config = ReplicateConfig{});
+        const ReplicateConfig &config = ReplicateConfig{},
+        int32_t device_id = kInvalidPhysicalDeviceId);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_internal(
@@ -750,14 +755,16 @@ class RealClient : public PyClient {
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{},
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        int32_t device_id = kInvalidPhysicalDeviceId);
 
     tl::expected<void, ErrorCode> put_batch_internal(
         const std::vector<std::string> &keys,
         const std::vector<std::span<const char>> &values,
         const ReplicateConfig &config = ReplicateConfig{},
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        int32_t device_id = kInvalidPhysicalDeviceId);
 
     tl::expected<void, ErrorCode> remove_internal(const std::string &key,
                                                   bool force = false);
@@ -782,12 +789,14 @@ class RealClient : public PyClient {
     std::shared_ptr<BufferHandle> get_buffer_internal(
         const std::string &key,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        int32_t device_id = kInvalidPhysicalDeviceId);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys,
         const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
-            nullptr);
+            nullptr,
+        int32_t device_id = kInvalidPhysicalDeviceId);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
     batch_get_replica_desc(const std::vector<std::string> &keys);
