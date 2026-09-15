@@ -1,4 +1,4 @@
-#include "nvme_kv_backend.h"
+#include "nvme_kv/nvme_kv_backend.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,10 +18,10 @@
 #include <vector>
 
 #include "config/nvme_kv_io_concurrency_config.h"
-#include "nvme_kv_executor_util.h"
-#include "nvme_kv_key_codec.h"
-#include "nvme_kv_key_conflict_policy.h"
-#include "nvme_kv_object_layout.h"
+#include "nvme_kv/nvme_kv_executor_util.h"
+#include "nvme_kv/nvme_kv_key_codec.h"
+#include "nvme_kv/nvme_kv_key_conflict_policy.h"
+#include "nvme_kv/nvme_kv_object_layout.h"
 
 namespace mooncake {
 
