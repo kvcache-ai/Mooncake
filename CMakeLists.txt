@@ -128,14 +128,14 @@ endif()
 
 if(WITH_STORE)
   message(STATUS "Mooncake Store will be built")
-  add_subdirectory(mooncake-store)
-  include_directories(mooncake-store/include)
   # mooncake-store sources include headers from mooncake-transfer-engine even
   # when WITH_TE=OFF (e.g. common.h for host-name helpers).  Add the TE include
-  # path unconditionally so store-only builds (WITH_TE=OFF) can find them.
+  # path before creating store targets so store-only builds can find them.
   if(NOT WITH_TE)
     include_directories(mooncake-transfer-engine/include)
   endif()
+  add_subdirectory(mooncake-store)
+  include_directories(mooncake-store/include)
 endif()
 
 if(WITH_CONDUCTOR)
