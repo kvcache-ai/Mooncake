@@ -2339,9 +2339,11 @@ TEST_F(StorageBackendTest, BucketEvictionDoesNotReportSkippedDuplicateKeys) {
     // The new (now colder) bucket is evicted. keyA must NOT be reported to
     // the master: its index entry points at the still-alive older bucket,
     // and reporting it would drop a live replica record with no self-heal.
+    // The 0.30 watermark keeps the quota crossing under matched accounting:
+    // only committed keys credit total_size_, and 12K+meta clears 9K.
     std::vector<std::string> notified_keys;
     auto evict_result = storage_backend.EvictAboveDiskWatermark(
-        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.50,
+        /*high_watermark_ratio=*/0.30, /*low_watermark_ratio=*/0.30,
         [&](const std::vector<std::string>& evicted_keys) {
             notified_keys.insert(notified_keys.end(), evicted_keys.begin(),
                                  evicted_keys.end());
