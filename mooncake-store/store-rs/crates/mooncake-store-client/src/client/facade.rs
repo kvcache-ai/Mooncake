@@ -2025,11 +2025,6 @@ impl StoreClient {
         self.cold_tier_shutdown_mode = mode;
     }
 
-    /// Shuts down the client and waits for its control-plane server to exit.
-    pub fn shutdown(mut self) {
-        self._control_plane.join_on_shutdown();
-    }
-
     pub fn prepare_heartbeat(&mut self, expires_at_ms: u64) -> HeartbeatLease {
         self.lease.state = self.lifecycle_state();
         self.lease.expires_at_ms = expires_at_ms;

@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::c_void;
-use std::ops::Deref;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -121,29 +119,6 @@ const DEFAULT_CLIENT_IDS: &str = "client-0";
 const DEFAULT_HOST_NQN: &str = "nqn.2026-09.io.mooncake:client-dev-5";
 const DEFAULT_DEVICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
-struct TestClient(Option<StoreClient>);
-
-impl TestClient {
-    fn new(client: StoreClient) -> Self {
-        Self(Some(client))
-    }
-}
-
-impl Deref for TestClient {
-    type Target = StoreClient;
-
-    fn deref(&self) -> &Self::Target {
-        self.0.as_ref().expect("test client already shut down")
-    }
-}
-
-impl Drop for TestClient {
-    fn drop(&mut self) {
-        if let Some(client) = self.0.take() {
-            client.shutdown();
-        }
-    }
-}
 const DEFAULT_OBJECTS_PER_CLIENT: usize = 16;
 const DEFAULT_VALUE_BYTES: usize = 64 * 1024;
 const DEFAULT_REPLICA_COUNT: usize = 1;
@@ -177,8 +152,7 @@ struct TestConfig {
     redis_url: String,
     keyspace: String,
     bind_ip: String,
-    barrier_dir: PathBuf,
-    barrier_redis_url: Option<String>,
+    barrier_redis_url: String,
     barrier_timeout: Duration,
     read_retries: usize,
     read_retry_delay: Duration,
@@ -326,6 +300,10 @@ impl TestConfig {
                 )))
             }
         };
+        let redis_url =
+            env::var("NOF_REDIS_URL").map_err(|_| invalid("NOF_REDIS_URL is required"))?;
+        let barrier_redis_url =
+            env::var("NOF_BARRIER_REDIS_URL").unwrap_or_else(|_| redis_url.clone());
         Ok(Self {
             targets,
             client_ids,
@@ -341,14 +319,10 @@ impl TestConfig {
             )?,
             test_prefix: env::var("NOF_TEST_PREFIX")
                 .unwrap_or_else(|_| "nof-multi-client".to_string()),
-            redis_url: env::var("NOF_REDIS_URL")
-                .map_err(|_| invalid("NOF_REDIS_URL is required"))?,
+            redis_url,
             keyspace: env::var("NOF_KEYSPACE").map_err(|_| invalid("NOF_KEYSPACE is required"))?,
             bind_ip: env::var("NOF_BIND_IP").map_err(|_| invalid("NOF_BIND_IP is required"))?,
-            barrier_dir: env::var("NOF_BARRIER_DIR")
-                .map(PathBuf::from)
-                .map_err(|_| invalid("NOF_BARRIER_DIR is required"))?,
-            barrier_redis_url: env::var("NOF_BARRIER_REDIS_URL").ok(),
+            barrier_redis_url,
             barrier_timeout: Duration::from_secs(parse_env(
                 "NOF_BARRIER_TIMEOUT_SECONDS",
                 DEFAULT_BARRIER_TIMEOUT_SECONDS,
@@ -456,163 +430,84 @@ fn barrier_key(config: &TestConfig, name: &str) -> String {
     format!("{}:barrier:{name}", config.keyspace)
 }
 
-fn redis_connection(config: &TestConfig) -> Result<Option<redis::Connection>> {
-    let Some(url) = config.barrier_redis_url.as_ref() else {
-        return Ok(None);
-    };
-    let client = redis::Client::open(url.as_str()).map_err(|error| {
-        StoreError::Transport(format!("failed to open NoF barrier Redis {url}: {error}"))
-    })?;
-    client.get_connection().map(Some).map_err(|error| {
+fn redis_connection(config: &TestConfig) -> Result<redis::Connection> {
+    let client = redis::Client::open(config.barrier_redis_url.as_str()).map_err(|error| {
         StoreError::Transport(format!(
-            "failed to connect NoF barrier Redis {url}: {error}"
+            "failed to open NoF barrier Redis {}: {error}",
+            config.barrier_redis_url
+        ))
+    })?;
+    client.get_connection().map_err(|error| {
+        StoreError::Transport(format!(
+            "failed to connect NoF barrier Redis {}: {error}",
+            config.barrier_redis_url
         ))
     })
 }
 
 fn wait_for_phase(config: &TestConfig, client_id: &str, phase: &str) -> Result<()> {
-    if let Some(mut connection) = redis_connection(config)? {
-        let _: () = connection
-            .set(
-                barrier_key(config, &format!("{phase}-{client_id}.ready")),
-                client_id,
-            )
-            .map_err(|error| {
-                StoreError::Transport(format!(
-                    "failed to publish NoF {phase} Redis barrier for {client_id}: {error}"
-                ))
-            })?;
-        let deadline = Instant::now() + config.barrier_timeout;
-        while Instant::now() < deadline {
-            let all_ready = config.client_ids.iter().try_fold(true, |ready, client| {
-                let exists: bool = connection
-                    .exists(barrier_key(config, &format!("{phase}-{client}.ready")))
-                    .map_err(|error| {
-                        StoreError::Transport(format!(
-                            "failed to read NoF {phase} Redis barrier for {client}: {error}"
-                        ))
-                    })?;
-                Ok::<_, StoreError>(ready && exists)
-            })?;
-            if all_ready {
-                return Ok(());
-            }
-            sleep(Duration::from_millis(100));
-        }
-        return Err(StoreError::Transport(format!(
-            "timed out waiting for {phase} Redis barrier"
-        )));
-    }
-
-    std::fs::create_dir_all(&config.barrier_dir).map_err(|error| {
-        mooncake_store_core::StoreError::Transport(format!(
-            "failed to create NoF test barrier {}: {error}",
-            config.barrier_dir.display()
-        ))
-    })?;
-    let ready_file = config
-        .barrier_dir
-        .join(format!("{phase}-{client_id}.ready"));
-    std::fs::write(&ready_file, client_id.as_bytes()).map_err(|error| {
-        mooncake_store_core::StoreError::Transport(format!(
-            "failed to publish NoF {phase} barrier for {client_id}: {error}"
-        ))
-    })?;
+    let mut connection = redis_connection(config)?;
+    let _: () = connection
+        .set(
+            barrier_key(config, &format!("{phase}-{client_id}.ready")),
+            client_id,
+        )
+        .map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to publish NoF {phase} barrier for {client_id}: {error}"
+            ))
+        })?;
     let deadline = Instant::now() + config.barrier_timeout;
     while Instant::now() < deadline {
-        if config.client_ids.iter().all(|client| {
-            config
-                .barrier_dir
-                .join(format!("{phase}-{client}.ready"))
-                .is_file()
-        }) {
+        let all_ready = config.client_ids.iter().try_fold(true, |ready, client| {
+            let exists: bool = connection
+                .exists(barrier_key(config, &format!("{phase}-{client}.ready")))
+                .map_err(|error| {
+                    StoreError::Transport(format!(
+                        "failed to read NoF {phase} barrier for {client}: {error}"
+                    ))
+                })?;
+            Ok::<_, StoreError>(ready && exists)
+        })?;
+        if all_ready {
             return Ok(());
         }
         sleep(Duration::from_millis(100));
     }
-    Err(mooncake_store_core::StoreError::Transport(format!(
-        "timed out waiting for {phase} barrier in {}",
-        config.barrier_dir.display()
+    Err(StoreError::Transport(format!(
+        "timed out waiting for {phase} barrier"
     )))
 }
 
 fn signal_phase_done(config: &TestConfig, phase: &str) -> Result<()> {
-    if let Some(mut connection) = redis_connection(config)? {
-        let _: () = connection
-            .set(barrier_key(config, &format!("{phase}.done")), now_ms())
-            .map_err(|error| {
-                StoreError::Transport(format!(
-                    "failed to publish NoF {phase} Redis completion barrier: {error}"
-                ))
-            })?;
-        return Ok(());
-    }
-
-    std::fs::write(
-        config.barrier_dir.join(format!("{phase}.done")),
-        now_ms().to_string(),
-    )
-    .map_err(|error| {
-        mooncake_store_core::StoreError::Transport(format!(
-            "failed to publish NoF {phase} completion barrier: {error}"
-        ))
-    })
+    let mut connection = redis_connection(config)?;
+    connection
+        .set(barrier_key(config, &format!("{phase}.done")), now_ms())
+        .map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to publish NoF {phase} completion barrier: {error}"
+            ))
+        })
 }
 
-fn phase_done_timestamp(config: &TestConfig, phase: &str) -> Result<u64> {
-    if let Some(mut connection) = redis_connection(config)? {
+fn wait_for_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
+    let mut connection = redis_connection(config)?;
+    let deadline = Instant::now() + config.barrier_timeout;
+    while Instant::now() < deadline {
         let value: Option<u64> = connection
             .get(barrier_key(config, &format!("{phase}.done")))
             .map_err(|error| {
                 StoreError::Transport(format!(
-                    "failed to read NoF {phase} Redis completion barrier: {error}"
+                    "failed to read NoF {phase} completion barrier: {error}"
                 ))
             })?;
-        return value.ok_or_else(|| {
-            StoreError::Transport(format!("NoF {phase} Redis completion barrier is missing"))
-        });
-    }
-
-    let path = config.barrier_dir.join(format!("{phase}.done"));
-    let contents = std::fs::read_to_string(&path).map_err(|error| {
-        mooncake_store_core::StoreError::Transport(format!(
-            "failed to read NoF {phase} completion barrier {}: {error}",
-            path.display()
-        ))
-    })?;
-    contents.trim().parse::<u64>().map_err(|error| {
-        mooncake_store_core::StoreError::Transport(format!(
-            "invalid NoF {phase} completion timestamp in {}: {error}",
-            path.display()
-        ))
-    })
-}
-
-fn wait_for_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
-    let deadline = Instant::now() + config.barrier_timeout;
-    while Instant::now() < deadline {
-        if let Some(mut connection) = redis_connection(config)? {
-            let exists: bool = connection
-                .exists(barrier_key(config, &format!("{phase}.done")))
-                .map_err(|error| {
-                    StoreError::Transport(format!(
-                        "failed to read NoF {phase} Redis completion barrier: {error}"
-                    ))
-                })?;
-            if exists {
-                return phase_done_timestamp(config, phase);
-            }
-            sleep(Duration::from_millis(100));
-            continue;
-        }
-        if config.barrier_dir.join(format!("{phase}.done")).is_file() {
-            return phase_done_timestamp(config, phase);
+        if let Some(timestamp) = value {
+            return Ok(timestamp);
         }
         sleep(Duration::from_millis(100));
     }
-    Err(mooncake_store_core::StoreError::Transport(format!(
-        "timed out waiting for {phase} completion barrier in {}",
-        config.barrier_dir.display()
+    Err(StoreError::Transport(format!(
+        "timed out waiting for {phase} completion barrier"
     )))
 }
 
@@ -754,51 +649,35 @@ fn verify_nof_copy_count(
 }
 
 fn wait_for_all_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
+    let mut connection = redis_connection(config)?;
     let deadline = Instant::now() + config.barrier_timeout;
     while Instant::now() < deadline {
-        if let Some(mut connection) = redis_connection(config)? {
-            let mut latest = 0;
-            let mut all_done = true;
-            for client in &config.client_ids {
-                let client_phase = format!("{phase}-{client}");
-                let key = barrier_key(config, &format!("{client_phase}.done"));
-                let value: Option<u64> = connection.get(key).map_err(|error| {
+        let mut latest = 0;
+        let mut all_done = true;
+        for client in &config.client_ids {
+            let client_phase = format!("{phase}-{client}");
+            let value: Option<u64> = connection
+                .get(barrier_key(config, &format!("{client_phase}.done")))
+                .map_err(|error| {
                     StoreError::Transport(format!(
-                        "failed to read NoF {client_phase} Redis completion barrier: {error}"
+                        "failed to read NoF {client_phase} completion barrier: {error}"
                     ))
                 })?;
-                match value {
-                    Some(timestamp) => latest = latest.max(timestamp),
-                    None => {
-                        all_done = false;
-                        break;
-                    }
+            match value {
+                Some(timestamp) => latest = latest.max(timestamp),
+                None => {
+                    all_done = false;
+                    break;
                 }
             }
-            if all_done {
-                return Ok(latest);
-            }
-            sleep(Duration::from_millis(100));
-            continue;
         }
-        if config.client_ids.iter().all(|client| {
-            config
-                .barrier_dir
-                .join(format!("{phase}-{client}.done"))
-                .is_file()
-        }) {
-            let mut latest = 0;
-            for client in &config.client_ids {
-                let client_phase = format!("{phase}-{client}");
-                latest = latest.max(phase_done_timestamp(config, &client_phase)?);
-            }
+        if all_done {
             return Ok(latest);
         }
         sleep(Duration::from_millis(100));
     }
-    Err(mooncake_store_core::StoreError::Transport(format!(
-        "timed out waiting for all {phase} completion barriers in {}",
-        config.barrier_dir.display()
+    Err(StoreError::Transport(format!(
+        "timed out waiting for all {phase} completion barriers"
     )))
 }
 
@@ -1011,7 +890,7 @@ fn run() -> Result<()> {
         config.client_ids.len(),
         config.batch_size
     );
-    let client = TestClient::new(build_client(&config, &client_id, rpc_port)?);
+    let client = build_client(&config, &client_id, rpc_port)?;
     println!(
         "{client_id}: runtime={} local memory registered; waiting for all clients",
         client.runtime_id()

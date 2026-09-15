@@ -546,7 +546,7 @@ struct ExtentStoreScratchLease {
     arena: std::sync::Arc<ExtentStoreScratchArena>,
 }
 
-struct ExtentStoreBufferPool {
+pub(super) struct ExtentStoreBufferPool {
     state: Mutex<ExtentStoreBufferPoolState>,
     max_bytes: usize,
     counters: std::sync::Arc<ExtentStoreIoCounters>,
@@ -557,7 +557,7 @@ struct ExtentStoreBufferPoolState {
     allocated_bytes: usize,
 }
 
-struct ExtentStoreBufferLease {
+pub(super) struct ExtentStoreBufferLease {
     buffer: Option<AlignedExtentStoreBuffer>,
     len: usize,
     pool: std::sync::Arc<ExtentStoreBufferPool>,
