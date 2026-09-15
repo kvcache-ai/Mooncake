@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <vector>
 
 #include <glog/logging.h>
 
@@ -108,6 +109,11 @@ class WorkerPoolTestPeer {
         pool.workers_running_.store(false);
         pool.cond_var_.notify_all();
         for (auto &entry : pool.worker_thread_) entry.join();
+    }
+
+    static size_t delayedSliceCount(WorkerPool &pool) {
+        std::lock_guard<std::mutex> lock(pool.delayed_slices_lock_);
+        return pool.delayed_slices_.size();
     }
 
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
@@ -277,9 +283,11 @@ TEST_F(WorkerPoolRailStateTest, RailsArePausedIndependently) {
 }
 
 // Exercise the submit path that used to mistake one peer's unavailable rails
-// for a local RNIC failure, not just the rail-pausing helper.
+// for a local RNIC failure, not just the rail-pausing helper. Unavailable peer
+// rails should now delay redispatch until recovery instead of failing
+// immediately.
 TEST_F(WorkerPoolRailStateTest,
-       AllRailsUnavailableSubmitsDoNotDeactivateContext) {
+       AllRailsUnavailableSubmitsAreDelayedWithoutDeactivatingContext) {
     constexpr SegmentID target_id = 3559;
     constexpr uint64_t buffer_addr = 0x10000;
     auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
@@ -300,23 +308,26 @@ TEST_F(WorkerPoolRailStateTest,
     WorkerPoolTestPeer::setContextActive(*worker_pool_, true);
     Transport::TransferTask task;
     task.batch_id = transport_->allocateBatchID(1);
-    for (int i = 0; i < WorkerPoolTestPeer::contextFailureThreshold(); ++i) {
+    const int threshold = WorkerPoolTestPeer::contextFailureThreshold();
+    std::vector<Transport::Slice> slices(threshold);
+    for (int i = 0; i < threshold; ++i) {
         failRail(kPeerA, /*immediate_pause=*/true);
         failRail(kPeerB, /*immediate_pause=*/true);
-        Transport::Slice slice{};
+        auto &slice = slices[i];
         slice.task = &task;
         slice.target_id = target_id;
         slice.rdma.dest_addr = buffer_addr;
         slice.length = 64;
         ASSERT_EQ(worker_pool_->submitPostSend({&slice}), 0);
-        EXPECT_EQ(slice.status, Transport::Slice::FAILED);
+        EXPECT_EQ(slice.status, Transport::Slice::PENDING);
         // Device selection succeeded, so the failure was unavailable rails.
         EXPECT_TRUE(slice.rdma.dest_rkey == 11 || slice.rdma.dest_rkey == 22);
+        EXPECT_EQ(WorkerPoolTestPeer::delayedSliceCount(*worker_pool_),
+                  static_cast<size_t>(i + 1));
         EXPECT_EQ(WorkerPoolTestPeer::contextFailureCount(*worker_pool_), 0);
         EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
     }
-    EXPECT_EQ(task.failed_slice_count,
-              WorkerPoolTestPeer::contextFailureThreshold());
+    EXPECT_EQ(task.failed_slice_count, 0);
     EXPECT_TRUE(transport_->freeBatchID(task.batch_id).ok());
 
     EXPECT_TRUE(WorkerPoolTestPeer::contextActive(*worker_pool_));
