@@ -101,6 +101,16 @@ int tent_close_segment(tent_engine_t engine, tent_segment_id_t handle) {
     return 0;
 }
 
+int tent_warmup_segment(tent_engine_t engine, tent_segment_id_t handle) {
+    CHECK_POINTER(engine);
+    auto status = CAST(engine)->warmupSegment(handle);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_warmup_segment: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
 int tent_get_segment_info(tent_engine_t engine, tent_segment_id_t handle,
                           tent_segment_info_t* info) {
     CHECK_POINTER(engine);
