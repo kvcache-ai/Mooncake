@@ -144,6 +144,15 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
                                 .size = total_size};
 }
 
+bool HasDeviceSlices(const std::vector<Slice>& slices) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    return std::any_of(slices.begin(), slices.end(), [&](const Slice& slice) {
+        return slice.size &&
+               runtime_accelerator.FindDeviceForPointer(slice.ptr);
+    });
+}
+
 ErrorCode ScatterFragmentError(const Status& status) {
     return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
                                       : ErrorCode::TRANSFER_FAIL;
@@ -1613,6 +1622,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
+    std::vector<std::optional<BufferHandle>> nof_read_buffers(
+        object_keys.size());
     // Collect all transfer operations for parallel execution
     // Tuple: (index, key, future, replica, cache_used)
     std::vector<std::tuple<size_t, std::string, TransferFuture,
@@ -1677,20 +1688,35 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
-            auto contiguous_range = GetContiguousSliceRange(slices_it->second);
+            auto* transfer_slices = &slices_it->second;
+            std::vector<Slice> staged_slices;
+            if (HasDeviceSlices(slices_it->second)) {
+                auto allocation = AllocateNofStagingBuffer(slices_it->second);
+                if (!allocation) {
+                    results[i] = tl::unexpected(allocation.error());
+                    continue;
+                }
+                nof_read_buffers[i].emplace(std::move(*allocation));
+                auto& buffer = *nof_read_buffers[i];
+                staged_slices.emplace_back(buffer.ptr(), buffer.size());
+                transfer_slices = &staged_slices;
+            }
+            auto contiguous_range = GetContiguousSliceRange(*transfer_slices);
             if (!contiguous_range.has_value()) {
+                nof_read_buffers[i].reset();
                 LOG(ERROR) << "NoF transfer requires contiguous slices";
                 results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
             future = transfer_submitter_->submit(
-                replica, slices_it->second, TransferRequest::READ,
+                replica, *transfer_slices, TransferRequest::READ,
                 contiguous_range->ptr, contiguous_range->size);
         } else {
             future = transfer_submitter_->submit(replica, slices_it->second,
                                                  TransferRequest::READ);
         }
         if (!future) {
+            nof_read_buffers[i].reset();
             // Release cache block if submit failed
             if (hot_cache_ && cache_used) {
                 hot_cache_->ReleaseHotKey(key);
@@ -1779,6 +1805,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Wait for all transfers to complete
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
+        auto staging_buffer =
+            std::exchange(nof_read_buffers[index], std::nullopt);
         ErrorCode result = future.get();
 
         // Release the cache block after transfer completes (memcpy is done)
@@ -1797,6 +1825,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
+
+            if (staging_buffer) {
+                result = CopyHostToSlices(*staging_buffer, slices_it->second);
+                if (result != ErrorCode::OK) {
+                    results[index] = tl::unexpected(result);
+                    continue;
+                }
+            }
+
             auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
                 query_results[index].object_checksum);
@@ -2316,6 +2353,7 @@ class PutOperation {
     PutOperationState state = PutOperationState::PENDING;
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
+    std::optional<BufferHandle> nof_write_buffer;
     std::vector<PendingTransferRecord> pending_transfers;
 
     size_t requested_memory_replicas = 0;
@@ -2750,7 +2788,25 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                                               : ReplicaType::NOF_SSD;
                 std::optional<TransferFuture> submit_result;
                 if (replica.is_nof_replica()) {
-                    auto contiguous_range = GetContiguousSliceRange(op.slices);
+                    auto* transfer_slices = &op.slices;
+                    std::vector<Slice> staged_slices;
+                    if (op.nof_write_buffer || HasDeviceSlices(op.slices)) {
+                        if (!op.nof_write_buffer) {
+                            auto allocation = StageSlicesToHost(op.slices);
+                            if (!allocation) {
+                                op.transfer_summary.RecordFailure(
+                                    replica_type, allocation.error());
+                                op.AppendFailureContext("NoF staging failed");
+                                continue;
+                            }
+                            op.nof_write_buffer.emplace(std::move(*allocation));
+                        }
+                        auto& buffer = *op.nof_write_buffer;
+                        staged_slices.emplace_back(buffer.ptr(), buffer.size());
+                        transfer_slices = &staged_slices;
+                    }
+                    auto contiguous_range =
+                        GetContiguousSliceRange(*transfer_slices);
                     if (!contiguous_range.has_value()) {
                         std::string failure_context =
                             "NoF transfer requires contiguous slices for "
@@ -2762,7 +2818,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                         continue;
                     }
                     submit_result = transfer_submitter_->submit(
-                        replica, op.slices, TransferRequest::WRITE,
+                        replica, *transfer_slices, TransferRequest::WRITE,
                         contiguous_range->ptr, contiguous_range->size);
                 } else {
                     submit_result = transfer_submitter_->submit(
@@ -2810,6 +2866,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                     pending_transfer.replica_type);
             }
         }
+
+        op.nof_write_buffer.reset();
 
         VLOG(1) << "Transfers finished for key " << op.key << ", success(mem="
                 << op.transfer_summary.successful_memory_transfers
@@ -4549,16 +4607,31 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    const bool use_staging =
+        replica_descriptor.is_nof_replica() && HasDeviceSlices(slices);
+    std::optional<BufferHandle> buffer;
+    std::vector<Slice> staged_slices;
+    auto* transfer_slices = &slices;
+    if (use_staging) {
+        auto allocation = op_code == TransferRequest::WRITE
+                              ? StageSlicesToHost(slices)
+                              : AllocateNofStagingBuffer(slices);
+        if (!allocation) return allocation.error();
+        buffer.emplace(std::move(*allocation));
+        staged_slices.emplace_back(buffer->ptr(), buffer->size());
+        transfer_slices = &staged_slices;
+    }
+
     std::optional<TransferFuture> future;
     if (replica_descriptor.is_nof_replica()) {
-        auto contiguous_range = GetContiguousSliceRange(slices);
+        auto contiguous_range = GetContiguousSliceRange(*transfer_slices);
         if (!contiguous_range.has_value()) {
             LOG(ERROR) << "NoF transfer requires contiguous slices";
             return ErrorCode::INVALID_PARAMS;
         }
-        future = transfer_submitter_->submit(replica_descriptor, slices,
-                                             op_code, contiguous_range->ptr,
-                                             contiguous_range->size);
+        future = transfer_submitter_->submit(
+            replica_descriptor, *transfer_slices, op_code,
+            contiguous_range->ptr, contiguous_range->size);
     } else {
         future =
             transfer_submitter_->submit(replica_descriptor, slices, op_code);
@@ -4570,7 +4643,13 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
     VLOG(1) << "Using transfer strategy: " << future->strategy();
 
-    return future->get();
+    auto result = future->get();
+    if (result != ErrorCode::OK) return result;
+    if (use_staging && op_code == TransferRequest::READ) {
+        result = CopyHostToSlices(*buffer, slices);
+        if (result != ErrorCode::OK) return result;
+    }
+    return ErrorCode::OK;
 }
 
 std::optional<TransferFuture> Client::SubmitRangeRead(
@@ -5410,6 +5489,73 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
         return replica_transfer_endpoint == GetTransportEndpoint();
     }
     return local_hostname_ == replica_transfer_endpoint;
+}
+
+void Client::SetNofStagingAllocator(
+    std::shared_ptr<ClientBufferAllocator> allocator) {
+    nof_staging_allocator_ = std::move(allocator);
+}
+
+tl::expected<BufferHandle, ErrorCode> Client::AllocateNofStagingBuffer(
+    const std::vector<Slice>& slices) {
+    size_t bytes = 0;
+    for (const auto& slice : slices) {
+        if ((slice.size && !slice.ptr) ||
+            slice.size > std::numeric_limits<size_t>::max() - bytes ||
+            slice.size > std::numeric_limits<uintptr_t>::max() -
+                             reinterpret_cast<uintptr_t>(slice.ptr)) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        bytes += slice.size;
+    }
+    if (!bytes) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!nof_staging_allocator_) {
+        LOG(ERROR) << "NoF staging requires a non-empty SPDK DMA client buffer "
+                      "pool; configure local_buffer_size with USE_NOF enabled";
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+
+    auto buffer = nof_staging_allocator_->allocate(bytes);
+    if (!buffer) return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    return std::move(*buffer);
+}
+
+tl::expected<BufferHandle, ErrorCode> Client::StageSlicesToHost(
+    const std::vector<Slice>& slices) {
+    auto buffer = AllocateNofStagingBuffer(slices);
+    if (!buffer) return tl::unexpected(buffer.error());
+
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    size_t offset = 0;
+    for (const auto& slice : slices) {
+        if (slice.size && !runtime_accelerator.CopyToHost(
+                              static_cast<char*>(buffer->ptr()) + offset,
+                              slice.ptr, slice.size)) {
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+        offset += slice.size;
+    }
+    return buffer;
+}
+
+ErrorCode Client::CopyHostToSlices(const BufferHandle& buffer,
+                                   const std::vector<Slice>& slices) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    size_t offset = 0;
+    for (const auto& slice : slices) {
+        if (slice.size &&
+            !runtime_accelerator.CopyFromHost(
+                slice.ptr, static_cast<char*>(buffer.ptr()) + offset,
+                slice.size)) {
+            return ErrorCode::TRANSFER_FAIL;
+        }
+        offset += slice.size;
+    }
+    return ErrorCode::OK;
 }
 
 }  // namespace mooncake
