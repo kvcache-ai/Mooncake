@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -50,7 +51,7 @@ struct ObjectMetadata {
     struct PendingSoftPinAction {
         SoftPinAction action{SoftPinAction::PRESERVE};
         std::chrono::milliseconds ttl{0};
-        std::vector<ReplicaID> eligible_replica_ids;
+        std::unordered_set<ReplicaID> eligible_replica_ids;
     };
 
     // RAII-style metric management
@@ -393,8 +394,9 @@ struct ObjectMetadata {
         return soft_pin_timeout;
     }
 
-    void BeginSoftPinAction(const ResolvedSoftPinRequest& request,
-                            std::vector<ReplicaID> eligible_replica_ids) {
+    void BeginSoftPinAction(
+        const ResolvedSoftPinRequest& request,
+        std::unordered_set<ReplicaID> eligible_replica_ids) {
         pending_soft_pin_action = PendingSoftPinAction{
             request.action, request.ttl, std::move(eligible_replica_ids)};
     }
@@ -403,9 +405,8 @@ struct ObjectMetadata {
         if (!pending_soft_pin_action) {
             return false;
         }
-        const auto& eligible = pending_soft_pin_action->eligible_replica_ids;
-        return std::find(eligible.begin(), eligible.end(), replica_id) !=
-               eligible.end();
+        return pending_soft_pin_action->eligible_replica_ids.contains(
+            replica_id);
     }
 
     void ClearPendingSoftPinAction() { pending_soft_pin_action.reset(); }
@@ -473,9 +474,7 @@ struct ObjectMetadata {
         const bool has_viable_replica = std::any_of(
             replicas_.begin(), replicas_.end(),
             [&eligible](const Replica& replica) {
-                const bool belongs_to_write =
-                    std::find(eligible.begin(), eligible.end(), replica.id()) !=
-                    eligible.end();
+                const bool belongs_to_write = eligible.contains(replica.id());
                 const bool valid_handle = !replica.has_invalid_mem_handle() &&
                                           !replica.has_invalid_nof_handle();
                 return belongs_to_write && replica.is_processing() &&
