@@ -182,6 +182,9 @@ class WrappedMasterService {
     [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
     GetNoFSegmentsByName(const std::string& segment_name);
 
+    tl::expected<void, ErrorCode> ReportNoFTargetUnreachable(
+        const UUID& client_id, const std::vector<std::string>& te_endpoints);
+
     tl::expected<std::string, ErrorCode> GetFsdir();
 
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();

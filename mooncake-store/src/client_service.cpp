@@ -255,6 +255,23 @@ struct ReplicaTransferSummary {
     }
 };
 
+// Transfer engine endpoint of a NoF replica, empty for every other type.
+// It is the only NoF target identity carried in a replica descriptor, so it
+// is what a client can name when reporting an unreachable target.
+std::string NoFTargetEndpoint(const Replica::Descriptor& replica) {
+    if (!replica.is_nof_replica()) {
+        return {};
+    }
+    return replica.get_nof_descriptor().buffer_descriptor.transport_endpoint_;
+}
+
+// A failed transfer only says something about client-to-target reachability
+// when the I/O itself failed. INVALID_PARAMS and friends are client-side
+// rejections and must not blocklist the target.
+bool IndicatesUnreachableTarget(ErrorCode error) {
+    return error == ErrorCode::TRANSFER_FAIL;
+}
+
 bool NonDfsTransfersSucceeded(const ReplicaTransferSummary& summary) {
     return summary.successful_memory_transfers ==
                summary.allocated_memory_replicas &&
@@ -1946,6 +1963,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         }
     }
 
+    std::vector<std::string> unreachable_nof_endpoints;
     for (const auto& replica : start_result.value()) {
         if (replica.is_memory_replica() || replica.is_nof_replica()) {
             // Transfer data using allocated handles from all replicas
@@ -1955,11 +1973,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
+                if (IndicatesUnreachableTarget(transfer_err)) {
+                    unreachable_nof_endpoints.push_back(
+                        NoFTargetEndpoint(replica));
+                }
                 continue;
             }
             transfer_summary.RecordSuccess(replica_type);
         }
     }
+    ReportUnreachableNoFTargets(std::move(unreachable_nof_endpoints));
 
     if (transfer_summary.allocated_dfs_replicas > 0 &&
         NonDfsTransfersSucceeded(transfer_summary)) {
@@ -2150,6 +2173,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // Transfer to memory and NoF replicas first.
+    std::vector<std::string> unreachable_nof_endpoints;
     for (const auto& replica : start_result.value()) {
         if (replica.is_memory_replica() || replica.is_nof_replica()) {
             const auto replica_type = replica.is_memory_replica()
@@ -2158,11 +2182,16 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
                 transfer_summary.RecordFailure(replica_type, transfer_err);
+                if (IndicatesUnreachableTarget(transfer_err)) {
+                    unreachable_nof_endpoints.push_back(
+                        NoFTargetEndpoint(replica));
+                }
                 continue;
             }
             transfer_summary.RecordSuccess(replica_type);
         }
     }
+    ReportUnreachableNoFTargets(std::move(unreachable_nof_endpoints));
 
     if (transfer_summary.allocated_dfs_replicas > 0 &&
         NonDfsTransfersSucceeded(transfer_summary)) {
@@ -2295,10 +2324,16 @@ class PutOperation {
     struct PendingTransferRecord {
         ReplicaType replica_type;
         TransferFuture future;
+        // Empty unless this is a NoF transfer. Kept here because the future
+        // outlives the replica descriptor loop that submitted it.
+        std::string te_endpoint;
 
         PendingTransferRecord(ReplicaType type,
-                              TransferFuture&& transfer_future)
-            : replica_type(type), future(std::move(transfer_future)) {}
+                              TransferFuture&& transfer_future,
+                              std::string endpoint = {})
+            : replica_type(type),
+              future(std::move(transfer_future)),
+              te_endpoint(std::move(endpoint)) {}
     };
 
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -2713,6 +2748,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         return;
     }
 
+    std::vector<std::string> unreachable_nof_endpoints;
     for (auto& op : ops) {
         // Skip operations that already failed in previous stages
         if (op.IsResolved()) {
@@ -2776,20 +2812,25 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                     op.transfer_summary.RecordFailure(replica_type,
                                                       ErrorCode::TRANSFER_FAIL);
                     op.AppendFailureContext(failure_context);
+                    unreachable_nof_endpoints.push_back(
+                        NoFTargetEndpoint(replica));
                     continue;
                 }
 
                 op.pending_transfers.emplace_back(
-                    replica_type, std::move(submit_result.value()));
+                    replica_type, std::move(submit_result.value()),
+                    NoFTargetEndpoint(replica));
             }
         }
 
         VLOG(1) << "Submitted " << op.pending_transfers.size()
                 << " transfers for key " << op.key;
     }
+    ReportUnreachableNoFTargets(std::move(unreachable_nof_endpoints));
 }
 
 void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
+    std::vector<std::string> unreachable_nof_endpoints;
     for (auto& op : ops) {
         // Skip operations that already failed or completed
         if (op.IsResolved()) {
@@ -2805,6 +2846,10 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 std::string error_context =
                     "Transfer " + std::to_string(i) + " failed";
                 op.AppendFailureContext(error_context);
+                if (IndicatesUnreachableTarget(transfer_result)) {
+                    unreachable_nof_endpoints.push_back(
+                        pending_transfer.te_endpoint);
+                }
             } else {
                 op.transfer_summary.RecordSuccess(
                     pending_transfer.replica_type);
@@ -2817,6 +2862,7 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
                 << "), fail(mem=" << op.transfer_summary.failed_memory_transfers
                 << ", nof=" << op.transfer_summary.failed_nof_transfers << ")";
     }
+    ReportUnreachableNoFTargets(std::move(unreachable_nof_endpoints));
 }
 
 std::vector<ErrorCode> Client::WriteDfsReplicas(
@@ -4060,6 +4106,26 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
 
 tl::expected<bool, ErrorCode> Client::PollRemoveAll() {
     return master_client_.PollRemoveAll();
+}
+
+void Client::ReportUnreachableNoFTargets(
+    std::vector<std::string> te_endpoints) {
+    std::sort(te_endpoints.begin(), te_endpoints.end());
+    te_endpoints.erase(std::unique(te_endpoints.begin(), te_endpoints.end()),
+                       te_endpoints.end());
+    std::erase_if(te_endpoints,
+                  [](const std::string& endpoint) { return endpoint.empty(); });
+    if (te_endpoints.empty()) {
+        return;
+    }
+    auto response =
+        master_client_.ReportNoFTargetUnreachable(client_id_, te_endpoints);
+    if (!response) {
+        // The write already failed and the caller reports that error; an old
+        // master that does not know this RPC must not turn it into a crash.
+        LOG(WARNING) << "ReportNoFTargetUnreachable failed, error code is "
+                     << response.error();
+    }
 }
 
 tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
