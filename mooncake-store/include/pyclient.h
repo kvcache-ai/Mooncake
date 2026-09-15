@@ -264,12 +264,13 @@ class PyClient {
             for (size_t i = 0; i < keys.size(); ++i) {
                 if (query_results[i] &&
                     !query_results[i]->IsLeaseExpired(now)) {
-                    earliest_lease =
-                        std::min(earliest_lease, query_results[i]->lease_timeout);
+                    earliest_lease = std::min(earliest_lease,
+                                              query_results[i]->lease_timeout);
                 } else {
                     all_fresh = false;
                 }
-                query_result_cache.emplace(keys[i], std::move(query_results[i]));
+                query_result_cache.emplace(keys[i],
+                                           std::move(query_results[i]));
             }
 
             if (all_fresh && earliest_lease > now) {
@@ -352,9 +353,9 @@ class PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const RangedReadSnapshot &snapshot) {
-        return get_into_ranges_from_snapshot(
-            buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-            snapshot.query_result_cache);
+        return get_into_ranges_from_snapshot(buffers, all_keys, all_dst_offsets,
+                                             all_src_offsets, all_sizes,
+                                             snapshot.query_result_cache);
     }
 
     virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
@@ -367,8 +368,8 @@ class PyClient {
         return snapshot;
     }
 
-    bool refresh_get_into_ranges_snapshot(RangedReadSnapshot &snapshot,
-                                          const std::vector<std::string> &keys) {
+    bool refresh_get_into_ranges_snapshot(
+        RangedReadSnapshot &snapshot, const std::vector<std::string> &keys) {
         auto query_results = batch_query(keys);
         return snapshot.reset(keys, std::move(query_results));
     }
