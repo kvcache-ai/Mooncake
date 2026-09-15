@@ -551,10 +551,11 @@ TEST(ShmTransportTest, RelocateCopySurvivesConcurrentCap) {
     std::atomic<bool> stop{false};
     std::thread copier([&]() {
         std::vector<char> src(page_size, 0x5a);
-        while (!stop.load()) {
+        // The cap loop may finish before this thread is scheduled.
+        do {
             std::memcpy(reinterpret_cast<void*>(pinned_addr), src.data(),
                         page_size);
-        }
+        } while (!stop.load());
     });
     for (int round = 0; round < 4; ++round) {
         for (const auto& buffer : buffers) {

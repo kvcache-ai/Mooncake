@@ -95,6 +95,12 @@ struct PreservedTentConfigOverrides {
     std::optional<std::string> rpc_server_hostname;
     std::optional<json> rpc_server_port;
     bool force_tcp{false};
+    std::optional<std::vector<std::string>> rdma_whitelist;
+    // Classic TE shim writes these nested leaves before construct(). Keep
+    // them on the existing identity whitelist instead of growing Config.
+    std::optional<bool> ascend_agent_mode;
+    std::optional<bool> ascend_store_te_init;
+    std::optional<bool> ascend_fabric_mem;
 };
 
 template <typename T>
@@ -219,6 +225,14 @@ PreservedTentConfigOverrides captureExplicitTransferEngineConfig(
     preserved.force_tcp = config.get("transports/force_tcp", false);
     preserved.rpc_server_port =
         captureExplicitConfigValue(config, "rpc_server_port", json());
+    preserved.rdma_whitelist = captureExplicitConfigValue(
+        config, "topology/rdma_whitelist", std::vector<std::string>());
+    preserved.ascend_agent_mode = captureExplicitConfigValue(
+        config, "transports/ascend_direct/agent_mode", false);
+    preserved.ascend_store_te_init = captureExplicitConfigValue(
+        config, "transports/ascend_direct/store_te_init", false);
+    preserved.ascend_fabric_mem = captureExplicitConfigValue(
+        config, "transports/ascend_direct/fabric_mem", false);
     return preserved;
 }
 
@@ -245,6 +259,14 @@ void restoreExplicitTransferEngineConfig(
     if (preserved.force_tcp) {
         ConfigHelper::forceTcp(config);
     }
+    restoreExplicitConfigValue(config, "topology/rdma_whitelist",
+                               preserved.rdma_whitelist);
+    restoreExplicitConfigValue(config, "transports/ascend_direct/agent_mode",
+                               preserved.ascend_agent_mode);
+    restoreExplicitConfigValue(config, "transports/ascend_direct/store_te_init",
+                               preserved.ascend_store_te_init);
+    restoreExplicitConfigValue(config, "transports/ascend_direct/fabric_mem",
+                               preserved.ascend_fabric_mem);
 }
 
 TransferEngineImpl::TransferEngineImpl()
