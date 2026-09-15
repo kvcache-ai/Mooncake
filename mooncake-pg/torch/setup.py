@@ -35,8 +35,7 @@ abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 pg_core_so_path = os.getenv("MOONCAKE_PG_CORE_SO_PATH", "")
 if not os.path.isfile(pg_core_so_path):
     raise RuntimeError(
-        "MOONCAKE_PG_CORE_SO_PATH is unset or does not name "
-        "libmooncake_pg.so"
+        "MOONCAKE_PG_CORE_SO_PATH is unset or does not name " "libmooncake_pg.so"
     )
 
 cxx_args = [
@@ -51,10 +50,12 @@ include_dirs = [
     os.path.join(current_dir, "../include"),
     os.path.join(current_dir, "../../mooncake-transfer-engine/include"),
 ]
-use_maca = (
-    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
-    or (hasattr(torch.version, "maca") and torch.version.maca is not None)
-)
+use_maca = os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+} or (hasattr(torch.version, "maca") and torch.version.maca is not None)
 
 if use_musa:
     musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1"]

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import unittest
 
-class TestImportStructure(unittest.TestCase):
 
+class TestImportStructure(unittest.TestCase):
     def test_new_import_structure(self):
         """Test that the new import structure works."""
         import mooncake.engine
@@ -43,5 +43,6 @@ class TestImportStructure(unittest.TestCase):
 
         self.assertIs(BufferPool, RegisteredBufferPool)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     unittest.main()

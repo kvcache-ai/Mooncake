@@ -1,5 +1,6 @@
 # This is a dummy RL training example for demonstrating the usage of Mooncake Store
 # in transmission of data between rollout engines and training engines when distributed
+import argparse
 import os
 import random
 import torch
@@ -10,7 +11,7 @@ from mooncake.store import MooncakeDistributedStore
 class TrainActor:
     """
     Simulate a single training worker (GPU or process).
-    
+
     Responsibilities:
     1. Initialize its own model and optimizer.
     2. Perform forward/backward passes on rollout data fetched from Mooncake store.
@@ -33,12 +34,12 @@ class TrainActor:
     def train(self, samples):
         """
         Perform one dummy training step on rollout samples.
-        
+
         Each sample is expected to be a dict with fields:
             - "obs": list[int], representing observations
             - "action": int, action taken
             - "reward": float, scalar reward
-        
+
         Training logic:
         1. Convert obs to tensor.
         2. Forward pass through model.
@@ -46,7 +47,9 @@ class TrainActor:
         4. Backward + optimizer step.
         """
         self.model.train()
-        obs = torch.tensor(samples["obs"], dtype=torch.float32).unsqueeze(0)  # shape [1, dim]
+        obs = torch.tensor(samples["obs"], dtype=torch.float32).unsqueeze(
+            0
+        )  # shape [1, dim]
         action = samples["action"]
         reward = torch.tensor([samples["reward"]], dtype=torch.float32)
 
@@ -62,8 +65,10 @@ class TrainActor:
         loss.backward()
         self.optimizer.step()
 
-        print(f"[TrainActor] Trained on sample (action={action}, reward={reward.item():.4f}), "
-              f"loss={loss.item():.4f}")
+        print(
+            f"[TrainActor] Trained on sample (action={action}, reward={reward.item():.4f}), "
+            f"loss={loss.item():.4f}"
+        )
         return loss.item()
 
     def save_model(self, rollout_id: int):
@@ -73,17 +78,18 @@ class TrainActor:
         torch.save(self.model.state_dict(), f"model_{rollout_id}.pth")
         print(f"[TrainActor] Model saved to model_{rollout_id}.pth")
 
+
 class TrainGroup:
     """
     Simulate the group of training engines.
-    
+
     Responsibilities:
     1. Initialize model state across multiple training actors.
     2. Connect to rollout manager for weight updates.
     3. Update weights after each rollout.
     4. Train on rollout data fetched from Mooncake store.
     5. Save checkpoints periodically.
-    
+
     All functionality is mocked except the data flow through MooncakeStore.
     """
 
@@ -97,14 +103,15 @@ class TrainGroup:
         # init Mooncake store client
         self.training_client = MooncakeDistributedStore()
         # RDMA initialization
-        self.training_client.setup("localhost:12345", 
-                                   "http://localhost:8080/metadata", 
-                                   512*1024*1024, 
-                                   128*1024*1024, 
-                                   "rdma", 
-                                   "erdma_1", # or other NIC like mlx5_1
-                                   "localhost:50051")
-
+        self.training_client.setup(
+            "localhost:12345",
+            "http://localhost:8080/metadata",
+            512 * 1024 * 1024,
+            128 * 1024 * 1024,
+            "rdma",
+            "erdma_1",  # or other NIC like mlx5_1
+            "localhost:50051",
+        )
 
     def init_actors(self, args, role="actor"):
         """
@@ -132,7 +139,7 @@ class TrainGroup:
     def train(self, rollout_id: int, rollout_key: str):
         """
         Consume rollout data from MooncakeStore and compute a dummy loss.
-        
+
         Steps:
         1. Fetch rollout samples from Mooncake store.
         2. Distribute samples across training actors.
@@ -167,18 +174,19 @@ class TrainGroup:
 class RolloutEngine:
     """
     Simulate a single rollout engine (inference worker).
-    
+
     Responsibilities:
     1. Generate rollout samples (obs, action, reward).
     2. Provide a dummy evaluation interface.
-    
+
     In a real RL setup, this would:
     - Run inference on the policy model given an environment state.
     - Collect (obs, action, reward, next_obs) tuples.
     - Possibly handle batching, KV-cache, etc.
-    
+
     Here, everything is mocked. We just produce random data.
     """
+
     def __init__(self, args):
         pass
 
@@ -208,10 +216,12 @@ class RolloutEngine:
             return
         # Fake "eval" = reward^2
         avg_reward = sum(s["reward"] for s in samples) / len(samples)
-        eval_score = avg_reward ** 2
-        print(f"[RolloutEngine] Evaluating rollout {rollout_id} "
-              f"(action={samples[0]['action']}, reward={avg_reward:.4f}) "
-              f"=> eval_score={eval_score:.4f}")
+        eval_score = avg_reward**2
+        print(
+            f"[RolloutEngine] Evaluating rollout {rollout_id} "
+            f"(action={samples[0]['action']}, reward={avg_reward:.4f}) "
+            f"=> eval_score={eval_score:.4f}"
+        )
 
 
 class RolloutController:
@@ -231,19 +241,23 @@ class RolloutController:
         # init Mooncake store client
         self.rollout_client = MooncakeDistributedStore()
         # RDMA initialization
-        self.rollout_client.setup("localhost:12346", 
-                                  "http://localhost:8080/metadata", 
-                                  512*1024*1024, 
-                                  128*1024*1024, 
-                                  "rdma", 
-                                  "erdma_0", # or other NIC like mlx5_0 
-                                  "localhost:50051")
+        self.rollout_client.setup(
+            "localhost:12346",
+            "http://localhost:8080/metadata",
+            512 * 1024 * 1024,
+            128 * 1024 * 1024,
+            "rdma",
+            "erdma_0",  # or other NIC like mlx5_0
+            "localhost:50051",
+        )
 
     def load(self, rollout_id=None):
         """
         Load previous dataset.
         """
-        path = os.path.join(self.args.model_path, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = os.path.join(
+            self.args.model_path, f"rollout/global_dataset_state_dict_{rollout_id}.pt"
+        )
         if not os.path.exists(path):
             print(f"Checkpoint {path} does not exist.")
             return
@@ -266,14 +280,17 @@ class RolloutController:
             "sample_index": self.sample_index,
             "metadata": self.metadata,
         }
-        path = os.path.join(self.args.model_path, f"rollout/global_dataset_state_dict_{rollout_id}.pt")
+        path = os.path.join(
+            self.args.model_path, f"rollout/global_dataset_state_dict_{rollout_id}.pt"
+        )
         os.makedirs(os.path.dirname(path), exist_ok=True)
         torch.save(state_dict, path)
+
 
 class RolloutManager:
     """
     Simulate the rollout manager (inference engine + buffer).
-    
+
     Responsibilities:
     1. Generate rollout samples and push them into MooncakeStore.
     2. Provide eval interface.
@@ -294,14 +311,14 @@ class RolloutManager:
         - obs: observation vector (4 ints)
         - action: random integer [0, 9]
         - reward: random float [-1, 1]
-        
+
         Store the sample in MooncakeStore under key = str(rollout_id).
         """
         rollout_samples = []
         for engine in self.rollout_engines:
             sample = engine.generate(rollout_id)
             rollout_samples.append(sample)
-        
+
         key = str(rollout_id)
         self.controller.rollout_client.put_tensor(key, rollout_samples)
 
@@ -316,8 +333,9 @@ class RolloutManager:
 
         for engine in self.rollout_engines:
             engine.eval(rollout_id, samples)
-        
+
         print(f"[RolloutManager] Evaluation at rollout {rollout_id}")
+
 
 def create_actor_group(args):
     """
@@ -332,6 +350,7 @@ def create_rollout_manager(args):
     """
     return RolloutManager(args)
 
+
 def train(args):
     """
     Dummy RL training loop adapted from THUDM/slime
@@ -345,7 +364,7 @@ def train(args):
 
     # sync the initialization (model initialization, load checkpoint, etc.)
     start_rollout_ids = actor_model.init_actors(args)
-    
+
     assert len(set(start_rollout_ids)) == 1
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
@@ -387,7 +406,6 @@ def train(args):
         ):
             rollout_manager.eval(rollout_id)
 
-import argparse
 
 def parse_args():
     """
@@ -420,26 +438,61 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(description="Dummy training with MooncakeStore")
 
-    parser.add_argument("--num_rollout", type=int, default=5,
-                        help="Total number of rollouts to generate")
-    parser.add_argument("--num_train_actor", type=int, default=1,
-                        help="Number of GPUs for training (dummy)")
-    parser.add_argument("--num_rollout_actor", type=int, default=1,
-                        help="Number of rollout engines (dummy)")
-    parser.add_argument("--save_interval", type=int, default=2,
-                        help="Interval for saving model checkpoints")
-    parser.add_argument("--eval_interval", type=int, default=2,
-                        help="Interval for evaluating rollout data")
-    parser.add_argument("--model_path", type=str, default="./checkpoints",
-                        help="Path to save model checkpoints")
-    parser.add_argument("--start_rollout_id", type=int, default=0,
-                        help="Starting rollout ID")
-    parser.add_argument("--num_epoch", type=int, default=1,
-                        help="Number of epochs (only meaningful if num_rollout is None)")
-    parser.add_argument("--rollout_global_dataset", action="store_true",
-                        help="Enable global rollout dataset (dummy mode)")
-    parser.add_argument("--rollout_shuffle", action="store_true",
-                        help="Shuffle dataset on load (dummy mode)")
+    parser.add_argument(
+        "--num_rollout",
+        type=int,
+        default=5,
+        help="Total number of rollouts to generate",
+    )
+    parser.add_argument(
+        "--num_train_actor",
+        type=int,
+        default=1,
+        help="Number of GPUs for training (dummy)",
+    )
+    parser.add_argument(
+        "--num_rollout_actor",
+        type=int,
+        default=1,
+        help="Number of rollout engines (dummy)",
+    )
+    parser.add_argument(
+        "--save_interval",
+        type=int,
+        default=2,
+        help="Interval for saving model checkpoints",
+    )
+    parser.add_argument(
+        "--eval_interval",
+        type=int,
+        default=2,
+        help="Interval for evaluating rollout data",
+    )
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        default="./checkpoints",
+        help="Path to save model checkpoints",
+    )
+    parser.add_argument(
+        "--start_rollout_id", type=int, default=0, help="Starting rollout ID"
+    )
+    parser.add_argument(
+        "--num_epoch",
+        type=int,
+        default=1,
+        help="Number of epochs (only meaningful if num_rollout is None)",
+    )
+    parser.add_argument(
+        "--rollout_global_dataset",
+        action="store_true",
+        help="Enable global rollout dataset (dummy mode)",
+    )
+    parser.add_argument(
+        "--rollout_shuffle",
+        action="store_true",
+        help="Shuffle dataset on load (dummy mode)",
+    )
 
     args = parser.parse_args()
     return args

@@ -23,9 +23,7 @@ import time
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="EFA Per-Transfer Latency Benchmark"
-    )
+    parser = argparse.ArgumentParser(description="EFA Per-Transfer Latency Benchmark")
     parser.add_argument("--target_host", required=True)
     parser.add_argument("--initiator_host", required=True)
     parser.add_argument(
@@ -47,7 +45,9 @@ def parse_args():
     parser.add_argument("--threads", type=int, default=1, help="Number of threads")
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument(
-        "--env", action="append", default=[],
+        "--env",
+        action="append",
+        default=[],
         help="Environment variables to pass to remote bench (e.g. --env MC_EFA_STRIPING_THRESHOLD=67108864)",
     )
     parser.add_argument("--output", default=None, help="Output file for results")
@@ -57,7 +57,9 @@ def parse_args():
 def run_ssh(host, command, user, ssh_opts, timeout=None):
     ssh_args = ["ssh", *ssh_opts.split(), f"{user}@{host}", command]
     try:
-        result = subprocess.run(ssh_args, capture_output=True, text=True, timeout=timeout)
+        result = subprocess.run(
+            ssh_args, capture_output=True, text=True, timeout=timeout
+        )
         return result.returncode, result.stdout, result.stderr
     except subprocess.TimeoutExpired:
         return -1, "", "Command timed out"
@@ -93,8 +95,11 @@ def start_target(host, build_dir, user, ssh_opts):
     for _ in range(20):
         time.sleep(1)
         rc, stdout, _ = run_ssh(
-            host, f"grep 'listening on' {log_file} 2>/dev/null",
-            user, ssh_opts, timeout=10,
+            host,
+            f"grep 'listening on' {log_file} 2>/dev/null",
+            user,
+            ssh_opts,
+            timeout=10,
         )
         if rc == 0 and "listening on" in stdout:
             match = re.search(r"listening on (\S+:\d+)", stdout)
@@ -103,9 +108,19 @@ def start_target(host, build_dir, user, ssh_opts):
     return None
 
 
-def run_single_bench(host, build_dir, target_addr, block_size,
-                     duration, operation, user, ssh_opts,
-                     threads=1, batch_size=1, env_vars=None):
+def run_single_bench(
+    host,
+    build_dir,
+    target_addr,
+    block_size,
+    duration,
+    operation,
+    user,
+    ssh_opts,
+    threads=1,
+    batch_size=1,
+    env_vars=None,
+):
     """Run bench with configurable threads and batch_size."""
     bench_bin = os.path.join(
         build_dir, "mooncake-transfer-engine/example/transfer_engine_bench"
@@ -138,7 +153,7 @@ def run_single_bench(host, build_dir, target_addr, block_size,
     if match:
         return float(match.group(1)) / 1024.0
 
-    print(f"    WARNING: Could not parse throughput", file=sys.stderr)
+    print("    WARNING: Could not parse throughput", file=sys.stderr)
     for line in combined.strip().split("\n")[-3:]:
         print(f"      {line}", file=sys.stderr)
     return None
@@ -184,10 +199,16 @@ def main():
         print(f"  [{i+1}/{len(block_sizes)}] {tag:>6} ...", end="", flush=True)
 
         tp = run_single_bench(
-            args.initiator_host, args.build_dir, target_addr,
-            block_size, args.duration, args.operation,
-            args.ssh_user, args.ssh_opts,
-            threads=args.threads, batch_size=args.batch_size,
+            args.initiator_host,
+            args.build_dir,
+            target_addr,
+            block_size,
+            args.duration,
+            args.operation,
+            args.ssh_user,
+            args.ssh_opts,
+            threads=args.threads,
+            batch_size=args.batch_size,
             env_vars=args.env,
         )
 
@@ -222,12 +243,14 @@ def main():
     # Write output file
     if args.output:
         with open(args.output, "w") as f:
-            f.write(f"# EFA Per-Transfer Latency Benchmark\n")
+            f.write("# EFA Per-Transfer Latency Benchmark\n")
             f.write(f"# Operation: {args.operation}\n")
             f.write(f"# Duration: {args.duration}s per point\n")
             f.write(f"# Mode: threads={args.threads}, batch_size={args.batch_size}\n")
-            f.write(f"#\n")
-            f.write(f"{'block_bytes':>12}  {'block_size':>10}  {'gbps':>10}  {'latency_us':>12}\n")
+            f.write("#\n")
+            f.write(
+                f"{'block_bytes':>12}  {'block_size':>10}  {'gbps':>10}  {'latency_us':>12}\n"
+            )
             for block_size, tp, lat in results:
                 tag = format_size(block_size)
                 if tp is not None:

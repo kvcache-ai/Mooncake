@@ -50,7 +50,11 @@ def _detect_manylinux_tag() -> str:
                     # Output format: "glibc X.Y" or "X.Y"
                     ver_str = result.stdout.strip()
                     ver = ver_str.split()[-1] if "glibc" in ver_str else ver_str
-            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+            except (
+                subprocess.CalledProcessError,
+                FileNotFoundError,
+                subprocess.TimeoutExpired,
+            ):
                 pass
 
         # Fallback: use ctypes with dynamic libc detection
@@ -87,7 +91,11 @@ def _detect_manylinux_tag() -> str:
                                         libc_path = parts[1].strip()
                                         libc = ctypes.CDLL(libc_path)
                                         break
-                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                    except (
+                        subprocess.CalledProcessError,
+                        FileNotFoundError,
+                        subprocess.TimeoutExpired,
+                    ):
                         pass
 
                 if libc is not None:
@@ -162,7 +170,6 @@ class CustomBdistWheel(bdist_wheel):
         self.root_is_pure = False
         self.plat_name_supplied = True
         self.plat_name = get_platform()
-
 
 
 # ---------------------------------------------------------------------------

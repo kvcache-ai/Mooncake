@@ -479,7 +479,9 @@ def test_small_dict_sized_groups_enable_auto_parallel_put() -> None:
     _store, transfer = make_transfer()
     groups = [[SizedBuffer(1024**2)] for _ in range(128)]
     policy = BundleTransferPolicy(max_inflight_put=8)
-    assert transfer._transport._resolve_buffer_group_put_mode(groups, policy) == "parallel"
+    assert (
+        transfer._transport._resolve_buffer_group_put_mode(groups, policy) == "parallel"
+    )
 
 
 def _seen_group_ids(configs: list[object]) -> list[list[str]]:
@@ -600,9 +602,7 @@ def test_structured_object_direct_copy_preserves_group_id(monkeypatch) -> None:
     result = transfer.materialize(transfer.read_spec(ref))
 
     assert result.objects["values"].tolist() == [1, 2, 3, 4]
-    group_ids = _seen_group_ids(
-        [*store.put_configs, *store.batch_put_from_configs]
-    )
+    group_ids = _seen_group_ids([*store.put_configs, *store.batch_put_from_configs])
     assert group_ids
     assert all(ids == ["rollout-group"] for ids in group_ids)
 
@@ -817,13 +817,9 @@ def test_high_level_put_auto_creates_opaque_storage_group(payload_type) -> None:
     assert handle["version"] == 1
     assert handle["storage_group_id"] == group_id
     assert all(
-        list(write_config.group_ids) == [group_id]
-        for write_config in store.put_configs
+        list(write_config.group_ids) == [group_id] for write_config in store.put_configs
     )
-    assert all(
-        write_config.replica_num == 2
-        for write_config in store.put_configs
-    )
+    assert all(write_config.replica_num == 2 for write_config in store.put_configs)
     assert config.group_ids is None
     assert config.replica_num == 2
 
@@ -857,8 +853,7 @@ def test_high_level_put_preserves_explicit_ungrouped_config() -> None:
         if write_config is not None
     )
     assert all(
-        seen_config is None
-        for seen_config in store.put_configs[first_put_count:]
+        seen_config is None for seen_config in store.put_configs[first_put_count:]
     )
     assert appended._storage_group_id is None
     assert np.array_equal(result["batch"]["input_ids"], np.arange(4))
@@ -906,9 +901,9 @@ def test_high_level_append_preserves_grouped_tensor_fast_path() -> None:
         stage="rollout",
     )
     group_id = _storage_group_id(ref)
-    old_payload_key = ref.stage_refs["rollout"].manifest["buffers"][
-        "batch.input_ids"
-    ]["key"]
+    old_payload_key = ref.stage_refs["rollout"].manifest["buffers"]["batch.input_ids"][
+        "key"
+    ]
 
     ref = transfer.append_dataproto_fields(
         ref,
@@ -1174,13 +1169,9 @@ def test_legacy_v1_handle_append_get_and_cleanup_uses_caller_group() -> None:
     assert np.array_equal(result["batch"]["input_ids"], np.arange(4))
     assert np.array_equal(result["batch"]["values"], np.arange(4) + 10)
     assert appended._storage_group_id is None
-    group_ids = _seen_group_ids(
-        [*store.put_configs, *store.batch_put_from_configs]
-    )
+    group_ids = _seen_group_ids([*store.put_configs, *store.batch_put_from_configs])
     assert group_ids
-    assert all(
-        write_group_ids == ["legacy-group"] for write_group_ids in group_ids
-    )
+    assert all(write_group_ids == ["legacy-group"] for write_group_ids in group_ids)
     assert config.group_ids == ["legacy-group"]
     assert config.replica_num == 2
     assert store.objects == {}
@@ -1217,9 +1208,7 @@ def test_concurrent_append_branches_inherit_group_without_merging_refs() -> None
 
     def append(name: str) -> None:
         try:
-            transfer = MooncakeBundleTransfer(
-                store, key_prefix="concurrent-append"
-            )
+            transfer = MooncakeBundleTransfer(store, key_prefix="concurrent-append")
             barrier.wait()
             branches[name] = transfer.append_dataproto_fields(
                 handle,
@@ -1249,10 +1238,7 @@ def test_concurrent_append_branches_inherit_group_without_merging_refs() -> None
     reward_result = writer.get_dataproto(branches["rewards"])
     assert set(value_result["batch"]) == {"input_ids", "values"}
     assert set(reward_result["batch"]) == {"input_ids", "rewards"}
-    assert all(
-        list(config.group_ids) == [group_id]
-        for config in store.put_configs
-    )
+    assert all(list(config.group_ids) == [group_id] for config in store.put_configs)
 
 
 @pytest.mark.parametrize("append_stage", ["rollout", "value"])
@@ -1360,9 +1346,7 @@ def test_catalog_concurrent_append_cleans_stale_loser(
     winner = import_dataproto_ref(winner_plan["handles"][fragment_id])
     winner_data = winner_client.transfer.get_dataproto(winner)
     assert set(winner_data["batch"]) == {"input_ids", winner_name}
-    assert np.array_equal(
-        winner_data["batch"][winner_name], np.arange(2) + 10
-    )
+    assert np.array_equal(winner_data["batch"][winner_name], np.arange(2) + 10)
     old_data = writer.get_dataproto(import_dataproto_ref(base_handle))
     assert np.array_equal(old_data["batch"]["input_ids"], np.arange(2))
 
@@ -1475,9 +1459,7 @@ def test_same_stage_append_cleanup_tolerates_lost_manifest_remove_response(
 
 def test_append_rejects_conflicting_group_before_write() -> None:
     store, transfer = make_transfer()
-    ref = transfer.put_dataproto(
-        SimpleDataProto(batch={"input_ids": np.arange(4)})
-    )
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"input_ids": np.arange(4)}))
     before_puts = len(store.put_configs)
 
     with pytest.raises(ValueError, match="conflicts"):
@@ -1580,9 +1562,7 @@ def test_dataproto_torch_save_fallback_supports_row_selection(monkeypatch) -> No
             tensor[rows],
         )
     with pytest.raises(ValueError, match="does not support destinations"):
-        transfer.get_dataproto(
-            ref, rows=[1], destinations={"tensor": object()}
-        )
+        transfer.get_dataproto(ref, rows=[1], destinations={"tensor": object()})
 
 
 def test_bundle_read_spec_full_read_is_partial_special_case() -> None:
@@ -2307,7 +2287,9 @@ def test_structured_object_direct_torch_tensor_slice_uses_real_store_ranges() ->
         pytest.skip("built mooncake.store lacks tensor serialization helpers")
     _store, transfer = real_transfer("structured-test-slice")
     tensor = torch.arange(48, dtype=torch.int64).reshape(12, 4)
-    ref = transfer.put_structured_object(StructuredObjectPayload(buffers={"tensor": tensor}))
+    ref = transfer.put_structured_object(
+        StructuredObjectPayload(buffers={"tensor": tensor})
+    )
 
     try:
         result = transfer.materialize(
@@ -2596,9 +2578,14 @@ def test_dataproto_helper_reads_rows_with_real_store_ranges() -> None:
                 )
             },
         )
-        tensor_payload_bytes = int(
-            ref.stage_refs["default"].manifest["buffers"]["batch.tensor"]["metadata_bytes"]
-        ) + tensor[[4, 1, 3]].numel() * tensor.element_size()
+        tensor_payload_bytes = (
+            int(
+                ref.stage_refs["default"].manifest["buffers"]["batch.tensor"][
+                    "metadata_bytes"
+                ]
+            )
+            + tensor[[4, 1, 3]].numel() * tensor.element_size()
+        )
         raw_tensor = pool.acquire(tensor_payload_bytes)
         raw_tensor_result = transfer.get_dataproto(
             ref,
@@ -2631,7 +2618,9 @@ def test_dataproto_helper_reads_rows_with_real_store_ranges() -> None:
         assert torch.equal(actual_ragged[1], data.non_tensor_batch["ragged"][3])
         assert torch.equal(actual_ragged[2], data.non_tensor_batch["ragged"][4])
         assert torch.equal(gathered["batch"]["tensor"], tensor[[4, 1, 3]])
-        assert np.array_equal(gathered["batch"]["array"], data.batch["array"][[4, 1, 3]])
+        assert np.array_equal(
+            gathered["batch"]["array"], data.batch["array"][[4, 1, 3]]
+        )
         assert gathered["non_tensor_batch"]["text"].tolist() == ["eeeee", "bb", "dddd"]
         assert into["batch"]["array"] is array_dst
         assert np.array_equal(array_dst, data.batch["array"][[4, 1, 3]])
@@ -2683,6 +2672,7 @@ def test_dataproto_helper_accepts_legacy_dict_inputs() -> None:
     assert envelope["non_tensor_batch"]["uid"].tolist() == ["a", "b", "c"]
     assert envelope["meta_info"] == {"step": 3}
 
+
 def _schema_test_data(field: str, values: np.ndarray) -> dict[str, object]:
     return {
         "batch": {"input_ids": np.arange(len(values))},
@@ -2718,9 +2708,7 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     with pytest.raises(AttributeError, match="failed to encode.*'text'.*utf8_ragged"):
         transfer.put_dataproto(
             _schema_test_data("text", bad_text),
-            field_schemas={
-                "text": FieldSchema(codec="utf8_ragged")
-            },
+            field_schemas={"text": FieldSchema(codec="utf8_ragged")},
         )
 
 
@@ -2824,9 +2812,7 @@ def test_dataproto_field_schema_does_not_apply_meta_info_schema_to_non_tensor() 
             "meta_info": {"label": "metadata-label"},
         },
         field_schemas={
-            "label": FieldSchema(
-                codec="utf8_ragged", metadata={"section": "meta_info"}
-            )
+            "label": FieldSchema(codec="utf8_ragged", metadata={"section": "meta_info"})
         },
     )
 
@@ -2891,9 +2877,9 @@ def test_dataproto_field_schema_encodes_ragged_tensor_dict() -> None:
     assert transfer.get_dataproto(all_null_ref)["non_tensor_batch"][
         "multi_modal_inputs"
     ].tolist() == [None, None, None]
-    assert transfer.get_dataproto(all_null_ref, rows=slice(1, 3))[
-        "non_tensor_batch"
-    ]["multi_modal_inputs"].tolist() == [None, None]
+    assert transfer.get_dataproto(all_null_ref, rows=slice(1, 3))["non_tensor_batch"][
+        "multi_modal_inputs"
+    ].tolist() == [None, None]
     assert transfer.get_dataproto(all_null_ref, rows=[2, 0])["non_tensor_batch"][
         "multi_modal_inputs"
     ].tolist() == [None, None]
@@ -2988,7 +2974,9 @@ def test_unified_put_rejects_unknown_type() -> None:
         (None, "batch_put_from_configs", True),
     ],
 )
-def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr, use_pool) -> None:
+def test_unified_dict_put_passes_store_config_to_writes(
+    policy, config_attr, use_pool
+) -> None:
     store, transfer = make_transfer(buffer_pool=FakeBufferPool() if use_pool else None)
     config = GroupConfig(None)
     data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
@@ -3067,9 +3055,7 @@ def test_release_result_recurses_into_ragged_row_views() -> None:
 
         def __array_finalize__(self, obj) -> None:
             if obj is not None:
-                self._mooncake_pool_owner = getattr(
-                    obj, "_mooncake_pool_owner", None
-                )
+                self._mooncake_pool_owner = getattr(obj, "_mooncake_pool_owner", None)
 
     owner = FakeOwner()
     other_owner = FakeOwner()
@@ -3079,7 +3065,15 @@ def test_release_result_recurses_into_ragged_row_views() -> None:
     object_items[0] = base[4:5]
 
     MooncakeBundleTransfer.release_result(
-        {"values": [None, 0, base[:2], {"nested": (base[2:4], object_items)}, other[:1]]}
+        {
+            "values": [
+                None,
+                0,
+                base[:2],
+                {"nested": (base[2:4], object_items)},
+                other[:1],
+            ]
+        }
     )
 
     assert owner.release_count == 1
@@ -3437,14 +3431,27 @@ def test_dataproto_helper_reads_rollout_transfer_data_with_real_store() -> None:
         assert np.array_equal(sliced["batch"]["responses"], responses[1:5])
         assert np.array_equal(sliced["batch"]["ref_log_probs"], ref_log_probs[1:5])
         assert np.array_equal(sliced["batch"]["returns"], returns[1:5])
-        assert sliced["non_tensor_batch"]["sample_meta"].tolist() == sample_meta[1:5].tolist()
+        assert (
+            sliced["non_tensor_batch"]["sample_meta"].tolist()
+            == sample_meta[1:5].tolist()
+        )
 
-        assert np.array_equal(gathered["batch"]["attention_mask"], attention_mask[[5, 0, 3]])
+        assert np.array_equal(
+            gathered["batch"]["attention_mask"], attention_mask[[5, 0, 3]]
+        )
         assert np.array_equal(gathered["batch"]["values"], values[[5, 0, 3]])
-        assert gathered["non_tensor_batch"]["prompts"].tolist() == prompts[[5, 0, 3]].tolist()
-        assert gathered["non_tensor_batch"]["sample_meta"].tolist() == sample_meta[[5, 0, 3]].tolist()
+        assert (
+            gathered["non_tensor_batch"]["prompts"].tolist()
+            == prompts[[5, 0, 3]].tolist()
+        )
+        assert (
+            gathered["non_tensor_batch"]["sample_meta"].tolist()
+            == sample_meta[[5, 0, 3]].tolist()
+        )
 
-        assert np.array_equal(imported_selected["batch"]["position_ids"], position_ids[[2, 4]])
+        assert np.array_equal(
+            imported_selected["batch"]["position_ids"], position_ids[[2, 4]]
+        )
         assert np.array_equal(imported_selected["batch"]["rewards"], rewards[[2, 4]])
         assert view["batch_fields"]["input_ids"]["stage"] == "rollout"
         assert view["batch_fields"]["old_log_probs"]["stage"] == "logprob"
@@ -3479,12 +3486,20 @@ def test_dataproto_helper_reads_large_rollout_transfer_data_with_real_store() ->
     advantages = values + np.float32(2.0)
     returns = values + np.float32(3.0)
     prompts = np.asarray(
-        ["" if index % 17 == 0 else f"prompt-{index}-" + "x" * (index % 23) for index in range(batch_size)],
+        [
+            "" if index % 17 == 0 else f"prompt-{index}-" + "x" * (index % 23)
+            for index in range(batch_size)
+        ],
         dtype=object,
     )
     sample_meta = np.asarray(
         [
-            {"row": index, "row_id": row_id, "prompt_len": prompt_len, "response_len": response_len}
+            {
+                "row": index,
+                "row_id": row_id,
+                "prompt_len": prompt_len,
+                "response_len": response_len,
+            }
             for index, row_id in enumerate(row_ids)
         ],
         dtype=object,
@@ -3555,7 +3570,9 @@ def test_dataproto_helper_reads_large_rollout_transfer_data_with_real_store() ->
             rows=gathered_rows,
             destinations={"position_ids": destination},
         )
-        meta_only = transfer.get_dataproto(handle, fields=[], meta_info_keys=["roll_row_ids"])
+        meta_only = transfer.get_dataproto(
+            handle, fields=[], meta_info_keys=["roll_row_ids"]
+        )
         full_tail = transfer.get_dataproto(
             handle,
             fields=["attention_mask", "advantages"],
@@ -3567,13 +3584,18 @@ def test_dataproto_helper_reads_large_rollout_transfer_data_with_real_store() ->
             selected["batch"]["action_log_probs"], action_log_probs[12:76]
         )
         assert np.array_equal(selected["batch"]["values"], values[12:76])
-        assert selected["non_tensor_batch"]["prompts"].tolist() == prompts[12:76].tolist()
+        assert (
+            selected["non_tensor_batch"]["prompts"].tolist() == prompts[12:76].tolist()
+        )
         assert np.array_equal(gathered["batch"]["responses"], responses[gathered_rows])
         assert np.array_equal(
             gathered["batch"]["ref_log_probs"], ref_log_probs[gathered_rows]
         )
         assert np.array_equal(gathered["batch"]["returns"], returns[gathered_rows])
-        assert gathered["non_tensor_batch"]["sample_meta"].tolist() == sample_meta[gathered_rows].tolist()
+        assert (
+            gathered["non_tensor_batch"]["sample_meta"].tolist()
+            == sample_meta[gathered_rows].tolist()
+        )
         assert into["batch"]["position_ids"] is destination
         assert np.array_equal(destination, position_ids[gathered_rows])
         assert meta_only["batch"] == {}
@@ -3582,7 +3604,9 @@ def test_dataproto_helper_reads_large_rollout_transfer_data_with_real_store() ->
         assert np.array_equal(
             full_tail["batch"]["attention_mask"], attention_mask[batch_size - 8 :]
         )
-        assert np.array_equal(full_tail["batch"]["advantages"], advantages[batch_size - 8 :])
+        assert np.array_equal(
+            full_tail["batch"]["advantages"], advantages[batch_size - 8 :]
+        )
     finally:
         transfer.cleanup_dataproto(ref)
 
@@ -3593,7 +3617,9 @@ def test_dataproto_helper_selection_errors_and_destinations_with_real_store() ->
     batch_size = 12
     input_ids = np.arange(batch_size * 12, dtype=np.int64).reshape(batch_size, 12)
     scores = np.linspace(0.0, 1.0, batch_size, dtype=np.float32)
-    prompts = np.asarray([f"prompt-{index}" for index in range(batch_size)], dtype=object)
+    prompts = np.asarray(
+        [f"prompt-{index}" for index in range(batch_size)], dtype=object
+    )
     ref = transfer.put_dataproto(
         {
             "batch": {"input_ids": input_ids, "scores": scores},
@@ -3615,7 +3641,9 @@ def test_dataproto_helper_selection_errors_and_destinations_with_real_store() ->
         with pytest.raises(TypeError, match="row indices"):
             transfer.get_dataproto(ref, fields=["input_ids"], rows=["0"])
         with pytest.raises(ValueError, match="step must be positive"):
-            transfer.get_dataproto(ref, fields=["input_ids"], rows=slice(None, None, -1))
+            transfer.get_dataproto(
+                ref, fields=["input_ids"], rows=slice(None, None, -1)
+            )
         with pytest.raises(ValueError, match="destination shape mismatch"):
             transfer.get_dataproto(
                 ref,
@@ -3641,7 +3669,10 @@ def test_dataproto_helper_selection_errors_and_destinations_with_real_store() ->
         assert np.array_equal(scores_destination, scores[[11, 3, 3, 0]])
         assert result["non_tensor_batch"] == {}
         assert non_tensor_only["batch"] == {}
-        assert non_tensor_only["non_tensor_batch"]["prompts"].tolist() == prompts[[2, 4, 6]].tolist()
+        assert (
+            non_tensor_only["non_tensor_batch"]["prompts"].tolist()
+            == prompts[[2, 4, 6]].tolist()
+        )
     finally:
         transfer.cleanup_dataproto(ref)
 
@@ -3677,7 +3708,9 @@ def test_dataproto_helper_imported_handle_same_stage_append_with_real_store() ->
     handle = export_dataproto_ref(appended)
 
     try:
-        result = transfer.get_dataproto(handle, fields=["input_ids", "values", "rewards"], rows=[7, 1, 4])
+        result = transfer.get_dataproto(
+            handle, fields=["input_ids", "values", "rewards"], rows=[7, 1, 4]
+        )
         assert np.array_equal(result["batch"]["input_ids"], input_ids[[7, 1, 4]])
         assert np.array_equal(result["batch"]["values"], values[[7, 1, 4]])
         assert np.array_equal(result["batch"]["rewards"], rewards[[7, 1, 4]])
@@ -3793,18 +3826,28 @@ def test_dataproto_helper_rollout_edge_cases_with_real_store() -> None:
         assert empty["batch"]["input_ids"].shape == (0, 16)
         assert empty["batch"]["scores"].shape == (0,)
         assert empty["non_tensor_batch"]["prompts"].tolist() == []
-        assert np.array_equal(tail_and_repeat["batch"]["input_ids"], input_ids[[9, 0, 9, 3]])
+        assert np.array_equal(
+            tail_and_repeat["batch"]["input_ids"], input_ids[[9, 0, 9, 3]]
+        )
         assert np.array_equal(
             tail_and_repeat["batch"]["attention_mask"], attention_mask[[9, 0, 9, 3]]
         )
         assert np.array_equal(tail_and_repeat["batch"]["scores"], scores[[9, 0, 9, 3]])
-        assert tail_and_repeat["non_tensor_batch"]["prompts"].tolist() == prompts[[9, 0, 9, 3]].tolist()
+        assert (
+            tail_and_repeat["non_tensor_batch"]["prompts"].tolist()
+            == prompts[[9, 0, 9, 3]].tolist()
+        )
         assert np.array_equal(step_slice["batch"]["input_ids"], input_ids[1:9:2])
         assert np.array_equal(step_slice["batch"]["scores"], scores[1:9:2])
         assert np.array_equal(same_stage["batch"]["input_ids"], input_ids[[2, 5, 9]])
         assert np.array_equal(same_stage["batch"]["values"], values[[2, 5, 9]])
-        assert same_stage["non_tensor_batch"]["prompts"].tolist() == prompts[[2, 5, 9]].tolist()
-        assert np.array_equal(overwritten["batch"]["scores"], replacement_scores[[0, 4, 9]])
+        assert (
+            same_stage["non_tensor_batch"]["prompts"].tolist()
+            == prompts[[2, 5, 9]].tolist()
+        )
+        assert np.array_equal(
+            overwritten["batch"]["scores"], replacement_scores[[0, 4, 9]]
+        )
         assert np.array_equal(overwritten["batch"]["values"], values[[0, 4, 9]])
         assert overwritten["meta_info"]["same_stage"] is True
         assert overwritten["meta_info"]["scores_overwritten"] is True
@@ -3825,7 +3868,10 @@ def test_structured_object_zero_byte_payload_skips_store_put() -> None:
     assert result.objects["empty"].shape == (4, 0)
     assert ref.manifest["buffers"]["empty"]["bytes"] == 0
     assert ref.manifest["buffers"]["empty"]["chunks"] == []
-    assert store.objects == {ref.manifest_key: store.objects[ref.manifest_key], ref.manifest["meta"]["key"]: store.objects[ref.manifest["meta"]["key"]]}
+    assert store.objects == {
+        ref.manifest_key: store.objects[ref.manifest_key],
+        ref.manifest["meta"]["key"]: store.objects[ref.manifest["meta"]["key"]],
+    }
 
 
 def test_dataproto_helper_multidim_boundary_reads_with_real_store() -> None:
@@ -3945,7 +3991,10 @@ def test_dataproto_helper_multidim_boundary_reads_with_real_store() -> None:
         assert duplicate_gather["non_tensor_batch"]["byte_blobs"].tolist() == [
             bytes(value) for value in byte_blobs[rows].tolist()
         ]
-        assert duplicate_gather["non_tensor_batch"]["json_meta"].tolist() == json_meta[rows].tolist()
+        assert (
+            duplicate_gather["non_tensor_batch"]["json_meta"].tolist()
+            == json_meta[rows].tolist()
+        )
         assert into["batch"]["image_features"] is image_destination
         assert np.array_equal(image_destination, image_features[rows])
         assert np.array_equal(step_batch["batch"]["logits"], logits[2:17:3])
@@ -3954,7 +4003,10 @@ def test_dataproto_helper_multidim_boundary_reads_with_real_store() -> None:
         assert tail_non_tensor["non_tensor_batch"]["byte_blobs"].tolist() == [
             bytes(value) for value in byte_blobs[batch_size - 3 :].tolist()
         ]
-        assert tail_non_tensor["non_tensor_batch"]["json_meta"].tolist() == json_meta[batch_size - 3 :].tolist()
+        assert (
+            tail_non_tensor["non_tensor_batch"]["json_meta"].tolist()
+            == json_meta[batch_size - 3 :].tolist()
+        )
         assert meta_selected["batch"] == {}
         assert meta_selected["non_tensor_batch"] == {}
         assert meta_selected["meta_info"] == {
@@ -4075,9 +4127,7 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
 
 
 def test_msgpack_ragged_decode_validates_row_count() -> None:
-    payload, _metadata = sos._encode_msgpack_ragged_values(
-        "json", [{"a": 1}, {"b": 2}]
-    )
+    payload, _metadata = sos._encode_msgpack_ragged_values("json", [{"a": 1}, {"b": 2}])
 
     with pytest.raises(ValueError, match="offsets length"):
         sos._decode_msgpack_ragged_values(payload, 1)
@@ -4229,21 +4279,15 @@ def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
     assert view["non_tensor_fields"]["values"]["spec"]["payload_specs"]["data"][
         "shape"
     ] == [14]
-    assert [
-        None if row is None else row.tolist() for row in result["values"]
-    ] == [
+    assert [None if row is None else row.tolist() for row in result["values"]] == [
         None if row is None else row.tolist() for row in rows
     ]
-    assert all(
-        row is None or isinstance(row, np.ndarray) for row in result["values"]
-    )
+    assert all(row is None or isinstance(row, np.ndarray) for row in result["values"])
     assert result["values"][0].shape == ()
     assert [row.dtype for row in result["values"] if row is not None] == [
         np.dtype(np.int32)
     ] * 4
-    gathered = transfer.get_dataproto(
-        ref, non_tensor_fields=["values"], rows=[4, 2, 0]
-    )
+    gathered = transfer.get_dataproto(ref, non_tensor_fields=["values"], rows=[4, 2, 0])
     assert [
         None if row is None else row.tolist()
         for row in gathered["non_tensor_batch"]["values"]
@@ -4261,13 +4305,12 @@ def _typed_ragged_payload_array(
     data = payload["data"]
     arrays = getattr(data, "arrays", None)
     if arrays is not None:
-        flat_arrays = [
-            np.asarray(array, dtype=dtype).reshape(-1) for array in arrays
-        ]
+        flat_arrays = [np.asarray(array, dtype=dtype).reshape(-1) for array in arrays]
         if not flat_arrays:
             return np.asarray([], dtype=dtype)
         return np.concatenate(flat_arrays)
     return np.concatenate([np.frombuffer(buf, dtype=dtype) for buf in data.buffers])
+
 
 def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
     rows = [np.arange(6, dtype=np.int32).reshape(2, 3) + i * 10 for i in range(3)]
@@ -4285,9 +4328,9 @@ def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
 def test_typed_ragged_single_ndarray_row_uses_general_layout() -> None:
     rows = [np.arange(6, dtype=np.int32).reshape(2, 3)]
 
-    assert sos._encode_typed_ragged_regular_ndarray_rows(
-        rows, np.dtype(np.int32)
-    ) is None
+    assert (
+        sos._encode_typed_ragged_regular_ndarray_rows(rows, np.dtype(np.int32)) is None
+    )
     payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
     data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
 
@@ -4306,9 +4349,9 @@ def test_typed_ragged_equal_shape_rows_with_nulls_use_general_layout() -> None:
         np.arange(6, 12, dtype=np.int32).reshape(2, 3),
     ]
 
-    assert sos._encode_typed_ragged_regular_ndarray_rows(
-        rows, np.dtype(np.int32)
-    ) is None
+    assert (
+        sos._encode_typed_ragged_regular_ndarray_rows(rows, np.dtype(np.int32)) is None
+    )
     payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
     data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
 
@@ -4316,12 +4359,8 @@ def test_typed_ragged_equal_shape_rows_with_nulls_use_general_layout() -> None:
 
     assert metadata["physical_layout"] == "contiguous_flat"
     assert decoded[1] is None
-    assert all(
-        row is None or isinstance(row, np.ndarray) for row in decoded
-    )
-    assert all(
-        row is None or np.shares_memory(row, data) for row in decoded
-    )
+    assert all(row is None or isinstance(row, np.ndarray) for row in decoded)
+    assert all(row is None or np.shares_memory(row, data) for row in decoded)
     assert [None if row is None else row.tolist() for row in decoded] == [
         rows[0].tolist(),
         None,
@@ -4500,14 +4539,18 @@ def test_dataproto_helper_dict_of_tensors_object_array_roundtrip() -> None:
     view = transfer.dataproto_manifest_view(ref)
 
     assert ref.encoded_non_tensor["samples"]["codec"] == "structured_recursive"
-    assert view["non_tensor_fields"]["samples"]["spec"]["codec"] == "structured_recursive"
+    assert (
+        view["non_tensor_fields"]["samples"]["spec"]["codec"] == "structured_recursive"
+    )
     assert result["meta_info"] == {"source": "dict-of-tensors"}
     actual = result["non_tensor_batch"]["samples"]
     for row, expected in enumerate(samples):
         _assert_tensor_object_equal(actual[row], expected)
 
 
-def test_dataproto_helper_dict_of_tensors_distinguishes_missing_keys_and_nulls() -> None:
+def test_dataproto_helper_dict_of_tensors_distinguishes_missing_keys_and_nulls() -> (
+    None
+):
     torch = pytest.importorskip("torch")
     _store, transfer = make_transfer()
     samples = np.asarray(
@@ -4616,12 +4659,16 @@ def test_dataproto_helper_reads_dict_of_tensors_rows_and_selected_field() -> Non
     )
 
     sliced = transfer.get_dataproto(ref, fields=["samples"], rows=slice(1, 5))
-    gathered = transfer.get_dataproto(ref, fields=["input_ids", "samples"], rows=[5, 0, 2, 4])
+    gathered = transfer.get_dataproto(
+        ref, fields=["input_ids", "samples"], rows=[5, 0, 2, 4]
+    )
 
     assert sliced["batch"] == {}
     assert sliced["meta_info"] == {"kind": "dict-tensor"}
     for row, expected in enumerate(samples[1:5]):
-        _assert_tensor_object_equal(sliced["non_tensor_batch"]["samples"][row], expected)
+        _assert_tensor_object_equal(
+            sliced["non_tensor_batch"]["samples"][row], expected
+        )
     assert np.array_equal(gathered["batch"]["input_ids"], input_ids[[5, 0, 2, 4]])
     for row, expected_index in enumerate([5, 0, 2, 4]):
         _assert_tensor_object_equal(
@@ -4633,7 +4680,9 @@ def test_dataproto_helper_recursive_manifest_export_append_and_overwrite() -> No
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()
     input_ids = np.arange(4, dtype=np.int64)
-    ref = transfer.put_dataproto(SimpleDataProto(batch={"input_ids": input_ids}), stage="rollout")
+    ref = transfer.put_dataproto(
+        SimpleDataProto(batch={"input_ids": input_ids}), stage="rollout"
+    )
     samples = np.asarray(
         [
             {"tokens": torch.arange(1, dtype=torch.float32), "score": 0.0},
@@ -4646,7 +4695,9 @@ def test_dataproto_helper_recursive_manifest_export_append_and_overwrite() -> No
 
     ref = transfer.append_dataproto_fields(
         ref,
-        SimpleDataProto(non_tensor_batch={"samples": samples}, meta_info={"stage": "samples"}),
+        SimpleDataProto(
+            non_tensor_batch={"samples": samples}, meta_info={"stage": "samples"}
+        ),
         stage="rollout",
     )
     handle = export_dataproto_ref(ref)
@@ -4668,7 +4719,9 @@ def test_dataproto_helper_recursive_manifest_export_append_and_overwrite() -> No
         ref,
         SimpleDataProto(
             batch={"input_ids": input_ids},
-            non_tensor_batch={"samples": np.asarray(["a", "b", "c", "d"], dtype=object)},
+            non_tensor_batch={
+                "samples": np.asarray(["a", "b", "c", "d"], dtype=object)
+            },
         ),
         stage="rollout",
         overwrite=True,
