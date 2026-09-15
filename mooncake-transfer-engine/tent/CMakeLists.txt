@@ -29,6 +29,7 @@ endif()
 option(TENT_METRICS_ENABLED "Enable TENT metrics collection" OFF)
 
 add_subdirectory(src)
+add_subdirectory(include/tent)
 add_subdirectory(plugins)
 if(BUILD_UNIT_TESTS)
   add_subdirectory(tests)
