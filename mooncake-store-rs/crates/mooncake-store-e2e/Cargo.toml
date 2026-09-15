@@ -7,6 +7,11 @@ edition = "2021"
 default = []
 nof-spdk = ["mooncake-store-client/nof-spdk"]
 
+[[bin]]
+name = "nof_multi_client"
+path = "src/bin/nof_multi_client.rs"
+required-features = ["nof-spdk"]
+
 [dependencies]
 mooncake-metadata = { path = "../mooncake-metadata" }
 mooncake-store-client = { path = "../mooncake-store-client" }
