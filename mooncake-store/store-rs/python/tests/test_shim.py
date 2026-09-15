@@ -186,6 +186,58 @@ class RedirectTests(ShimTestCase):
             f"vendored but not redirected, unreachable as mooncake.*: {missing}",
         )
 
+    def test_vendored_assets_match_existing_upstream_sources(self) -> None:
+        build_wheel = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "build"
+            / "build-wheel.sh"
+        )
+        if not build_wheel.is_file():
+            self.skipTest(f"{build_wheel} not present")
+
+        build_text = build_wheel.read_text()
+        build_block = re.search(r"python_assets = \[(.*?)\]", build_text, re.S)
+        self.assertIsNotNone(
+            build_block, "could not locate python_assets in build-wheel.sh"
+        )
+        assert build_block is not None
+        staged = set(re.findall(r'"([^"]+\.py)"', build_block.group(1)))
+
+        release_script = build_wheel.with_name("replace-wheel-mooncake-release.py")
+        release_text = release_script.read_text()
+        release_block = re.search(r"PYTHON_ASSETS = \{(.*?)\}", release_text, re.S)
+        self.assertIsNotNone(
+            release_block,
+            "could not locate PYTHON_ASSETS in replace-wheel-mooncake-release.py",
+        )
+        assert release_block is not None
+        replacement = set(re.findall(r'"([^"]+\.py)"', release_block.group(1)))
+        self.assertEqual(replacement, staged)
+
+        repository_root = build_wheel.parents[4]
+        source_candidates = (
+            repository_root / "mooncake-wheel" / "mooncake",
+            build_wheel.parents[2]
+            / "third_party"
+            / "Mooncake"
+            / "mooncake-wheel"
+            / "mooncake",
+        )
+        upstream_source = next(
+            (candidate for candidate in source_candidates if candidate.is_dir()),
+            None,
+        )
+        self.assertIsNotNone(upstream_source, source_candidates)
+        assert upstream_source is not None
+        missing = sorted(
+            name for name in staged if not (upstream_source / name).is_file()
+        )
+        self.assertFalse(
+            missing,
+            f"wheel asset list references missing upstream files in {upstream_source}: {missing}",
+        )
+
     def test_unlisted_submodules_are_left_to_upstream(self) -> None:
         finder = _shim.StoreRsFinder()
         # Real upstream modules this wheel neither implements nor vendors; they
@@ -194,6 +246,8 @@ class RedirectTests(ShimTestCase):
             "mooncake.cli_bench",
             "mooncake.mooncake_elastic_buffer",
             "mooncake.mooncake_ssd_register",
+            "mooncake.ep",
+            "mooncake.mooncake_ep_buffer",
             "mooncake.spdk_tgt_create",
         ):
             with self.subTest(module=name):
