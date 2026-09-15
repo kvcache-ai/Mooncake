@@ -300,6 +300,7 @@ set_tests_properties(dummy_client_object_checksum_test
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
+  add_store_test(oss_adapter_config_test oss_adapter_config_test.cpp)
   add_store_test(oss_adapter_test oss_adapter_test.cpp)
 endif()
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)

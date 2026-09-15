@@ -195,7 +195,8 @@ if(CURL_FOUND AND OpenSSL_FOUND)
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       TRUE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES storage/distributed/oss_adapter.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+       storage/distributed/oss_adapter.cpp)
   list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
   add_definitions(-DHAVE_OSS_ADAPTER)
 else()
