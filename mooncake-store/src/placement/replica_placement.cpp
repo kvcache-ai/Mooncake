@@ -60,7 +60,7 @@ AllocationCandidateKind ReplicaPlacement::Kind() const {
 
 tl::expected<std::vector<Replica>, ErrorCode> ReplicaPlacement::Allocate(
     ScopedPlacementReadAccess& access, const ReplicaAllocationRequest& request,
-    PlacementDiagnostics* diagnostics) const {
+    AllocationDiagnostics* diagnostics) const {
     auto resolved = request;
     std::vector<std::string> preferred;
     if (backend_ == Backend::Memory &&
@@ -87,12 +87,21 @@ tl::expected<std::vector<Replica>, ErrorCode> ReplicaPlacement::Allocate(
         resolved.placement.preferred_segment_names = preferred;
         resolved.host_affinity = {};
     }
-    return std::visit(
+    PlacementDiagnostics placement_diagnostics;
+    auto result = std::visit(
         [&](const auto& policy) {
-            return ReplicaAllocator(policy).Allocate(access, resolved,
-                                                     diagnostics);
+            return ReplicaAllocator(policy).Allocate(
+                access, resolved,
+                diagnostics ? &placement_diagnostics : nullptr);
         },
         policy_);
+    if (diagnostics) {
+        diagnostics->reclamation_may_help =
+            ((result && result->size() < request.replicas.count) ||
+             (!result && result.error() == ErrorCode::NO_AVAILABLE_HANDLE)) &&
+            placement_diagnostics.has_sufficient_active_entry_count;
+    }
+    return result;
 }
 
 tl::expected<Replica, ErrorCode> ReplicaPlacement::AllocateFrom(

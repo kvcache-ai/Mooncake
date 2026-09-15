@@ -1,3 +1,5 @@
+#include "pool_transaction_internal.h"
+
 #include "segment/recovery.h"
 
 #include <algorithm>
@@ -82,12 +84,11 @@ NoFBufferRecovery::Restore(const Replica::Descriptor& desc,
 }
 
 bool SegmentPool::RestoreBufferBindings(
-    const std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
-                             boost::hash<UUID>>& clients,
+    const std::unordered_map<UUID, ClientSessionPtr, boost::hash<UUID>>&
+        clients,
     std::span<AllocatedBuffer* const> buffers) {
     auto access = AcquireWriteAccess();
-    for (const auto& [client, record] : clients)
-        access.BindClientLiveness(client, record);
+    if (!access.RestoreClientSessions(clients)) return false;
     bool valid = true;
     for (auto* buffer : buffers) {
         if (!buffer || !access.RebindBufferToOwningSegment(*buffer))
@@ -195,13 +196,12 @@ struct PreparedRemount::State {
     SegmentPool& pool;
     SegmentPool::WriteAccess access;
     RemountRequest request;
-    std::shared_ptr<ClientLivenessRecord> liveness;
+    ClientSessionPtr liveness;
     std::vector<std::optional<RegionMountTxn>> transactions;
     std::unordered_map<std::string, uint64_t> imported;
     std::vector<RestoredBuffer> result;
     bool committed{false};
-    State(SegmentPool& pool, RemountRequest request,
-          std::shared_ptr<ClientLivenessRecord> liveness)
+    State(SegmentPool& pool, RemountRequest request, ClientSessionPtr liveness)
         : pool(pool),
           access(pool.AcquireWriteAccess()),
           request(std::move(request)),
@@ -216,9 +216,13 @@ PreparedRemount& PreparedRemount::operator=(PreparedRemount&&) noexcept =
     default;
 
 tl::expected<PreparedRemount, ErrorCode> SegmentPool::PrepareRemount(
-    RemountRequest request, std::shared_ptr<ClientLivenessRecord> liveness) {
+    RemountRequest request, ClientSessionPtr liveness) {
+    if (!liveness || liveness->client_id() != request.client_id_)
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     auto state = std::make_unique<PreparedRemount::State>(
         *this, std::move(request), std::move(liveness));
+    if (!state->liveness->ShouldRetainResources())
+        return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     std::vector<Segment> segments;
     for (const auto& region : state->request.regions_)
         segments.push_back(region.segment);
@@ -227,6 +231,13 @@ tl::expected<PreparedRemount, ErrorCode> SegmentPool::PrepareRemount(
     size_t count = 0;
     for (const auto& region : state->request.regions_) {
         count += region.bindings.size();
+        if (const auto* mounted = catalog_.Find(region.segment.id)) {
+            const auto* resource = GetResource(*mounted);
+            if (!resource) return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            const auto owner = resource->candidate->client_session();
+            if (owner && owner != state->liveness)
+                return tl::unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
         if (region.descriptors.empty() && catalog_.Find(region.segment.id)) {
             state->transactions.emplace_back();
             continue;
@@ -238,6 +249,7 @@ tl::expected<PreparedRemount, ErrorCode> SegmentPool::PrepareRemount(
                                                       state->request.client_id_,
                                                       region.descriptors);
         if (!txn) return tl::unexpected(txn.error());
+        txn->BindClientSession(state->liveness);
         if (txn->imported_buffers().size() != region.bindings.size() ||
             std::ranges::any_of(txn->imported_buffers(),
                                 [](const auto& buffer) { return !buffer; }))
@@ -260,36 +272,55 @@ tl::expected<PreparedRemount, ErrorCode> SegmentPool::PrepareRemount(
 
 std::vector<RestoredBuffer> PreparedRemount::Commit() {
     CHECK(state_ && !state_->committed);
-    auto& s = *state_;
-    for (auto& transaction : s.transactions) {
-        if (transaction) CHECK(transaction->Commit(s.access) == ErrorCode::OK);
+    auto& state = *state_;
+    for (auto& transaction : state.transactions) {
+        if (transaction) {
+            CHECK(transaction->Commit(state.access) == ErrorCode::OK);
+        }
     }
-    s.access.BindClientLiveness(s.request.client_id_, s.liveness);
-    for (size_t i = 0; i < s.transactions.size(); ++i) {
-        const auto& region = s.request.regions_[i];
-        if (s.transactions[i]) {
-            auto buffers = s.transactions[i]->TakeImportedBuffers();
+
+    for (size_t i = 0; i < state.transactions.size(); ++i) {
+        const auto& region = state.request.regions_[i];
+        auto& transaction = state.transactions[i];
+        if (!transaction) {
+            const auto* mounted = state.pool.catalog_.Find(region.segment.id);
+            state.pool.GetResource(*mounted)->candidate->BindClientSession(
+                state.liveness);
+        } else {
+            auto buffers = transaction->TakeImportedBuffers();
             for (size_t j = 0; j < buffers.size(); ++j) {
-                CHECK(s.access.BindBufferToSegment(region.segment.id,
-                                                   *buffers[j]));
-                s.result.push_back({region.bindings[j], std::move(buffers[j])});
+                CHECK(state.access.BindBufferToSegment(region.segment.id,
+                                                       *buffers[j]));
+                state.result.push_back(
+                    {region.bindings[j], std::move(buffers[j])});
             }
         }
-        if (s.pool.recovery_) {
-            s.pool.recovery_->allocators_.erase(region.segment.name);
-            s.pool.recovery_->allocators_.erase(region.segment.te_endpoint);
+        if (state.pool.recovery_) {
+            state.pool.recovery_->allocators_.erase(region.segment.name);
+            state.pool.recovery_->allocators_.erase(region.segment.te_endpoint);
         }
     }
-    for (const auto& [name, bytes] : s.imported) {
+
+    // Replace placeholder accounting only after all live buffers are bound.
+    for (const auto& [name, bytes] : state.imported) {
         if (!bytes) continue;
         MasterMetricManager::instance().dec_allocated_mem_size(
             name, static_cast<int64_t>(bytes));
-        auto& accounted = s.pool.recovery_->accounted_.at(name);
+        auto& accounted = state.pool.recovery_->accounted_.at(name);
         accounted -= bytes;
-        if (!accounted) s.pool.recovery_->accounted_.erase(name);
+        if (!accounted) state.pool.recovery_->accounted_.erase(name);
     }
-    s.committed = true;
-    return std::move(s.result);
+
+    // Publish the client host only after the entire batch has committed.
+    // Preserve the first nonempty hint, including existing-region remounts.
+    for (const auto& region : state.request.regions_) {
+        if (!region.segment.host_id.empty()) {
+            state.liveness->SetHostId(region.segment.host_id);
+            break;
+        }
+    }
+    state.committed = true;
+    return std::move(state.result);
 }
 
 }  // namespace mooncake

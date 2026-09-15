@@ -10,6 +10,12 @@ uint64_t StableSegmentScore(std::string_view key, std::string_view segment);
 
 // Concrete policy executor shared by resource owners. It owns policy selection,
 // not resources. LocalSSD metrics are borrowed and must outlive this object.
+struct AllocationDiagnostics {
+    // A best-effort pressure signal on a failed/partial allocation, not a
+    // promise of success after eviction (constraints/fragmentation may remain).
+    bool reclamation_may_help{false};
+};
+
 class ReplicaPlacement final {
    public:
     enum class Backend { Memory, NoF };
@@ -21,7 +27,7 @@ class ReplicaPlacement final {
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         ScopedPlacementReadAccess& access,
         const ReplicaAllocationRequest& request,
-        PlacementDiagnostics* diagnostics = nullptr) const;
+        AllocationDiagnostics* diagnostics = nullptr) const;
     tl::expected<Replica, ErrorCode> AllocateFrom(
         ScopedPlacementReadAccess& access, std::string_view name,
         size_t size) const;

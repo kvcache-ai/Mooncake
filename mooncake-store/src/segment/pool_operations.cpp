@@ -3,14 +3,16 @@
 namespace mooncake {
 
 ClientUnmountBatch SegmentPool::WriteAccess::BeginClientUnmount(
-    const UUID& client_id) {
+    const ClientSessionPtr& session) {
+    if (!session) return {};
+    const auto& client_id = session->client_id();
     std::vector<Segment> segments;
     (void)GetClientSegments(client_id, segments);
     ClientUnmountBatch batch;
     batch.prepared.reserve(segments.size());
     batch.pending.reserve(segments.size());
     for (const auto& segment : segments) {
-        auto prepared = BeginUnmount(segment.id, client_id);
+        auto prepared = BeginUnmount(segment.id, session);
         if (prepared) {
             batch.prepared.push_back(std::move(*prepared));
         } else if (prepared.error() != ErrorCode::SEGMENT_NOT_FOUND) {
@@ -18,6 +20,19 @@ ClientUnmountBatch SegmentPool::WriteAccess::BeginClientUnmount(
         }
     }
     return batch;
+}
+
+tl::expected<SegmentUnmountOperation, ErrorCode>
+SegmentPool::WriteAccess::BeginUnmount(const UUID& segment_id,
+                                       const ClientSessionPtr& session) {
+    if (!session) return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    const auto* mounted = catalog_.Find(segment_id);
+    const auto* resource =
+        mounted ? segment_pool_.GetResource(*mounted) : nullptr;
+    // An old offboarding job must not touch a newer incarnation's resources.
+    if (!resource || resource->candidate->client_session() != session)
+        return tl::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    return BeginUnmount(segment_id, session->client_id());
 }
 
 bool SegmentPool::WriteAccess::IsNameReserved(std::string_view name) const {

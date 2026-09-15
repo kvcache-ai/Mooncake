@@ -1,3 +1,5 @@
+#include "../tests/segment_pool_test_peer.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -323,6 +325,9 @@ static void setupResourceLimits() {
  * allocator handles are retained only to inspect utilization/fragmentation.
  */
 class BenchmarkPlacement final {
+    std::unique_ptr<ClientRegistry> clients_ =
+        std::make_unique<ClientRegistry>(false);
+
    public:
     explicit BenchmarkPlacement(PlacementPolicyType policy) {
         RegionDriverConfig config;
@@ -343,13 +348,15 @@ class BenchmarkPlacement final {
     std::shared_ptr<BufferAllocatorBase> Add(const Segment& segment) {
         {
             auto access = pool_->AcquireWriteAccess();
-            auto error = access.MountSegment(segment, client_id_);
+            auto error =
+                access.MountSegment(segment, clients_->GetOrCreate(client_id_));
             if (error != ErrorCode::OK) {
                 throw std::runtime_error("failed to mount benchmark segment " +
                                          segment.name + ": " + toString(error));
             }
         }
-        auto allocator = pool_->AcquireReadAccess().GetAllocator(segment.id);
+        auto allocator = SegmentPoolTestPeer::GetAllocator(
+            pool_->AcquireReadAccess(), segment.id);
         allocators_.push_back(allocator);
         return allocator;
     }

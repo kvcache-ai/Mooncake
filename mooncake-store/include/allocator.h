@@ -11,7 +11,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "client_liveness.h"
+#include "client_session.h"
 #include "offset_allocator/offset_allocator.h"
 #include "storage_usage.h"
 #include "types.h"
@@ -47,24 +47,48 @@ class BufferAllocatorBase;
 class Replica;
 class SegmentAllocatorRegistration;
 
+// Shared region runtime identity. Owner reconstruction updates this object,
+// so every buffer (including one restored before its owner) observes the same
+// session. Segment availability and client liveness remain independent.
 class SegmentLifetime {
    public:
-    SegmentLifetime() : available_(std::make_shared<std::atomic<bool>>(true)) {}
+    explicit SegmentLifetime(bool requires_client_session = false)
+        : state_(std::make_shared<State>(requires_client_session)) {}
 
     [[nodiscard]] bool isAvailable() const {
-        return available_->load(std::memory_order_acquire);
+        return state_->available.load(std::memory_order_acquire);
     }
 
     void setAvailable(bool available) const {
-        available_->store(available, std::memory_order_release);
+        state_->available.store(available, std::memory_order_release);
+    }
+
+    ClientSessionPtr clientSession() const {
+        return std::atomic_load_explicit(&state_->session,
+                                         std::memory_order_acquire);
+    }
+
+    void bindClientSession(ClientSessionPtr session) const {
+        std::atomic_store_explicit(&state_->session, std::move(session),
+                                   std::memory_order_release);
+    }
+
+    bool requiresClientSession() const {
+        return state_->requires_client_session;
     }
 
     [[nodiscard]] bool operator==(const SegmentLifetime& other) const {
-        return available_ == other.available_;
+        return state_ == other.state_;
     }
 
    private:
-    std::shared_ptr<std::atomic<bool>> available_;
+    struct State {
+        explicit State(bool required) : requires_client_session(required) {}
+        std::atomic<bool> available{true};
+        ClientSessionPtr session;
+        const bool requires_client_session;
+    };
+    std::shared_ptr<State> state_;
 };
 
 class AllocatedBuffer {
@@ -109,9 +133,11 @@ class AllocatedBuffer {
         if (!isAllocatorValid()) {
             return false;
         }
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
-        return !record || record->IsServing();
+        const auto record = getClientLiveness();
+        // A restored region awaiting its owner is unavailable, not invalid:
+        // queries must not reclaim its allocation before owner reconstruction.
+        return record ? record->IsServing()
+                      : !segment_lifetime_.requiresClientSession();
     }
 
     void bindClientLiveness(
@@ -127,6 +153,9 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::shared_ptr<ClientLivenessRecord> getClientLiveness()
         const {
+        const auto session = segment_lifetime_.clientSession();
+        if (session || segment_lifetime_.requiresClientSession())
+            return session;
         return std::atomic_load_explicit(&client_liveness_,
                                          std::memory_order_acquire);
     }
@@ -167,7 +196,7 @@ class AllocatedBuffer {
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
 
-    friend class Serializer<AllocatedBuffer>;
+    friend class SegmentPool;
     friend class Replica;
     friend class SegmentAllocatorRegistration;
     friend class AllocationCandidate;

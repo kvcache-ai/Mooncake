@@ -6,6 +6,8 @@
 
 #include "master_metric_manager.h"
 
+#include <glog/logging.h>
+
 #include <utility>
 #include <unordered_set>
 
@@ -16,6 +18,9 @@ SegmentPool::SegmentPool(RegionDriverRegistry region_drivers,
                          const LocalSsdManager* local_ssd)
     : allocation_(policy, ReplicaPlacement::Backend::Memory, local_ssd),
       region_drivers_(std::move(region_drivers)) {
+    if (allocation_.UsesHostAffinity()) {
+        LOG(INFO) << "Local-first allocation strategy enabled";
+    }
     for (const auto& [kind, driver] : region_drivers_) {
         if (auto allocator = driver->GetSharedAllocator()) {
             allocator->AttachUsageTracker(usage_tracker_);
@@ -25,9 +30,15 @@ SegmentPool::SegmentPool(RegionDriverRegistry region_drivers,
 
 tl::expected<std::vector<Replica>, ErrorCode> SegmentPool::AllocateReplicas(
     const ReplicaAllocationRequest& request,
-    PlacementDiagnostics* diagnostics) const {
+    AllocationDiagnostics* diagnostics) const {
     auto access = AcquirePlacementAccess();
-    return allocation_.Allocate(access, request, diagnostics);
+    auto resolved = request;
+    if (request.replicas.count != 1 ||
+        (!allocation_.UsesHostAffinity() &&
+         !request.host_affinity.prefer_alloc_in_same_node)) {
+        resolved.host_affinity = {};
+    }
+    return allocation_.Allocate(access, resolved, diagnostics);
 }
 
 tl::expected<Replica, ErrorCode> SegmentPool::AllocateInSegment(

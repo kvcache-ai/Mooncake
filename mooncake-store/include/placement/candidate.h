@@ -5,6 +5,7 @@
 #include <utility>
 
 #include "allocator.h"
+#include "client_session.h"
 
 namespace mooncake {
 
@@ -28,20 +29,20 @@ class AllocationCandidate {
     // Liveness and buffer identity belong to a mounted region, not its
     // allocator (CXL regions can share one allocator).
     bool IsServing() const {
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
+        const auto session = client_session();
         return allocation_lifetime_.isAvailable() &&
-               (!record || record->IsServing());
+               (session ? session->IsServing()
+                        : !buffer_lifetime_.requiresClientSession());
     }
 
-    void BindClientLiveness(std::shared_ptr<ClientLivenessRecord> record) {
-        std::atomic_store_explicit(&client_liveness_, std::move(record),
-                                   std::memory_order_release);
+    void BindClientSession(ClientSessionPtr session) {
+        buffer_lifetime_.bindClientSession(std::move(session));
+    }
+    ClientSessionPtr client_session() const {
+        return buffer_lifetime_.clientSession();
     }
     void BindBuffer(AllocatedBuffer& buffer) const {
         buffer.bindSegmentLifetime(buffer_lifetime_);
-        buffer.bindClientLiveness(std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire));
     }
     bool OwnsBuffer(const AllocatedBuffer& buffer) const {
         return buffer.segment_lifetime_ == buffer_lifetime_;
@@ -50,13 +51,10 @@ class AllocationCandidate {
         allocation_lifetime_.setAvailable(allocatable);
         buffer_lifetime_.setAvailable(readable);
     }
-    // Allocator replacement keeps the region's identity so recovered buffers
-    // can be rebound after client liveness records are reconstructed.
+    // Allocator replacement preserves both the region identity and its owner.
     void InheritBinding(const AllocationCandidate& previous) {
         allocation_lifetime_ = previous.allocation_lifetime_;
         buffer_lifetime_ = previous.buffer_lifetime_;
-        BindClientLiveness(std::atomic_load_explicit(
-            &previous.client_liveness_, std::memory_order_acquire));
     }
 
     size_t Capacity() const { return allocator_->capacity(); }
@@ -68,24 +66,20 @@ class AllocationCandidate {
     }
 
    protected:
-    explicit AllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator)
-        : allocator_(std::move(allocator)) {}
+    explicit AllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator,
+                                 bool requires_client_session = false)
+        : allocator_(std::move(allocator)),
+          buffer_lifetime_(requires_client_session) {}
 
     BufferAllocatorBase& allocator() const noexcept { return *allocator_; }
 
     std::unique_ptr<AllocatedBuffer> AllocateRegistered(size_t size) const {
         if (!IsServing()) return nullptr;
-        const auto record = std::atomic_load_explicit(
-            &client_liveness_, std::memory_order_acquire);
+        const auto session = client_session();
         auto buffer = allocator().allocate(size);
         if (!buffer) return nullptr;
-        buffer->bindSegmentLifetime(buffer_lifetime_);
-        buffer->bindClientLiveness(record);
-        if (!IsServing() ||
-            record != std::atomic_load_explicit(&client_liveness_,
-                                                std::memory_order_acquire)) {
-            return nullptr;
-        }
+        BindBuffer(*buffer);
+        if (!IsServing() || session != client_session()) return nullptr;
         return buffer;
     }
 
@@ -93,7 +87,6 @@ class AllocationCandidate {
     std::shared_ptr<BufferAllocatorBase> allocator_;
     SegmentLifetime allocation_lifetime_;
     SegmentLifetime buffer_lifetime_;
-    std::shared_ptr<ClientLivenessRecord> client_liveness_;
 };
 
 }  // namespace mooncake

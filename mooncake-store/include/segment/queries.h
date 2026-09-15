@@ -39,6 +39,7 @@ class SegmentQueries {
     ErrorCode GetSegmentOwner(std::string_view name, UUID& owner) const;
     bool HasServingCandidate(std::string_view name) const;
     void GetActiveSegmentNames(std::vector<std::string>& names) const;
+    ErrorCode ValidateTarget(std::string_view target) const;
     ErrorCode ValidateTargets(std::span<const std::string> targets) const;
     ErrorCode ValidateDrain(std::span<const std::string> sources,
                             std::span<const std::string> targets) const;

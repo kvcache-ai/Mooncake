@@ -32,10 +32,9 @@ class SegmentPool final {
 
     tl::expected<std::vector<Replica>, ErrorCode> AllocateReplicas(
         const ReplicaAllocationRequest& request,
-        PlacementDiagnostics* diagnostics = nullptr) const;
+        AllocationDiagnostics* diagnostics = nullptr) const;
     tl::expected<Replica, ErrorCode> AllocateInSegment(std::string_view name,
                                                        size_t size) const;
-    bool UsesHostAffinity() const { return allocation_.UsesHostAffinity(); }
     bool SupportsAllocatorSnapshots() const;
     bool IsAllocationSizeSupported(size_t size) const;
     ~SegmentPool();
@@ -43,12 +42,12 @@ class SegmentPool final {
     tl::expected<RemountRequest, ErrorCode> PlanRemount(
         std::span<const Segment> segments, const UUID& client_id) const;
     tl::expected<PreparedRemount, ErrorCode> PrepareRemount(
-        RemountRequest request, std::shared_ptr<ClientLivenessRecord> liveness);
+        RemountRequest request, ClientSessionPtr liveness);
     std::unordered_set<std::string> InstallRecovery(
         std::unique_ptr<SegmentRecovery> recovery);
     bool RestoreBufferBindings(
-        const std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
-                                 boost::hash<UUID>>& clients,
+        const std::unordered_map<UUID, ClientSessionPtr, boost::hash<UUID>>&
+            clients,
         std::span<AllocatedBuffer* const> buffers);
 
     WriteAccess AcquireWriteAccess();
@@ -60,16 +59,15 @@ class SegmentPool final {
     // lifetime/mutations.
     tl::expected<SegmentPoolSnapshot, ErrorCode> CaptureSnapshot() const;
 
+    // Same fork-child/external-quiescence contract as CaptureSnapshot().
+    tl::expected<BufferSnapshot, ErrorCode> CaptureBufferSnapshot(
+        const AllocatedBuffer& buffer) const;
+
     // Consumes the snapshot, staging all resources before replacing the pool.
     // Preparation failure leaves published state unchanged. Temporary readers
     // may omit capacity accounting.
     tl::expected<void, ErrorCode> RestoreSnapshot(
         SegmentPoolSnapshot snapshot, bool account_capacity_metrics);
-
-    // Allocates one replica under the read lock, with no segment/kind fallback.
-    tl::expected<Replica, ErrorCode> AllocateInSegment(
-        std::string_view segment_name, AllocationCandidateKind kind,
-        size_t size, ReplicaType replica_type = ReplicaType::MEMORY) const;
 
     [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
     [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
@@ -77,6 +75,11 @@ class SegmentPool final {
     }
 
    private:
+    // Allocates one replica under the read lock, with no segment/kind fallback.
+    tl::expected<Replica, ErrorCode> AllocateInSegment(
+        std::string_view segment_name, AllocationCandidateKind kind,
+        size_t size, ReplicaType replica_type = ReplicaType::MEMORY) const;
+
     ScopedPlacementReadAccess AcquirePlacementAccess() const;
     void ReleaseCapacityMetrics();
     void ClearRecovery();
@@ -84,7 +87,7 @@ class SegmentPool final {
                               const UUID& client_id) const;
     friend class PreparedRemount;
     std::unique_ptr<SegmentRecovery> recovery_;
-    friend class Serializer<AllocatedBuffer>;
+    friend class SegmentPoolTestPeer;
 
     RegionDriver* GetDriver(RegionKind kind);
     const RegionDriver* GetDriver(RegionKind kind) const;

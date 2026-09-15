@@ -2,6 +2,8 @@
 // one segment. QPS and latency use separate phases; RPC, metadata, and transfer
 // work are intentionally excluded.
 
+#include "../tests/segment_pool_test_peer.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -305,6 +307,8 @@ class OffsetAllocatorFixture {
 };
 
 class PutAllocationFixture {
+    mooncake::ClientRegistry clients_{false};
+
    public:
     PutAllocationFixture(uint64_t capacity, uint64_t /* unused */)
         : capacity_(capacity), pool_(CreateDrivers()) {
@@ -317,14 +321,16 @@ class PutAllocationFixture {
         segment.protocol = "tcp";
         {
             auto access = pool_.AcquireWriteAccess();
-            auto error = access.MountSegment(segment, generate_uuid());
+            auto error = access.MountSegment(
+                segment, clients_.GetOrCreate(generate_uuid()));
             if (error != ErrorCode::OK) {
                 throw std::runtime_error("failed to mount benchmark segment: " +
                                          mooncake::toString(error));
             }
         }
         buffer_allocator_ = std::dynamic_pointer_cast<OffsetBufferAllocator>(
-            pool_.AcquireReadAccess().GetAllocator(segment.id));
+            mooncake::SegmentPoolTestPeer::GetAllocator(
+                pool_.AcquireReadAccess(), segment.id));
         if (!buffer_allocator_) {
             throw std::runtime_error(
                 "benchmark requires OffsetBufferAllocator");

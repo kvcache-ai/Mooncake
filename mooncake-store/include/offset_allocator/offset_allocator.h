@@ -53,7 +53,7 @@ struct OffsetAllocation {
     bool isNoSpace() const { return offset == NO_SPACE; }
 
     friend class __Allocator;
-    friend class Serializer<OffsetAllocationHandle>;
+    friend class OffsetAllocationHandle;
     friend class OffsetAllocator;  // for createHandleAtNode during recovery
 };
 
@@ -72,6 +72,13 @@ struct OffsetAllocStorageReportFull {
 };
 
 // RAII Handle class for automatic deallocation
+struct OffsetAllocationSnapshot {
+    uint64_t address;
+    uint64_t size;
+    uint32_t offset;
+    uint32_t metadata;
+};
+
 class OffsetAllocationHandle {
    public:
     // Default constructor: creates an invalid (empty) handle
@@ -106,6 +113,11 @@ class OffsetAllocationHandle {
 
     void* ptr() const { return reinterpret_cast<void*>(address()); }
 
+    OffsetAllocationSnapshot CaptureSnapshot() const noexcept {
+        return {real_base, requested_size, m_allocation.offset,
+                m_allocation.metadata};
+    }
+
     // Get size
     uint64_t size() const { return requested_size; }
 
@@ -117,8 +129,8 @@ class OffsetAllocationHandle {
     uint64_t real_base;
     uint64_t requested_size;
 
+    friend class OffsetAllocator;
     friend class OffsetAllocatorTest;  // for unit tests
-    friend class Serializer<OffsetAllocationHandle>;
 };
 
 struct OffsetAllocatorMetrics {
@@ -175,6 +187,11 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     [[nodiscard]] std::optional<OffsetAllocationHandle> createHandleAtNode(
         uint32_t node_index, uint64_t real_offset, uint64_t requested_size);
+
+    // Reconstruct an existing allocation without freeing it on validation
+    // failure.
+    [[nodiscard]] std::optional<OffsetAllocationHandle> RestoreHandle(
+        const OffsetAllocationSnapshot& snapshot);
 
     // Returns the actual region size consumed by allocate(size), or zero when
     // the request cannot be represented by this allocator.

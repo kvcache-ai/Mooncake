@@ -1,3 +1,6 @@
+#include "segment_pool_test_peer.h"
+#include "client_registry.h"
+
 #include "segment/pool.h"
 
 #include <gtest/gtest.h>
@@ -68,7 +71,8 @@ void CommitUnmount(SegmentPool& pool, const Segment& segment,
                    const UUID& client_id) {
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareUnmount(segment.id, client_id);
+        return SegmentPoolTestPeer::PrepareUnmount(access, segment.id,
+                                                   client_id);
     }();
     ASSERT_TRUE(transaction.has_value());
     auto access = pool.AcquireWriteAccess();
@@ -105,26 +109,32 @@ tl::expected<LocalSsdPersistedState, SerializationError> DecodeAndRestore(
 }  // namespace
 
 TEST(SegmentPoolTest, ClassifiesOnlyCxlProtocolAsCxl) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers(true));
     const UUID client = generate_uuid();
     auto host = MakeSegment(0, "host", "rdma");
     auto cxl = MakeSegment(1, "cxl", "cxl");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(host, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(cxl, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(host, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(cxl, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
 
     {
         auto view = pool.AcquireReadAccess();
-        ASSERT_NE(view.Catalog().Find(host.id), nullptr);
-        EXPECT_EQ(view.Catalog().Find(host.id)->kind, RegionKind::HOST_MEMORY);
-        ASSERT_NE(view.Catalog().Find(cxl.id), nullptr);
-        EXPECT_EQ(view.Catalog().Find(cxl.id)->kind, RegionKind::CXL);
-        EXPECT_NE(
-            view.Placement().Find(host.name, AllocationCandidateKind::NATIVE),
-            nullptr);
-        EXPECT_NE(view.Placement().Find(cxl.name, AllocationCandidateKind::CXL),
+        ASSERT_TRUE(view.FindSegment(host.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(view).Find(host.id)->kind,
+                  RegionKind::HOST_MEMORY);
+        ASSERT_TRUE(view.FindSegment(cxl.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(view).Find(cxl.id)->kind,
+                  RegionKind::CXL);
+        EXPECT_NE(SegmentPoolTestPeer::Placement(view).Find(
+                      host.name, AllocationCandidateKind::NATIVE),
+                  nullptr);
+        EXPECT_NE(SegmentPoolTestPeer::Placement(view).Find(
+                      cxl.name, AllocationCandidateKind::CXL),
                   nullptr);
     }
 
@@ -138,18 +148,20 @@ TEST(SegmentPoolTest, PreparedMountPublishesOnlyOnCommit) {
     auto segment = MakeSegment(0, "prepared");
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareMount(segment, client);
+        auto transaction =
+            SegmentPoolTestPeer::PrepareMount(access, segment, client);
         ASSERT_TRUE(transaction.has_value());
     }
-    EXPECT_EQ(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
+    EXPECT_FALSE(pool.AcquireReadAccess().FindSegment(segment.id).has_value());
 
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareMount(segment, client);
+        auto transaction =
+            SegmentPoolTestPeer::PrepareMount(access, segment, client);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(transaction->Commit(access), ErrorCode::OK);
     }
-    EXPECT_NE(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
+    EXPECT_TRUE(pool.AcquireReadAccess().FindSegment(segment.id).has_value());
     CommitUnmount(pool, segment, client);
 }
 
@@ -159,9 +171,11 @@ TEST(SegmentPoolTest, MountCommitRejectsPreparedIdConflicts) {
     auto segment = MakeSegment(0, "prepared-conflict");
     {
         auto access = pool.AcquireWriteAccess();
-        auto first = access.PrepareMount(segment, client);
-        auto duplicate = access.PrepareMount(segment, client);
-        auto conflicting_owner = access.PrepareMount(segment, generate_uuid());
+        auto first = SegmentPoolTestPeer::PrepareMount(access, segment, client);
+        auto duplicate =
+            SegmentPoolTestPeer::PrepareMount(access, segment, client);
+        auto conflicting_owner =
+            SegmentPoolTestPeer::PrepareMount(access, segment, generate_uuid());
         ASSERT_TRUE(first.has_value());
         ASSERT_TRUE(duplicate.has_value());
         ASSERT_TRUE(conflicting_owner.has_value());
@@ -174,51 +188,60 @@ TEST(SegmentPoolTest, MountCommitRejectsPreparedIdConflicts) {
     }
     {
         auto read = pool.AcquireReadAccess();
-        EXPECT_EQ(read.Catalog().Regions().size(), 1U);
-        auto* entry = read.Placement().Find(segment.name,
-                                            AllocationCandidateKind::NATIVE);
+        EXPECT_EQ(read.Segments().size(), 1U);
+        auto* entry = SegmentPoolTestPeer::Placement(read).Find(
+            segment.name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         ASSERT_EQ(entry->candidates.size(), 1U);
         EXPECT_EQ((*entry->candidates.begin())->allocator_handle(),
-                  read.GetAllocator(segment.id));
+                  SegmentPoolTestPeer::GetAllocator(read, segment.id));
     }
     EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, kRegionSize);
-    EXPECT_TRUE(pool.AllocateInSegment(segment.name,
-                                       AllocationCandidateKind::NATIVE, 4096)
+    EXPECT_TRUE(SegmentPoolTestPeer::AllocateInSegment(
+                    pool, segment.name, AllocationCandidateKind::NATIVE, 4096)
                     .has_value());
     CommitUnmount(pool, segment, client);
 }
 
 TEST(SegmentPoolTest, RemountCommitRejectsInterveningStatusChanges) {
+    ClientRegistry clients{false};
     for (auto initial : {SegmentStatus::OK, SegmentStatus::DRAINING}) {
         SegmentPool pool(Drivers());
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "status-conflict");
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-            ASSERT_EQ(access.SetSegmentStatusByName(segment.name, initial),
+            ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                      ErrorCode::OK);
+            ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                          access, segment.name, initial),
                       ErrorCode::OK);
         }
-        auto original = pool.AcquireReadAccess().GetAllocator(segment.id);
+        auto original = SegmentPoolTestPeer::GetAllocator(
+            pool.AcquireReadAccess(), segment.id);
         const auto next = initial == SegmentStatus::OK ? SegmentStatus::DRAINING
                                                        : SegmentStatus::OK;
         {
             auto access = pool.AcquireWriteAccess();
-            auto prepared = access.PrepareMount(segment, client);
+            auto prepared =
+                SegmentPoolTestPeer::PrepareMount(access, segment, client);
             ASSERT_TRUE(prepared.has_value());
-            ASSERT_EQ(access.SetSegmentStatusByName(segment.name, next),
+            ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                          access, segment.name, next),
                       ErrorCode::OK);
             EXPECT_EQ(prepared->Commit(access),
                       ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
         {
             auto read = pool.AcquireReadAccess();
-            EXPECT_EQ(read.GetAllocator(segment.id), original);
-            EXPECT_EQ(read.Catalog().Find(segment.id)->status, next);
+            EXPECT_EQ(SegmentPoolTestPeer::GetAllocator(read, segment.id),
+                      original);
+            EXPECT_EQ(
+                SegmentPoolTestPeer::Catalog(read).Find(segment.id)->status,
+                next);
         }
-        EXPECT_EQ(pool.AllocateInSegment(segment.name,
-                                         AllocationCandidateKind::NATIVE, 4096)
+        EXPECT_EQ(SegmentPoolTestPeer::AllocateInSegment(
+                      pool, segment.name, AllocationCandidateKind::NATIVE, 4096)
                       .has_value(),
                   next == SegmentStatus::OK);
         CommitUnmount(pool, segment, client);
@@ -226,19 +249,23 @@ TEST(SegmentPoolTest, RemountCommitRejectsInterveningStatusChanges) {
 }
 
 TEST(SegmentPoolTest, RemountCommitRejectsReplacedOrRemovedResource) {
+    ClientRegistry clients{false};
     for (bool clear : {false, true}) {
         SegmentPool pool(Drivers());
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "resource-conflict");
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-            auto stale = access.PrepareMount(segment, client);
+            ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                      ErrorCode::OK);
+            auto stale =
+                SegmentPoolTestPeer::PrepareMount(access, segment, client);
             ASSERT_TRUE(stale.has_value());
             if (clear) {
                 access.Clear();
             } else {
-                auto replacement = access.PrepareMount(segment, client);
+                auto replacement =
+                    SegmentPoolTestPeer::PrepareMount(access, segment, client);
                 ASSERT_TRUE(replacement.has_value());
                 ASSERT_EQ(replacement->Commit(access), ErrorCode::OK);
             }
@@ -247,8 +274,8 @@ TEST(SegmentPoolTest, RemountCommitRejectsReplacedOrRemovedResource) {
         }
         EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes,
                   clear ? 0U : kRegionSize);
-        EXPECT_EQ(pool.AllocateInSegment(segment.name,
-                                         AllocationCandidateKind::NATIVE, 4096)
+        EXPECT_EQ(SegmentPoolTestPeer::AllocateInSegment(
+                      pool, segment.name, AllocationCandidateKind::NATIVE, 4096)
                       .has_value(),
                   !clear);
         if (!clear) {
@@ -266,7 +293,8 @@ TEST(SegmentPoolTest, RestoreReturnsImportedBuffersInInputOrder) {
         {4096, segment.base, "tcp", segment.te_endpoint}};
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareRestore(segment, client, descriptors);
+        auto transaction = SegmentPoolTestPeer::PrepareRestore(
+            access, segment, client, descriptors);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(transaction->imported_buffers().size(), 2U);
         EXPECT_EQ(transaction->imported_requested_bytes(), 8192U);
@@ -284,73 +312,80 @@ TEST(SegmentPoolTest, RestoreReturnsImportedBuffersInInputOrder) {
 }
 
 TEST(SegmentPoolTest, RollbackRestoresOriginalLifecycleState) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "draining", "tcp", "host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-        ASSERT_EQ(access.SetSegmentStatusByName(segment.name,
-                                                SegmentStatus::DRAINING),
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
                   ErrorCode::OK);
-        auto transaction = access.PrepareUnmount(segment.id, client);
+        ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                      access, segment.name, SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+        auto transaction =
+            SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(std::move(*transaction).Rollback(access), ErrorCode::OK);
-        ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
-        EXPECT_EQ(access.Catalog().Find(segment.id)->status,
+        ASSERT_TRUE(access.FindSegment(segment.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(access).Find(segment.id)->status,
                   SegmentStatus::DRAINING);
     }
 
     {
         auto view = pool.AcquireReadAccess();
-        ASSERT_NE(view.Catalog().Find(segment.id), nullptr);
-        EXPECT_EQ(view.Catalog().Find(segment.id)->status,
+        ASSERT_TRUE(view.FindSegment(segment.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(view).Find(segment.id)->status,
                   SegmentStatus::DRAINING);
-        EXPECT_TRUE(ActiveRegionsByHost(view.Catalog()).empty());
-        EXPECT_EQ(view.Placement().Find(segment.name,
-                                        AllocationCandidateKind::NATIVE),
+        EXPECT_TRUE(
+            ActiveRegionsByHost(SegmentPoolTestPeer::Catalog(view)).empty());
+        EXPECT_EQ(SegmentPoolTestPeer::Placement(view).Find(
+                      segment.name, AllocationCandidateKind::NATIVE),
                   nullptr);
     }
 
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(
-            access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
-            ErrorCode::OK);
+        ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                      access, segment.name, SegmentStatus::OK),
+                  ErrorCode::OK);
     }
     CommitUnmount(pool, segment, client);
 }
 
 TEST(SegmentPoolTest, ImmediateUnmountRollbackRestoresPlacement) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "rollback", "tcp", "host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareUnmount(segment.id, client);
+        return SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
     }();
     ASSERT_TRUE(transaction.has_value());
     {
         auto access = pool.AcquireWriteAccess();
-        EXPECT_TRUE(ActiveRegionsByHost(access.Catalog()).empty());
+        EXPECT_TRUE(
+            ActiveRegionsByHost(SegmentPoolTestPeer::Catalog(access)).empty());
         ASSERT_EQ(std::move(*transaction).Rollback(access), ErrorCode::OK);
         EXPECT_EQ(std::move(*transaction).Rollback(access),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         EXPECT_EQ(std::move(*transaction).Commit(access),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        EXPECT_TRUE(ActiveRegionsByHost(access.Catalog())
+        EXPECT_TRUE(ActiveRegionsByHost(SegmentPoolTestPeer::Catalog(access))
                         .at("host")
                         .at(segment.name)
                         .contains(segment.id));
     }
     {
         auto view = pool.AcquireReadAccess();
-        EXPECT_NE(view.Placement().Find(segment.name,
-                                        AllocationCandidateKind::NATIVE),
+        EXPECT_NE(SegmentPoolTestPeer::Placement(view).Find(
+                      segment.name, AllocationCandidateKind::NATIVE),
                   nullptr);
     }
     CommitUnmount(pool, segment, client);
@@ -358,17 +393,20 @@ TEST(SegmentPoolTest, ImmediateUnmountRollbackRestoresPlacement) {
 
 TEST(SegmentPoolTest,
      UnmountMoveTransfersOwnershipAndFailureConsumesTransaction) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "consume-unmount");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-    auto prepared = access.PrepareUnmount(segment.id, client);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
+    auto prepared =
+        SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
     ASSERT_TRUE(prepared.has_value());
     auto transaction = std::move(*prepared);
     EXPECT_EQ(std::move(*prepared).Commit(access),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    EXPECT_EQ(access.Catalog().Find(segment.id)->status,
+    EXPECT_EQ(SegmentPoolTestPeer::Catalog(access).Find(segment.id)->status,
               SegmentStatus::UNMOUNTING);
     access.Clear();
     EXPECT_EQ(std::move(transaction).Rollback(access),
@@ -378,13 +416,16 @@ TEST(SegmentPoolTest,
 }
 
 TEST(SegmentPoolTest, UnmountTryCommitPreservesTokenAfterFailure) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     SegmentPool empty_pool(Drivers());
     const UUID client = generate_uuid();
     const auto segment = MakeSegment(0, "retry-unmount");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-    auto transaction = access.PrepareUnmount(segment.id, client);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
+    auto transaction =
+        SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
     ASSERT_TRUE(transaction);
     {
         auto missing_access = empty_pool.AcquireWriteAccess();
@@ -392,7 +433,7 @@ TEST(SegmentPoolTest, UnmountTryCommitPreservesTokenAfterFailure) {
                   ErrorCode::SEGMENT_NOT_FOUND);
     }
     EXPECT_EQ(transaction->TryCommit(access), ErrorCode::OK);
-    EXPECT_EQ(access.Catalog().Find(segment.id), nullptr);
+    EXPECT_FALSE(access.FindSegment(segment.id).has_value());
     EXPECT_EQ(transaction->TryCommit(access),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
@@ -409,7 +450,8 @@ TEST(SegmentPoolTest, AllocationKeepsReadLockAcrossAllocatorCall) {
             MountedRegion mounted{segment, client, SegmentStatus::OK,
                                   RegionKind::HOST_MEMORY};
             auto access = pool.AcquireWriteAccess();
-            auto transaction = access.PrepareAdopt(mounted, allocator, true);
+            auto transaction = SegmentPoolTestPeer::PrepareAdopt(
+                access, mounted, allocator, true);
             ASSERT_TRUE(transaction.has_value());
             ASSERT_EQ(transaction->Commit(access), ErrorCode::OK);
         }
@@ -418,9 +460,9 @@ TEST(SegmentPoolTest, AllocationKeepsReadLockAcrossAllocatorCall) {
         auto started = allocator->AllocationStarted();
         auto allocation = std::async(std::launch::async, [&] {
             if (named) {
-                return pool
-                    .AllocateInSegment(segment.name,
-                                       AllocationCandidateKind::NATIVE, 4096)
+                return SegmentPoolTestPeer::AllocateInSegment(
+                           pool, segment.name, AllocationCandidateKind::NATIVE,
+                           4096)
                     .has_value();
             }
             ReplicaAllocationRequest request;
@@ -445,14 +487,17 @@ TEST(SegmentPoolTest, AllocationKeepsReadLockAcrossAllocatorCall) {
 }
 
 TEST(SegmentPoolTest, LocalPlacementUsesMountedHostIdentity) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers(), PlacementPolicyType::LOCAL_FIRST);
     const UUID client = generate_uuid();
     auto local = MakeSegment(0, "local", "tcp", "writer");
     auto remote = MakeSegment(1, "remote", "tcp", "other-host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(local, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(remote, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(local, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(remote, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
     ReplicaAllocationRequest request;
     request.replicas.size = 4096;
@@ -463,21 +508,68 @@ TEST(SegmentPoolTest, LocalPlacementUsesMountedHostIdentity) {
     EXPECT_EQ(ReplicaEndpoint(result->front()), local.te_endpoint);
 }
 
+TEST(SegmentPoolTest, HostPreferenceIsResolvedInsidePool) {
+    ClientRegistry clients{false};
+    for (const bool prefer_same_node : {false, true}) {
+        for (const size_t replica_count : {1U, 2U}) {
+            SCOPED_TRACE(prefer_same_node);
+            SCOPED_TRACE(replica_count);
+            SegmentPool pool(Drivers(), PlacementPolicyType::FREE_RATIO_FIRST);
+            const UUID client = generate_uuid();
+            auto local = MakeSegment(0, "local", "tcp", "writer");
+            auto remote = MakeSegment(1, "remote", "tcp", "other-host");
+            auto remote2 = MakeSegment(2, "remote2", "tcp", "other-host2");
+            {
+                auto access = pool.AcquireWriteAccess();
+                ASSERT_EQ(
+                    access.MountSegment(local, clients.GetOrCreate(client)),
+                    ErrorCode::OK);
+                ASSERT_EQ(
+                    access.MountSegment(remote, clients.GetOrCreate(client)),
+                    ErrorCode::OK);
+                ASSERT_EQ(
+                    access.MountSegment(remote2, clients.GetOrCreate(client)),
+                    ErrorCode::OK);
+            }
+            // Make local less attractive to FREE_RATIO_FIRST without filling
+            // it.
+            auto occupied = pool.AllocateInSegment(local.name, kRegionSize / 2);
+            ASSERT_TRUE(occupied);
+            ReplicaAllocationRequest request;
+            request.replicas = {4096, replica_count, ReplicaType::MEMORY};
+            request.host_affinity = {"writer", "key", prefer_same_node};
+            auto result = pool.AllocateReplicas(request);
+            ASSERT_TRUE(result);
+            ASSERT_EQ(result->size(), replica_count);
+            for (const auto& replica : *result) {
+                if (prefer_same_node && replica_count == 1) {
+                    EXPECT_EQ(ReplicaEndpoint(replica), local.te_endpoint);
+                } else {
+                    EXPECT_NE(ReplicaEndpoint(replica), local.te_endpoint);
+                }
+            }
+        }
+    }
+}
+
 TEST(SegmentPoolTest, SameNameKindsRemainIndependentAcrossUnmountRollback) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers(true));
     const UUID client = generate_uuid();
     auto native = MakeSegment(0, "shared", "tcp", "host");
     auto cxl = MakeSegment(1, "shared", "cxl", "host");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(native, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(cxl, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(native, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(cxl, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
     {
-        auto native_replica = pool.AllocateInSegment(
-            "shared", AllocationCandidateKind::NATIVE, 4096);
-        auto cxl_replica = pool.AllocateInSegment(
-            "shared", AllocationCandidateKind::CXL, 4096);
+        auto native_replica = SegmentPoolTestPeer::AllocateInSegment(
+            pool, "shared", AllocationCandidateKind::NATIVE, 4096);
+        auto cxl_replica = SegmentPoolTestPeer::AllocateInSegment(
+            pool, "shared", AllocationCandidateKind::CXL, 4096);
         ASSERT_TRUE(native_replica.has_value());
         ASSERT_TRUE(cxl_replica.has_value());
         EXPECT_EQ(ReplicaEndpoint(*native_replica), native.te_endpoint);
@@ -485,74 +577,77 @@ TEST(SegmentPoolTest, SameNameKindsRemainIndependentAcrossUnmountRollback) {
     }
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareUnmount(cxl.id, client);
+        return SegmentPoolTestPeer::PrepareUnmount(access, cxl.id, client);
     }();
     ASSERT_TRUE(transaction.has_value());
-    EXPECT_TRUE(
-        pool.AllocateInSegment("shared", AllocationCandidateKind::NATIVE, 4096)
-            .has_value());
-    EXPECT_FALSE(
-        pool.AllocateInSegment("shared", AllocationCandidateKind::CXL, 4096)
-            .has_value());
+    EXPECT_TRUE(SegmentPoolTestPeer::AllocateInSegment(
+                    pool, "shared", AllocationCandidateKind::NATIVE, 4096)
+                    .has_value());
+    EXPECT_FALSE(SegmentPoolTestPeer::AllocateInSegment(
+                     pool, "shared", AllocationCandidateKind::CXL, 4096)
+                     .has_value());
     {
         auto access = pool.AcquireReadAccess();
         size_t used = 0;
         size_t capacity = 0;
-        EXPECT_EQ(
-            access.QueryAllocationCandidates(
-                "shared", AllocationCandidateKind::NATIVE, used, capacity),
-            ErrorCode::OK);
+        EXPECT_EQ(access.QueryCapacity("shared", used, capacity),
+                  ErrorCode::OK);
         EXPECT_EQ(capacity, kRegionSize);
-        EXPECT_EQ(access.QueryAllocationCandidates(
-                      "shared", AllocationCandidateKind::CXL, used, capacity),
-                  ErrorCode::SEGMENT_NOT_FOUND);
     }
     {
         auto access = pool.AcquireWriteAccess();
         ASSERT_EQ(std::move(*transaction).Rollback(access), ErrorCode::OK);
     }
-    EXPECT_TRUE(
-        pool.AllocateInSegment("shared", AllocationCandidateKind::CXL, 4096)
-            .has_value());
+    EXPECT_TRUE(SegmentPoolTestPeer::AllocateInSegment(
+                    pool, "shared", AllocationCandidateKind::CXL, 4096)
+                    .has_value());
     CommitUnmount(pool, cxl, client);
-    EXPECT_TRUE(
-        pool.AllocateInSegment("shared", AllocationCandidateKind::NATIVE, 4096)
-            .has_value());
+    EXPECT_TRUE(SegmentPoolTestPeer::AllocateInSegment(
+                    pool, "shared", AllocationCandidateKind::NATIVE, 4096)
+                    .has_value());
     CommitUnmount(pool, native, client);
 }
 
 TEST(SegmentPoolTest,
      FailedRestoreKeepsExistingRegionAndRequiresCanonicalEndpoint) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "restore-validation");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
-    auto original = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto original =
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
     std::vector<AllocatedBuffer::Descriptor> descriptors{
         {4096, segment.base, "tcp", segment.name}};
     {
         auto access = pool.AcquireWriteAccess();
-        auto alias = access.PrepareRestore(segment, client, descriptors);
+        auto alias = SegmentPoolTestPeer::PrepareRestore(access, segment,
+                                                         client, descriptors);
         ASSERT_FALSE(alias.has_value());
         EXPECT_EQ(alias.error(), ErrorCode::INVALID_PARAMS);
         descriptors[0].transport_endpoint_ = segment.te_endpoint;
         descriptors.push_back(descriptors[0]);
-        auto overlap = access.PrepareRestore(segment, client, descriptors);
+        auto overlap = SegmentPoolTestPeer::PrepareRestore(access, segment,
+                                                           client, descriptors);
         ASSERT_FALSE(overlap.has_value());
         EXPECT_EQ(overlap.error(), ErrorCode::INVALID_PARAMS);
     }
-    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), original);
-    EXPECT_TRUE(pool.AllocateInSegment(segment.name,
-                                       AllocationCandidateKind::NATIVE, 4096)
+    EXPECT_EQ(
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id),
+        original);
+    EXPECT_TRUE(SegmentPoolTestPeer::AllocateInSegment(
+                    pool, segment.name, AllocationCandidateKind::NATIVE, 4096)
                     .has_value());
     CommitUnmount(pool, segment, client);
 }
 
 TEST(SegmentPoolTest,
      RemountReplacesPublishedCandidateWithoutDuplicatingCapacity) {
+    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     const auto capacity_before = metrics.get_total_mem_capacity();
     SegmentPool pool(Drivers());
@@ -560,23 +655,24 @@ TEST(SegmentPoolTest,
     auto segment = MakeSegment(0, "remount");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
     EXPECT_EQ(metrics.get_total_mem_capacity(), capacity_before + kRegionSize);
-    auto old_allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto old_allocator =
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareMount(segment, client);
+        auto transaction =
+            SegmentPoolTestPeer::PrepareMount(access, segment, client);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(transaction->Commit(access), ErrorCode::OK);
     }
     {
         auto access = pool.AcquireReadAccess();
-        EXPECT_NE(access.GetAllocator(segment.id), old_allocator);
-        EXPECT_TRUE(access.IsInactive(old_allocator, segment.name));
-        EXPECT_FALSE(
-            access.IsInactive(access.GetAllocator(segment.id), segment.name));
-        const auto* entry = access.Placement().Find(
+        EXPECT_NE(SegmentPoolTestPeer::GetAllocator(access, segment.id),
+                  old_allocator);
+        const auto* entry = SegmentPoolTestPeer::Placement(access).Find(
             segment.name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         EXPECT_EQ(entry->candidates.size(), 1U);
@@ -585,39 +681,43 @@ TEST(SegmentPoolTest,
     EXPECT_EQ(pool.GetMemoryUsageSnapshot().capacity_bytes, kRegionSize);
     old_allocator.reset();
     EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, kRegionSize);
-    EXPECT_TRUE(pool.AllocateInSegment(segment.name,
-                                       AllocationCandidateKind::NATIVE, 4096)
+    EXPECT_TRUE(SegmentPoolTestPeer::AllocateInSegment(
+                    pool, segment.name, AllocationCandidateKind::NATIVE, 4096)
                     .has_value());
     CommitUnmount(pool, segment, client);
     EXPECT_EQ(metrics.get_total_mem_capacity(), capacity_before);
 }
 
 TEST(SegmentPoolTest, GracefulUnmountRetainsResourceUntilFinalization) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
-    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto allocator =
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
     auto buffer = allocator->allocate(4096);
     ASSERT_NE(buffer, nullptr);
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareGracefulUnmount(segment.id, client);
+        return SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id,
+                                                           client);
     }();
     ASSERT_TRUE(transaction.has_value());
     {
         auto access = pool.AcquireReadAccess();
-        EXPECT_FALSE(access.IsInactive(allocator, segment.name));
-        EXPECT_EQ(access.GetAllocator(segment.id), allocator);
-        EXPECT_EQ(access.Placement().Find(segment.name,
-                                          AllocationCandidateKind::NATIVE),
+        EXPECT_EQ(SegmentPoolTestPeer::GetAllocator(access, segment.id),
+                  allocator);
+        EXPECT_EQ(SegmentPoolTestPeer::Placement(access).Find(
+                      segment.name, AllocationCandidateKind::NATIVE),
                   nullptr);
     }
-    auto named = pool.AllocateInSegment(segment.name,
-                                        AllocationCandidateKind::NATIVE, 4096);
+    auto named = SegmentPoolTestPeer::AllocateInSegment(
+        pool, segment.name, AllocationCandidateKind::NATIVE, 4096);
     ASSERT_FALSE(named.has_value());
     EXPECT_EQ(named.error(), ErrorCode::SEGMENT_NOT_FOUND);
     ReplicaAllocationRequest request;
@@ -638,31 +738,35 @@ TEST(SegmentPoolTest, GracefulUnmountRetainsResourceUntilFinalization) {
 }
 
 TEST(SegmentPoolTest, GracefulUnmountCanResumeAndConsumesMovedTransaction) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-resume");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-        auto wrong_client =
-            access.PrepareGracefulUnmount(segment.id, generate_uuid());
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        auto wrong_client = SegmentPoolTestPeer::PrepareGracefulUnmount(
+            access, segment.id, generate_uuid());
         ASSERT_FALSE(wrong_client.has_value());
         EXPECT_EQ(wrong_client.error(), ErrorCode::INVALID_PARAMS);
-        auto abandoned = access.PrepareGracefulUnmount(segment.id, client);
+        auto abandoned = SegmentPoolTestPeer::PrepareGracefulUnmount(
+            access, segment.id, client);
         ASSERT_TRUE(abandoned.has_value());
     }
     {
         auto access = pool.AcquireReadAccess();
-        ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
-        EXPECT_EQ(access.Catalog().Find(segment.id)->status,
+        ASSERT_TRUE(access.FindSegment(segment.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(access).Find(segment.id)->status,
                   SegmentStatus::GRACEFULLY_UNMOUNTING);
-        EXPECT_EQ(access.Placement().Find(segment.name,
-                                          AllocationCandidateKind::NATIVE),
+        EXPECT_EQ(SegmentPoolTestPeer::Placement(access).Find(
+                      segment.name, AllocationCandidateKind::NATIVE),
                   nullptr);
     }
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareGracefulUnmount(segment.id, client);
+        return SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id,
+                                                           client);
     }();
     ASSERT_TRUE(transaction.has_value());
     auto moved = std::move(*transaction);
@@ -670,138 +774,170 @@ TEST(SegmentPoolTest, GracefulUnmountCanResumeAndConsumesMovedTransaction) {
         auto access = pool.AcquireWriteAccess();
         EXPECT_EQ(std::move(*transaction).Finalize(access),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        EXPECT_NE(access.Catalog().Find(segment.id), nullptr);
+        EXPECT_TRUE(access.FindSegment(segment.id).has_value());
         EXPECT_EQ(std::move(moved).Finalize(access), ErrorCode::OK);
         EXPECT_EQ(std::move(moved).Finalize(access),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        EXPECT_EQ(access.Catalog().Find(segment.id), nullptr);
+        EXPECT_FALSE(access.FindSegment(segment.id).has_value());
     }
 }
 
 TEST(SegmentPoolTest, StaleGracefulUnmountCannotFinalizeNewMount) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-remount");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-    auto stale = access.PrepareGracefulUnmount(segment.id, client);
-    auto resumed = access.PrepareGracefulUnmount(segment.id, client);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
+    auto stale =
+        SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id, client);
+    auto resumed =
+        SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id, client);
     ASSERT_TRUE(stale.has_value());
     ASSERT_TRUE(resumed.has_value());
     ASSERT_EQ(std::move(*resumed).Finalize(access), ErrorCode::OK);
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-    auto current = access.PrepareGracefulUnmount(segment.id, client);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
+    auto current =
+        SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id, client);
     ASSERT_TRUE(current.has_value());
     EXPECT_EQ(std::move(*stale).Finalize(access),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
+    ASSERT_TRUE(access.FindSegment(segment.id).has_value());
     EXPECT_EQ(std::move(*current).Finalize(access), ErrorCode::OK);
 }
 
 TEST(SegmentPoolTest, UnmountCannotEraseRegionOwnedByAnotherClient) {
+    ClientRegistry clients{false};
     for (bool graceful : {false, true}) {
         SegmentPool pool(Drivers());
         const UUID client = generate_uuid();
         const UUID new_client = generate_uuid();
         auto segment = MakeSegment(0, "unmount-new-owner");
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
         auto remount = [&] {
             access.Clear();
-            ASSERT_EQ(access.MountSegment(segment, new_client), ErrorCode::OK);
+            ASSERT_EQ(
+                access.MountSegment(segment, clients.GetOrCreate(new_client)),
+                ErrorCode::OK);
         };
         if (graceful) {
-            auto stale = access.PrepareGracefulUnmount(segment.id, client);
+            auto stale = SegmentPoolTestPeer::PrepareGracefulUnmount(
+                access, segment.id, client);
             ASSERT_TRUE(stale.has_value());
             remount();
             EXPECT_EQ(std::move(*stale).Finalize(access),
                       ErrorCode::INVALID_PARAMS);
         } else {
-            auto stale = access.PrepareUnmount(segment.id, client);
+            auto stale =
+                SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
             ASSERT_TRUE(stale.has_value());
             remount();
             EXPECT_EQ(std::move(*stale).Commit(access),
                       ErrorCode::INVALID_PARAMS);
         }
-        const auto* mounted = access.Catalog().Find(segment.id);
-        ASSERT_NE(mounted, nullptr);
+        const auto mounted = access.FindSegment(segment.id);
+        ASSERT_TRUE(mounted.has_value());
         EXPECT_EQ(mounted->client_id, new_client);
         EXPECT_EQ(mounted->status, SegmentStatus::OK);
-        auto current = access.PrepareUnmount(segment.id, new_client);
+        auto current =
+            SegmentPoolTestPeer::PrepareUnmount(access, segment.id, new_client);
         ASSERT_TRUE(current.has_value());
         EXPECT_EQ(std::move(*current).Commit(access), ErrorCode::OK);
     }
 }
 
 TEST(SegmentPoolTest, GracefulUnmountCannotFinalizeUnexpectedStatus) {
+    ClientRegistry clients{false};
     for (auto status : {SegmentStatus::OK, SegmentStatus::DRAINING}) {
         SegmentPool pool(Drivers());
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "graceful-status-changed");
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-        auto transaction = access.PrepareGracefulUnmount(segment.id, client);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        auto transaction = SegmentPoolTestPeer::PrepareGracefulUnmount(
+            access, segment.id, client);
         ASSERT_TRUE(transaction.has_value());
-        ASSERT_EQ(access.SetSegmentStatusByName(segment.name, status),
+        ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                      access, segment.name, status),
                   ErrorCode::OK);
         EXPECT_EQ(std::move(*transaction).Finalize(access),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
-        EXPECT_EQ(access.Catalog().Find(segment.id)->status, status);
-        auto current = access.PrepareUnmount(segment.id, client);
+        ASSERT_TRUE(access.FindSegment(segment.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(access).Find(segment.id)->status,
+                  status);
+        auto current =
+            SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
         ASSERT_TRUE(current.has_value());
         EXPECT_EQ(std::move(*current).Commit(access), ErrorCode::OK);
     }
 }
 
 TEST(SegmentPoolTest, StaleGracefulUnmountCannotFinalizeNewDrain) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-new-drain");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-    auto stale = access.PrepareGracefulUnmount(segment.id, client);
-    ASSERT_TRUE(stale.has_value());
-    ASSERT_EQ(access.SetSegmentStatusByName(segment.name, SegmentStatus::OK),
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
               ErrorCode::OK);
-    auto current = access.PrepareGracefulUnmount(segment.id, client);
+    auto stale =
+        SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id, client);
+    ASSERT_TRUE(stale.has_value());
+    ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(access, segment.name,
+                                                          SegmentStatus::OK),
+              ErrorCode::OK);
+    auto current =
+        SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id, client);
     ASSERT_TRUE(current.has_value());
     EXPECT_EQ(std::move(*stale).Finalize(access),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-    ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
+    ASSERT_TRUE(access.FindSegment(segment.id).has_value());
     EXPECT_EQ(std::move(*current).Finalize(access), ErrorCode::OK);
 }
 
 TEST(SegmentPoolTest, StaleUnmountCannotModifyRegionAfterClear) {
+    ClientRegistry clients{false};
     for (bool rollback : {false, true}) {
         SegmentPool pool(Drivers());
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "unmount-clear");
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-        auto stale = access.PrepareUnmount(segment.id, client);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        auto stale =
+            SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
         ASSERT_TRUE(stale.has_value());
         access.Clear();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-        auto current = access.PrepareUnmount(segment.id, client);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        auto current =
+            SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
         ASSERT_TRUE(current.has_value());
         EXPECT_EQ(rollback ? std::move(*stale).Rollback(access)
                            : std::move(*stale).Commit(access),
                   ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
-        ASSERT_NE(access.Catalog().Find(segment.id), nullptr);
-        EXPECT_EQ(access.Catalog().Find(segment.id)->status,
+        ASSERT_TRUE(access.FindSegment(segment.id).has_value());
+        EXPECT_EQ(SegmentPoolTestPeer::Catalog(access).Find(segment.id)->status,
                   SegmentStatus::UNMOUNTING);
         EXPECT_EQ(std::move(*current).Rollback(access), ErrorCode::OK);
     }
 }
 
 TEST(SegmentPoolTest, GracefulUnmountFailureConsumesTransaction) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "graceful-removed");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
-    auto transaction = access.PrepareGracefulUnmount(segment.id, client);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
+    auto transaction =
+        SegmentPoolTestPeer::PrepareGracefulUnmount(access, segment.id, client);
     ASSERT_TRUE(transaction.has_value());
     access.Clear();
     EXPECT_EQ(std::move(*transaction).Finalize(access),
@@ -811,45 +947,47 @@ TEST(SegmentPoolTest, GracefulUnmountFailureConsumesTransaction) {
 }
 
 TEST(SegmentPoolTest, RemovedCxlBindingIsInactiveWhileSiblingRemainsReadable) {
-    SegmentPool pool(Drivers(true));
+    ClientRegistry clients{false};
+    SegmentPool pool(Drivers(true), PlacementPolicyType::CXL);
     const UUID client = generate_uuid();
     auto first = MakeSegment(0, "first-binding", "cxl");
     auto second = MakeSegment(1, "second-binding", "cxl");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(first, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(second, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
-    auto allocator = pool.AcquireReadAccess().GetAllocator(first.id);
-    auto transaction = [&] {
-        auto access = pool.AcquireWriteAccess();
-        return access.PrepareUnmount(first.id, client);
-    }();
-    ASSERT_TRUE(transaction.has_value());
-    EXPECT_TRUE(pool.AcquireReadAccess().IsInactive(allocator, first.name));
+    auto first_replica = pool.AllocateInSegment(first.name, 4096);
+    auto second_replica = pool.AllocateInSegment(second.name, 4096);
+    ASSERT_TRUE(first_replica);
+    ASSERT_TRUE(second_replica);
+    auto operation = pool.AcquireWriteAccess().BeginUnmount(first.id, client);
+    ASSERT_TRUE(operation);
+    EXPECT_TRUE(first_replica->has_invalid_mem_handle());
+    EXPECT_FALSE(second_replica->has_invalid_mem_handle());
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(std::move(*transaction).Commit(access), ErrorCode::OK);
+        ASSERT_EQ(access.ReleaseUnmountedResources(operation->id),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.AcknowledgeUnmount(operation->id), ErrorCode::OK);
+        ASSERT_EQ(access.StartGracefulUnmount(second.id, client),
+                  ErrorCode::OK);
     }
-    {
-        auto access = pool.AcquireReadAccess();
-        EXPECT_TRUE(access.IsInactive(allocator, first.name));
-        EXPECT_FALSE(access.IsInactive(allocator, second.name));
-    }
-    auto graceful = [&] {
-        auto access = pool.AcquireWriteAccess();
-        return access.PrepareGracefulUnmount(second.id, client);
-    }();
-    ASSERT_TRUE(graceful.has_value());
-    EXPECT_FALSE(pool.AcquireReadAccess().IsInactive(allocator, second.name));
-    {
-        auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(std::move(*graceful).Finalize(access), ErrorCode::OK);
-    }
-    EXPECT_TRUE(pool.AcquireReadAccess().IsInactive(allocator, second.name));
+    EXPECT_TRUE(first_replica->has_invalid_mem_handle());
+    EXPECT_FALSE(second_replica->has_invalid_mem_handle());
+    EXPECT_FALSE(pool.AllocateInSegment(second.name, 4096));
+    operation = pool.AcquireWriteAccess().BeginUnmount(second.id, client);
+    ASSERT_TRUE(operation);
+    EXPECT_TRUE(second_replica->has_invalid_mem_handle());
+    auto access = pool.AcquireWriteAccess();
+    ASSERT_EQ(access.ReleaseUnmountedResources(operation->id), ErrorCode::OK);
+    ASSERT_EQ(access.AcknowledgeUnmount(operation->id), ErrorCode::OK);
 }
 
 TEST(SegmentPoolTest, CxlBindingsShareUsageAndDriverCapacityLifetime) {
+    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     const auto before = metrics.get_total_mem_capacity();
     {
@@ -861,8 +999,10 @@ TEST(SegmentPoolTest, CxlBindingsShareUsageAndDriverCapacityLifetime) {
         EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, kRegionSize);
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
-            ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(first, clients.GetOrCreate(client)),
+                      ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(second, clients.GetOrCreate(client)),
+                      ErrorCode::OK);
         }
         EXPECT_EQ(pool.GetMemoryUsageSnapshot().capacity_bytes, kRegionSize);
         EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, kRegionSize);
@@ -947,6 +1087,7 @@ TEST(RegionCatalogTest, StatusChangesPreserveIdentityAndOwnership) {
 }
 
 TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto a1 = MakeSegment(0, "a", "tcp", "host-b");
@@ -957,7 +1098,8 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
     {
         auto access = pool.AcquireWriteAccess();
         for (const auto& segment : {a1, a2, a3, b, c}) {
-            ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                      ErrorCode::OK);
         }
     }
     std::string key;
@@ -965,7 +1107,7 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
     auto names = [&] {
         auto access = pool.AcquireReadAccess();
         std::vector<std::string> result;
-        access.Placement().VisitHostOrderedSegmentNames(
+        SegmentPoolTestPeer::Placement(access).VisitHostOrderedSegmentNames(
             "host-b", key, [&](auto name) {
                 result.emplace_back(name);
                 return false;
@@ -975,20 +1117,22 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
     EXPECT_EQ(names(), (std::vector<std::string>{"a", "b", "c"}));
     for (const auto& segment : {a1, a2, a3}) {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareUnmount(segment.id, client);
+        auto transaction =
+            SegmentPoolTestPeer::PrepareUnmount(access, segment.id, client);
         ASSERT_TRUE(transaction.has_value());
         ASSERT_EQ(std::move(*transaction).Commit(access), ErrorCode::OK);
     }
     EXPECT_EQ(names(), (std::vector<std::string>{"b", "c"}));
     auto graceful = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareGracefulUnmount(b.id, client);
+        return SegmentPoolTestPeer::PrepareGracefulUnmount(access, b.id,
+                                                           client);
     }();
     ASSERT_TRUE(graceful.has_value());
     EXPECT_EQ(names(), (std::vector<std::string>{"c"}));
     auto unmount = [&] {
         auto access = pool.AcquireWriteAccess();
-        return access.PrepareUnmount(c.id, client);
+        return SegmentPoolTestPeer::PrepareUnmount(access, c.id, client);
     }();
     ASSERT_TRUE(unmount.has_value());
     EXPECT_TRUE(names().empty());
@@ -996,15 +1140,17 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
         auto access = pool.AcquireWriteAccess();
         ASSERT_EQ(std::move(*unmount).Rollback(access), ErrorCode::OK);
         ASSERT_EQ(std::move(*graceful).Finalize(access), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
-        auto replacement = access.PrepareMount(c, client);
+        ASSERT_EQ(access.MountSegment(b, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        auto replacement = SegmentPoolTestPeer::PrepareMount(access, c, client);
         ASSERT_TRUE(replacement.has_value());
         ASSERT_EQ(replacement->Commit(access), ErrorCode::OK);
     }
     EXPECT_EQ(names(), (std::vector<std::string>{"b", "c"}));
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.SetSegmentStatusByName("b", SegmentStatus::DRAINING),
+        ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                      access, "b", SegmentStatus::DRAINING),
                   ErrorCode::OK);
     }
     EXPECT_EQ(names(), (std::vector<std::string>{"c"}));
@@ -1013,7 +1159,8 @@ TEST(SegmentPoolTest, HostPlacementTracksLastMemberAndLifecycle) {
     {
         auto access = pool.AcquireWriteAccess();
         access.Clear();
-        ASSERT_EQ(access.MountSegment(b, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(b, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
     EXPECT_EQ(names(), (std::vector<std::string>{"b"}));
 }
@@ -1026,17 +1173,17 @@ TEST(SegmentPoolTest, AbandonedAdoptionDoesNotRegisterUsage) {
         segment.name, segment.te_endpoint, kRegionSize, segment.base);
     {
         auto access = pool.AcquireWriteAccess();
-        auto transaction = access.PrepareAdopt(
-            {segment, client, SegmentStatus::OK}, allocator, true);
+        auto transaction = SegmentPoolTestPeer::PrepareAdopt(
+            access, {segment, client, SegmentStatus::OK}, allocator, true);
         ASSERT_TRUE(transaction.has_value());
     }
-    EXPECT_TRUE(pool.AcquireReadAccess().Catalog().Regions().empty());
+    EXPECT_TRUE(pool.AcquireReadAccess().Segments().empty());
     EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, 0U);
 
     SegmentPool destination(Drivers());
     auto access = destination.AcquireWriteAccess();
-    auto transaction = access.PrepareAdopt({segment, client, SegmentStatus::OK},
-                                           allocator, true);
+    auto transaction = SegmentPoolTestPeer::PrepareAdopt(
+        access, {segment, client, SegmentStatus::OK}, allocator, true);
     ASSERT_TRUE(transaction.has_value());
     ASSERT_EQ(transaction->Commit(access), ErrorCode::OK);
     EXPECT_EQ(destination.GetMemoryUsage().capacity_bytes, kRegionSize);
@@ -1044,47 +1191,53 @@ TEST(SegmentPoolTest, AbandonedAdoptionDoesNotRegisterUsage) {
 }
 
 TEST(SegmentPoolTest, RejectedAdoptionCommitDoesNotRegisterUsage) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "adopt-rejected");
     auto allocator = std::make_shared<TestBufferAllocator>(
         segment.name, segment.te_endpoint, kRegionSize, segment.base);
     auto access = pool.AcquireWriteAccess();
-    auto transaction = access.PrepareAdopt({segment, client, SegmentStatus::OK},
-                                           allocator, true);
+    auto transaction = SegmentPoolTestPeer::PrepareAdopt(
+        access, {segment, client, SegmentStatus::OK}, allocator, true);
     ASSERT_TRUE(transaction.has_value());
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
     EXPECT_EQ(transaction->Commit(access), ErrorCode::SEGMENT_ALREADY_EXISTS);
     access.Clear();
     EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, 0U);
 }
 
 TEST(SegmentPoolTest, AdoptRejectsCatalogConflictWithoutReplacingResource) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "adopt-conflict");
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+    ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+              ErrorCode::OK);
     auto allocator = std::make_shared<TestBufferAllocator>(
         segment.name, segment.te_endpoint, kRegionSize, segment.base);
-    auto duplicate = access.PrepareAdopt({segment, client, SegmentStatus::OK},
-                                         allocator, true);
+    auto duplicate = SegmentPoolTestPeer::PrepareAdopt(
+        access, {segment, client, SegmentStatus::OK}, allocator, true);
     ASSERT_FALSE(duplicate.has_value());
     EXPECT_EQ(duplicate.error(), ErrorCode::SEGMENT_ALREADY_EXISTS);
-    auto conflict = access.PrepareAdopt(
-        {segment, generate_uuid(), SegmentStatus::OK}, allocator, true);
+    auto conflict = SegmentPoolTestPeer::PrepareAdopt(
+        access, {segment, generate_uuid(), SegmentStatus::OK}, allocator, true);
     ASSERT_FALSE(conflict.has_value());
     EXPECT_EQ(conflict.error(), ErrorCode::SEGMENT_ALREADY_EXISTS);
-    EXPECT_EQ(access.Catalog().Regions().size(), 1U);
+    EXPECT_EQ(access.Segments().size(), 1U);
 }
 
 TEST(SegmentPoolTest, SnapshotCaptureDoesNotAcquireInheritedPoolMutex) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "fork-safe");
     {
         auto access = pool.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(segment, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(segment, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
 
         // A fork child can inherit this mutex as locked by a vanished thread.
         // Capture must not acquire the inherited runtime lock.
@@ -1095,30 +1248,33 @@ TEST(SegmentPoolTest, SnapshotCaptureDoesNotAcquireInheritedPoolMutex) {
 }
 
 TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "snapshot", "tcp", "host-a");
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(client)),
               ErrorCode::OK);
     auto encoded = CaptureAndEncode(source, LocalSsdPersistedState{});
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
 
     SegmentPool restored(Drivers());
     auto stale = MakeSegment(1, "stale");
-    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(stale, client),
+    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(
+                  stale, clients.GetOrCreate(client)),
               ErrorCode::OK);
     // Replacement must also allow an existing UUID and a different old owner.
-    ASSERT_EQ(
-        restored.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
-        ErrorCode::OK);
+    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(generate_uuid())),
+              ErrorCode::OK);
     auto decoded = DecodeAndRestore(restored, *encoded, false);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
 
     {
         auto view = restored.AcquireReadAccess();
-        EXPECT_EQ(view.Catalog().Find(stale.id), nullptr);
-        const auto* mounted = view.Catalog().Find(segment.id);
-        ASSERT_NE(mounted, nullptr);
+        EXPECT_FALSE(view.FindSegment(stale.id).has_value());
+        const auto mounted = view.FindSegment(segment.id);
+        ASSERT_TRUE(mounted.has_value());
         EXPECT_EQ(mounted->segment.host_id, segment.host_id);
         EXPECT_EQ(mounted->client_id, client);
         EXPECT_EQ(mounted->status, SegmentStatus::OK);
@@ -1129,6 +1285,7 @@ TEST(SegmentPoolTest, SnapshotRoundTripPreservesCatalogAndHost) {
 }
 
 TEST(SegmentPoolTest, SharedNameIndexesSurviveSnapshotAndReverseUnmount) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     auto first = MakeSegment(0, "shared-hostname", "tcp", "shared-host");
@@ -1137,23 +1294,26 @@ TEST(SegmentPoolTest, SharedNameIndexesSurviveSnapshotAndReverseUnmount) {
     {
         auto access = source.AcquireWriteAccess();
         // Split registrations of one client retain the same logical name.
-        ASSERT_EQ(access.MountSegment(first, client), ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(second, client), ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(first, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(second, clients.GetOrCreate(client)),
+                  ErrorCode::OK);
     }
     auto encoded = CaptureAndEncode(source, {});
     ASSERT_TRUE(encoded.has_value());
     SegmentPool restored(Drivers());
     ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
+    ASSERT_TRUE(restored.RestoreBufferBindings(clients.Snapshot(), {}));
     {
         auto access = restored.AcquireReadAccess();
-        ASSERT_EQ(access.Catalog().Regions().size(), 2U);
+        ASSERT_EQ(access.Segments().size(), 2U);
         for (const auto& segment : {first, second}) {
-            const auto* region = access.Catalog().Find(segment.id);
-            ASSERT_NE(region, nullptr);
+            const auto region = access.FindSegment(segment.id);
+            ASSERT_TRUE(region.has_value());
             EXPECT_EQ(region->client_id, client);
             EXPECT_EQ(region->segment.te_endpoint, segment.te_endpoint);
         }
-        const auto* entry = access.Placement().Find(
+        const auto* entry = SegmentPoolTestPeer::Placement(access).Find(
             first.name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         EXPECT_EQ(entry->candidates.size(), 2U);
@@ -1162,34 +1322,35 @@ TEST(SegmentPoolTest, SharedNameIndexesSurviveSnapshotAndReverseUnmount) {
     CommitUnmount(restored, second, client);
     {
         auto access = restored.AcquireReadAccess();
-        EXPECT_EQ(access.Catalog().Find(second.id), nullptr);
-        EXPECT_FALSE(access.Catalog().RegionIds(first.name).empty());
-        EXPECT_EQ(access.Catalog().FindOwnerClientId(first.name), client);
-        const auto* entry = access.Placement().Find(
+        EXPECT_FALSE(access.FindSegment(second.id).has_value());
+        EXPECT_FALSE(
+            SegmentPoolTestPeer::Catalog(access).RegionIds(first.name).empty());
+        EXPECT_EQ(access.FindOwnerClientId(first.name), client);
+        const auto* entry = SegmentPoolTestPeer::Placement(access).Find(
             first.name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         EXPECT_EQ(entry->candidates.size(), 1U);
         std::vector<std::string> names;
-        access.Placement().VisitHostOrderedSegmentNames(
+        SegmentPoolTestPeer::Placement(access).VisitHostOrderedSegmentNames(
             first.host_id, "key", [&](auto name) {
                 names.emplace_back(name);
                 return false;
             });
         EXPECT_EQ(names, (std::vector<std::string>{first.name}));
     }
-    auto allocated = restored.AllocateInSegment(
-        first.name, AllocationCandidateKind::NATIVE, 4096);
+    auto allocated = SegmentPoolTestPeer::AllocateInSegment(
+        restored, first.name, AllocationCandidateKind::NATIVE, 4096);
     ASSERT_TRUE(allocated.has_value());
     EXPECT_EQ(ReplicaEndpoint(*allocated), first.te_endpoint);
 
     CommitUnmount(restored, first, client);
     auto access = restored.AcquireReadAccess();
-    EXPECT_TRUE(access.Catalog().Regions().empty());
-    EXPECT_FALSE(access.Catalog().FindOwnerClientId(first.name).has_value());
-    EXPECT_FALSE(access.Placement().Contains(first.name,
-                                             AllocationCandidateKind::NATIVE));
+    EXPECT_TRUE(access.Segments().empty());
+    EXPECT_FALSE(access.FindOwnerClientId(first.name).has_value());
+    EXPECT_FALSE(SegmentPoolTestPeer::Placement(access).Contains(
+        first.name, AllocationCandidateKind::NATIVE));
     std::vector<std::string> names;
-    access.Placement().VisitHostOrderedSegmentNames(
+    SegmentPoolTestPeer::Placement(access).VisitHostOrderedSegmentNames(
         first.host_id, "key", [&](auto name) {
             names.emplace_back(name);
             return false;
@@ -1198,15 +1359,18 @@ TEST(SegmentPoolTest, SharedNameIndexesSurviveSnapshotAndReverseUnmount) {
 }
 
 TEST(SegmentPoolTest, SnapshotPreservesSsdPlacementOwnerRanking) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     LocalSsdManager local_ssd;
     auto busy = MakeSegment(0, "busy");
     auto free = MakeSegment(1, "free");
     const UUID busy_owner = generate_uuid();
     const UUID free_owner = generate_uuid();
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(busy, busy_owner),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  busy, clients.GetOrCreate(busy_owner)),
               ErrorCode::OK);
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(free, free_owner),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  free, clients.GetOrCreate(free_owner)),
               ErrorCode::OK);
     for (const auto& owner : {busy_owner, free_owner}) {
         ASSERT_EQ(local_ssd.RegisterClient(owner, true), ErrorCode::OK);
@@ -1220,6 +1384,7 @@ TEST(SegmentPoolTest, SnapshotPreservesSsdPlacementOwnerRanking) {
     SegmentPool restored(Drivers(), PlacementPolicyType::SSD_FREE_RATIO_FIRST,
                          &local_ssd);
     ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
+    ASSERT_TRUE(restored.RestoreBufferBindings(clients.Snapshot(), {}));
     // SSD usage is a live metrics view. Restored placement must look it up by
     // the preserved owner rather than by segment name or insertion order.
     ReplicaAllocationRequest request;
@@ -1230,33 +1395,41 @@ TEST(SegmentPoolTest, SnapshotPreservesSsdPlacementOwnerRanking) {
     EXPECT_EQ(ReplicaEndpoint(allocated->front()), free.te_endpoint);
     {
         auto access = restored.AcquireReadAccess();
-        EXPECT_EQ(access.Catalog().FindOwnerClientId(busy.name), busy_owner);
-        EXPECT_EQ(access.Catalog().FindOwnerClientId(free.name), free_owner);
+        EXPECT_EQ(access.FindOwnerClientId(busy.name), busy_owner);
+        EXPECT_EQ(access.FindOwnerClientId(free.name), free_owner);
     }
 }
 
 TEST(SegmentPoolTest, RestoreSnapshotRejectsConflictsBeforeReplacingPool) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(0, "restore-conflict");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(generate_uuid())),
               ErrorCode::OK);
-    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto allocator =
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
     auto snapshot = pool.CaptureSnapshot();
     auto duplicate = pool.CaptureSnapshot();
     ASSERT_TRUE(snapshot);
     ASSERT_TRUE(duplicate);
     snapshot->regions.push_back(std::move(duplicate->regions.front()));
     EXPECT_FALSE(pool.RestoreSnapshot(std::move(*snapshot), true));
-    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+    EXPECT_EQ(
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id),
+        allocator);
 
     auto invalid = pool.CaptureSnapshot();
     ASSERT_TRUE(invalid);
     invalid->regions.front().allocator.allocation_state.layout.reset();
     EXPECT_FALSE(pool.RestoreSnapshot(std::move(*invalid), true));
-    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
+    EXPECT_EQ(
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id),
+        allocator);
 }
 
 TEST(SegmentPoolTest, SnapshotReplacementPreservesAllocatedMetrics) {
+    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     const auto baseline = metrics.get_allocated_mem_size();
 
@@ -1264,10 +1437,12 @@ TEST(SegmentPoolTest, SnapshotReplacementPreservesAllocatedMetrics) {
         SegmentPool pool(Drivers());
         const UUID client = generate_uuid();
         auto segment = MakeSegment(0, "snapshot-allocated-metrics");
-        ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+        ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
+                      segment, clients.GetOrCreate(client)),
                   ErrorCode::OK);
-        auto buffer =
-            pool.AcquireReadAccess().GetAllocator(segment.id)->allocate(4096);
+        auto buffer = SegmentPoolTestPeer::GetAllocator(
+                          pool.AcquireReadAccess(), segment.id)
+                          ->allocate(4096);
         ASSERT_NE(buffer, nullptr);
         auto encoded = CaptureAndEncode(pool, LocalSsdPersistedState{});
         ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -1280,8 +1455,8 @@ TEST(SegmentPoolTest, SnapshotReplacementPreservesAllocatedMetrics) {
         EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
                   account_capacity ? kRegionSize : 0);
         {
-            auto next = pool.AcquireReadAccess()
-                            .GetAllocator(segment.id)
+            auto next = SegmentPoolTestPeer::GetAllocator(
+                            pool.AcquireReadAccess(), segment.id)
                             ->allocate(4096);
             ASSERT_NE(next, nullptr);
             EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
@@ -1295,6 +1470,7 @@ TEST(SegmentPoolTest, SnapshotReplacementPreservesAllocatedMetrics) {
 }
 
 TEST(SegmentPoolTest, SnapshotRestoresPlacementAndEveryLifecycleStatus) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     std::vector<Segment> segments;
@@ -1307,77 +1483,83 @@ TEST(SegmentPoolTest, SnapshotRestoresPlacementAndEveryLifecycleStatus) {
         segments.push_back(MakeSegment(i, "lifecycle-" + std::to_string(i),
                                        "tcp", "host-" + std::to_string(i)));
         auto access = source.AcquireWriteAccess();
-        ASSERT_EQ(
-            access.MountSegment(segments.back(), i == 1 ? UUID{8, 9} : client),
-            ErrorCode::OK);
-        ASSERT_EQ(
-            access.SetSegmentStatusByName(segments.back().name, statuses[i]),
-            ErrorCode::OK);
+        ASSERT_EQ(access.MountSegment(
+                      segments.back(),
+                      clients.GetOrCreate(i == 1 ? UUID{8, 9} : client)),
+                  ErrorCode::OK);
+        ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
+                      access, segments.back().name, statuses[i]),
+                  ErrorCode::OK);
     }
 
     // Same-name regions must all survive; only their logical name is
     // deduplicated.
     auto sibling = MakeSegment(8, segments[0].name, "tcp", segments[0].host_id);
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(sibling, client),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  sibling, clients.GetOrCreate(client)),
               ErrorCode::OK);
     auto encoded = CaptureAndEncode(source, {});
     ASSERT_TRUE(encoded.has_value());
     SegmentPool restored(Drivers());
     ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
+    ASSERT_TRUE(restored.RestoreBufferBindings(clients.Snapshot(), {}));
     {
         auto access = restored.AcquireReadAccess();
-        EXPECT_EQ(access.Catalog().Regions().size(), segments.size() + 1);
+        EXPECT_EQ(access.Segments().size(), segments.size() + 1);
         for (size_t i = 0; i < segments.size(); ++i) {
-            const auto* region = access.Catalog().Find(segments[i].id);
-            ASSERT_NE(region, nullptr);
+            const auto region = access.FindSegment(segments[i].id);
+            ASSERT_TRUE(region.has_value());
             EXPECT_EQ(region->status, statuses[i]);
             EXPECT_EQ(region->client_id, i == 1 ? (UUID{8, 9}) : client);
-            EXPECT_EQ(access.Placement().Contains(
+            EXPECT_EQ(SegmentPoolTestPeer::Placement(access).Contains(
                           segments[i].name, AllocationCandidateKind::NATIVE),
                       statuses[i] == SegmentStatus::OK);
-            EXPECT_NE(access.GetAllocator(segments[i].id), nullptr);
+            EXPECT_NE(SegmentPoolTestPeer::GetAllocator(access, segments[i].id),
+                      nullptr);
         }
         std::vector<std::string> names;
-        access.Placement().GetActiveSegmentNames(
-            AllocationCandidateKind::NATIVE, names);
+        access.GetActiveSegmentNames(names);
         EXPECT_EQ(names, (std::vector<std::string>{segments[0].name,
                                                    segments[1].name}));
         std::vector<std::string> by_host;
-        access.Placement().VisitHostOrderedSegmentNames(
+        SegmentPoolTestPeer::Placement(access).VisitHostOrderedSegmentNames(
             segments[1].host_id, "key", [&](auto name) {
                 by_host.emplace_back(name);
                 return false;
             });
         ASSERT_EQ(by_host.size(), 2U);
         EXPECT_EQ(by_host.front(), segments[1].name);
-        const auto* entry = access.Placement().Find(
+        const auto* entry = SegmentPoolTestPeer::Placement(access).Find(
             segments[0].name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         EXPECT_EQ(entry->candidates.size(), 2U);
     }
 
     CommitUnmount(restored, segments[0], client);
-    EXPECT_TRUE(restored.AcquireReadAccess().Placement().Contains(
-        sibling.name, AllocationCandidateKind::NATIVE));
+    EXPECT_TRUE(SegmentPoolTestPeer::Placement(restored.AcquireReadAccess())
+                    .Contains(sibling.name, AllocationCandidateKind::NATIVE));
     CommitUnmount(restored, sibling, client);
-    EXPECT_FALSE(restored.AcquireReadAccess().Placement().Contains(
-        sibling.name, AllocationCandidateKind::NATIVE));
-    auto buffer = restored.AcquireReadAccess()
-                      .GetAllocator(segments[1].id)
+    EXPECT_FALSE(SegmentPoolTestPeer::Placement(restored.AcquireReadAccess())
+                     .Contains(sibling.name, AllocationCandidateKind::NATIVE));
+    auto buffer = SegmentPoolTestPeer::GetAllocator(
+                      restored.AcquireReadAccess(), segments[1].id)
                       ->allocate(4096);
     ASSERT_NE(buffer, nullptr);
 }
 
 TEST(SegmentPoolTest,
      SnapshotPreservesFragmentationAndLegacyAllocationHandles) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     const auto segment = MakeSegment(0, "snapshot-handles");
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(client)),
               ErrorCode::OK);
 
     auto allocator = std::dynamic_pointer_cast<OffsetBufferAllocator>(
-        source.AcquireReadAccess().GetAllocator(segment.id));
+        SegmentPoolTestPeer::GetAllocator(source.AcquireReadAccess(),
+                                          segment.id));
     ASSERT_NE(allocator, nullptr);
     auto first = allocator->allocate(4096);
     auto hole = allocator->allocate(4096);
@@ -1421,7 +1603,8 @@ TEST(SegmentPoolTest,
     SegmentPool restored(Drivers());
     ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
     auto target = std::dynamic_pointer_cast<OffsetBufferAllocator>(
-        restored.AcquireReadAccess().GetAllocator(segment.id));
+        SegmentPoolTestPeer::GetAllocator(restored.AcquireReadAccess(),
+                                          segment.id));
     ASSERT_NE(target, nullptr);
     EXPECT_EQ(restored.GetMemoryUsage().used_bytes, 8192U);
 
@@ -1433,15 +1616,10 @@ TEST(SegmentPoolTest,
 
     auto objects = msgpack::unpack(handles.data(), handles.size());
     for (uint32_t i = 0; i < 2; ++i) {
-        const auto& fields = objects.get().via.array.ptr[i].via.array;
-        auto handle =
-            Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
-                fields.ptr[4], target->getOffsetAllocator());
-        ASSERT_TRUE(handle.has_value());
-        auto buffer = std::make_unique<AllocatedBuffer>(
-            target, reinterpret_cast<void*>(fields.ptr[1].as<uint64_t>()),
-            fields.ptr[0].as<uint64_t>(), std::move(**handle));
-        buffer.reset();
+        auto buffer = Serializer<AllocatedBuffer>::deserialize(
+            objects.get().via.array.ptr[i], restored.AcquireReadAccess());
+        ASSERT_TRUE(buffer.has_value());
+        buffer->reset();
         EXPECT_EQ(restored.GetMemoryUsage().used_bytes, (1U - i) * 4096U);
     }
 
@@ -1451,14 +1629,16 @@ TEST(SegmentPoolTest,
 }
 
 TEST(SegmentPoolTest, SnapshotReadersAndEmptyReplacementBalanceMetrics) {
+    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     SegmentPool source(Drivers());
     const auto segment = MakeSegment(0, "snapshot-reader");
-    ASSERT_EQ(
-        source.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
-        ErrorCode::OK);
-    auto live =
-        source.AcquireReadAccess().GetAllocator(segment.id)->allocate(4096);
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(generate_uuid())),
+              ErrorCode::OK);
+    auto live = SegmentPoolTestPeer::GetAllocator(source.AcquireReadAccess(),
+                                                  segment.id)
+                    ->allocate(4096);
     ASSERT_NE(live, nullptr);
     auto encoded = CaptureAndEncode(source, {});
     ASSERT_TRUE(encoded.has_value());
@@ -1491,8 +1671,7 @@ TEST(SegmentPoolTest, SnapshotReadersAndEmptyReplacementBalanceMetrics) {
                     ASSERT_TRUE(DecodeAndRestore(reader, *empty_encoded,
                                                  account_capacity)
                                     .has_value());
-                    EXPECT_TRUE(
-                        reader.AcquireReadAccess().Catalog().Regions().empty());
+                    EXPECT_TRUE(reader.AcquireReadAccess().Segments().empty());
                     EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0U);
                     EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0U);
                     EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
@@ -1509,19 +1688,24 @@ TEST(SegmentPoolTest, SnapshotReadersAndEmptyReplacementBalanceMetrics) {
 }
 
 TEST(SegmentPoolTest, SnapshotReplacementBalancesExternallyRetainedAllocator) {
+    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     const auto baseline = metrics.get_allocated_mem_size();
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(0, "snapshot-retained");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(generate_uuid())),
               ErrorCode::OK);
-    auto retained = pool.AcquireReadAccess().GetAllocator(segment.id);
+    auto retained =
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
     auto old_buffer = retained->allocate(4096);
     ASSERT_NE(old_buffer, nullptr);
     auto encoded = CaptureAndEncode(pool, {});
     ASSERT_TRUE(encoded.has_value());
     ASSERT_TRUE(DecodeAndRestore(pool, *encoded, true).has_value());
-    EXPECT_NE(pool.AcquireReadAccess().GetAllocator(segment.id), retained);
+    EXPECT_NE(
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id),
+        retained);
     EXPECT_EQ(metrics.get_allocated_mem_size(), baseline + 8192);
     EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 8192);
 
@@ -1538,6 +1722,7 @@ TEST(SegmentPoolTest, SnapshotReplacementBalancesExternallyRetainedAllocator) {
 }
 
 TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
+    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     for (bool retain_allocator : {false, true}) {
         SCOPED_TRACE(retain_allocator);
@@ -1547,11 +1732,11 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
         {
             SegmentPool source(Drivers());
             auto segment = MakeSegment(0, name);
-            ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment,
-                                                               generate_uuid()),
+            ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                          segment, clients.GetOrCreate(generate_uuid())),
                       ErrorCode::OK);
-            auto live = source.AcquireReadAccess()
-                            .GetAllocator(segment.id)
+            auto live = SegmentPoolTestPeer::GetAllocator(
+                            source.AcquireReadAccess(), segment.id)
                             ->allocate(4096);
             ASSERT_NE(live, nullptr);
             auto encoded = CaptureAndEncode(source, {});
@@ -1559,8 +1744,8 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
             SegmentPool restored(Drivers());
             ASSERT_TRUE(DecodeAndRestore(restored, *encoded, true).has_value());
             if (retain_allocator) {
-                retained =
-                    restored.AcquireReadAccess().GetAllocator(segment.id);
+                retained = SegmentPoolTestPeer::GetAllocator(
+                    restored.AcquireReadAccess(), segment.id);
             }
             EXPECT_NE(metrics.serialize_metrics().find(label),
                       std::string::npos);
@@ -1578,11 +1763,12 @@ TEST(SegmentPoolTest, DestroyedPoolAndRetainedAllocatorRemoveMetricLabels) {
 }
 
 TEST(SegmentPoolTest, EmptySnapshotAllocatorKeepsOtherPoolsCapacityLabels) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const auto segment = MakeSegment(0, "snapshot-shared-capacity");
-    ASSERT_EQ(
-        source.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
-        ErrorCode::OK);
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(generate_uuid())),
+              ErrorCode::OK);
     auto encoded = CaptureAndEncode(source, {});
     ASSERT_TRUE(encoded.has_value());
     auto& metrics = MasterMetricManager::instance();
@@ -1602,13 +1788,16 @@ TEST(SegmentPoolTest, EmptySnapshotAllocatorKeepsOtherPoolsCapacityLabels) {
 }
 
 TEST(SegmentPoolTest, ForkedSnapshotEncodesWhileAnotherThreadOwnsPoolLock) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     const auto segment = MakeSegment(0, "real-fork");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
+                  segment, clients.GetOrCreate(client)),
               ErrorCode::OK);
     auto live =
-        pool.AcquireReadAccess().GetAllocator(segment.id)->allocate(4096);
+        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id)
+            ->allocate(4096);
     ASSERT_NE(live, nullptr);
 
     int fds[2];
@@ -1677,7 +1866,8 @@ TEST(SegmentPoolTest, ForkedSnapshotEncodesWhileAnotherThreadOwnsPoolLock) {
     SegmentPool restored(Drivers());
     ASSERT_TRUE(DecodeAndRestore(restored, bytes, false).has_value());
     EXPECT_EQ(restored.GetMemoryUsage().used_bytes, 4096U);
-    EXPECT_NE(restored.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
+    EXPECT_TRUE(
+        restored.AcquireReadAccess().FindSegment(segment.id).has_value());
 }
 
 }  // namespace mooncake::test

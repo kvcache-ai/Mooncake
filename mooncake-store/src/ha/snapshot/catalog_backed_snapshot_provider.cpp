@@ -507,35 +507,13 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
 
-        // Extract standby segment registry entries from the deserialized
-        // SegmentPool. StoreResourceSnapshotCodec::Encode()
-        // currently carries enough data to rebuild only memory segments
-        // (the SegmentPool catalog, whose memory resources own allocators by
-        // construction).
-        //
-        // LocalSSD state is serialized as per-client offloading bookkeeping
-        // without the transport_endpoint / file_path / capacity fields that
-        // StandbySegmentInfo needs, and NoF segments are not serialized at
-        // all in this snapshot path. Both have to be re-mounted explicitly
-        // via SEGMENT_MOUNT OpLog replay after standby promotion (see
-        // OpLogApplier::Apply / HotStandbyService::LoadSnapshotBaselineLocked).
-        //
-        // If a future change makes the serializer carry richer per-segment
-        // data, the predicate below should be replaced with explicit branches
-        // for each segment type.
-        SegmentPool::ReadAccess view = segment_pool.AcquireReadAccess();
-        for (const auto& mounted : view.Catalog().Regions()) {
+        // The resource codec currently restores only host-memory regions.
+        // Pool restoration already validated every resource; consumers only
+        // project owned segment descriptions into the standby wire format.
+        // NoF and LocalSSD still require their existing remount/replay paths.
+        auto view = segment_pool.AcquireReadAccess();
+        for (const auto& mounted : view.Segments()) {
             const auto& segment = mounted.segment;
-            if (!view.GetAllocator(segment.id)) {
-                // Defensive: a catalog entry without a driver resource should
-                // not exist. Log and skip rather than emitting a half-populated
-                // StandbySegmentInfo.
-                LOG(WARNING)
-                    << "snapshot contains MountedRegion without allocator; "
-                    << "skipping segment_name=" << segment.name
-                    << " segment_id=" << segment.id;
-                continue;
-            }
             StandbySegmentInfo info;
             info.segment_name = segment.name;
             info.transport_endpoint = segment.te_endpoint;

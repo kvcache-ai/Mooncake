@@ -59,22 +59,6 @@ class Serializer<offset_allocator::OffsetAllocator> {
         const msgpack::object &obj);
 };
 
-// Serializer specialization for OffsetAllocationHandle
-template <>
-class Serializer<offset_allocator::OffsetAllocationHandle> {
-   public:
-    using PointerType =
-        std::shared_ptr<offset_allocator::OffsetAllocationHandle>;
-
-    static tl::expected<void, SerializationError> serialize(
-        const offset_allocator::OffsetAllocationHandle &handle,
-        MsgpackPacker &packer);
-
-    static tl::expected<PointerType, SerializationError> deserialize(
-        const msgpack::object &obj,
-        const std::shared_ptr<offset_allocator::OffsetAllocator> &allocator);
-};
-
 // Encoding with SegmentPool requires a forked child or external quiescence;
 // the ReadAccess overload is for callers already holding a runtime read lock.
 template <>
@@ -91,11 +75,6 @@ class Serializer<AllocatedBuffer> {
     static tl::expected<PointerType, SerializationError> deserialize(
         const msgpack::object& obj,
         const SegmentPool::ReadAccess& segment_view);
-
-   private:
-    static tl::expected<void, SerializationError> SerializeWithRegionId(
-        const AllocatedBuffer& buffer, const UUID& region_id,
-        MsgpackPacker& packer);
 };
 
 template <>

@@ -68,7 +68,7 @@ class NoFSegmentManager final {
           allocation_(policy, ReplicaPlacement::Backend::NoF) {}
     tl::expected<std::vector<Replica>, ErrorCode> AllocateReplicas(
         const ReplicaAllocationRequest& request,
-        PlacementDiagnostics* diagnostics = nullptr) const {
+        AllocationDiagnostics* diagnostics = nullptr) const {
         auto access = AcquirePlacementAccess();
         return allocation_.Allocate(access, request, diagnostics);
     }

@@ -1,3 +1,5 @@
+#include "../../segment_pool_test_peer.h"
+
 #include <gtest/gtest.h>
 
 #include <sys/wait.h>
@@ -12,6 +14,7 @@
 
 #include "ha/snapshot/master_snapshot_codec.h"
 #include "master_config.h"
+#include "master_metric_manager.h"
 #include "master_service.h"
 #include "segment/pool_read_access.h"
 #include "segment/pool_write_access.h"
@@ -38,14 +41,14 @@ class MasterSnapshotCodecTest : public ::testing::Test {
     // funneled through this helper (friendship is not inherited by the
     // TEST_F-generated subclasses).
     static MasterSnapshotStateView MakeStateView(MasterService& service) {
-        return MasterSnapshotStateView(service, service.segment_pool_,
+        return MasterSnapshotStateView(service, *service.segment_pool_,
                                        service.local_ssd_manager_,
                                        service.task_manager_);
     }
 
     static int EncodeInForkWithPoolLocked(MasterService& service) {
         std::unique_lock snapshot_lock(service.snapshot_mutex_);
-        auto pool_lock = service.segment_pool_.AcquireWriteAccess();
+        auto pool_lock = service.segment_pool_->AcquireWriteAccess();
         const pid_t child = fork();
         if (child == 0) {
             alarm(5);
@@ -64,14 +67,48 @@ class MasterSnapshotCodecTest : public ::testing::Test {
 
     static std::shared_ptr<BufferAllocatorBase> RetireSegmentPool(
         MasterService& service, const UUID& segment_id) {
-        auto allocator =
-            service.segment_pool_.AcquireReadAccess().GetAllocator(segment_id);
-        service.segment_pool_.AcquireWriteAccess().Clear();
+        auto allocator = SegmentPoolTestPeer::GetAllocator(
+            service.segment_pool_->AcquireReadAccess(), segment_id);
+        service.segment_pool_->AcquireWriteAccess().Clear();
         return allocator;
+    }
+
+    static auto ApplyState(MasterService& service) {
+        return service.ApplySnapshotState(std::chrono::system_clock::now());
+    }
+    static void ResetState(MasterService& service) {
+        service.ResetStateAfterFailedRestoreAttempt();
     }
 
     std::unique_ptr<MasterService> master_service_;
 };
+
+TEST_F(MasterSnapshotCodecTest,
+       ApplyingAndResettingRestorePreservesOtherPoolCapacity) {
+    auto& metrics = MasterMetricManager::instance();
+    const auto before = metrics.get_total_mem_capacity();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "restore-capacity-owner";
+    segment.te_endpoint = "restore-capacity-endpoint";
+    segment.base = 0x300000000;
+    segment.size = 16 * 1024 * 1024;
+    ASSERT_TRUE(master_service_->MountSegment(segment, generate_uuid()));
+    MasterSnapshotCodec codec;
+    auto state_view = MakeStateView(*master_service_);
+    auto payloads = codec.Encode(state_view);
+    ASSERT_TRUE(payloads);
+    auto restored = MakeMasterService();
+    ASSERT_TRUE(codec.Decode(restored.get(), *payloads));
+    const auto size = static_cast<int64_t>(segment.size);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), before + 2 * size);
+    ASSERT_TRUE(ApplyState(*restored));
+    EXPECT_EQ(metrics.get_total_mem_capacity(), before + 2 * size);
+    ResetState(*restored);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), before + size);
+    ResetState(*restored);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), before + size);
+}
 
 TEST_F(MasterSnapshotCodecTest, EncodeManifestPreservesSnapshotId) {
     std::vector<uint8_t> bytes = MasterSnapshotCodec::EncodeManifest(
@@ -134,6 +171,9 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
         master_service_->PutEnd(client_id, kKey, kTenant, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value())
         << "PutEnd failed: " << static_cast<int>(put_end.error());
+    // ApplyState intentionally drops expired metadata. Preserve a live read
+    // lease so this test exercises owner reconstruction, not lease cleanup.
+    ASSERT_TRUE(master_service_->GetReplicaList(kKey, kTenant));
 
     MasterSnapshotCodec codec;
     MasterSnapshotStateView state_view = MakeStateView(*master_service_);
@@ -157,6 +197,13 @@ TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTripWithMemoryReplica) {
         codec.Decode(target_service.get(), encode_result.value());
     ASSERT_TRUE(decode_result.has_value())
         << "Decode failed: " << decode_result.error().message;
+
+    // Decode restores resources, not client sessions. Only the explicit apply
+    // phase makes recovered replicas serve again.
+    auto pending = target_service->GetReplicaList(kKey, kTenant);
+    ASSERT_FALSE(pending);
+    EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    ASSERT_TRUE(ApplyState(*target_service));
 
     // The MEMORY replica must be fully restored and queryable.
     auto get_result = target_service->GetReplicaList(kKey, kTenant);
@@ -196,6 +243,7 @@ TEST_F(MasterSnapshotCodecTest,
     ASSERT_TRUE(encoded) << encoded.error().message;
     auto restored = MakeMasterService();
     ASSERT_TRUE(codec.Decode(restored.get(), *encoded));
+    ASSERT_TRUE(ApplyState(*restored));
     EXPECT_TRUE(restored->ReMountSegment({first}, first_owner));
     EXPECT_TRUE(restored->ReMountSegment({second}, second_owner));
     EXPECT_FALSE(restored->ReMountSegment({first}, second_owner));

@@ -101,6 +101,8 @@ bool SegmentQueries::HasServingCandidate(std::string_view name) const {
 void SegmentQueries::GetActiveSegmentNames(
     std::vector<std::string>& names) const {
     query_placement_.GetActiveSegmentNames(query_kind_, names);
+    std::erase_if(names,
+                  [&](const auto& name) { return !HasServingCandidate(name); });
 }
 
 ErrorCode SegmentQueries::QueryCapacity(std::string_view name, size_t& used,
@@ -115,12 +117,17 @@ ErrorCode SegmentQueries::QueryCapacity(std::string_view name, size_t& used,
     return capacity ? ErrorCode::OK : ErrorCode::SEGMENT_NOT_FOUND;
 }
 
+ErrorCode SegmentQueries::ValidateTarget(std::string_view name) const {
+    if (!ContainsSegment(name)) return ErrorCode::SEGMENT_NOT_FOUND;
+    return HasServingCandidate(name) ? ErrorCode::OK
+                                     : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+}
+
 ErrorCode SegmentQueries::ValidateTargets(
     std::span<const std::string> targets) const {
     for (const auto& name : targets) {
-        if (!ContainsSegment(name)) return ErrorCode::SEGMENT_NOT_FOUND;
-        if (!HasServingCandidate(name))
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+        const auto error = ValidateTarget(name);
+        if (error != ErrorCode::OK) return error;
     }
     return ErrorCode::OK;
 }

@@ -18,6 +18,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     config/local_file_snapshot_config.cpp
     config/redis_connection_config.cpp
     segment_allocator_registration.cpp
+    client_registry.cpp
     client_offboarding.cpp
     master_service.cpp
     master_snapshot_manager.cpp

@@ -195,16 +195,25 @@ ErrorCode SegmentPool::WriteAccess::EraseUnmountedRegion(
     return ErrorCode::OK;
 }
 
-void SegmentPool::WriteAccess::BindClientLiveness(
-    const UUID& client_id,
-    const std::shared_ptr<ClientLivenessRecord>& client_liveness) {
+bool SegmentPool::WriteAccess::RestoreClientSessions(
+    const std::unordered_map<UUID, ClientSessionPtr, boost::hash<UUID>>&
+        clients) {
+    // Validate the entire restore before changing any ownership binding.
     for (const auto& mounted : catalog_.Regions()) {
-        if (mounted.client_id == client_id) {
-            if (auto* resource = segment_pool_.GetResource(mounted)) {
-                resource->candidate->BindClientLiveness(client_liveness);
-            }
-        }
+        const auto it = clients.find(mounted.client_id);
+        const auto* resource = segment_pool_.GetResource(mounted);
+        if (it == clients.end() || !it->second || !resource ||
+            it->second->client_id() != mounted.client_id ||
+            !it->second->ShouldRetainResources())
+            return false;
+        const auto owner = resource->candidate->client_session();
+        if (owner && owner != it->second) return false;
     }
+    for (const auto& mounted : catalog_.Regions()) {
+        segment_pool_.GetResource(mounted)->candidate->BindClientSession(
+            clients.at(mounted.client_id));
+    }
+    return true;
 }
 
 bool SegmentPool::WriteAccess::BindBufferToSegment(const UUID& segment_id,
@@ -227,10 +236,6 @@ bool SegmentPool::WriteAccess::RebindBufferToOwningSegment(
         }
     }
     return false;
-}
-
-const RegionCatalog& SegmentPool::WriteAccess::Catalog() const {
-    return catalog_;
 }
 
 ErrorCode SegmentPool::WriteAccess::SetSegmentStatusByName(

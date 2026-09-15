@@ -1,4 +1,4 @@
-#include "client_offboarding.h"
+#include "client_offboarding_internal.h"
 
 #include <algorithm>
 #include <iterator>
@@ -7,7 +7,6 @@
 #include <glog/logging.h>
 
 #include "master_metric_manager.h"
-#include "master_service.h"
 
 namespace mooncake {
 
@@ -46,7 +45,9 @@ void ClientOffboardingWorker::ReserveJob() {
         std::lock_guard<std::mutex> lock(mutex_);
         CHECK(running_);
         pending_jobs_.fetch_add(1, std::memory_order_release);
-        MasterMetricManager::instance().inc_client_offboarding_queue_depth();
+        if (account_metrics_)
+            MasterMetricManager::instance()
+                .inc_client_offboarding_queue_depth();
     }
 }
 
@@ -61,20 +62,22 @@ void ClientOffboardingWorker::ScheduleReserved(ClientOffboardingJob job) {
 
 std::chrono::seconds ClientOffboardingWorker::RetryDelay(uint64_t retry_count) {
     constexpr uint64_t kBackoffs[] = {1, 2, 4, 8, 16, 30};
-    const size_t index = static_cast<size_t>(
-        std::min<uint64_t>(retry_count - 1, std::size(kBackoffs) - 1));
+    const size_t index = static_cast<size_t>(std::min<uint64_t>(
+        retry_count ? retry_count - 1 : 0, std::size(kBackoffs) - 1));
     return std::chrono::seconds(kBackoffs[index]);
 }
 
 void ClientOffboardingWorker::CompleteJob(const ClientOffboardingJob& job) {
     pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
-    MasterMetricManager::instance().dec_client_offboarding_queue_depth();
+    if (account_metrics_)
+        MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     const auto duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - job.enqueued_at)
             .count();
-    MasterMetricManager::instance().observe_client_offboarding_duration_ms(
-        duration_ms);
+    if (account_metrics_)
+        MasterMetricManager::instance().observe_client_offboarding_duration_ms(
+            duration_ms);
     LOG(INFO) << "client_id=" << job.client_id
               << ", action=client_offboarding_complete"
               << ", retries=" << job.retry_count
@@ -84,7 +87,8 @@ void ClientOffboardingWorker::CompleteJob(const ClientOffboardingJob& job) {
 void ClientOffboardingWorker::DropJob(const ClientOffboardingJob& job,
                                       const char* reason) {
     pending_jobs_.fetch_sub(1, std::memory_order_acq_rel);
-    MasterMetricManager::instance().dec_client_offboarding_queue_depth();
+    if (account_metrics_)
+        MasterMetricManager::instance().dec_client_offboarding_queue_depth();
     LOG(ERROR) << "client_id=" << job.client_id
                << ", action=client_offboarding_dropped"
                << ", reason=" << reason << ", retry_count=" << job.retry_count;
@@ -104,7 +108,7 @@ void ClientOffboardingWorker::ThreadFunc() {
                 jobs_.clear();
                 lock.unlock();
                 for (const auto& queued : dropped) {
-                    DropJob(queued, "master_stopping");
+                    DropJob(queued, "registry_stopping");
                 }
                 break;
             }
@@ -123,15 +127,28 @@ void ClientOffboardingWorker::ThreadFunc() {
             jobs_.erase(next);
         }
 
-        if (service_->ProcessClientOffboardingJob(job)) {
+        bool complete = false;
+        try {
+            complete = process_(job);
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "client_id=" << job.client_id
+                       << ", action=client_offboarding_exception, error="
+                       << error.what();
+        } catch (...) {
+            LOG(ERROR)
+                << "client_id=" << job.client_id
+                << ", action=client_offboarding_exception, error=unknown";
+        }
+        if (complete) {
             CompleteJob(job);
             continue;
         }
 
         ++job.retry_count;
-        MasterMetricManager::instance().inc_client_offboarding_retry();
+        if (account_metrics_)
+            MasterMetricManager::instance().inc_client_offboarding_retry();
         const bool alert = ShouldAlert(job.retry_count);
-        if (alert) {
+        if (alert && account_metrics_) {
             MasterMetricManager::instance().inc_client_offboarding_alert();
         }
         LOG(ERROR) << "client_id=" << job.client_id
@@ -157,7 +174,7 @@ void ClientOffboardingWorker::ThreadFunc() {
         if (requeued) {
             cv_.notify_one();
         } else {
-            DropJob(job, "master_stopping_after_attempt");
+            DropJob(job, "registry_stopping_after_attempt");
         }
     }
     LOG(INFO) << "Client offboarding worker stopped";

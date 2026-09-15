@@ -46,6 +46,9 @@ struct PlacementConstraints final {
 struct HostAffinity final {
     std::string_view writer_host_id;
     std::string_view object_key;
+    // Request-level preference; SegmentPool also considers its placement
+    // policy.
+    bool prefer_alloc_in_same_node{false};
 };
 
 struct ReplicaAllocationRequest final {

@@ -2,7 +2,7 @@
 
 #include <optional>
 
-#include "segment/transaction.h"
+#include "pool_transaction_internal.h"
 
 namespace mooncake {
 

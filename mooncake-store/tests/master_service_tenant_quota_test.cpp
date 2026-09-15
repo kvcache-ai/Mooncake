@@ -362,8 +362,10 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;
 
-        auto segment_access = service.segment_pool_.AcquireWriteAccess();
-        return segment_access.MountSegment(segment, generate_uuid());
+        auto segment_access = service.segment_pool_->AcquireWriteAccess();
+        ClientRegistry clients(false);
+        return segment_access.MountSegment(
+            segment, clients.GetOrCreate(generate_uuid()));
     }
 
     void RecomputeTenantEffectiveQuotasForTest(MasterService& service) {

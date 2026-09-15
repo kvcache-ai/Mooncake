@@ -1,3 +1,4 @@
+#include "client_registry.h"
 #include "segment/region_driver.h"
 
 #include <gtest/gtest.h>
@@ -165,6 +166,9 @@ TEST(RegionDriverTest, CxlCandidateProducesCxlDescriptors) {
     auto prepared = driver->PrepareOpen(spec, {});
     ASSERT_TRUE(prepared.has_value());
 
+    ClientRegistry clients(false);
+    prepared->resource().candidate->BindClientSession(
+        clients.GetOrCreate(generate_uuid()));
     auto buffer = prepared->resource().candidate->Allocate(4096);
     ASSERT_NE(buffer, nullptr);
     const auto descriptor = buffer->get_descriptor();

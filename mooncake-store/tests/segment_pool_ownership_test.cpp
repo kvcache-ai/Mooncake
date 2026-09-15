@@ -1,3 +1,6 @@
+#include "segment_pool_test_peer.h"
+#include "client_registry.h"
+
 #include "segment/pool.h"
 
 #include <gtest/gtest.h>
@@ -153,115 +156,136 @@ TEST(SegmentPoolOwnershipTest,
 
 TEST(SegmentPoolOwnershipTest,
      SameNameMountsKeepExactOwnersAndRejectIdTakeover) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto first = Region(1);
     const auto second = Region(2);
     const auto third = Region(3);
     {
         auto access = pool.AcquireWriteAccess();
-        auto prepared = access.PrepareMount(third.segment, third.client_id);
+        auto prepared = SegmentPoolTestPeer::PrepareMount(access, third.segment,
+                                                          third.client_id);
         ASSERT_TRUE(prepared.has_value());
-        ASSERT_EQ(access.MountSegment(first.segment, first.client_id),
+        ASSERT_EQ(access.MountSegment(first.segment,
+                                      clients.GetOrCreate(first.client_id)),
                   ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(second.segment, second.client_id),
+        ASSERT_EQ(access.MountSegment(second.segment,
+                                      clients.GetOrCreate(second.client_id)),
                   ErrorCode::OK);
         // Another owner registered the name after preparation, not this ID.
         ASSERT_EQ(prepared->Commit(access), ErrorCode::OK);
-        EXPECT_EQ(access.MountSegment(first.segment, first.client_id),
+        EXPECT_EQ(access.MountSegment(first.segment,
+                                      clients.GetOrCreate(first.client_id)),
                   ErrorCode::SEGMENT_ALREADY_EXISTS);
-        EXPECT_EQ(access.MountSegment(first.segment, second.client_id),
+        EXPECT_EQ(access.MountSegment(first.segment,
+                                      clients.GetOrCreate(second.client_id)),
                   ErrorCode::INVALID_PARAMS);
-        auto takeover = access.PrepareMount(first.segment, second.client_id);
+        auto takeover = SegmentPoolTestPeer::PrepareMount(access, first.segment,
+                                                          second.client_id);
         ASSERT_FALSE(takeover.has_value());
         EXPECT_EQ(takeover.error(), ErrorCode::INVALID_PARAMS);
-        auto unmount =
-            access.PrepareUnmount(first.segment.id, second.client_id);
+        auto unmount = SegmentPoolTestPeer::PrepareUnmount(
+            access, first.segment.id, second.client_id);
         ASSERT_FALSE(unmount.has_value());
         EXPECT_EQ(unmount.error(), ErrorCode::INVALID_PARAMS);
-        ExpectOwners(access.Catalog(), {first, second, third});
+        ExpectOwners(SegmentPoolTestPeer::Catalog(access),
+                     {first, second, third});
     }
     auto view = pool.AcquireReadAccess();
-    const auto* entry = view.Placement().Find(first.segment.name,
-                                              AllocationCandidateKind::NATIVE);
+    const auto* entry = SegmentPoolTestPeer::Placement(view).Find(
+        first.segment.name, AllocationCandidateKind::NATIVE);
     ASSERT_NE(entry, nullptr);
     EXPECT_EQ(entry->candidates.size(), 3U);
     EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, 3 * kRegionSize);
 }
 
 TEST(SegmentPoolOwnershipTest, AdoptionAndRestoreAcceptDistinctSameNameOwners) {
+    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto first = Region(1);
     const auto second = Region(2);
     const auto third = Region(3);
     auto access = pool.AcquireWriteAccess();
-    ASSERT_EQ(access.MountSegment(first.segment, first.client_id),
+    ASSERT_EQ(access.MountSegment(first.segment,
+                                  clients.GetOrCreate(first.client_id)),
               ErrorCode::OK);
     auto allocator = std::make_shared<OffsetBufferAllocator>(
         second.segment.name, second.segment.base, second.segment.size,
         second.segment.te_endpoint);
-    auto adopted = access.PrepareAdopt(second, allocator, true);
+    auto adopted =
+        SegmentPoolTestPeer::PrepareAdopt(access, second, allocator, true);
     ASSERT_TRUE(adopted.has_value());
     ASSERT_EQ(adopted->Commit(access), ErrorCode::OK);
 
     const std::vector<AllocatedBuffer::Descriptor> descriptors{
         {4096, third.segment.base, "tcp", third.segment.te_endpoint}};
-    auto restored =
-        access.PrepareRestore(third.segment, third.client_id, descriptors);
+    auto restored = SegmentPoolTestPeer::PrepareRestore(
+        access, third.segment, third.client_id, descriptors);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->Commit(access), ErrorCode::OK);
     auto buffers = restored->TakeImportedBuffers();
     ASSERT_EQ(buffers.size(), 1U);
     EXPECT_EQ(buffers.front()->get_descriptor().transport_endpoint_,
               third.segment.te_endpoint);
-    auto remounted = access.PrepareMount(second.segment, second.client_id);
+    auto remounted = SegmentPoolTestPeer::PrepareMount(access, second.segment,
+                                                       second.client_id);
     ASSERT_TRUE(remounted.has_value());
     ASSERT_EQ(remounted->Commit(access), ErrorCode::OK);
-    auto takeover =
-        access.PrepareRestore(third.segment, first.client_id, descriptors);
+    auto takeover = SegmentPoolTestPeer::PrepareRestore(
+        access, third.segment, first.client_id, descriptors);
     ASSERT_FALSE(takeover.has_value());
     EXPECT_EQ(takeover.error(), ErrorCode::INVALID_PARAMS);
-    ExpectOwners(access.Catalog(), {first, second, third});
+    ExpectOwners(SegmentPoolTestPeer::Catalog(access), {first, second, third});
 }
 
 TEST(SegmentPoolOwnershipTest,
      ClientExpiryAndUnmountDoNotAffectSameNameSibling) {
     for (bool cxl : {false, true}) {
+        ClientRegistry clients{false};
         SCOPED_TRACE(cxl);
         SegmentPool pool(Drivers(cxl));
         auto first = Region(1);
         auto second = Region(2);
         first.segment.protocol = second.segment.protocol = cxl ? "cxl" : "tcp";
         const auto now = ClientLivenessRecord::TimePoint{};
-        auto first_liveness = std::make_shared<ClientLivenessRecord>(now);
-        auto second_liveness = std::make_shared<ClientLivenessRecord>(now);
+        auto first_liveness = clients.GetOrCreate(first.client_id, now);
+        auto second_liveness = clients.GetOrCreate(second.client_id, now);
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(access.MountSegment(first.segment, first.client_id),
+            ASSERT_EQ(access.MountSegment(first.segment,
+                                          clients.GetOrCreate(first.client_id)),
                       ErrorCode::OK);
-            ASSERT_EQ(access.MountSegment(second.segment, second.client_id),
-                      ErrorCode::OK);
-            access.BindClientLiveness(first.client_id, first_liveness);
-            access.BindClientLiveness(second.client_id, second_liveness);
+            ASSERT_EQ(
+                access.MountSegment(second.segment,
+                                    clients.GetOrCreate(second.client_id)),
+                ErrorCode::OK);
         }
         std::unique_ptr<AllocatedBuffer> first_buffer;
         std::unique_ptr<AllocatedBuffer> second_buffer;
         {
             auto view = pool.AcquireReadAccess();
-            first_buffer = view.GetAllocator(first.segment.id)->allocate(4096);
+            first_buffer =
+                SegmentPoolTestPeer::GetAllocator(view, first.segment.id)
+                    ->allocate(4096);
             second_buffer =
-                view.GetAllocator(second.segment.id)->allocate(4096);
+                SegmentPoolTestPeer::GetAllocator(view, second.segment.id)
+                    ->allocate(4096);
             ASSERT_NE(first_buffer, nullptr);
             ASSERT_NE(second_buffer, nullptr);
-            ASSERT_TRUE(
-                view.BindBufferToSegment(first.segment.id, *first_buffer));
-            ASSERT_TRUE(
-                view.BindBufferToSegment(second.segment.id, *second_buffer));
+        }
+        {
+            auto access = pool.AcquireWriteAccess();
+            ASSERT_TRUE(SegmentPoolTestPeer::BindBufferToSegment(
+                access, first.segment.id, *first_buffer));
+            ASSERT_TRUE(SegmentPoolTestPeer::BindBufferToSegment(
+                access, second.segment.id, *second_buffer));
         }
         // Recovery must rebind by region identity, even with one shared CXL
         // allocator and the same name, rather than choosing an arbitrary owner.
         {
             auto access = pool.AcquireWriteAccess();
-            ASSERT_TRUE(access.RebindBufferToOwningSegment(*second_buffer));
+            ASSERT_TRUE(SegmentPoolTestPeer::RebindBufferToOwningSegment(
+                access, *second_buffer));
         }
         EXPECT_EQ(first_buffer->getClientLiveness(), first_liveness);
         EXPECT_EQ(second_buffer->getClientLiveness(), second_liveness);
@@ -278,36 +302,40 @@ TEST(SegmentPoolOwnershipTest,
         EXPECT_TRUE(second_liveness->IsServing());
         const auto kind = cxl ? AllocationCandidateKind::CXL
                               : AllocationCandidateKind::NATIVE;
-        auto allocated = pool.AllocateInSegment(first.segment.name, kind, 4096);
+        auto allocated = SegmentPoolTestPeer::AllocateInSegment(
+            pool, first.segment.name, kind, 4096);
         ASSERT_TRUE(allocated.has_value());
         EXPECT_EQ(allocated->getClientLiveness(), second_liveness);
         {
             auto access = pool.AcquireWriteAccess();
-            auto unmount =
-                access.PrepareUnmount(first.segment.id, first.client_id);
+            auto unmount = SegmentPoolTestPeer::PrepareUnmount(
+                access, first.segment.id, first.client_id);
             ASSERT_TRUE(unmount.has_value());
-            EXPECT_EQ(access.Catalog().FindOwnerClientId(first.segment.name),
+            EXPECT_EQ(access.FindOwnerClientId(first.segment.name),
                       second.client_id);
             ASSERT_EQ(std::move(*unmount).Commit(access), ErrorCode::OK);
-            ExpectOwners(access.Catalog(), {second});
+            ExpectOwners(SegmentPoolTestPeer::Catalog(access), {second});
         }
         EXPECT_TRUE(second_buffer->isAvailable());
-        auto remaining =
-            pool.AllocateInSegment(second.segment.name, kind, 4096);
+        auto remaining = SegmentPoolTestPeer::AllocateInSegment(
+            pool, second.segment.name, kind, 4096);
         ASSERT_TRUE(remaining.has_value());
         EXPECT_EQ(remaining->getClientLiveness(), second_liveness);
     }
 }
 
 TEST(SegmentPoolOwnershipTest, SnapshotRoundTripPreservesEverySameNameOwner) {
+    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const auto first = Region(1);
     const auto second = Region(2);
     {
         auto access = source.AcquireWriteAccess();
-        ASSERT_EQ(access.MountSegment(second.segment, second.client_id),
+        ASSERT_EQ(access.MountSegment(second.segment,
+                                      clients.GetOrCreate(second.client_id)),
                   ErrorCode::OK);
-        ASSERT_EQ(access.MountSegment(first.segment, first.client_id),
+        ASSERT_EQ(access.MountSegment(first.segment,
+                                      clients.GetOrCreate(first.client_id)),
                   ErrorCode::OK);
     }
     auto snapshot = source.CaptureSnapshot();
@@ -317,29 +345,28 @@ TEST(SegmentPoolOwnershipTest, SnapshotRoundTripPreservesEverySameNameOwner) {
     auto decoded = ha::StoreResourceSnapshotCodec::Decode(*encoded);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
     SegmentPool restored(Drivers());
-    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(first.segment,
-                                                         second.client_id),
+    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(
+                  first.segment, clients.GetOrCreate(second.client_id)),
               ErrorCode::OK);
     ASSERT_TRUE(
         restored.RestoreSnapshot(std::move(decoded->segment_pool), false)
             .has_value());
     {
         auto view = restored.AcquireReadAccess();
-        ExpectOwners(view.Catalog(), {first, second});
-        EXPECT_EQ(view.Catalog().FindOwnerClientId(first.segment.name),
-                  first.client_id);
-        auto* entry = view.Placement().Find(first.segment.name,
-                                            AllocationCandidateKind::NATIVE);
+        ExpectOwners(SegmentPoolTestPeer::Catalog(view), {first, second});
+        EXPECT_EQ(view.FindOwnerClientId(first.segment.name), first.client_id);
+        auto* entry = SegmentPoolTestPeer::Placement(view).Find(
+            first.segment.name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         EXPECT_EQ(entry->candidates.size(), 2U);
     }
     auto access = restored.AcquireWriteAccess();
-    auto unmount = access.PrepareUnmount(first.segment.id, first.client_id);
+    auto unmount = SegmentPoolTestPeer::PrepareUnmount(access, first.segment.id,
+                                                       first.client_id);
     ASSERT_TRUE(unmount.has_value());
     ASSERT_EQ(std::move(*unmount).Commit(access), ErrorCode::OK);
-    EXPECT_EQ(access.Catalog().FindOwnerClientId(first.segment.name),
-              second.client_id);
-    ExpectOwners(access.Catalog(), {second});
+    EXPECT_EQ(access.FindOwnerClientId(first.segment.name), second.client_id);
+    ExpectOwners(SegmentPoolTestPeer::Catalog(access), {second});
 }
 
 TEST(SegmentPoolOwnershipTest,
@@ -368,10 +395,10 @@ TEST(SegmentPoolOwnershipTest,
             for (auto& region : regions) region.segment.host_id.clear();
         }
         auto view = restored.AcquireReadAccess();
-        ExpectOwners(view.Catalog(), regions);
-        EXPECT_EQ(view.Catalog().FindOwnerClientId(regions[0].segment.name),
+        ExpectOwners(SegmentPoolTestPeer::Catalog(view), regions);
+        EXPECT_EQ(view.FindOwnerClientId(regions[0].segment.name),
                   regions[5].client_id);
-        const auto* entry = view.Placement().Find(
+        const auto* entry = SegmentPoolTestPeer::Placement(view).Find(
             regions[0].segment.name, AllocationCandidateKind::NATIVE);
         ASSERT_NE(entry, nullptr);
         EXPECT_EQ(entry->candidates.size(), 2U);

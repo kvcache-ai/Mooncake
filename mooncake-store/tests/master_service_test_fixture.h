@@ -7,6 +7,10 @@
 
 #pragma once
 
+#include "client_registry_test_peer.h"
+
+#include "segment_pool_test_peer.h"
+
 #include "master_service.h"
 #include "segment/pool_read_access.h"
 #include "segment/pool_write_access.h"
@@ -60,43 +64,46 @@ class MasterServiceTest : public ::testing::Test {
         service.replica_cleanup_worker_.Schedule();
     }
 
-    std::shared_ptr<ClientLivenessRecord> FindClientLivenessForTest(
-        MasterService& service, const UUID& client_id) {
-        return service.FindClientRecord(client_id);
+    ClientSessionPtr FindClientLivenessForTest(MasterService& service,
+                                               const UUID& client_id) {
+        return service.client_registry_.Find(client_id);
     }
 
     bool ProcessClientOffboardingForTest(MasterService& service,
                                          ClientOffboardingJob& job) {
-        return service.ProcessClientOffboardingJob(job);
+        return ClientRegistryTestPeer::ProcessPreparedJob(
+            service.client_registry_, job);
     }
 
     tl::expected<RegionUnmountTxn, ErrorCode> PrepareUnmountSegmentForTest(
         MasterService& service, const UUID& segment_id, const UUID& client_id) {
-        auto access = service.segment_pool_.AcquireWriteAccess();
-        return access.PrepareUnmount(segment_id, client_id);
+        auto access = service.segment_pool_->AcquireWriteAccess();
+        return SegmentPoolTestPeer::PrepareUnmount(access, segment_id,
+                                                   client_id);
     }
 
     ErrorCode CommitUnmountSegmentForTest(MasterService& service,
                                           RegionUnmountTxn&& transaction) {
-        auto access = service.segment_pool_.AcquireWriteAccess();
+        auto access = service.segment_pool_->AcquireWriteAccess();
         return std::move(transaction).Commit(access);
     }
 
     uint64_t SegmentGenerationForTest(MasterService& service,
                                       const UUID& segment_id) {
-        auto access = service.segment_pool_.AcquireReadAccess();
-        const auto* region = access.Catalog().Find(segment_id);
+        auto access = service.segment_pool_->AcquireReadAccess();
+        const auto* region =
+            SegmentPoolTestPeer::Catalog(access).Find(segment_id);
         EXPECT_NE(region, nullptr);
         return region ? region->generation : 0;
     }
 
     std::chrono::seconds ClientOffboardingRetryDelayForTest(
         uint64_t retry_count) {
-        return ClientOffboardingWorker::RetryDelay(retry_count);
+        return ClientRegistryTestPeer::RetryDelay(retry_count);
     }
 
     bool ClientOffboardingShouldAlertForTest(uint64_t retry_count) {
-        return ClientOffboardingWorker::ShouldAlert(retry_count);
+        return ClientRegistryTestPeer::ShouldAlert(retry_count);
     }
 
     // Runs the stale-handle sweep inline. The fixture is a friend of
