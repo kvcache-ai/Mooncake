@@ -190,6 +190,11 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
+    // Probe whether every metadata shard's read lock can be acquired within a
+    // bounded budget. Used by the master self-health probe; no client_id, no
+    // mount, no side effects.
+    tl::expected<HealthCheckResponse, ErrorCode> HealthCheck();
+
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
 
     tl::expected<std::vector<TenantQuotaSnapshot>, ErrorCode>

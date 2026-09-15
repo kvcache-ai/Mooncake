@@ -9,7 +9,16 @@
 #include <thread>
 
 #include <glog/logging.h>
+#include <gflags/gflags.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+DEFINE_bool(enable_rpc_health_probe, true,
+            "Enable the loopback HealthCheck self-probe that drives /readyz "
+            "and the mooncake_master_rpc_responsive gauge");
+DEFINE_int32(rpc_probe_interval_seconds, 5,
+             "Interval between loopback HealthCheck probes in seconds");
+DEFINE_int32(rpc_probe_timeout_seconds, 3,
+             "Timeout for each loopback HealthCheck probe in seconds");
 
 #include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
@@ -646,6 +655,11 @@ int MasterServiceSupervisor::Start() {
     mooncake::MasterAdminServer admin_server(
         static_cast<uint16_t>(config_.metrics_port),
         config_.enable_metric_reporting, config_.metrics_host);
+    admin_server.ConfigureRpcProbe(
+        config_.rpc_address, static_cast<uint16_t>(config_.rpc_port),
+        FLAGS_enable_rpc_health_probe,
+        std::chrono::seconds(FLAGS_rpc_probe_interval_seconds),
+        std::chrono::seconds(FLAGS_rpc_probe_timeout_seconds));
     if (!admin_server.Start()) {
         LOG(ERROR) << "Failed to start master admin server, metrics_port="
                    << config_.metrics_port;
