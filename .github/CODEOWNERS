@@ -19,6 +19,12 @@
 /python/mooncake/mooncake_elastic_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/mooncake/mooncake_ep_buffer.py @UNIDY2002 @ympcMark @yuechen-sys
 /python/tests/ep/ @UNIDY2002 @ympcMark @yuechen-sys
+/python/mooncake/cli.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli_client.py @ykwd @stmatengss @zxpdemonio
+/python/mooncake/cli_bench.py @ShangmingCai @alogfans @stmatengss
+/python/mooncake/transfer_engine_topology_dump.py @ShangmingCai @alogfans @stmatengss
+/python/tests/integration/test_cli.py @ShangmingCai @stmatengss @zxpdemonio
+/python/tests/unit/test_cli_modules.py @ShangmingCai @stmatengss @zxpdemonio
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q @staryxchen
 /mooncake-transfer-engine/tent @alogfans @doujiang24 @chestnut-Q @staryxchen @00fish0 @dtcccc
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov

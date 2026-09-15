@@ -180,11 +180,16 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage migrated EP modules and the legacy Reshard package for the combined
+# Stage migrated EP and CLI modules and the legacy Reshard package for the combined
 # wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
+    _launcher.py
+    cli.py
+    cli_bench.py
+    cli_client.py
+    transfer_engine_topology_dump.py
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py
