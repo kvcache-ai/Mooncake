@@ -117,6 +117,7 @@ jobs:
           cd build
           cmake_args=(
             -DUSE_MUSA=ON
+            -DWITH_EP=ON
             -DUSE_HTTP=ON
             -DUSE_ETCD=ON
             -DSTORE_USE_ETCD=ON
@@ -133,6 +134,8 @@ jobs:
           set -eo pipefail
           export PYTHONPATH="${PYTHONPATH:-}"
           export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
+          # Limit the nested PG setup.py build to avoid OOM in the release container.
+          export MAX_JOBS=2
           cd build
           cmake --build . -j"$(nproc)"
 
