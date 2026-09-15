@@ -3537,6 +3537,8 @@ struct MasterService::LegacyRestoreContext {
     size_t& already_existing_count;
     std::vector<std::pair<TenantId, std::string>>& repair_remove_keys;
     std::vector<std::pair<TenantId, std::string>>& repair_canonical_keys;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>& new_known_owner_records;
 
     struct AcceptedEntry {
         const StandbyObjectEntry* entry;
@@ -3563,6 +3565,21 @@ void MasterService::NoteLegacyStandbyRejection(LegacyRestoreContext& ctx,
                  << entry.key << ", reason=" << reason;
     MasterMetricManager::instance().inc_standby_restore_rejected_objects(
         reason);
+}
+
+std::shared_ptr<ClientLivenessRecord> MasterService::RecordRestoreKnownOwner(
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>& new_known_owner_records,
+    const UUID& owner) {
+    if (const auto existing = client_liveness_records_.find(owner);
+        existing != client_liveness_records_.end()) {
+        return existing->second;
+    }
+    auto [record, inserted] = new_known_owner_records.try_emplace(
+        owner, std::make_shared<ClientLivenessRecord>(
+                   ClientLivenessRecord::Clock::now()));
+    (void)inserted;
+    return record->second;
 }
 
 tl::expected<void, ErrorCode> MasterService::ValidateLegacyStandbyEntries(
@@ -3803,10 +3820,12 @@ tl::expected<void, ErrorCode> MasterService::ConstructLegacyStandbyReplicas(
                     construction_ok = false;
                     break;
                 }
-                replicas.push_back(Replica(desc.id, local_disk_desc.client_id,
-                                           local_disk_desc.object_size,
-                                           local_disk_desc.transport_endpoint,
-                                           desc.status));
+                replicas.push_back(Replica(
+                    desc.id, local_disk_desc.client_id,
+                    local_disk_desc.object_size,
+                    local_disk_desc.transport_endpoint, desc.status,
+                    RecordRestoreKnownOwner(ctx.new_known_owner_records,
+                                            local_disk_desc.client_id)));
             } else {
                 LOG(ERROR) << "RestoreFromStandbySnapshot: unsupported replica "
                            << "descriptor, tenant="
@@ -3929,15 +3948,7 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
                        boost::hash<UUID>>
         new_known_owner_records;
     const auto record_for_known_owner = [&](const UUID& owner) {
-        const auto existing = client_liveness_records_.find(owner);
-        if (existing != client_liveness_records_.end()) {
-            return existing->second;
-        }
-        auto [record, inserted] = new_known_owner_records.try_emplace(
-            owner, std::make_shared<ClientLivenessRecord>(
-                       ClientLivenessRecord::Clock::now()));
-        (void)inserted;
-        return record->second;
+        return RecordRestoreKnownOwner(new_known_owner_records, owner);
     };
 
     const auto& resolve_standby_object = ResolveStandbyObject;
@@ -4285,10 +4296,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
     if (legacy_objects) {
         LegacyRestoreContext legacy_ctx{
-            *legacy_objects,     memory_segments_by_alias,
-            restored_allocators, restored_accounted_memory_bytes,
-            rejected_count,      already_existing_count,
-            repair_remove_keys,  repair_canonical_keys};
+            *legacy_objects,        memory_segments_by_alias,
+            restored_allocators,    restored_accounted_memory_bytes,
+            rejected_count,         already_existing_count,
+            repair_remove_keys,     repair_canonical_keys,
+            new_known_owner_records};
         if (auto r = ValidateLegacyStandbyEntries(legacy_ctx); !r) {
             return tl::make_unexpected(r.error());
         }
