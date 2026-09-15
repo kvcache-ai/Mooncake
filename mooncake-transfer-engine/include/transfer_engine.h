@@ -65,6 +65,10 @@ enum class PeerLiveness : uint8_t {
 
 struct AutoDiscoverConfig {
     bool enabled = false;
+    // Transport hint, read whether or not auto-discovery is enabled: "efa"
+    // selects EFA, and on an Ascend Direct build the hint decides between
+    // Ascend Direct and the host transports. Written by setAutoDiscover(), or
+    // by the protocol argument of init() when that is not empty.
     std::string protocol;
 };
 
