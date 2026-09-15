@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <chrono>
 #include <exception>
+#include <thread>
 
 #include "common.h"
 #include "config.h"
@@ -1303,8 +1304,21 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
             if (status) *status = GetResult::kUnavailable;
             return nullptr;
         }
-        ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
-                                                  peer_json);
+        // Retry transient failures (the peer accepted the TCP connection but
+        // has not finished publishing its segment, or its listener is busy
+        // with a burst of concurrent handshakes). Three attempts with
+        // 100/200 ms backoff, ~300 ms of sleep in total; longer-lived
+        // recovery is left to the worker pool's slice-level retry.
+        constexpr int kMaxRetries = 3;
+        for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+            ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
+                                                      peer_json);
+            if (ret == 0) break;
+            if (attempt + 1 < kMaxRetries) {
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(100 * (1 << attempt)));
+            }
+        }
         if (ret) {
             if (status) *status = GetResult::kUnavailable;
             return nullptr;
@@ -1963,8 +1977,23 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     }
     auto local = TransferHandshakeUtil::encode(local_desc);
     Json::Value peer;
-    int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
+    // Retry transient failures (connection refused while the peer is still
+    // starting, short reads while its listener is busy with a burst of
+    // concurrent handshakes). Four attempts with 100/200/400 ms backoff,
+    // ~700 ms of sleep in total; longer-lived recovery is left to the worker
+    // pool's slice-level retry.
+    constexpr int kMaxRetries = 4;
+    int ret = 0;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        peer = Json::Value();
+        ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
+        if (ret == 0) break;
+        if (attempt + 1 < kMaxRetries) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100 * (1 << attempt)));
+        }
+    }
     if (ret) return ret;
     if (TransferHandshakeUtil::decode(peer, peer_desc)) {
         LOG(ERROR) << "Handshake from " << peer_server_name
@@ -1988,8 +2017,20 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
     }
     auto local = TransferNotifyUtil::encode(local_desc);
     Json::Value peer;
-    int ret = handshake_plugin_->sendNotify(
-        peer_location.ip_or_host_name, peer_location.rpc_port, local, peer);
+    // Same transient-failure retry as sendHandshake(): four attempts,
+    // 100/200/400 ms backoff, ~700 ms of sleep in total.
+    constexpr int kMaxRetries = 4;
+    int ret = 0;
+    for (int attempt = 0; attempt < kMaxRetries; ++attempt) {
+        peer = Json::Value();
+        ret = handshake_plugin_->sendNotify(
+            peer_location.ip_or_host_name, peer_location.rpc_port, local, peer);
+        if (ret == 0) break;
+        if (attempt + 1 < kMaxRetries) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(100 * (1 << attempt)));
+        }
+    }
     if (ret) return ret;
     TransferNotifyUtil::decode(peer, peer_desc);
     if (peer_desc.notify_msg.empty()) {
