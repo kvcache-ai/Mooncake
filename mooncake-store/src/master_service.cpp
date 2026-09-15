@@ -1600,7 +1600,14 @@ MasterService::GetOrCreateTenantCatalogHandle(const TenantId& tenant_id) {
     // the same absent tenant must both land on the winning TenantCatalog, or
     // the loser's object would live in a TenantCatalog the directory can never
     // reach again.
-    return catalog_.GetOrCreateTenant(tenant_id, [this, &tenant_id]() {
+    //
+    // The factory stays a call-site argument rather than a catalog member: it
+    // needs the owning service (quota table, multi-tenant flag), and the only
+    // way to bind it once would be a post-construction binding that adds a
+    // "must be bound before the first tenant is created" invariant. It also
+    // captures its tenant by value, so it stays correct if the directory ever
+    // invokes it outside this call.
+    return catalog_.GetOrCreateTenant(tenant_id, [this, tenant_id]() {
         auto handle = std::make_shared<metadata::TenantCatalog>();
         if (enable_multi_tenants_) {
             handle->BindQuotaAccount(
