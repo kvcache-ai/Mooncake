@@ -649,12 +649,11 @@ class MasterServiceHATest : public ::testing::Test {
         auto& tenant_state =
             service->GetOrCreateTenantState(shard_access.get(), tenant);
         tenant_state.promotion_tasks.emplace(
-            key, MasterService::PromotionTask{
-                     .source_id = 0,
-                     .alloc_id = alloc_id,
-                     .object_size = object_size,
-                     .start_time = std::chrono::system_clock::now(),
-                     .holder_id = holder_id});
+            key, PromotionTask{.source_id = 0,
+                               .alloc_id = alloc_id,
+                               .object_size = object_size,
+                               .start_time = std::chrono::system_clock::now(),
+                               .holder_id = holder_id});
     }
 
     static bool SnapshotManagerCreatedForTesting(const MasterService& service) {
