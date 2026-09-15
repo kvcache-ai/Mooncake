@@ -64,7 +64,6 @@ namespace ha {
 class SnapshotCatalogStore;
 class MasterSnapshotCodec;
 struct MasterSnapshotPayloads;
-class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
 class EtcdOpLogStore;
@@ -79,38 +78,9 @@ class OpLogBatchStorage;
 class OrderedOpLogWriter;
 struct MetadataStoragePlugin;
 
-// Forward declarations for test classes
 namespace test {
-class MasterServiceTest;
-class MasterServiceSnapshotTestBase;
-class SnapshotChildProcessTest;
-// Friended so the promotion-on-hit tests can drive a serialize/reset/
-// deserialize cycle directly via the otherwise-private
-// MetadataSerializer, and inspect private clamp fields. This avoids
-// standing up a full snapshot catalog + child-process harness, and
-// exposing test-only accessors on MasterService itself.
-class PromotionOnHitTest;
-class DynamicReplicationTest;
-class MasterServiceTenantQuotaTest;
-class MasterScenario;
-class MasterServiceHATest;
-// Friended so the processing_keys double-erase reproduction test can
-// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
-// ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
-class MasterServiceProcessingKeyDoubleEraseTest;
-// Friended so the LOCAL_DISK deregistration interleaving tests can run the
-// two halves of UnmountLocalDiskSegment (deregistration, replica sweep)
-// with a competing mount + register serialized between them, pinning the
-// interleaving instead of hoping a thread scheduler produces it.
-class LocalDiskUnmountInterleavingTest;
-// Friended so the #2997 regression test can call the private
-// PushOffloadingQueue directly with degenerate replica states that the
-// public PutStart/PutEnd path never produces.
-class MasterServiceSSDTest;
+class MasterServiceTestPeer;
 }  // namespace test
-namespace benchmarks {
-class BatchEvictBench;
-}  // namespace benchmarks
 
 // std::unordered_map/set never shrink their bucket array on erase, so a
 // container that once held millions of entries keeps its high-water bucket
@@ -151,29 +121,12 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 
 class MasterService {
-    // Test friend class for snapshot/restore testing
-    friend class test::MasterServiceSnapshotTestBase;
-    friend class test::MasterServiceTest;
-    friend class test::SnapshotChildProcessTest;
-    friend class test::PromotionOnHitTest;
-    friend class test::DynamicReplicationTest;
-    friend class benchmarks::BatchEvictBench;
-    friend class test::MasterServiceTenantQuotaTest;
-    // The scenario DSL controls lease timestamps so eviction tests do not
-    // depend on sleeps or the background eviction thread.
-    friend class test::MasterScenario;
-    // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
-    friend class test::MasterServiceProcessingKeyDoubleEraseTest;
-    friend class test::LocalDiskUnmountInterleavingTest;
-    // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
-    friend class test::MasterServiceSSDTest;
+    friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
-    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
-    friend class test::MasterServiceHATest;
 
    public:
     using NoFProbeFn =
@@ -188,11 +141,6 @@ class MasterService {
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
-    void SetNoFProbeFnForTesting(NoFProbeFn fn);
-    size_t GetMountedNoFSegmentCountForTesting();
-    bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
-    std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
-        const UUID& segment_id);
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
@@ -204,51 +152,9 @@ class MasterService {
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
-    ErrorCode SetBatchOpLogBackendForTesting(
-        std::shared_ptr<HaKvBackend> backend);
-    void SetBatchOpLogWriterFactoryForTesting(BatchOpLogWriterFactory factory);
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
-
-    /**
-     * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
-     *        unit tests can drive a single eviction cycle synchronously
-     *        without standing up the periodic eviction thread.
-     */
-    void RunBatchEvictForTesting(double evict_ratio_target,
-                                 double evict_ratio_lowerbound);
-    void RunNoFBatchEvictForTesting(double evict_ratio_target,
-                                    double evict_ratio_lowerbound);
-    void RunDfsEvictionForTesting();
-
-    /**
-     * @brief Test-only wrapper around EvictTenantsOverWatermark, the background
-     *        pass that drains any tenant over its own quota watermark. Lets a
-     *        test drive one pass synchronously instead of racing the periodic
-     *        eviction thread's 1 Hz tick.
-     */
-    void RunTenantEvictForTesting();
-
-    /**
-     * @brief Enables the tenant-epoch bookkeeping that decides whether
-     *        RemoveAll may publish `cleared`. Production turns this on from the
-     *        publisher config; tests need it without a live ZMQ socket.
-     */
-    void SetKvTenantEpochTrackingForTesting(bool enabled);
-    /**
-     * @brief Installs a callback invoked after each shard's lock is released
-     *        during a RemoveAll scan, receiving the shard index just finished.
-     *        Lets a test commit into an already-scanned shard
-     *        deterministically.
-     */
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
-    /**
-     * @brief Counts of `cleared` publications and of clears withheld because a
-     *        concurrent commit advanced the tenant epoch mid-scan.
-     */
-    uint64_t GetKvClearedPublishedForTesting() const;
-    uint64_t GetKvClearedSuppressedForTesting() const;
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -1792,6 +1698,8 @@ class MasterService {
     GroupDomain group_domain_;
 
     class SoftPinDeadlineIndex {
+        friend class test::MasterServiceTestPeer;
+
        public:
         using TimePoint = std::chrono::system_clock::time_point;
 
@@ -1808,9 +1716,6 @@ class MasterService {
                              const TimePoint& deadline);
         std::vector<Entry> PopExpired(const TimePoint& now);
         void Clear();
-
-        size_t HeapSizeForTest() const;
-        size_t RegistrationCountForTest() const;
 
        private:
         struct Registration {
@@ -2282,9 +2187,6 @@ class MasterService {
     bool IsTransientResult(PromotionQueueResult result) const;
     size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
     size_t RunPromotionCandidateRetry();
-    size_t RunPromotionCandidateRetryForTesting();
-    size_t CountCandidatesForTesting(const TenantId& tenant_id);
-    void ResetCandidateBackoffsForTesting();
 
     // Erase any in-flight PromotionTask for `key`, refund its pending charge,
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task

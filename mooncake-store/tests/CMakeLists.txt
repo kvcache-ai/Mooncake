@@ -6,6 +6,7 @@ function(add_store_test name)
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
+           master_service_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
@@ -23,6 +24,7 @@ function(add_ha_test name)
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
+           master_service_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
