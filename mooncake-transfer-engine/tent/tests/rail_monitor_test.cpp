@@ -397,8 +397,8 @@ TEST(RailMonitorRecoverTest, CooldownDoesNotCarryOverAfterRecovery) {
 // once when a fresh pause arms; errors arriving while already paused are
 // no-ops.
 //
-// error_threshold=1, cooldown=1s, probe_interval disabled (60s). 8 rapid
-// markFailed calls must arm resume_time at now+1s, not now+256s.
+// error_threshold=1, cooldown=1s. 8 rapid markFailed calls must arm resume_time
+// at now+1s, not now+256s.
 // ---------------------------------------------------------------------------
 
 TEST(RailMonitorBurstTest, BurstFailuresDoNotEscalateCooldown) {
@@ -409,7 +409,6 @@ TEST(RailMonitorBurstTest, BurstFailuresDoNotEscalateCooldown) {
     cfg.set(RailMonitor::kCfgErrorThreshold, 1);
     cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
     cfg.set(RailMonitor::kCfgCooldownSecs, 1);
-    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);  // disable probing
 
     RailMonitor rail;
     ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
@@ -429,17 +428,24 @@ TEST(RailMonitorBurstTest, BurstFailuresDoNotEscalateCooldown) {
 }
 
 // ---------------------------------------------------------------------------
-// Core fix: when the cooldown timer expires, available() must NOT reopen the
-// rail to all traffic. It admits exactly ONE trial transfer (Half-Open) and
-// refuses the next caller, so a still-dead peer is not slammed with every
-// slice — that was the storm the breaker exists to prevent, previously
-// recurring at 30s/60s/120s intervals.
+// Defect A (cross-cycle): cooldown-expiry RETAINS the cooldown so a rail that
+// fails again right after expiry backs off harder. (cooldown is reset to 0
+// only by markRecovered, a proven-healthy recovery.) This is the escalation
+// path that the old "reset cooldown on expiry" behavior collapsed.
 //
-// error_threshold=1, cooldown=1s, probe_interval disabled (60s) so the
-// Half-Open trial admits exactly one and does not re-admit within the test.
+// Open-phase probing and Half-Open (admit one trial on expiry, escalate on
+// trial failure) are out of scope for this PR: available() is a mutating
+// admit used as a predicate across updateBestMapping / fallback / GDR, and
+// with default probe_interval=1s there is no in-flight tracking, so a second
+// probe can go out while the first is still on the wire. They land in a
+// follow-up once available() is split into a non-mutating predicate plus an
+// admit() with in-flight tracking.
+//
+// error_threshold=1, cooldown=1s. Cycle 1: pause 1s, expire. Cycle 2: re-fail
+// must escalate to 2s.
 // ---------------------------------------------------------------------------
 
-TEST(RailMonitorHalfOpenTest, ExpiryAdmitsOneTrialNotFullReopen) {
+TEST(RailMonitorEscalationTest, ExpiryRetainsCooldownForNextCycle) {
     auto local = makeSingleNicTopology("mlx5_0");
     auto remote = makeSingleNicTopology("mlx5_1");
 
@@ -447,45 +453,6 @@ TEST(RailMonitorHalfOpenTest, ExpiryAdmitsOneTrialNotFullReopen) {
     cfg.set(RailMonitor::kCfgErrorThreshold, 1);
     cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
     cfg.set(RailMonitor::kCfgCooldownSecs, 1);
-    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);  // one trial, no re-admit
-
-    RailMonitor rail;
-    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
-
-    rail.markFailed(0, 0);
-    EXPECT_FALSE(rail.available(0, 0));
-
-    // Cooldown (1s) expires. The first caller gets the single Half-Open trial.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_TRUE(rail.available(0, 0)) << "Expiry must admit one trial";
-
-    // The very next caller must NOT get through — the rail is Half-Open, not
-    // fully reopened. A full reopen (the old bug) would return true here and
-    // flood a still-dead peer.
-    EXPECT_FALSE(rail.available(0, 0))
-        << "After the trial is admitted, subsequent callers must be refused; "
-           "expiry must not reopen all traffic.";
-}
-
-// ---------------------------------------------------------------------------
-// Half-Open trial failure escalates the cooldown and re-arms the pause.
-// Escalation happens on the PROBE/TRIAL RESULT, not because the clock fired
-// (elapsed time does not prove the path is healthy).
-//
-// error_threshold=1, cooldown=1s, probe disabled. Cycle 1: pause 1s, expire,
-// trial fails -> escalate 1->2s. Cycle 2: 2s cooldown, expire, trial admitted.
-// ---------------------------------------------------------------------------
-
-TEST(RailMonitorHalfOpenTest, TrialFailureEscalatesCooldown) {
-    auto local = makeSingleNicTopology("mlx5_0");
-    auto remote = makeSingleNicTopology("mlx5_1");
-
-    Config cfg;
-    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
-    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
-    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
-    cfg.set(RailMonitor::kCfgProbeIntervalSecs,
-            60);  // disable exploratory probes
 
     RailMonitor rail;
     ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
@@ -496,7 +463,8 @@ TEST(RailMonitorHalfOpenTest, TrialFailureEscalatesCooldown) {
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     ASSERT_TRUE(rail.available(0, 0)) << "Cycle 1 cooldown (1s) must expire";
 
-    // The trial admitted at expiry fails: escalation 1->2s, re-arm.
+    // Cycle 2: fail again. Expiry retained cooldown=1s (not proven healthy),
+    // so markFailed escalates 1->2s.
     rail.markFailed(0, 0);
     EXPECT_FALSE(rail.available(0, 0));
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
@@ -504,78 +472,6 @@ TEST(RailMonitorHalfOpenTest, TrialFailureEscalatesCooldown) {
         << "Cycle 2 must use the escalated 2s cooldown; 1.1s is not enough.";
     std::this_thread::sleep_for(std::chrono::milliseconds(1400));
     EXPECT_TRUE(rail.available(0, 0)) << "Cycle 2 (2s) must expire by ~2.5s.";
-}
-
-// ---------------------------------------------------------------------------
-// Half-Open trial success closes the rail and resets backoff, so the next
-// failure starts from the initial cooldown, not a doubled leftover.
-//
-// error_threshold=1, cooldown=1s, probe disabled. Pause, expire to Half-Open,
-// trial succeeds (markRecovered). The next pause must use 1s, not 2s.
-// ---------------------------------------------------------------------------
-
-TEST(RailMonitorHalfOpenTest, TrialSuccessResetsBackoff) {
-    auto local = makeSingleNicTopology("mlx5_0");
-    auto remote = makeSingleNicTopology("mlx5_1");
-
-    Config cfg;
-    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
-    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
-    cfg.set(RailMonitor::kCfgCooldownSecs, 1);
-    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 60);
-
-    RailMonitor rail;
-    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
-
-    // Pause, let it expire to Half-Open, then the trial succeeds.
-    rail.markFailed(0, 0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    ASSERT_TRUE(rail.available(0, 0)) << "Half-Open trial admitted";
-    rail.markRecovered(0, 0);
-    EXPECT_TRUE(rail.available(0, 0)) << "Trial success must close the rail";
-
-    // Next pause must use the initial 1s cooldown (backoff was reset), not 2s
-    // that a leftover-from-Half-Open value would produce.
-    rail.markFailed(0, 0);
-    EXPECT_FALSE(rail.available(0, 0));
-    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
-    EXPECT_TRUE(rail.available(0, 0))
-        << "After a successful trial, the next pause must use the initial 1s "
-           "cooldown; staying paused past 1.5s indicates backoff carried over.";
-}
-
-// ---------------------------------------------------------------------------
-// Defect B: while a rail is paused, available() admits one transfer every
-// probe_interval as a recovery probe. A probe that succeeds (simulated via
-// markRecovered) un-pauses early, instead of waiting out the full cooldown.
-// ---------------------------------------------------------------------------
-
-TEST(RailMonitorProbeTest, ProbeAdmitsTransferDuringCooldown) {
-    auto local = makeSingleNicTopology("mlx5_0");
-    auto remote = makeSingleNicTopology("mlx5_1");
-
-    Config cfg;
-    cfg.set(RailMonitor::kCfgErrorThreshold, 1);
-    cfg.set(RailMonitor::kCfgErrorWindowSecs, 60);
-    cfg.set(RailMonitor::kCfgCooldownSecs, 10);  // long cooldown
-    cfg.set(RailMonitor::kCfgProbeIntervalSecs, 1);
-
-    RailMonitor rail;
-    ASSERT_TRUE(rail.load(local, remote, "", &cfg).ok());
-
-    rail.markFailed(0, 0);
-    // Immediately: probe throttled (last_probe_time armed to now on pause).
-    EXPECT_FALSE(rail.available(0, 0));
-
-    // After one probe_interval, available() admits a probe transfer.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    EXPECT_TRUE(rail.available(0, 0))
-        << "Probe must fire after probe_interval to test peer recovery.";
-
-    // The probe slice succeeds (simulated): markRecovered clears the pause
-    // well before the 10s cooldown would have elapsed.
-    rail.markRecovered(0, 0);
-    EXPECT_TRUE(rail.available(0, 0));
 }
 
 }  // namespace

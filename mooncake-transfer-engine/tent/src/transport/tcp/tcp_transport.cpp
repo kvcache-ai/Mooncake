@@ -210,7 +210,9 @@ void TcpTransport::startTransfer(TcpTask *task) {
         auto status = doTransferWithRetry(task);
         completed = status.ok();
         if (!completed) {
-            LOG(WARNING) << "TCP transfer failed: " << status.ToString();
+            VLOG(1) << "TCP transfer failed: " << status.ToString();
+            LOG_EVERY_N(WARNING, 100)
+                << "TCP transfer failed: " << status.ToString();
         }
     } catch (const std::exception &error) {
         // enqueue() stores exceptions in a future which the submit path does
