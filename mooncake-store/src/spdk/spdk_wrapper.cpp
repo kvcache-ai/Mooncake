@@ -406,6 +406,7 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     }
 
     if (probe_buffer->ptr != nullptr && probe_buffer->size == block_size) {
+        probe_buffer->in_flight = true;
         return probe_buffer.get();
     }
 
@@ -424,7 +425,36 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
         return nullptr;
     }
     probe_buffer->size = block_size;
+    probe_buffer->in_flight = true;
     return probe_buffer.get();
+}
+
+void SpdkWrapper::MarkProbeBufferIdle(const std::string &tr_str) {
+    std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+    auto it = probe_buffers_.find(tr_str);
+    if (it != probe_buffers_.end() && it->second) {
+        it->second->in_flight = false;
+    }
+}
+
+void SpdkWrapper::ReleaseProbeResources(const std::string &tr_str) {
+    std::lock_guard<std::mutex> lock(probe_buffers_mutex_);
+    auto it = probe_buffers_.find(tr_str);
+    if (it == probe_buffers_.end()) {
+        return;
+    }
+    if (it->second && it->second->in_flight) {
+        // The last probe never completed, so the controller may still DMA
+        // into this buffer. Keep it until Cleanup() tears the device down.
+        LOG(WARNING) << "endpoint=" << tr_str
+                     << ", action=skip_release_nof_probe_buffer"
+                     << ", reason=probe_in_flight";
+        return;
+    }
+    if (it->second && it->second->ptr) {
+        spdk_free(it->second->ptr);
+    }
+    probe_buffers_.erase(it);
 }
 
 bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
@@ -464,6 +494,7 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                             ProbeReadComplete, probe_ctx);
     if (ret != 0) {
         RecycleProbeRequestContext(probe_ctx);
+        MarkProbeBufferIdle(tr_str);
         if (error_reason) {
             *error_reason = "submit_fail";
         }
@@ -476,6 +507,11 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
            std::chrono::steady_clock::now() < deadline) {
         NvmePollProcessCompletion(seg_handle, 0);
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (probe_ctx->done.load(std::memory_order_acquire)) {
+        // The request completed, so nothing references the buffer any more.
+        MarkProbeBufferIdle(tr_str);
     }
 
     bool ok = probe_ctx->done.load(std::memory_order_acquire) &&
