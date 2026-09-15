@@ -93,17 +93,17 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
-    nvme_kv_backend.cpp
-    nvme_kv_connector.cpp
-    config/nvme_kv_connector_config.cpp
-    config/nvme_kv_io_concurrency_config.cpp
-    config/nvme_kv_u32_parser.cpp
-    nvme_kv_executor_io_uring.cpp
-    nvme_kv_executor_ioctl.cpp
-    nvme_kv_executor_util.cpp
-    nvme_kv_key_codec.cpp
-    nvme_kv_key_conflict_policy.cpp
-    nvme_kv_object_layout.cpp
+    nvme_kv/nvme_kv_backend.cpp
+    nvme_kv/nvme_kv_connector.cpp
+    nvme_kv/config/nvme_kv_connector_config.cpp
+    nvme_kv/config/nvme_kv_io_concurrency_config.cpp
+    nvme_kv/config/nvme_kv_u32_parser.cpp
+    nvme_kv/nvme_kv_executor_io_uring.cpp
+    nvme_kv/nvme_kv_executor_ioctl.cpp
+    nvme_kv/nvme_kv_executor_util.cpp
+    nvme_kv/nvme_kv_key_codec.cpp
+    nvme_kv/nvme_kv_key_conflict_policy.cpp
+    nvme_kv/nvme_kv_object_layout.cpp
     transfer_task.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -144,7 +144,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     engram/engram_store.cpp)
 
 if(BUILD_UNIT_TESTS)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/nvme_kv_executor_stub.cpp)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")

@@ -1,4 +1,4 @@
-#include "../src/config/nvme_kv_connector_config.h"
+#include "../../src/nvme_kv/config/nvme_kv_connector_config.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
