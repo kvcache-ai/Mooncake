@@ -54,6 +54,7 @@ class TaskCongestionObservation {
         delete;
 
     bool beginAttempt(uint64_t attempt_id, size_t submitted_slice_count);
+    bool extendAttempt(uint64_t attempt_id, size_t submitted_slice_count);
     bool defer(size_t slice_id, uint64_t attempt_id,
                const TaskCongestionEvidence& evidence);
     bool avoid(size_t slice_id, uint64_t attempt_id,

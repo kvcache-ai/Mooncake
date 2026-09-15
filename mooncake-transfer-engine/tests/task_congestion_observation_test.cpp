@@ -129,6 +129,21 @@ TEST(TaskCongestionObservationTest, NewAttemptCanUseMoreSubmittedSlices) {
     EXPECT_EQ(detail.slice_id.value, 1);
 }
 
+TEST(TaskCongestionObservationTest, PublishedSlicesExtendCurrentAttempt) {
+    TaskCongestionObservation task(1, 1);
+    EXPECT_TRUE(task.defer(0, 1, windowEvidence()));
+    EXPECT_TRUE(task.extendAttempt(1, 3));
+    EXPECT_FALSE(task.extendAttempt(0, 4));
+    EXPECT_FALSE(task.extendAttempt(1, 2));
+
+    TaskCongestionEvidence isolation;
+    isolation.reason = TaskCongestionReason::kPathQuarantined;
+    EXPECT_TRUE(task.avoid(2, 1, isolation));
+    EXPECT_EQ(task.state(), TaskCongestionState::kLongUnavailable);
+    EXPECT_TRUE(task.resolve(2, 1));
+    EXPECT_EQ(task.state(), TaskCongestionState::kCongested);
+}
+
 TEST(TaskCongestionObservationTest,
      SlicesOnDifferentControllerGenerationsShareAttempt) {
     TaskCongestionObservation task(2, 1);

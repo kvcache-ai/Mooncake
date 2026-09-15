@@ -39,6 +39,16 @@ bool TaskCongestionObservation::beginAttempt(uint64_t attempt_id,
     return true;
 }
 
+bool TaskCongestionObservation::extendAttempt(uint64_t attempt_id,
+                                              size_t submitted_slice_count) {
+    std::lock_guard lock(mutex_);
+    if (!currentAttempt(attempt_id) || submitted_slice_count < slice_count_)
+        return false;
+    if (!slices_.empty()) slices_.resize(submitted_slice_count);
+    slice_count_ = submitted_slice_count;
+    return true;
+}
+
 bool TaskCongestionObservation::defer(size_t slice_id, uint64_t attempt_id,
                                       const TaskCongestionEvidence& evidence) {
     return record(slice_id, attempt_id, TaskCongestionState::kCongested,
