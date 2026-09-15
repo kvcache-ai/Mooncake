@@ -338,8 +338,25 @@ export MC_INTRANODE_NVLINK=true
 **Requirements:**
 - Linux POSIX shm (`/dev/shm`)
 - Buffers allocated with `TransferEngine::allocateSharedMemory` (ordinary `malloc` cannot be exported)
-- Runtime opt-in: `MC_FORCE_SHM=1`, or `installTransport("shm")`. With `-DENABLE_MULTI_PROTOCOL=ON` this adds SHM next to RDMA/TCP (`rdma,shm` / `tcp,shm`); without it, SHM is the only transport.
+- Runtime opt-in: `MC_FORCE_SHM=1`, or `installTransport("shm")` / Python `initialize(..., protocol="shm")`. With `-DENABLE_MULTI_PROTOCOL=ON` this adds SHM next to RDMA/TCP (`rdma,shm` / `tcp,shm`); without it, SHM is the only transport.
 - Same-host SHM **and** cross-host RDMA/TCP in one engine: build with `-DENABLE_MULTI_PROTOCOL=ON` (segment protocol becomes `rdma,shm` or `tcp,shm`)
+- Python `allocate_managed_buffer` uses POSIX shm when SHM is installed (buddy slabs are 256 MiB). Ordinary `numpy`/`malloc` buffers still cannot be exported as SHM.
+
+**Configuration:**
+```python
+# Python API
+engine.initialize(
+    "127.0.0.1:12345",
+    "P2PHANDSHAKE",
+    "shm",
+    ""
+)
+```
+
+```bash
+# Environment variables (classic Transfer Engine init)
+export MC_FORCE_SHM=1
+```
 
 **Limitations:**
 - Same host only. Without `ENABLE_MULTI_PROTOCOL`, `MC_FORCE_SHM=1` (or `installTransport("shm")` after another transport) sets `segment.protocol` to `shm` and replaces RDMA/TCP routing; `installTransport("shm")` logs a WARNING when it overwrites a non-empty protocol. Coexistence needs `-DENABLE_MULTI_PROTOCOL=ON`.
