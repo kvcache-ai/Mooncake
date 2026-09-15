@@ -12,11 +12,6 @@ namespace mooncake {
 
 class PlacementIndex;
 
-using RegionMountTxn = SegmentPool::WriteAccess::RegionMountTxn;
-using RegionUnmountTxn = SegmentPool::WriteAccess::RegionUnmountTxn;
-using RegionGracefulUnmountTxn =
-    SegmentPool::WriteAccess::RegionGracefulUnmountTxn;
-
 // A prepared mount that has not yet been published to the catalog or
 // placement index. Destroying an uncommitted transaction releases the staged
 // driver resource.
@@ -39,9 +34,6 @@ class SegmentPool::WriteAccess::RegionMountTxn final {
     std::vector<std::unique_ptr<AllocatedBuffer>> TakeImportedBuffers() {
         return resource_.TakeImportedBuffers();
     }
-    void BindClientSession(ClientSessionPtr session) {
-        session_ = std::move(session);
-    }
     uint64_t imported_requested_bytes() const noexcept {
         return imported_requested_bytes_;
     }
@@ -59,7 +51,6 @@ class SegmentPool::WriteAccess::RegionMountTxn final {
           previous_allocator_(std::move(previous_allocator)) {}
 
    private:
-    ClientSessionPtr session_;
     MountedRegion mounted_;
     bool existed_;
     bool account_capacity_metrics_;

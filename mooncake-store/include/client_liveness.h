@@ -59,20 +59,11 @@ class ClientLivenessRecord {
         RetainingGuard(RetainingGuard&&) noexcept = default;
         RetainingGuard& operator=(RetainingGuard&&) noexcept = default;
 
-        // Commit a successful observation without releasing the transition
-        // barrier held across resource publication.
-        ClientLivenessObservation Observe(TimePoint now) {
-            return record_->CommitObservationLocked(
-                now, record_->state_.load(std::memory_order_relaxed));
-        }
-
        private:
         friend class ClientLivenessRecord;
-        RetainingGuard(ClientLivenessRecord& record,
-                       std::unique_lock<std::mutex>&& lock)
-            : record_(&record), lock_(std::move(lock)) {}
+        explicit RetainingGuard(std::unique_lock<std::mutex>&& lock)
+            : lock_(std::move(lock)) {}
 
-        ClientLivenessRecord* record_;
         std::unique_lock<std::mutex> lock_;
     };
 
@@ -103,7 +94,7 @@ class ClientLivenessRecord {
             ClientLivenessState::OFFLINE) {
             return std::nullopt;
         }
-        return RetainingGuard(*this, std::move(lock));
+        return RetainingGuard(std::move(lock));
     }
 
     [[nodiscard]] ClientLivenessObservation Observe(TimePoint now) {

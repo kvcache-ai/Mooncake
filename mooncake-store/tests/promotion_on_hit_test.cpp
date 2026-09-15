@@ -2,8 +2,6 @@
 // the master-service entry points directly without going through the RPC
 // layer.
 
-#include "segment_pool_test_peer.h"
-
 #include "master_service.h"
 #include "segment/pool_read_access.h"
 
@@ -100,7 +98,7 @@ class PromotionOnHitTest : public ::testing::Test {
 
     static void MarkClientOfflineForTesting(MasterService* service,
                                             const UUID& client_id) {
-        auto record = service->client_registry_.Find(client_id);
+        auto record = service->FindClientRecord(client_id);
         ASSERT_TRUE(record);
         const auto now = ClientLivenessRecord::Clock::now();
         ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
@@ -166,9 +164,8 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const UUID& segment_id, size_t size) {
         std::shared_ptr<BufferAllocatorBase> allocator;
         {
-            auto segment_access = service->segment_pool_->AcquireReadAccess();
-            allocator =
-                SegmentPoolTestPeer::GetAllocator(segment_access, segment_id);
+            auto segment_access = service->segment_pool_.AcquireReadAccess();
+            allocator = segment_access.GetAllocator(segment_id);
         }
         if (!allocator) {
             return nullptr;

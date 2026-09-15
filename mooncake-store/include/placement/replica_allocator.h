@@ -46,9 +46,6 @@ struct PlacementConstraints final {
 struct HostAffinity final {
     std::string_view writer_host_id;
     std::string_view object_key;
-    // Request-level preference; SegmentPool also considers its placement
-    // policy.
-    bool prefer_alloc_in_same_node{false};
 };
 
 struct ReplicaAllocationRequest final {
@@ -117,5 +114,15 @@ extern template class ReplicaAllocator<FreeRatioFirstPlacementPolicy>;
 extern template class ReplicaAllocator<SsdFreeRatioFirstPlacementPolicy>;
 extern template class ReplicaAllocator<LocalFirstPlacementPolicy>;
 extern template class ReplicaAllocator<PreferredOnlyPlacementPolicy>;
+
+inline RandomPlacementPolicy MakeNoFPlacementPolicy(
+    const SsdFreeRatioFirstPlacementPolicy&) {
+    return {};
+}
+
+template <ReplicaPlacementPolicy Policy>
+Policy MakeNoFPlacementPolicy(const Policy& memory_policy) {
+    return memory_policy;
+}
 
 }  // namespace mooncake

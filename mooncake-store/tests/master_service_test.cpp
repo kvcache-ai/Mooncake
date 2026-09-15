@@ -2842,59 +2842,6 @@ TEST_F(MasterServiceTest, ClientOffboardingRetryPolicy) {
     EXPECT_TRUE(ClientOffboardingShouldAlertForTest(11));
 }
 
-TEST_F(MasterServiceTest,
-       MountObservationCommitsOnlyForSuccessfulRegistration) {
-    MasterService service;
-    const UUID owner = generate_uuid();
-    auto segment = MakeSegment("mount-session");
-    ASSERT_TRUE(service.MountSegment(segment, owner));
-    const auto session = FindClientLivenessForTest(service, owner);
-    ASSERT_TRUE(session);
-    ASSERT_EQ(session->Evaluate(ClientSession::Clock::now(),
-                                std::chrono::seconds(0), std::chrono::hours(1)),
-              ClientLivenessTransition::BECAME_SUSPECTED);
-    MasterMetricManager::instance().client_liveness_became_suspected();
-
-    auto conflict = segment;
-    conflict.size += 4096;
-    EXPECT_FALSE(service.MountSegment(conflict, owner));
-    EXPECT_EQ(session->state(), ClientLivenessState::SUSPECTED);
-    const UUID wrong_owner = generate_uuid();
-    EXPECT_FALSE(service.MountSegment(segment, wrong_owner));
-    EXPECT_FALSE(FindClientLivenessForTest(service, wrong_owner));
-
-    // An idempotent mount observes the existing incarnation, not a new record.
-    ASSERT_TRUE(service.MountSegment(segment, owner));
-    EXPECT_EQ(FindClientLivenessForTest(service, owner), session);
-    EXPECT_EQ(session->state(), ClientLivenessState::ACTIVE);
-}
-
-TEST_F(MasterServiceTest, StaleOffboardingCannotRetireReplacementSession) {
-    MasterService service;
-    const UUID owner = generate_uuid();
-    const auto segment = MakeSegment("replacement-session");
-    ASSERT_TRUE(service.MountSegment(segment, owner));
-    ClientOffboardingJob old_job;
-    old_job.client_id = owner;
-    old_job.liveness = FindClientLivenessForTest(service, owner);
-    old_job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
-    ASSERT_TRUE(ProcessClientOffboardingForTest(service, old_job));
-    ASSERT_TRUE(service.MountSegment(segment, owner));
-    const auto replacement = FindClientLivenessForTest(service, owner);
-    ASSERT_NE(replacement, old_job.liveness);
-
-    old_job.pending_prepare_segments.push_back(
-        {.segment_id = segment.id,
-         .segment_name = segment.name,
-         .transport_endpoint = segment.te_endpoint});
-    EXPECT_TRUE(ProcessClientOffboardingForTest(service, old_job));
-    EXPECT_EQ(FindClientLivenessForTest(service, owner), replacement);
-    EXPECT_TRUE(service.QuerySegmentStatusById(segment.id));
-}
-
 TEST_F(MasterServiceTest, ReMountDoesNotRecoverSuspectedClient) {
     MasterService service;
     auto segment = MakeSegment("suspected_remount_segment");

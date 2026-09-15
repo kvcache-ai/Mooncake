@@ -145,7 +145,7 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(
     if (!snapshot) {
         return tl::unexpected(snapshot.error());
     }
-    auto restored = master_service->segment_pool_->RestoreSnapshot(
+    auto restored = master_service->segment_pool_.RestoreSnapshot(
         std::move(snapshot->segment_pool), true);
     if (!restored) {
         return tl::unexpected(SerializationError(

@@ -1,26 +1,17 @@
 #include "segment/pool.h"
-#include "pool_operations_internal.h"
 
 #include "segment/pool_write_access.h"
 #include "segment/pool_read_access.h"
 
 #include "master_metric_manager.h"
 
-#include <glog/logging.h>
-
 #include <utility>
 #include <unordered_set>
 
 namespace mooncake {
 
-SegmentPool::SegmentPool(RegionDriverRegistry region_drivers,
-                         PlacementPolicyType policy,
-                         const LocalSsdManager* local_ssd)
-    : allocation_(policy, ReplicaPlacement::Backend::Memory, local_ssd),
-      region_drivers_(std::move(region_drivers)) {
-    if (allocation_.UsesHostAffinity()) {
-        LOG(INFO) << "Local-first allocation strategy enabled";
-    }
+SegmentPool::SegmentPool(RegionDriverRegistry region_drivers)
+    : region_drivers_(std::move(region_drivers)) {
     for (const auto& [kind, driver] : region_drivers_) {
         if (auto allocator = driver->GetSharedAllocator()) {
             allocator->AttachUsageTracker(usage_tracker_);
@@ -28,39 +19,7 @@ SegmentPool::SegmentPool(RegionDriverRegistry region_drivers,
     }
 }
 
-tl::expected<std::vector<Replica>, ErrorCode> SegmentPool::AllocateReplicas(
-    const ReplicaAllocationRequest& request,
-    AllocationDiagnostics* diagnostics) const {
-    auto access = AcquirePlacementAccess();
-    auto resolved = request;
-    if (request.replicas.count != 1 ||
-        (!allocation_.UsesHostAffinity() &&
-         !request.host_affinity.prefer_alloc_in_same_node)) {
-        resolved.host_affinity = {};
-    }
-    return allocation_.Allocate(access, resolved, diagnostics);
-}
-
-tl::expected<Replica, ErrorCode> SegmentPool::AllocateInSegment(
-    std::string_view name, size_t size) const {
-    auto access = AcquirePlacementAccess();
-    return allocation_.AllocateFrom(access, name, size);
-}
-
-bool SegmentPool::SupportsAllocatorSnapshots() const {
-    const auto* driver = GetDriver(RegionKind::HOST_MEMORY);
-    return driver && driver->allocator_type() == BufferAllocatorType::OFFSET;
-}
-
-bool SegmentPool::IsAllocationSizeSupported(size_t size) const {
-    const auto* driver = GetDriver(RegionKind::HOST_MEMORY);
-    return !driver ||
-           driver->allocator_type() != BufferAllocatorType::CACHELIB ||
-           size <= kMaxSliceSize;
-}
-
 SegmentPool::~SegmentPool() {
-    ClearRecovery();
     for (const auto& mounted : catalog_.Regions()) {
         if (auto* resource = GetResource(mounted)) {
             resource->candidate->SetAvailability(false, false);

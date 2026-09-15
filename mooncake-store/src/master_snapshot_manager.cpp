@@ -150,7 +150,7 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
                 close(log_pipe[1]);
                 break;
             }
-            if (master_service_->client_registry_.HasPendingOffboarding()) {
+            if (master_service_->ShouldSkipSnapshotForClientOffboarding()) {
                 LOG(WARNING)
                     << "[Snapshot] Skipping snapshot while Client offboarding "
                        "is pending, snapshot_id="
@@ -456,7 +456,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         // Use the new MasterSnapshotCodec to encode all state
         ha::MasterSnapshotCodec codec;
         ha::MasterSnapshotStateView state_view(
-            *master_service_, *master_service_->segment_pool_,
+            *master_service_, master_service_->segment_pool_,
             master_service_->local_ssd_manager_,
             master_service_->task_manager_);
 

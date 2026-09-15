@@ -54,10 +54,7 @@
 // that into a clean test failure. After the fix the child exits 0 (PutEnd
 // simply reports OBJECT_NOT_FOUND) and the test passes.
 
-#include "segment_pool_test_peer.h"
-
 #include "master_service.h"
-#include "segment/pool_write_access.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -152,9 +149,8 @@ class MasterServiceProcessingKeyDoubleEraseTest : public ::testing::Test {
         //    invalidating the replica's memory handle (weak_ptr expires).
         //    No ClearInvalidHandles sweep here (see file header).
         {
-            auto segment_access = service.segment_pool_->AcquireWriteAccess();
-            if (!SegmentPoolTestPeer::PrepareUnmount(segment_access, segment.id,
-                                                     client_id)
+            auto segment_access = service.segment_pool_.AcquireWriteAccess();
+            if (!segment_access.PrepareUnmount(segment.id, client_id)
                      .has_value()) {
                 ::_exit(kExitUnmountFailed);
             }

@@ -10,7 +10,7 @@
 #include <string>
 #include <vector>
 
-#include "client_registry.h"
+#include "client_liveness.h"
 #include "local_ssd/manager.h"
 #include "placement/index.h"
 #include "random.h"
@@ -119,10 +119,9 @@ class ScopedRandomSeed final {
     RandomEngine saved_engine_;
 };
 
-ClientSessionPtr SuspectedClient() {
+std::shared_ptr<ClientLivenessRecord> SuspectedClient() {
     const auto initial = ClientLivenessRecord::TimePoint{};
-    ClientRegistry clients(false);
-    auto record = clients.GetOrCreate(generate_uuid(), initial);
+    auto record = std::make_shared<ClientLivenessRecord>(initial);
     EXPECT_EQ(
         record->Evaluate(initial + std::chrono::seconds(1),
                          std::chrono::seconds(1), std::chrono::seconds(60)),
@@ -166,7 +165,7 @@ TYPED_TEST(ReplicaAllocatorLivenessTest,
     for (size_t i = 0; i < 256; ++i) {
         auto name = "suspected-" + std::to_string(i);
         this->state.Add(name, name);
-        this->state.candidates.back()->BindClientSession(suspected);
+        this->state.candidates.back()->BindClientLiveness(suspected);
     }
     this->state.Add("full", "full", kCapacity);
     this->state.Add("healthy", "healthy");
@@ -187,7 +186,7 @@ TYPED_TEST(ReplicaAllocatorLivenessTest,
     this->state.Add("healthy", "healthy");
     this->state.Add("healthy", "duplicate");
     this->state.Add("suspected", "suspected");
-    this->state.candidates.back()->BindClientSession(suspected);
+    this->state.candidates.back()->BindClientLiveness(suspected);
     this->state.Add("unavailable", "unavailable");
     this->state.candidates.back()->SetAvailability(false, true);
     this->state.Add("cxl", "cxl", 0, true);
@@ -227,7 +226,7 @@ TYPED_TEST(ReplicaAllocatorLivenessTest,
            NoServingEntriesReportNoCapacityWithoutAllocationAttempts) {
     auto suspected = SuspectedClient();
     this->state.Add("suspected", "suspected");
-    this->state.candidates.back()->BindClientSession(suspected);
+    this->state.candidates.back()->BindClientLiveness(suspected);
     PlacementDiagnostics diagnostics;
     diagnostics.has_sufficient_active_entry_count = true;
     auto result = this->Allocate(Request(), &diagnostics);
@@ -246,7 +245,7 @@ TEST(ReplicaAllocatorTest, RankedSamplingSkipsSuspectedEntries) {
         for (size_t i = 0; i < 256; ++i) {
             auto name = "suspected-" + std::to_string(i);
             state.Add(name, name);
-            state.candidates.back()->BindClientSession(suspected);
+            state.candidates.back()->BindClientLiveness(suspected);
         }
         state.Add("second", "second", kCapacity / 2);
         state.Add("best", "best");
@@ -289,7 +288,7 @@ TEST(ReplicaAllocatorTest, SharedEntrySamplesOnlyServingCandidates) {
     const auto* first = *entry->candidates.nth(randomIndex(4, probe));
     for (auto& candidate : state.candidates) {
         if (candidate.get() == first) {
-            candidate->BindClientSession(suspected);
+            candidate->BindClientLiveness(suspected);
         }
     }
     ScopedRandomSeed seed(3);
@@ -312,7 +311,7 @@ TEST(ReplicaAllocatorTest, PreferredOnlyCountsServingEntriesOfRequiredKind) {
         const bool is_cxl = kind == AllocationCandidateKind::CXL;
         auto suspected = SuspectedClient();
         state.Add("preferred", "preferred", 0, is_cxl);
-        state.candidates.back()->BindClientSession(suspected);
+        state.candidates.back()->BindClientLiveness(suspected);
         state.Add("healthy", "healthy", 0, is_cxl);
         state.Add("other-kind", "other-kind", 0, !is_cxl);
         auto access = state.Access();

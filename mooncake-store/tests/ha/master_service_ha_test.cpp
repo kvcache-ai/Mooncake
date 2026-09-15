@@ -1,6 +1,3 @@
-#include "client_registry_test_peer.h"
-#include "../segment_pool_test_peer.h"
-
 #include "master_service.h"
 
 #include <glog/logging.h>
@@ -791,9 +788,9 @@ class MasterServiceHATest : public ::testing::Test {
                });
     }
 
-    static ClientSessionPtr ClientRecordForTesting(MasterService& service,
-                                                   const UUID& client_id) {
-        return service.client_registry_.Find(client_id);
+    static std::shared_ptr<ClientLivenessRecord> ClientRecordForTesting(
+        MasterService& service, const UUID& client_id) {
+        return service.FindClientRecord(client_id);
     }
 
     static tl::expected<bool, ErrorCode> AddReplicaForRetainedClientForTesting(
@@ -805,8 +802,7 @@ class MasterServiceHATest : public ::testing::Test {
 
     static bool ProcessClientOffboardingForTesting(MasterService& service,
                                                    ClientOffboardingJob& job) {
-        return ClientRegistryTestPeer::ProcessPreparedJob(
-            service.client_registry_, job);
+        return service.ProcessClientOffboardingJob(job);
     }
 
     static bool HasCompletedMemoryReplicaForTesting(MasterService& service,
@@ -889,7 +885,7 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService& service, const UUID& source_client,
         const TenantId& tenant_id, const std::string& key,
         CreateTask create_task) {
-        auto liveness = service.client_registry_.Find(source_client);
+        auto liveness = service.FindClientRecord(source_client);
         auto serving_guard =
             liveness ? liveness->TryAcquireServingGuard() : std::nullopt;
         if (!serving_guard) {
@@ -897,7 +893,7 @@ class MasterServiceHATest : public ::testing::Test {
         }
 
         auto segment_lock = std::make_unique<SegmentPool::WriteAccess>(
-            service.segment_pool_->AcquireWriteAccess());
+            service.segment_pool_.AcquireWriteAccess());
         auto task = std::async(std::launch::async, std::move(create_task));
         auto& metadata_mutex =
             service.metadata_shards_[service.getShardIndex(tenant_id, key)]
@@ -936,8 +932,9 @@ class MasterServiceHATest : public ::testing::Test {
         if (object_lock.owns_lock()) {
             return false;
         }
-        auto client_access = service.client_registry_.TryAcquireWriteAccess();
-        if (!client_access) {
+        std::unique_lock<std::shared_mutex> client_lock(service.client_mutex_,
+                                                        std::try_to_lock);
+        if (!client_lock.owns_lock()) {
             return false;
         }
         std::unique_lock<std::shared_mutex> snapshot_lock(
@@ -945,9 +942,9 @@ class MasterServiceHATest : public ::testing::Test {
         return !snapshot_lock.owns_lock();
     }
 
-    static ClientRegistry::WriteAccess LockClientForTesting(
+    static std::unique_lock<std::shared_mutex> LockClientForTesting(
         MasterService& service) {
-        return service.client_registry_.AcquireWriteAccess();
+        return std::unique_lock<std::shared_mutex>(service.client_mutex_);
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
@@ -969,10 +966,9 @@ class MasterServiceHATest : public ::testing::Test {
     static void PrepareUnmountSegmentForTesting(MasterService& service,
                                                 const UUID& segment_id,
                                                 const UUID& client_id) {
-        auto segment_access = service.segment_pool_->AcquireWriteAccess();
-        ASSERT_TRUE(SegmentPoolTestPeer::PrepareUnmount(segment_access,
-                                                        segment_id, client_id)
-                        .has_value());
+        auto segment_access = service.segment_pool_.AcquireWriteAccess();
+        ASSERT_TRUE(
+            segment_access.PrepareUnmount(segment_id, client_id).has_value());
     }
 
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
@@ -1010,9 +1006,9 @@ class MasterServiceHATest : public ::testing::Test {
 
     static int64_t GetLocalDiskUsedBytesForTesting(
         MasterService& service, const std::string& segment_name) {
-        auto client_id =
-            service.segment_pool_->AcquireReadAccess().FindOwnerClientId(
-                segment_name);
+        auto client_id = service.segment_pool_.AcquireReadAccess()
+                             .Catalog()
+                             .FindOwnerClientId(segment_name);
         if (!client_id) {
             return 0;
         }
@@ -1697,14 +1693,13 @@ TEST_F(MasterServiceHATest,
         FAIL() << "PutStart did not reach the snapshot barrier";
     }
 
-    // ReMountSegment holds ClientRegistry write access exclusively while
-    // waiting for the snapshot barrier. PutStart must not reacquire it inside
-    // that barrier.
+    // ReMountSegment holds client_mutex_ exclusively while waiting for the
+    // snapshot barrier. PutStart must not reacquire it inside that barrier.
     auto client_lock = LockClientForTesting(service);
     shard_lock.unlock();
     const bool completed_while_client_locked =
         put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.Release();
+    client_lock.unlock();
 
     ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = put.get();
@@ -1763,7 +1758,7 @@ TEST_F(MasterServiceHATest,
     });
     const bool completed_while_client_locked =
         add.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
-    client_lock.Release();
+    client_lock.unlock();
 
     ASSERT_EQ(add.wait_for(std::chrono::seconds(5)), std::future_status::ready);
     auto result = add.get();

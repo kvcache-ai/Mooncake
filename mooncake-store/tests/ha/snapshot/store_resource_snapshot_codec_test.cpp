@@ -1,6 +1,3 @@
-#include "client_registry.h"
-#include "../../segment_pool_test_peer.h"
-
 #include "ha/snapshot/store_resource_snapshot_codec.h"
 
 #include <gtest/gtest.h>
@@ -57,8 +54,7 @@ void CommitUnmount(SegmentPool& pool, const Segment& segment,
                    const UUID& client_id) {
     auto transaction = [&] {
         auto access = pool.AcquireWriteAccess();
-        return SegmentPoolTestPeer::PrepareUnmount(access, segment.id,
-                                                   client_id);
+        return access.PrepareUnmount(segment.id, client_id);
     }();
     ASSERT_TRUE(transaction.has_value());
     auto access = pool.AcquireWriteAccess();
@@ -145,7 +141,6 @@ std::vector<uint8_t> ReplaceSnapshotAllocatorType(
 
 TEST(StoreResourceSnapshotCodecTest,
      CapturedSnapshotOutlivesPoolAndPreservesOriginalLayout) {
-    ClientRegistry clients{false};
     auto& metrics = MasterMetricManager::instance();
     const auto baseline_used = metrics.get_allocated_mem_size();
     const auto baseline_capacity = metrics.get_total_mem_capacity();
@@ -157,11 +152,9 @@ TEST(StoreResourceSnapshotCodecTest,
     uintptr_t last_address = 0;
     {
         SegmentPool pool(Drivers());
-        ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                      segment, clients.GetOrCreate(client)),
+        ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
                   ErrorCode::OK);
-        auto allocator = SegmentPoolTestPeer::GetAllocator(
-            pool.AcquireReadAccess(), segment.id);
+        auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
         auto first = allocator->allocate(4096);
         auto hole = allocator->allocate(4096);
         auto last = allocator->allocate(4096);
@@ -186,12 +179,9 @@ TEST(StoreResourceSnapshotCodecTest,
         last.reset();
         auto all = allocator->allocate(kRegionSize);
         ASSERT_NE(all, nullptr);
-        {
-            auto access = pool.AcquireWriteAccess();
-            ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
-                          access, segment.name, SegmentStatus::DRAINED),
-                      ErrorCode::OK);
-        }
+        ASSERT_EQ(pool.AcquireWriteAccess().SetSegmentStatusByName(
+                      segment.name, SegmentStatus::DRAINED),
+                  ErrorCode::OK);
         pool.AcquireWriteAccess().Clear();
     }
     EXPECT_EQ(metrics.get_allocated_mem_size(), baseline_used);
@@ -206,15 +196,14 @@ TEST(StoreResourceSnapshotCodecTest,
     ASSERT_TRUE(DecodeAndRestore(restored, *encoded, false).has_value());
     EXPECT_EQ(restored.GetMemoryUsage().used_bytes, 8192U);
     auto access = restored.AcquireReadAccess();
-    const auto mounted = access.FindSegment(segment.id);
-    ASSERT_TRUE(mounted.has_value());
+    const auto* mounted = access.Catalog().Find(segment.id);
+    ASSERT_NE(mounted, nullptr);
     EXPECT_EQ(mounted->status, SegmentStatus::OK);
     EXPECT_EQ(mounted->client_id, client);
     EXPECT_EQ(mounted->segment.host_id, segment.host_id);
-    EXPECT_TRUE(SegmentPoolTestPeer::Placement(access).Contains(
-        segment.name, AllocationCandidateKind::NATIVE));
-    auto next =
-        SegmentPoolTestPeer::GetAllocator(access, segment.id)->allocate(4096);
+    EXPECT_TRUE(access.Placement().Contains(segment.name,
+                                            AllocationCandidateKind::NATIVE));
+    auto next = access.GetAllocator(segment.id)->allocate(4096);
     ASSERT_NE(next, nullptr);
     EXPECT_NE(reinterpret_cast<uintptr_t>(next->data()), first_address);
     EXPECT_NE(reinterpret_cast<uintptr_t>(next->data()), last_address);
@@ -222,15 +211,12 @@ TEST(StoreResourceSnapshotCodecTest,
 
 TEST(StoreResourceSnapshotCodecTest,
      DecodeReturnsDetachedStateWithoutMetricSideEffects) {
-    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const auto segment = MakeSegment(0, "decode-detached");
     const auto client = generate_uuid();
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(client)),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
               ErrorCode::OK);
-    auto allocator = SegmentPoolTestPeer::GetAllocator(
-        source.AcquireReadAccess(), segment.id);
+    auto allocator = source.AcquireReadAccess().GetAllocator(segment.id);
     auto buffer = allocator->allocate(4096);
     ASSERT_NE(buffer, nullptr);
     auto encoded = CaptureAndEncode(source, {});
@@ -252,7 +238,6 @@ TEST(StoreResourceSnapshotCodecTest,
 }
 
 TEST(StoreResourceSnapshotCodecTest, SnapshotDecodeReencodePreservesBytes) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client{1, 1};
     auto first = MakeSegment(0, "roundtrip-z");
@@ -265,12 +250,10 @@ TEST(StoreResourceSnapshotCodecTest, SnapshotDecodeReencodePreservesBytes) {
     {
         auto access = pool.AcquireWriteAccess();
         for (const auto* segment : {&first, &second, &inactive}) {
-            ASSERT_EQ(
-                access.MountSegment(*segment, clients.GetOrCreate(client)),
-                ErrorCode::OK);
+            ASSERT_EQ(access.MountSegment(*segment, client), ErrorCode::OK);
         }
-        ASSERT_EQ(SegmentPoolTestPeer::SetSegmentStatusByName(
-                      access, inactive.name, SegmentStatus::DRAINED),
+        ASSERT_EQ(access.SetSegmentStatusByName(inactive.name,
+                                                SegmentStatus::DRAINED),
                   ErrorCode::OK);
     }
     auto encoded = CaptureAndEncode(pool, {});
@@ -304,12 +287,10 @@ TEST(StoreResourceSnapshotCodecTest, SnapshotDecodeReencodePreservesBytes) {
 
 TEST(StoreResourceSnapshotCodecTest,
      OutOfRangeSnapshotAllocatorTypeReturnsError) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "snapshot-invalid-allocator-type");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(client)),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
               ErrorCode::OK);
     auto encoded = CaptureAndEncode(pool, LocalSsdPersistedState{});
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -323,28 +304,24 @@ TEST(StoreResourceSnapshotCodecTest,
             ASSERT_FALSE(result.has_value());
             EXPECT_EQ(result.error().code, ErrorCode::DESERIALIZE_FAIL);
         });
-        EXPECT_TRUE(
-            pool.AcquireReadAccess().FindSegment(segment.id).has_value());
+        EXPECT_NE(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
     }
     CommitUnmount(pool, segment, client);
 }
 
 TEST(StoreResourceSnapshotCodecTest,
      InvalidSnapshotDoesNotReplacePublishedPool) {
-    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     auto segment = MakeSegment(0, "snapshot-active");
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(client)),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(segment, client),
               ErrorCode::OK);
     auto encoded = CaptureAndEncode(source, LocalSsdPersistedState{});
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
 
     SegmentPool restored(Drivers());
     auto stale = MakeSegment(1, "published");
-    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(
-                  stale, clients.GetOrCreate(client)),
+    ASSERT_EQ(restored.AcquireWriteAccess().MountSegment(stale, client),
               ErrorCode::OK);
     auto corrupted = ReplaceSnapshotActiveNames(*encoded, {});
     auto result = DecodeAndRestore(restored, corrupted, false);
@@ -353,25 +330,22 @@ TEST(StoreResourceSnapshotCodecTest,
 
     {
         auto view = restored.AcquireReadAccess();
-        EXPECT_TRUE(view.FindSegment(stale.id).has_value());
-        EXPECT_FALSE(view.FindSegment(segment.id).has_value());
+        EXPECT_NE(view.Catalog().Find(stale.id), nullptr);
+        EXPECT_EQ(view.Catalog().Find(segment.id), nullptr);
     }
 
     CommitUnmount(source, segment, client);
 }
 
 TEST(StoreResourceSnapshotCodecTest, SnapshotPreservesLegacyWireFormat) {
-    ClientRegistry clients{false};
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     // Preserve insertion order, not lexicographic name order.
     auto first = MakeSegment(0, "compat-z", "tcp", "host-a");
     auto second = MakeSegment(1, "compat-a", "tcp", "host-b");
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
-                  first, clients.GetOrCreate(client)),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(first, client),
               ErrorCode::OK);
-    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(
-                  second, clients.GetOrCreate(client)),
+    ASSERT_EQ(source.AcquireWriteAccess().MountSegment(second, client),
               ErrorCode::OK);
 
     LocalSsdPersistedState ssd;
@@ -433,17 +407,15 @@ TEST(StoreResourceSnapshotCodecTest, SnapshotPreservesLegacyWireFormat) {
     SegmentPool restored(Drivers());
     auto decoded = DecodeAndRestore(restored, *encoded, false);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
-    ASSERT_TRUE(restored.RestoreBufferBindings(clients.Snapshot(), {}));
     EXPECT_EQ(PackLocalSsd(*decoded), PackLocalSsd(ssd));
     {
         auto access = restored.AcquireReadAccess();
-        ASSERT_EQ(access.Segments().size(), 2U);
-        ASSERT_TRUE(access.FindSegment(first.id).has_value());
-        EXPECT_EQ(
-            SegmentPoolTestPeer::Catalog(access).Find(first.id)->client_id,
-            client);
+        ASSERT_EQ(access.Catalog().Regions().size(), 2U);
+        ASSERT_NE(access.Catalog().Find(first.id), nullptr);
+        EXPECT_EQ(access.Catalog().Find(first.id)->client_id, client);
         std::vector<std::string> names;
-        access.GetActiveSegmentNames(names);
+        access.Placement().GetActiveSegmentNames(
+            AllocationCandidateKind::NATIVE, names);
         EXPECT_EQ(names, (std::vector<std::string>{first.name, second.name}));
     }
 
@@ -465,26 +437,23 @@ TEST(StoreResourceSnapshotCodecTest, SnapshotPreservesLegacyWireFormat) {
     decoded = DecodeAndRestore(restored, historical, false);
     ASSERT_TRUE(decoded.has_value());
     EXPECT_TRUE(decoded->empty());
-    EXPECT_TRUE(SegmentPoolTestPeer::Catalog(restored.AcquireReadAccess())
+    EXPECT_TRUE(restored.AcquireReadAccess()
+                    .Catalog()
                     .Find(first.id)
                     ->segment.host_id.empty());
 }
 
 TEST(StoreResourceSnapshotCodecTest,
      MalformedSnapshotsPreservePublishedResourcesAndMetrics) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const UUID client = generate_uuid();
     const auto segment = MakeSegment(0, "snapshot-atomic");
     const auto other = MakeSegment(1, "snapshot-atomic-other");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(client)),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, client),
               ErrorCode::OK);
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  other, clients.GetOrCreate(client)),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(other, client),
               ErrorCode::OK);
-    auto allocator =
-        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
     auto live = allocator->allocate(4096);
     ASSERT_NE(live, nullptr);
     auto encoded = CaptureAndEncode(pool, {});
@@ -597,9 +566,7 @@ TEST(StoreResourceSnapshotCodecTest,
         EXPECT_EQ(result.error().code, name == "second adoption fails"
                                            ? ErrorCode::INVALID_PARAMS
                                            : ErrorCode::DESERIALIZE_FAIL);
-        EXPECT_EQ(SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(),
-                                                    segment.id),
-                  allocator);
+        EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
 
         if (name == "second adoption fails") {
             EXPECT_EQ(result.error().message, "restore SegmentPool failed");
@@ -611,10 +578,9 @@ TEST(StoreResourceSnapshotCodecTest,
                 << result.error().message;
         }
 
-        EXPECT_EQ(pool.AcquireReadAccess().Segments().size(), 2U);
-        EXPECT_TRUE(
-            SegmentPoolTestPeer::Placement(pool.AcquireReadAccess())
-                .Contains(segment.name, AllocationCandidateKind::NATIVE));
+        EXPECT_EQ(pool.AcquireReadAccess().Catalog().Regions().size(), 2U);
+        EXPECT_TRUE(pool.AcquireReadAccess().Placement().Contains(
+            segment.name, AllocationCandidateKind::NATIVE));
         EXPECT_EQ(pool.GetMemoryUsage().used_bytes, 4096U);
         EXPECT_EQ(pool.GetMemoryUsage().capacity_bytes, 2 * kRegionSize);
         EXPECT_EQ(metrics.get_allocated_mem_size(), used);
@@ -625,7 +591,6 @@ TEST(StoreResourceSnapshotCodecTest,
 
 TEST(StoreResourceSnapshotCodecTest,
      SnapshotRejectsUnsupportedDriversAndCorruptContainers) {
-    ClientRegistry clients{false};
     RegionDriverConfig config;
     config.memory_allocator = BufferAllocatorType::CACHELIB;
     auto drivers = CreateRegionDrivers(config);
@@ -637,8 +602,7 @@ TEST(StoreResourceSnapshotCodecTest,
 
     SegmentPool cxl(Drivers(true));
     ASSERT_EQ(cxl.AcquireWriteAccess().MountSegment(
-                  MakeSegment(0, "snapshot-cxl", "cxl"),
-                  clients.GetOrCreate(generate_uuid())),
+                  MakeSegment(0, "snapshot-cxl", "cxl"), generate_uuid()),
               ErrorCode::OK);
     encoded = CaptureAndEncode(cxl, {});
     ASSERT_FALSE(encoded.has_value());
@@ -646,11 +610,9 @@ TEST(StoreResourceSnapshotCodecTest,
 
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(1, "snapshot-container");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(generate_uuid())),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
               ErrorCode::OK);
-    auto allocator =
-        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
 
     // Invalid zstd, invalid MessagePack, and a valid non-map root.
     const uint8_t invalid_msgpack = 0xc1;
@@ -664,20 +626,16 @@ TEST(StoreResourceSnapshotCodecTest,
         auto decoded = DecodeAndRestore(pool, bytes, false);
         ASSERT_FALSE(decoded.has_value());
         EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
-        EXPECT_EQ(SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(),
-                                                    segment.id),
-                  allocator);
+        EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
     }
 }
 
 // Capacities from the payload drive node storage allocation, so they must be
 // bounded and validated before the allocator is materialized.
 TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorCapacityIsRejected) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(0, "snapshot-capacity");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(generate_uuid())),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
               ErrorCode::OK);
     auto encoded = CaptureAndEncode(pool, {});
     ASSERT_TRUE(encoded.has_value());
@@ -705,8 +663,7 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorCapacityIsRejected) {
         ASSERT_FALSE(decoded.has_value());
         EXPECT_EQ(decoded.error().code, ErrorCode::DESERIALIZE_FAIL);
         EXPECT_NE(decoded.error().message.find("capacity"), std::string::npos);
-        EXPECT_TRUE(
-            pool.AcquireReadAccess().FindSegment(segment.id).has_value());
+        EXPECT_NE(pool.AcquireReadAccess().Catalog().Find(segment.id), nullptr);
     }
 }
 
@@ -788,11 +745,9 @@ TEST(StoreResourceSnapshotCodecTest,
 // node bytes must be rejected before the decompression buffer is allocated.
 TEST(StoreResourceSnapshotCodecTest,
      OversizedNodeFrameIsRejectedBeforeAllocation) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(0, "snapshot-frame-header");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(generate_uuid())),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
               ErrorCode::OK);
     auto encoded = CaptureAndEncode(pool, {});
     ASSERT_TRUE(encoded.has_value()) << encoded.error().message;
@@ -836,14 +791,11 @@ TEST(StoreResourceSnapshotCodecTest,
 // layout, and Decode reports the specific mismatch instead of a generic
 // rejection.
 TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorInternalsAreRejected) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(0, "snapshot-internals");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(generate_uuid())),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
               ErrorCode::OK);
-    auto allocator =
-        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
     auto buffer = allocator->allocate(4096);
     ASSERT_NE(buffer, nullptr);
     auto encoded = CaptureAndEncode(pool, {});
@@ -893,9 +845,7 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorInternalsAreRejected) {
     }
 
     // Decoding is pure: the published allocator and the metrics are unchanged.
-    EXPECT_EQ(
-        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id),
-        allocator);
+    EXPECT_EQ(pool.AcquireReadAccess().GetAllocator(segment.id), allocator);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size(),
               baseline_used);
 }
@@ -905,14 +855,11 @@ TEST(StoreResourceSnapshotCodecTest, CorruptAllocatorInternalsAreRejected) {
 // rejection.
 TEST(StoreResourceSnapshotCodecTest,
      LegacyAllocatorDeserializeReportsDetailedReason) {
-    ClientRegistry clients{false};
     SegmentPool pool(Drivers());
     const auto segment = MakeSegment(0, "snapshot-legacy-reason");
-    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(
-                  segment, clients.GetOrCreate(generate_uuid())),
+    ASSERT_EQ(pool.AcquireWriteAccess().MountSegment(segment, generate_uuid()),
               ErrorCode::OK);
-    auto allocator =
-        SegmentPoolTestPeer::GetAllocator(pool.AcquireReadAccess(), segment.id);
+    auto allocator = pool.AcquireReadAccess().GetAllocator(segment.id);
     auto buffer = allocator->allocate(4096);
     ASSERT_NE(buffer, nullptr);
     auto encoded = CaptureAndEncode(pool, {});

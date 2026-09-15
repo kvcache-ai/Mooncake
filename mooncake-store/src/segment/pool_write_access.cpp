@@ -1,5 +1,4 @@
 #include "segment/pool_write_access.h"
-#include "pool_operations_internal.h"
 
 #include <algorithm>
 #include "master_metric_manager.h"
@@ -7,9 +6,7 @@
 
 namespace mooncake {
 SegmentPool::WriteAccess::WriteAccess(AccessKey, SegmentPool& segment_pool)
-    : SegmentQueries(segment_pool.catalog_, segment_pool.placement_index_,
-                     segment_pool.allocation_.Kind()),
-      segment_pool_(segment_pool),
+    : segment_pool_(segment_pool),
       lock_(segment_pool.pool_mutex_),
       catalog_(segment_pool.catalog_) {}
 
@@ -195,25 +192,16 @@ ErrorCode SegmentPool::WriteAccess::EraseUnmountedRegion(
     return ErrorCode::OK;
 }
 
-bool SegmentPool::WriteAccess::RestoreClientSessions(
-    const std::unordered_map<UUID, ClientSessionPtr, boost::hash<UUID>>&
-        clients) {
-    // Validate the entire restore before changing any ownership binding.
+void SegmentPool::WriteAccess::BindClientLiveness(
+    const UUID& client_id,
+    const std::shared_ptr<ClientLivenessRecord>& client_liveness) {
     for (const auto& mounted : catalog_.Regions()) {
-        const auto it = clients.find(mounted.client_id);
-        const auto* resource = segment_pool_.GetResource(mounted);
-        if (it == clients.end() || !it->second || !resource ||
-            it->second->client_id() != mounted.client_id ||
-            !it->second->ShouldRetainResources())
-            return false;
-        const auto owner = resource->candidate->client_session();
-        if (owner && owner != it->second) return false;
+        if (mounted.client_id == client_id) {
+            if (auto* resource = segment_pool_.GetResource(mounted)) {
+                resource->candidate->BindClientLiveness(client_liveness);
+            }
+        }
     }
-    for (const auto& mounted : catalog_.Regions()) {
-        segment_pool_.GetResource(mounted)->candidate->BindClientSession(
-            clients.at(mounted.client_id));
-    }
-    return true;
 }
 
 bool SegmentPool::WriteAccess::BindBufferToSegment(const UUID& segment_id,
@@ -236,6 +224,10 @@ bool SegmentPool::WriteAccess::RebindBufferToOwningSegment(
         }
     }
     return false;
+}
+
+const RegionCatalog& SegmentPool::WriteAccess::Catalog() const {
+    return catalog_;
 }
 
 ErrorCode SegmentPool::WriteAccess::SetSegmentStatusByName(
@@ -292,10 +284,6 @@ ErrorCode SegmentPool::WriteAccess::TransitionRegion(
 }
 
 void SegmentPool::WriteAccess::Clear() noexcept {
-    segment_pool_.ClearRecovery();
-    segment_pool_.unmounts_.clear();
-    segment_pool_.unmount_by_region_.clear();
-    segment_pool_.reserved_names_.clear();
     for (const auto& mounted : catalog_.Regions()) {
         if (auto* driver = segment_pool_.GetDriver(mounted.kind)) {
             (void)driver->Erase(mounted.segment.id);

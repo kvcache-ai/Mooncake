@@ -1074,18 +1074,6 @@ std::ostream& operator<<(std::ostream& os,
 // Recovery helpers
 // ============================================================================
 
-std::optional<OffsetAllocationHandle> OffsetAllocator::RestoreHandle(
-    const OffsetAllocationSnapshot& snapshot) {
-    auto handle =
-        createHandleAtNode(snapshot.metadata, snapshot.address, snapshot.size);
-    if (!handle) return std::nullopt;
-    if (handle->m_allocation.getOffset() != snapshot.offset) {
-        handle->m_allocator.reset();
-        return std::nullopt;
-    }
-    return handle;
-}
-
 std::optional<OffsetAllocationHandle> OffsetAllocator::createHandleAtNode(
     uint32_t node_index, uint64_t real_offset, uint64_t requested_size) {
     MutexLocker guard(&m_mutex);

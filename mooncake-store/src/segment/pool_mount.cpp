@@ -1,5 +1,3 @@
-#include "pool_transaction_internal.h"
-
 #include "segment/pool_write_access.h"
 
 #include <algorithm>
@@ -55,9 +53,6 @@ SegmentPool::WriteAccess::PrepareWithLiveAllocations(
     const Segment& segment, const UUID& client_id,
     const std::vector<LiveAllocation>& live_allocations,
     uint64_t imported_requested_bytes) {
-    if (IsNameReserved(segment.name)) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
     const RegionKind kind = ClassifyRegion(segment);
     RegionDriver* driver = segment_pool_.GetDriver(kind);
     if (!driver) {
@@ -140,7 +135,7 @@ ErrorCode RegionMountTxn::Commit(SegmentPool::WriteAccess& access) noexcept {
     }
     const auto result =
         access.PublishMount(mounted_, existed_, account_capacity_metrics_,
-                            resource_, previous_allocator_, session_);
+                            resource_, previous_allocator_);
     if (result == ErrorCode::OK) {
         committed_ = true;
     }
@@ -150,8 +145,7 @@ ErrorCode RegionMountTxn::Commit(SegmentPool::WriteAccess& access) noexcept {
 ErrorCode SegmentPool::WriteAccess::PublishMount(
     const MountedRegion& mounted, bool existed, bool account_capacity_metrics,
     PreparedRegionResource& prepared,
-    const std::weak_ptr<BufferAllocatorBase>& previous_allocator,
-    const ClientSessionPtr& session) noexcept {
+    const std::weak_ptr<BufferAllocatorBase>& previous_allocator) noexcept {
     const auto* current = catalog_.Find(mounted.segment.id);
     if (existed) {
         if (!current || current->segment != mounted.segment ||
@@ -173,7 +167,6 @@ ErrorCode SegmentPool::WriteAccess::PublishMount(
         new_resource.candidate->InheritBinding(
             *segment_pool_.GetResource(*current)->candidate);
     }
-    if (session) new_resource.candidate->BindClientSession(session);
     for (const auto& buffer : prepared.imported_buffers()) {
         new_resource.candidate->BindBuffer(*buffer);
     }
@@ -206,30 +199,21 @@ ErrorCode SegmentPool::WriteAccess::PublishMount(
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentPool::WriteAccess::MountSegment(
-    const Segment& segment, const ClientSessionPtr& session) {
-    if (!session) return ErrorCode::INVALID_PARAMS;
-    if (!session->ShouldRetainResources())
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-    const auto& client_id = session->client_id();
-    if (IsNameReserved(segment.name)) return ErrorCode::INVALID_PARAMS;
+ErrorCode SegmentPool::WriteAccess::MountSegment(const Segment& segment,
+                                                 const UUID& client_id) {
     if (const auto* mounted = catalog_.Find(segment.id)) {
-        if (mounted->client_id != client_id || mounted->segment != segment)
-            return ErrorCode::INVALID_PARAMS;
-        if (mounted->status != SegmentStatus::OK)
+        if (mounted->status != SegmentStatus::OK) {
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        const auto* resource = segment_pool_.GetResource(*mounted);
-        // Unbound restored regions must use the explicit restore/remount path.
-        if (!resource || resource->candidate->client_session() != session)
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        }
+        return mounted->client_id == client_id && mounted->segment == segment
+                   ? ErrorCode::SEGMENT_ALREADY_EXISTS
+                   : ErrorCode::INVALID_PARAMS;
     }
     auto prepared = PrepareMount(segment, client_id);
-    if (!prepared) return prepared.error();
-    prepared->BindClientSession(session);
-    const auto result = prepared->Commit(*this);
-    if (result == ErrorCode::OK) session->SetHostId(segment.host_id);
-    return result;
+    if (!prepared) {
+        return prepared.error();
+    }
+    return prepared->Commit(*this);
 }
 
 }  // namespace mooncake

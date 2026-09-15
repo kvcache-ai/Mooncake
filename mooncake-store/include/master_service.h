@@ -27,7 +27,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "background_worker.h"
-#include "client_registry.h"
+#include "client_liveness.h"
 #include "client_offboarding.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
@@ -37,6 +37,7 @@
 #include "nof_segment_manager.h"
 #include "placement/replica_allocator.h"
 #include "segment/pool.h"
+#include "segment/pool_write_access.h"
 #include "serialize/serializer.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
@@ -135,7 +136,7 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. ClientRegistry access
+ * 1. client_mutex_
  * 2. tenant_quota_policy_mutex_
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
@@ -170,6 +171,7 @@ class MasterService {
     friend class test::MasterServiceSSDTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
+    friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
     friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
@@ -785,14 +787,13 @@ class MasterService {
      * function is idempotent.
      *
      * Drops the client's LOCAL_DISK registration and then its LOCAL_DISK
-     * replicas -- the outcome the client-expiry branch of client registry
-     * monitoring reaches after one client_ttl. Exposing it as an operation lets
-     * a store that is shutting down deregister while it can still serve,
-     * instead of leaving the master advertising it as an owner until the TTL
-     * elapses. Object metadata whose last replica was on that disk is erased,
-     * exactly as on expiry; a store that comes back re-adopts its files through
-     * the MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates
-     * them.
+     * replicas -- the outcome the client-expiry branch of ClientMonitorFunc
+     * reaches after one client_ttl. Exposing it as an operation lets a store
+     * that is shutting down deregister while it can still serve, instead of
+     * leaving the master advertising it as an owner until the TTL elapses.
+     * Object metadata whose last replica was on that disk is erased, exactly
+     * as on expiry; a store that comes back re-adopts its files through the
+     * MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates them.
      *
      * The replica sweep targets exactly this owner (see
      * ClearLocalDiskHandlesOwnedBy), and the deregistration runs under the
@@ -1058,12 +1059,21 @@ class MasterService {
     // tenant_eviction_high_watermark_ratio are both enabled.
     void EvictTenantsOverWatermark();
 
+    std::shared_ptr<ClientLivenessRecord> FindClientRecord(
+        const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
     auto AddReplicaForRetainedClient(const UUID& client_id,
                                      const std::string& key,
                                      const TenantId& tenant_id,
                                      Replica& replica)
         -> tl::expected<bool, ErrorCode>;
+    // Caller must hold client_mutex_.
+    std::unordered_set<UUID, boost::hash<UUID>> GetRetainingClientIdsLocked()
+        const;
+    void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
+    std::string GetClientHostId(const UUID& client_id) const;
+    std::string ResolveWriterHostId(const UUID& client_id,
+                                    const ReplicateConfig& config);
 
     void ClearInvalidHandles();
     // Caller owns snapshot_mutex_ (shared) while metadata is swept.
@@ -1085,7 +1095,10 @@ class MasterService {
     // shard until the sweep moved on.
     tl::expected<void, ErrorCode> ClearStaleHandles(
         const std::function<bool(const Replica&)>& is_stale);
-    bool CleanupClientResources(ClientOffboardingJob& job);
+    bool ProcessClientOffboardingJob(ClientOffboardingJob& job);
+    bool ShouldSkipSnapshotForClientOffboarding() const {
+        return client_offboarding_worker_.HasPending();
+    }
 
     std::string FormatTimestamp(
         const std::chrono::system_clock::time_point& tp);
@@ -2374,9 +2387,9 @@ class MasterService {
             }
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
-            // violation (ClientRegistry access must be acquired before metadata
-            // shard). local_disk replicas are cleaned up by
-            // ClearInvalidHandles() in client registry monitoring.
+            // violation (client_mutex_ must be acquired before metadata shard).
+            // local_disk replicas are cleaned up by ClearInvalidHandles() in
+            // ClientMonitorFunc.
             if (!(service_->enable_ha_ && service_->enable_oplog_) &&
                 tenant_state_ != nullptr &&
                 it_ != tenant_state_->metadata.end()) {
@@ -2387,8 +2400,8 @@ class MasterService {
                 const auto previous_kv_media =
                     service_->KvMediaSnapshot(it_->second);
                 // Erase invalid memory replicas (those with unmounted
-                // segments). No ClientRegistry access needed since we only
-                // check memory replicas.
+                // segments). No client_mutex_ needed since we only check memory
+                // replicas.
                 const uint64_t before_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
                 std::vector<ReplicaID> removed_replica_ids;
@@ -2661,7 +2674,21 @@ class MasterService {
     ViewVersionId view_version_;
 
     // Client related members
-    ClientRegistry client_registry_;
+    mutable std::shared_mutex client_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                       boost::hash<UUID>>
+        client_liveness_records_;
+    std::unordered_set<UUID, boost::hash<UUID>>
+        ok_client_;  // client with ok status
+    std::unordered_map<UUID, std::string, boost::hash<UUID>> client_host_id_;
+    ClientOffboardingWorker client_offboarding_worker_{this};
+    void ClientMonitorFunc();
+    std::thread client_monitor_thread_;
+    std::atomic<bool> client_monitor_running_{false};
+    static constexpr uint64_t kClientMonitorSleepMs =
+        1000;  // 1000 ms sleep between client monitor checks
+    const int64_t client_active_ttl_sec_;
+    const int64_t client_suspicion_ttl_sec_;
     const std::chrono::seconds nof_heartbeat_interval_sec_;
     const std::chrono::milliseconds nof_heartbeat_probe_timeout_ms_;
     const uint32_t nof_heartbeat_failures_threshold_;
@@ -2789,6 +2816,8 @@ class MasterService {
     static constexpr double kDynamicReplicationTargetHighWatermark = 0.85;
 
     bool DynamicReplicationEnabled() const;
+    static uint64_t DynamicReplicationStableScore(const std::string& key,
+                                                  const std::string& segment);
     bool DynamicReplicationEnforce() const;
     uint32_t DynamicReplicationAdmissionMinHits() const;
     void CleanupDynamicReplicationWindowsLocked(
@@ -2874,10 +2903,32 @@ class MasterService {
     std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
-    // Placement borrows LocalSSD metrics; the provider must outlive the Pool.
+    SegmentPool segment_pool_;
+    // Process-local offboarding tokens, protected by the Pool write lock.
+    // The worker's pending-job barrier keeps them out of snapshots.
+    std::unordered_map<UUID, RegionUnmountTxn, boost::hash<UUID>>
+        client_offboarding_unmounts_;
+    // Names outlive resource removal until the terminal OpLog is accepted.
+    std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>>
+        client_offboarding_reserved_names_;
     LocalSsdManager local_ssd_manager_;
-    std::unique_ptr<SegmentPool> segment_pool_;
     NoFSegmentManager nof_segment_manager_;
+    BufferAllocatorType memory_allocator_type_;
+    const PlacementPolicyType memory_placement_policy_;
+
+    AllocationCandidateKind MemoryAllocationKind() const {
+        return memory_placement_policy_ == PlacementPolicyType::CXL
+                   ? AllocationCandidateKind::CXL
+                   : AllocationCandidateKind::NATIVE;
+    }
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateMemoryReplicas(
+        const ReplicaAllocationRequest& request,
+        PlacementDiagnostics* diagnostics = nullptr);
+    tl::expected<Replica, ErrorCode> AllocateMemoryReplicaFrom(
+        size_t size, std::string_view segment_name);
+    tl::expected<std::vector<Replica>, ErrorCode> AllocateNoFReplicas(
+        const ReplicaAllocationRequest& request);
+
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
@@ -2961,6 +3012,13 @@ class MasterService {
 
     static constexpr uint32_t kMaxDrainUnitRetries = 3;
 
+    tl::expected<void, ErrorCode> ValidateDrainTargets(
+        const CreateDrainJobRequest& request);
+    tl::expected<void, ErrorCode> ValidateDrainRequest(
+        const CreateDrainJobRequest& request);
+    tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
+        SegmentPool::WriteAccess& segment_access,
+        const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);
     void ScheduleDrainJobTasks(DrainJob& job);
@@ -3116,6 +3174,15 @@ class MasterService {
     // Standby-restored memory endpoints remain unreadable until the owning
     // Client has successfully remounted them.
     std::unordered_set<std::string> invalid_replica_endpoints_;
+
+    // Keep DummyBufferAllocator alive after standby restore.
+    // Key: transport_endpoint, Value: allocator.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_allocator_keepalive_;
+    std::vector<StandbySegmentInfo> standby_memory_segments_;
+    std::unordered_map<std::string, uint64_t> standby_accounted_memory_bytes_;
+
+    ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool TryGetReadableReplicaDescriptor(const Replica& replica,
                                          Replica::Descriptor& descriptor) const;

@@ -31,7 +31,11 @@ TEST(NoFSegmentManagerTest, PlacementAllocatesAndTracksUsage) {
     ReplicaAllocationRequest request;
     request.replicas = {.size = 4096, .count = 1, .type = ReplicaType::NOF_SSD};
     request.placement.preferred_segment_name = segment.name;
-    auto allocated = manager.AllocateReplicas(request);
+    auto allocated = [&] {
+        auto placement = manager.AcquirePlacementAccess();
+        return ReplicaAllocator(RandomPlacementPolicy{})
+            .Allocate(placement, request);
+    }();
     ASSERT_TRUE(allocated.has_value());
     ASSERT_EQ(allocated->size(), 1U);
     EXPECT_TRUE(allocated->front().is_nof_replica());

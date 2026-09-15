@@ -19,7 +19,7 @@ class NativeAllocationCandidate final : public AllocationCandidate {
    public:
     explicit NativeAllocationCandidate(
         std::shared_ptr<BufferAllocatorBase> allocator)
-        : AllocationCandidate(std::move(allocator), true) {}
+        : AllocationCandidate(std::move(allocator)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {
         return AllocateRegistered(size);
@@ -34,7 +34,7 @@ class CxlAllocationCandidate final : public AllocationCandidate {
    public:
     CxlAllocationCandidate(std::shared_ptr<BufferAllocatorBase> allocator,
                            std::string binding_name)
-        : AllocationCandidate(std::move(allocator), true),
+        : AllocationCandidate(std::move(allocator)),
           cxl_binding_name_(std::move(binding_name)) {}
 
     std::unique_ptr<AllocatedBuffer> Allocate(size_t size) const override {

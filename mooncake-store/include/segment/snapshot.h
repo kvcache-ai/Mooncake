@@ -8,15 +8,6 @@
 
 namespace mooncake {
 
-// Detached legacy buffer record. Codecs encode fields; the Pool validates
-// ownership, allocator layout and lifetime binding when restoring it.
-struct BufferSnapshot {
-    UUID region_id;
-    uint64_t size;
-    uint64_t address;
-    std::optional<offset_allocator::OffsetAllocationSnapshot> allocation;
-};
-
 struct RegionSnapshot {
     MountedRegion mounted;
     OffsetBufferAllocatorSnapshot allocator;

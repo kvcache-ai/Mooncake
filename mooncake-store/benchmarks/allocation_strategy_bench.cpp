@@ -1,5 +1,3 @@
-#include "../tests/segment_pool_test_peer.h"
-
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -325,11 +323,8 @@ static void setupResourceLimits() {
  * allocator handles are retained only to inspect utilization/fragmentation.
  */
 class BenchmarkPlacement final {
-    std::unique_ptr<ClientRegistry> clients_ =
-        std::make_unique<ClientRegistry>(false);
-
    public:
-    explicit BenchmarkPlacement(PlacementPolicyType policy) {
+    explicit BenchmarkPlacement(PlacementPolicyType policy) : policy_(policy) {
         RegionDriverConfig config;
         config.memory_allocator = BufferAllocatorType::OFFSET;
         auto drivers = CreateRegionDrivers(config);
@@ -338,7 +333,7 @@ class BenchmarkPlacement final {
                 "failed to create benchmark region drivers: " +
                 toString(drivers.error()));
         }
-        pool_ = std::make_unique<SegmentPool>(std::move(*drivers), policy);
+        pool_ = std::make_unique<SegmentPool>(std::move(*drivers));
     }
     BenchmarkPlacement(BenchmarkPlacement&&) noexcept = default;
     BenchmarkPlacement& operator=(BenchmarkPlacement&&) = delete;
@@ -348,15 +343,13 @@ class BenchmarkPlacement final {
     std::shared_ptr<BufferAllocatorBase> Add(const Segment& segment) {
         {
             auto access = pool_->AcquireWriteAccess();
-            auto error =
-                access.MountSegment(segment, clients_->GetOrCreate(client_id_));
+            auto error = access.MountSegment(segment, client_id_);
             if (error != ErrorCode::OK) {
                 throw std::runtime_error("failed to mount benchmark segment " +
                                          segment.name + ": " + toString(error));
             }
         }
-        auto allocator = SegmentPoolTestPeer::GetAllocator(
-            pool_->AcquireReadAccess(), segment.id);
+        auto allocator = pool_->AcquireReadAccess().GetAllocator(segment.id);
         allocators_.push_back(allocator);
         return allocator;
     }
@@ -366,7 +359,16 @@ class BenchmarkPlacement final {
         ReplicaAllocationRequest request;
         request.replicas.size = size;
         request.replicas.count = replica_count;
-        return pool_->AllocateReplicas(request);
+        switch (policy_) {
+            case PlacementPolicyType::RANDOM:
+                return pool_->AllocateReplicas(request,
+                                               RandomPlacementPolicy{});
+            case PlacementPolicyType::FREE_RATIO_FIRST:
+                return pool_->AllocateReplicas(request,
+                                               FreeRatioFirstPlacementPolicy{});
+            default:
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators()
@@ -378,6 +380,7 @@ class BenchmarkPlacement final {
     // SegmentPool itself is not movable; keep it stable when returning a
     // fixture.
     std::unique_ptr<SegmentPool> pool_;
+    PlacementPolicyType policy_;
     UUID client_id_ = generate_uuid();
     std::vector<std::shared_ptr<BufferAllocatorBase>> allocators_;
 };
