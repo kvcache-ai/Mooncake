@@ -488,15 +488,16 @@ fn managed_nof_persists_route_reads_cold_and_releases_locator() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
     let backend = Arc::new(FakeManagedNof::default());
+    let transport = Arc::new(TestTransport::new("nof-managed-segment"));
     let target = NofTargetConfig::new(
         "nof-managed-a",
         NofBackend::new(backend.clone()).expect("managed NoF backend should build"),
     )
     .expect("managed NoF target should build");
-    let client = StoreClientBuilder::new(metadata, "nof-managed-runtime")
+    let client = StoreClientBuilder::new(metadata.clone(), "nof-managed-runtime")
         .state(ClientLifecycleState::Active)
         .label("storage", "true")
-        .transport(Arc::new(TestTransport::new("nof-managed-segment")))
+        .transport(transport.clone())
         .local_memory(storage_config_with_bytes(512))
         .nof_target(target)
         .build(test_future_expiry_ms())
@@ -532,13 +533,37 @@ fn managed_nof_persists_route_reads_cold_and_releases_locator() {
     );
     assert_eq!(backend.records.lock().len(), 1);
 
+    let reader_target = NofTargetConfig::new(
+        "nof-managed-a",
+        NofBackend::new(backend.clone()).expect("managed NoF reader backend should build"),
+    )
+    .expect("managed NoF reader target should build");
+    let reader = StoreClientBuilder::new(metadata, "nof-managed-reader")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "false")
+        .transport(Arc::new(transport.peer("nof-managed-reader-segment")))
+        .local_memory(storage_config_with_bytes(0))
+        .nof_target(reader_target)
+        .build(test_future_expiry_ms())
+        .expect("managed NoF reader should build without storage memory");
+    reader
+        .register_local_memory()
+        .expect("managed NoF reader scratch memory should register");
+
     force_cold_only_route(&client, "managed-nof-key");
     assert_eq!(
-        client
-            .get("managed-nof-key")
-            .expect("managed NoF cold restore should succeed"),
-        payload
+        reader
+            .batch_get(&[ObjectRef::new("managed-nof-key")])
+            .expect("embedded client should batch-read managed NoF into its destination buffer"),
+        vec![payload.to_vec()]
     );
+    reader.wait_for_restore_promotions();
+    let restored_route = reader
+        .query_route("managed-nof-key")
+        .expect("managed route query after read should succeed")
+        .expect("managed route should remain");
+    assert!(restored_route.replicas.is_empty());
+    assert!(restored_route.nof_backing.is_some());
 
     client
         .remove("managed-nof-key", true)
@@ -547,6 +572,192 @@ fn managed_nof_persists_route_reads_cold_and_releases_locator() {
         wait_for_nof_reclaims(&client, || backend.records.lock().is_empty()),
         "managed NoF locator remains allocated: {:?}",
         backend.records.lock().keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn managed_nof_resolved_read_keeps_selected_target() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend = Arc::new(FakeManagedNof::default());
+    let target = NofTargetConfig::new(
+        "nof-managed-selected-b",
+        NofBackend::new(backend).expect("managed NoF backend should build"),
+    )
+    .expect("managed NoF target should build");
+    let client = StoreClientBuilder::new(metadata, "nof-managed-selected-reader")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new("nof-managed-selected-segment")))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_target(target)
+        .build(test_future_expiry_ms())
+        .expect("managed NoF reader should build");
+    client
+        .register_local_memory()
+        .expect("managed NoF reader memory should register");
+
+    let primary_locator = NofManagedLocator::new(b"primary".to_vec())
+        .expect("primary locator")
+        .to_hex();
+    let selected_locator = NofManagedLocator::new(b"selected".to_vec())
+        .expect("selected locator")
+        .to_hex();
+    let mut route = ObjectRoute {
+        key: ObjectKey::new("managed-nof-selected-key"),
+        namespace: None,
+        logical_key: None,
+        canonical_key: None,
+        sharing_scope: None,
+        qos_tier: None,
+        version: RouteVersion(1),
+        state: mooncake_store_core::RouteState::Active,
+        compatibility: CompatibilityDescriptor::default(),
+        replicas: Vec::new(),
+        cold_backing: None,
+        nof_backing: Some(mooncake_store_core::NofBackingRoute {
+            owner: ClientRuntimeId::new("nof-managed-primary-owner", ClientEpoch(1)),
+            target_id: "nof-managed-selected-a".to_string(),
+            object_locator: primary_locator,
+            length: 16,
+            checksum: Some(7),
+            state: mooncake_store_core::ColdBackingState::Materialized,
+            replicas: vec![mooncake_store_core::NofBackingReplica {
+                owner: client.runtime_id().clone(),
+                target_id: "nof-managed-selected-b".to_string(),
+                object_locator: selected_locator.clone(),
+            }],
+        }),
+    };
+    mooncake_store_core::apply_route_identity(
+        &mut route,
+        &mooncake_store_core::LogicalObjectId::new(
+            mooncake_store_core::NamespaceScope::default(),
+            "managed-nof-selected-key",
+        ),
+    );
+    let mut readable = BTreeSet::new();
+    readable.insert(client.runtime_id().clone());
+
+    let resolved = client
+        .resolve_cold_backing_read(
+            route,
+            "default",
+            "managed-nof-selected-key",
+            &readable,
+        )
+        .expect("managed NoF route should resolve through the local NoF target");
+    let cold = super::cold_tier::resolved_cold_backing(&resolved)
+        .expect("resolved NoF cold backing should be retained");
+
+    assert_eq!(cold.cold_tier_id, "nof-managed-selected-b");
+    assert_eq!(cold.object_locator, selected_locator);
+}
+
+
+#[test]
+fn managed_nof_materialization_runs_on_target_owner() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend_a = Arc::new(FakeManagedNof::default());
+    let backend_b = Arc::new(FakeManagedNof::default());
+    let build = |stable_id: &str, segment: &str, backend: Arc<FakeManagedNof>| {
+        let target = NofTargetConfig::new(
+            "nof-managed-owner-target",
+            NofBackend::new(backend).expect("managed NoF backend should build"),
+        )
+        .expect("managed NoF target should build");
+        let client = StoreClientBuilder::new(metadata.clone(), stable_id)
+            .state(ClientLifecycleState::Active)
+            .label("storage", "true")
+            .transport(Arc::new(TestTransport::new(segment)))
+            .local_memory(storage_config_with_bytes(512))
+            .nof_target(target)
+            .build(test_future_expiry_ms())
+            .expect("managed NoF client should build");
+        client
+            .register_local_memory()
+            .expect("managed NoF local memory should register");
+        client
+    };
+    let client_a = build(
+        "nof-managed-owner-a",
+        "nof-managed-owner-segment-a",
+        backend_a.clone(),
+    );
+    let client_b = build(
+        "nof-managed-owner-b",
+        "nof-managed-owner-segment-b",
+        backend_b.clone(),
+    );
+
+    let owner_deadline = Instant::now() + Duration::from_secs(3);
+    let owner = loop {
+        let owner_a = client_a
+            .storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .heartbeat_owner_for("nof-managed-owner-target");
+        let owner_b = client_b
+            .storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .heartbeat_owner_for("nof-managed-owner-target");
+        if let (Some(owner_a), Some(owner_b)) = (&owner_a, &owner_b) {
+            if owner_a == owner_b {
+                break owner_a.clone();
+            }
+        }
+        assert!(
+            Instant::now() < owner_deadline,
+            "managed NoF owner views did not converge: a={owner_a:?} b={owner_b:?}"
+        );
+        sleep(Duration::from_millis(25));
+    };
+    let (writer, writer_backend, owner_backend) = if owner == *client_a.runtime_id() {
+        (&client_b, &backend_b, &backend_a)
+    } else {
+        assert_eq!(owner, *client_b.runtime_id());
+        (&client_a, &backend_a, &backend_b)
+    };
+
+    writer
+        .put("managed-nof-owner-key", &[41u8; 150])
+        .expect("managed NoF writer put should succeed");
+    let evicted = writer
+        .debug_evict_all()
+        .expect("non-owner managed NoF eviction should run");
+    assert!(
+        evicted.completed
+            && evicted.evicted == 1
+            && evicted.remaining_hot_replicas == 0
+            && evicted.dropped_without_cold == 0,
+        "unexpected managed NoF eviction result: {evicted:?}"
+    );
+    assert_eq!(
+        owner_backend.writes.load(Ordering::Relaxed),
+        1,
+        "target owner executor should materialize the payload"
+    );
+    assert_eq!(
+        writer_backend.writes.load(Ordering::Relaxed),
+        0,
+        "writer-local executor must not materialize an owner-managed target"
+    );
+    assert_eq!(owner_backend.records.lock().len(), 1);
+    assert!(writer_backend.records.lock().is_empty());
+
+    let route = writer
+        .query_route("managed-nof-owner-key")
+        .expect("managed NoF route query should succeed")
+        .expect("managed NoF route should exist");
+    let backing = route
+        .nof_backing
+        .expect("managed NoF route should publish NoF backing");
+    assert_eq!(backing.owner, owner);
+    assert_eq!(
+        backing.state,
+        mooncake_store_core::ColdBackingState::Materialized
     );
 }
 

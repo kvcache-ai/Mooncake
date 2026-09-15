@@ -140,8 +140,12 @@ Mooncake resolves the logical route first. Only an `Active` route without a read
 local-disk copy causes the client to derive the provider key and query provider metadata for
 existence and length. This keeps KVCS queries off the hot-hit path. The existing Cold Tier target
 selector, singleflight, admission control, and batch restore path then call the provider batch-get
-API and promote the payload to a hot copy. Route lookup and provider query are deliberately not
-issued speculatively in parallel.
+API. A Mooncake-managed ExtentStore read instead uses the selected target and opaque locator from
+`ObjectRoute.nof_backing`. In both cases the client reads through its local target executor into the
+caller's destination buffer. The current ExtentStore transport reads through SPDK DMA memory and
+copies the decoded payload into that destination. NoF reads do not enqueue Cold Tier promotion and
+do not change the route. Route lookup and provider query are deliberately not issued speculatively
+in parallel.
 
 Removal first changes the logical route from `Active` to `Deleting`. It then fans out the stable
 provider key to the current target set. A provider error is returned to the caller and the
@@ -160,6 +164,28 @@ KVCS targets must therefore be configured consistently on clients that share a r
 Changing a target set does not create a metadata migration. Because KVCS 0.4.0 has no listing API,
 Mooncake cannot enumerate or reclaim provider records that are unreachable from a current logical
 route and target configuration.
+
+## Read-path TODOs
+
+### TODO: NoF promotion
+
+NoF reads currently leave the object in NoF and do not create a hot replica. Reuse the existing
+Cold Tier promotion pipeline after defining the promotion destination policy, especially for an
+embedded client that has no local memory segment. The destination must be selected by the normal
+memory placement policy rather than by NoF target ownership; the target owner remains a
+control-plane and maintenance role.
+
+### TODO: zero-copy NoF reads
+
+Evaluate two implementation paths while retaining the current copy path as the compatibility
+fallback:
+
+1. Define an aligned ExtentStore record/payload contract and make an SPDK DMA buffer the returned
+   destination buffer, with explicit buffer ownership, registration, and lifetime. This path must
+   handle record headers, manifests, payload offsets, and requests that cannot meet the alignment
+   contract without introducing another full-value staging copy.
+2. Use GDS for capable GPU destinations so data can move directly between NVMe storage and GPU
+   memory. This path must be capability-gated and fall back cleanly when GDS is unavailable.
 
 ## Replica write coordination
 
@@ -613,7 +639,7 @@ KVCS Standard API's idempotency and manifest contract.
 
 ## Four-node managed NoF validation
 
-The SPDK shim is compiled as a static Rust/C++ shim and links the external SPDK/DPDK
+The SPDK shim is compiled as a static Rust/C shim and links the external SPDK/DPDK
 libraries dynamically. This is intentional: the four NoF hosts run Ubuntu 24.04/glibc 2.39,
 while the canonical Rust build container is Ubuntu 22.04/glibc 2.35. Linking the host-built SPDK
 archives statically in the container produces `__isoc23_*`/`__strlcpy_chk` ABI failures. The
@@ -644,6 +670,9 @@ library resolution. The test artifact is `target/debug/nof_multi_client` (or the
 `NOF_BUILD_PROFILE=release`). The bastion runner passes the same profile through to staging; set
 `NOF_RUN_UNIT_TESTS=1` to run the NoF unit subset before any target reset.
 
+RDMA targets require an RDMA-capable NIC on both endpoints and an SPDK build configured with
+`--with-rdma`; `NOF_SPDK_LIB_DIR` must select that RDMA-enabled runtime on each initiator.
+
 `run-nof-multi-client.sh` repeats `ldd -r` on the actual initiator after adding its SPDK runtime
 directory, and writes hostname, kernel, interface inventory, binary hash, and runtime-library
 status to `run-manifest.txt`. A run is not started when a shared library or symbol is unresolved.
@@ -659,7 +688,7 @@ enabled, is deliberately performed from the bastion:
 NOF_BUILD_HOST='<build-ssh-host>' \
 NOF_BUILD_ROOT='<repo-path-on-build-host>' \
 MOONCAKE_SPDK_PREFIX='<spdk-prefix-on-build-host-and-initiators>' \
-NOF_TARGETS='<target-ssh-host-a>|<target-traddr-a>|<target-id-a>|<target-subnqn-a>|<target-port-a>,<target-ssh-host-b>|<target-traddr-b>|<target-id-b>|<target-subnqn-b>|<target-port-b>' \
+NOF_TARGETS='<target-ssh-host-a>|<target-traddr-a>|<target-id-a>|<target-subnqn-a>|<target-port-a>|tcp,<target-ssh-host-b>|<target-traddr-b>|<target-id-b>|<target-subnqn-b>|<target-port-b>|rdma' \
 NOF_CLIENT_IDS='<client-id-a>,<client-id-b>' \
 NOF_INITIATORS='<initiator-ssh-host-a>|<initiator-bind-ip-a>|<client-id-a>;<initiator-ssh-host-b>|<initiator-bind-ip-b>|<client-id-b>' \
 NOF_REDIS_URL='redis://<redis-host>:<redis-port>/<redis-db>' \
@@ -671,7 +700,9 @@ The multi-node script intentionally has no target, initiator, Redis, build-host,
 defaults. A real reservation must pass the topology explicitly:
 
 - `NOF_TARGETS` is a comma-separated target list. Each entry is
-  `public_host|traddr|target_id|subnqn|port`. The number of NoF targets is the number of entries.
+  `public_host|traddr|target_id|subnqn|port[|transport]`. `transport` accepts `tcp` or `rdma` and
+  defaults to `tcp` when omitted. Both transports use the same SPDK block-device and ExtentStore
+  implementation. The number of NoF targets is the number of entries.
 - `NOF_CLIENT_IDS` is the global client list used by the test binary for barriers and read
   verification.
 - `NOF_INITIATORS` is a semicolon-separated initiator list. Each entry is
@@ -696,15 +727,31 @@ used to start only the client subset that belongs on the current machine while k
 
 The runner sets `MC_STORE_RS_ENABLE_COLD_TIER=1`, creates per-run registration, write/offload,
 and read-start barriers, and starts the client IDs from `NOF_CLIENT_IDS` with
-`NOF_REPLICA_COUNT`. Each client writes a disjoint object set, waits until all configured clients
-finish offload and the routes report materialized Managed NoF backing, then all clients issue
-`batch_get_into` reads concurrently and verify the complete object set. The test binary uses
+`NOF_REPLICA_COUNT`. Each client writes a disjoint object set and calls the synchronous
+`debug_evict_all` API. A client joins the offload barrier only after eviction reports completion,
+zero remaining hot replicas, and no replica dropped without cold backing. After every configured
+client reaches that barrier, all clients issue `batch_get_into` reads concurrently and verify the
+complete object set. Read-only recovery runs wait separately for recovered target manifests because
+there are no hot replicas for `debug_evict_all` to process. The test binary uses
 `NoopTransport` for the local hot segment, so it does not claim to validate remote hot-memory
 transfers; the cross-client assertion is the managed NoF read path. A passing run must contain the
 configured write/offload and read verification counts in each client log. The target list is
 configured by `NOF_TARGETS`, client IDs by `NOF_CLIENT_IDS`, local client subset by
 `NOF_LOCAL_CLIENT_IDS`, initiator machines by `NOF_INITIATORS`, and the image size by
 `NOF_TEST_IMAGE_BYTES`; the reset operation removes and recreates only `NOF_TARGET_IMAGE`.
+
+The same runner exposes focused lifecycle checks without embedding a topology:
+
+- `NOF_EXPECT_NOF_COPIES` verifies the number of materialized target copies per route.
+- `NOF_WATERMARK_HIGH_BYTES` and `NOF_WATERMARK_LOW_BYTES`, combined with
+  `NOF_POST_OFFLOAD_WAIT_SECONDS`, verify owner-driven high-to-low watermark cleanup.
+- `NOF_DELETE_AND_REWRITE=true` deletes the first object set and writes a second set, allowing a
+  deliberately small `NOF_DEVICE_BYTES` to verify extent release and reuse.
+- `NOF_HANDOFF_DEPARTING_CLIENT=<client-id>` makes one of exactly two clients exit normally after
+  offload; the survivor then deletes, rewrites, offloads, and reads the complete object set.
+- `NOF_READ_ONLY=true` skips writes and validates routes rebuilt from existing target manifests.
+- `NOF_EXPECT_ABSENT_TARGETS` verifies that long-failed target copies have been removed after an
+  externally orchestrated target outage.
 
 ## Validation
 

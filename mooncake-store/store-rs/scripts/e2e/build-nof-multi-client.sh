@@ -102,6 +102,7 @@ cargo build --locked "${PROFILE_ARGS[@]}" -p mooncake-store-e2e --bin nof_multi_
 
 if [[ "${NOF_RUN_UNIT_TESTS:-0}" == 1 ]]; then
   cargo test --locked -p mooncake-store-client --lib --features nof-spdk nof
+  cargo test --locked -p mooncake-store-e2e --bin nof_multi_client --features nof-spdk
 fi
 
 [[ -x "${BINARY}" ]] || { echo "built binary not found: ${BINARY}" >&2; exit 1; }

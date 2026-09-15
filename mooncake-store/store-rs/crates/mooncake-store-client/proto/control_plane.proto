@@ -555,6 +555,7 @@ enum ManagedNofRouteAction {
   MANAGED_NOF_ROUTE_ACTION_PREPARE = 1;
   MANAGED_NOF_ROUTE_ACTION_PUBLISH = 2;
   MANAGED_NOF_ROUTE_ACTION_RELEASE = 3;
+  MANAGED_NOF_ROUTE_ACTION_MATERIALIZE = 4;
 }
 
 message ManageNofBackingRequest {
@@ -563,6 +564,7 @@ message ManageNofBackingRequest {
   ManagedNofRouteAction action = 3;
   uint64 length = 4;
   optional uint64 checksum = 5;
+  bytes payload = 6;
 }
 
 message ManageNofBackingReply {

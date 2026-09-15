@@ -423,7 +423,7 @@ impl StorageOwnerState {
                 break;
             }
             result.attempted_victims = result.attempted_victims.saturating_add(1);
-            if self.free_one_managed_nof_backing_lru(target_id)? {
+            if self.free_one_managed_nof_backing(target_id)? {
                 result.freed_backings = result.freed_backings.saturating_add(1);
             } else {
                 result.skipped_backings = result.skipped_backings.saturating_add(1);
@@ -852,75 +852,47 @@ impl StorageOwnerState {
         Ok(false)
     }
 
-    fn free_one_managed_nof_backing_lru(&self, target_id: &str) -> Result<bool> {
-        for rebuild in 0..=1usize {
-            let budget = self.hot_replicas.eviction_budget().max(1);
-            for _ in 0..budget {
-                let victim = self.hot_replicas.pick_victim(
-                    None,
-                    self.offload_priority.eviction_policy,
-                    self.offload_priority.eviction_scan_limit,
-                );
-                let Some(victim) = victim else {
-                    break;
-                };
-                if self.free_managed_nof_candidate(&victim, target_id)? {
-                    return Ok(true);
-                }
-            }
-            if rebuild == 0 {
-                self.rebuild_clock()?;
-            }
-        }
-        Ok(false)
-    }
-
-    fn free_managed_nof_candidate(&self, victim: &ClockEntryId, target_id: &str) -> Result<bool> {
-        let Some(route) = self.route_ops.load_route(&victim.route_key)? else {
-            self.hot_replicas.remove_id(victim);
-            return Ok(false);
-        };
-        if route.state != RouteState::Active {
-            self.hot_replicas.remove_id(victim);
-            return Ok(false);
-        }
-        let Some(backing) = route.nof_backing.as_ref() else {
-            self.sync_route(&route);
-            return Ok(false);
-        };
-        if backing.state != mooncake_store_core::ColdBackingState::Materialized
-            || !managed_nof_backing_contains_target(backing, target_id)
-            || !managed_nof_target_removal_is_safe(&route, backing)
-        {
-            self.sync_route(&route);
-            return Ok(false);
-        }
-        match self
+    fn free_one_managed_nof_backing(&self, target_id: &str) -> Result<bool> {
+        for indexed_route in self
             .cold_tier_devices
             .nof_targets
-            .release_managed_target(target_id, route.clone())
+            .list_managed_routes(target_id)?
         {
-            Ok(next) => {
-                info!(
-                    runtime = %self.runtime,
-                    key = %route.key.0,
-                    target_id,
-                    nof_backing_length = backing.length,
-                    "managed_nof_backing_released_for_watermark"
-                );
-                self.sync_route(&next);
-                Ok(true)
+            let Some(route) = self.route_ops.load_route(&indexed_route.key)? else {
+                self.hot_replicas.remove_key(&indexed_route.key);
+                continue;
+            };
+            let Some(backing) = route.nof_backing.as_ref() else {
+                continue;
+            };
+            if route.state != RouteState::Active
+                || backing.state != mooncake_store_core::ColdBackingState::Materialized
+                || !managed_nof_backing_contains_target(backing, target_id)
+                || !managed_nof_target_removal_is_safe(&route, backing)
+            {
+                continue;
             }
-            Err(StoreError::Conflict(_)) => {
-                if let Some(current) = self.route_ops.load_route(&route.key)? {
-                    self.sync_route(&current);
-                } else {
-                    self.hot_replicas.remove_key(&route.key);
+            return match self
+                .cold_tier_devices
+                .nof_targets
+                .release_managed_target(target_id, route.clone())
+            {
+                Ok(next) => {
+                    info!(
+                        runtime = %self.runtime,
+                        key = %route.key.0,
+                        target_id,
+                        nof_backing_length = backing.length,
+                        "managed_nof_backing_released_for_watermark"
+                    );
+                    self.sync_route(&next);
+                    Ok(true)
                 }
-                Ok(false)
-            }
-            Err(error) => Err(error),
+                Err(StoreError::Conflict(_)) => Ok(false),
+                Err(error) => Err(error),
+            };
         }
+        Ok(false)
     }
 
     fn downline_unhealthy_managed_nof_targets(
@@ -954,19 +926,27 @@ impl StorageOwnerState {
         target_id: &str,
         max_routes: usize,
     ) -> Result<ColdTierCleanupResult> {
-        let routes = self.metadata.as_ref().list_object_routes_by_nof_backing(
-            &mooncake_store_core::NofBackingRouteFilter {
-                target_id: Some(target_id.to_string()),
-                state: Some(mooncake_store_core::ColdBackingState::Materialized),
-                limit: Some(max_routes.max(1)),
-            },
-        )?;
+        let routes = self
+            .cold_tier_devices
+            .nof_targets
+            .list_managed_routes(target_id)?;
         let mut result = ColdTierCleanupResult::default();
-        for route in routes {
+        for indexed_route in routes.into_iter().take(max_routes.max(1)) {
             result.attempted_victims = result.attempted_victims.saturating_add(1);
+            let Some(route) = self.route_ops.load_route(&indexed_route.key)? else {
+                self.hot_replicas.remove_key(&indexed_route.key);
+                continue;
+            };
+            self.cold_tier_devices
+                .nof_targets
+                .mirror_managed_route(&route);
             let Some(backing) = route.nof_backing.as_ref() else {
                 continue;
             };
+            if !managed_nof_backing_contains_target(backing, target_id) {
+                self.sync_route(&route);
+                continue;
+            }
             if !managed_nof_target_removal_is_safe(&route, backing) {
                 result.skipped_backings = result.skipped_backings.saturating_add(1);
                 self.sync_route(&route);

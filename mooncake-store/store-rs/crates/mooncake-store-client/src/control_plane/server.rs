@@ -20,6 +20,7 @@ pub(crate) struct ControlPlaneHandle {
     address: String,
     shutdown: Option<oneshot::Sender<()>>,
     thread: Option<JoinHandle<()>>,
+    join_on_shutdown: bool,
 }
 
 impl ControlPlaneHandle {
@@ -28,6 +29,7 @@ impl ControlPlaneHandle {
             address: String::new(),
             shutdown: None,
             thread: None,
+            join_on_shutdown: false,
         }
     }
 
@@ -95,6 +97,7 @@ impl ControlPlaneHandle {
             address,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
+            join_on_shutdown: false,
         })
     }
 
@@ -102,11 +105,20 @@ impl ControlPlaneHandle {
         &self.address
     }
 
+    pub(crate) fn join_on_shutdown(&mut self) {
+        self.join_on_shutdown = true;
+    }
+
     pub(crate) fn shutdown(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        let _ = self.thread.take();
+        let thread = self.thread.take();
+        if self.join_on_shutdown {
+            if let Some(thread) = thread {
+                let _ = thread.join();
+            }
+        }
     }
 }
 

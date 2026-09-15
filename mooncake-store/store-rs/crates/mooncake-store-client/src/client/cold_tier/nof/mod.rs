@@ -40,7 +40,7 @@ pub use physical::{
 };
 pub use runtime::NofTargetConfig;
 pub(in crate::client) use runtime::{
-    target_set_fingerprint, NofManagedRecoveryTarget, NofTargetManager,
+    mirror_managed_route_index, target_set_fingerprint, NofManagedRecoveryTarget, NofTargetManager,
 };
 
 pub use crate::client::cold_tier::layout::{

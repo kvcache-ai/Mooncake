@@ -107,6 +107,13 @@ impl NofRuntimeTarget {
                     "NoF target excluded after consecutive heartbeat failures"
                 );
             }
+            (_, TARGET_HEARTBEAT_DOWNLINE_FAILURE_THRESHOLD) => {
+                tracing::warn!(
+                    target_id,
+                    failures = health.consecutive_failures,
+                    "NoF target reached the long-failure downline threshold"
+                );
+            }
             _ => {}
         }
         health.snapshot().is_ok()
@@ -262,6 +269,10 @@ impl NofOwnerState {
                 limit: None,
             },
         )
+    }
+
+    pub(super) fn mirror_managed_route(&self, route: &ObjectRoute) -> Result<()> {
+        super::nof::mirror_managed_route_index(self.metadata.as_ref(), route)
     }
 
     pub(super) fn accept_handoff(

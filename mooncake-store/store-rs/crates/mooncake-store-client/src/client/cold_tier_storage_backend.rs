@@ -931,22 +931,58 @@ fn reconcile_nof_managed_startup(
                 .cmp(&b.manifest.key)
                 .then(b.manifest.route_version.cmp(&a.manifest.route_version))
         });
+        let mut seen_keys = std::collections::BTreeSet::new();
+        let mut live_records = Vec::new();
         for recovered in &recovered_objects {
-            if let Err(error) = try_register_recovered_cold_object(
+            if !seen_keys.insert(recovered.manifest.key.clone()) {
+                continue;
+            }
+            match try_register_recovered_cold_object(
                 metadata,
                 route_directory,
                 observer,
                 recovered,
                 RecoveredBackingKind::Nof,
             ) {
-                tracing::warn!(
+                Ok(
+                    RecoveredObjectOutcome::Registered | RecoveredObjectOutcome::AlreadyConsistent,
+                ) => {
+                    live_records.push(cold_tier::nof::NofManagedReadRequest {
+                        locator: cold_tier::nof::NofManagedLocator::from_hex(
+                            &recovered.manifest.object_locator,
+                        )?,
+                        length: recovered.metadata.length,
+                        checksum: recovered.metadata.checksum,
+                    });
+                    if let Some(route) =
+                        route_directory.get_object_route(observer, &recovered.manifest.key)?
+                    {
+                        if let Err(error) =
+                            cold_tier::nof::mirror_managed_route_index(metadata, &route)
+                        {
+                            tracing::warn!(
+                                route_key = %route.key.0,
+                                %error,
+                                "managed NoF startup recovery route index update failed"
+                            );
+                        }
+                    }
+                }
+                Ok(RecoveredObjectOutcome::Superseded) => {}
+                Err(error) => tracing::warn!(
                     route_key = %recovered.manifest.key.0,
                     target_id = %target.target_id,
                     %error,
                     "managed NoF startup recovery: skipping object due to error"
-                );
+                ),
             }
         }
+        target
+            .backend
+            .backing
+            .managed_allocator()
+            .expect("managed allocator capability was checked during construction")
+            .recover(&live_records)?;
     }
     Ok(())
 }

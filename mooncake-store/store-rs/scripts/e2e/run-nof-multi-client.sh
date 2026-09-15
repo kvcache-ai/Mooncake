@@ -12,6 +12,7 @@ RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 KEYSPACE="${NOF_KEYSPACE:-mc/store-rs/nof-multi-client/${RUN_TAG}}"
 REDIS_URL="${NOF_REDIS_URL:-redis://127.0.0.1:6379/0}"
 BIND_IP="${NOF_BIND_IP:-127.0.0.1}"
+HOST_NQN="${NOF_HOST_NQN:-}"
 SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-${MOONCAKE_SPDK_PREFIX:+${MOONCAKE_SPDK_PREFIX}/install/lib}}"
 RESET_TARGETS="${NOF_RESET_TARGETS:-0}"
 SKIP_TARGET_SSH_CHECK="${NOF_SKIP_TARGET_SSH_CHECK:-1}"
@@ -42,9 +43,14 @@ fi
 IFS=',' read -r -a TARGETS <<<"${TARGETS_SPEC}"
 [[ "${#TARGETS[@]}" -gt 0 ]] || { echo "NOF_TARGETS must not be empty" >&2; exit 1; }
 for target in "${TARGETS[@]}"; do
-  IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
+  IFS='|' read -r public_ip lan_ip target_id subnqn port transport <<<"${target}"
   [[ -n "${public_ip}" && -n "${lan_ip}" && -n "${target_id}" && -n "${subnqn}" && -n "${port}" ]] || {
-    echo "NOF_TARGETS entries must be public_ip|traddr|target_id|subnqn|port: ${target}" >&2
+    echo "NOF_TARGETS entries must be public_ip|traddr|target_id|subnqn|port[|transport]: ${target}" >&2
+    exit 1
+  }
+  transport="${transport:-tcp}"
+  [[ "${transport,,}" == tcp || "${transport,,}" == rdma ]] || {
+    echo "NOF_TARGETS transport must be tcp or rdma: ${target}" >&2
     exit 1
   }
 done
@@ -74,7 +80,7 @@ reset_target() {
 
 if [[ "${RESET_TARGETS}" == 1 ]]; then
   for target in "${TARGETS[@]}"; do
-    IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
+    IFS='|' read -r public_ip lan_ip target_id subnqn port transport <<<"${target}"
     echo "resetting NoF backing on ${public_ip} (${lan_ip}, ${target_id})"
     reset_target "${public_ip}"
   done
@@ -83,20 +89,24 @@ fi
 check_target_endpoint() {
   local lan_ip="$1"
   local port="$2"
-  timeout 2 bash -c "</dev/tcp/${lan_ip}/${port}"
+  local transport="$3"
+  if [[ "${transport,,}" == tcp ]]; then
+    timeout 2 bash -c "</dev/tcp/${lan_ip}/${port}"
+  fi
 }
 
 for target in "${TARGETS[@]}"; do
-  IFS='|' read -r public_ip lan_ip target_id subnqn port <<<"${target}"
+  IFS='|' read -r public_ip lan_ip target_id subnqn port transport <<<"${target}"
+  transport="${transport:-tcp}"
   if [[ "${SKIP_TARGET_SSH_CHECK}" != 1 ]]; then
     [[ -n "${NVMF_SERVICE}" ]] || {
       echo "NOF_NVMF_SERVICE is required when NOF_SKIP_TARGET_SSH_CHECK=0" >&2
       exit 1
     }
     ssh -o BatchMode=yes -o ConnectTimeout=8 "root@${public_ip}" \
-      "test \"\$(systemctl is-active '${NVMF_SERVICE}')\" = active && timeout 2 bash -c '</dev/tcp/${lan_ip}/${port}'"
+      "test \"\$(systemctl is-active '${NVMF_SERVICE}')\" = active"
   else
-    check_target_endpoint "${lan_ip}" "${port}"
+    check_target_endpoint "${lan_ip}" "${port}" "${transport}"
   fi
 done
 
@@ -143,6 +153,7 @@ mkdir -p "${BARRIER_DIR}"
   sha256sum "${BINARY}"
   printf 'run_tag=%s\nkeyspace=%s\nbind_ip=%s\nredis_url=%s\n' \
     "${RUN_TAG}" "${KEYSPACE}" "${BIND_IP}" "${REDIS_URL}"
+  printf 'host_nqn=%s\n' "${HOST_NQN:-<default>}"
   printf 'target_inventory=%s\nclient_ids=%s\nlocal_client_ids=%s\nroute_control=%s\n' \
     "${TARGETS_SPEC}" "${CLIENT_IDS_SPEC}" "${LOCAL_CLIENT_IDS_SPEC}" "${ROUTE_CONTROL}"
   printf 'nvmf_service=%s\ntarget_image=%s\n' "${NVMF_SERVICE}" "${TARGET_IMAGE}"
@@ -159,6 +170,9 @@ mkdir -p "${BARRIER_DIR}"
 export NOF_REDIS_URL="${REDIS_URL}"
 export NOF_KEYSPACE="${KEYSPACE}"
 export NOF_BIND_IP="${BIND_IP}"
+if [[ -n "${HOST_NQN}" ]]; then
+  export NOF_HOST_NQN="${HOST_NQN}"
+fi
 export NOF_TARGETS="${TARGETS_SPEC}"
 export NOF_CLIENT_IDS="${CLIENT_IDS_SPEC}"
 export NOF_ROUTE_CONTROL="${ROUTE_CONTROL}"

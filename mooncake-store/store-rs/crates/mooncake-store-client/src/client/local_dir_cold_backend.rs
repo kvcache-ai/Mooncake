@@ -516,19 +516,25 @@ fn recovered_backing_is_consistent(
     manifest_backing: &mooncake_store_core::ColdBackingRoute,
     backing_kind: RecoveredBackingKind,
 ) -> bool {
-    let current_backing = match backing_kind {
-        RecoveredBackingKind::Cold => current.cold_backing.clone(),
-        RecoveredBackingKind::Nof => current
-            .nof_backing
-            .as_ref()
-            .map(mooncake_store_core::NofBackingRoute::to_cold),
-    };
-    current_backing.as_ref().is_some_and(|backing| {
-        backing.cold_tier_id == manifest_backing.cold_tier_id
-            && backing.object_locator == manifest_backing.object_locator
-            && backing.owner == manifest_backing.owner
-            && backing.state == mooncake_store_core::ColdBackingState::Materialized
-    })
+    match backing_kind {
+        RecoveredBackingKind::Cold => current.cold_backing.as_ref().is_some_and(|backing| {
+            backing.cold_tier_id == manifest_backing.cold_tier_id
+                && backing.object_locator == manifest_backing.object_locator
+                && backing.owner == manifest_backing.owner
+                && backing.state == mooncake_store_core::ColdBackingState::Materialized
+        }),
+        RecoveredBackingKind::Nof => current.nof_backing.as_ref().is_some_and(|backing| {
+            (backing.target_id == manifest_backing.cold_tier_id
+                && backing.object_locator == manifest_backing.object_locator
+                && backing.owner == manifest_backing.owner
+                || backing.replicas.iter().any(|replica| {
+                    replica.target_id == manifest_backing.cold_tier_id
+                        && replica.object_locator == manifest_backing.object_locator
+                        && replica.owner == manifest_backing.owner
+                }))
+                && backing.state == mooncake_store_core::ColdBackingState::Materialized
+        }),
+    }
 }
 
 fn apply_recovered_backing(
@@ -543,11 +549,45 @@ fn apply_recovered_backing(
         }
         RecoveredBackingKind::Nof => {
             route.cold_backing = None;
-            route.nof_backing = Some(mooncake_store_core::NofBackingRoute::from_cold(
-                manifest_backing,
-            ));
+            let Some(backing) = route.nof_backing.as_mut() else {
+                route.nof_backing = Some(mooncake_store_core::NofBackingRoute::from_cold(
+                    manifest_backing,
+                ));
+                return;
+            };
+            backing.length = manifest_backing.length;
+            backing.checksum = manifest_backing.checksum;
+            backing.state = mooncake_store_core::ColdBackingState::Materialized;
+            if backing.target_id == manifest_backing.cold_tier_id {
+                backing.owner = manifest_backing.owner.clone();
+                backing.object_locator = manifest_backing.object_locator.clone();
+            } else if let Some(replica) = backing
+                .replicas
+                .iter_mut()
+                .find(|replica| replica.target_id == manifest_backing.cold_tier_id)
+            {
+                replica.owner = manifest_backing.owner.clone();
+                replica.object_locator = manifest_backing.object_locator.clone();
+            } else {
+                backing
+                    .replicas
+                    .push(mooncake_store_core::NofBackingReplica {
+                        target_id: manifest_backing.cold_tier_id.clone(),
+                        owner: manifest_backing.owner.clone(),
+                        object_locator: manifest_backing.object_locator.clone(),
+                    });
+            }
         }
     }
+}
+
+fn recovered_nof_matches_current_object(
+    current: &ObjectRoute,
+    manifest_backing: &mooncake_store_core::ColdBackingRoute,
+) -> bool {
+    current.nof_backing.as_ref().is_none_or(|backing| {
+        backing.length == manifest_backing.length && backing.checksum == manifest_backing.checksum
+    })
 }
 
 pub(super) fn try_register_recovered_cold_object(
@@ -570,6 +610,11 @@ pub(super) fn try_register_recovered_cold_object(
     let repair_current = |current: ObjectRoute| -> Result<RecoveredObjectOutcome> {
         if recovered_backing_is_consistent(&current, &manifest_backing, backing_kind) {
             return Ok(RecoveredObjectOutcome::AlreadyConsistent);
+        }
+        if backing_kind == RecoveredBackingKind::Nof
+            && !recovered_nof_matches_current_object(&current, &manifest_backing)
+        {
+            return Ok(RecoveredObjectOutcome::Superseded);
         }
 
         let mut next = current.clone();
@@ -606,11 +651,32 @@ pub(super) fn try_register_recovered_cold_object(
         }
     };
 
-    if let Some(current) = metadata.get_object_route(&recovered.manifest.key)? {
+    let authority_current =
+        match route_directory.get_object_route(observer, &recovered.manifest.key) {
+            Ok(current) => current,
+            Err(error) if should_retry_recovered_route_locally(&error) => None,
+            Err(error) => return Err(error),
+        };
+    if let Some(current) = authority_current {
         return repair_current(current);
     }
 
-    let route = route_from_recovered_cold_object(recovered, observer.runtime.clone(), backing_kind);
+    let route = if let Some(current) = metadata.get_object_route(&recovered.manifest.key)? {
+        if backing_kind == RecoveredBackingKind::Nof
+            && !recovered_nof_matches_current_object(&current, &manifest_backing)
+        {
+            return Ok(RecoveredObjectOutcome::Superseded);
+        }
+        let mut next = current;
+        // The persistent copy is a recovery hint, not the route authority. If no
+        // authority survived, its memory replicas refer to dead runtime epochs.
+        next.replicas.clear();
+        next.version = next.version.next();
+        apply_recovered_backing(&mut next, &manifest_backing, backing_kind);
+        next
+    } else {
+        route_from_recovered_cold_object(recovered, observer.runtime.clone(), backing_kind)
+    };
     let cas = compare_and_swap_recovered_route(
         route_directory,
         observer,

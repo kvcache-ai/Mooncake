@@ -40,6 +40,12 @@ pub(in super::super) fn enqueue_restore_promotion(
     resolved: &ResolvedObject,
     payload: RestorePromotionPayload<'_>,
 ) {
+    // NoF is readable by every client through its local executor. Promoting a
+    // NoF hit to the target owner would add a copy and incorrectly couple reads
+    // to ownership.
+    if resolved.route.nof_backing.is_some() || resolved.transient_nof_read.is_some() {
+        return;
+    }
     let payload = payload.into_arc();
     let payload_bytes = payload.len();
     let Some(cold_backing) = resolved_cold_backing(resolved) else {
