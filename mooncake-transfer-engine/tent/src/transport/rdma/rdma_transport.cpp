@@ -420,6 +420,14 @@ Status RdmaTransport::uninstall() {
         }
 
         workers_.reset();
+        // Workers joined: nothing can name an orphan any more.
+        {
+            std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+            for (auto& orphan : orphan_slices_)
+                RdmaSliceStorage::Get().deallocate(orphan.slice);
+            orphan_slices_.clear();
+            orphans_pending_.store(false, std::memory_order_release);
+        }
         metadata_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
@@ -444,16 +452,39 @@ Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
     auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch)
         return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
+    // Settle what an earlier free left behind before adding to it: an orphan
+    // whose handler has since finished is freed here rather than waiting for
+    // the monitor's next second.
+    if (orphans_pending_.load(std::memory_order_acquire))
+        reapOrphanSlices(/*on_tick=*/false);
     for (auto* task : rdma_batch->task_list) {
         task->deref();  // Release batch's reference to the task
     }
     rdma_batch->task_list.clear();
+    // A slice still owed a completion cannot go back to the slab: its
+    // address is a live work-request id, and the next transfer would get
+    // that storage, so the stale completion would resolve somebody else's
+    // slice and report bytes that never moved. The batch being terminal
+    // does not rule this out -- a timeout resolves a slice while its work
+    // request is live. Hand those over; the batch itself is freed now.
+    std::vector<OrphanSlice> orphans;
     for (auto slice : rdma_batch->slice_chain) {
         while (slice) {
             auto next = slice->next;
-            RdmaSliceStorage::Get().deallocate(slice);
+            if (slice->completions_owed.load(std::memory_order_acquire) > 0) {
+                slice->next = nullptr;  // it leaves the chain behind
+                orphans.push_back({slice, 0});
+            } else {
+                RdmaSliceStorage::Get().deallocate(slice);
+            }
             slice = next;
         }
+    }
+    if (!orphans.empty()) {
+        std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+        orphan_slices_.insert(orphan_slices_.end(), orphans.begin(),
+                              orphans.end());
+        orphans_pending_.store(true, std::memory_order_release);
     }
     Slab<RdmaSubBatch>::Get().deallocate(rdma_batch);
     batch = nullptr;
@@ -577,6 +608,60 @@ Status RdmaTransport::submitTransferTasks(
         }
     }
     return Status::OK();
+}
+
+void RdmaTransport::reapOrphanSlices(bool on_tick) {
+    // Taken whole so the scan runs outside the lock: expired() reaches the
+    // endpoint's control block, which is a cache miss per slice once a spell
+    // of timeouts has filled this up. Survivors are compacted in place and
+    // the same buffer goes back, so a tick allocates nothing. A batch freed
+    // meanwhile appends to the emptied vector; those are kept too, and
+    // nothing here reads the order.
+    std::vector<OrphanSlice> taken;
+    {
+        std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+        taken.swap(orphan_slices_);
+    }
+    if (taken.empty()) return;
+
+    size_t kept = 0;
+    size_t warned = 0;
+    for (auto& orphan : taken) {
+        auto* slice = orphan.slice;
+        // The completion has been handled, or its endpoint is gone -- a
+        // provider clears a queue pair's completions when it is destroyed
+        // (mlx5 and mlx4 do), so none can name this slice afterwards.
+        // Exactly zero: a handler pays on its way out and submitSlices()
+        // counts the post under the queue pair lock that handler needs, so
+        // the count never goes negative; if it ever did, holding on is the
+        // safe way to be wrong.
+        const int owed =
+            slice->completions_owed.load(std::memory_order_acquire);
+        if (owed == 0 || slice->ep_weak_ptr.expired()) {
+            RdmaSliceStorage::Get().deallocate(slice);
+            continue;
+        }
+        // Still held, so its endpoint is still alive: a queue pair the
+        // teardown has not destroyed. Say so once, then keep holding -- an
+        // age cap would free a slice the completion queue may yet name.
+        if (on_tick && ++orphan.passes == orphan_warn_after_passes_) {
+            ++warned;
+            LOG(WARNING) << "Orphaned slice " << slice << " still owes " << owed
+                         << " completion(s) after " << orphan.passes
+                         << " reap passes and its endpoint is still alive; "
+                            "held until the queue pair is destroyed -- see "
+                            "the endpoint teardown log for why it is not";
+        }
+        taken[kept++] = orphan;
+    }
+    taken.resize(kept);
+
+    std::lock_guard<std::mutex> guard(orphan_slice_mutex_);
+    orphan_warnings_ += warned;
+    if (!orphan_slices_.empty())
+        taken.insert(taken.end(), orphan_slices_.begin(), orphan_slices_.end());
+    orphan_slices_.swap(taken);
+    orphans_pending_.store(!orphan_slices_.empty(), std::memory_order_release);
 }
 
 Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,

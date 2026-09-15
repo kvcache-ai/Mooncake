@@ -720,11 +720,12 @@ void Workers::asyncPostSend() {
                 LOG(ERROR) << "Failed to generate post path for slice " << slice
                            << ": " << status.ToString();
                 releaseSliceQuota(slice, getCurrentTimeInNano());
+                // Count first: resolving the slice lets the batch be freed.
+                discountFromOwner(worker, slice);
                 updateSliceStatus(slice, slice->task->cancel_requested.load(
                                              std::memory_order_acquire)
                                              ? CANCELED
                                              : FAILED);
-                discountFromOwner(worker, slice);
             } else if (dropUnpostableSlice(worker, slice)) {
                 slice = slice->next;
                 continue;
@@ -763,8 +764,8 @@ void Workers::asyncPostSend() {
                     LOG(WARNING)
                         << "Slice " << slice << " failed: retry count exceeded";
                     disableEndpoint(slice);
-                    updateSliceStatus(slice, FAILED);
                     discountFromOwner(worker, slice);
+                    updateSliceStatus(slice, FAILED);
                 } else {
                     // The re-submit moves the count to the lane it lands on.
                     submitFromTick(worker, slice);
@@ -802,8 +803,8 @@ void Workers::asyncPostSend() {
             worker.inflight_slice_set.erase(slice);
             releaseSliceQuota(slice, post_ts);
             if (slice->task->cancel_requested.load(std::memory_order_acquire)) {
-                updateSliceStatus(slice, CANCELED);
                 discountFromOwner(worker, slice);
+                updateSliceStatus(slice, CANCELED);
                 continue;
             }
             slice->retry_count++;
@@ -812,8 +813,8 @@ void Workers::asyncPostSend() {
                 LOG(WARNING)
                     << "Slice " << slice << " failed: retry count exceeded";
                 disableEndpoint(slice);
-                updateSliceStatus(slice, FAILED);
                 discountFromOwner(worker, slice);
+                updateSliceStatus(slice, FAILED);
             } else {
                 submitFromTick(worker, slice);
             }
@@ -950,6 +951,19 @@ void Workers::handleCompletion(WorkerContext& worker, RdmaContext& context,
                                const ibv_wc& wc, uint64_t poll_ts,
                                bool last_in_pass) {
     auto slice = (RdmaSlice*)wc.wr_id;
+    // The completion this post owed, paid back only once this handler is
+    // done with the slice. Paying it on entry is not enough: acknowledge()
+    // further down publishes the terminal status the caller is waiting for,
+    // so the batch can be freed, and the slice with it, while the lines
+    // after it still read the slice. Above zero, freeSubBatch() hands the
+    // slice to the orphan list instead of the slab and the reaper leaves it
+    // there.
+    struct CompletionPaid {
+        RdmaSlice* slice;
+        ~CompletionPaid() {
+            slice->completions_owed.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    } completion_paid{slice};
     // What the acknowledge callbacks below need, behind one reference so
     // the std::function stays in its small-buffer storage (no allocation
     // per completion).
@@ -1392,6 +1406,8 @@ void Workers::monitorThread() {
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
             reclaimEndpoints();
+            // An endpoint destroyed above settles its orphans right here.
+            transport_->reapOrphanSlices(/*on_tick=*/true);
             // Safety net for a recovery event that never reached us.
             resumePausedContexts();
             last_reclaim_time = current_time;
