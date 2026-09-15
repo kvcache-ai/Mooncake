@@ -49,6 +49,24 @@
 namespace mooncake {
 class TransferEngineImplTestPeer;
 
+// Whether an Ascend build installs the Ascend transport for a protocol hint.
+// Hints that name no protocol or name Ascend install it; a hint naming a host
+// transport (e.g. "rdma") leaves the classic host-transport selection in
+// charge. That block is compiled for USE_ASCEND_DIRECT builds only, so HCCL
+// builds (USE_ASCEND without USE_ASCEND_DIRECT) always install Ascend.
+static inline bool shouldInstallAscendTransport(const std::string& protocol) {
+#if defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+    (void)protocol;
+    return true;
+#elif defined(USE_ASCEND_DIRECT)
+    return protocol.empty() || protocol == "ascend" ||
+           protocol == "ascend_direct";
+#else
+    (void)protocol;
+    return false;
+#endif
+}
+
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -424,6 +442,19 @@ class TransferEngineImpl {
 
     void setAutoDiscover(const AutoDiscoverConfig& config) {
         auto_discover_config_ = config;
+    }
+
+    // Optional transport hint carried by the protocol argument of init(). An
+    // empty value keeps the config written by setAutoDiscover(), which Store
+    // uses to pass the protocol of the client before calling init(). A hint
+    // for a transport this build does not provide is dropped, so discovery
+    // still falls back to the host transports rather than failing the install.
+    void applyProtocolHint(const std::string& protocol) {
+        if (protocol.empty()) return;
+#ifndef USE_EFA
+        if (protocol == "efa") return;
+#endif
+        auto_discover_config_.protocol = protocol;
     }
 
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
