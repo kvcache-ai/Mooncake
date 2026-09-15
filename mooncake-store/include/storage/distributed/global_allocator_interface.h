@@ -44,6 +44,13 @@ struct BatchAllocateResult {
  */
 class GlobalAllocatorInterface {
    public:
+    struct EvictionCandidate {
+        std::string key;
+        int shard_idx = 0;
+        uint64_t offset = 0;
+        DistributedFSDescriptor descriptor;
+    };
+
     virtual ~GlobalAllocatorInterface() = default;
 
     virtual DfsAllocatorType Type() const = 0;
