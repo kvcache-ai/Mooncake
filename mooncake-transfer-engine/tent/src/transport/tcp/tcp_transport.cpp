@@ -86,6 +86,7 @@ Status TcpTransport::install(std::string &local_segment_name,
                       params_.max_concurrent_tasks);
     }
 
+    shutting_down_.store(false, std::memory_order_release);
     thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
 
     installed_ = true;
@@ -110,11 +111,22 @@ Status TcpTransport::install(std::string &local_segment_name,
 Status TcpTransport::uninstall() {
     if (installed_) {
         if (metadata_) metadata_->setNotifyCallback(nullptr);
-        shutting_down_.store(true, std::memory_order_release);
-        thread_pool_.reset();
+        quiesce();
         metadata_.reset();
         installed_ = false;
     }
+    return Status::OK();
+}
+
+Status TcpTransport::quiesce() {
+    std::unique_ptr<ThreadPool> thread_pool;
+    {
+        std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+        shutting_down_.store(true, std::memory_order_release);
+        thread_pool = std::move(thread_pool_);
+    }
+    // Join outside the admission lock so completion callbacks can return.
+    thread_pool.reset();
     return Status::OK();
 }
 
@@ -142,6 +154,10 @@ Status TcpTransport::submitTransferTasks(
     auto tcp_batch = dynamic_cast<TcpSubBatch *>(batch);
     if (!tcp_batch)
         return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
+    std::lock_guard<std::mutex> guard(lifecycle_mutex_);
+    if (shutting_down_.load(std::memory_order_acquire)) {
+        return Status::InternalError("TCP transport is shutting down" LOC_MARK);
+    }
     if (request_list.size() + tcp_batch->task_list.size() > tcp_batch->max_size)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
 
@@ -234,6 +250,9 @@ void TcpTransport::startTransfer(TcpTask *task) {
 }
 
 Status TcpTransport::doTransferWithRetry(TcpTask *task) {
+    if (shutting_down_.load(std::memory_order_acquire))
+        return Status::InternalError("Transport shutting down");
+
     std::string rpc_server_addr;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,

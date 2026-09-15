@@ -144,6 +144,10 @@ class ClientRequester {
    public:
     ClientRequester();
 
+    // Drains in-flight offload RPCs before the pools member is released
+    // (#3909).
+    ~ClientRequester();
+
     /**
      * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
      * @param client_addr Network address (e.g., "ip:port") of the remote
@@ -195,6 +199,7 @@ class ClientRequester {
     mutable std::shared_mutex client_pool_mutex_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
+    RpcDrainGuard rpc_drain_;
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -585,7 +590,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     if (!cached_result.success) {
         return tl::make_unexpected(cached_result.error);
     }
-    return QueryResult(
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place,
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
         now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
