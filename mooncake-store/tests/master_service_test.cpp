@@ -2893,7 +2893,7 @@ TEST_F(MasterServiceTest, HealthCheckReturnsOkWhenNoLockHeld) {
 
     ASSERT_TRUE(result.has_value()) << "HealthCheck returned error";
     EXPECT_TRUE(result->ok) << "expected ok=true with no shard locks held";
-    EXPECT_EQ(result->shards_checked, MasterService::kNumShards);
+    EXPECT_EQ(result->shards_checked, GetNumShardsForTest());
     EXPECT_EQ(result->shards_blocked, 0u);
     // 1024 non-contended try_lock_shared calls should be fast (well under a
     // second). Use a generous bound to avoid flakiness on loaded CI hosts.
@@ -2913,8 +2913,10 @@ TEST_F(MasterServiceTest, HealthCheckDetectsShardWriteLockHeld) {
     std::atomic<bool> release_now{false};
 
     std::thread holder([&]() {
-        MasterService::MetadataShardAccessorRW shard(service_.get(),
-                                                     kBlockedShard);
+        // MasterServiceTest is a friend of MasterService; use the fixture
+        // helper to obtain the shard mutex and hold it exclusively.
+        auto& mutex = GetShardMutexForTest(*service_, kBlockedShard);
+        std::unique_lock<SharedMutex> lock(mutex);
         lock_acquired.store(true);
         while (!release_now.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -2942,7 +2944,7 @@ TEST_F(MasterServiceTest, HealthCheckDetectsShardWriteLockHeld) {
     auto recovered = service_->HealthCheck();
     ASSERT_TRUE(recovered.has_value());
     EXPECT_TRUE(recovered->ok);
-    EXPECT_EQ(recovered->shards_checked, MasterService::kNumShards);
+    EXPECT_EQ(recovered->shards_checked, GetNumShardsForTest());
 }
 
 }  // namespace mooncake::test
