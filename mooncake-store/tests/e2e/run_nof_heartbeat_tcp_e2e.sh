@@ -87,7 +87,7 @@ python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_create_subsystem "$TARGET_N
 python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_ns "$TARGET_NQN" Malloc0 >/dev/null || true
 python3 "$REPO_ROOT/extern/spdk/scripts/rpc.py" nvmf_subsystem_add_listener "$TARGET_NQN" -t tcp -a "$TARGET_HOST" -s "$TARGET_PORT" >/dev/null || true
 
-python3 "$REPO_ROOT/mooncake-wheel/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
+python3 "$REPO_ROOT/python/mooncake/http_metadata_server.py" --host "$METADATA_HOST" --port "$METADATA_PORT" >"$LOG_DIR/metadata.log" 2>&1 &
 META_PID=$!
 sleep 2
 
