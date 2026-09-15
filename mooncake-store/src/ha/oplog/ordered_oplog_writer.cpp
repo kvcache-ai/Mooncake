@@ -119,6 +119,7 @@ struct OrderedOpLogWriter::Impl {
             callback = terminal_callback;
             state = terminal_state;
         }
+        cv.notify_all();
         if (callback) {
             callback(*state);
         }
@@ -294,6 +295,21 @@ void OrderedOpLogWriter::Abort(Reservation&& reservation) {
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
     impl_->PublishRuntime();
+}
+
+ErrorCode OrderedOpLogWriter::AwaitDurable(uint64_t sequence) {
+    std::unique_lock<std::mutex> lock(impl_->mutex);
+    impl_->cv.wait(lock, [&] {
+        return impl_->durable_prefix.last_seq >= sequence ||
+               impl_->terminal_state.has_value() || impl_->stop_requested;
+    });
+    if (impl_->durable_prefix.last_seq >= sequence) {
+        return ErrorCode::OK;
+    }
+    if (impl_->terminal_state.has_value()) {
+        return impl_->terminal_state->error;
+    }
+    return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
 }
 
 bool OrderedOpLogWriter::IsAccepting() const {
@@ -537,17 +553,19 @@ void OrderedOpLogWriter::Start() {
 }
 
 void OrderedOpLogWriter::Stop() {
+    bool running;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->accepting = false;
         impl_->stop_requested = true;
         impl_->retry_delay_ms = 0;
         impl_->PublishRuntime();
-        if (!impl_->running) {
-            return;
-        }
+        running = impl_->running;
     }
     impl_->cv.notify_all();
+    if (!running) {
+        return;
+    }
     if (impl_->writer_thread.joinable()) {
         impl_->writer_thread.join();
     }

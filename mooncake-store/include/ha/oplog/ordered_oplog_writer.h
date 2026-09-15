@@ -80,6 +80,13 @@ class OrderedOpLogWriter {
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     void Abort(Reservation&& reservation);
 
+    // Wait for the sequence to be durable, independently of callback
+    // completion. An already-covered sequence succeeds even after terminal
+    // failure or Stop(). Otherwise return the terminal error, or
+    // UNAVAILABLE_IN_CURRENT_STATUS on Stop(). Callers must not hold locks
+    // needed by storage or callbacks.
+    ErrorCode AwaitDurable(uint64_t sequence);
+
     bool IsAccepting() const;
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
