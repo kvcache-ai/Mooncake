@@ -1,0 +1,335 @@
+name: 'Hygon HCU PR Build & Test'
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [labeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hcu-upstream-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  build-wheel:
+    name: Build wheel
+    if: >-
+      github.repository == 'kvcache-ai/Mooncake' &&
+      github.event.label.name == 'run-hygon-ci'
+    runs-on: [self-hosted, Linux, X64, hcu1]
+    timeout-minutes: 120
+    container:
+      image: harbor.sourcefind.cn:5443/hcu/admin/base/dtk:26.04-ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10
+      options: --mount type=bind,source=/etc/hygon-ci,target=/etc/hygon-ci,readonly
+    env:
+      CI: "false"
+      FREE_BUILD_DIR: "0"
+    steps:
+      - name: Checkout PR source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          submodules: recursive
+          path: pr-source
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE/pr-source"
+
+      - name: Record tested commit
+        shell: bash
+        working-directory: pr-source
+        run: |
+          git rev-parse HEAD
+          printf 'HCU source commit: `%s`\n' "$(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Load HCU CI configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          config_file=/etc/hygon-ci/config.env
+          test -r "${config_file}" || {
+            echo "ERROR: ${config_file} is not readable" >&2
+            exit 1
+          }
+          set -a
+          source "${config_file}"
+          set +a
+          for name in DTK_PKG_URL PIP_INDEX_URL; do
+            value="${!name:-}"
+            test -n "${value}" || {
+              echo "ERROR: ${name} is missing from ${config_file}" >&2
+              exit 1
+            }
+            echo "::add-mask::${value}"
+            printf '%s=%s\n' "${name}" "${value}" >> "${GITHUB_ENV}"
+          done
+
+      - name: Install DTK
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          cd /opt
+          wget -q "${DTK_PKG_URL}"
+          tarball="$(basename "${DTK_PKG_URL}")"
+          tar -xzf "${tarball}"
+          dtk_dir="$(find /opt -mindepth 1 -maxdepth 1 -type d -name 'dtk-*' -print -quit)"
+          test -n "${dtk_dir}"
+          ln -s "${dtk_dir}" dtk
+
+      - name: Configure and build Mooncake
+        shell: bash
+        working-directory: pr-source
+        run: |
+          set -Eeuo pipefail
+          export GOPROXY="${GOPROXY:-https://goproxy.cn,https://goproxy.io,direct}"
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+
+          bash dependencies.sh -y
+          mkdir -p build
+          cd build
+          cmake .. -DUSE_HTTP=ON -DCMAKE_BUILD_TYPE=Release
+          cmake --build . -j"$(nproc)"
+          cmake --install .
+
+      - name: Build wheel
+        shell: bash
+        working-directory: pr-source
+        run: |
+          set -Eeuo pipefail
+          set +u
+          source /opt/dtk/env.sh
+          set -u
+
+          python3 -m pip install patchelf==0.14.5
+          PYTHON_VERSION=3.10 OUTPUT_DIR=dist bash scripts/build_wheel.sh
+
+          wheel_count="$(find mooncake-wheel/dist -maxdepth 1 -type f -name '*.whl' | wc -l)"
+          if [ "${wheel_count}" -ne 1 ]; then
+            echo "Expected exactly one wheel, found ${wheel_count}" >&2
+            find mooncake-wheel/dist -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+          ls -lh mooncake-wheel/dist/*.whl
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: pr-source/mooncake-wheel/dist/*.whl
+          if-no-files-found: error
+          retention-days: 3
+
+      - name: Cleanup build environment
+        if: always()
+        shell: bash
+        run: |
+          set -u
+          rm -rf /opt/dtk
+          if [ -n "${DTK_PKG_URL:-}" ]; then
+            tarball="$(basename "${DTK_PKG_URL}")"
+            rm -f "/opt/${tarball}"
+          fi
+          rm -rf pr-source/build pr-source/mooncake-wheel/dist
+
+  test-transfer-engine-cross-node:
+    name: Transfer Engine cross-node test
+    needs: build-wheel
+    runs-on: [self-hosted, Linux, X64, hcu1]
+    timeout-minutes: 60
+    env:
+      TEST_IMAGE: harbor.sourcefind.cn:5443/hcu/admin/base/dtk:26.04-ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10
+    steps:
+      - name: Checkout authorized PR test scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: ci-control
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: ${{ runner.temp }}/artifacts/${{ github.run_id }}-${{ github.run_attempt }}/wheel
+
+      - name: Load HCU CI configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          config_file=/etc/hygon-ci/config.env
+          test -r "${config_file}" || {
+            echo "ERROR: ${config_file} is not readable" >&2
+            exit 1
+          }
+          set -a
+          source "${config_file}"
+          set +a
+          for name in DTK_PKG_URL PIP_INDEX_URL TARGET_HOST INITIATOR_HOST TARGET_FILTER INITIATOR_FILTER; do
+            value="${!name:-}"
+            test -n "${value}" || {
+              echo "ERROR: ${name} is missing from ${config_file}" >&2
+              exit 1
+            }
+            echo "::add-mask::${value}"
+            printf '%s=%s\n' "${name}" "${value}" >> "${GITHUB_ENV}"
+          done
+          for host in "${TARGET_HOST}" "${INITIATOR_HOST}"; do
+            getent ahostsv4 "${host}" | awk '{print $1}' | sort -u | while read -r address; do
+              test -z "${address}" || echo "::add-mask::${address}"
+            done
+          done
+
+      - name: Run Transfer Engine cross-node test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          artifact_dir="${RUNNER_TEMP}/artifacts/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/wheel"
+          mapfile -t wheels < <(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' -print)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+          bash ci-control/scripts/hygon/test_transfer_engine_cross_node.sh "${wheels[0]}"
+
+      - name: Upload Transfer Engine cross-node test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: transfer-engine-logs
+          path: ${{ runner.temp }}/transfer-engine-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  test-mooncake-store-cross-node:
+    name: Mooncake Store cross-node test
+    needs: test-transfer-engine-cross-node
+    runs-on: [self-hosted, Linux, X64, hcu1]
+    timeout-minutes: 60
+    env:
+      TEST_IMAGE: harbor.sourcefind.cn:5443/hcu/admin/base/dtk:26.04-ubuntu22.04-mpi5.0-gcc11.4-cmake3.29-py3.10
+    steps:
+      - name: Checkout authorized PR test scripts
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: ci-control
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel
+          path: ${{ runner.temp }}/artifacts/${{ github.run_id }}-${{ github.run_attempt }}/wheel
+
+      - name: Load HCU CI configuration
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          config_file=/etc/hygon-ci/config.env
+          test -r "${config_file}" || {
+            echo "ERROR: ${config_file} is not readable" >&2
+            exit 1
+          }
+          set -a
+          source "${config_file}"
+          set +a
+          for name in DTK_PKG_URL PIP_INDEX_URL TARGET_HOST INITIATOR_HOST TARGET_FILTER INITIATOR_FILTER; do
+            value="${!name:-}"
+            test -n "${value}" || {
+              echo "ERROR: ${name} is missing from ${config_file}" >&2
+              exit 1
+            }
+            echo "::add-mask::${value}"
+            printf '%s=%s\n' "${name}" "${value}" >> "${GITHUB_ENV}"
+          done
+          for host in "${TARGET_HOST}" "${INITIATOR_HOST}"; do
+            getent ahostsv4 "${host}" | awk '{print $1}' | sort -u | while read -r address; do
+              test -z "${address}" || echo "::add-mask::${address}"
+            done
+          done
+
+      - name: Run mooncake store cross-node test
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          artifact_dir="${RUNNER_TEMP}/artifacts/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}/wheel"
+          mapfile -t wheels < <(find "${artifact_dir}" -maxdepth 1 -type f -name '*.whl' -print)
+          if [ "${#wheels[@]}" -ne 1 ]; then
+            echo "Expected exactly one wheel, found ${#wheels[@]}" >&2
+            exit 1
+          fi
+
+          bash ci-control/scripts/hygon/test_mooncake_store_cross_node.sh "${wheels[0]}"
+
+      - name: Upload mooncake store cross-node test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-store-logs
+          path: ${{ runner.temp }}/mooncake-store-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  hcu-pr-gate:
+    name: HCU PR gate
+    if: >-
+      always() &&
+      github.repository == 'kvcache-ai/Mooncake' &&
+      github.event.label.name == 'run-hygon-ci'
+    needs:
+      - build-wheel
+      - test-transfer-engine-cross-node
+      - test-mooncake-store-cross-node
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require build and cross-node tests to pass
+        shell: bash
+        env:
+          BUILD_RESULT: ${{ needs.build-wheel.result }}
+          RDMA_TEST_RESULT: ${{ needs.test-transfer-engine-cross-node.result }}
+          STORE_TEST_RESULT: ${{ needs.test-mooncake-store-cross-node.result }}
+        run: |
+          set -Eeuo pipefail
+          printf 'Build wheel:           %s\n' "${BUILD_RESULT}"
+          printf 'Transfer-Engine test:       %s\n' "${RDMA_TEST_RESULT}"
+          printf 'Mooncake Store benchmark test: %s\n' "${STORE_TEST_RESULT}"
+
+          if [ "${BUILD_RESULT}" != "success" ] || \
+             [ "${RDMA_TEST_RESULT}" != "success" ] || \
+             [ "${STORE_TEST_RESULT}" != "success" ]; then
+            echo "::error::HCU PR validation failed or was skipped."
+            exit 1
+          fi
+
+          echo "The wheel built successfully and all HCU tests passed."
+
+  cleanup-label:
+    name: Remove HCU CI request label
+    needs: hcu-pr-gate
+    if: >-
+      always() &&
+      github.repository == 'kvcache-ai/Mooncake' &&
+      github.event.label.name == 'run-hygon-ci'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Remove request label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh pr edit "$PR_NUMBER" --remove-label run-hygon-ci
