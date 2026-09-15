@@ -1,4 +1,4 @@
-#include "nvme_kv_connector_config.h"
+#include "connector_config.h"
 
 #include <glog/logging.h>
 
@@ -7,7 +7,7 @@
 
 #include "environ.h"
 #include "environment_variables.h"
-#include "nvme_kv_u32_parser.h"
+#include "u32_parser.h"
 
 namespace mooncake {
 namespace {

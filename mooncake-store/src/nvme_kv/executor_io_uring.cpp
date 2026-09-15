@@ -1,9 +1,9 @@
-#include "nvme_kv_executor.h"
+#include "nvme_kv/executor.h"
 
 #ifdef MOONCAKE_HAVE_NVME_URING_CMD
 
-#include "nvme_kv_executor_util.h"
-#include "nvme_kv_object_layout.h"
+#include "nvme_kv/executor_util.h"
+#include "nvme_kv/object_layout.h"
 
 #include <fcntl.h>
 #include <liburing.h>
