@@ -1292,7 +1292,8 @@ ErrorCode ScopedNoFSegmentAccess::ReMountSegment(
 }
 
 ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
-    const UUID& segment_id, size_t& metrics_dec_capacity) {
+    const UUID& segment_id, size_t& metrics_dec_capacity,
+    std::string* te_endpoint) {
     auto it = nof_segment_manager_->mounted_segments_.find(segment_id);
     if (it == nof_segment_manager_->mounted_segments_.end()) {
         LOG(WARNING) << "NoF segment unmount: segment_id=" << segment_id
@@ -1308,6 +1309,9 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
     auto& mounted_segment = it->second;
     auto& segment = mounted_segment.segment;
     metrics_dec_capacity = segment.size;
+    if (te_endpoint != nullptr) {
+        *te_endpoint = segment.te_endpoint;
+    }
 
     std::shared_ptr<BufferAllocatorBase> allocator =
         mounted_segment.buf_allocator;

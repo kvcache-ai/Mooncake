@@ -167,6 +167,7 @@ class MasterService {
    public:
     using NoFProbeFn =
         std::function<bool(const std::string&, uint32_t, std::string*)>;
+    using NoFProbeReleaseFn = std::function<void(const std::string&)>;
     using DurableFinalizeCallback =
         std::function<void(const OpLogEntry& durable_entry)>;
     using BatchOpLogWriterFactory =
@@ -178,6 +179,7 @@ class MasterService {
     ~MasterService();
 
     void SetNoFProbeFnForTesting(NoFProbeFn fn);
+    void SetNoFProbeReleaseFnForTesting(NoFProbeReleaseFn fn);
     size_t GetMountedNoFSegmentCountForTesting();
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
@@ -2016,6 +2018,7 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
     void NofHeartbeatThreadFunc();
+    void ReleaseNoFProbeResources(const std::string& te_endpoint);
     bool TryUnmountNoFSegmentByHeartbeat(
         const MountedNoFSegmentSnapshot& snapshot,
         const std::string& error_reason);
@@ -2486,6 +2489,7 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+    NoFProbeReleaseFn nof_probe_release_fn_;
 
     // if high availability features enabled
     const bool enable_ha_;

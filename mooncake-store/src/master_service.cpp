@@ -355,6 +355,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
         return SpdkWrapper::GetInstance().ProbeNofSegment(
             te_endpoint, timeout_ms, error_reason);
     };
+    nof_probe_release_fn_ = [](const std::string& te_endpoint) {
+        SpdkWrapper::GetInstance().CloseNofSegment(te_endpoint);
+    };
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
@@ -738,6 +741,39 @@ void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
     };
 #else
     (void)fn;
+#endif
+}
+
+void MasterService::SetNoFProbeReleaseFnForTesting(NoFProbeReleaseFn fn) {
+#ifdef USE_NOF
+    std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+    if (fn) {
+        nof_probe_release_fn_ = std::move(fn);
+        return;
+    }
+    nof_probe_release_fn_ = [](const std::string& te_endpoint) {
+        SpdkWrapper::GetInstance().CloseNofSegment(te_endpoint);
+    };
+#else
+    (void)fn;
+#endif
+}
+
+void MasterService::ReleaseNoFProbeResources(const std::string& te_endpoint) {
+#ifdef USE_NOF
+    if (te_endpoint.empty()) {
+        return;
+    }
+    NoFProbeReleaseFn release_fn;
+    {
+        std::lock_guard<std::mutex> lock(nof_probe_fn_mutex_);
+        release_fn = nof_probe_release_fn_;
+    }
+    if (release_fn) {
+        release_fn(te_endpoint);
+    }
+#else
+    (void)te_endpoint;
 #endif
 }
 
@@ -2729,6 +2765,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
 #else
     size_t metrics_dec_capacity = 0;  // to update the metrics
+    std::string te_endpoint;
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
@@ -2740,7 +2777,7 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         ScopedNoFSegmentAccess segment_access =
             nof_segment_manager_.getNoFSegmentAccess();
         ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
+            segment_id, metrics_dec_capacity, &te_endpoint);
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
             return {};
@@ -2766,6 +2803,9 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
     }
+    // 4. Drop Master SpdkWrapper probe resources for this endpoint. Mount
+    // rejects duplicate te_endpoints, so no other OK segment still needs them.
+    ReleaseNoFProbeResources(te_endpoint);
     return {};
 #endif
 }
@@ -11228,6 +11268,9 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(snapshot.segment_id);
     }
+    // Release SpdkWrapper probe resources so remounts reopen a fresh qpair
+    // instead of reusing a failed cached handle.
+    ReleaseNoFProbeResources(snapshot.segment.te_endpoint);
     MasterMetricManager::instance()
         .inc_nof_segments_unmounted_by_heartbeat_total();
     LOG(INFO) << "segment_id=" << snapshot.segment_id

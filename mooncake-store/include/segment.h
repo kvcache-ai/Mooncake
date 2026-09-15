@@ -262,10 +262,13 @@ class ScopedNoFSegmentAccess {
                              const UUID& client_id);
 
     /**
-     * @brief Prepare to unmount a segment by deleting its allocator
+     * @brief Prepare to unmount a segment by deleting its allocator.
+     *        When te_endpoint is non-null, fills it with the segment transport
+     *        endpoint so callers can release SpdkWrapper probe resources.
      */
     ErrorCode PrepareUnmountSegment(const UUID& segment_id,
-                                    size_t& metrics_dec_capacity);
+                                    size_t& metrics_dec_capacity,
+                                    std::string* te_endpoint = nullptr);
 
     /**
      * @brief Deleting the segment to complete the unmounting operation
