@@ -43,11 +43,21 @@ the launching shell's environment does not reconfigure running workers.
 | `MC_ADAPTIVE_CONGESTION_CONTROL_MIN_WINDOW_BYTES` | `4194304` (4 MiB) | Lower bound for the normal adaptive window. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_MAX_WINDOW_BYTES` | `67108864` (64 MiB) | Upper bound for the normal adaptive window. |
 | `MC_ADAPTIVE_CONGESTION_CONTROL_TARGET_DRAIN_US` | `2000` | Target estimated queue-drain time, in microseconds. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS` | `2` | Consecutive high-pressure epochs before shrinking the window. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS` | `3` | Consecutive low-pressure epochs before growing the window. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD` | `3` | Hard errors before quarantining the path. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS` | `30000` | Quarantine cooldown, in milliseconds. |
+| `MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES` | `65536` | Recovery probe window, in bytes. |
 
 Byte and time settings must be positive decimal integers; the minimum window
-must not exceed the maximum. Invalid or overflowing settings disable the
+must not exceed the maximum. Explicit probe windows must not exceed the minimum
+window; epoch counts and the hard-error threshold must fit in 32 bits. Invalid
+or overflowing settings disable the
 controller and produce an initialization error message. The application still
 uses its existing transport behavior. Leaving all settings unset keeps it off.
+
+See the [Chinese startup-parameter reference](adaptive-congestion-control-startup-config.md)
+for the shared TE/TENT defaults and units.
 
 The windows control admission, not memory registration or the transport's
 static queue capacity. A valid slice is indivisible at this boundary: if a
