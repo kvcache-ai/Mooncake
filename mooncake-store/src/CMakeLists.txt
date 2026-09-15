@@ -385,11 +385,6 @@ elseif(USE_HIP)
 endif()
 
 # Sources used by both the Master and Client sides of Store.
-set(MOONCAKE_STORE_TRANSFER_METADATA_LIB)
-if(TARGET transfer_metadata_plugin)
-  set(MOONCAKE_STORE_TRANSFER_METADATA_LIB transfer_metadata_plugin)
-endif()
-
 add_library(mooncake_store_shared_objects OBJECT
             ${MOONCAKE_STORE_SHARED_SOURCES})
 set_target_properties(mooncake_store_shared_objects
@@ -399,7 +394,7 @@ target_include_directories(mooncake_store_shared_objects
 target_link_libraries(
   mooncake_store_shared_objects
   PRIVATE cachelib_memory_allocator
-          ${MOONCAKE_STORE_TRANSFER_METADATA_LIB}
+          transfer_metadata_plugin
           glog::glog
           gflags::gflags
           mooncake_common
@@ -425,7 +420,7 @@ target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
           mooncake_local_ssd
-          ${MOONCAKE_STORE_TRANSFER_METADATA_LIB}
+          transfer_metadata_plugin
           cachelib_memory_allocator
           glog::glog
           gflags::gflags
@@ -530,7 +525,7 @@ target_link_libraries(
           Mooncake::zstd
           asio_shared
           yalantinglibs::yalantinglibs
-          ${MOONCAKE_STORE_TRANSFER_METADATA_LIB}
+          transfer_metadata_plugin
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
