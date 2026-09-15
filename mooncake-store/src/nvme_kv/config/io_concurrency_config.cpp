@@ -1,4 +1,4 @@
-#include "nvme_kv_io_concurrency_config.h"
+#include "io_concurrency_config.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -8,7 +8,7 @@
 
 #include "environ.h"
 #include "environment_variables.h"
-#include "nvme_kv_u32_parser.h"
+#include "u32_parser.h"
 
 namespace mooncake {
 namespace {

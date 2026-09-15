@@ -1,4 +1,4 @@
-#include "../../src/nvme_kv/config/nvme_kv_io_concurrency_config.h"
+#include "../../src/nvme_kv/config/io_concurrency_config.h"
 
 #include <gtest/gtest.h>
 

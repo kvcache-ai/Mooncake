@@ -1,6 +1,6 @@
-#include "nvme_kv/nvme_kv_executor.h"
-#include "nvme_kv/nvme_kv_executor_util.h"
-#include "nvme_kv/nvme_kv_object_layout.h"
+#include "nvme_kv/executor.h"
+#include "nvme_kv/executor_util.h"
+#include "nvme_kv/object_layout.h"
 
 #include <fcntl.h>
 #include <linux/nvme_ioctl.h>

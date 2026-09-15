@@ -1,4 +1,4 @@
-#include "nvme_kv/nvme_kv_connector.h"
+#include "nvme_kv/connector.h"
 
 #include <cstdlib>
 #include <filesystem>
@@ -7,8 +7,8 @@
 
 #include <glog/logging.h>
 
-#include "config/nvme_kv_connector_config.h"
-#include "nvme_kv/nvme_kv_executor_util.h"
+#include "config/connector_config.h"
+#include "nvme_kv/executor_util.h"
 #include "storage_backend.h"
 
 namespace mooncake {

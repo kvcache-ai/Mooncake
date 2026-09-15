@@ -5,7 +5,7 @@
 #include <memory>
 #include <string>
 
-#include "nvme_kv/nvme_kv_executor.h"
+#include "nvme_kv/executor.h"
 #include "types.h"
 
 namespace mooncake {
