@@ -34,7 +34,7 @@
 #include "lease.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "nof_segment_manager.h"
+#include "segment.h"
 #include "placement/replica_allocator.h"
 #include "segment/pool.h"
 #include "segment/pool_write_access.h"
@@ -2914,10 +2914,11 @@ class MasterService {
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
-    const PlacementPolicyType memory_placement_policy_;
+    const AllocationStrategyType memory_placement_policy_;
+    std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     AllocationCandidateKind MemoryAllocationKind() const {
-        return memory_placement_policy_ == PlacementPolicyType::CXL
+        return memory_placement_policy_ == AllocationStrategyType::CXL
                    ? AllocationCandidateKind::CXL
                    : AllocationCandidateKind::NATIVE;
     }

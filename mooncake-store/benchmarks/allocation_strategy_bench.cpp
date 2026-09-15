@@ -5,11 +5,9 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
-#include <memory>
 #include <numeric>
 #include <random>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 #include <sys/resource.h>
@@ -19,11 +17,8 @@
 
 #include "offset_allocator/offset_allocator.h"
 #include "allocator.h"
-#include "placement/replica_allocator.h"
-#include "random.h"
-#include "segment/pool.h"
-#include "segment/pool_read_access.h"
-#include "segment/pool_write_access.h"
+#include "allocation_strategy.h"
+#include "local_ssd/manager.h"
 
 // --- gflags definitions ---
 DEFINE_int64(segment_capacity, 1024,
@@ -137,7 +132,7 @@ struct BenchConfig {
     // exit.
     int prefill_pct = 0;
     std::string strategy_name;
-    PlacementPolicyType strategy_type;
+    AllocationStrategyType strategy_type;
 
     // Workload
     WorkloadType workload_type;
@@ -317,86 +312,16 @@ static void setupResourceLimits() {
 }
 
 /**
- * @brief Placement fixture using the same SegmentPool path as MasterService.
- *
- * The pool owns the OffsetBufferAllocators and their AllocationCandidates;
- * allocator handles are retained only to inspect utilization/fragmentation.
- */
-class BenchmarkPlacement final {
-   public:
-    explicit BenchmarkPlacement(PlacementPolicyType policy) : policy_(policy) {
-        RegionDriverConfig config;
-        config.memory_allocator = BufferAllocatorType::OFFSET;
-        auto drivers = CreateRegionDrivers(config);
-        if (!drivers) {
-            throw std::runtime_error(
-                "failed to create benchmark region drivers: " +
-                toString(drivers.error()));
-        }
-        pool_ = std::make_unique<SegmentPool>(std::move(*drivers));
-    }
-    BenchmarkPlacement(BenchmarkPlacement&&) noexcept = default;
-    BenchmarkPlacement& operator=(BenchmarkPlacement&&) = delete;
-    BenchmarkPlacement(const BenchmarkPlacement&) = delete;
-    BenchmarkPlacement& operator=(const BenchmarkPlacement&) = delete;
-
-    std::shared_ptr<BufferAllocatorBase> Add(const Segment& segment) {
-        {
-            auto access = pool_->AcquireWriteAccess();
-            auto error = access.MountSegment(segment, client_id_);
-            if (error != ErrorCode::OK) {
-                throw std::runtime_error("failed to mount benchmark segment " +
-                                         segment.name + ": " + toString(error));
-            }
-        }
-        auto allocator = pool_->AcquireReadAccess().GetAllocator(segment.id);
-        allocators_.push_back(allocator);
-        return allocator;
-    }
-
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        size_t size, size_t replica_count) {
-        ReplicaAllocationRequest request;
-        request.replicas.size = size;
-        request.replicas.count = replica_count;
-        switch (policy_) {
-            case PlacementPolicyType::RANDOM:
-                return pool_->AllocateReplicas(request,
-                                               RandomPlacementPolicy{});
-            case PlacementPolicyType::FREE_RATIO_FIRST:
-                return pool_->AllocateReplicas(request,
-                                               FreeRatioFirstPlacementPolicy{});
-            default:
-                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
-    const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators()
-        const {
-        return allocators_;
-    }
-
-   private:
-    // SegmentPool itself is not movable; keep it stable when returning a
-    // fixture.
-    std::unique_ptr<SegmentPool> pool_;
-    PlacementPolicyType policy_;
-    UUID client_id_ = generate_uuid();
-    std::vector<std::shared_ptr<BufferAllocatorBase>> allocators_;
-};
-
-/**
- * @brief Create a placement fixture populated with N OffsetBufferAllocators.
+ * @brief Create an AllocatorManager populated with N OffsetBufferAllocators.
  *
  * Each allocator manages only offset metadata, so memory overhead is minimal
  * even for very large simulated capacities.
  *
  * @param id_offset Starting index for segment naming (for Scale-Out additions)
  */
-static BenchmarkPlacement createCluster(int num_segments, size_t base_capacity,
-                                        bool skewed, PlacementPolicyType policy,
-                                        int id_offset = 0) {
-    BenchmarkPlacement placement(policy);
+static AllocatorManager createCluster(int num_segments, size_t base_capacity,
+                                      bool skewed, int id_offset = 0) {
+    AllocatorManager manager;
     // Distribute segments evenly across kNumVirtualNodes virtual nodes if
     // num_segments > kNumVirtualNodes, otherwise 1 segment per node.
     int segments_per_node = std::max(1, num_segments / kNumVirtualNodes);
@@ -414,20 +339,15 @@ static BenchmarkPlacement createCluster(int num_segments, size_t base_capacity,
                                     : base_capacity * (1.0 - kSkewRatio);
         }
         uint64_t base_addr = kPrimaryBaseAddr + (global_i * base_capacity);
-        Segment segment;
-        segment.id = generate_uuid();
-        segment.name = name;
-        segment.base = base_addr;
-        segment.size = capacity;
-        segment.te_endpoint = name;
-        segment.protocol = "tcp";
-        placement.Add(segment);
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, base_addr, capacity, name);
+        manager.addAllocator(name, allocator);
     }
-    return placement;
+    return manager;
 }
 
 /**
- * @brief Inject `count` new, fully-empty segments into an existing pool.
+ * @brief Inject `count` new, fully-empty segments into an existing manager.
  *
  * New segments are named with the id_offset to avoid collisions.
  * Each new segment has the same capacity as the original segments
@@ -436,21 +356,17 @@ static BenchmarkPlacement createCluster(int num_segments, size_t base_capacity,
  * @return The shared_ptrs of the newly added allocators (for tracking util)
  */
 static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
-    BenchmarkPlacement& placement, int count, size_t capacity, int id_offset) {
+    AllocatorManager& manager, int count, size_t capacity, int id_offset) {
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_allocs;
     new_allocs.reserve(count);
     for (int i = 0; i < count; ++i) {
         std::string name = "new_node_" + std::to_string(id_offset + i);
         uint64_t base_addr = kInjectedBaseAddr +
                              (static_cast<uint64_t>(id_offset + i) * capacity);
-        Segment segment;
-        segment.id = generate_uuid();
-        segment.name = name;
-        segment.base = base_addr;
-        segment.size = capacity;
-        segment.te_endpoint = name;
-        segment.protocol = "tcp";
-        new_allocs.push_back(placement.Add(segment));
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, base_addr, capacity, name);
+        manager.addAllocator(name, allocator);
+        new_allocs.push_back(allocator);
     }
     return new_allocs;
 }
@@ -458,23 +374,33 @@ static std::vector<std::shared_ptr<BufferAllocatorBase>> injectNewSegments(
 /**
  * @brief Compute average utilization ratio across all segments.
  */
-static double computeAverageUtilAll(const BenchmarkPlacement& placement) {
-    if (placement.allocators().empty()) return 0.0;
+static double computeAverageUtilAll(const AllocatorManager& manager) {
+    const auto& names = manager.getNames();
+    if (names.empty()) return 0.0;
     double sum = 0.0;
     int count = 0;
-    for (const auto& alloc : placement.allocators()) {
-        double cap = static_cast<double>(alloc->capacity());
-        if (cap == 0) continue;
-        sum += static_cast<double>(alloc->size()) / cap;
-        ++count;
+    for (const auto& name : names) {
+        const auto* allocators = manager.getAllocators(name);
+        if (!allocators || allocators->empty()) continue;
+        for (const auto& registration : *allocators) {
+            const auto alloc = registration->GetAllocator();
+            double cap = static_cast<double>(alloc->capacity());
+            if (cap == 0) continue;
+            sum += static_cast<double>(alloc->size()) / cap;
+            ++count;
+        }
     }
     return count > 0 ? sum / count : 0.0;
 }
 
-static size_t computeTotalCapacity(const BenchmarkPlacement& placement) {
+static size_t computeTotalCapacity(const AllocatorManager& manager) {
     size_t total = 0;
-    for (const auto& alloc : placement.allocators()) {
-        total += alloc->capacity();
+    for (const auto& name : manager.getNames()) {
+        const auto* allocs = manager.getAllocators(name);
+        if (!allocs) continue;
+        for (const auto& registration : *allocs) {
+            total += registration->GetAllocator()->capacity();
+        }
     }
     return total;
 }
@@ -482,17 +408,23 @@ static size_t computeTotalCapacity(const BenchmarkPlacement& placement) {
 /**
  * @brief Compute standard deviation of per-segment utilization ratios.
  */
-static double computeUtilizationStdDev(const BenchmarkPlacement& placement) {
-    if (placement.allocators().empty()) return 0.0;
+static double computeUtilizationStdDev(const AllocatorManager& manager) {
+    const auto& names = manager.getNames();
+    if (names.empty()) return 0.0;
 
     std::vector<double> ratios;
-    ratios.reserve(placement.allocators().size());
+    ratios.reserve(names.size());
 
-    for (const auto& alloc : placement.allocators()) {
-        double cap = static_cast<double>(alloc->capacity());
-        if (cap == 0) continue;
-        double used = static_cast<double>(alloc->size());
-        ratios.push_back(used / cap);
+    for (const auto& name : names) {
+        const auto* allocators = manager.getAllocators(name);
+        if (!allocators || allocators->empty()) continue;
+        for (const auto& registration : *allocators) {
+            const auto alloc = registration->GetAllocator();
+            double cap = static_cast<double>(alloc->capacity());
+            if (cap == 0) continue;
+            double used = static_cast<double>(alloc->size());
+            ratios.push_back(used / cap);
+        }
     }
 
     if (ratios.empty()) return 0.0;
@@ -570,32 +502,38 @@ static DistributionStats computeDistributionStats(std::vector<double>& values) {
 }
 
 static FragmentationSnapshot computeFragmentationSnapshot(
-    const BenchmarkPlacement& placement) {
+    const AllocatorManager& manager) {
     FragmentationSnapshot snapshot;
     double weighted_fragmentation = 0.0;
 
-    for (const auto& alloc : placement.allocators()) {
-        auto offset_alloc =
-            std::dynamic_pointer_cast<OffsetBufferAllocator>(alloc);
-        if (!offset_alloc) continue;
+    for (const auto& name : manager.getNames()) {
+        const auto* allocs = manager.getAllocators(name);
+        if (!allocs) continue;
 
-        auto allocator = offset_alloc->getOffsetAllocator();
-        if (!allocator) continue;
+        for (const auto& registration : *allocs) {
+            auto offset_alloc =
+                std::dynamic_pointer_cast<OffsetBufferAllocator>(
+                    registration->GetAllocator());
+            if (!offset_alloc) continue;
 
-        auto metrics = allocator->get_metrics();
-        snapshot.total_free_space += metrics.total_free_space_;
-        snapshot.capacity += metrics.capacity;
-        snapshot.largest_free_region = std::max(snapshot.largest_free_region,
-                                                metrics.largest_free_region_);
-        if (metrics.total_free_space_ > 0) {
-            double local_fragmentation =
-                1.0 - (static_cast<double>(metrics.largest_free_region_) /
-                       static_cast<double>(metrics.total_free_space_));
-            local_fragmentation = std::clamp(local_fragmentation, 0.0, 1.0);
-            weighted_fragmentation +=
-                local_fragmentation * metrics.total_free_space_;
+            auto allocator = offset_alloc->getOffsetAllocator();
+            if (!allocator) continue;
+
+            auto metrics = allocator->get_metrics();
+            snapshot.total_free_space += metrics.total_free_space_;
+            snapshot.capacity += metrics.capacity;
+            snapshot.largest_free_region = std::max(
+                snapshot.largest_free_region, metrics.largest_free_region_);
+            if (metrics.total_free_space_ > 0) {
+                double local_fragmentation =
+                    1.0 - (static_cast<double>(metrics.largest_free_region_) /
+                           static_cast<double>(metrics.total_free_space_));
+                local_fragmentation = std::clamp(local_fragmentation, 0.0, 1.0);
+                weighted_fragmentation +=
+                    local_fragmentation * metrics.total_free_space_;
+            }
+            snapshot.valid = true;
         }
-        snapshot.valid = true;
     }
 
     if (snapshot.valid && snapshot.total_free_space > 0) {
@@ -638,7 +576,8 @@ static size_t chooseSizeClassIndex(const std::vector<SizeClassSpec>& specs,
 
     if (total_weight <= 0) return 0;
 
-    int pick = randomUniform(1, total_weight, rng);
+    std::uniform_int_distribution<int> dist(1, total_weight);
+    int pick = dist(rng);
     for (size_t i = 0; i < specs.size(); ++i) {
         pick -= specs[i].weight;
         if (pick <= 0) return i;
@@ -663,7 +602,7 @@ static double computeWeightedAverageObjectSize(
 }
 
 static size_t deriveSizeClassPrefillMaxAttempts(
-    const BenchmarkPlacement& placement, const BenchConfig& cfg,
+    const AllocatorManager& manager, const BenchConfig& cfg,
     const std::vector<SizeClassSpec>& specs) {
     if (cfg.prefill_pct <= 0 || cfg.replica_num <= 0) return 0;
 
@@ -671,7 +610,7 @@ static size_t deriveSizeClassPrefillMaxAttempts(
     if (avg_object_size <= 0.0) return kSizeClassMinPrefillAttempts;
 
     const double target_bytes =
-        static_cast<double>(computeTotalCapacity(placement)) * cfg.prefill_pct /
+        static_cast<double>(computeTotalCapacity(manager)) * cfg.prefill_pct /
         100.0;
     const double bytes_per_attempt =
         avg_object_size * static_cast<double>(cfg.replica_num);
@@ -686,11 +625,11 @@ static size_t deriveSizeClassPrefillMaxAttempts(
                     static_cast<size_t>(derived_attempts));
 }
 
-static std::string strategyName(PlacementPolicyType type) {
+static std::string strategyName(AllocationStrategyType type) {
     switch (type) {
-        case PlacementPolicyType::RANDOM:
+        case AllocationStrategyType::RANDOM:
             return "Random";
-        case PlacementPolicyType::FREE_RATIO_FIRST:
+        case AllocationStrategyType::FREE_RATIO_FIRST:
             return "FreeRatioFirst";
         default:
             return "Unknown";
@@ -732,8 +671,10 @@ static void computeLatencyStats(std::vector<double>& latencies, double total_us,
  * No periodic sampling or convergence detection.
  */
 static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
-    BenchmarkPlacement placement = createCluster(
-        cfg.num_segments, cfg.segment_capacity, cfg.skewed, cfg.strategy_type);
+    AllocatorManager manager =
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     std::vector<double> latencies;
     latencies.reserve(cfg.num_allocations);
@@ -776,10 +717,11 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
             // Sample adaptively to avoid O(N) evaluation on every alloc,
             // while still stopping close to the target utilization.
             if (pre_count % pre_fill_sample_interval == 0) {
-                if (computeAverageUtilAll(placement) * 100.0 >= cfg.prefill_pct)
+                if (computeAverageUtilAll(manager) * 100.0 >= cfg.prefill_pct)
                     break;
             }
-            auto r = placement.Allocate(pre_fill_alloc_size, cfg.replica_num);
+            auto r = strategy->Allocate(manager, pre_fill_alloc_size,
+                                        cfg.replica_num);
             if (r.has_value()) {
                 active_allocations.push_back(std::move(r.value()));
                 pre_consec_failures = 0;
@@ -794,7 +736,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
 
     for (int i = 0; i < cfg.num_allocations; ++i) {
         auto t0 = std::chrono::high_resolution_clock::now();
-        auto result = placement.Allocate(cfg.alloc_size, cfg.replica_num);
+        auto result =
+            strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         latencies.push_back(
@@ -827,8 +770,8 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
     res.skewed = cfg.skewed;
     res.cluster_capacity_gb = computeClusterCapacityGB(
         cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    res.final_util_stddev = computeUtilizationStdDev(placement);
-    res.final_avg_util = computeAverageUtilAll(placement);
+    res.final_util_stddev = computeUtilizationStdDev(manager);
+    res.final_avg_util = computeAverageUtilAll(manager);
     res.success_count = success_count;
     res.total_count = total_count;
 
@@ -848,8 +791,10 @@ static FillUpResult runFillUpBenchmark(const BenchConfig& cfg) {
  * Measures throughput/latency + convergence + new-node adoption speed.
  */
 static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
-    BenchmarkPlacement placement = createCluster(
-        cfg.num_segments, cfg.segment_capacity, cfg.skewed, cfg.strategy_type);
+    AllocatorManager manager =
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
     const double convergence_threshold = FLAGS_convergence_threshold;
 
@@ -862,8 +807,7 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     res.alloc_size = cfg.alloc_size;
     res.replica_num = cfg.replica_num;
     res.skewed = cfg.skewed;
-    res.initial_capacity_gb =
-        static_cast<double>(computeTotalCapacity(placement)) / GiB;
+    res.initial_capacity_gb = (double)computeTotalCapacity(manager) / GiB;
     res.scaled_capacity_gb =
         res.initial_capacity_gb;  // Will be updated after injection
     res.cluster_capacity_gb = res.initial_capacity_gb;
@@ -890,12 +834,13 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
         // Sample periodically to avoid O(N) evaluation on every pre-fill
         // allocation
         if (pre_alloc_count % kPreFillSampleInterval == 0) {
-            if (computeAverageUtilAll(placement) * 100.0 >=
+            if (computeAverageUtilAll(manager) * 100.0 >=
                 cfg.scale_out_trigger_pct) {
                 break;
             }
         }
-        auto result = placement.Allocate(pre_fill_alloc_size, cfg.replica_num);
+        auto result =
+            strategy->Allocate(manager, pre_fill_alloc_size, cfg.replica_num);
         if (result.has_value()) {
             active_allocations.push_back(std::move(result.value()));
             consec_failures = 0;
@@ -906,14 +851,13 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     }
 
     // --- Inject New Nodes ---
-    res.stddev_before_scale = computeUtilizationStdDev(placement);
+    res.stddev_before_scale = computeUtilizationStdDev(manager);
     std::vector<std::shared_ptr<BufferAllocatorBase>> new_node_allocs =
-        injectNewSegments(placement, cfg.scale_out_new_segments,
+        injectNewSegments(manager, cfg.scale_out_new_segments,
                           cfg.segment_capacity, cfg.num_segments);
-    res.scaled_capacity_gb =
-        static_cast<double>(computeTotalCapacity(placement)) / GiB;
+    res.scaled_capacity_gb = (double)computeTotalCapacity(manager) / GiB;
     res.cluster_capacity_gb = res.scaled_capacity_gb;
-    res.stddev_just_after_scale = computeUtilizationStdDev(placement);
+    res.stddev_just_after_scale = computeUtilizationStdDev(manager);
     res.trigger_alloc_idx = 0;
 
     // Reset counters for the benchmarking phase
@@ -949,7 +893,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     for (int i = 0; i < measurement_allocs; ++i) {
         // --- Allocate ---
         auto t0 = std::chrono::high_resolution_clock::now();
-        auto result = placement.Allocate(cfg.alloc_size, cfg.replica_num);
+        auto result =
+            strategy->Allocate(manager, cfg.alloc_size, cfg.replica_num);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         latencies.push_back(
@@ -969,8 +914,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
             auto s0 = std::chrono::high_resolution_clock::now();
 
             sample_points.push_back(i + 1);
-            stddev_over_time.push_back(computeUtilizationStdDev(placement));
-            avg_util_over_time.push_back(computeAverageUtilAll(placement));
+            stddev_over_time.push_back(computeUtilizationStdDev(manager));
+            avg_util_over_time.push_back(computeAverageUtilAll(manager));
 
             if (!new_node_allocs.empty()) {
                 res.new_node_util_over_time.push_back(
@@ -1032,8 +977,8 @@ static ScaleOutResult runScaleOutBenchmark(const BenchConfig& cfg) {
     }
 
     // Compute final metrics while active_allocations is still alive
-    res.final_util_stddev = computeUtilizationStdDev(placement);
-    res.final_avg_util = computeAverageUtilAll(placement);
+    res.final_util_stddev = computeUtilizationStdDev(manager);
+    res.final_avg_util = computeAverageUtilAll(manager);
     res.converge_avg_util = (converged_at != -1 && first_converge_avg_util >= 0)
                                 ? first_converge_avg_util
                                 : res.final_avg_util;
@@ -1054,7 +999,8 @@ static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
     if (to_drop > live.size()) to_drop = live.size();
 
     for (size_t i = 0; i < to_drop; ++i) {
-        size_t idx = randomIndex(live.size(), rng);
+        std::uniform_int_distribution<size_t> dist(0, live.size() - 1);
+        size_t idx = dist(rng);
         std::swap(live[idx], live.back());
         live.pop_back();  // Replica destructor returns memory to allocator.
     }
@@ -1062,12 +1008,13 @@ static void evictRandomFraction(std::vector<std::vector<Replica>>& live,
 
 // Try to allocate once; on failure, sample utilization before eviction.
 static bool dsaAllocateWithEvict(
-    BenchmarkPlacement& placement, size_t size, int replica_num,
+    const std::shared_ptr<AllocationStrategy>& strategy,
+    AllocatorManager& manager, size_t size, int replica_num,
     std::vector<std::vector<Replica>>& live, std::mt19937& rng,
     int& evict_count, double evict_ratio,
     std::vector<double>* pre_evict_util = nullptr) {
     for (int attempt = 0; attempt <= kDsaMaxRetries; ++attempt) {
-        auto result = placement.Allocate(size, replica_num);
+        auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
             live.push_back(std::move(result.value()));
             return true;
@@ -1077,7 +1024,7 @@ static bool dsaAllocateWithEvict(
         if (attempt == kDsaMaxRetries) return false;
 
         if (attempt == 0 && pre_evict_util != nullptr) {
-            pre_evict_util->push_back(computeAverageUtilAll(placement));
+            pre_evict_util->push_back(computeAverageUtilAll(manager));
         }
 
         evictRandomFraction(live, evict_ratio, rng);
@@ -1088,11 +1035,12 @@ static bool dsaAllocateWithEvict(
 }
 
 static SizeClassAllocationResult sizeClassAllocateWithEvict(
-    BenchmarkPlacement& placement, size_t size, int replica_num,
+    const std::shared_ptr<AllocationStrategy>& strategy,
+    AllocatorManager& manager, size_t size, int replica_num,
     std::vector<std::vector<Replica>>& live, std::mt19937& rng,
     int& evict_count, double evict_ratio) {
     for (int attempt = 0; attempt <= kSizeClassMaxRetries; ++attempt) {
-        auto result = placement.Allocate(size, replica_num);
+        auto result = strategy->Allocate(manager, size, replica_num);
         if (result.has_value()) {
             size_t replica_count = result->size();
             if (replica_count == 0) {
@@ -1118,14 +1066,14 @@ static SizeClassAllocationResult sizeClassAllocateWithEvict(
 }
 
 static SizeClassPrefillStats prefillSizeClassChurn(
-    BenchmarkPlacement& placement, const BenchConfig& cfg,
+    const std::shared_ptr<AllocationStrategy>& strategy,
+    AllocatorManager& manager, const BenchConfig& cfg,
     const std::vector<SizeClassSpec>& specs,
     std::vector<std::vector<Replica>>& live_allocations, std::mt19937& rng) {
     SizeClassPrefillStats stats;
     if (cfg.prefill_pct <= 0 || specs.empty()) return stats;
     stats.requested_pct = cfg.prefill_pct;
-    stats.max_attempts =
-        deriveSizeClassPrefillMaxAttempts(placement, cfg, specs);
+    stats.max_attempts = deriveSizeClassPrefillMaxAttempts(manager, cfg, specs);
 
     int consec_failures = 0;
     int evict_throwaway = 0;
@@ -1133,7 +1081,7 @@ static SizeClassPrefillStats prefillSizeClassChurn(
 
     while (stats.attempts < stats.max_attempts) {
         if (stats.attempts % kPreFillSampleInterval == 0) {
-            stats.achieved_util_pct = computeAverageUtilAll(placement) * 100.0;
+            stats.achieved_util_pct = computeAverageUtilAll(manager) * 100.0;
             if (stats.achieved_util_pct >= cfg.prefill_pct) {
                 stats.reached_target = true;
                 break;
@@ -1142,8 +1090,9 @@ static SizeClassPrefillStats prefillSizeClassChurn(
 
         size_t class_idx = chooseSizeClassIndex(specs, rng);
         auto alloc_result = sizeClassAllocateWithEvict(
-            placement, specs[class_idx].size, cfg.replica_num, live_allocations,
-            rng, evict_throwaway, FLAGS_size_class_evict_ratio);
+            strategy, manager, specs[class_idx].size, cfg.replica_num,
+            live_allocations, rng, evict_throwaway,
+            FLAGS_size_class_evict_ratio);
         ++stats.attempts;
         if (alloc_result.status == SizeClassAllocationStatus::FULL) {
             ++stats.full_count;
@@ -1159,7 +1108,7 @@ static SizeClassPrefillStats prefillSizeClassChurn(
         }
     }
 
-    stats.achieved_util_pct = computeAverageUtilAll(placement) * 100.0;
+    stats.achieved_util_pct = computeAverageUtilAll(manager) * 100.0;
     if (stats.achieved_util_pct >= cfg.prefill_pct) {
         stats.reached_target = true;
     }
@@ -1168,10 +1117,12 @@ static SizeClassPrefillStats prefillSizeClassChurn(
 
 // Run DSA workload; the allocation count is derived from cluster capacity.
 static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
-    BenchmarkPlacement placement = createCluster(
-        cfg.num_segments, cfg.segment_capacity, cfg.skewed, cfg.strategy_type);
+    AllocatorManager manager =
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
 
-    const size_t total_capacity = computeTotalCapacity(placement);
+    const size_t total_capacity = computeTotalCapacity(manager);
     const size_t avg_obj_size =
         cfg.dsa_paired ? (kDsaKvSize + kDsaIndexerSize) / 2 : kDsaKvSize;
     const size_t bytes_per_alloc = avg_obj_size * cfg.replica_num;
@@ -1202,20 +1153,21 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     live_allocations.reserve(std::min(total_allocs, 1 << 20));
 
     std::mt19937 rng(42);
+    std::uniform_int_distribution<int> batch_dist(1, kDsaMaxBatch);
 
     if (warmup_allocs > 0) {
         int warmup_count = 0;
         int warmup_evict_throwaway = 0;
         auto warmup_run = [&](size_t size,
                               std::vector<std::vector<Replica>>& live) {
-            (void)dsaAllocateWithEvict(placement, size, cfg.replica_num, live,
-                                       rng, warmup_evict_throwaway,
+            (void)dsaAllocateWithEvict(strategy, manager, size, cfg.replica_num,
+                                       live, rng, warmup_evict_throwaway,
                                        FLAGS_dsa_evict_ratio);
             ++warmup_count;
         };
 
         while (warmup_count < warmup_allocs) {
-            int batch = randomUniform(1, kDsaMaxBatch, rng);
+            int batch = batch_dist(rng);
             for (int i = 0; i < batch && warmup_count < warmup_allocs; ++i) {
                 warmup_run(kDsaKvSize, live_allocations);
             }
@@ -1235,9 +1187,9 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     auto run_one = [&](size_t size,
                        std::vector<std::vector<Replica>>& live) -> bool {
         auto t0 = std::chrono::high_resolution_clock::now();
-        bool ok = dsaAllocateWithEvict(placement, size, cfg.replica_num, live,
-                                       rng, evict_count, FLAGS_dsa_evict_ratio,
-                                       &util_ratios);
+        bool ok = dsaAllocateWithEvict(strategy, manager, size, cfg.replica_num,
+                                       live, rng, evict_count,
+                                       FLAGS_dsa_evict_ratio, &util_ratios);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         latencies.push_back(
@@ -1251,7 +1203,7 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     auto total_start = std::chrono::high_resolution_clock::now();
 
     while (total_count < measure_allocs) {
-        int batch = randomUniform(1, kDsaMaxBatch, rng);
+        int batch = batch_dist(rng);
 
         for (int i = 0; i < batch && total_count < measure_allocs; ++i) {
             run_one(kDsaKvSize, live_allocations);
@@ -1277,8 +1229,8 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
     res.skewed = cfg.skewed;
     res.cluster_capacity_gb = computeClusterCapacityGB(
         cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    res.final_util_stddev = computeUtilizationStdDev(placement);
-    res.final_avg_util = computeAverageUtilAll(placement);
+    res.final_util_stddev = computeUtilizationStdDev(manager);
+    res.final_avg_util = computeAverageUtilAll(manager);
     res.success_count = success_count;
     res.total_count = total_count;
     res.evict_count = evict_count;
@@ -1289,8 +1241,10 @@ static FillUpResult runDsaBenchmark(const BenchConfig& cfg) {
 }
 
 static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
-    BenchmarkPlacement placement = createCluster(
-        cfg.num_segments, cfg.segment_capacity, cfg.skewed, cfg.strategy_type);
+    AllocatorManager manager =
+        createCluster(cfg.num_segments, cfg.segment_capacity, cfg.skewed);
+    LocalSsdManager local_ssd;
+    auto strategy = CreateAllocationStrategy(cfg.strategy_type, local_ssd);
     auto specs = getSizeClassSpecs(cfg.size_class_pattern);
 
     std::vector<SizeClassStat> per_class_stats;
@@ -1316,8 +1270,8 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     live_allocations.reserve(std::min(cfg.num_allocations, 1 << 20));
 
     std::mt19937 rng(42);
-    SizeClassPrefillStats prefill_stats =
-        prefillSizeClassChurn(placement, cfg, specs, live_allocations, rng);
+    SizeClassPrefillStats prefill_stats = prefillSizeClassChurn(
+        strategy, manager, cfg, specs, live_allocations, rng);
 
     int success_count = 0;
     int partial_count = 0;
@@ -1334,8 +1288,8 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
 
         auto t0 = std::chrono::high_resolution_clock::now();
         auto alloc_result = sizeClassAllocateWithEvict(
-            placement, spec.size, cfg.replica_num, live_allocations, rng,
-            evict_count, FLAGS_size_class_evict_ratio);
+            strategy, manager, spec.size, cfg.replica_num, live_allocations,
+            rng, evict_count, FLAGS_size_class_evict_ratio);
         auto t1 = std::chrono::high_resolution_clock::now();
 
         double latency_ns =
@@ -1358,7 +1312,7 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
 
         if ((i + 1) % sample_interval == 0 || i == cfg.num_allocations - 1) {
             auto s0 = std::chrono::high_resolution_clock::now();
-            auto snapshot = computeFragmentationSnapshot(placement);
+            auto snapshot = computeFragmentationSnapshot(manager);
             if (snapshot.valid) {
                 fragmentation_samples.push_back(snapshot.fragmentation_ratio);
                 largest_free_mb_samples.push_back(
@@ -1390,8 +1344,8 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     res.skewed = cfg.skewed;
     res.cluster_capacity_gb = computeClusterCapacityGB(
         cfg.num_segments, cfg.segment_capacity, cfg.skewed);
-    res.final_util_stddev = computeUtilizationStdDev(placement);
-    res.final_avg_util = computeAverageUtilAll(placement);
+    res.final_util_stddev = computeUtilizationStdDev(manager);
+    res.final_avg_util = computeAverageUtilAll(manager);
     res.success_count = success_count;
     res.partial_count = partial_count;
     res.failed_count = failed_count;
@@ -1402,7 +1356,7 @@ static SizeClassChurnResult runSizeClassChurnBenchmark(const BenchConfig& cfg) {
     res.fragmentation_stats = computeDistributionStats(fragmentation_samples);
     res.largest_free_mb_stats =
         computeDistributionStats(largest_free_mb_samples);
-    res.final_fragmentation = computeFragmentationSnapshot(placement);
+    res.final_fragmentation = computeFragmentationSnapshot(manager);
     res.size_class_stats = std::move(per_class_stats);
     computeLatencyStats(latencies, total_us, total_count, res);
     return res;
@@ -1628,13 +1582,13 @@ static void runFillupBenchmarks() {
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {512 * KiB, 8 * MiB, 32 * MiB};
     std::vector<int> replica_nums = {1, 2, 3};
-    std::vector<PlacementPolicyType> strategies = {
-        PlacementPolicyType::RANDOM,
-        PlacementPolicyType::FREE_RATIO_FIRST,
+    std::vector<AllocationStrategyType> strategies = {
+        AllocationStrategyType::RANDOM,
+        AllocationStrategyType::FREE_RATIO_FIRST,
     };
 
     std::cout
-        << "\n=== Placement Policy Fill-Up Benchmark Matrix ===\n"
+        << "\n=== AllocationStrategy Fill-Up Benchmark Matrix ===\n"
         << (FLAGS_prefill_pct > 0
                 ? ("Mode: prefill_pct=" + std::to_string(FLAGS_prefill_pct) +
                    "% (cluster pre-filled before measuring; no early exit)\n")
@@ -1672,7 +1626,7 @@ static void runFillupBenchmarks() {
     }
 
     // Run the linear list of configs
-    PlacementPolicyType current_strategy = PlacementPolicyType::RANDOM;
+    AllocationStrategyType current_strategy = AllocationStrategyType::RANDOM;
     bool first = true;
     for (const auto& cfg : configs) {
         // Print header when strategy
@@ -1692,8 +1646,9 @@ static void runScaleOutMatrix() {
     std::vector<int> segment_counts = {1, 10, 100, 512, 1024};
     std::vector<size_t> alloc_sizes = {512 * KiB, 8 * MiB, 32 * MiB};
     std::vector<int> replica_nums = {1, 2, 3};
-    std::vector<PlacementPolicyType> strategies = {
-        PlacementPolicyType::RANDOM, PlacementPolicyType::FREE_RATIO_FIRST};
+    std::vector<AllocationStrategyType> strategies = {
+        AllocationStrategyType::RANDOM,
+        AllocationStrategyType::FREE_RATIO_FIRST};
 
     std::cout
         << "\n=== Scale-Out Workload Benchmark (Matrix) ===\n"
@@ -1736,7 +1691,7 @@ static void runScaleOutMatrix() {
         }
     }
 
-    PlacementPolicyType current_strategy = PlacementPolicyType::RANDOM;
+    AllocationStrategyType current_strategy = AllocationStrategyType::RANDOM;
     bool first = true;
     for (const auto& cfg : configs) {
         if (first || cfg.strategy_type != current_strategy) {
@@ -1756,9 +1711,9 @@ static void runDsaMatrix() {
     std::vector<int> segment_counts = {1, 2, 4, 8, 16};
     std::vector<int> replica_nums = {1, 2, 3};
     std::vector<bool> paired_modes = {false, true};
-    std::vector<PlacementPolicyType> strategies = {
-        PlacementPolicyType::RANDOM,
-        PlacementPolicyType::FREE_RATIO_FIRST,
+    std::vector<AllocationStrategyType> strategies = {
+        AllocationStrategyType::RANDOM,
+        AllocationStrategyType::FREE_RATIO_FIRST,
     };
 
     size_t seg_cap_mb = static_cast<size_t>(FLAGS_dsa_segment_capacity);
@@ -1828,7 +1783,7 @@ static void runDsaMatrix() {
 
     bool first = true;
     bool prev_paired = false;
-    PlacementPolicyType prev_strategy = PlacementPolicyType::RANDOM;
+    AllocationStrategyType prev_strategy = AllocationStrategyType::RANDOM;
 
     for (const auto& cfg : configs) {
         if (first || cfg.dsa_paired != prev_paired) {
@@ -1854,9 +1809,9 @@ static void runSizeClassChurnMatrix() {
     std::vector<bool> skewed_options = {false, true};
     std::vector<int> segment_counts = {1, 10, 100};
     std::vector<int> replica_nums = {1, 2, 3};
-    std::vector<PlacementPolicyType> strategies = {
-        PlacementPolicyType::RANDOM,
-        PlacementPolicyType::FREE_RATIO_FIRST,
+    std::vector<AllocationStrategyType> strategies = {
+        AllocationStrategyType::RANDOM,
+        AllocationStrategyType::FREE_RATIO_FIRST,
     };
 
     std::vector<std::string> patterns;
@@ -1930,7 +1885,7 @@ static void runSizeClassChurnMatrix() {
 
     bool first = true;
     std::string prev_pattern;
-    PlacementPolicyType prev_strategy = PlacementPolicyType::RANDOM;
+    AllocationStrategyType prev_strategy = AllocationStrategyType::RANDOM;
 
     for (const auto& cfg : configs) {
         if (first || cfg.size_class_pattern != prev_pattern) {
@@ -1953,7 +1908,7 @@ static void runSizeClassChurnMatrix() {
 
 int main(int argc, char* argv[]) {
     gflags::SetUsageMessage(
-        "Placement policy performance benchmark.\n"
+        "AllocationStrategy performance benchmark.\n"
         "Usage: allocation_strategy_bench [flags]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     setupResourceLimits();

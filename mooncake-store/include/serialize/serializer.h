@@ -16,6 +16,9 @@ class OffsetAllocationHandle;
 }  // namespace mooncake::offset_allocator
 
 namespace mooncake {
+class SegmentView;
+class MountedSegment;
+class OffsetBufferAllocator;
 class AllocatedBuffer;
 class Replica;
 class MasterService;
@@ -83,6 +86,13 @@ class Serializer<AllocatedBuffer> {
     using PointerType = std::unique_ptr<AllocatedBuffer>;
 
     static tl::expected<void, SerializationError> serialize(
+        const AllocatedBuffer &buffer, const SegmentView &segment_view,
+        MsgpackPacker &packer);
+
+    static tl::expected<PointerType, SerializationError> deserialize(
+        const msgpack::object &obj, const SegmentView &segment_view);
+
+    static tl::expected<void, SerializationError> serialize(
         const AllocatedBuffer& buffer, const SegmentPool& segment_pool,
         MsgpackPacker& packer);
     static tl::expected<void, SerializationError> serialize(
@@ -104,6 +114,13 @@ class Serializer<Replica> {
     using PointerType = std::shared_ptr<Replica>;
 
     static tl::expected<void, SerializationError> serialize(
+        const Replica &replica, const SegmentView &segment_view,
+        MsgpackPacker &packer);
+
+    static tl::expected<PointerType, SerializationError> deserialize(
+        const msgpack::object &obj, const SegmentView &segment_view);
+
+    static tl::expected<void, SerializationError> serialize(
         const Replica& replica, const SegmentPool& segment_pool,
         MsgpackPacker& packer);
     static tl::expected<void, SerializationError> serialize(
@@ -118,6 +135,29 @@ class Serializer<Replica> {
     static tl::expected<void, SerializationError> SerializeImpl(
         const Replica& replica, const SegmentAccess& segment_access,
         MsgpackPacker& packer);
+};
+
+template <>
+class Serializer<MountedSegment> {
+   public:
+    static tl::expected<void, SerializationError> serialize(
+        const MountedSegment &mounted_segment, MsgpackPacker &packer);
+
+    static tl::expected<MountedSegment, SerializationError> deserialize(
+        const msgpack::object &obj);
+};
+
+// Serializer specialization for OffsetBufferAllocator (interface declaration)
+template <>
+class Serializer<OffsetBufferAllocator> {
+   public:
+    using PointerType = std::shared_ptr<OffsetBufferAllocator>;
+
+    static tl::expected<void, SerializationError> serialize(
+        const OffsetBufferAllocator &allocator, MsgpackPacker &packer);
+
+    static tl::expected<PointerType, SerializationError> deserialize(
+        const msgpack::object &obj);
 };
 
 // Generic serialization helper class

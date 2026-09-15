@@ -452,9 +452,9 @@ struct Segment {
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
- * @brief Placement policy type for region allocation
+ * @brief Allocation strategy type for segment allocation
  */
-enum class PlacementPolicyType {
+enum class AllocationStrategyType {
     RANDOM = 0,            // Pure random allocation
     FREE_RATIO_FIRST,      // Free-ratio-first allocation
     CXL,                   // CXL-specific allocation
