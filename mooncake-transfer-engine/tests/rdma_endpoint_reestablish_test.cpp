@@ -846,10 +846,9 @@ class RdmaEndPointTestPeer {
                                  int &out_stage, int &out_sys_errno) {
         RdmaEndPoint::SetupConnectionFailureInfo failure_info = {};
         constexpr uint8_t kLegacyPeerReadDepth = 16;
-        int rc = endpoint.doSetupConnection(qp_index, peer_gid, peer_lid,
-                                            peer_qp_num, local_gid_index,
-                                            kLegacyPeerReadDepth, reply_msg,
-                                            &failure_info);
+        int rc = endpoint.doSetupConnection(
+            qp_index, peer_gid, peer_lid, peer_qp_num, local_gid_index,
+            kLegacyPeerReadDepth, reply_msg, &failure_info);
         out_stage = static_cast<int>(failure_info.stage);
         out_sys_errno = failure_info.sys_errno;
         return rc;
