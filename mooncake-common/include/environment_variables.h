@@ -127,6 +127,23 @@ struct DistributedStorageEnvironmentVariables {
     MC_DEFINE_ENV_VAR(int, MOONCAKE_DFS_EVICTION_CHECK_INTERVAL);
 };
 
+struct OssAdapterEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, OSS_ENDPOINT);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_BUCKET);
+    MC_DEFINE_ENV_VAR(std::string, OSS_BUCKET);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, OSS_REGION);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, OSS_ACCESS_KEY_ID);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_ACCESS_KEY_SECRET);
+    MC_DEFINE_ENV_VAR(std::string, OSS_ACCESS_KEY_SECRET);
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OSS_SECURITY_TOKEN);
+    MC_DEFINE_ENV_VAR(std::string, OSS_SESSION_TOKEN);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OSS_PATH_STYLE);
+    MC_DEFINE_ENV_VAR(bool, MOONCAKE_OSS_ANONYMOUS);
+};
+
 struct OffsetAllocatorBackendEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_EVICTION_POLICY);
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_OFFSET_HIGH_RATIO);

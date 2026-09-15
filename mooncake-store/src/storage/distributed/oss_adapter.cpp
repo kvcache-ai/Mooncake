@@ -20,7 +20,7 @@
 
 #include <glog/logging.h>
 
-#include "environ.h"
+#include "config/oss_adapter_config.h"
 
 namespace mooncake {
 namespace {
@@ -226,38 +226,19 @@ OssObjectStorageAdapter::OssObjectStorageAdapter(std::string key_prefix)
 }
 
 tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
-    endpoint_ = Environ::GetString("MOONCAKE_OSS_ENDPOINT",
-                                   Environ::GetString("OSS_ENDPOINT", ""));
-    bucket_ = Environ::GetString("MOONCAKE_OSS_BUCKET",
-                                 Environ::GetString("OSS_BUCKET", ""));
-    region_ = Environ::GetString("MOONCAKE_OSS_REGION",
-                                 Environ::GetString("OSS_REGION", ""));
-    access_key_id_ =
-        Environ::GetString("MOONCAKE_OSS_ACCESS_KEY_ID",
-                           Environ::GetString("OSS_ACCESS_KEY_ID", ""));
-    access_key_secret_ =
-        Environ::GetString("MOONCAKE_OSS_ACCESS_KEY_SECRET",
-                           Environ::GetString("OSS_ACCESS_KEY_SECRET", ""));
-    security_token_ =
-        Environ::GetString("MOONCAKE_OSS_SECURITY_TOKEN",
-                           Environ::GetString("OSS_SESSION_TOKEN", ""));
-    boost::algorithm::trim(security_token_);
-    path_style_ = Environ::GetBool("MOONCAKE_OSS_PATH_STYLE", false);
-    anonymous_ = Environ::GetBool("MOONCAKE_OSS_ANONYMOUS", false);
-
-    while (!endpoint_.empty() && endpoint_.back() == '/') endpoint_.pop_back();
-
-    if (endpoint_.empty() || bucket_.empty() || region_.empty()) {
-        LOG(ERROR) << "OSS requires MOONCAKE_OSS_ENDPOINT, "
-                      "MOONCAKE_OSS_BUCKET and MOONCAKE_OSS_REGION";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto config = OssAdapterConfig::FromEnvironment();
+    if (!config.has_value()) {
+        return tl::make_unexpected(config.error());
     }
-    if (!anonymous_ && (access_key_id_.empty() || access_key_secret_.empty())) {
-        LOG(ERROR)
-            << "OSS credentials are missing; set MOONCAKE_OSS_ACCESS_KEY_ID "
-               "and MOONCAKE_OSS_ACCESS_KEY_SECRET";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
+    endpoint_ = std::move(config->endpoint);
+    bucket_ = std::move(config->bucket);
+    region_ = std::move(config->region);
+    access_key_id_ = std::move(config->access_key_id);
+    access_key_secret_ = std::move(config->access_key_secret);
+    security_token_ = std::move(config->security_token);
+    path_style_ = config->path_style;
+    anonymous_ = config->anonymous;
+
     std::call_once(curl_init_once,
                    [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
     initialized_ = true;
