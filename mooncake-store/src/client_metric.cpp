@@ -35,6 +35,7 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
                  "Build version of the running client; the value is always 1 "
                  "and the version strings are carried by the labels",
                  WithBuildInfoLabels(labels)),
+      master_heartbeat_metric(labels),
       should_stop_metrics_thread_(false),
       metrics_interval_seconds_(interval_seconds),
       bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
@@ -83,6 +84,7 @@ void ClientMetric::serialize(std::string& str) {
     ssd_metric.serialize(str);
     dfs_metric.serialize(str);
     build_info.serialize(str);
+    master_heartbeat_metric.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {

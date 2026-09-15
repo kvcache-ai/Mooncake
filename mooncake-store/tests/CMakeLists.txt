@@ -432,3 +432,10 @@ foreach(
   ordered_oplog_writer_test)
   target_link_libraries(${target} PRIVATE Mooncake::xxhash)
 endforeach()
+
+# The observation contract needs only YLT metrics and GoogleTest.
+add_executable(master_heartbeat_metric_test master_heartbeat_metric_test.cpp)
+target_include_directories(master_heartbeat_metric_test PRIVATE ../include)
+target_link_libraries(master_heartbeat_metric_test PRIVATE yalantinglibs gtest
+                                                           gtest_main pthread)
+add_test(NAME master_heartbeat_metric_test COMMAND master_heartbeat_metric_test)
