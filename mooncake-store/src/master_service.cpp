@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <array>
-#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cctype>
@@ -32,7 +31,8 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "environ.h"
-#include "segment.h"
+#include "segment/pool_write_access.h"
+#include "segment/pool_read_access.h"
 #include "segment/region_driver.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
@@ -172,6 +172,111 @@ tl::expected<std::string, ErrorCode> GetGroupIdForKey(
     return config.group_ids->at(key_index);
 }
 
+template <typename Allocate>
+auto WithPlacementPolicy(AllocationStrategyType type,
+                         const LocalSsdManager& local_ssd,
+                         Allocate&& allocate) {
+    switch (type) {
+        case AllocationStrategyType::RANDOM:
+            return allocate(RandomPlacementPolicy{});
+        case AllocationStrategyType::FREE_RATIO_FIRST:
+            return allocate(FreeRatioFirstPlacementPolicy{});
+        case AllocationStrategyType::CXL:
+            return allocate(
+                PreferredOnlyPlacementPolicy{AllocationCandidateKind::CXL});
+        case AllocationStrategyType::SSD_FREE_RATIO_FIRST:
+            return allocate(SsdFreeRatioFirstPlacementPolicy{
+                LocalSSDMetricsView(local_ssd)});
+        case AllocationStrategyType::LOCAL_FIRST:
+            return allocate(LocalFirstPlacementPolicy{});
+    }
+    return allocate(RandomPlacementPolicy{});
+}
+
+std::vector<MountedRegion> CopyMountedRegions(const RegionCatalog& catalog) {
+    std::vector<MountedRegion> regions;
+    for (const auto& mounted : catalog.Regions()) {
+        regions.push_back(mounted);
+    }
+    return regions;
+}
+
+void GetSegmentNames(const RegionCatalog& catalog,
+                     std::vector<std::string>& names) {
+    std::unordered_set<std::string> unique_names;
+    names.clear();
+    for (const auto& mounted : catalog.Regions()) {
+        if (unique_names.insert(mounted.segment.name).second) {
+            names.push_back(mounted.segment.name);
+        }
+    }
+}
+
+ErrorCode GetClientSegments(const RegionCatalog& catalog, const UUID& client_id,
+                            std::vector<Segment>& segments) {
+    segments.clear();
+    for (const auto& mounted : catalog.Regions()) {
+        if (mounted.client_id == client_id) {
+            segments.push_back(mounted.segment);
+        }
+    }
+    return segments.empty() ? ErrorCode::SEGMENT_NOT_FOUND : ErrorCode::OK;
+}
+
+ErrorCode GetSegmentStatus(const RegionCatalog& catalog, std::string_view name,
+                           SegmentStatus& status) {
+    const auto ids = catalog.RegionIds(name);
+    if (ids.empty()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = SegmentStatus::UNDEFINED;
+    for (const auto& id : ids) {
+        const auto candidate = catalog.Find(id)->status;
+        if (SegmentStatusAvailabilityRank(candidate) <
+            SegmentStatusAvailabilityRank(status)) {
+            status = candidate;
+        }
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode GetSegmentStatus(const RegionCatalog& catalog, const UUID& id,
+                           SegmentStatus& status) {
+    const auto* mounted = catalog.Find(id);
+    if (!mounted) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    status = mounted->status;
+    return ErrorCode::OK;
+}
+
+ErrorCode GetSegmentOwner(const RegionCatalog& catalog, std::string_view name,
+                          UUID& owner) {
+    auto client = catalog.FindOwnerClientId(name);
+    if (!client) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    owner = *client;
+    return ErrorCode::OK;
+}
+
+bool HasServingAllocationCandidate(const SegmentPool::ReadAccess& view,
+                                   std::string_view name,
+                                   AllocationCandidateKind kind) {
+    const auto* entry = view.Placement().Find(name, kind);
+    return entry &&
+           std::any_of(
+               entry->candidates.begin(), entry->candidates.end(),
+               [](const auto* candidate) { return candidate->IsServing(); });
+}
+
+bool HasRegionByEndpoint(const RegionCatalog& catalog,
+                         std::string_view endpoint) {
+    return std::ranges::any_of(catalog.Regions(), [&](const auto& mounted) {
+        return mounted.segment.te_endpoint == endpoint;
+    });
+}
+
 }  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -221,13 +326,27 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
-      segment_manager_(config.memory_allocator, config.enable_cxl),
+      segment_pool_([&config] {
+          RegionDriverConfig drivers{
+              .memory_allocator = config.memory_allocator, .cxl = std::nullopt};
+          if (config.enable_cxl) {
+              drivers.cxl =
+                  CxlRegionDriverConfig{config.cxl_path, config.cxl_size};
+          }
+          auto result = CreateRegionDrivers(drivers);
+          if (!result) {
+              throw std::runtime_error(
+                  "Failed to initialize segment drivers: " +
+                  toString(result.error()));
+          }
+          return std::move(*result);
+      }()),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_type_(config.enable_cxl
-                                    ? AllocationStrategyType::CXL
-                                    : config.allocation_strategy_type),
-      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_,
+      memory_placement_policy_(config.enable_cxl
+                                   ? AllocationStrategyType::CXL
+                                   : config.allocation_strategy_type),
+      allocation_strategy_(CreateAllocationStrategy(memory_placement_policy_,
                                                     local_ssd_manager_)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
@@ -257,7 +376,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
     } else {
         http_metadata_prefix_ = "mooncake/";
     }
-    if (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST) {
+    if (memory_placement_policy_ == AllocationStrategyType::LOCAL_FIRST) {
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
 
@@ -575,16 +694,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(INFO) << "Skipping primary snapshot generation in batch-record "
                      "OpLog mode; snapshots are owned by standby";
     }
-
-    if (config.enable_cxl) {
-        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
-        const auto result = segment_manager_.initializeCxlAllocator(
-            config.cxl_path, config.cxl_size);
-        LOG_IF(FATAL, result != ErrorCode::OK)
-            << "Failed to initialize CXL allocator: "
-            << static_cast<int>(result);
-        VLOG(1) << "action=start_cxl_global_allocator";
-    }
 }
 
 tl::expected<int, ErrorCode> MasterService::GetDfsShardCount() const {
@@ -740,11 +849,8 @@ MasterService::~MasterService() {
         MasterMetricManager::instance().remove_segment_metrics(segment);
     }
 
-    // Segments still mounted here never went through CommitUnmountSegment;
-    // release their capacity contribution so the process-lifetime
-    // MasterMetricManager stays consistent when the next leadership term
-    // constructs a fresh MasterService and the clients remount.
-    segment_manager_.releaseCapacityMetrics();
+    // Release mounted capacity before removing process-local client records.
+    segment_pool_.AcquireWriteAccess().Clear();
 
     std::unique_lock<std::shared_mutex> client_lock(client_mutex_);
     auto& metrics = MasterMetricManager::instance();
@@ -839,7 +945,7 @@ bool MasterService::IsNoFSegmentMountedForTesting(const UUID& segment_id) {
     return std::any_of(
         mounted_segments.begin(), mounted_segments.end(),
         [&segment_id](const MountedNoFSegmentSnapshot& snapshot) {
-            return snapshot.segment_id == segment_id &&
+            return snapshot.segment.id == segment_id &&
                    snapshot.status == SegmentStatus::OK;
         });
 }
@@ -856,7 +962,7 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
 
 TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
     return {
-        .memory = segment_manager_.GetMemoryUsageSnapshot(),
+        .memory = segment_pool_.GetMemoryUsageSnapshot(),
         .nof = nof_segment_manager_.GetUsageSnapshot(),
     };
 }
@@ -974,13 +1080,26 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             record->ObserveAndRun(ClientLivenessRecord::Clock::now(), [&] {
                 std::shared_lock<std::shared_mutex> snapshot_lock(
                     snapshot_mutex_);
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
+                SegmentPool::WriteAccess segment_access =
+                    segment_pool_.AcquireWriteAccess();
                 LOG(INFO) << "client_id=" << client_id
                           << ", action=mount_segment, segment_name="
                           << segment.name;
-                mount_result =
-                    segment_access.MountSegment(segment, client_id, record);
+                if (client_offboarding_reserved_names_.contains(segment.name)) {
+                    mount_result = ErrorCode::INVALID_PARAMS;
+                } else if (const auto* mounted =
+                               segment_access.Catalog().Find(segment.id);
+                           mounted && (mounted->client_id != client_id ||
+                                       mounted->segment != segment)) {
+                    mount_result = ErrorCode::INVALID_PARAMS;
+                } else {
+                    mount_result =
+                        segment_access.MountSegment(segment, client_id);
+                    if (mount_result == ErrorCode::OK ||
+                        mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+                        segment_access.BindClientLiveness(client_id, record);
+                    }
+                }
                 return mount_result == ErrorCode::OK ||
                        mount_result == ErrorCode::SEGMENT_ALREADY_EXISTS;
             });
@@ -1093,128 +1212,67 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-        const auto discard_provisional_record = [&] {
-            if (!record_inserted) {
-                return;
+        const auto fail_remount =
+            [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+            if (record_inserted) {
+                client_liveness_records_.erase(client_id);
+                MasterMetricManager::instance()
+                    .on_client_liveness_record_removed(
+                        ClientLivenessState::ACTIVE);
             }
-            client_liveness_records_.erase(client_id);
-            MasterMetricManager::instance().on_client_liveness_record_removed(
-                ClientLivenessState::ACTIVE);
+            return tl::make_unexpected(error);
         };
         std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
-        for (const auto& segment : segments) {
-            if (!segment.host_id.empty()) {
-                client_host_id_[client_id] = segment.host_id;
-                break;
-            }
-        }
         {
-            auto segment_access = segment_manager_.getSegmentAccess();
+            auto view = segment_pool_.AcquireReadAccess();
+            std::unordered_set<UUID, boost::hash<UUID>> ids;
             for (const auto& segment : segments) {
-                auto standby_validation =
-                    ValidateStandbyRemountSegment(segment);
-                if (standby_validation != ErrorCode::OK) {
-                    discard_provisional_record();
-                    return tl::make_unexpected(standby_validation);
+                if (!ids.insert(segment.id).second ||
+                    client_offboarding_reserved_names_.contains(segment.name)) {
+                    return fail_remount(ErrorCode::INVALID_PARAMS);
                 }
-                auto validation =
-                    segment_access.ValidateRemountSegment(segment, client_id);
+                auto validation = ValidateStandbyRemountSegment(segment);
                 if (validation != ErrorCode::OK) {
-                    discard_provisional_record();
-                    return tl::make_unexpected(validation);
+                    return fail_remount(validation);
+                }
+                if (const auto* mounted = view.Catalog().Find(segment.id)) {
+                    if (mounted->client_id != client_id ||
+                        mounted->segment != segment) {
+                        return fail_remount(ErrorCode::INVALID_PARAMS);
+                    }
+                    if (mounted->status == SegmentStatus::UNMOUNTING) {
+                        return fail_remount(
+                            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                    }
                 }
             }
         }
         if (ok_client_.contains(client_id)) {
             LOG(WARNING) << "client_id=" << client_id
                          << ", warn=client_already_remounted";
-            // Return OK because this is an idempotent operation
             return {};
         }
 
         struct SegmentRestore {
             Segment segment;
-            std::shared_ptr<BufferAllocatorBase> old_allocator;
-            std::shared_ptr<BufferAllocatorBase> restored_allocator;
             std::vector<Replica*> replicas;
             std::vector<AllocatedBuffer::Descriptor> descriptors;
-            std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+            std::optional<RegionMountTxn> prepared;
             uint64_t imported_size{0};
         };
         std::vector<SegmentRestore> restores;
         restores.reserve(segments.size());
-        std::vector<bool> segment_existed(segments.size());
-        auto rollback_new_segments = [&] {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (size_t i = 0; i < segments.size(); ++i) {
-                if (segment_existed[i] ||
-                    !segment_access.GetAllocator(segments[i].id)) {
-                    continue;
-                }
-                size_t capacity = 0;
-                if (segment_access.PrepareUnmountSegment(
-                        segments[i].id, capacity) != ErrorCode::OK) {
-                    LOG(ERROR) << "segment_name=" << segments[i].name
-                               << ", error=remount_rollback_prepare_failed";
-                    continue;
-                }
-                if (segment_access.CommitUnmountSegment(
-                        segments[i].id, client_id, capacity) != ErrorCode::OK) {
-                    LOG(ERROR) << "segment_name=" << segments[i].name
-                               << ", error=remount_rollback_commit_failed";
-                }
-            }
-        };
-        auto fail_remount =
-            [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
-            rollback_new_segments();
-            discard_provisional_record();
-            return tl::make_unexpected(error);
-        };
-
-        ErrorCode remount_error = ErrorCode::OK;
-        {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (size_t i = 0; i < segments.size(); ++i) {
-                segment_existed[i] =
-                    segment_access.GetAllocator(segments[i].id) != nullptr;
-            }
-
-            remount_error =
-                segment_access.ReMountSegment(segments, client_id, record);
-            if (remount_error == ErrorCode::OK) {
-                segment_access.BindClientLiveness(client_id, record);
-                for (const auto& segment : segments) {
-                    auto allocator = segment_access.GetAllocator(segment.id);
-                    Segment authoritative;
-                    if (!allocator ||
-                        !segment_access.GetSegment(segment.id, authoritative)) {
-                        remount_error = ErrorCode::INTERNAL_ERROR;
-                        break;
-                    }
-                    restores.push_back({std::move(authoritative),
-                                        std::move(allocator),
-                                        nullptr,
-                                        {},
-                                        {},
-                                        {},
-                                        0});
-                }
-            }
+        for (const auto& segment : segments) {
+            restores.push_back({segment, {}, {}, std::nullopt, 0});
         }
-        if (remount_error != ErrorCode::OK) {
-            return fail_remount(remount_error);
-        }
-
         bool ambiguous_endpoint = false;
-        bool unsupported_cxl = false;
         std::unordered_set<ObjectMetadata*> affected_objects;
-        bool any_standby_kept_alive = std::any_of(
+        const bool any_standby_kept_alive = std::any_of(
             segments.begin(), segments.end(), [this](const Segment& segment) {
                 return standby_accounted_memory_bytes_.contains(segment.name);
             });
+        // Discover metadata before taking the Pool lock. snapshot_mutex_ is
+        // exclusive, so these pointers stay valid through preparation/commit.
         for (size_t shard_index = 0;
              any_standby_kept_alive && shard_index < kNumShards;
              ++shard_index) {
@@ -1247,14 +1305,11 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                 }
                             }
                             if (match != nullptr) {
-                                if (descriptor.protocol_ == "cxl") {
-                                    unsupported_cxl = true;
-                                    return;
-                                }
                                 descriptor.transport_endpoint_ =
                                     match->segment.te_endpoint;
                                 match->replicas.push_back(&replica);
-                                match->descriptors.push_back(descriptor);
+                                match->descriptors.push_back(
+                                    std::move(descriptor));
                                 affected_objects.insert(&metadata);
                             }
                         });
@@ -1264,121 +1319,97 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         if (ambiguous_endpoint) {
             return fail_remount(ErrorCode::INVALID_PARAMS);
         }
-        if (unsupported_cxl) {
-            return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-        }
-
-        for (auto& restore : restores) {
-            if (restore.descriptors.empty()) {
-                continue;
-            }
-            const RegionResourceSpec spec{
-                restore.segment.id, restore.segment.name, restore.segment.base,
-                restore.segment.size, restore.segment.te_endpoint};
-            auto allocations =
-                BuildRegionLiveAllocations(spec, restore.descriptors);
-            if (!allocations) {
-                return fail_remount(allocations.error());
-            }
-            if (std::dynamic_pointer_cast<OffsetBufferAllocator>(
-                    restore.old_allocator)) {
-                auto imported = ImportOffsetBufferAllocator(
-                    restore.segment.name, restore.segment.base,
-                    restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
-                if (!imported) {
-                    return fail_remount(ErrorCode::INVALID_PARAMS);
+        {
+            auto access = segment_pool_.AcquireWriteAccess();
+            std::unordered_map<std::string, uint64_t> imported_by_name;
+            // Prepare every resource before publishing any of them. Existing
+            // allocators without standby descriptors must remain intact.
+            for (auto& restore : restores) {
+                if (restore.descriptors.empty() &&
+                    access.Catalog().Find(restore.segment.id)) {
+                    continue;
                 }
-                restore.restored_allocator = std::move(imported->allocator);
-                restore.buffers = std::move(imported->buffers);
-            } else if (std::dynamic_pointer_cast<CachelibBufferAllocator>(
-                           restore.old_allocator)) {
-                auto imported = ImportCachelibBufferAllocator(
-                    restore.segment.name, restore.segment.base,
-                    restore.segment.size, restore.segment.te_endpoint,
-                    *allocations);
-                if (!imported) {
-                    return fail_remount(ErrorCode::INVALID_PARAMS);
+                auto prepared =
+                    restore.descriptors.empty()
+                        ? access.PrepareMount(restore.segment, client_id)
+                        : access.PrepareRestore(restore.segment, client_id,
+                                                restore.descriptors);
+                if (!prepared) {
+                    return fail_remount(prepared.error());
                 }
-                restore.restored_allocator = std::move(imported->allocator);
-                restore.buffers = std::move(imported->buffers);
-            } else {
-                return fail_remount(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-            }
-        }
-
-        std::vector<ScopedSegmentAccess::AllocatorReplacement>
-            allocator_replacements;
-        for (auto& restore : restores) {
-            if (restore.restored_allocator) {
-                if (restore.buffers.size() != restore.replicas.size() ||
-                    std::any_of(restore.buffers.begin(), restore.buffers.end(),
+                if (prepared->imported_buffers().size() !=
+                        restore.replicas.size() ||
+                    std::any_of(prepared->imported_buffers().begin(),
+                                prepared->imported_buffers().end(),
                                 [](const auto& buffer) { return !buffer; })) {
                     return fail_remount(ErrorCode::INTERNAL_ERROR);
                 }
-                restore.imported_size = std::accumulate(
-                    restore.descriptors.begin(), restore.descriptors.end(),
-                    uint64_t{0}, [](uint64_t sum, const auto& descriptor) {
-                        return sum + descriptor.size_;
-                    });
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                if (accounted == standby_accounted_memory_bytes_.end() ||
-                    accounted->second < restore.imported_size) {
+                restore.imported_size = prepared->imported_requested_bytes();
+                auto& imported = imported_by_name[restore.segment.name];
+                if (restore.imported_size >
+                    std::numeric_limits<uint64_t>::max() - imported) {
                     return fail_remount(ErrorCode::INTERNAL_ERROR);
                 }
-                allocator_replacements.push_back({restore.segment.id,
-                                                  restore.old_allocator,
-                                                  restore.restored_allocator});
+                imported += restore.imported_size;
+                restore.prepared.emplace(std::move(*prepared));
             }
-        }
-        bool allocators_replaced = false;
-        {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            allocators_replaced =
-                segment_access.ReplaceAllocators(allocator_replacements);
-        }
-        if (!allocators_replaced) {
-            return fail_remount(ErrorCode::INTERNAL_ERROR);
-        }
-        {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            for (auto& restore : restores) {
-                for (auto& buffer : restore.buffers) {
-                    segment_access.BindBufferToSegment(restore.segment.id,
-                                                       *buffer);
+            for (const auto& [name, imported] : imported_by_name) {
+                if (imported == 0) {
+                    continue;
+                }
+                auto accounted = standby_accounted_memory_bytes_.find(name);
+                if (accounted == standby_accounted_memory_bytes_.end() ||
+                    accounted->second < imported) {
+                    return fail_remount(ErrorCode::INTERNAL_ERROR);
                 }
             }
-        }
-        for (auto& restore : restores) {
-            if (restore.imported_size != 0) {
+            for (auto& restore : restores) {
+                if (restore.prepared) {
+                    // Unique IDs, a common owner, and the retained write lock
+                    // rule out catalog conflicts between these commits.
+                    const auto result = restore.prepared->Commit(access);
+                    CHECK(result == ErrorCode::OK) << toString(result);
+                }
+            }
+            access.BindClientLiveness(client_id, record);
+            for (auto& restore : restores) {
+                if (restore.prepared) {
+                    auto buffers = restore.prepared->TakeImportedBuffers();
+                    for (size_t i = 0; i < restore.replicas.size(); ++i) {
+                        CHECK(access.BindBufferToSegment(restore.segment.id,
+                                                         *buffers[i]));
+                        CHECK(restore.replicas[i]->replace_memory_buffer(
+                            std::move(buffers[i])));
+                    }
+                }
+                invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
+                invalid_replica_endpoints_.erase(restore.segment.name);
+                standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
+                standby_allocator_keepalive_.erase(restore.segment.name);
+            }
+            for (const auto& [name, imported] : imported_by_name) {
+                if (imported == 0) {
+                    continue;
+                }
                 MasterMetricManager::instance().dec_allocated_mem_size(
-                    restore.segment.name,
-                    static_cast<int64_t>(restore.imported_size));
-                auto accounted =
-                    standby_accounted_memory_bytes_.find(restore.segment.name);
-                accounted->second -= restore.imported_size;
+                    name, static_cast<int64_t>(imported));
+                auto accounted = standby_accounted_memory_bytes_.find(name);
+                accounted->second -= imported;
                 if (accounted->second == 0) {
                     standby_accounted_memory_bytes_.erase(accounted);
                 }
             }
-            for (size_t i = 0; i < restore.replicas.size(); ++i) {
-                (void)restore.replicas[i]->replace_memory_buffer(
-                    std::move(restore.buffers[i]));
-            }
-            invalid_replica_endpoints_.erase(restore.segment.te_endpoint);
-            invalid_replica_endpoints_.erase(restore.segment.name);
-            standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
-            standby_allocator_keepalive_.erase(restore.segment.name);
         }
         for (const auto* metadata : affected_objects) {
             metadata->GrantReadLease(
                 std::chrono::milliseconds(default_kv_lease_ttl_));
         }
-
-        // Change the client status to OK
+        for (const auto& segment : segments) {
+            if (!segment.host_id.empty()) {
+                client_host_id_[client_id] = segment.host_id;
+                break;
+            }
+        }
         ok_client_.insert(client_id);
         MasterMetricManager::instance().inc_active_clients();
     }
@@ -1464,6 +1495,17 @@ std::string MasterService::GetClientHostId(const UUID& client_id) const {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     auto it = client_host_id_.find(client_id);
     return it == client_host_id_.end() ? std::string() : it->second;
+}
+
+std::string MasterService::ResolveWriterHostId(const UUID& client_id,
+                                               const ReplicateConfig& config) {
+    UpdateClientHostId(client_id, config.host_id);
+    if (config.replica_num != 1 ||
+        (memory_placement_policy_ != AllocationStrategyType::LOCAL_FIRST &&
+         !config.prefer_alloc_in_same_node)) {
+        return {};
+    }
+    return config.host_id.empty() ? GetClientHostId(client_id) : config.host_id;
 }
 
 const TenantId& MasterService::ResolveRequestTenantId(
@@ -1590,16 +1632,17 @@ uint64_t MasterService::RequestedMemoryQuotaCharge(
 
 uint64_t MasterService::GetTenantQuotaAllocatableCapacityBytes() {
     uint64_t capacity = 0;
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<std::pair<Segment, UUID>> segments;
-    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
-        return 0;
+    std::vector<MountedRegion> regions;
+    {
+        SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+        regions = CopyMountedRegions(view.Catalog());
     }
-    for (const auto& [segment, _] : segments) {
-        if (capacity > std::numeric_limits<uint64_t>::max() - segment.size) {
+    for (const auto& mounted : regions) {
+        if (capacity >
+            std::numeric_limits<uint64_t>::max() - mounted.segment.size) {
             return std::numeric_limits<uint64_t>::max();
         }
-        capacity += segment.size;
+        capacity += mounted.segment.size;
     }
     return capacity;
 }
@@ -2951,13 +2994,13 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
         std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
         if (!job.pending_prepare_segments.empty()) {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
+            SegmentPool::WriteAccess segment_access =
+                segment_pool_.AcquireWriteAccess();
             for (auto it = job.pending_prepare_segments.begin();
                  it != job.pending_prepare_segments.end();) {
                 SegmentStatus status = SegmentStatus::UNDEFINED;
-                const auto status_err =
-                    segment_access.GetSegmentStatusById(it->segment_id, status);
+                const auto status_err = GetSegmentStatus(
+                    segment_access.Catalog(), it->segment_id, status);
                 if (status_err == ErrorCode::SEGMENT_NOT_FOUND) {
                     it = job.pending_prepare_segments.erase(it);
                     continue;
@@ -2968,15 +3011,19 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
                     continue;
                 }
 
-                size_t metrics_dec_capacity = 0;
-                const auto err = segment_access.PrepareUnmountSegment(
-                    it->segment_id, metrics_dec_capacity);
-                if (err == ErrorCode::OK) {
+                auto transaction = segment_access.PrepareUnmount(it->segment_id,
+                                                                 job.client_id);
+                const auto err =
+                    transaction ? ErrorCode::OK : transaction.error();
+                if (transaction) {
+                    client_offboarding_unmounts_.try_emplace(
+                        it->segment_id, std::move(*transaction));
+                    client_offboarding_reserved_names_[it->segment_name].insert(
+                        it->segment_id);
                     job.prepared_segments.push_back(
                         {.segment_id = it->segment_id,
                          .segment_name = it->segment_name,
-                         .transport_endpoint = it->transport_endpoint,
-                         .metrics_dec_capacity = metrics_dec_capacity});
+                         .transport_endpoint = it->transport_endpoint});
                     it = job.pending_prepare_segments.erase(it);
                     continue;
                 }
@@ -3057,21 +3104,28 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
 
         for (auto it = job.prepared_segments.begin();
              it != job.prepared_segments.end();) {
-            ScopedSegmentAccess segment_access =
-                segment_manager_.getSegmentAccess();
-            const auto commit_result = segment_access.CommitUnmountSegment(
-                it->segment_id, job.client_id, it->metrics_dec_capacity,
-                /*retain_name_registration=*/true);
-            if (commit_result != ErrorCode::OK &&
-                commit_result != ErrorCode::SEGMENT_NOT_FOUND) {
-                LOG(ERROR) << "client_id=" << job.client_id
-                           << ", segment_name=" << it->segment_name
-                           << ", action=commit_client_offboarding"
-                           << ", error=" << toString(commit_result);
-                ++it;
-                continue;
+            SegmentPool::WriteAccess segment_access =
+                segment_pool_.AcquireWriteAccess();
+            auto transaction =
+                client_offboarding_unmounts_.find(it->segment_id);
+            if (transaction != client_offboarding_unmounts_.end()) {
+                const auto result =
+                    transaction->second.TryCommit(segment_access);
+                if (result != ErrorCode::OK &&
+                    result != ErrorCode::SEGMENT_NOT_FOUND) {
+                    LOG(ERROR) << "client_id=" << job.client_id
+                               << ", segment_name=" << it->segment_name
+                               << ", action=commit_client_offboarding"
+                               << ", error=" << toString(result);
+                    ++it;
+                    continue;
+                }
+                client_offboarding_unmounts_.erase(transaction);
+                quota_recompute_needed = true;
             }
-
+            // Physical resources and capacity are already released. Keep the
+            // process-local name reservation through OpLog retries so a new
+            // mount cannot race the old incarnation's routing cleanup.
             if (enable_oplog_ && ordered_oplog_writer_ &&
                 !it->transport_endpoint.empty()) {
                 SegmentUnmountOp op{it->transport_endpoint};
@@ -3092,8 +3146,14 @@ bool MasterService::ProcessClientOffboardingJob(ClientOffboardingJob& job) {
             }
 
             cleanupHttpMetadata(it->segment_name);
-            segment_access.ReleaseUnmountedSegmentName(it->segment_id,
-                                                       it->segment_name);
+            auto reservation =
+                client_offboarding_reserved_names_.find(it->segment_name);
+            if (reservation != client_offboarding_reserved_names_.end()) {
+                reservation->second.erase(it->segment_id);
+                if (reservation->second.empty()) {
+                    client_offboarding_reserved_names_.erase(reservation);
+                }
+            }
             LOG(INFO) << "client_id=" << job.client_id
                       << ", segment_name=" << it->segment_name
                       << ", action=unmount_offline_mem_segment";
@@ -3151,60 +3211,54 @@ void MasterService::TaskCleanupThreadFunc() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    size_t metrics_dec_capacity = 0;  // to update the metrics
+    std::optional<RegionUnmountTxn> transaction;
 
     std::shared_lock<std::shared_mutex> client_lock(client_mutex_);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto retaining_clients = GetRetainingClientIdsLocked();
     client_lock.unlock();
-    // 1. Prepare to unmount the segment by deleting its allocator
+    // 1. Hide the segment from placement and deactivate its resource.
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
-        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+        SegmentPool::WriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
+        auto prepared = segment_access.PrepareUnmount(segment_id, client_id);
+        if (!prepared && prepared.error() == ErrorCode::SEGMENT_NOT_FOUND) {
             // Return OK because this is an idempotent operation
             return {};
         }
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
+        if (!prepared) {
+            return tl::make_unexpected(prepared.error());
         }
+        transaction.emplace(std::move(*prepared));
     }
 
-    // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
-    // become unreadable as soon as PrepareUnmountSegment releases their
-    // allocator; only the physical metadata sweep is deferred.
+    // The driver retains the physical resource until the metadata sweep has
+    // completed and CommitUnmount erases it.
     if (enable_async_segment_cleanup_) {
         replica_cleanup_worker_.Schedule();
     } else {
         ClearInvalidHandles(retaining_clients);
     }
 
-    // Cache endpoint before commit removes segment from registry.
-    std::string segment_name;
-    std::string te_endpoint;
-    if (!segment_manager_.GetSegmentBasicInfo(segment_id, segment_name,
-                                              te_endpoint)) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
-
+    // Commit consumes the transaction, including its Segment descriptor.
+    const Segment unmounted_segment = transaction->segment();
     // 3. Commit the unmount operation
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                       metrics_dec_capacity);
+        SegmentPool::WriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
+        auto err = std::move(*transaction).Commit(segment_access);
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
     }
 
-    if (enable_oplog_ && ordered_oplog_writer_ && !te_endpoint.empty()) {
-        SegmentUnmountOp op{te_endpoint};
+    if (enable_oplog_ && ordered_oplog_writer_ &&
+        !unmounted_segment.te_endpoint.empty()) {
+        SegmentUnmountOp op{unmounted_segment.te_endpoint};
         auto bytes = struct_pack::serialize(op);
         PersistSegmentOpForHAOrEnqueue("UnmountSegment",
-                                       OpType::SEGMENT_UNMOUNT, te_endpoint,
+                                       OpType::SEGMENT_UNMOUNT,
+                                       unmounted_segment.te_endpoint,
                                        std::string(bytes.begin(), bytes.end()));
     }
     RecomputeTenantEffectiveQuotas();
@@ -3216,28 +3270,17 @@ auto MasterService::GracefulUnmountSegment(const UUID& segment_id,
                                            uint64_t grace_period_ms)
     -> tl::expected<void, ErrorCode> {
     std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::WriteAccess segment_access =
+        segment_pool_.AcquireWriteAccess();
 
-    // Verify ownership: the segment must belong to the calling client
-    std::vector<Segment> client_segments;
-    auto err = segment_access.GetClientSegments(client_id, client_segments);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
-    bool owned = false;
-    for (auto& seg : client_segments) {
-        if (seg.id == segment_id) {
-            owned = true;
-            break;
-        }
-    }
-    if (!owned) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    err = segment_access.PrepareGracefulUnmountSegment(segment_id);
+    auto transaction =
+        segment_access.PrepareGracefulUnmount(segment_id, client_id);
+    const auto err = transaction ? ErrorCode::OK : transaction.error();
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
         return {};
+    }
+    if (err == ErrorCode::INVALID_PARAMS) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
@@ -3405,12 +3448,9 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
 
 auto MasterService::GetAllSegments()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
     std::vector<std::string> all_segments;
-    auto err = segment_access.GetAllSegments(all_segments);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
+    GetSegmentNames(view.Catalog(), all_segments);
     return all_segments;
 }
 
@@ -3434,34 +3474,33 @@ auto MasterService::GetNoFSegmentsByName(const std::string& segment_name)
 
 auto MasterService::GetSegmentsDetail()
     -> tl::expected<std::vector<SegmentDetailInfo>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
 
     // Get full info of all segments (including Segment and client_id)
-    std::vector<std::pair<Segment, UUID>> all_segments;
-    auto err = segment_access.GetAllSegments(all_segments);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
-    }
+    std::vector<MountedRegion> all_segments;
+    all_segments = CopyMountedRegions(view.Catalog());
 
     std::vector<SegmentDetailInfo> result;
     result.reserve(all_segments.size());
 
-    for (const auto& [segment, client_id] : all_segments) {
+    for (const auto& mounted : all_segments) {
+        const auto& segment = mounted.segment;
         SegmentDetailInfo info;
         info.segment_name = segment.name;
         info.segment_id = segment.id;
-        info.client_id = client_id;
+        info.client_id = mounted.client_id;
         info.base_address = segment.base;
         info.size_bytes = segment.size;
         info.te_endpoint = segment.te_endpoint;
         info.protocol = segment.protocol;
 
-        // Query segment status
-        segment_access.GetSegmentStatusByName(segment.name, info.status);
+        info.status = mounted.status;
 
-        // Query allocator used/capacity
         size_t used = 0, capacity = 0;
-        segment_access.QuerySegments(segment.name, used, capacity);
+        if (const auto allocator = view.GetAllocator(segment.id)) {
+            used = allocator->size();
+            capacity = allocator->capacity();
+        }
         info.allocator_used_bytes = used;
         info.allocator_capacity_bytes = capacity;
 
@@ -3473,9 +3512,10 @@ auto MasterService::GetSegmentsDetail()
 
 auto MasterService::QuerySegments(const std::string& segment)
     -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
     size_t used, capacity;
-    auto err = segment_access.QuerySegments(segment, used, capacity);
+    auto err = view.QueryAllocationCandidates(segment, MemoryAllocationKind(),
+                                              used, capacity);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -3484,9 +3524,9 @@ auto MasterService::QuerySegments(const std::string& segment)
 
 auto MasterService::QuerySegmentStatus(const std::string& segment_name)
     -> tl::expected<SegmentStatus, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
     SegmentStatus status = SegmentStatus::UNDEFINED;
-    auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+    auto err = GetSegmentStatus(view.Catalog(), segment_name, status);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -3495,9 +3535,9 @@ auto MasterService::QuerySegmentStatus(const std::string& segment_name)
 
 auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     -> tl::expected<SegmentStatus, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
     SegmentStatus status = SegmentStatus::UNDEFINED;
-    auto err = segment_access.GetSegmentStatusById(segment_id, status);
+    auto err = GetSegmentStatus(view.Catalog(), segment_id, status);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -3632,7 +3672,8 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         if (seg.segment_name != seg.transport_endpoint) {
             restored_allocators[seg.segment_name] = allocator;
         }
-        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
+        if (!HasRegionByEndpoint(segment_pool_.AcquireReadAccess().Catalog(),
+                                 seg.transport_endpoint)) {
             restored_invalid_endpoints.insert(seg.transport_endpoint);
             if (seg.segment_name != seg.transport_endpoint) {
                 restored_invalid_endpoints.insert(seg.segment_name);
@@ -3949,9 +3990,12 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
 
 auto MasterService::QueryIp(const UUID& client_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<Segment> segments;
-    ErrorCode err = segment_access.GetClientSegments(client_id, segments);
+    ErrorCode err;
+    {
+        SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+        err = GetClientSegments(view.Catalog(), client_id, segments);
+    }
     if (err != ErrorCode::OK) {
         if (err == ErrorCode::SEGMENT_NOT_FOUND) {
             VLOG(1) << "QueryIp: client_id=" << client_id
@@ -4687,6 +4731,66 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
     return results;
 }
 
+tl::expected<std::vector<Replica>, ErrorCode>
+MasterService::AllocateMemoryReplicas(const ReplicaAllocationRequest& request,
+                                      PlacementDiagnostics* diagnostics) {
+    auto resolved = request;
+    std::vector<std::string> preferred_segments;
+    if (!request.host_affinity.writer_host_id.empty()) {
+        // The per-request same-node hint applies to every policy, not only
+        // LocalFirst. Preserve explicit preferences ahead of host ordering.
+        auto append = [&](std::string_view name) {
+            if (!name.empty() &&
+                std::find(preferred_segments.begin(), preferred_segments.end(),
+                          name) == preferred_segments.end()) {
+                preferred_segments.emplace_back(name);
+            }
+        };
+        if (!request.placement.preferred_segment_name.empty()) {
+            append(request.placement.preferred_segment_name);
+        } else {
+            for (const auto& name : request.placement.preferred_segment_names) {
+                append(name);
+            }
+        }
+        {
+            auto view = segment_pool_.AcquireReadAccess();
+            view.Placement().VisitHostOrderedSegmentNames(
+                request.host_affinity.writer_host_id,
+                request.host_affinity.object_key, [&](std::string_view name) {
+                    append(name);
+                    return false;
+                });
+        }
+        resolved.placement.preferred_segment_name = {};
+        resolved.placement.preferred_segment_names = preferred_segments;
+        resolved.host_affinity = {};
+    }
+    return WithPlacementPolicy(memory_placement_policy_, local_ssd_manager_,
+                               [&](auto policy) {
+                                   return segment_pool_.AllocateReplicas(
+                                       resolved, policy, diagnostics);
+                               });
+}
+
+tl::expected<Replica, ErrorCode> MasterService::AllocateMemoryReplicaFrom(
+    size_t size, std::string_view segment_name) {
+    return segment_pool_.AllocateInSegment(segment_name, MemoryAllocationKind(),
+                                           size);
+}
+
+tl::expected<std::vector<Replica>, ErrorCode>
+MasterService::AllocateNoFReplicas(const ReplicaAllocationRequest& request) {
+    auto access = nof_segment_manager_.getAllocatorAccess();
+    return allocation_strategy_->Allocate(
+        access.getAllocatorManager(), request.replicas.size,
+        request.replicas.count,
+        std::vector<std::string>(
+            request.placement.preferred_segment_names.begin(),
+            request.placement.preferred_segment_names.end()),
+        std::set<std::string>(), ReplicaType::NOF_SSD);
+}
+
 auto MasterService::AllocateReplicas(const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
@@ -4696,62 +4800,31 @@ auto MasterService::AllocateReplicas(const std::string& key,
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
-    bool has_enough_memory_segments = false;
-
+    bool has_sufficient_memory_entry_count = false;
     if (config.replica_num > 0) {
-        std::vector<std::string> preferred_segments;
-        auto append_preferred_segment = [&preferred_segments](
-                                            const std::string& segment_name) {
-            if (!segment_name.empty() &&
-                std::find(preferred_segments.begin(), preferred_segments.end(),
-                          segment_name) == preferred_segments.end()) {
-                preferred_segments.push_back(segment_name);
-            }
+        const ReplicaAllocationRequest request{
+            .replicas = {value_length, config.replica_num, ReplicaType::MEMORY},
+            .placement = {config.preferred_segment,
+                          config.preferred_segments,
+                          {}},
+            .host_affinity = {writer_host_id, key},
         };
-        if (!config.preferred_segment.empty()) {
-            append_preferred_segment(config.preferred_segment);
-        } else {
-            for (const auto& preferred_segment : config.preferred_segments) {
-                append_preferred_segment(preferred_segment);
-            }
-        }
-        AllocatorManager allocator_snapshot;
-        {
-            ScopedAllocatorAccess allocator_access =
-                segment_manager_.getAllocatorAccess();
-            has_enough_memory_segments = allocator_access.getAllocatorManager()
-                                             .getServingNames()
-                                             .size() >= config.replica_num;
-            if (!writer_host_id.empty()) {
-                auto host_ordered_segments =
-                    allocator_access.GetHostOrderedSegments(writer_host_id,
-                                                            key);
-                for (const auto& segment_name : host_ordered_segments) {
-                    append_preferred_segment(segment_name);
-                }
-                if (!host_ordered_segments.empty()) {
-                    VLOG(1) << "key=" << key
-                            << ", writer_host_id=" << writer_host_id
-                            << ", local_first_preferred_segments="
-                            << host_ordered_segments.size();
-                }
-            }
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
-        }
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_snapshot, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
+        PlacementDiagnostics diagnostics;
+        auto allocation_result = AllocateMemoryReplicas(request, &diagnostics);
+        has_sufficient_memory_entry_count =
+            diagnostics.has_sufficient_active_entry_count;
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
-                    << ", error: " << allocation_result.error();
+                    << ", error: " << allocation_result.error()
+                    << ", has_sufficient_active_entry_count="
+                    << diagnostics.has_sufficient_active_entry_count;
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
-                if (has_enough_memory_segments) {
+                if (has_sufficient_memory_entry_count) {
                     need_mem_eviction_ = true;
                 }
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -4765,16 +4838,13 @@ auto MasterService::AllocateReplicas(const std::string& key,
 #ifdef USE_NOF
     if (config.nof_replica_num > 0 &&
         nof_segment_manager_.getMountedSegmentCount() > 0) {
-        ScopedAllocatorAccess allocator_access =
-            nof_segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-
-        std::vector<std::string> preferred_segments =
-            config.preferred_nof_segments;
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.nof_replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
+        const ReplicaAllocationRequest request{
+            .replicas = {value_length, config.nof_replica_num,
+                         ReplicaType::NOF_SSD},
+            .placement = {{}, config.preferred_nof_segments, {}},
+            .host_affinity = {},
+        };
+        auto allocation_result = AllocateNoFReplicas(request);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate nof replicas for key=" << key
@@ -4805,7 +4875,7 @@ auto MasterService::AllocateReplicas(const std::string& key,
             MasterMetricManager::instance().inc_put_start_alloc_failures();
             if (config.replica_num > 0 &&
                 allocated_memory_replicas != config.replica_num &&
-                has_enough_memory_segments) {
+                has_sufficient_memory_entry_count) {
                 need_mem_eviction_ = true;
             }
             if (config.nof_replica_num > 0 &&
@@ -5036,7 +5106,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #ifndef USE_NOF
-    if (config.nof_replica_num > 0) {
+    if (config.nof_replica_num > 0 &&
+        nof_segment_manager_.getMountedSegmentCount() > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
                    << ", error=nof_pool_disabled";
@@ -5049,14 +5120,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    UpdateClientHostId(client_id, config.host_id);
-    std::string writer_host_id;
-    if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
-         config.prefer_alloc_in_same_node) &&
-        config.replica_num == 1) {
-        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                : config.host_id;
-    }
+    const std::string writer_host_id = ResolveWriterHostId(client_id, config);
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -5690,7 +5754,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #ifndef USE_NOF
-    if (config.nof_replica_num > 0) {
+    if (config.nof_replica_num > 0 &&
+        nof_segment_manager_.getMountedSegmentCount() > 0) {
         LOG(ERROR) << "key=" << key
                    << ", nof_replica_num=" << config.nof_replica_num
                    << ", error=nof_pool_disabled";
@@ -5703,14 +5768,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(soft_pin_request.error());
     }
 
-    UpdateClientHostId(client_id, config.host_id);
-    std::string writer_host_id;
-    if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
-         config.prefer_alloc_in_same_node) &&
-        config.replica_num == 1) {
-        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                : config.host_id;
-    }
+    const std::string writer_host_id = ResolveWriterHostId(client_id, config);
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -6378,15 +6436,15 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (!dynamic_copy) {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
         for (const auto& tgt_segment : tgt_segments) {
-            if (!segment_access.ExistsSegmentName(tgt_segment)) {
+            if (view.Catalog().RegionIds(tgt_segment).empty()) {
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_found";
                 return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
             }
-            if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+            if (!HasServingAllocationCandidate(view, tgt_segment,
+                                               MemoryAllocationKind())) {
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_allocatable";
                 return tl::make_unexpected(
@@ -6431,16 +6489,16 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         return tl::make_unexpected(pending_validation.error());
     }
     if (dynamic_copy) {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
         for (const auto& tgt_segment : tgt_segments) {
-            if (!segment_access.ExistsSegmentName(tgt_segment)) {
+            if (view.Catalog().RegionIds(tgt_segment).empty()) {
                 ClearDynamicReplicationStateForKey(tenant_state, key);
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_found";
                 return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
             }
-            if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+            if (!HasServingAllocationCandidate(view, tgt_segment,
+                                               MemoryAllocationKind())) {
                 ClearDynamicReplicationStateForKey(tenant_state, key);
                 LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                            << ", error=target_segment_not_allocatable";
@@ -6500,12 +6558,6 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     // locked, so terminal cleanup cannot pass this operation before its
     // metadata changes become visible.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
-    {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
-    }
 
     for (auto& tgt_segment : tgt_segments) {
         if (metadata.GetReplicaBySegmentName(tgt_segment) != nullptr) {
@@ -6513,8 +6565,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
             continue;
         }
 
-        auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.size, tgt_segment);
+        auto replica = AllocateMemoryReplicaFrom(metadata.size, tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -6573,7 +6624,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     source->inc_refcnt();
 
     // Add replicas to the object.
-    // DO NOT ACCESS source AFTER THIS !!!
+    // DO NOT ACCESS source AFTER THIS !
     metadata.AddReplicas(std::move(replicas));
 
     return response;
@@ -6856,14 +6907,14 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        if (!segment_access.ExistsSegmentName(tgt_segment)) {
+        SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+        if (view.Catalog().RegionIds(tgt_segment).empty()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", error=target_segment_not_found";
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
-        if (!segment_access.IsSegmentAllocatable(tgt_segment)) {
+        if (!HasServingAllocationCandidate(view, tgt_segment,
+                                           MemoryAllocationKind())) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", error=target_segment_not_allocatable";
             return tl::make_unexpected(
@@ -6919,14 +6970,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
                                pending_quota_charge);
         };
 
-        AllocatorManager allocator_snapshot;
-        {
-            ScopedAllocatorAccess allocator_access =
-                segment_manager_.getAllocatorAccess();
-            allocator_snapshot = allocator_access.SnapshotAllocatorManager();
-        }
-        auto replica = allocation_strategy_->AllocateFrom(
-            allocator_snapshot, metadata.size, tgt_segment);
+        auto replica = AllocateMemoryReplicaFrom(metadata.size, tgt_segment);
         if (!replica.has_value()) {
             LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
                        << ", failed to allocate replica";
@@ -6982,7 +7026,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     source->inc_refcnt();
 
     // Add replicas to the object.
-    // DO NOT ACCESS source AFTER THIS !!!
+    // DO NOT ACCESS source AFTER THIS !
     metadata.AddReplicas(std::move(replicas));
 
     return response;
@@ -8535,9 +8579,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         }
         std::optional<UUID> client_id;
         {
-            auto allocator_access = segment_manager_.getAllocatorAccess();
+            auto view = segment_pool_.AcquireReadAccess();
             client_id =
-                allocator_access.GetOwnerClientId(segment_name_it.value());
+                view.Catalog().FindOwnerClientId(segment_name_it.value());
         }
         if (!client_id) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
@@ -8549,9 +8593,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
-        auto allocator_access = segment_manager_.getAllocatorAccess();
+        auto view = segment_pool_.AcquireReadAccess();
         const auto current_owner =
-            allocator_access.GetOwnerClientId(segment_name_it.value());
+            view.Catalog().FindOwnerClientId(segment_name_it.value());
         if (!current_owner || *current_owner != *client_id ||
             !TryGetReadableReplicaDescriptor(replica, source_descriptor)) {
             return tl::make_unexpected(
@@ -9262,15 +9306,12 @@ MasterService::SelectDynamicReplicaPlan(
         source_liveness_by_segment;
     size_t memory_replicas = 0;
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<std::pair<Segment, UUID>> segments;
-    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
-        return std::nullopt;
-    }
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+    std::vector<MountedRegion> segments;
+    segments = CopyMountedRegions(view.Catalog());
     std::unordered_map<std::string, Segment> segments_by_name;
-    for (const auto& [segment, client_id] : segments) {
-        (void)client_id;
-        segments_by_name.emplace(segment.name, segment);
+    for (const auto& mounted : segments) {
+        segments_by_name.emplace(mounted.segment.name, mounted.segment);
     }
 
     metadata.VisitReplicas(
@@ -9313,13 +9354,14 @@ MasterService::SelectDynamicReplicaPlan(
 
     auto is_valid_target = [&](const Segment& segment) {
         if (existing_segments.contains(segment.name) ||
-            !segment_access.IsSegmentAllocatable(segment.name)) {
+            !HasServingAllocationCandidate(view, segment.name,
+                                           MemoryAllocationKind())) {
             return false;
         }
         size_t used = 0;
         size_t capacity = 0;
-        if (segment_access.QuerySegments(segment.name, used, capacity) !=
-                ErrorCode::OK ||
+        if (view.QueryAllocationCandidates(segment.name, MemoryAllocationKind(),
+                                           used, capacity) != ErrorCode::OK ||
             capacity == 0 || used >= capacity ||
             capacity - used < metadata.size) {
             return false;
@@ -9332,8 +9374,8 @@ MasterService::SelectDynamicReplicaPlan(
     auto target_score = [&](const Segment& segment) {
         size_t used = 0;
         size_t capacity = 0;
-        if (segment_access.QuerySegments(segment.name, used, capacity) !=
-                ErrorCode::OK ||
+        if (view.QueryAllocationCandidates(segment.name, MemoryAllocationKind(),
+                                           used, capacity) != ErrorCode::OK ||
             capacity == 0) {
             return std::tuple<bool, double, uint64_t>(
                 false, std::numeric_limits<double>::max(),
@@ -9353,16 +9395,17 @@ MasterService::SelectDynamicReplicaPlan(
     if (preferred_target_segment.has_value()) {
         const auto preferred = std::find_if(
             segments.begin(), segments.end(), [&](const auto& entry) {
-                return entry.first.name == *preferred_target_segment;
+                return entry.segment.name == *preferred_target_segment;
             });
-        if (preferred != segments.end() && is_valid_target(preferred->first)) {
-            target_segment = preferred->first.name;
+        if (preferred != segments.end() &&
+            is_valid_target(preferred->segment)) {
+            target_segment = preferred->segment.name;
         }
     }
     if (!target_segment.has_value()) {
         std::optional<std::tuple<bool, double, uint64_t>> best_score;
-        for (const auto& [segment, client_id] : segments) {
-            (void)client_id;
+        for (const auto& mounted : segments) {
+            const auto& segment = mounted.segment;
             if (!is_valid_target(segment)) {
                 continue;
             }
@@ -9556,10 +9599,10 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
     const UUID& lease_id, uint64_t version_epoch) {
     UUID source_client;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        ErrorCode error = segment_access.GetClientIdBySegmentName(
-            plan.source_segment, source_client);
+        SegmentPool::ReadAccess segment_access =
+            segment_pool_.AcquireReadAccess();
+        ErrorCode error = GetSegmentOwner(segment_access.Catalog(),
+                                          plan.source_segment, source_client);
         if (error != ErrorCode::OK) {
             return tl::make_unexpected(error);
         }
@@ -9574,10 +9617,10 @@ tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
     if (!liveness->IsServing()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess segment_access = segment_pool_.AcquireReadAccess();
     UUID current_source_client;
-    if (segment_access.GetClientIdBySegmentName(
-            plan.source_segment, current_source_client) != ErrorCode::OK ||
+    if (GetSegmentOwner(segment_access.Catalog(), plan.source_segment,
+                        current_source_client) != ErrorCode::OK ||
         current_source_client != source_client) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -9615,7 +9658,7 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // Watermark gate: don't promote if DRAM is already under eviction
     // pressure. The check is best-effort (state can change between this
     // sample and the actual allocation in PromotionAllocStart).
-    const double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+    const double used_ratio = segment_pool_.GetMemoryUsage().used_ratio();
     if (used_ratio >= eviction_high_watermark_ratio_) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         if (record_candidate) {
@@ -9841,14 +9884,8 @@ auto MasterService::PromotionAllocStart(
                            pending_quota_charge);
     };
 
-    // Allocate a single MEMORY replica via the existing strategy, biased to
-    // the holder's mem segment when possible.
-    ReplicateConfig config;
-    config.replica_num = 1;
-    if (!preferred_segments.empty()) {
-        config.preferred_segments = preferred_segments;
-    }
-
+    // Allocate a single MEMORY replica through SegmentPool placement, biased
+    // to the holder's memory segment when possible.
     std::vector<Replica> staged_replicas;
     // Allocation is guarded by the selected memory Segment owner. Release the
     // holder guard first so a co-located holder cannot self-deadlock and two
@@ -9856,14 +9893,12 @@ auto MasterService::PromotionAllocStart(
     // already admitted and its metadata shard stays locked until the staged
     // replica and task state are committed or rolled back.
     serving_guard.reset();
-    AllocatorManager allocator_snapshot;
-    {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        allocator_snapshot = allocator_access.SnapshotAllocatorManager();
-    }
-    auto allocation_result = allocation_strategy_->Allocate(
-        allocator_snapshot, size, config.replica_num, preferred_segments);
+    const ReplicaAllocationRequest request{
+        .replicas = {size, 1, ReplicaType::MEMORY},
+        .placement = {{}, preferred_segments, {}},
+        .host_affinity = {},
+    };
+    auto allocation_result = AllocateMemoryReplicas(request);
     if (!allocation_result) {
         refund_pending_quota();
         return tl::make_unexpected(allocation_result.error());
@@ -10193,7 +10228,7 @@ void MasterService::EvictionThreadFunc() {
     auto next_tenant_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
-        double used_ratio = segment_manager_.GetMemoryUsage().used_ratio();
+        double used_ratio = segment_pool_.GetMemoryUsage().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
@@ -10709,13 +10744,17 @@ void MasterService::RestoreState() {
 }
 
 void MasterService::ResetStateAfterFailedRestoreAttempt() {
-    SegmentSerializer segment_serializer(&segment_manager_);
     MetadataSerializer metadata_serializer(this);
     TaskManagerSerializer task_manager_serializer(&task_manager_);
 
     task_manager_serializer.Reset();
     metadata_serializer.Reset();
-    segment_serializer.Reset();
+    {
+        auto access = segment_pool_.AcquireWriteAccess();
+        client_offboarding_unmounts_.clear();
+        client_offboarding_reserved_names_.clear();
+        access.Clear();
+    }
     local_ssd_manager_.Clear();
 
     {
@@ -10735,12 +10774,9 @@ tl::expected<void, SerializationError>
 MasterService::RebuildClientLivenessAfterSnapshotRestore() {
     std::vector<std::pair<Segment, UUID>> segments;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        const auto err = segment_access.GetAllSegments(segments);
-        if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
-            return tl::make_unexpected(SerializationError(
-                err, "failed to enumerate restored memory segments"));
+        auto view = segment_pool_.AcquireReadAccess();
+        for (const auto& mounted : view.Catalog().Regions()) {
+            segments.emplace_back(mounted.segment, mounted.client_id);
         }
     }
 
@@ -10781,8 +10817,8 @@ MasterService::RebuildClientLivenessAfterSnapshotRestore() {
 
     bool missing_memory_registration = false;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::WriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         for (const auto& [client_id, record] : records) {
             segment_access.BindClientLiveness(client_id, record);
         }
@@ -10843,9 +10879,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
     std::vector<std::string> segment_names;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        segment_access.GetAllSegmentNames(segment_names);
+        SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+        GetSegmentNames(view.Catalog(), segment_names);
     }
 
     // Cleanup expired metadata (unless test environment disables it)
@@ -10915,7 +10950,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         }
 
         LOG(INFO) << "[Restore] Total allocated size after restore: "
-                  << segment_manager_.GetMemoryUsage().used_bytes;
+                  << segment_pool_.GetMemoryUsage().used_bytes;
     }
 
     // Soft pin is runtime-only and is never restored from a snapshot.
@@ -10923,39 +10958,43 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
 
     // Rebuild total capacity metrics
     {
+        std::vector<MountedRegion> unready_regions;
+        {
+            SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+            for (const auto& mounted : view.Catalog().Regions()) {
+                if (mounted.status != SegmentStatus::OK) {
+                    unready_regions.push_back(mounted);
+                }
+            }
+        }
+        for (const auto& mounted : unready_regions) {
+            UnmountSegment(mounted.segment.id, mounted.client_id);
+        }
+
+        // Live snapshot adoption registers every host region with the Pool's
+        // capacity accounting. Remove unready regions before resetting and
+        // rebuilding the gauges so later unmount/destruction remains
+        // symmetric with the restored contribution.
         MasterMetricManager::instance().reset_total_mem_capacity();
         for (auto& segment_name : segment_names) {
             MasterMetricManager::instance().reset_segment_total_mem_capacity(
                 segment_name);
         }
 
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
-            for (const auto& [segment, client_id] : unready_segments) {
-                UnmountSegment(segment.id, client_id);
-            }
+        std::vector<MountedRegion> all_segments;
+        {
+            SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+            all_segments = CopyMountedRegions(view.Catalog());
         }
-
-        std::vector<std::pair<Segment, UUID>> all_segments;
-        auto err = segment_access.GetAllSegments(all_segments);
-
-        if (err == ErrorCode::OK) {
-            int64_t total_size = 0;
-            for (const auto& [segment, client_id] : all_segments) {
-                Ping(client_id);
-                total_size += static_cast<int64_t>(segment.size);
-                MasterMetricManager::instance().inc_total_mem_capacity(
-                    segment.name, segment.size);
-            }
-            LOG(INFO) << "[Restore] Total capacity size after restore: "
-                      << total_size;
-        } else {
-            LOG(ERROR) << "[Restore] Failed to get all segments, error: "
-                       << err;
+        int64_t total_size = 0;
+        for (const auto& mounted : all_segments) {
+            Ping(mounted.client_id);
+            total_size += static_cast<int64_t>(mounted.segment.size);
+            MasterMetricManager::instance().inc_total_mem_capacity(
+                mounted.segment.name, mounted.segment.size);
         }
+        LOG(INFO) << "[Restore] Total capacity size after restore: "
+                  << total_size;
     }
 
     return {};
@@ -12369,18 +12408,17 @@ void MasterService::ClientMonitorFunc() {
                     std::shared_lock<std::shared_mutex> snapshot_lock(
                         snapshot_mutex_);
                     {
-                        ScopedSegmentAccess segment_access =
-                            segment_manager_.getSegmentAccess();
+                        SegmentPool::WriteAccess segment_access =
+                            segment_pool_.AcquireWriteAccess();
                         std::vector<Segment> segments;
-                        const auto get_result =
-                            segment_access.GetClientSegments(client_id,
-                                                             segments);
+                        const auto get_result = GetClientSegments(
+                            segment_access.Catalog(), client_id, segments);
                         if (get_result == ErrorCode::OK) {
                             for (const auto& segment : segments) {
                                 SegmentStatus status = SegmentStatus::UNDEFINED;
                                 const auto status_result =
-                                    segment_access.GetSegmentStatusById(
-                                        segment.id, status);
+                                    GetSegmentStatus(segment_access.Catalog(),
+                                                     segment.id, status);
                                 if (status_result ==
                                     ErrorCode::SEGMENT_NOT_FOUND) {
                                     continue;
@@ -12395,18 +12433,23 @@ void MasterService::ClientMonitorFunc() {
                                     continue;
                                 }
 
-                                size_t metrics_dec_capacity = 0;
+                                auto transaction =
+                                    segment_access.PrepareUnmount(segment.id,
+                                                                  client_id);
                                 const auto prepare_result =
-                                    segment_access.PrepareUnmountSegment(
-                                        segment.id, metrics_dec_capacity);
-                                if (prepare_result == ErrorCode::OK) {
+                                    transaction ? ErrorCode::OK
+                                                : transaction.error();
+                                if (transaction) {
+                                    client_offboarding_unmounts_.try_emplace(
+                                        segment.id, std::move(*transaction));
+                                    client_offboarding_reserved_names_
+                                        [segment.name]
+                                            .insert(segment.id);
                                     job.prepared_segments.push_back(
                                         {.segment_id = segment.id,
                                          .segment_name = segment.name,
                                          .transport_endpoint =
-                                             segment.te_endpoint,
-                                         .metrics_dec_capacity =
-                                             metrics_dec_capacity});
+                                             segment.te_endpoint});
                                 } else if (prepare_result !=
                                            ErrorCode::SEGMENT_NOT_FOUND) {
                                     job.pending_prepare_segments.push_back(
@@ -13126,7 +13169,7 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Serialize replicas
     for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
-            replica, service_->segment_manager_.getView(), packer);
+            replica, service_->segment_pool_, packer);
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -13242,7 +13285,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
                                    "deserialize ObjectMetadata truncated"));
         }
         auto result = Serializer<Replica>::deserialize(
-            array[index++], service_->segment_manager_.getView());
+            array[index++], service_->segment_pool_.AcquireReadAccess());
         if (!result) {
             return tl::unexpected(result.error());
         }
@@ -13327,14 +13370,13 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
         target_segments.front() != pending.target_segment) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    UUID source_client;
-    auto err = segment_access.GetClientIdBySegmentName(pending.source_segment,
-                                                       source_client);
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(err);
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
+    auto source_client =
+        view.Catalog().FindOwnerClientId(pending.source_segment);
+    if (!source_client) {
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    if (source_client != client_id) {
+    if (*source_client != client_id) {
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
     return {};
@@ -13398,15 +13440,16 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         }
 
         const auto& metadata = accessor.Get();
-        ScopedSegmentAccess segment_accessor =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::ReadAccess segment_accessor =
+            segment_pool_.AcquireReadAccess();
         for (const auto& target : targets) {
-            if (!segment_accessor.ExistsSegmentName(target)) {
+            if (segment_accessor.Catalog().RegionIds(target).empty()) {
                 LOG(ERROR) << "key=" << key << ", target_segment=" << target
                            << ", error=target_segment_not_mounted";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
-            if (!segment_accessor.IsSegmentAllocatable(target)) {
+            if (!HasServingAllocationCandidate(segment_accessor, target,
+                                               MemoryAllocationKind())) {
                 LOG(ERROR) << "key=" << key << ", target_segment=" << target
                            << ", error=target_segment_not_allocatable";
                 return tl::make_unexpected(
@@ -13424,8 +13467,9 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
                         continue;
                     }
                     UUID owner;
-                    if (segment_accessor.GetClientIdBySegmentName(
-                            *segment_name, owner) == ErrorCode::OK) {
+                    if (GetSegmentOwner(segment_accessor.Catalog(),
+                                        *segment_name,
+                                        owner) == ErrorCode::OK) {
                         const auto liveness = replica.getClientLiveness();
                         if (liveness) {
                             serving_sources.emplace_back(*segment_name, owner,
@@ -13455,10 +13499,11 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     const auto& metadata = submission_metadata.Get();
-    ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess submission_access =
+        segment_pool_.AcquireReadAccess();
     UUID current_source_client;
-    if (submission_access.GetClientIdBySegmentName(
-            selected_source_segment, current_source_client) != ErrorCode::OK ||
+    if (GetSegmentOwner(submission_access.Catalog(), selected_source_segment,
+                        current_source_client) != ErrorCode::OK ||
         current_source_client != select_client ||
         !metadata.HasReplica(
             [this, &selected_source_segment](const Replica& replica) {
@@ -13475,7 +13520,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     for (const auto& target : targets) {
-        if (!submission_access.IsSegmentAllocatable(target)) {
+        if (!HasServingAllocationCandidate(submission_access, target,
+                                           MemoryAllocationKind())) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
@@ -13517,14 +13563,15 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         }
 
         const auto& metadata = accessor.Get();
-        ScopedSegmentAccess segment_accessor =
-            segment_manager_.getSegmentAccess();
-        if (!segment_accessor.ExistsSegmentName(target)) {
+        SegmentPool::ReadAccess segment_accessor =
+            segment_pool_.AcquireReadAccess();
+        if (segment_accessor.Catalog().RegionIds(target).empty()) {
             LOG(ERROR) << "key=" << key << ", target_segment=" << target
                        << ", error=target_segment_not_mounted";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (!segment_accessor.IsSegmentAllocatable(target)) {
+        if (!HasServingAllocationCandidate(segment_accessor, target,
+                                           MemoryAllocationKind())) {
             LOG(ERROR) << "key=" << key << ", target_segment=" << target
                        << ", error=target_segment_not_allocatable";
             return tl::make_unexpected(
@@ -13560,7 +13607,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
         ErrorCode error =
-            segment_accessor.GetClientIdBySegmentName(source, select_client);
+            GetSegmentOwner(segment_accessor.Catalog(), source, select_client);
         if (error != ErrorCode::OK) {
             LOG(ERROR) << "key=" << key << ", segment_name=" << source
                        << ", error=client_id_not_found";
@@ -13584,12 +13631,14 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     const auto& metadata = submission_metadata.Get();
-    ScopedSegmentAccess submission_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess submission_access =
+        segment_pool_.AcquireReadAccess();
     UUID current_source_client;
-    if (submission_access.GetClientIdBySegmentName(
-            source, current_source_client) != ErrorCode::OK ||
+    if (GetSegmentOwner(submission_access.Catalog(), source,
+                        current_source_client) != ErrorCode::OK ||
         current_source_client != select_client ||
-        !submission_access.IsSegmentAllocatable(target) ||
+        !HasServingAllocationCandidate(submission_access, target,
+                                       MemoryAllocationKind()) ||
         !metadata.HasReplica([this, &source](const Replica& replica) {
             if (!IsReplicaReadable(replica)) {
                 return false;
@@ -13664,14 +13713,36 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
     return {};
 }
 
+tl::expected<void, ErrorCode> MasterService::ValidateDrainTargets(
+    const CreateDrainJobRequest& request) {
+    auto view = segment_pool_.AcquireReadAccess();
+    for (const auto& target : request.target_segments) {
+        if (view.Catalog().RegionIds(target).empty()) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        if (!HasServingAllocationCandidate(view, target,
+                                           MemoryAllocationKind())) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+    }
+    return {};
+}
+
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequest(
     const CreateDrainJobRequest& request) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    auto targets = ValidateDrainTargets(request);
+    if (!targets) {
+        return targets;
+    }
+    SegmentPool::WriteAccess segment_access =
+        segment_pool_.AcquireWriteAccess();
     return ValidateDrainRequestLocked(segment_access, request);
 }
 
 tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
-    ScopedSegmentAccess& segment_access, const CreateDrainJobRequest& request) {
+    SegmentPool::WriteAccess& segment_access,
+    const CreateDrainJobRequest& request) {
     if (request.segments.empty() || request.max_concurrency == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -13683,11 +13754,12 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
     }
 
     for (const auto& segment_name : request.segments) {
-        if (!segment_access.ExistsSegmentName(segment_name)) {
+        if (segment_access.Catalog().RegionIds(segment_name).empty()) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
         SegmentStatus status = SegmentStatus::UNDEFINED;
-        auto err = segment_access.GetSegmentStatusByName(segment_name, status);
+        auto err =
+            GetSegmentStatus(segment_access.Catalog(), segment_name, status);
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
@@ -13701,10 +13773,13 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
         if (unique_segments.contains(target_segment)) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (!segment_access.ExistsSegmentName(target_segment)) {
+        if (segment_access.Catalog().RegionIds(target_segment).empty()) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
         }
-        if (!segment_access.IsSegmentAllocatable(target_segment)) {
+        SegmentStatus target_status = SegmentStatus::UNDEFINED;
+        if (GetSegmentStatus(segment_access.Catalog(), target_segment,
+                             target_status) != ErrorCode::OK ||
+            target_status != SegmentStatus::OK) {
             return tl::make_unexpected(
                 ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         }
@@ -13714,10 +13789,14 @@ tl::expected<void, ErrorCode> MasterService::ValidateDrainRequestLocked(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateDrainJob(
     const CreateDrainJobRequest& request) {
+    auto targets = ValidateDrainTargets(request);
+    if (!targets) {
+        return tl::make_unexpected(targets.error());
+    }
     std::vector<std::string> draining_segments;
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::WriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         auto valid = ValidateDrainRequestLocked(segment_access, request);
         if (!valid.has_value()) {
             return tl::make_unexpected(valid.error());
@@ -13817,10 +13896,11 @@ tl::expected<void, ErrorCode> MasterService::CancelDrainJob(
         segments_to_restore = job->request.segments;
     }
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::WriteAccess segment_access =
+        segment_pool_.AcquireWriteAccess();
     for (const auto& segment_name : segments_to_restore) {
         SegmentStatus status = SegmentStatus::UNDEFINED;
-        if (segment_access.GetSegmentStatusByName(segment_name, status) ==
+        if (GetSegmentStatus(segment_access.Catalog(), segment_name, status) ==
                 ErrorCode::OK &&
             status != SegmentStatus::UNMOUNTING) {
             (void)segment_access.SetSegmentStatusByName(segment_name,
@@ -13840,13 +13920,11 @@ std::string MasterService::MakeDrainUnitKey(
 std::optional<std::string> MasterService::SelectDrainTargetForKey(
     const ObjectMetadata& metadata, const std::string& source_segment,
     const std::vector<std::string>& requested_targets) {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    SegmentPool::ReadAccess view = segment_pool_.AcquireReadAccess();
     std::vector<std::string> candidate_segments = requested_targets;
     if (candidate_segments.empty()) {
-        auto err = segment_access.GetAllSegments(candidate_segments);
-        if (err != ErrorCode::OK) {
-            return std::nullopt;
-        }
+        view.Placement().GetActiveSegmentNames(MemoryAllocationKind(),
+                                               candidate_segments);
     }
 
     const auto existing_segments = metadata.GetReplicaSegmentNames();
@@ -13860,12 +13938,13 @@ std::optional<std::string> MasterService::SelectDrainTargetForKey(
                       candidate) != existing_segments.end()) {
             continue;
         }
-        if (!segment_access.IsSegmentAllocatable(candidate)) {
+        if (!HasServingAllocationCandidate(view, candidate,
+                                           MemoryAllocationKind())) {
             continue;
         }
         size_t used = 0, capacity = 0;
-        if (segment_access.QuerySegments(candidate, used, capacity) !=
-                ErrorCode::OK ||
+        if (view.QueryAllocationCandidates(candidate, MemoryAllocationKind(),
+                                           used, capacity) != ErrorCode::OK ||
             capacity == 0) {
             continue;
         }
@@ -14081,8 +14160,8 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::WriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         for (const auto& segment_name : job.request.segments) {
             if (!remaining_segments.contains(segment_name)) {
                 (void)segment_access.SetSegmentStatusByName(
@@ -14110,12 +14189,12 @@ bool MasterService::MaybeCompleteDrainJob(DrainJob& job) {
     }
 
     {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        SegmentPool::WriteAccess segment_access =
+            segment_pool_.AcquireWriteAccess();
         for (const auto& segment_name : job.request.segments) {
             SegmentStatus status = SegmentStatus::UNDEFINED;
-            if (segment_access.GetSegmentStatusByName(segment_name, status) ==
-                    ErrorCode::OK &&
+            if (GetSegmentStatus(segment_access.Catalog(), segment_name,
+                                 status) == ErrorCode::OK &&
                 status != SegmentStatus::UNMOUNTING) {
                 (void)segment_access.SetSegmentStatusByName(segment_name,
                                                             SegmentStatus::OK);
@@ -14189,7 +14268,7 @@ MasterService::MetadataSerializer::SerializeDiscardedReplicas(
         // Serialize each replica
         for (const auto& replica : item.replicas_) {
             auto result = Serializer<Replica>::serialize(
-                replica, service_->segment_manager_.getView(), packer);
+                replica, service_->segment_pool_, packer);
             if (!result) {
                 return tl::unexpected(result.error());
             }
@@ -14249,7 +14328,7 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
 
         for (uint32_t j = 0; j < replica_count; ++j) {
             auto replica_result = Serializer<Replica>::deserialize(
-                item_array[3 + j], service_->segment_manager_.getView());
+                item_array[3 + j], service_->segment_pool_.AcquireReadAccess());
             if (!replica_result) {
                 return tl::make_unexpected(SerializationError(
                     ErrorCode::DESERIALIZE_FAIL,

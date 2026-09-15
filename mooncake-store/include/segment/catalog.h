@@ -43,10 +43,14 @@ class RegionCatalog final {
                    return r.segment.id;
                });
     }
+    // IDs are unique; names may be shared by regions of different clients.
     ErrorCode Register(const MountedRegion& mounted);
     bool Erase(const UUID& segment_id);
     bool SetStatus(const UUID& segment_id, SegmentStatus status);
     void Clear();
+    // Lossy name lookup, not an ownership check. Prefer an OK region, then
+    // the lowest segment UUID, independently of registration/snapshot order.
+    // Exact ownership must be resolved with Find(segment_id)->client_id.
     std::optional<UUID> FindOwnerClientId(std::string_view name) const;
 
    private:

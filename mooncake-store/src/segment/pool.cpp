@@ -10,7 +10,23 @@
 
 namespace mooncake {
 
-SegmentPool::~SegmentPool() { ReleaseCapacityMetrics(); }
+SegmentPool::SegmentPool(RegionDriverRegistry region_drivers)
+    : region_drivers_(std::move(region_drivers)) {
+    for (const auto& [kind, driver] : region_drivers_) {
+        if (auto allocator = driver->GetSharedAllocator()) {
+            allocator->AttachUsageTracker(usage_tracker_);
+        }
+    }
+}
+
+SegmentPool::~SegmentPool() {
+    for (const auto& mounted : catalog_.Regions()) {
+        if (auto* resource = GetResource(mounted)) {
+            resource->candidate->SetAvailability(false, false);
+        }
+    }
+    ReleaseCapacityMetrics();
+}
 
 SegmentPool::WriteAccess SegmentPool::AcquireWriteAccess() {
     return WriteAccess(AccessKey{}, *this);
@@ -36,20 +52,25 @@ StorageUsageSnapshot SegmentPool::GetMemoryUsageSnapshot() const {
     std::shared_lock lock(pool_mutex_);
     StorageUsageSnapshot snapshot;
     std::unordered_set<const BufferAllocatorBase*> counted;
-    for (const auto& mounted : catalog_.Regions()) {
-        const auto* resource = GetResource(mounted);
-        if (!resource || !resource->allocator() ||
-            !counted.insert(resource->allocator().get()).second) {
-            continue;
+    const auto add_allocator = [&](const auto& allocator) {
+        if (!allocator || !counted.insert(allocator.get()).second) {
+            return;
         }
-        const size_t used = resource->allocator()->size();
-        const size_t capacity = resource->allocator()->capacity();
+        const size_t used = allocator->size();
+        const size_t capacity = allocator->capacity();
         snapshot.used_bytes += used;
         snapshot.capacity_bytes += capacity;
-        auto& region =
-            snapshot.segments[resource->allocator()->getSegmentName()];
+        auto& region = snapshot.segments[allocator->getSegmentName()];
         region.used_bytes += used;
         region.capacity_bytes += capacity;
+    };
+    for (const auto& [kind, driver] : region_drivers_) {
+        add_allocator(driver->GetSharedAllocator());
+    }
+    for (const auto& mounted : catalog_.Regions()) {
+        if (const auto* resource = GetResource(mounted)) {
+            add_allocator(resource->allocator());
+        }
     }
     return snapshot;
 }

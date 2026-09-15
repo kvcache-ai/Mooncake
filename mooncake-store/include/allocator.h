@@ -170,6 +170,7 @@ class AllocatedBuffer {
     friend class Serializer<AllocatedBuffer>;
     friend class Replica;
     friend class SegmentAllocatorRegistration;
+    friend class AllocationCandidate;
 };
 
 /**

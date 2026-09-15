@@ -2936,10 +2936,9 @@ TEST_F(MasterServiceTest,
         MakeSegment("offboarding_blocked_segment", /*base=*/0x400000000);
     ASSERT_TRUE(service.MountSegment(prepared_segment, client_id).has_value());
     ASSERT_TRUE(service.MountSegment(blocked_segment, client_id).has_value());
-    size_t blocked_metrics_dec_capacity = 0;
-    ASSERT_EQ(ErrorCode::OK,
-              PrepareUnmountSegmentForTest(service, blocked_segment.id,
-                                           blocked_metrics_dec_capacity));
+    auto blocked_unmount =
+        PrepareUnmountSegmentForTest(service, blocked_segment.id, client_id);
+    ASSERT_TRUE(blocked_unmount.has_value());
 
     ClientOffboardingJob job;
     job.client_id = client_id;
@@ -2959,19 +2958,18 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
     EXPECT_EQ(job.pending_prepare_segments.front().segment_id,
               blocked_segment.id);
-    const auto retained_capacity =
-        job.prepared_segments.front().metrics_dec_capacity;
+    const auto prepared_generation =
+        SegmentGenerationForTest(service, prepared_segment.id);
 
     ASSERT_FALSE(ProcessClientOffboardingForTest(service, job));
     ASSERT_EQ(job.prepared_segments.size(), 1u);
     ASSERT_EQ(job.pending_prepare_segments.size(), 1u);
     EXPECT_EQ(job.prepared_segments.front().segment_id, prepared_segment.id);
-    EXPECT_EQ(job.prepared_segments.front().metrics_dec_capacity,
-              retained_capacity);
+    EXPECT_EQ(SegmentGenerationForTest(service, prepared_segment.id),
+              prepared_generation);
 
     ASSERT_EQ(ErrorCode::OK, CommitUnmountSegmentForTest(
-                                 service, blocked_segment.id, client_id,
-                                 blocked_metrics_dec_capacity));
+                                 service, std::move(*blocked_unmount)));
     ASSERT_TRUE(ProcessClientOffboardingForTest(service, job));
     EXPECT_TRUE(job.prepared_segments.empty());
     EXPECT_TRUE(job.pending_prepare_segments.empty());

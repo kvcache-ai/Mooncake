@@ -52,14 +52,17 @@ RegionUnmountTxn::RegionUnmountTxn(RegionUnmountTxn&& other) noexcept
 
 ErrorCode RegionUnmountTxn::Commit(SegmentPool::WriteAccess& access) && {
     auto transaction = std::move(*this);
-    if (transaction.finished_) {
+    return transaction.TryCommit(access);
+}
+
+ErrorCode RegionUnmountTxn::TryCommit(SegmentPool::WriteAccess& access) & {
+    if (finished_) {
         return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     auto result = access.EraseUnmountedRegion(
-        transaction.segment_.id, transaction.client_id_,
-        SegmentStatus::UNMOUNTING, transaction.generation_);
+        segment_.id, client_id_, SegmentStatus::UNMOUNTING, generation_);
     if (result == ErrorCode::OK) {
-        transaction.finished_ = true;
+        finished_ = true;
     }
     return result;
 }
@@ -189,6 +192,40 @@ ErrorCode SegmentPool::WriteAccess::EraseUnmountedRegion(
     return ErrorCode::OK;
 }
 
+void SegmentPool::WriteAccess::BindClientLiveness(
+    const UUID& client_id,
+    const std::shared_ptr<ClientLivenessRecord>& client_liveness) {
+    for (const auto& mounted : catalog_.Regions()) {
+        if (mounted.client_id == client_id) {
+            if (auto* resource = segment_pool_.GetResource(mounted)) {
+                resource->candidate->BindClientLiveness(client_liveness);
+            }
+        }
+    }
+}
+
+bool SegmentPool::WriteAccess::BindBufferToSegment(const UUID& segment_id,
+                                                   AllocatedBuffer& buffer) {
+    const auto* mounted = catalog_.Find(segment_id);
+    auto* resource = mounted ? segment_pool_.GetResource(*mounted) : nullptr;
+    if (!resource || resource->allocator() != buffer.getAllocator())
+        return false;
+    resource->candidate->BindBuffer(buffer);
+    return true;
+}
+
+bool SegmentPool::WriteAccess::RebindBufferToOwningSegment(
+    AllocatedBuffer& buffer) {
+    for (const auto& mounted : catalog_.Regions()) {
+        auto* resource = segment_pool_.GetResource(mounted);
+        if (resource && resource->candidate->OwnsBuffer(buffer)) {
+            resource->candidate->BindBuffer(buffer);
+            return true;
+        }
+    }
+    return false;
+}
+
 const RegionCatalog& SegmentPool::WriteAccess::Catalog() const {
     return catalog_;
 }
@@ -239,6 +276,8 @@ ErrorCode SegmentPool::WriteAccess::TransitionRegion(
             DCHECK(deactivated);
         }
     }
+    resource.candidate->SetAvailability(status == SegmentStatus::OK,
+                                        status != SegmentStatus::UNMOUNTING);
     const bool updated = catalog_.SetStatus(mounted.segment.id, status);
     DCHECK(updated);
     return ErrorCode::OK;

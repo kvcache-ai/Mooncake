@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <functional>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -14,7 +15,6 @@
 #include "common/zstd_util.h"
 #include "ha/snapshot/local_ssd_codec.h"
 #include "master_metric_manager.h"
-#include "segment.h"
 #include "segment/pool.h"
 #include "segment/pool_read_access.h"
 #include "segment/pool_write_access.h"
@@ -337,8 +337,7 @@ TEST(StoreResourceSnapshotCodecTest,
     CommitUnmount(source, segment, client);
 }
 
-TEST(StoreResourceSnapshotCodecTest,
-     SnapshotInteroperatesWithLegacySerializer) {
+TEST(StoreResourceSnapshotCodecTest, SnapshotPreservesLegacyWireFormat) {
     SegmentPool source(Drivers());
     const UUID client = generate_uuid();
     // Preserve insertion order, not lexicographic name order.
@@ -360,22 +359,53 @@ TEST(StoreResourceSnapshotCodecTest,
     auto encoded = CaptureAndEncode(source, ssd);
     ASSERT_TRUE(encoded.has_value());
 
-    SegmentManager legacy(BufferAllocatorType::OFFSET);
-    SegmentSerializer serializer(&legacy);
-    auto old_decoded = serializer.Deserialize(*encoded);
-    ASSERT_TRUE(old_decoded.has_value()) << old_decoded.error().message;
-    EXPECT_EQ(PackLocalSsd(*old_decoded), PackLocalSsd(ssd));
-
-    MountedSegment mounted;
-    ASSERT_EQ(legacy.getView().GetMountedSegment(first.id, mounted),
-              ErrorCode::OK);
-    EXPECT_EQ(mounted.segment.host_id, first.host_id);
-
-    auto old_encoded = serializer.Serialize(*old_decoded);
-    ASSERT_TRUE(old_encoded.has_value());
+    // Keep the legacy wire contract explicit without depending on the deleted
+    // SegmentManager/SegmentSerializer implementation.
+    const auto bytes = zstd_decompress(*encoded);
+    auto unpacked = msgpack::unpack(reinterpret_cast<const char*>(bytes.data()),
+                                    bytes.size());
+    auto root = unpacked.get();
+    ASSERT_EQ(root.type, msgpack::type::MAP);
+    EXPECT_EQ(root.via.map.size, 5U);
+    EXPECT_EQ(SnapshotField(root, "ma").as<int32_t>(),
+              static_cast<int32_t>(BufferAllocatorType::OFFSET));
+    EXPECT_EQ(SnapshotField(root, "an").as<std::vector<std::string>>(),
+              (std::vector<std::string>{first.name, second.name}));
+    auto& regions = SnapshotField(root, "ms");
+    ASSERT_EQ(regions.type, msgpack::type::MAP);
+    ASSERT_EQ(regions.via.map.size, 2U);
+    for (uint32_t i = 0; i < regions.via.map.size; ++i) {
+        const auto& item = regions.via.map.ptr[i];
+        const auto& segment =
+            item.key.as<std::string>() == UuidToString(first.id) ? first
+                                                                 : second;
+        EXPECT_EQ(item.key.as<std::string>(), UuidToString(segment.id));
+        ASSERT_EQ(item.val.type, msgpack::type::ARRAY);
+        ASSERT_EQ(item.val.via.array.size, 9U);
+        const auto* fields = item.val.via.array.ptr;
+        EXPECT_EQ(fields[0].as<std::string>(), UuidToString(segment.id));
+        EXPECT_EQ(fields[1].as<std::string>(), segment.name);
+        EXPECT_EQ(fields[2].as<uint64_t>(), segment.base);
+        EXPECT_EQ(fields[3].as<uint64_t>(), segment.size);
+        EXPECT_EQ(fields[4].as<std::string>(), segment.te_endpoint);
+        EXPECT_EQ(fields[5].as<int16_t>(),
+                  static_cast<int16_t>(SegmentStatus::OK));
+        EXPECT_TRUE(fields[6].as<bool>());
+        EXPECT_EQ(fields[8].as<std::string>(), segment.host_id);
+    }
+    const auto owners =
+        SnapshotField(root, "cs")
+            .as<std::map<std::string, std::vector<std::string>>>();
+    ASSERT_EQ(owners.size(), 1U);
+    auto region_ids = owners.at(UuidToString(client));
+    std::sort(region_ids.begin(), region_ids.end());
+    auto expected_ids = std::vector<std::string>{UuidToString(first.id),
+                                                 UuidToString(second.id)};
+    std::sort(expected_ids.begin(), expected_ids.end());
+    EXPECT_EQ(region_ids, expected_ids);
 
     SegmentPool restored(Drivers());
-    auto decoded = DecodeAndRestore(restored, *old_encoded, false);
+    auto decoded = DecodeAndRestore(restored, *encoded, false);
     ASSERT_TRUE(decoded.has_value()) << decoded.error().message;
     EXPECT_EQ(PackLocalSsd(*decoded), PackLocalSsd(ssd));
     {
@@ -390,7 +420,7 @@ TEST(StoreResourceSnapshotCodecTest,
     }
 
     // Historical MountedSegment arrays had no host_id, and ld was optional.
-    auto historical = RewriteSnapshot(*old_encoded, [](auto& root, auto&) {
+    auto historical = RewriteSnapshot(*encoded, [](auto& root, auto&) {
         auto& regions = SnapshotField(root, "ms");
         for (uint32_t i = 0; i < regions.via.map.size; ++i) {
             regions.via.map.ptr[i].val.via.array.size = 8;

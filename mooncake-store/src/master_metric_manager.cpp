@@ -8,7 +8,7 @@
 #include <cmath>
 
 #include "common/byte_size.h"
-#include "segment.h"
+#include "segment/usage.h"
 #include "version.h"
 
 namespace mooncake {

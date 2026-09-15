@@ -13,7 +13,11 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "mutex.h"
-#include "serialize/serializer.h"
+
+namespace mooncake {
+template <typename T>
+class Serializer;
+}
 
 namespace mooncake::offset_allocator {
 typedef unsigned char uint8;
@@ -23,6 +27,7 @@ using NodeIndex = uint32;
 
 // Forward declarations
 class OffsetAllocator;
+class OffsetAllocationHandle;
 class __Allocator;
 struct OffsetAllocatorSnapshot;
 

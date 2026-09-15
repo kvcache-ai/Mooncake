@@ -3,9 +3,9 @@
 #include "master_service.h"
 #include "master_snapshot_manager.h"
 #include "master_metric_manager.h"
-#include "segment.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "segment/pool_read_access.h"
 #include "task_manager.h"
 
 #include <glog/logging.h>
@@ -279,9 +279,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
         // === LocalSSD persisted state ===
         {
-            auto access = service->segment_manager_.getAllocatorAccess();
             for (const auto& name : state.all_segments) {
-                auto client_id = access.GetOwnerClientId(name);
+                auto client_id = service->segment_pool_.AcquireReadAccess()
+                                     .Catalog()
+                                     .FindOwnerClientId(name);
                 if (client_id) {
                     state.client_by_name[name] = *client_id;
                 }
@@ -752,13 +753,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     static void AssertRestoredClientAffiliations(MasterService* service) {
         std::unordered_set<const ClientLivenessRecord*> known_records;
         {
-            auto segment_access = service->segment_manager_.getSegmentAccess();
-            std::vector<std::pair<Segment, UUID>> segments;
-            ASSERT_EQ(segment_access.GetAllSegments(segments), ErrorCode::OK);
-            for (const auto& [segment, owner] : segments) {
-                (void)segment;
+            auto segment_access = service->segment_pool_.AcquireReadAccess();
+            for (const auto& region : segment_access.Catalog().Regions()) {
                 const auto record =
-                    service->client_liveness_records_.find(owner);
+                    service->client_liveness_records_.find(region.client_id);
                 ASSERT_NE(record, service->client_liveness_records_.end());
                 known_records.insert(record->second.get());
             }
