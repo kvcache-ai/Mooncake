@@ -236,8 +236,11 @@ tl::expected<void, std::string> S3Helper::InspectObject(
 
     const std::string encoded = outcome.GetResult().GetChecksumCRC32C();
     const std::string decoded = base64::Decode(encoded);
-    if (!encoded.empty() && decoded.size() == sizeof(uint32_t) &&
-        base64::Encode(decoded) == encoded) {
+    if (!encoded.empty()) {
+        if (decoded.size() != sizeof(uint32_t) ||
+            base64::Encode(decoded) != encoded) {
+            return tl::make_unexpected("Invalid full-object CRC32C metadata");
+        }
         crc32c = (static_cast<uint32_t>(static_cast<unsigned char>(decoded[0]))
                   << 24) |
                  (static_cast<uint32_t>(static_cast<unsigned char>(decoded[1]))
