@@ -980,6 +980,13 @@ class MasterService {
     tl::expected<size_t, ErrorCode> InstallLegacyStandbyObjects(
         LegacyRestoreContext& ctx);
 
+    // A restored local-disk replica reads only while its owner has a liveness
+    // record; share the existing one or stage a fresh record for install.
+    std::shared_ptr<ClientLivenessRecord> RecordRestoreKnownOwner(
+        std::unordered_map<UUID, std::shared_ptr<ClientLivenessRecord>,
+                           boost::hash<UUID>>& new_known_owner_records,
+        const UUID& owner);
+
     std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
         const MasterServiceConfig& config);
 
