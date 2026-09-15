@@ -1175,8 +1175,7 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const std::vector<size_t>& sizes,
-    const WriteRouteRequestConfig& route_config,
-    std::string ctx_attachment) {
+    const WriteRouteRequestConfig& route_config, std::string ctx_attachment) {
     if (IsLocalWrite(route_config)) {
         return InnerBatchPutLocalOnly(keys, batched_slices, sizes);
     }
@@ -1287,11 +1286,10 @@ P2PClientService::InnerBatchPutNormal(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const std::vector<size_t>& sizes,
-    const WriteRouteRequestConfig& route_config,
-    std::string ctx_attachment) {
+    const WriteRouteRequestConfig& route_config, std::string ctx_attachment) {
     // Phase 1: fetch write routes from master.
-    auto batch_routes =
-        BatchFetchWriteRoutes(keys, sizes, route_config, std::move(ctx_attachment));
+    auto batch_routes = BatchFetchWriteRoutes(keys, sizes, route_config,
+                                              std::move(ctx_attachment));
     if (!batch_routes) {
         LOG(ERROR) << "BatchGetWriteRoute RPC failed: " << batch_routes.error();
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -1834,8 +1832,7 @@ std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandles(
     const std::vector<std::string>& keys,
     std::shared_ptr<ClientBufferAllocator> allocator,
-    const ReadRouteConfig& config,
-    std::string ctx_attachment) {
+    const ReadRouteConfig& config, std::string ctx_attachment) {
     auto local_get = [&](std::string_view key,
                          size_t) -> tl::expected<ReadTaskHandle, ErrorCode> {
         if (data_manager_ == nullptr) {
@@ -1844,10 +1841,11 @@ P2PClientService::BatchCreateGetHandles(
         }
         return data_manager_->Get(key, allocator);
     };
-    auto remote_get = [&, att = ctx_attachment](std::string_view key, size_t,
+    auto remote_get = [&, att = ctx_attachment](
+                          std::string_view key, size_t,
                           std::vector<ResolvedRoute> routes) {
-        return CreateRemoteGetHandle(key, allocator, config,
-                                     std::move(routes), att);
+        return CreateRemoteGetHandle(key, allocator, config, std::move(routes),
+                                     att);
     };
     return BatchCreateGetHandlesImpl(keys, config, local_get, remote_get,
                                      ctx_attachment);
@@ -1856,8 +1854,7 @@ P2PClientService::BatchCreateGetHandles(
 std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
 P2PClientService::BatchCreateGetHandles(
     const std::vector<std::string>& keys,
-    std::vector<std::vector<Slice>>& all_slices,
-    const ReadRouteConfig& config,
+    std::vector<std::vector<Slice>>& all_slices, const ReadRouteConfig& config,
     std::string ctx_attachment) {
     auto local_get = [&](std::string_view key,
                          size_t i) -> tl::expected<ReadTaskHandle, ErrorCode> {
@@ -1867,7 +1864,8 @@ P2PClientService::BatchCreateGetHandles(
         }
         return data_manager_->Get(key, all_slices[i]);
     };
-    auto remote_get = [&, att = ctx_attachment](std::string_view key, size_t i,
+    auto remote_get = [&, att = ctx_attachment](
+                          std::string_view key, size_t i,
                           std::vector<ResolvedRoute> routes) {
         return CreateRemoteGetHandle(key, all_slices[i], config,
                                      std::move(routes), att);
@@ -1939,8 +1937,8 @@ P2PClientService::BatchCreateGetHandlesImpl(
     for (size_t i : miss_indices) {
         miss_key_views.emplace_back(keys[i]);
     }
-    auto routes = BatchFetchReadRoutes(miss_key_views, config,
-                                       std::move(ctx_attachment));
+    auto routes =
+        BatchFetchReadRoutes(miss_key_views, config, std::move(ctx_attachment));
 
     // Phase C: remote get for each miss
     for (size_t j = 0; j < miss_indices.size(); ++j) {
@@ -2471,7 +2469,8 @@ P2PClientService::BuildRouteIter(std::string_view key,
     RouteIterator iter(key, std::move(routes), object_size,
                        route_cache_ ? &(*route_cache_) : nullptr,
                        [this, key, config, att = std::move(ctx_attachment)]() {
-                           return AsyncResolveRoutesFromMaster(key, config, att);
+                           return AsyncResolveRoutesFromMaster(key, config,
+                                                               att);
                        });
     if (iter.empty()) {
         iter.Prime();

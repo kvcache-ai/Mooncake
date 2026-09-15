@@ -19,15 +19,16 @@ struct RequestContext {
     std::string trace_id;    // distributed trace id
     std::string span_id;
     std::string parent_span_id;
-    // Wire-compatible additions (struct_pack::compatible => optional semantics).
-    // Appended at the end so older binaries lacking them safely ignore the
-    // trailing compatible bytes, and a newer binary receiving old bytes sees
-    // them unset; the type code stays stable (verified by a struct_pack
-    // round-trip test). Distinct increasing version tags (1, 2) fix the wire
-    // order and leave room for future compatible fields (use >=3). See
-    // plan_trace.md §2.8.
-    struct_pack::compatible<std::string, 1> caller_id;   // which dummy-client / TP rank issued the RPC
-    struct_pack::compatible<std::string, 2> caller_role; // caller's thread role, e.g. prefetch / backup
+    // Wire-compatible additions (struct_pack::compatible => optional
+    // semantics). Appended at the end so older binaries lacking them safely
+    // ignore the trailing compatible bytes, and a newer binary receiving old
+    // bytes sees them unset; the type code stays stable (verified by a
+    // struct_pack round-trip test). Distinct increasing version tags (1, 2) fix
+    // the wire order and leave room for future compatible fields (use >=3).
+    struct_pack::compatible<std::string, 1>
+        caller_id;  // which dummy-client / TP rank issued the RPC
+    struct_pack::compatible<std::string, 2>
+        caller_role;  // caller's thread role, e.g. prefetch / backup
 };
 
 // Enable struct_pack field-name-based serialization. Compatible fields appended
@@ -104,7 +105,8 @@ inline char RequestContextLowHexChar(char c) {
 inline bool RequestContextIsLowerHexChar(char c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
 }
-inline std::uint64_t RequestContextFnv1a64(std::string_view s, std::uint64_t seed) {
+inline std::uint64_t RequestContextFnv1a64(std::string_view s,
+                                           std::uint64_t seed) {
     std::uint64_t h = seed;
     for (unsigned char c : s) {
         h ^= static_cast<std::uint64_t>(c);
@@ -112,7 +114,8 @@ inline std::uint64_t RequestContextFnv1a64(std::string_view s, std::uint64_t see
     }
     return h;
 }
-inline std::string RequestContextBytesToHex(const unsigned char* data, std::size_t n) {
+inline std::string RequestContextBytesToHex(const unsigned char* data,
+                                            std::size_t n) {
     static const char* kHex = "0123456789abcdef";
     std::string out;
     out.resize(n * 2);
@@ -184,15 +187,17 @@ inline void EnsureRequestIdAsTraceId(RequestContext& ctx) {
 // uniformly without dereferencing the optional; unset => empty => omitted from
 // logs and span attributes.
 inline std::string_view caller_id_of(const RequestContext& ctx) {
-    return ctx.caller_id ? std::string_view(*ctx.caller_id) : std::string_view{};
+    return ctx.caller_id ? std::string_view(*ctx.caller_id)
+                         : std::string_view{};
 }
 inline std::string_view caller_role_of(const RequestContext& ctx) {
-    return ctx.caller_role ? std::string_view(*ctx.caller_role) : std::string_view{};
+    return ctx.caller_role ? std::string_view(*ctx.caller_role)
+                           : std::string_view{};
 }
 
 // ---------------------------------------------------------------------------
-// Caller-based virtual-root derivation (plan_trace.md §2.9). HiCache backup ops
-// carry caller_id/caller_role but no request_id, so the chain would otherwise
+// Caller-based virtual-root derivation. HiCache backup ops carry caller_id /
+// caller_role but no request_id, so the chain would otherwise
 // degenerate to a per-hop random root and become uncorrelatable. We synthesize
 // a stable *virtual* trace/span id keyed on the caller using FNV-1a with seeds
 // distinct from the request-id namespace above, so a literal collision (same
@@ -201,7 +206,7 @@ inline std::string_view caller_role_of(const RequestContext& ctx) {
 // used both with tracing enabled (MakeRemoteSpanContext falls back to it) and
 // disabled (so logs stay correlatable across hops for caller-keyed traffic).
 inline std::string CallerDeriveKey(std::string_view caller_id,
-                                  std::string_view caller_role) {
+                                   std::string_view caller_role) {
     std::string key;
     key.reserve(caller_id.size() + 1 + caller_role.size());
     key.append(caller_id);
@@ -236,7 +241,8 @@ inline std::string DeriveSpanIdFromCaller(std::string_view caller_id,
                                           std::string_view caller_role) {
     if (caller_id.empty() && caller_role.empty()) return {};
     const std::string key = CallerDeriveKey(caller_id, caller_role);
-    // Seed intentionally differs from DeriveSpanIdFromRequestId's 0x9dc5d7e9c4b2f1a3.
+    // Seed intentionally differs from DeriveSpanIdFromRequestId's
+    // 0x9dc5d7e9c4b2f1a3.
     std::uint64_t h = RequestContextFnv1a64(key, 0x3a1c2b4e9d7c5debULL);
     if (h == 0) h = 1;  // all-zero SpanId is invalid
     unsigned char bytes[8];
@@ -250,11 +256,11 @@ inline std::string DeriveSpanIdFromCaller(std::string_view caller_id,
 // EnsureRequestIdAsTraceId first, so the request-id path keeps precedence).
 // Idempotent: a context already carrying a trace id is left untouched.
 inline void EnsureTraceIdFromCaller(RequestContext& ctx) {
-    if (!ctx.trace_id.empty()) return;            // upstream / already seeded
-    if (!ctx.request_id.empty()) return;         // request-id path owns it
+    if (!ctx.trace_id.empty()) return;    // upstream / already seeded
+    if (!ctx.request_id.empty()) return;  // request-id path owns it
     auto cid = caller_id_of(ctx);
     auto crole = caller_role_of(ctx);
-    if (cid.empty() && crole.empty()) return;     // nothing to key on -> root
+    if (cid.empty() && crole.empty()) return;  // nothing to key on -> root
     ctx.trace_id = DeriveTraceIdFromCaller(cid, crole);
 }
 

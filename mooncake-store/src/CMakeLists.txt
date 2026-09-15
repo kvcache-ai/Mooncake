@@ -144,7 +144,7 @@ target_link_libraries(mooncake_store
         transfer_engine
 )
 
-# OpenTelemetry tracing (plan_trace.md): OTLP/HTTP (built-in curl) and OTLP/gRPC
+# OpenTelemetry tracing: OTLP/HTTP (built-in curl) and OTLP/gRPC
 # exporters fold the pre-built, installed opentelemetry-cpp imported targets
 # (found in top-level CMakeLists.txt; produced by install_otel.sh with
 # WITH_OTLP_HTTP=ON, WITH_OTLP_GRPC=ON) statically into this target. gRPC +
@@ -313,7 +313,7 @@ endif()
 add_library(mooncake_master_core STATIC ${MOONCAKE_CENTRALIZED_MASTER_SOURCES})
 target_link_libraries(mooncake_master_core PUBLIC mooncake_master_support)
 
-# OpenTelemetry tracing (plan_trace.md): OTLP/HTTP (built-in curl) and OTLP/gRPC
+# OpenTelemetry tracing: OTLP/HTTP (built-in curl) and OTLP/gRPC
 # exporters fold the pre-built, installed opentelemetry-cpp imported targets
 # (found in top-level CMakeLists.txt; produced by install_otel.sh with
 # WITH_OTLP_HTTP=ON, WITH_OTLP_GRPC=ON) statically into this target. gRPC +

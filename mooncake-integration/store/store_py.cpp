@@ -1186,9 +1186,10 @@ PYBIND11_MODULE(store, m) {
                 if (trace_id) ctx.trace_id = *trace_id;
                 if (span_id) ctx.span_id = *span_id;
                 if (parent_span_id) ctx.parent_span_id = *parent_span_id;
-                // Caller attribution (plan_trace.md §2.8): which dummy-client /
-                // TP rank and which thread role (e.g. prefetch/backup). Optional
-                // merge: omitted args preserve any value already on this thread.
+                // Caller attribution: which dummy-client / TP rank issued the
+                // RPC and which thread role (e.g. prefetch/backup). Optional
+                // merge: omitted args preserve any value already on this
+                // thread.
                 if (caller_id) ctx.caller_id = *caller_id;
                 if (caller_role) ctx.caller_role = *caller_role;
                 set_current_request_context(std::move(ctx));
@@ -1199,7 +1200,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("caller_id") = py::none(),
             py::arg("caller_role") = py::none(),
             "Set per-request context (request_id/trace_id/..., plus optional "
-            "caller_id/caller_role attribution) on the calling thread; consumed "
+            "caller_id/caller_role attribution) on the calling thread; "
+            "consumed "
             "by subsequent store/master operations.")
         .def(
             "clear_request_context",

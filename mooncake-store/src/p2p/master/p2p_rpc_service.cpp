@@ -524,12 +524,13 @@ tl::expected<void, ErrorCode> P2PMasterRpcService::CompleteRouteSync(
     return result;
 }
 
-
 // hop B extract: per-request "_with_context" V3 handlers. Each reads the
 // out-of-band attachment, reinstalls it with a CurrentCtxScope, and delegates
-// to the existing value-returning handler. Empty attachment == no per-request id.
+// to the existing value-returning handler. Empty attachment == no per-request
+// id.
 void P2PMasterRpcService::ExistKey_with_context(
-    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx, std::string_view key) {
+    coro_rpc::context<tl::expected<bool, ErrorCode>> ctx,
+    std::string_view key) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -545,7 +546,8 @@ void P2PMasterRpcService::ExistKey_with_context(
 }
 
 void P2PMasterRpcService::BatchExistKey_with_context(
-    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx, const std::vector<std::string_view>& keys) {
+    coro_rpc::context<std::vector<tl::expected<bool, ErrorCode>>> ctx,
+    const std::vector<std::string_view>& keys) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -561,13 +563,17 @@ void P2PMasterRpcService::BatchExistKey_with_context(
 }
 
 void P2PMasterRpcService::GetReadRouteByRegex_with_context(
-    coro_rpc::context<tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>, ErrorCode>> ctx, std::string_view regex) {
+    coro_rpc::context<tl::expected<
+        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
+        ErrorCode>>
+        ctx,
+    std::string_view regex) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
         rc = deserialize_request_context(att);
-        VLOG(2) << "hop-B GetReadRouteByRegex_with_context att_sz=" << att.size()
-                << " request_id=[" << rc.request_id << "]"
+        VLOG(2) << "hop-B GetReadRouteByRegex_with_context att_sz="
+                << att.size() << " request_id=[" << rc.request_id << "]"
                 << " trace_id=[" << rc.trace_id << "]"
                 << " span_id=[" << rc.span_id << "]"
                 << " parent_span_id=[" << rc.parent_span_id << "]";
@@ -577,7 +583,9 @@ void P2PMasterRpcService::GetReadRouteByRegex_with_context(
 }
 
 void P2PMasterRpcService::GetReadRoute_with_context(
-    coro_rpc::context<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>> ctx, const P2PGetReadRouteRequest& req) {
+    coro_rpc::context<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
+        ctx,
+    const P2PGetReadRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -593,7 +601,8 @@ void P2PMasterRpcService::GetReadRoute_with_context(
 }
 
 void P2PMasterRpcService::BatchGetReadRoute_with_context(
-    coro_rpc::context<P2PBatchGetReadRouteResponse> ctx, const P2PBatchGetReadRouteRequest& req) {
+    coro_rpc::context<P2PBatchGetReadRouteResponse> ctx,
+    const P2PBatchGetReadRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -609,7 +618,9 @@ void P2PMasterRpcService::BatchGetReadRoute_with_context(
 }
 
 void P2PMasterRpcService::GetWriteRoute_with_context(
-    coro_rpc::context<tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>> ctx, const P2PGetWriteRouteRequest& req) {
+    coro_rpc::context<tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>>
+        ctx,
+    const P2PGetWriteRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -625,7 +636,8 @@ void P2PMasterRpcService::GetWriteRoute_with_context(
 }
 
 void P2PMasterRpcService::BatchGetWriteRoute_with_context(
-    coro_rpc::context<P2PBatchGetWriteRouteResponse> ctx, const P2PBatchGetWriteRouteRequest& req) {
+    coro_rpc::context<P2PBatchGetWriteRouteResponse> ctx,
+    const P2PBatchGetWriteRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -641,7 +653,8 @@ void P2PMasterRpcService::BatchGetWriteRoute_with_context(
 }
 
 void P2PMasterRpcService::PublishRoute_with_context(
-    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const P2PPublishRouteRequest& req) {
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const P2PPublishRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -657,7 +670,8 @@ void P2PMasterRpcService::PublishRoute_with_context(
 }
 
 void P2PMasterRpcService::WithdrawRoute_with_context(
-    coro_rpc::context<tl::expected<void, ErrorCode>> ctx, const P2PWithdrawRouteRequest& req) {
+    coro_rpc::context<tl::expected<void, ErrorCode>> ctx,
+    const P2PWithdrawRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -673,7 +687,8 @@ void P2PMasterRpcService::WithdrawRoute_with_context(
 }
 
 void P2PMasterRpcService::BatchWithdrawRoute_with_context(
-    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx, const P2PBatchWithdrawRouteRequest& req) {
+    coro_rpc::context<std::vector<tl::expected<void, ErrorCode>>> ctx,
+    const P2PBatchWithdrawRouteRequest& req) {
     auto att = ctx.get_context_info()->release_request_attachment();
     RequestContext rc;
     if (!att.empty()) {
@@ -736,21 +751,25 @@ void RegisterP2PRpcService(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::BatchExistKey_with_context>(
         &wrapped_master_service);
-    server.register_handler<&P2PMasterRpcService::GetReadRouteByRegex_with_context>(
+    server.register_handler<
+        &P2PMasterRpcService::GetReadRouteByRegex_with_context>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::GetReadRoute_with_context>(
         &wrapped_master_service);
-    server.register_handler<&P2PMasterRpcService::BatchGetReadRoute_with_context>(
-        &wrapped_master_service);
+    server
+        .register_handler<&P2PMasterRpcService::BatchGetReadRoute_with_context>(
+            &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::GetWriteRoute_with_context>(
         &wrapped_master_service);
-    server.register_handler<&P2PMasterRpcService::BatchGetWriteRoute_with_context>(
+    server.register_handler<
+        &P2PMasterRpcService::BatchGetWriteRoute_with_context>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::PublishRoute_with_context>(
         &wrapped_master_service);
     server.register_handler<&P2PMasterRpcService::WithdrawRoute_with_context>(
         &wrapped_master_service);
-    server.register_handler<&P2PMasterRpcService::BatchWithdrawRoute_with_context>(
+    server.register_handler<
+        &P2PMasterRpcService::BatchWithdrawRoute_with_context>(
         &wrapped_master_service);
 
     server.register_handler<&P2PMasterRpcService::BatchSyncRoutes>(

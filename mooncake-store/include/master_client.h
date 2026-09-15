@@ -434,8 +434,7 @@ class MasterClient {
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
     invoke_batch_rpc_with_context(std::string attachment, size_t input_size,
-                                     Args&&... args);
-
+                                  Args&&... args);
 
     /**
      * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool

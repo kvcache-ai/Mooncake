@@ -96,15 +96,15 @@ std::optional<std::array<std::uint8_t, N>> HexToBytes(std::string_view hex) {
 
 std::string TraceIdHex(const trace_api::TraceId& id) {
     char buf[trace_api::TraceId::kSize * 2];
-    id.ToLowerBase16(
-        nostd::span<char, trace_api::TraceId::kSize * 2>(buf, trace_api::TraceId::kSize * 2));
+    id.ToLowerBase16(nostd::span<char, trace_api::TraceId::kSize * 2>(
+        buf, trace_api::TraceId::kSize * 2));
     return std::string(buf, trace_api::TraceId::kSize * 2);
 }
 
 std::string SpanIdHex(const trace_api::SpanId& id) {
     char buf[trace_api::SpanId::kSize * 2];
-    id.ToLowerBase16(
-        nostd::span<char, trace_api::SpanId::kSize * 2>(buf, trace_api::SpanId::kSize * 2));
+    id.ToLowerBase16(nostd::span<char, trace_api::SpanId::kSize * 2>(
+        buf, trace_api::SpanId::kSize * 2));
     return std::string(buf, trace_api::SpanId::kSize * 2);
 }
 
@@ -117,13 +117,14 @@ std::string SpanIdHex(const trace_api::SpanId& id) {
 // whole chain share ONE trace id tied to the request -- same request_id yields
 // the same trace_id across hops and across requests -- we cannot let hop-a be
 // a true root: OTel assigns a fresh RANDOM trace id to a root. Instead we
-// synthesize a stable parent (trace id = DeriveTraceIdFromRequestId(request_id),
-// span id = DeriveSpanIdFromRequestId(request_id)); the started span is a child
-// of that un-exported "remote" parent and inherits the request-derived trace
-// id, which PopulateRequestContext then propagates to the next hop.
+// synthesize a stable parent (trace id =
+// DeriveTraceIdFromRequestId(request_id), span id =
+// DeriveSpanIdFromRequestId(request_id)); the started span is a child of that
+// un-exported "remote" parent and inherits the request-derived trace id, which
+// PopulateRequestContext then propagates to the next hop.
 //
-// Caller fallback (plan_trace.md §2.9): HiCache backup ops have no request_id
-// at all, only caller_id/caller_role. Without a request_id the synthesized
+// Caller fallback: HiCache backup ops have no request_id at all, only
+// caller_id/caller_role. Without a request_id the synthesized
 // parent would be empty and hop-a would again become a random root. We fall
 // back to a caller-keyed virtual parent so same caller/role => same trace id
 // and the otherwise rootless backup traffic stays correlatable.
@@ -168,11 +169,11 @@ trace_api::SpanContext MakeRemoteSpanContext(const RequestContext* ctx,
     if (!tid || !sid) return trace_api::SpanContext::GetInvalid();
 
     trace_api::TraceId trace_id(
-        nostd::span<const std::uint8_t, trace_api::TraceId::kSize>(tid->data(),
-                                                                   trace_api::TraceId::kSize));
+        nostd::span<const std::uint8_t, trace_api::TraceId::kSize>(
+            tid->data(), trace_api::TraceId::kSize));
     trace_api::SpanId span_id(
-        nostd::span<const std::uint8_t, trace_api::SpanId::kSize>(sid->data(),
-                                                                  trace_api::SpanId::kSize));
+        nostd::span<const std::uint8_t, trace_api::SpanId::kSize>(
+            sid->data(), trace_api::SpanId::kSize));
     parent_span_id_out = SpanIdHex(span_id);
     return trace_api::SpanContext(
         trace_id, span_id,
@@ -231,10 +232,11 @@ class ScopedSpanImpl {
         if (remote.IsValid()) opts.parent = remote;
         span_ = tracer_->StartSpan(span_name, opts);
         parent_span_hex_ = std::move(parent_span_id);
-        // Record the application-level correlation id as a span attribute so the
-        // trace can be cross-referenced with request-scoped logs. request_id is
-        // carried unchanged across hops (PopulateRequestContext only refreshes
-        // trace/span ids), so this stays stable for the whole request chain.
+        // Record the application-level correlation id as a span attribute so
+        // the trace can be cross-referenced with request-scoped logs.
+        // request_id is carried unchanged across hops (PopulateRequestContext
+        // only refreshes trace/span ids), so this stays stable for the whole
+        // request chain.
         if (parent_ctx != nullptr && !parent_ctx->request_id.empty()) {
             span_->SetAttribute(
                 "request.id",
@@ -242,9 +244,9 @@ class ScopedSpanImpl {
                                    parent_ctx->request_id.size()));
         }
         // Caller attribution (disambiguate which dummy-client / thread issued
-        // the RPC; see plan_trace.md §2.8). Recorded only when the caller
-        // actually supplied them -- absent (compatible field unset) on older /
-        // non-sglang callers, so those spans are unchanged.
+        // the RPC). Recorded only when the caller actually supplied them --
+        // absent (compatible field unset) on older / non-sglang callers, so
+        // those spans are unchanged.
         if (parent_ctx != nullptr) {
             if (auto v = caller_id_of(*parent_ctx); !v.empty()) {
                 span_->SetAttribute("caller.id",
@@ -270,7 +272,8 @@ class ScopedSpanImpl {
     // --- span enrichment (no-op when the span was never started) ---
     void SetAttribute(const char* key, std::string_view value) {
         if (span_) {
-            span_->SetAttribute(key, nostd::string_view(value.data(), value.size()));
+            span_->SetAttribute(key,
+                                nostd::string_view(value.data(), value.size()));
         }
     }
     void SetAttribute(const char* key, std::int64_t value) {
@@ -331,14 +334,18 @@ bool InitTracing(const std::string& otlp_endpoint, std::string service_name,
     bsp_opts.schedule_delay_millis = std::chrono::milliseconds(5000);
     bsp_opts.max_export_batch_size = 512;
 
-    auto processor = trace_sdk::BatchSpanProcessorFactory::Create(std::move(exporter), bsp_opts);
+    auto processor = trace_sdk::BatchSpanProcessorFactory::Create(
+        std::move(exporter), bsp_opts);
 
-    resource_sdk::ResourceAttributes attr = {{"service.name", std::move(service_name)}};
+    resource_sdk::ResourceAttributes attr = {
+        {"service.name", std::move(service_name)}};
     auto resource = resource_sdk::Resource::Create(attr);
 
     g_provider = std::shared_ptr<trace_sdk::TracerProvider>(
-        trace_sdk::TracerProviderFactory::Create(std::move(processor), resource));
-    std::shared_ptr<opentelemetry::trace::TracerProvider> api_provider = g_provider;
+        trace_sdk::TracerProviderFactory::Create(std::move(processor),
+                                                 resource));
+    std::shared_ptr<opentelemetry::trace::TracerProvider> api_provider =
+        g_provider;
     trace_sdk::Provider::SetTracerProvider(api_provider);
 
     g_tracing_enabled.store(true);
@@ -357,7 +364,8 @@ bool IsTracingEnabled() { return g_tracing_enabled.load(); }
 
 ScopedSpan::ScopedSpan(const char* tracer_name, const char* span_name,
                        const RequestContext* parent_ctx)
-    : impl_(IsTracingEnabled() ? std::make_unique<ScopedSpanImpl>(tracer_name, span_name, parent_ctx)
+    : impl_(IsTracingEnabled() ? std::make_unique<ScopedSpanImpl>(
+                                     tracer_name, span_name, parent_ctx)
                                : nullptr) {}
 ScopedSpan::~ScopedSpan() = default;
 bool ScopedSpan::active() const { return impl_ != nullptr; }
@@ -389,8 +397,9 @@ class ScopedSpanImpl {};
 
 static std::atomic<bool> g_tracing_enabled{false};
 
-bool InitTracing(const std::string& otlp_http_endpoint, std::string /*service_name*/,
-                       const std::string& /*protocol*/) {
+bool InitTracing(const std::string& otlp_http_endpoint,
+                 std::string /*service_name*/,
+                 const std::string& /*protocol*/) {
     (void)otlp_http_endpoint;
     return false;
 }
@@ -403,7 +412,8 @@ ScopedSpan::ScopedSpan(const char* /*tracer_name*/, const char* /*span_name*/,
 ScopedSpan::~ScopedSpan() = default;
 bool ScopedSpan::active() const { return false; }
 void ScopedSpan::PopulateRequestContext(RequestContext& /*ctx*/) const {}
-void ScopedSpan::AddAttribute(const char* /*key*/, std::string_view /*value*/) {}
+void ScopedSpan::AddAttribute(const char* /*key*/, std::string_view /*value*/) {
+}
 void ScopedSpan::AddAttribute(const char* /*key*/, std::int64_t /*value*/) {}
 void ScopedSpan::AddAttribute(const char* /*key*/, bool /*value*/) {}
 void ScopedSpan::SetError(std::string_view /*description*/) {}

@@ -148,7 +148,6 @@ struct RpcNameTraits<&P2PMasterRpcService::BatchWithdrawRoute_with_context> {
     static constexpr const char* value = "BatchWithdrawRoute";
 };
 
-
 ErrorCode P2PMasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "P2PMasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
@@ -239,38 +238,48 @@ tl::expected<bool, ErrorCode> P2PMasterClient::ExistKey(
     std::string_view object_key, std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::ExistKey");
     timer.LogRequest("object_key=", object_key);
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::ExistKey, bool>(object_key)
-        :  invoke_rpc_with_context<&P2PMasterRpcService::ExistKey_with_context, bool>(std::move(ctx_attachment), object_key);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::ExistKey, bool>(object_key)
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::ExistKey_with_context, bool>(
+                  std::move(ctx_attachment), object_key);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<bool, ErrorCode>> P2PMasterClient::BatchExistKey(
-    const std::vector<std::string_view>& object_keys, std::string ctx_attachment) {
+    const std::vector<std::string_view>& object_keys,
+    std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchExistKey");
     timer.LogRequest("keys_count=", object_keys.size());
-    auto result = ctx_attachment.empty()
-        ?  invoke_batch_rpc<&P2PMasterRpcService::BatchExistKey, bool>(
-        object_keys.size(), object_keys)
-        :  invoke_batch_rpc_with_context<&P2PMasterRpcService::BatchExistKey_with_context, bool>(std::move(ctx_attachment), 
-        object_keys.size(), object_keys);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_batch_rpc<&P2PMasterRpcService::BatchExistKey, bool>(
+                  object_keys.size(), object_keys)
+            : invoke_batch_rpc_with_context<
+                  &P2PMasterRpcService::BatchExistKey_with_context, bool>(
+                  std::move(ctx_attachment), object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
 }
 
 tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>
 P2PMasterClient::GetReadRoute(std::string_view key,
-                              const P2PReadRouteConfig& config, std::string ctx_attachment) {
+                              const P2PReadRouteConfig& config,
+                              std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetReadRoute");
     timer.LogRequest("object_key=", key);
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::GetReadRoute,
-                             std::vector<P2PRouteDescriptor>>(
-        P2PGetReadRouteRequest{.key = key, .config = config})
-        :  invoke_rpc_with_context<&P2PMasterRpcService::GetReadRoute_with_context,
-                             std::vector<P2PRouteDescriptor>>(std::move(ctx_attachment), 
-        P2PGetReadRouteRequest{.key = key, .config = config});
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::GetReadRoute,
+                         std::vector<P2PRouteDescriptor>>(
+                  P2PGetReadRouteRequest{.key = key, .config = config})
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::GetReadRoute_with_context,
+                  std::vector<P2PRouteDescriptor>>(
+                  std::move(ctx_attachment),
+                  P2PGetReadRouteRequest{.key = key, .config = config});
     timer.LogResponseExpected(result);
     return result;
 }
@@ -285,15 +294,17 @@ P2PMasterClient::AsyncGetReadRoute(std::string_view key,
                                             std::vector<P2PRouteDescriptor>>(
             P2PGetReadRouteRequest{.key = key, .config = config});
     }
-    co_return co_await invoke_rpc_async_with_context<&P2PMasterRpcService::GetReadRoute_with_context,
-                                            std::vector<P2PRouteDescriptor>>(
+    co_return co_await invoke_rpc_async_with_context<
+        &P2PMasterRpcService::GetReadRoute_with_context,
+        std::vector<P2PRouteDescriptor>>(
         std::move(ctx_attachment),
         P2PGetReadRouteRequest{.key = key, .config = config});
 }
 
 std::vector<tl::expected<std::vector<P2PRouteDescriptor>, ErrorCode>>
 P2PMasterClient::BatchGetReadRoute(const std::vector<std::string_view>& keys,
-                                   const P2PReadRouteConfig& config, std::string ctx_attachment) {
+                                   const P2PReadRouteConfig& config,
+                                   std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchGetReadRoute");
     timer.LogRequest("requests_count=", keys.size());
     if (keys.empty()) return {};
@@ -304,11 +315,13 @@ P2PMasterClient::BatchGetReadRoute(const std::vector<std::string_view>& keys,
     for (std::string_view key : keys) {
         req.keys.emplace_back(key);
     }
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::BatchGetReadRoute,
-                             P2PBatchGetReadRouteResponse>(req)
-        :  invoke_rpc_with_context<&P2PMasterRpcService::BatchGetReadRoute_with_context,
-                             P2PBatchGetReadRouteResponse>(std::move(ctx_attachment), req);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::BatchGetReadRoute,
+                         P2PBatchGetReadRouteResponse>(req)
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::BatchGetReadRoute_with_context,
+                  P2PBatchGetReadRouteResponse>(std::move(ctx_attachment), req);
     if (!result.has_value()) {
         LOG(ERROR) << "BatchGetReadRoute RPC failed: "
                    << toString(result.error());
@@ -339,18 +352,21 @@ P2PMasterClient::BatchGetReadRoute(const std::vector<std::string_view>& keys,
 
 tl::expected<std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>,
              ErrorCode>
-P2PMasterClient::GetReadRouteByRegex(std::string_view regex, std::string ctx_attachment) {
+P2PMasterClient::GetReadRouteByRegex(std::string_view regex,
+                                     std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetReadRouteByRegex");
     timer.LogRequest("Regex=", regex);
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<
-        &P2PMasterRpcService::GetReadRouteByRegex,
-        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>>(
-        regex)
-        :  invoke_rpc_with_context<
-        &P2PMasterRpcService::GetReadRouteByRegex_with_context,
-        std::unordered_map<std::string, std::vector<P2PRouteDescriptor>>>(std::move(ctx_attachment), 
-        regex);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::GetReadRouteByRegex,
+                         std::unordered_map<std::string,
+                                            std::vector<P2PRouteDescriptor>>>(
+                  regex)
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::GetReadRouteByRegex_with_context,
+                  std::unordered_map<std::string,
+                                     std::vector<P2PRouteDescriptor>>>(
+                  std::move(ctx_attachment), regex);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -421,29 +437,36 @@ tl::expected<ViewVersionId, ErrorCode> P2PMasterClient::UnregisterClient(
 }
 
 tl::expected<std::vector<P2PWriteCandidate>, ErrorCode>
-P2PMasterClient::GetWriteRoute(const P2PGetWriteRouteRequest& req, std::string ctx_attachment) {
+P2PMasterClient::GetWriteRoute(const P2PGetWriteRouteRequest& req,
+                               std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::GetWriteRoute");
     timer.LogRequest("key=", req.key);
 
     auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::GetWriteRoute,
-                             std::vector<P2PWriteCandidate>>(req)
-        :  invoke_rpc_with_context<&P2PMasterRpcService::GetWriteRoute_with_context,
-                             std::vector<P2PWriteCandidate>>(std::move(ctx_attachment), req);
+                      ? invoke_rpc<&P2PMasterRpcService::GetWriteRoute,
+                                   std::vector<P2PWriteCandidate>>(req)
+                      : invoke_rpc_with_context<
+                            &P2PMasterRpcService::GetWriteRoute_with_context,
+                            std::vector<P2PWriteCandidate>>(
+                            std::move(ctx_attachment), req);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<P2PBatchGetWriteRouteResponse, ErrorCode>
-P2PMasterClient::BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req, std::string ctx_attachment) {
+P2PMasterClient::BatchGetWriteRoute(const P2PBatchGetWriteRouteRequest& req,
+                                    std::string ctx_attachment) {
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchGetWriteRoute");
     timer.LogRequest("key_count=", req.keys.size());
 
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::BatchGetWriteRoute,
-                             P2PBatchGetWriteRouteResponse>(req)
-        :  invoke_rpc_with_context<&P2PMasterRpcService::BatchGetWriteRoute_with_context,
-                             P2PBatchGetWriteRouteResponse>(std::move(ctx_attachment), req);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::BatchGetWriteRoute,
+                         P2PBatchGetWriteRouteResponse>(req)
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::BatchGetWriteRoute_with_context,
+                  P2PBatchGetWriteRouteResponse>(std::move(ctx_attachment),
+                                                 req);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -453,9 +476,12 @@ tl::expected<void, ErrorCode> P2PMasterClient::PublishRoute(
     ScopedVLogTimer timer(1, "P2PMasterClient::PublishRoute");
     timer.LogRequest("key=", req.key);
 
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::PublishRoute, void>(req)
-        :  invoke_rpc_with_context<&P2PMasterRpcService::PublishRoute_with_context, void>(std::move(ctx_attachment), req);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::PublishRoute, void>(req)
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::PublishRoute_with_context, void>(
+                  std::move(ctx_attachment), req);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -465,9 +491,12 @@ tl::expected<void, ErrorCode> P2PMasterClient::WithdrawRoute(
     ScopedVLogTimer timer(1, "P2PMasterClient::WithdrawRoute");
     timer.LogRequest("key=", req.key);
 
-    auto result = ctx_attachment.empty()
-        ?  invoke_rpc<&P2PMasterRpcService::WithdrawRoute, void>(req)
-        :  invoke_rpc_with_context<&P2PMasterRpcService::WithdrawRoute_with_context, void>(std::move(ctx_attachment), req);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_rpc<&P2PMasterRpcService::WithdrawRoute, void>(req)
+            : invoke_rpc_with_context<
+                  &P2PMasterRpcService::WithdrawRoute_with_context, void>(
+                  std::move(ctx_attachment), req);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -477,13 +506,13 @@ std::vector<tl::expected<void, ErrorCode>> P2PMasterClient::BatchWithdrawRoute(
     ScopedVLogTimer timer(1, "P2PMasterClient::BatchWithdrawRoute");
     timer.LogRequest("key=", req.key, "segment_count=", req.segment_ids.size());
 
-    auto result = ctx_attachment.empty()
-        ? 
-        invoke_batch_rpc<&P2PMasterRpcService::BatchWithdrawRoute, void>(
-            req.segment_ids.size(), req)
-        : 
-        invoke_batch_rpc_with_context<&P2PMasterRpcService::BatchWithdrawRoute_with_context, void>(std::move(ctx_attachment), 
-            req.segment_ids.size(), req);
+    auto result =
+        ctx_attachment.empty()
+            ? invoke_batch_rpc<&P2PMasterRpcService::BatchWithdrawRoute, void>(
+                  req.segment_ids.size(), req)
+            : invoke_batch_rpc_with_context<
+                  &P2PMasterRpcService::BatchWithdrawRoute_with_context, void>(
+                  std::move(ctx_attachment), req.segment_ids.size(), req);
     timer.LogResponse("result=", result.size(), " routes");
     return result;
 }

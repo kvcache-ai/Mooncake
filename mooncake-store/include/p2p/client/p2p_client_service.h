@@ -516,14 +516,12 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::shared_ptr<ClientBufferAllocator> allocator,
-        const ReadRouteConfig& config,
-        std::string ctx_attachment = {});
+        const ReadRouteConfig& config, std::string ctx_attachment = {});
 
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> BatchCreateGetHandles(
         const std::vector<std::string>& keys,
         std::vector<std::vector<Slice>>& all_slices,
-        const ReadRouteConfig& config,
-        std::string ctx_attachment = {});
+        const ReadRouteConfig& config, std::string ctx_attachment = {});
 
     template <typename LocalGetFn, typename RemoteGetFn>
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>>
