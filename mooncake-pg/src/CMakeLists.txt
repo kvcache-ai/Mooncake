@@ -60,15 +60,16 @@ elseif(USE_MUSA OR USE_MACA)
                                   --cuda-gpu-arch=mp_31)
   elseif(USE_MACA)
     set(_pg_platform_name MACA)
-    set(_pg_device_compiler_name mxcc)
-    set(_pg_device_compiler_hint "${MACA_ROOT}/bin")
-    set(_pg_platform_device_flags --compiler-options=-fPIC)
+    set(_pg_device_compiler_name nvcc)
+    set(_pg_device_compiler_hint "${MACA_ROOT}/tools/cu-bridge/bin")
+    set(_pg_platform_device_flags -Xcompiler=-fPIC -include cuda_bf16.h)
+    list(APPEND _pg_device_flags "-I${MACA_ROOT}/tools/cu-bridge/include")
   endif()
 
   find_program(
     _pg_device_compiler
     NAMES "${_pg_device_compiler_name}"
-    HINTS "${_pg_device_compiler_hint}")
+    HINTS ${_pg_device_compiler_hint})
   if(NOT _pg_device_compiler)
     message(
       FATAL_ERROR "USE_${_pg_platform_name}=ON requires the "
@@ -150,6 +151,11 @@ target_compile_features(mooncake_pg PRIVATE cxx_std_20)
 target_include_directories(
   mooncake_pg PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
                      $<INSTALL_INTERFACE:include>)
+if(USE_MACA)
+  target_include_directories(mooncake_pg PRIVATE
+                             "${MACA_ROOT}/tools/cu-bridge/include"
+                             "${MACA_ROOT}/include/mcr")
+endif()
 target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 
 set_target_properties(
