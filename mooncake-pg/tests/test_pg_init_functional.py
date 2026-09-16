@@ -2,6 +2,7 @@ import unittest
 
 import torch
 import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
@@ -81,7 +82,7 @@ def _subgroup_create_destroy_worker(ctx: MooncakePGWorkerContext) -> None:
                     pass
 
 
-def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext) -> None:
+def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext, destroyed) -> None:
     """Test destroy and re-init process group."""
     # First init
     device = ctx.init_group()
@@ -90,10 +91,9 @@ def _destroy_and_reinit_worker(ctx: MooncakePGWorkerContext) -> None:
     sum1 = int(tensor1.cpu().item())
 
     # Destroy WORLD group
-    try:
-        dist.destroy_process_group(dist.group.WORLD)
-    except Exception:
-        pass
+    dist.destroy_process_group(dist.group.WORLD)
+    # Reinitialization should start after every old communicator unregisters.
+    destroyed.wait(timeout=10)
 
     # Re-init
     device = ctx.init_group()
@@ -155,7 +155,8 @@ class _InitFunctionalMixin:
 
     def test_destroy_and_reinit(self) -> None:
         """Test destroy and re-init process group."""
-        rows = self.spawn_backend_and_collect(_destroy_and_reinit_worker)
+        destroyed = mp.get_context("spawn").Barrier(self.world_size)
+        rows = self.spawn_backend_and_collect(_destroy_and_reinit_worker, destroyed)
         self.assert_all_ok(rows)
 
         expected = sum(range(1, self.world_size + 1))

@@ -1179,8 +1179,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(
-        std::move(result.value().replicas),
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
         result.value().object_checksum);
 }
@@ -1212,11 +1212,11 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            results.emplace_back(QueryResult(
-                std::move(response[i].value().replicas),
+            results.emplace_back(
+                tl::in_place, std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum));
+                response[i].value().object_checksum);
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -2508,7 +2508,7 @@ void Client::healDanglingLocalDiskBatchStarts(
             }
             continue;
         }
-        op.replicas = retry_responses[r].value();
+        op.replicas = std::move(retry_responses[r].value());
         op.RecordAllocatedReplicas();
         if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
             op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2590,7 +2590,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2680,7 +2680,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start upsert operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,

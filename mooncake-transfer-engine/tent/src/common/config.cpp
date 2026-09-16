@@ -155,6 +155,12 @@ static inline void setArrayConfig(Config& config, const std::string& env_key,
     if (!items.empty()) config.set(config_key, items);
 }
 
+void ConfigHelper::forceTcp(Config& config) {
+    config.set("transports/force_tcp", true);
+    config.set("transports/tcp/enable", true);
+    config.set("transports/rdma/enable", false);
+}
+
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();
@@ -188,6 +194,11 @@ Status ConfigHelper::loadFromEnv(Config& config) {
 
     // Legacy keys for backward compatibility (MC_* env vars)
     setConfig(config, "MOONCAKE_LOCAL_HOSTNAME", "rpc_server_hostname");
+    if (std::getenv("MC_FORCE_TCP")) {
+        forceTcp(config);
+        LOG(INFO)
+            << "MC_FORCE_TCP is set, forcing TENT memory transfers to use TCP";
+    }
     setBoolConfig(config, "MC_MNNVL_EGM", "transports/mnnvl/egm");
     setConfig(config, "MC_RDMA_BIND_ADDRESS", "transports/rdma/bind_address");
     setConfig(config, "MC_NUM_CQ_PER_CTX",

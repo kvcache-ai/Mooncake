@@ -15,8 +15,33 @@ endif()
 find_package(Threads REQUIRED)
 find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
-add_library(conductor_cpp_core STATIC src/common/utils.cpp
-                                      src/prefixindex/hash_strategy.cpp)
+# msgpack-cxx is a header-only C++ binding whose packaging varies: some
+# distributions ship a CMake package config, while Debian and Ubuntu up to
+# 22.04 bundle the headers into libmsgpack-dev with no config at all. Prefer the
+# config when present and otherwise locate the headers directly.
+find_package(msgpack-cxx QUIET)
+if(TARGET msgpack-cxx)
+  set(CONDUCTOR_MSGPACK_LIBS msgpack-cxx)
+  message(STATUS "conductor: msgpack-cxx via package config")
+else()
+  find_path(CONDUCTOR_MSGPACK_INCLUDE_DIR msgpack.hpp)
+  if(NOT CONDUCTOR_MSGPACK_INCLUDE_DIR)
+    message(
+      FATAL_ERROR
+        "msgpack C++ headers (msgpack.hpp) not found; install libmsgpack-cxx-dev or libmsgpack-dev"
+    )
+  endif()
+  set(CONDUCTOR_MSGPACK_INCLUDES ${CONDUCTOR_MSGPACK_INCLUDE_DIR})
+  message(
+    STATUS
+      "conductor: msgpack-cxx via headers in ${CONDUCTOR_MSGPACK_INCLUDE_DIR}")
+endif()
+
+add_library(
+  conductor_cpp_core STATIC
+  src/common/utils.cpp src/prefixindex/hash_strategy.cpp
+  src/prefixindex/prefix_indexer.cpp src/zmq/msg_decoder.cpp
+  src/kvevent/object_key_parser.cpp)
 
 # mooncake-common headers are consumed directly instead of linking
 # mooncake_common: the helpers conductor needs (ascii_string.h,
@@ -26,11 +51,13 @@ add_library(conductor_cpp_core STATIC src/common/utils.cpp
 target_include_directories(
   conductor_cpp_core
   PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
-         ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-common/include)
+         ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-common/include
+         ${CONDUCTOR_MSGPACK_INCLUDES})
 
 target_link_libraries(
-  conductor_cpp_core PUBLIC OpenSSL::Crypto glog::glog JsonCpp::JsonCpp
-                            Threads::Threads)
+  conductor_cpp_core
+  PUBLIC OpenSSL::Crypto ${CONDUCTOR_MSGPACK_LIBS} glog::glog
+         JsonCpp::JsonCpp Threads::Threads)
 
 # The /query hash chain prefers the low-level SHA256_* API, which hashes through
 # a stack context instead of allocating an EVP context per call. Those
