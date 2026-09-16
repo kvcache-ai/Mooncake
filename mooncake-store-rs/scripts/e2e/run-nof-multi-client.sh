@@ -196,7 +196,7 @@ for index in "${!pids[@]}"; do
   fi
   if [[ "${HANDOFF_ABRUPT_EXIT}" == true
         && "${client_id}" == "${HANDOFF_DEPARTING_CLIENT}"
-        && "${exit_code}" == 99 ]]; then
+        && "${exit_code}" == 137 ]]; then
     echo "accepted expected abrupt exit from ${client_id}"
   else
     status=1

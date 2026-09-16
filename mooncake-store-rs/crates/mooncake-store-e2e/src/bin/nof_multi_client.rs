@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::c_void;
+use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1349,7 +1350,12 @@ fn run() -> Result<()> {
         if &client_id == departing {
             if config.handoff_abrupt_exit {
                 eprintln!("{client_id}: exiting abruptly without owner drain");
-                std::process::exit(99);
+                let error = std::process::Command::new("/bin/sh")
+                    .args(["-c", "kill -KILL $$"])
+                    .exec();
+                return Err(StoreError::Transport(format!(
+                    "failed to terminate departing client with SIGKILL: {error}"
+                )));
             }
             println!("{client_id}: leaving normally to hand off NoF target ownership");
             return Ok(());
