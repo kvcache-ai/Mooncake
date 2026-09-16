@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <string_view>
+#include <thread>
 #include <utility>
 
 #include <glog/logging.h>
@@ -510,8 +511,10 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::PrepareRequest(
             curl_easy_setopt(curl, CURLOPT_SEEKDATA, &context.upload_context);
             curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
                              static_cast<curl_off_t>(body_size));
+#if LIBCURL_VERSION_NUM >= 0x073e00  // Added in libcurl 7.62.0.
             curl_easy_setopt(curl, CURLOPT_UPLOAD_BUFFERSIZE,
                              upload_buffer_size_);
+#endif
         } else {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
@@ -705,7 +708,18 @@ OssObjectStorageAdapter::RequestBatch(
         if (multi_result != CURLM_OK || active == 0) break;
         if (completed) continue;
         int ready = 0;
-        multi_result = curl_multi_poll(multi.get(), nullptr, 0, 1000, &ready);
+        const auto wait_start = std::chrono::steady_clock::now();
+        multi_result = curl_multi_wait(multi.get(), nullptr, 0, 1000, &ready);
+        if (multi_result == CURLM_OK && ready == 0) {
+            // With no sockets, curl_multi_wait can return immediately. Avoid
+            // spinning, but do not delay a timer that needs immediate service.
+            long timeout_ms = -1;
+            curl_multi_timeout(multi.get(), &timeout_ms);
+            if (timeout_ms != 0) {
+                std::this_thread::sleep_until(wait_start +
+                                              std::chrono::milliseconds(1));
+            }
+        }
     }
     if (multi_result != CURLM_OK) {
         LOG(ERROR) << "OSS batch request failed: "
