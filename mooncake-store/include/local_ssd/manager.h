@@ -13,7 +13,7 @@
 
 #include "local_ssd/persisted_state.h"
 #include "mutex.h"
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 #include "types.h"
 
 namespace mooncake {

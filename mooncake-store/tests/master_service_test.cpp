@@ -27,6 +27,7 @@
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 #include "common/network.h"
+#include "common/shrink_buckets.h"
 #include "master_service_test_fixture.h"
 
 namespace mooncake::test {
@@ -731,59 +732,6 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
         << "the object survived, so the tenant was never emptied";
 }
 
-// RemoveAll holds one shard lock at a time, so a commit can land in a shard the
-// scan already passed. The scan's own bookkeeping cannot see it, and publishing
-// `cleared` would order it after that commit's `stored` — telling subscribers
-// to drop an object that is live. Pause the scan right after the shard the new
-// key belongs to, commit there, and the clear must be withheld.
-TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
-    MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
-    const auto context = PrepareSimpleSegment(service);
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    ASSERT_TRUE(service
-                    .PutStart(context.client_id, "victim_key",
-                              TenantId::Default(), 1024, config)
-                    .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "victim_key",
-                            TenantId::Default(), ReplicaType::ALL)
-                    .has_value());
-
-    const size_t racer_shard = ShardIndexForKey(service, "racer_key");
-    bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        // Commit exactly once, immediately after the scan releases the shard
-        // the new key hashes to, so the scan can never observe it.
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "racer_key",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "racer_key",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
-
-    service.RemoveAll(true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
-
-    ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
-    auto exists = service.ExistKey("racer_key", TenantId::Default());
-    ASSERT_TRUE(exists.has_value());
-    EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
-
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
-        << "a clear here would retract racer_key, which was just announced";
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
-}
-
 // The mirror image: with no concurrent commit the epoch is unchanged, so the
 // clear must still go out. Without this the fix could pass by never publishing.
 TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
@@ -808,47 +756,148 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
     EXPECT_EQ(0u, service.GetKvClearedSuppressedForTesting());
 }
 
-// The tenant-scoped overload reads the epoch before its scan instead of at
-// first sight of an object, so it needs its own coverage of the same ordering
-// rule.
-TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
+// The other half of the same rule, pinned without any thread: a commit that
+// lands after the baseline read moves the tenant epoch, and the clear for that
+// tenant must then be withheld. Without this the suppression branch had no
+// coverage at all -- only its uncontended mirror above was tested.
+TEST_F(MasterServiceTest, ClearedIsSuppressedWhenACommitRacedTheScan) {
     MasterService service;
     service.SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
+    const TenantId tenant = TenantId::Default();
 
+    // The baseline RemoveAll reads before it starts walking.
+    const uint64_t baseline = KvTenantEpochForTest(service, tenant);
+
+    // A writer commits into the same tenant after that baseline, so its
+    // `stored` is on the wire by the time the walk would decide.
+    ASSERT_TRUE(
+        service.PutStart(context.client_id, "raced_key", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(context.client_id, "raced_key", tenant, ReplicaType::MEMORY)
+            .has_value());
+
+    PublishKvClearedIfEpochUnchangedForTest(service, tenant, baseline);
+
+    auto exists = service.ExistKey("raced_key", tenant);
+    ASSERT_TRUE(exists.has_value());
+    EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract raced_key, which was just announced";
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
+// The same rule through the real entry point. RemoveAll snapshots the tenant
+// keys and reads the epoch baseline before the walk; holding an entry lock
+// parks it between those two steps, so the commit below lands inside the
+// window the rule exists for. A run where the sweep had not yet snapshotted
+// fails the `raced_key` assertion rather than passing vacuously.
+TEST_F(MasterServiceTest, RemoveAllWithholdsClearWhenACommitRacesTheScan) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const TenantId tenant = TenantId::Default();
+
+    ASSERT_TRUE(
+        service.PutStart(context.client_id, "victim_key", tenant, 1024, config)
+            .has_value());
     ASSERT_TRUE(service
-                    .PutStart(context.client_id, "scoped_victim",
-                              TenantId::Default(), 1024, config)
-                    .has_value());
-    ASSERT_TRUE(service
-                    .PutEnd(context.client_id, "scoped_victim",
-                            TenantId::Default(), ReplicaType::ALL)
+                    .PutEnd(context.client_id, "victim_key", tenant,
+                            ReplicaType::MEMORY)
                     .has_value());
 
-    const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
-    bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "scoped_racer",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "scoped_racer",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
+    auto victim = GetEntryForTest(service, tenant, "victim_key");
+    ASSERT_NE(victim, nullptr);
+    auto gate = victim->LockUnique();
+
+    auto remover = std::async(std::launch::async,
+                              [&] { (void)service.RemoveAll(/*force=*/true); });
+    // Let the sweep reach the gate. It snapshots the tenant's keys before the
+    // loop and blocks on the locked entry inside it, which is exactly the
+    // window this rule covers.
+    ASSERT_EQ(remover.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::timeout);
+
+    ASSERT_TRUE(
+        service.PutStart(context.client_id, "racer_key", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service
+            .PutEnd(context.client_id, "racer_key", tenant, ReplicaType::MEMORY)
+            .has_value());
+
+    gate.unlock();
+    remover.get();
+
+    auto racer = service.ExistKey("racer_key", tenant);
+    ASSERT_TRUE(racer.has_value());
+    EXPECT_TRUE(racer.value()) << "the raced commit must still be live";
+    auto swept = service.ExistKey("victim_key", tenant);
+    ASSERT_TRUE(swept.has_value());
+    EXPECT_FALSE(swept.value()) << "the sweep must have torn the victim down";
+
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract racer_key, which was just announced";
+    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+}
+
+// The tenant-scoped overload reads its epoch before the scan, not at first
+// sight of an object, so it needs its own coverage of the same ordering rule.
+TEST_F(MasterServiceTest,
+       TenantScopedRemoveAllWithholdsClearWhenACommitRacesTheScan) {
+    MasterService service;
+    service.SetKvTenantEpochTrackingForTesting(true);
+    const auto context = PrepareSimpleSegment(service);
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const TenantId tenant = TenantId::Default();
+
+    ASSERT_TRUE(
+        service
+            .PutStart(context.client_id, "scoped_victim", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "scoped_victim", tenant,
+                            ReplicaType::MEMORY)
+                    .has_value());
+
+    auto victim = GetEntryForTest(service, tenant, "scoped_victim");
+    ASSERT_NE(victim, nullptr);
+    auto gate = victim->LockUnique();
+
+    auto remover = std::async(std::launch::async, [&] {
+        (void)service.RemoveAll(tenant, /*force=*/true);
     });
+    ASSERT_EQ(remover.wait_for(std::chrono::milliseconds(500)),
+              std::future_status::timeout);
 
-    service.RemoveAll(TenantId::Default(), true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
+    ASSERT_TRUE(
+        service
+            .PutStart(context.client_id, "scoped_racer", tenant, 1024, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(context.client_id, "scoped_racer", tenant,
+                            ReplicaType::MEMORY)
+                    .has_value());
 
-    ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting());
+    gate.unlock();
+    remover.get();
+
+    auto racer = service.ExistKey("scoped_racer", tenant);
+    ASSERT_TRUE(racer.has_value());
+    EXPECT_TRUE(racer.value()) << "the raced commit must still be live";
+    auto swept = service.ExistKey("scoped_victim", tenant);
+    ASSERT_TRUE(swept.has_value());
+    EXPECT_FALSE(swept.value()) << "the sweep must have torn the victim down";
+
+    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+        << "a clear here would retract scoped_racer";
     EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
 }
 
@@ -972,6 +1021,73 @@ TEST_F(MasterServiceTest, TenantScopedPutsAndRemovesUpdateGlobalKeyCount) {
 
     ASSERT_TRUE(service_->Remove(key, tenant_b, /*force=*/true).has_value());
     EXPECT_EQ(service_->GetKeyCount(), 0u);
+}
+
+TEST_F(MasterServiceTest,
+       ConcurrentFirstWritesToDistinctKeysShareReachableTenant) {
+    // Get-or-create must be atomic: 16 threads racing to write the first 16
+    // distinct keys of the same absent tenant all run the tenant factory, but
+    // only the published TenantCatalog is reachable through the directory. With
+    // a non-atomic Lookup + Upsert the losers kept writing into a private
+    // TenantCatalog, silently stranding their objects.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+    const TenantId tenant_id("tenant_concurrent_first_write_distinct_keys");
+
+    static constexpr size_t kThreadCount = 16;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    std::atomic<size_t> ready{0};
+    std::atomic<bool> start{false};
+    std::vector<std::string> keys(kThreadCount);
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        keys[i] = "first_write_key_" + std::to_string(i);
+    }
+
+    for (size_t i = 0; i < kThreadCount; ++i) {
+        threads.emplace_back([&, i]() {
+            ready.fetch_add(1, std::memory_order_acq_rel);
+            while (!start.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+            auto put_start =
+                service_->PutStart(client_id, keys[i], tenant_id, 1024, config);
+            ASSERT_TRUE(put_start.has_value())
+                << "key=" << keys[i] << ", error=" << put_start.error();
+            ASSERT_TRUE(
+                service_
+                    ->PutEnd(client_id, keys[i], tenant_id, ReplicaType::MEMORY)
+                    .has_value());
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreadCount) {
+        std::this_thread::yield();
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Every object must be reachable through the directory, not stranded in a
+    // losing TenantCatalog.
+    for (const auto& key : keys) {
+        EXPECT_TRUE(service_->GetReplicaList(key, tenant_id).has_value())
+            << "stranded key=" << key;
+    }
+}
+
+TEST_F(MasterServiceTest, AccessorCreateRebindsToRouteWinner) {
+    // Regression: MetadataAccessorRW::Create() used to ignore InsertObject()'s
+    // return value, so a concurrent writer that won the key left the accessor
+    // holding an orphan entry that no lookup could reach. It must re-resolve
+    // the route winner instead. The scenario lives on the fixture because the
+    // accessor is private to MasterService and friendship does not inherit.
+    std::unique_ptr<MasterService> service_(new MasterService());
+    AccessorCreateRePinsWinnerEntry(*service_);
 }
 
 TEST_F(MasterServiceTest,
@@ -1372,12 +1488,12 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 }
 
 // A mass client expiry marks handles stale all over the metadata table, so
-// the sweep cleans a shard in bounded write-lock batches instead of holding
-// it exclusively for the whole walk. Dropping and retaking the lock mid-shard
-// must not cost coverage: every key of the departed segment is erased, and
-// every key of a live segment survives. The keys are forced onto one shard
-// because the batch bound is per shard.
-TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
+// the sweep pre-checks every entry under its shared lock and takes the
+// entry's write lock only when the pre-check matches, re-classifying under
+// it. Dropping and retaking the lock between the two must not cost
+// coverage: every key of the departed segment is erased, and every key of a
+// live segment survives.
+TEST_F(MasterServiceTest, ClearInvalidHandlesSweepPreservesCoverage) {
     auto service = std::make_unique<MasterService>();
     PauseReplicaCleanup(*service);
 
@@ -1389,21 +1505,13 @@ TEST_F(MasterServiceTest, ClearInvalidHandlesSweepsShardAcrossLockBatches) {
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Enough keys per segment that draining the shard takes several batches.
     constexpr size_t kKeysPerSegment = 100;
-    const size_t target_shard =
-        MetadataShardIndex(*service, "batch_sweep_seed");
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
     for (size_t i = 0;
          stale_keys.size() + live_keys.size() < 2 * kKeysPerSegment; ++i) {
-        ASSERT_LT(i, 1000000u)
-            << "could not gather enough keys on shard " << target_shard;
         const std::string key = "batch_sweep_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
-            continue;
-        }
 
         const bool on_stale_segment = stale_keys.size() < kKeysPerSegment;
         const UUID& client_id =
@@ -1690,11 +1798,11 @@ TEST_F(MasterServiceTest, ShrinkBucketsIfSparseThresholds) {
     EXPECT_GE(map.bucket_count(), map.size());
 }
 
-TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
+TEST_F(MasterServiceTest, BatchEvictShrinksSparseObjectRoute) {
     // Zero lease TTL so every committed object is immediately evictable.
     auto service_config =
         MasterServiceConfig::builder().set_default_kv_lease_ttl(0).build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    std::unique_ptr<MasterService> service(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     constexpr size_t buffer = 0x300000000;
     constexpr size_t object_size = 1024;
@@ -1702,50 +1810,46 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     // Size the segment with ample headroom so the background eviction
     // thread never fires; only the explicit call below evicts.
     [[maybe_unused]] const auto context = PrepareSimpleSegment(
-        *service_, "test_segment", buffer, object_size * object_count * 16);
+        *service, "test_segment", buffer, object_size * object_count * 16);
 
-    // Pick keys that all hash to one shard so its metadata map grows past
-    // the shrink floor; random keys would spread these objects thinly
-    // across all 1024 shards.
-    const size_t target_shard = MetadataShardIndex(*service_, "shrink_key_0");
+    // One tenant owns one object route, so these puts grow a single bucket
+    // array past the shrink floor.
     std::vector<std::string> keys;
-    for (size_t i = 0; keys.size() < object_count; ++i) {
-        std::string key = "shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service_, key) != target_shard) continue;
-        keys.push_back(std::move(key));
+    keys.reserve(object_count);
+    for (size_t i = 0; i < object_count; ++i) {
+        keys.push_back("shrink_key_" + std::to_string(i));
     }
 
     ReplicateConfig config;
     config.replica_num = 1;
     for (const auto& key : keys) {
         // Hard-pin the first object: it is excluded from eviction, so the
-        // tenant (and its metadata map) deterministically survives the
-        // full eviction below and the shrunk bucket count stays
-        // observable.
+        // tenant (and its route) deterministically survives the full
+        // eviction below and the shrunk bucket count stays observable.
         config.with_hard_pin = (&key == &keys.front());
-        ASSERT_TRUE(service_
+        ASSERT_TRUE(service
                         ->PutStart(client_id, key, TenantId::Default(),
                                    object_size, config)
                         .has_value());
-        ASSERT_TRUE(service_
+        ASSERT_TRUE(service
                         ->PutEnd(client_id, key, TenantId::Default(),
                                  ReplicaType::MEMORY)
                         .has_value());
     }
 
-    const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
+    const size_t buckets_before = RouteBucketCountForTesting(*service);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
-    service_->RunBatchEvictForTesting(1.0, 1.0);
+    service->RunBatchEvictForTesting(1.0, 1.0);
 
-    const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
+    const size_t buckets_after = RouteBucketCountForTesting(*service);
     ASSERT_GT(buckets_after, 0u);
     // Without the post-eviction shrink the bucket array would still sit at
     // its high-water mark and this assertion would fail.
     EXPECT_LT(buckets_after, buckets_before / 2);
 }
 
-TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
+TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseObjectRoute) {
     // Regression for the lease-expire / client-offboarding delete path.
     // ClearInvalidHandles -> ClearStaleHandles can erase tens of millions of
     // keys from a shared tenant; erase() never returns bucket memory, so a
@@ -1763,24 +1867,15 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     const auto live_segment = PrepareSimpleSegment(*service, live_segment_name,
                                                    0x400000000, kSegmentSize);
 
-    // Gather keys on one shard so its metadata map grows past the shrink
-    // floor; spreading them across all 1024 shards would leave each map tiny.
-    const size_t target_shard =
-        MetadataShardIndex(*service, "clear_shrink_key_0");
-    // A few live keys keep the shared tenant alive after the sweep (partial
-    // drain, not full erase); the rest are swept and must trigger a shrink.
+    // A few live keys keep the shared tenant alive after the sweep (a partial
+    // drain, not a full erase); the rest are swept and must trigger a shrink.
     constexpr size_t kLiveKeys = 128;
     constexpr size_t kTotalKeys = 2 * kShrinkMinBucketCount;
 
     std::vector<std::string> stale_keys;
     std::vector<std::string> live_keys;
     for (size_t i = 0; stale_keys.size() + live_keys.size() < kTotalKeys; ++i) {
-        ASSERT_LT(i, 5000000u)
-            << "could not gather enough keys on shard " << target_shard;
         const std::string key = "clear_shrink_key_" + std::to_string(i);
-        if (MetadataShardIndex(*service, key) != target_shard) {
-            continue;
-        }
 
         const bool on_live = live_keys.size() < kLiveKeys;
         const UUID& client_id =
@@ -1804,11 +1899,11 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     }
     ASSERT_GT(stale_keys.size(), live_keys.size());
 
-    const size_t buckets_before = MetadataBucketCount(*service, target_shard);
+    const size_t buckets_before = RouteBucketCountForTesting(*service);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
     // Unmount the stale segment, then sweep inline. The tenant survives
-    // because the live segment still holds keys, so the metadata map is only
+    // because the live segment still holds keys, so the object route is only
     // partially drained — exactly the case that leaks bucket memory without
     // the shrink.
     ASSERT_TRUE(
@@ -1821,7 +1916,7 @@ TEST_F(MasterServiceTest, ClearStaleHandlesShrinksSparseMetadataMaps) {
     // "merely hidden by the unmount".
     EXPECT_EQ(live_keys.size(), service->GetKeyCount());
 
-    const size_t buckets_after = MetadataBucketCount(*service, target_shard);
+    const size_t buckets_after = RouteBucketCountForTesting(*service);
     ASSERT_GT(buckets_after, 0u);
     // Without the post-sweep shrink the bucket array would stay at its
     // high-water mark and this assertion would fail.
@@ -1992,8 +2087,8 @@ TEST_F(MasterServiceTest, SoftPinDeadlineIndexExpiresOnlyDueEntries) {
     PutCompletedObject(*service, client_id, "deadline_key", config);
 
     ReplicateConfig grouped_config = config;
-    grouped_config.group_ids = std::vector<std::string>{
-        FindGroupIdOnDifferentShard("grouped_deadline_key")};
+    grouped_config.group_ids =
+        std::vector<std::string>{UnrelatedGroupId("grouped_deadline_key")};
     PutCompletedObject(*service, client_id, "grouped_deadline_key",
                        grouped_config);
 
@@ -2109,8 +2204,7 @@ TEST_F(MasterServiceTest, SoftPinDeadlineHeapCompactsRepeatedUpdates) {
     constexpr size_t kUpdates = 5000;
     for (size_t i = 0; i < kUpdates; ++i) {
         UpsertSoftPinDeadlineIndexForTest(
-            service, "compaction_key", 0,
-            base + std::chrono::milliseconds(i + 1));
+            service, "compaction_key", base + std::chrono::milliseconds(i + 1));
     }
 
     EXPECT_EQ(SoftPinRegistrationCount(service), 1u);

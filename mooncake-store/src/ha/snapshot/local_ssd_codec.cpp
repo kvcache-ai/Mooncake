@@ -2,7 +2,7 @@
 
 #include <fmt/format.h>
 
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 
 namespace mooncake::ha {
 namespace {

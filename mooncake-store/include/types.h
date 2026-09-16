@@ -11,7 +11,7 @@
 #include <utility>
 #include <vector>
 
-#include "tenant_id.h"
+#include "tenant/tenant_id.h"
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"

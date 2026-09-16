@@ -731,12 +731,12 @@ TEST_F(SegmentTest,
             ErrorCode::OK);
     }
 
-    AllocatorManager snapshot;
+    std::shared_ptr<const AllocatorManager> snapshot;
     {
         auto allocator_access = segment_manager.getAllocatorAccess();
         snapshot = allocator_access.SnapshotAllocatorManager();
     }
-    auto registrations = snapshot.getAllocators(segment.name);
+    auto registrations = snapshot->getAllocators(segment.name);
     ASSERT_NE(registrations, nullptr);
     ASSERT_EQ(registrations->size(), 1u);
     auto existing_buffer = registrations->front()->Allocate(1024);
@@ -750,7 +750,7 @@ TEST_F(SegmentTest,
     }
 
     RandomAllocationStrategy strategy;
-    auto allocation = strategy.AllocateFrom(snapshot, 1024, segment.name);
+    auto allocation = strategy.AllocateFrom(*snapshot, 1024, segment.name);
     ASSERT_FALSE(allocation.has_value());
     EXPECT_EQ(allocation.error(), ErrorCode::NO_AVAILABLE_HANDLE);
     EXPECT_TRUE(existing_buffer->isAvailable());
@@ -856,7 +856,7 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
 
     auto blocking = std::make_shared<BlockingAllocateOffsetBufferAllocator>(
         segment.name, segment.base, segment.size, segment.te_endpoint);
-    AllocatorManager snapshot;
+    std::shared_ptr<const AllocatorManager> snapshot;
     {
         auto segment_access = segment_manager.getSegmentAccess();
         ASSERT_EQ(
@@ -870,7 +870,7 @@ TEST_F(SegmentTest, DetachedAllocationDoesNotBlockLivenessTransition) {
         auto allocator_access = segment_manager.getAllocatorAccess();
         snapshot = allocator_access.SnapshotAllocatorManager();
     }
-    const auto* registrations = snapshot.getAllocators(segment.name);
+    const auto* registrations = snapshot->getAllocators(segment.name);
     ASSERT_NE(registrations, nullptr);
     ASSERT_EQ(registrations->size(), 1u);
 

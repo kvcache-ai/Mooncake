@@ -320,8 +320,8 @@ class ScopedAllocatorAccess {
         return allocator_manager_;
     }
 
-    AllocatorManager SnapshotAllocatorManager() const {
-        return allocator_manager_.Snapshot(client_by_name_);
+    std::shared_ptr<const AllocatorManager> SnapshotAllocatorManager() const {
+        return allocator_manager_.SharedSnapshot(client_by_name_);
     }
 
     std::vector<std::string> GetHostOrderedSegments(
