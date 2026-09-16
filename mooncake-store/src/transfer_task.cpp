@@ -17,6 +17,7 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #ifdef USE_NOF
+#include "nof_io_layout.h"
 #include "spdk/spdk_wrapper.h"
 #endif
 
@@ -1428,21 +1429,89 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     }
 
     uint32_t block_size = SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-    if (block_size == INVALID_BLOCK_SIZE ||
-        handle.buffer_address_ % block_size != 0 || size % block_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(ptr) % block_size != 0) {
-        LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
-                   << ", ptr=" << ptr << ", size=" << size
-                   << " is not aligned to block size " << block_size;
+    if (block_size == INVALID_BLOCK_SIZE || block_size == 0) {
+        LOG(ERROR) << "Invalid NoF block size " << block_size
+                   << " for endpoint=" << handle.transport_endpoint_;
         return std::nullopt;
     }
 
-    auto state = std::make_shared<SpdkNofOperationState>();
-    SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
-                     size / block_size, op_code, state);
-    spdk_nvmf_pool_->submitTask(std::move(task));
+    // Upstream callers pass logical object sizes and buffer addresses that
+    // need not be block multiples, so pad the I/O up to a block boundary
+    // instead of rejecting the request.
+    NoFIoLayout layout;
+    if (!BuildNoFIoLayout(block_size, handle.buffer_address_,
+                          reinterpret_cast<std::uintptr_t>(ptr), size,
+                          layout)) {
+        LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
+                   << ", ptr=" << ptr << ", size=" << size
+                   << " cannot be mapped onto block size " << block_size;
+        return std::nullopt;
+    }
 
-    VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;
+    char* buffer = static_cast<char*>(ptr);
+    if (layout.is_direct()) {
+        const auto& segment = layout.segments.front();
+        auto state = std::make_shared<SpdkNofOperationState>();
+        SpdkNofTask task(seg_handle, buffer + segment.buffer_offset,
+                         segment.lba, segment.lba_count, op_code, state);
+        spdk_nvmf_pool_->submitTask(std::move(task));
+
+        VLOG(1) << "SPDK NoF transfer submitted to "
+                << handle.transport_endpoint_;
+        return TransferFuture(state);
+    }
+
+    // Every bounce buffer is allocated before the first task is queued: once
+    // a task reaches the worker pool its completion is guaranteed, so bailing
+    // out halfway would leave the shared state waiting forever.
+    std::vector<SpdkNofStagingBuffer> staging;
+    std::vector<SpdkNofStagedOperationState::CopyBack> copy_backs;
+    std::vector<void*> segment_buffers(layout.segments.size(), nullptr);
+    for (size_t i = 0; i < layout.segments.size(); ++i) {
+        const auto& segment = layout.segments[i];
+        if (segment.kind == NoFIoSegmentKind::kDirect) {
+            segment_buffers[i] = buffer + segment.buffer_offset;
+            continue;
+        }
+
+        const size_t staging_size =
+            static_cast<size_t>(segment.lba_count) * block_size;
+        void* staged =
+            SpdkWrapper::GetInstance().Alloc(staging_size, block_size);
+        if (!staged) {
+            LOG(ERROR) << "Failed to allocate " << staging_size
+                       << " bytes of NoF staging memory for endpoint="
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+        staging.emplace_back(staged);
+        segment_buffers[i] = staged;
+
+        if (op_code == TransferRequest::WRITE) {
+            // Alloc() hands back zeroed memory, so the padding bytes are
+            // already zero and the caller's buffer is never read past its
+            // logical end.
+            std::memcpy(staged, buffer + segment.buffer_offset,
+                        segment.payload_size);
+        } else {
+            copy_backs.push_back({buffer + segment.buffer_offset, staged,
+                                  static_cast<size_t>(segment.payload_size)});
+        }
+    }
+
+    auto state = std::make_shared<SpdkNofStagedOperationState>(
+        static_cast<int>(layout.segments.size()), std::move(staging),
+        std::move(copy_backs));
+    for (size_t i = 0; i < layout.segments.size(); ++i) {
+        const auto& segment = layout.segments[i];
+        SpdkNofTask task(seg_handle, segment_buffers[i], segment.lba,
+                         segment.lba_count, op_code, state);
+        spdk_nvmf_pool_->submitTask(std::move(task));
+    }
+
+    VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_
+            << " in " << layout.segments.size() << " parts, "
+            << layout.staging_bytes(block_size) << " staged bytes";
     return TransferFuture(state);
 }
 #endif

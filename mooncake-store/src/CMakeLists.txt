@@ -104,6 +104,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv_key_codec.cpp
     nvme_kv_key_conflict_policy.cpp
     nvme_kv_object_layout.cpp
+    nof_io_layout.cpp
     transfer_task.cpp
     posix_file.cpp
     client_buffer.cpp
