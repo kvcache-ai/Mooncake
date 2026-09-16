@@ -258,7 +258,9 @@ change executor locators.
 `SpdkNofBlockDevice` is the transport below ExtentStore. It attaches an NVMe-oF controller,
 serializes I/O through the current SPDK qpair, uses SPDK DMA buffers for submitted chunks,
 performs aligned block I/O, exposes geometry, and implements the flush barrier. Extent alignment
-is not part of the generic NoF traits.
+is not part of the generic NoF traits. A failed health check or I/O operation invalidates the
+controller; the next operation reattaches with the saved transport configuration, verifies that
+the target geometry is unchanged, and retries the operation once.
 
 A StoreClient target set uses exactly one authority mode. Provider-owned KVCS targets and
 Mooncake-managed ExtentStore targets are configured on separate clients so recovery and deletion
@@ -793,9 +795,10 @@ not implement a second LRU oracle.
   an old and rewritten route to share a target/locator pair.
 - `NOF_HANDOFF_DEPARTING_CLIENT=<client-id>` makes one of exactly two clients exit normally after
   offload; the survivor then deletes, rewrites, offloads, and reads the complete object set.
-- `NOF_HANDOFF_ABRUPT_EXIT=true` makes that departing client exit without drain; the runner accepts
-  the dedicated test exit code only for that client, then the survivor waits for lease expiry and
-  exercises takeover. Set `NOF_LEASE_TTL_MS` to a short test lease and set
+- `NOF_HANDOFF_ABRUPT_EXIT=true` kills that departing client with `SIGKILL`, without drain; the
+  runner accepts exit status 137 only for that client. The survivor continues renewing its own
+  lease while it waits for the departed owner's lease to expire, then exercises takeover. Set
+  `NOF_LEASE_TTL_MS` to a short test lease and set
   `NOF_HANDOFF_WAIT_SECONDS` greater than the lease plus two seconds. The per-client timeout must
   also exceed the handoff wait.
 - `NOF_READ_ONLY=true` skips writes and validates routes rebuilt from existing target manifests.
