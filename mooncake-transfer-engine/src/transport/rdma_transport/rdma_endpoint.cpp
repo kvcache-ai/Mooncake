@@ -24,6 +24,8 @@
 #include <chrono>
 #include <thread>
 #include <sstream>
+#include <utility>
+#include <vector>
 
 #ifdef USE_MLX5DV
 #include <infiniband/mlx5dv.h>
@@ -145,6 +147,8 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
+    posted_fifo_.assign(num_qp_list, {});
+    unsignaled_since_signal_.assign(num_qp_list, 0);
     for (size_t i = 0; i < num_qp_list; ++i) {
         wr_depth_list_[i].store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
@@ -221,7 +225,19 @@ int RdmaEndPoint::deconstructLocked() {
     peer_notify_qp_num_ = 0;
     // Adjust cq_outstanding_ before destroying QPs, so the counter is
     // always corrected even if ibv_destroy_qp fails and we return early.
+    // Only signaled WRs occupy CQ slots; wr_depth counts every WR.
     bool displayed = false;
+    int cq_sub = 0;
+    for (auto &q : posted_fifo_) {
+        for (auto *slice : q) {
+            if (slice && slice->rdma.signaled) cq_sub++;
+        }
+        q.clear();
+    }
+    posted_fifo_.clear();
+    unsignaled_since_signal_.clear();
+    if (cq_outstanding_ && cq_sub)
+        cq_outstanding_->fetch_sub(cq_sub, std::memory_order_acq_rel);
     if (wr_depth_list_) {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
             int wr_depth = wr_depth_list_[i].load(std::memory_order_relaxed);
@@ -232,7 +248,6 @@ int RdmaEndPoint::deconstructLocked() {
                            "be generated";
                     displayed = true;
                 }
-                cq_outstanding_->fetch_sub(wr_depth, std::memory_order_acq_rel);
                 wr_depth_list_[i].store(0, std::memory_order_relaxed);
             }
         }
@@ -1270,6 +1285,23 @@ const std::string RdmaEndPoint::toString() const {
         return "EndPoint: local " + context_.nicPath() + " (unconnected)";
 }
 
+size_t RdmaEndPoint::collectPostedCompletions(
+    Transport::Slice *signaled, bool success,
+    std::vector<Transport::Slice *> &out) {
+    RWSpinlock::WriteGuard guard(lock_);
+    if (!signaled || posted_fifo_.empty()) return 0;
+    const int qp = signaled->rdma.qp_index;
+    if (qp < 0 || qp >= static_cast<int>(posted_fifo_.size())) return 0;
+    const size_t n =
+        collectPostedFifo(posted_fifo_[static_cast<size_t>(qp)], signaled,
+                          !success, out);
+    if (n && wr_depth_list_) {
+        wr_depth_list_[qp].fetch_sub(static_cast<int>(n),
+                                     std::memory_order_acq_rel);
+    }
+    return n;
+}
+
 int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
@@ -1287,12 +1319,11 @@ int RdmaEndPoint::submitPostSend(
     int cq_remaining = int(globalConfig().max_cqe) -
                        cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
+    const int signal_interval = globalConfig().rdma_signal_interval;
 
-    // Only allocate for the max number of WRs we can actually post per QP,
-    // not the entire requested slice count. Each QP iteration reuses the
-    // wr_list/sge_list from index 0, so we only need max_wr_depth_ entries.
+    // Allocate for SQ depth, not CQ depth: unsignaled WRs do not consume CQEs.
     size_t max_postable_per_qp =
-        std::min({(size_t)max_wr_depth_, (size_t)cq_remaining, requested});
+        std::min({(size_t)max_wr_depth_, requested});
     std::vector<ibv_send_wr> wr_list(max_postable_per_qp, ibv_send_wr{});
     std::vector<ibv_sge> sge_list(max_postable_per_qp);
     size_t total_posted = 0;
@@ -1304,6 +1335,7 @@ int RdmaEndPoint::submitPostSend(
         int qp_avail = max_wr_depth_ -
                        wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
+        if (qp_index >= posted_fifo_.size()) continue;
 
         size_t remaining_qps = num_qp - qp_index;
         size_t remaining_slices = requested - cursor;
@@ -1312,8 +1344,35 @@ int RdmaEndPoint::submitPostSend(
         size_t end = std::min(start + chunk, requested);
         int assigned_count = (int)(end - start);
 
-        int wr_count = std::min(assigned_count, qp_avail);
-        wr_count = std::min(wr_count, cq_remaining);
+        int candidate = std::min(assigned_count, qp_avail);
+        auto compute_signals = [&](int n) {
+            std::vector<char> sig(static_cast<size_t>(n));
+            int since = unsignaled_since_signal_[qp_index];
+            int nsig = 0;
+            for (int i = 0; i < n; ++i) {
+                const bool last = (i + 1 == n);
+                sig[static_cast<size_t>(i)] = shouldSignalRdmaWr(
+                    since, signal_interval, max_wr_depth_, last);
+                if (sig[static_cast<size_t>(i)]) {
+                    nsig++;
+                    since = 0;
+                } else {
+                    since++;
+                }
+            }
+            return std::make_pair(std::move(sig), nsig);
+        };
+        auto computed = compute_signals(candidate);
+        std::vector<char> sig = std::move(computed.first);
+        int nsig = computed.second;
+        while (candidate > 0 && nsig > cq_remaining) {
+            --candidate;
+            computed = compute_signals(candidate);
+            sig = std::move(computed.first);
+            nsig = computed.second;
+        }
+        const int wr_count = candidate;
+        if (wr_count <= 0) continue;
 
         for (int i = 0; i < wr_count; ++i) {
             auto *slice = slice_list[start + i];
@@ -1330,18 +1389,20 @@ int RdmaEndPoint::submitPostSend(
                             : IBV_WR_RDMA_WRITE;
             wr.num_sge = 1;
             wr.sg_list = &sge;
-            wr.send_flags = IBV_SEND_SIGNALED;
+            wr.send_flags = sig[static_cast<size_t>(i)] ? IBV_SEND_SIGNALED : 0;
             wr.next = (i + 1 == wr_count) ? nullptr : &wr_list[i + 1];
             wr.wr.rdma.remote_addr = slice->rdma.dest_addr;
             wr.wr.rdma.rkey = slice->rdma.dest_rkey;
             slice->ts = getCurrentTimeInNano();
             slice->status = Transport::Slice::POSTED;
             slice->rdma.qp_depth = &wr_depth_list_[qp_index];
+            slice->rdma.qp_index = static_cast<int>(qp_index);
+            slice->rdma.signaled = sig[static_cast<size_t>(i)];
         }
 
         ibv_send_wr *bad_wr = nullptr;
         wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
-        cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
+        cq_outstanding_->fetch_add(nsig, std::memory_order_acq_rel);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
         context_.trackPostedSlices(slice_list, start, wr_count);
@@ -1352,21 +1413,44 @@ int RdmaEndPoint::submitPostSend(
                 bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0;
             context_.untrackPostedSlices(slice_list, start + first_failed,
                                          wr_count - first_failed);
+            int failed_signaled = 0;
+            int failed_count = 0;
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);
-                wr_depth_list_[qp_index].fetch_sub(1,
-                                                   std::memory_order_acq_rel);
-                cq_outstanding_->fetch_sub(1, std::memory_order_acq_rel);
+                if (sig[static_cast<size_t>(i)]) failed_signaled++;
+                failed_count++;
                 bad_wr = bad_wr->next;
             }
+            wr_depth_list_[qp_index].fetch_sub(failed_count,
+                                               std::memory_order_acq_rel);
+            cq_outstanding_->fetch_sub(failed_signaled,
+                                       std::memory_order_acq_rel);
+            int since = unsignaled_since_signal_[qp_index];
+            for (size_t i = 0; i < first_failed; ++i) {
+                posted_fifo_[qp_index].push_back(slice_list[start + i]);
+                if (sig[i])
+                    since = 0;
+                else
+                    since++;
+            }
+            unsignaled_since_signal_[qp_index] = since;
             total_posted += wr_count;
             cursor += wr_count;
             break;
         }
+        int since = unsignaled_since_signal_[qp_index];
+        for (int i = 0; i < wr_count; ++i) {
+            posted_fifo_[qp_index].push_back(slice_list[start + i]);
+            if (sig[static_cast<size_t>(i)])
+                since = 0;
+            else
+                since++;
+        }
+        unsignaled_since_signal_[qp_index] = since;
         total_posted += wr_count;
         cursor += wr_count;
-        cq_remaining -= wr_count;
+        cq_remaining -= nsig;
     }
     slice_list.erase(slice_list.begin(),
                      slice_list.begin() + (ptrdiff_t)total_posted);

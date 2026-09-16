@@ -221,6 +221,16 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* signal_interval_env = std::getenv("MC_RDMA_SIGNAL_INTERVAL");
+    if (signal_interval_env) {
+        int val = atoi(signal_interval_env);
+        if (val > 0 && val <= UINT16_MAX)
+            config.rdma_signal_interval = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_SIGNAL_INTERVAL";
+    }
+
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
     if (max_inline_env) {
         size_t val = atoi(max_inline_env);
@@ -875,6 +885,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;
     LOG(INFO) << "max_sge = " << config.max_sge;
     LOG(INFO) << "max_wr = " << config.max_wr;
+    LOG(INFO) << "rdma_signal_interval = " << config.rdma_signal_interval;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;

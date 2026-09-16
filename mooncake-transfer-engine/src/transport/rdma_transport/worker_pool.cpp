@@ -793,7 +793,6 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
     }
 
     const static size_t kPollCount = 64;
-    std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
     if (cq_index < 0) return 0;
@@ -805,30 +804,42 @@ int WorkerPool::performPollCq(int thread_id, bool defer_local_redispatch) {
         return nr_poll;
     }
 
-    if (nr_poll > 0 && globalConfig().track_rdma_posted_slices) {
-        std::lock_guard<std::mutex> lock(posted_slices_mutex_);
-        for (int i = 0; i < nr_poll; ++i) {
-            auto *slice = reinterpret_cast<Transport::Slice *>(wc[i].wr_id);
-            posted_slices_.erase(slice);
+    int cqe_consumed = 0;
+    for (int i = 0; i < nr_poll; ++i) {
+        Transport::Slice *signaled = (Transport::Slice *)wc[i].wr_id;
+        if (!signaled) continue;
+        assert(postingThreadForPeer(signaled->peerNicPath()) == thread_id);
+        const bool success = wc[i].status == IBV_WC_SUCCESS;
+        std::vector<Transport::Slice *> drained;
+        if (signaled->rdma.endpoint) {
+            const size_t n = signaled->rdma.endpoint->collectPostedCompletions(
+                signaled, success, drained);
+            // A later flush CQE for a WR already retired with an error
+            // window must not complete the slice twice.
+            if (n == 0) {
+                cqe_consumed++;
+                continue;
+            }
+        } else {
+            drained.push_back(signaled);
+            if (signaled->rdma.qp_depth)
+                signaled->rdma.qp_depth->fetch_sub(
+                    1, std::memory_order_acq_rel);
+        }
+        cqe_consumed++;
+        if (globalConfig().track_rdma_posted_slices) {
+            std::lock_guard<std::mutex> lock(posted_slices_mutex_);
+            for (auto *slice : drained) posted_slices_.erase(slice);
+        }
+        for (auto *slice : drained) {
+            ibv_wc expanded = wc[i];
+            expanded.wr_id = reinterpret_cast<uint64_t>(slice);
+            wc_list.push_back(expanded);
         }
     }
-
-    for (int i = 0; i < nr_poll; ++i) {
-        Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
-        assert(slice);
-        assert(postingThreadForPeer(slice->peerNicPath()) == thread_id);
-        if (qp_depth_set.count(slice->rdma.qp_depth))
-            qp_depth_set[slice->rdma.qp_depth]++;
-        else
-            qp_depth_set[slice->rdma.qp_depth] = 1;
-        wc_list.push_back(wc[i]);
-    }
-    if (nr_poll)
+    if (cqe_consumed)
         context_.cqOutstandingCount(cq_index)->fetch_sub(
-            nr_poll, std::memory_order_acq_rel);
-
-    for (auto &entry : qp_depth_set)
-        entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
+            cqe_consumed, std::memory_order_acq_rel);
 
     if (!wc_list.empty())
         processCompletions(thread_id, wc_list, defer_local_redispatch);

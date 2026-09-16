@@ -17,11 +17,14 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <queue>
+#include <vector>
 
 #include "rdma_context.h"
+#include "rdma_posted_fifo.h"
 
 namespace mooncake {
 
@@ -181,6 +184,14 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
 
+    // Map a signaled CQE onto the posting-order FIFO for that QP. On
+    // success, retires every unsignaled WR up to `signaled`. On failure,
+    // retires the whole remaining window (later WRs will not generate CQEs).
+    // Decrements wr_depth by the number of retired slices. Returns 0 if
+    // `signaled` is not in the FIFO (already collected).
+    size_t collectPostedCompletions(Transport::Slice *signaled, bool success,
+                                    std::vector<Transport::Slice *> &out);
+
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
 
@@ -276,6 +287,12 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
+
+    // One posting-order FIFO per QP so a signaled CQE can retire the
+    // unsignaled WRs that preceded it. unsignaled_since_signal_ is the
+    // number of consecutive unsignaled WRs already on that QP's SQ.
+    std::vector<std::deque<Transport::Slice *>> posted_fifo_;
+    std::vector<int> unsignaled_since_signal_;
 
     std::atomic<bool> active_;
     ibv_cq *cq_;
