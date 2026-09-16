@@ -9,8 +9,9 @@
 // split the hugetlb VMA at a non-hugepage-aligned boundary.
 //
 // Sub-range registrations are deliberately NOT special-cased: they register
-// the logical range exactly as passed and fail with EINVAL on RDMA when
-// misaligned (documented boundary).
+// the logical range exactly as passed. On RDMA a misaligned range may fail
+// with EINVAL depending on the environment's fork-protection behavior; the
+// invariant is that the range is never silently widened.
 //
 // Protocol/device are taken from the PROTOCOL / DEVICE_NAME environment
 // variables (tcp|rdma, same convention as pybind_client_test). With
@@ -126,6 +127,24 @@ TEST_F(RealClientHugepageRegisterTest, SegmentBaseRegistersFullSegment) {
     EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
 }
 
+// A zero-length registration of a segment base must still be rejected. The
+// base-widening path expands "size < shm->size" to the physical segment, and
+// size==0 would otherwise satisfy that check and be silently widened, slipping
+// past the length==0 rejection. The size>0 guard keeps zero-length requests on
+// the normal rejection path. The request is refused before any ibv_reg_mr, so
+// this test is protocol-agnostic and leaves no fork-protection residue.
+TEST_F(RealClientHugepageRegisterTest, ZeroLengthSegmentBaseIsRejected) {
+    const size_t kSegmentSize = 8 * 1024 * 1024;
+    void* base = ShmHelper::getInstance()->allocate(kSegmentSize);
+    ASSERT_NE(base, nullptr);
+    ASSERT_TRUE(ShmHelper::getInstance()->is_hugepage());
+
+    EXPECT_NE(client_->register_buffer(base, 0), 0)
+        << "zero-length registration must not be widened to the segment";
+
+    EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
+}
+
 // The parallel preTouch path (buffers >= 4GiB) trial-registers each thread's
 // block, so its block split must be kernel-page aligned. A 4GiB+1MB logical
 // request aligns the segment up to 2049 hugepages (4GiB + 2MB); 2049 is not
@@ -225,11 +244,13 @@ TEST_F(RealClientHugepageRegisterTest,
     void* sub = static_cast<char*>(base) + kOffset;
 
     const int rc = client_->register_buffer(sub, kLength);
-    if (protocol_ == std::string("rdma")) {
-        EXPECT_NE(rc, 0)
-            << "misaligned interior sub-range must not be silently widened";
-    } else {
-        EXPECT_EQ(rc, 0);
+    // The interior pointer is registered exactly as passed: widening only
+    // applies to the segment base (buffer == shm->base_addr), so it never
+    // triggers here. Whether ibv_reg_mr then rejects the misaligned range
+    // depends on the environment's fork-protection behavior (e.g.
+    // IBV_FORK_UNNEEDED, or RDMAV_HUGEPAGES_SAFE=1), so accept both outcomes
+    // and only require that a successful registration unregisters cleanly.
+    if (rc == 0) {
         EXPECT_EQ(client_->unregister_buffer(sub), 0);
     }
 

@@ -3564,11 +3564,13 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     // otherwise madvise(MADV_DONTFORK) (active after ibv_fork_init) fails
     // with EINVAL when the kernel has to split the hugetlb VMA. Sub-range
     // registrations are not special-cased and behave exactly as before.
+    // A zero-length request is left untouched so it keeps hitting the
+    // existing length==0 rejection instead of being widened to the segment.
     size_t registration_size = size;
     auto *shm_helper = ShmHelper::getInstance();
     if (shm_helper->is_hugepage()) {
         auto shm = shm_helper->get_shm(buffer);
-        if (shm && buffer == shm->base_addr && size < shm->size) {
+        if (shm && buffer == shm->base_addr && size > 0 && size < shm->size) {
             registration_size = shm->size;
             LOG(INFO) << "Registering HugeTLB shared-memory segment: base="
                       << buffer << ", segment_size=" << shm->size
