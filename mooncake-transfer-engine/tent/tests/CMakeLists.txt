@@ -9,6 +9,10 @@ target_include_directories(tent_diagnostic_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_diagnostic_test COMMAND tent_diagnostic_test)
 
+add_test(NAME tent_cli_test
+         COMMAND ${CMAKE_COMMAND} "-DTENT_CLI=$<TARGET_FILE:tent_cli>" -P
+                 ${CMAKE_CURRENT_SOURCE_DIR}/cli_test.cmake)
+
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
 # asio_shared must be linked explicitly for executables:

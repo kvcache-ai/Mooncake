@@ -22,22 +22,26 @@ namespace diagnostics = mooncake::tent::diagnostics;
 namespace {
 
 void printUsage(std::ostream& output) {
-    output << "Usage: tent version [--json]\n";
+    output << "Usage: tent <command> [options]\n"
+           << "Commands:\n"
+           << "  diagnostics  Run offline diagnostics\n";
 }
 
-}  // namespace
+void printDiagnosticsUsage(std::ostream& output) {
+    output << "Usage: tent diagnostics version [--json]\n";
+}
 
-int main(int argc, char** argv) {
+int runDiagnostics(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--help") {
-        printUsage(std::cout);
+        printDiagnosticsUsage(std::cout);
         return 0;
     }
     if (argc < 2 || std::string_view(argv[1]) != "version") {
-        printUsage(std::cerr);
+        printDiagnosticsUsage(std::cerr);
         return 2;
     }
     if (argc > 3 || (argc == 3 && std::string_view(argv[2]) != "--json")) {
-        printUsage(std::cerr);
+        printDiagnosticsUsage(std::cerr);
         return 2;
     }
 
@@ -48,4 +52,18 @@ int main(int argc, char** argv) {
         std::cout << diagnostics::renderText(snapshot);
     }
     return diagnostics::diagnosticExitCode(snapshot);
+}
+
+}  // namespace
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--help") {
+        printUsage(std::cout);
+        return 0;
+    }
+    if (argc >= 2 && std::string_view(argv[1]) == "diagnostics") {
+        return runDiagnostics(argc - 1, argv + 1);
+    }
+    printUsage(std::cerr);
+    return 2;
 }
