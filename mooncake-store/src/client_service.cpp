@@ -16,6 +16,7 @@
 #include "types.h"
 #include "p2p/client/p2p_client_service.h"
 #include "centralized_client_service.h"
+#include "tracing.h"
 #include <ylt/coro_http/coro_http_client.hpp>
 
 namespace mooncake {
@@ -573,6 +574,43 @@ void ClientService::RegisterHttpMethods() {
         "/health", [this](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, GetHealthStatus());
+        });
+
+    // GET  /trace_filter            -> current Backup span export state
+    // POST /trace_filter?export_backup_spans=true|false|1|0 -> toggle it.
+    // When Backup span export is off, the real_client hop drops Backup-role
+    // spans and tags the outgoing RequestContext so the master hop drops its
+    // span for the same request too (see tracing.h).
+    http_server_->set_http_handler<GET>(
+        "/trace_filter",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            bool on = IsExportBackupSpansEnabled();
+            resp.add_header("Content-Type", "text/plain");
+            resp.set_status_and_content(
+                status_type::ok,
+                on ? "export_backup_spans=true" : "export_backup_spans=false");
+        });
+    http_server_->set_http_handler<POST>(
+        "/trace_filter",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto val = req.get_query_value("export_backup_spans");
+            bool enable = false;
+            if (val == "true" || val == "1") {
+                enable = true;
+            } else if (val == "false" || val == "0") {
+                enable = false;
+            } else {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "export_backup_spans must be true|false|1|0");
+                return;
+            }
+            SetExportBackupSpansEnabled(enable);
+            bool on = IsExportBackupSpansEnabled();
+            resp.add_header("Content-Type", "text/plain");
+            resp.set_status_and_content(
+                status_type::ok,
+                on ? "export_backup_spans=true" : "export_backup_spans=false");
         });
 
     RegisterRuntimeConfigHttpMethods();

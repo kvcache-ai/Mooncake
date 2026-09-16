@@ -23,21 +23,25 @@ struct RequestContext {
     // semantics). Appended at the end so older binaries lacking them safely
     // ignore the trailing compatible bytes, and a newer binary receiving old
     // bytes sees them unset; the type code stays stable (verified by a
-    // struct_pack round-trip test). Distinct increasing version tags (1, 2) fix
-    // the wire order and leave room for future compatible fields (use >=3).
+    // struct_pack round-trip test). Distinct increasing version tags (1, 2, 3)
+    // fix the wire order and leave room for future compatible fields (use >=4).
     struct_pack::compatible<std::string, 1>
         caller_id;  // which dummy-client / TP rank issued the RPC
     struct_pack::compatible<std::string, 2>
         caller_role;  // caller's thread role, e.g. prefetch / backup
+    // Set by the real_client hop when it suppresses a Backup-role span at
+    // runtime (see the /trace_filter HTTP endpoint); the downstream master
+    // hop reads it to suppress its span for the same request too.
+    struct_pack::compatible<bool, 3> skip_tracing;
 };
 
 // Enable struct_pack field-name-based serialization. Compatible fields appended
 // at the end keep the type code stable: an older binary lacking them ignores
 // the trailing compatible bytes (forward), and a newer binary receiving old
 // bytes sees them unset (backward). Future compatible additions should use
-// increasing version tags (>=3).
+// increasing version tags (>=4).
 YLT_REFL(RequestContext, request_id, trace_id, span_id, parent_span_id,
-         caller_id, caller_role);
+         caller_id, caller_role, skip_tracing);
 
 // Per-thread current request context. Set on the calling (Python) thread before
 // a store operation and consumed synchronously by the master-client wrappers on

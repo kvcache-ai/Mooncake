@@ -74,6 +74,11 @@ class ScopedSpan {
 
    private:
     std::unique_ptr<ScopedSpanImpl> impl_;
+    // True when this span was intentionally not created because it is a
+    // Backup-role span and IsExportBackupSpansEnabled() is false.
+    // PopulateRequestContext then tags the outgoing RequestContext so the
+    // master hop skips its span for the same request too.
+    bool suppressed_backup_ = false;
 };
 
 // Initialize the global tracer provider. `otlp_endpoint` selects the OTLP
@@ -94,5 +99,13 @@ void ShutdownTracing();
 
 // True once InitTracing has successfully enabled tracing.
 bool IsTracingEnabled();
+
+// Whether this process exports Backup-role spans. The real_client exposes a
+// runtime toggle (/trace_filter) that flips this; when it is off, a
+// Backup-role ScopedSpan is created inactive, and the propagated
+// RequestContext is tagged (skip_tracing) so the downstream master hop also
+// drops its span for the same request.
+bool IsExportBackupSpansEnabled();
+void SetExportBackupSpansEnabled(bool enabled);
 
 }  // namespace mooncake
