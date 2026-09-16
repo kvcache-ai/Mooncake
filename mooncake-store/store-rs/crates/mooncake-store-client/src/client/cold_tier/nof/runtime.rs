@@ -1010,11 +1010,29 @@ impl NofTargetManager {
                 .all_targets()
                 .map(|(target_id, _, _)| target_id.to_string())
                 .collect::<Vec<_>>();
+            let route_ops = self
+                .route_ops
+                .as_ref()
+                .expect("managed route ops are configured");
             let mut current = route.clone();
             let mut deleted = false;
             let mut first_error = None;
             for target_id in target_ids {
-                match self.release_managed_target(&target_id, current.clone()) {
+                let released = match self.release_managed_target(&target_id, current.clone()) {
+                    Err(StoreError::Conflict(_)) => {
+                        let Some(latest) = route_ops.load_route(&current.key)? else {
+                            return Ok(true);
+                        };
+                        current = latest;
+                        if managed_target_cold_backing(&current, &target_id).is_err() {
+                            deleted = true;
+                            continue;
+                        }
+                        self.release_managed_target(&target_id, current.clone())
+                    }
+                    result => result,
+                };
+                match released {
                     Ok(next) => {
                         current = next;
                         deleted = true;
