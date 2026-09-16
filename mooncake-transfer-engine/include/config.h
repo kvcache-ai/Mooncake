@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -46,6 +47,12 @@ struct GlobalConfig {
     int gid_index = -1;       // -1 for auto-selection, >=0 for user-specified
     uint16_t pkey_index = 0;  // QP attr.pkey_index; override via MC_PKEY_INDEX
     uint64_t max_mr_size = 0x10000000000;
+    // Explicit RDMA-only chunk limit, independent of the device-clamped limit
+    // used by other transports. Registration still must succeed on every NIC.
+    std::optional<size_t> rdma_max_mr_size_override;
+    size_t rdmaMaxMrSize() const {
+        return rdma_max_mr_size_override.value_or(max_mr_size);
+    }
     size_t max_cqe = 4096;
     int max_ep_per_ctx = 65536;
     size_t num_qp_per_ep = 2;

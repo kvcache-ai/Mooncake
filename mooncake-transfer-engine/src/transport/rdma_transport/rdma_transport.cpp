@@ -239,8 +239,8 @@ int RdmaTransport::preTouchMemory(void *addr, size_t length) {
 
     auto hwc = std::thread::hardware_concurrency();
     auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
-    if (length > (size_t)globalConfig().max_mr_size) {
-        length = (size_t)globalConfig().max_mr_size;
+    if (length > globalConfig().rdmaMaxMrSize()) {
+        length = globalConfig().rdmaMaxMrSize();
     }
     size_t block_size = length / num_threads;
     if (block_size == 0) {
@@ -293,14 +293,14 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
 
-    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
-    // max_mr_size, but the metadata would still advertise the full BufferDesc
+    // Mooncake#2017: the context used to truncate registrations to the device
+    // limit, but the metadata would still advertise the full BufferDesc
     // length, so any remote RDMA op past the boundary fails with
     // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
     // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
     // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
     // are address-range based, so each chunk gets the correct key).
-    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
+    size_t chunk_limit = globalConfig().rdmaMaxMrSize();
     std::vector<std::pair<void *, size_t>> chunks;
     if (chunk_limit > 0 && length > chunk_limit) {
         for (size_t offset = 0; offset < length;) {
@@ -311,7 +311,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
                      << " bytes) into " << chunks.size()
                      << " chunks of <= " << chunk_limit
-                     << " bytes each (device max_mr_size; Mooncake#2017)";
+                     << " bytes each (effective RDMA MR limit; Mooncake#2017)";
     } else {
         chunks.emplace_back(addr, length);
     }

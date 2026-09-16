@@ -18,6 +18,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <limits>
 #include <thread>
 
 #include "config.h"
@@ -25,6 +26,105 @@
 
 namespace mooncake {
 namespace {
+
+// Preserve both process configuration and environment: device discovery mutates
+// the shared config, whereas parsing tests below use independent instances.
+class RdmaMrLimitTest : public ::testing::Test {
+   protected:
+    GlobalConfig saved_config_;
+    std::optional<std::string> saved_override_;
+    std::optional<std::string> saved_max_;
+
+    void SetUp() override {
+        saved_config_ = globalConfig();
+        if (const char* v = std::getenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE"))
+            saved_override_ = v;
+        if (const char* v = std::getenv("MC_MAX_MR_SIZE")) saved_max_ = v;
+        ::unsetenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE");
+        ::unsetenv("MC_MAX_MR_SIZE");
+        globalConfig() = GlobalConfig{};
+    }
+
+    void TearDown() override {
+        globalConfig() = saved_config_;
+        if (saved_override_)
+            ::setenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE", saved_override_->c_str(),
+                     1);
+        else
+            ::unsetenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE");
+        if (saved_max_)
+            ::setenv("MC_MAX_MR_SIZE", saved_max_->c_str(), 1);
+        else
+            ::unsetenv("MC_MAX_MR_SIZE");
+    }
+
+    void discoverDevice(uint64_t limit) {
+        ibv_device_attr device{};
+        device.max_mr_size = limit;
+        updateGlobalConfig(device);
+    }
+};
+
+TEST_F(RdmaMrLimitTest, DefaultStillClampsAcrossDevices) {
+    auto& config = globalConfig();
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.rdma_max_mr_size_override.has_value());
+    discoverDevice(4ULL << 30);
+    discoverDevice(2ULL << 30);
+    discoverDevice(8ULL << 30);
+    EXPECT_EQ(config.rdmaMaxMrSize(), 2ULL << 30);
+    EXPECT_EQ(config.max_mr_size, 2ULL << 30);
+}
+
+TEST_F(RdmaMrLimitTest, ExistingUserLimitStillAppliesWithoutOverride) {
+    ASSERT_EQ(::setenv("MC_MAX_MR_SIZE", "67108864", 1), 0);
+    loadGlobalConfig(globalConfig());
+    discoverDevice(2ULL << 30);
+    EXPECT_EQ(globalConfig().rdmaMaxMrSize(), 64ULL << 20);
+}
+
+TEST_F(RdmaMrLimitTest, OverrideSurvivesDeviceClampWithoutChangingSharedLimit) {
+    ASSERT_EQ(::setenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE", "4294967296", 1), 0);
+    ASSERT_EQ(::setenv("MC_MAX_MR_SIZE", "1073741824", 1), 0);
+    auto& config = globalConfig();
+    loadGlobalConfig(config);
+    discoverDevice(2ULL << 30);
+    discoverDevice(512ULL << 20);
+    EXPECT_EQ(config.rdmaMaxMrSize(), 4ULL << 30);
+    // Other transports still consume max_mr_size, not the RDMA override.
+    EXPECT_EQ(config.max_mr_size, 512ULL << 20);
+}
+
+TEST_F(RdmaMrLimitTest, OverrideCanAlsoLowerTheChunkLimit) {
+    ASSERT_EQ(::setenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE", "65536", 1), 0);
+    loadGlobalConfig(globalConfig());
+    discoverDevice(2ULL << 30);
+    EXPECT_EQ(globalConfig().rdmaMaxMrSize(), 65536u);
+    EXPECT_EQ(globalConfig().max_mr_size, 2ULL << 30);
+}
+
+TEST_F(RdmaMrLimitTest, InvalidOverrideDoesNotBypassDeviceClamp) {
+    for (const char* value :
+         {"", "0", "-1", "+1", "4G", "4294967296x", " 4294967296",
+          "4294967296 ", "18446744073709551616"}) {
+        SCOPED_TRACE(value);
+        ASSERT_EQ(::setenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE", value, 1), 0);
+        globalConfig() = GlobalConfig{};
+        loadGlobalConfig(globalConfig());
+        discoverDevice(2ULL << 30);
+        EXPECT_FALSE(globalConfig().rdma_max_mr_size_override.has_value());
+        EXPECT_EQ(globalConfig().rdmaMaxMrSize(), 2ULL << 30);
+    }
+}
+
+TEST_F(RdmaMrLimitTest, AcceptsSizeTMaximumWithoutTruncating) {
+    const auto maximum = std::numeric_limits<size_t>::max();
+    ASSERT_EQ(::setenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE",
+                       std::to_string(maximum).c_str(), 1),
+              0);
+    loadGlobalConfig(globalConfig());
+    EXPECT_EQ(globalConfig().rdmaMaxMrSize(), maximum);
+}
 
 // --- MC_PKEY_INDEX (stoi with try-catch, range 0-65535) ---
 

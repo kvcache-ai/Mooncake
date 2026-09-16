@@ -48,6 +48,7 @@ bool IsGoogleLoggingInitialized();
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <limits>
 #include <sstream>
 #include <strings.h>
 #include <unistd.h>
@@ -321,6 +322,21 @@ void loadGlobalConfig(GlobalConfig& config) {
         } else {
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_MR_SIZE";
+        }
+    }
+
+    const char* rdma_mr_override = std::getenv("MC_RDMA_MAX_MR_SIZE_OVERRIDE");
+    if (rdma_mr_override) {
+        uint64_t value = 0;
+        const char* end = rdma_mr_override + std::strlen(rdma_mr_override);
+        auto result = std::from_chars(rdma_mr_override, end, value);
+        if (result.ec == std::errc{} && result.ptr == end && value > 0 &&
+            value <= std::numeric_limits<size_t>::max()) {
+            config.rdma_max_mr_size_override = static_cast<size_t>(value);
+        } else {
+            LOG(WARNING)
+                << "Ignore invalid MC_RDMA_MAX_MR_SIZE_OVERRIDE; expected a "
+                   "positive decimal byte count representable as size_t";
         }
     }
 
@@ -859,6 +875,11 @@ void dumpGlobalConfig() {
     LOG(INFO) << "gid_index = " << config.gid_index;
     LOG(INFO) << "pkey_index = " << config.pkey_index;
     LOG(INFO) << "max_mr_size = " << config.max_mr_size;
+    LOG(INFO) << "rdma_max_mr_size_override = "
+              << (config.rdma_max_mr_size_override
+                      ? std::to_string(*config.rdma_max_mr_size_override)
+                      : "unset")
+              << ", effective RDMA MR chunk limit = " << config.rdmaMaxMrSize();
     LOG(INFO) << "max_cqe = " << config.max_cqe;
     LOG(INFO) << "max_ep_per_ctx = " << config.max_ep_per_ctx;
     LOG(INFO) << "num_qp_per_ep = " << config.num_qp_per_ep;

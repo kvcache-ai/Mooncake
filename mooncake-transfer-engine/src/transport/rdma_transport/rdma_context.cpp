@@ -627,15 +627,15 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
                                               int access,
                                               const DmabufExport &exp,
                                               MemoryRegionMeta &mrMeta) {
-    if (length > (size_t)globalConfig().max_mr_size) {
-        // #2017: registerLocalMemory auto-chunks buffers to <= max_mr_size, so
+    const size_t mr_limit = globalConfig().rdmaMaxMrSize();
+    if (length > mr_limit) {
+        // #2017: registerLocalMemory auto-chunks buffers to <= mr_limit, so
         // no larger buffer should reach here. Fail loudly instead of silently
         // truncating the MR — a truncated MR advertises bytes past the
         // registered region and causes IBV_WC_REM_ACCESS_ERR on RDMA ops whose
         // target lands past the boundary.
         LOG(ERROR) << "Buffer length " << length
-                   << " exceeds device max_mr_size "
-                   << globalConfig().max_mr_size
+                   << " exceeds effective RDMA MR limit " << mr_limit
                    << " (should have been chunked before registration, #2017)";
         return ERR_INVALID_ARGUMENT;
     }
@@ -1486,6 +1486,14 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
+        if (globalConfig().rdma_max_mr_size_override) {
+            LOG(WARNING) << "RDMA MR limit override on " << device_name
+                         << ": advertised=" << device_attr.max_mr_size
+                         << ", override="
+                         << *globalConfig().rdma_max_mr_size_override
+                         << ", effective=" << globalConfig().rdmaMaxMrSize()
+                         << " bytes; driver registration errors are propagated";
+        }
         GidNetworkState gid_state;
         auto_gid_selection_enabled_ = gid_index < 0;
         if (gid_index < 0) {

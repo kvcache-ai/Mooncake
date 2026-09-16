@@ -498,3 +498,14 @@ if(USE_NCCL_DEVICE AND NOT USE_CXI)
     endif()
   endif()
 endif()
+
+# Fake verbs cover MR-size overrides, metadata and rollback without RDMA
+# hardware.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  add_executable(rdma_mr_override_test ${WORKSPACE}/rdma_mr_override_test.cpp)
+  target_link_libraries(rdma_mr_override_test PRIVATE transfer_engine gtest
+                                                      gtest_main)
+  target_link_options(rdma_mr_override_test PRIVATE "-Wl,--wrap=ibv_reg_mr"
+                      "-Wl,--wrap=ibv_reg_mr_iova2" "-Wl,--wrap=ibv_dereg_mr")
+  add_test(NAME rdma_mr_override_test COMMAND rdma_mr_override_test)
+endif()
