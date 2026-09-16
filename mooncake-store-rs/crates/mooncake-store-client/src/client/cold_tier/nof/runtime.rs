@@ -299,6 +299,7 @@ impl NofTargetManager {
         &self,
         target_id: &str,
     ) -> Result<Option<PersistentStorageBackendHealth>> {
+        let _management = self.state.management_gate.read();
         let Some(target) = self.locally_owned_managed_target(target_id)? else {
             return Ok(None);
         };
