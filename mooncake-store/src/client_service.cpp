@@ -5459,10 +5459,26 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
     }
     const auto replica_transfer_endpoint =
         replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
+    // Fast paths first: lock-free comparisons against this client's own
+    // endpoint/hostname.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        return replica_transfer_endpoint == GetTransportEndpoint();
+        if (replica_transfer_endpoint == GetTransportEndpoint()) {
+            return true;
+        }
+    } else if (local_hostname_ == replica_transfer_endpoint) {
+        return true;
     }
-    return local_hostname_ == replica_transfer_endpoint;
+    // Fallback: the replica's endpoint may address one of this client's
+    // mounted segments by segment name or TE endpoint (e.g. when the writer
+    // published the segment under a name different from local_hostname_).
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    for (const auto& [segment_id, segment] : mounted_segments_) {
+        if (replica_transfer_endpoint == segment.name ||
+            replica_transfer_endpoint == segment.te_endpoint) {
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace mooncake
