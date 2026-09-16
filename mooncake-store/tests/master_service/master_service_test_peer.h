@@ -24,8 +24,6 @@ class MasterServiceTestPeer {
     using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
     using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
     using ObjectIdentity = MasterService::ObjectIdentity;
-    // These three moved out of MasterService to namespace scope, so unlike the
-    // aliases around them they name the type rather than a nested one.
     using ObjectMetadata = mooncake::ObjectMetadata;
     using PromotionQueueResult = mooncake::PromotionQueueResult;
     using PromotionTask = mooncake::PromotionTask;
