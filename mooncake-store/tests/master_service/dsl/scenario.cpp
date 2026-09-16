@@ -2161,6 +2161,7 @@ bool MasterScenario::EnsureService() {
         segment.base = next_segment_base_;
         segment.size = node.capacity;
         segment.te_endpoint = node.endpoint;
+        segment.block_size = 512;
         next_segment_base_ += node.capacity + 4096;
 
         const auto owner = node.owner.empty() ? node.name : node.owner;

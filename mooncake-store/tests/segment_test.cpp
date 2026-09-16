@@ -466,6 +466,7 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     segment.size = kSegmentSize;
     segment.base = 0x300000000;
     segment.te_endpoint = "nof_usage_snapshot_endpoint";
+    segment.block_size = 512;
     UUID client_id = generate_uuid();
 
     {
@@ -520,6 +521,26 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     allocator.reset();
     EXPECT_EQ(segment_manager.GetUsage().used_bytes, 0u);
     EXPECT_EQ(segment_manager.GetUsage().capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, NoFMountRejectsInvalidBlockSizes) {
+    NoFSegmentManager manager(BufferAllocatorType::OFFSET);
+    const UUID client_id = generate_uuid();
+    auto access = manager.getNoFSegmentAccess();
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "nof_invalid_block_size";
+    segment.size = 16 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    for (uint32_t block_size : {0u, 1u, 256u, 513u, 768u, 4095u}) {
+        SCOPED_TRACE(block_size);
+        segment.block_size = block_size;
+        EXPECT_EQ(access.MountSegment(segment, client_id),
+                  ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<MountedNoFSegmentSnapshot> mounted;
+    EXPECT_EQ(access.GetMountedSegments(mounted), ErrorCode::OK);
+    EXPECT_TRUE(mounted.empty());
 }
 
 // MountSegmentDuplicate Tests:
