@@ -839,6 +839,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
         ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+        // Freeze the restored instance before comparing snapshots. Its
+        // eviction worker would otherwise mutate metadata between restores.
+        restored_service->eviction_running_ = false;
+        if (restored_service->eviction_thread_.joinable()) {
+            restored_service->eviction_thread_.join();
+        }
         AssertRestoredClientAffiliations(restored_service.get());
 
         // ========== Phase 4: Persist restored metadata again ==========
