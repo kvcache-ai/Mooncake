@@ -36,7 +36,7 @@ void ThrowIfError(const Status& status) {
 std::pair<std::shared_ptr<SharedSegment>, py::bytes> SegmentCreate(
     const std::string& name, uint64_t size, uint32_t world_size,
     uint32_t rank_id, uint32_t owner_rank, int32_t device_id, bool mmap,
-    bool host_register) {
+    bool host_register, bool hugetlb) {
     SharedSegmentOptions options;
     options.world_size = world_size;
     options.rank_id = rank_id;
@@ -44,6 +44,7 @@ std::pair<std::shared_ptr<SharedSegment>, py::bytes> SegmentCreate(
     options.device_id = device_id;
     options.mmap = mmap;
     options.host_register = host_register;
+    options.hugetlb = hugetlb;
 
     std::string blob;
     std::shared_ptr<SharedSegment> segment;
@@ -74,9 +75,11 @@ void bind_shared_segment(py::module_& m) {
                     py::arg("world_size"), py::arg("rank_id"),
                     py::arg("owner_rank") = 0, py::arg("device_id") = 0,
                     py::arg("mmap") = true, py::arg("host_register") = false,
+                    py::arg("hugetlb") = false,
                     "Phase one; returns (segment, blob).")
         .def_static("supported", &SharedSegment::Supported,
                     py::arg("mmap") = true, py::arg("host_register") = false,
+                    py::arg("hugetlb") = false,
                     "Whether this build can share memory across processes.")
         .def("complete", &SegmentComplete, py::arg("blobs"),
              "Phase two; blobs are indexed by rank.")
