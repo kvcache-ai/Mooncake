@@ -2238,6 +2238,39 @@ int RealClient::start_http_server(int port) {
             resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
+    // Runtime control for whether Backup-role spans are exported. When this
+    // is off, hop-A drops a Backup span and tags the outgoing RequestContext so
+    // hop-B does the same for that request.
+    http_server_->set_http_handler<GET>(
+        "/trace_filter", [](coro_http_request &req, coro_http_response &resp) {
+            (void)req;
+            const bool enabled = IsExportBackupSpansEnabled();
+            resp.add_header("Content-Type", "text/plain");
+            resp.set_status_and_content(status_type::ok,
+                                        enabled ? "export_backup_spans=true"
+                                                : "export_backup_spans=false");
+        });
+    http_server_->set_http_handler<POST>(
+        "/trace_filter", [](coro_http_request &req, coro_http_response &resp) {
+            const auto value = req.get_query_value("export_backup_spans");
+            bool enabled = false;
+            if (value == "true" || value == "1") {
+                enabled = true;
+            } else if (value == "false" || value == "0") {
+                enabled = false;
+            } else {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "export_backup_spans must be true|false|1|0");
+                return;
+            }
+            SetExportBackupSpansEnabled(enabled);
+            resp.add_header("Content-Type", "text/plain");
+            resp.set_status_and_content(status_type::ok,
+                                        enabled ? "export_backup_spans=true"
+                                                : "export_backup_spans=false");
+        });
+
     auto ec = http_server_->async_start();
     if (ec.hasResult()) {
         LOG(WARNING) << "Failed to start HTTP server on port " << port;

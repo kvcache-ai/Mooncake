@@ -68,6 +68,21 @@ namespace nostd = opentelemetry::nostd;
 
 namespace mooncake {
 
+// Runtime toggle (set from the real_client HTTP /trace_filter endpoint) for
+// whether this client exports Backup-role spans. When false, Backup-role
+// ScopedSpans on this process are created inactive, and the outgoing
+// RequestContext is tagged with `skip_tracing` so the master hop also drops
+// its span for the same request. Lives outside the OTel ifdef so the endpoint
+// compiles and toggles even in the tracing-disabled build (where it is simply
+// a harmless no-op).
+static std::atomic<bool> g_export_backup_spans{true};
+
+bool IsExportBackupSpansEnabled() { return g_export_backup_spans.load(); }
+
+void SetExportBackupSpansEnabled(bool enabled) {
+    g_export_backup_spans.store(enabled);
+}
+
 #ifdef MOONCAKE_ENABLE_OTEL_TRACING
 namespace {
 
@@ -364,13 +379,36 @@ bool IsTracingEnabled() { return g_tracing_enabled.load(); }
 
 ScopedSpan::ScopedSpan(const char* tracer_name, const char* span_name,
                        const RequestContext* parent_ctx)
-    : impl_(IsTracingEnabled() ? std::make_unique<ScopedSpanImpl>(
-                                     tracer_name, span_name, parent_ctx)
-                               : nullptr) {}
+    : impl_(nullptr), suppressed_backup_(false) {
+    if (!IsTracingEnabled()) return;
+    if (parent_ctx != nullptr) {
+        // The upstream hop (real_client) asked us to skip this request: it
+        // suppressed a Backup span and tagged the propagated context.
+        if (parent_ctx->skip_tracing && *parent_ctx->skip_tracing) return;
+        // Backup-role spans can be turned off at runtime from the real_client
+        // HTTP /trace_filter endpoint; remembering it lets
+        // PopulateRequestContext forward the decision to the next hop.
+        if (!g_export_backup_spans.load() &&
+            caller_role_of(*parent_ctx) == "Backup") {
+            suppressed_backup_ = true;
+            return;
+        }
+    }
+    impl_ =
+        std::make_unique<ScopedSpanImpl>(tracer_name, span_name, parent_ctx);
+}
 ScopedSpan::~ScopedSpan() = default;
 bool ScopedSpan::active() const { return impl_ != nullptr; }
 void ScopedSpan::PopulateRequestContext(RequestContext& ctx) const {
-    if (impl_) impl_->PopulateRequestContext(ctx);
+    if (impl_) {
+        impl_->PopulateRequestContext(ctx);
+        return;
+    }
+    if (suppressed_backup_) {
+        // We dropped this Backup span on the real_client hop; tag the outgoing
+        // context so the master hop drops its span for the same request too.
+        ctx.skip_tracing = true;
+    }
 }
 void ScopedSpan::AddAttribute(const char* key, std::string_view value) {
     if (impl_) impl_->SetAttribute(key, value);
