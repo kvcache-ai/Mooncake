@@ -215,6 +215,13 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
 
     std::vector<std::string> success_keys;
     std::vector<StorageObjectMetadata> success_metas;
+    std::vector<ObjectPutRequest> requests;
+    // Own descriptors through PutBatch; each request only borrows an array.
+    std::vector<std::vector<iovec>> iov_storage;
+    std::vector<size_t> request_sizes;
+    requests.reserve(batch_object.size());
+    iov_storage.reserve(batch_object.size());
+    request_sizes.reserve(batch_object.size());
     for (const auto& [key, slices] : batch_object) {
         if (slices.size() >
             static_cast<size_t>(std::numeric_limits<int>::max())) {
@@ -222,8 +229,6 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                          << ": slice count exceeds INT_MAX";
             continue;
         }
-        const int iovcnt = static_cast<int>(slices.size());
-
         std::vector<iovec> iovs;
         iovs.reserve(slices.size());
         size_t total_size = 0;
@@ -242,16 +247,29 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
             continue;
         }
 
-        auto result = object_storage_adapter_->PutV(key, iovs.data(), iovcnt);
-        if (!result) {
-            LOG(WARNING) << "Failed to offload key " << key << ": "
-                         << static_cast<int>(result.error());
+        iov_storage.push_back(std::move(iovs));
+        const auto& stored_iovs = iov_storage.back();
+        requests.push_back(
+            {key, stored_iovs.data(), static_cast<int>(stored_iovs.size())});
+        request_sizes.push_back(total_size);
+    }
+
+    auto results = object_storage_adapter_->PutBatch(requests);
+    if (results.size() != requests.size()) {
+        LOG(ERROR)
+            << "Object storage returned an invalid PUT batch result count";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            LOG(WARNING) << "Failed to offload key " << requests[i].logical_key
+                         << ": " << static_cast<int>(results[i].error());
             continue;
         }
-
-        success_keys.push_back(key);
-        success_metas.emplace_back(-1, 0, static_cast<int64_t>(key.size()),
-                                   static_cast<int64_t>(total_size), "");
+        success_keys.push_back(requests[i].logical_key);
+        success_metas.emplace_back(
+            -1, 0, static_cast<int64_t>(requests[i].logical_key.size()),
+            static_cast<int64_t>(request_sizes[i]), "");
     }
 
     if (complete_handler && !success_keys.empty()) {
@@ -455,12 +473,22 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    std::vector<ObjectGetRequest> requests;
+    requests.reserve(batched_slices.size());
     for (auto& [key, slice] : batched_slices) {
-        auto result = object_storage_adapter_->Get(key, slice.ptr, slice.size);
-        if (!result) {
-            return tl::make_unexpected(result.error());
+        requests.push_back({key, slice.ptr, slice.size});
+    }
+    auto results = object_storage_adapter_->GetBatch(requests);
+    if (results.size() != requests.size()) {
+        LOG(ERROR)
+            << "Object storage returned an invalid GET batch result count";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i]) {
+            return tl::make_unexpected(results[i].error());
         }
-        if (*result != slice.size) {
+        if (*results[i] != requests[i].size) {
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }
