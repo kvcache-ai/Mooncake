@@ -2303,6 +2303,14 @@ PYBIND11_MODULE(store, m) {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_unregister_by_endpoint(
                      nqn, nsid, traddr, trsvcid, master_server_addr);
+             })
+        .def("query_and_register",
+             [](MooncakeDistributedNoFRegisterPyWrapper &self,
+                const std::string &nqn, size_t nsid, const std::string &traddr,
+                size_t trsvcid, const std::string &master_server_addr) {
+                 self.register_ = std::make_shared<NoFRegisterClient>();
+                 return self.register_->query_and_register(
+                     nqn, nsid, traddr, trsvcid, master_server_addr);
              });
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
