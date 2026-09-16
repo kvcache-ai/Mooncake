@@ -27,10 +27,9 @@ inline std::unique_ptr<ObjectMetadata> MakeObjectMetadata(
 }
 
 // The same envelope inside the per-object shell the route stores.
-inline std::shared_ptr<metadata::ObjectEntry> MakeObjectEntry(
+inline std::shared_ptr<ObjectEntry> MakeObjectEntry(
     const std::string& key, const std::string& group_id = {}) {
-    return std::make_shared<metadata::ObjectEntry>(
-        MakeObjectMetadata(key, group_id));
+    return std::make_shared<ObjectEntry>(MakeObjectMetadata(key, group_id));
 }
 
 }  // namespace test

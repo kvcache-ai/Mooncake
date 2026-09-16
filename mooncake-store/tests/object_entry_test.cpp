@@ -7,7 +7,6 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace metadata {
 namespace {
 
 TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
@@ -48,5 +47,4 @@ TEST(ObjectEntryTest, TryLockUniqueReportsWhetherTheEntryWasFree) {
 }
 
 }  // namespace
-}  // namespace metadata
 }  // namespace mooncake

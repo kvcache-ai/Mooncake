@@ -18,7 +18,6 @@
 #include "object_runtime_state.h"
 
 namespace mooncake {
-namespace metadata {
 
 class ObjectEntry {
    public:
@@ -92,5 +91,4 @@ class ObjectEntry {
     mutable std::shared_mutex mutex;
 };
 
-}  // namespace metadata
 }  // namespace mooncake

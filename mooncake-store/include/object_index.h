@@ -22,7 +22,6 @@
 #include "rpc_types.h"
 
 namespace mooncake {
-namespace metadata {
 
 // The object route for one tenant: a flat map from object key to a strong
 // ObjectEntry handle, plus the in-flight dynamic-replication lease table.
@@ -223,5 +222,4 @@ class ObjectIndex {
         dynamic_replication_leases;
 };
 
-}  // namespace metadata
 }  // namespace mooncake

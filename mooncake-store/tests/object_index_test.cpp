@@ -10,7 +10,6 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace metadata {
 namespace {
 
 // --- Object route ---
@@ -204,5 +203,4 @@ TEST(ObjectIndexTest, WithObjectVisitsThePresentKeyOnly) {
 }
 
 }  // namespace
-}  // namespace metadata
 }  // namespace mooncake
