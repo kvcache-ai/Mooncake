@@ -137,6 +137,7 @@ add_store_test(master_service_promotion_test_for_snapshot
                ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
 if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+  add_store_test(nof_env_reacquire_test nof_env_reacquire_test.cpp)
 endif()
 add_store_test(nof_register_config_test nof_register_config_test.cpp)
 add_store_test(spdk_controller_config_test spdk_controller_config_test.cpp)
@@ -160,6 +161,10 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+add_store_test(nvmeof_initiator_test nvmeof_initiator_test.cpp)
+add_store_test(nof_page_registry_test nof_page_registry_test.cpp)
+add_store_test(nof_probe_context_pool_test
+               nof_probe_context_pool_test.cpp)
 add_store_test(transfer_submitter_config_test
                transfer_submitter_config_test.cpp)
 find_package(CUDAToolkit QUIET)
