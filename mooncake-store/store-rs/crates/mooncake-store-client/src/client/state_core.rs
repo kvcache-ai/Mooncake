@@ -334,6 +334,7 @@ struct StorageOwnerState {
     state: Arc<Mutex<StoreState>>,
     cold_tier_devices: ColdTierDeviceManager,
     hot_replicas: HotReplicaTracker,
+    nof_backings: HotReplicaTracker,
     pending_offloads: ColdTierOffloadManager,
     cold_tier_cleanup: ColdTierCleanupManager,
     initial_cold_backing_repair_at_ms: AtomicU64,

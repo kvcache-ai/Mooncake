@@ -24,6 +24,8 @@ pub(in crate::client) use super::owner::{
 };
 pub use backend::NofBackend;
 pub use backing::NofBacking;
+#[cfg(test)]
+pub(in crate::client) use managed::NofManagedRecovery;
 #[allow(unused_imports)]
 pub use managed::{
     NofManagedAllocationRequest, NofManagedAllocator, NofManagedLimits, NofManagedLocator,
@@ -40,7 +42,8 @@ pub use physical::{
 };
 pub use runtime::NofTargetConfig;
 pub(in crate::client) use runtime::{
-    mirror_managed_route_index, target_set_fingerprint, NofManagedRecoveryTarget, NofTargetManager,
+    adopt_managed_target_owner, managed_target_cold_backing, mirror_managed_route_index,
+    route_has_payload, route_without_managed_target, target_set_fingerprint, NofTargetManager,
 };
 
 pub use crate::client::cold_tier::layout::{

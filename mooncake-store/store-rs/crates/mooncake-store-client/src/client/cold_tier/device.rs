@@ -80,6 +80,7 @@ impl StorageOwnerState {
             state,
             cold_tier_devices: ColdTierDeviceManager::new(cold_tier),
             hot_replicas: super::super::HotReplicaTracker::default(),
+            nof_backings: super::super::HotReplicaTracker::default(),
             pending_offloads: super::super::ColdTierOffloadManager::new(offload_priority),
             cold_tier_cleanup: super::super::ColdTierCleanupManager::default(),
             initial_cold_backing_repair_at_ms: AtomicU64::new(0),

@@ -152,6 +152,7 @@ impl RouteOperations {
         tombstone.state = RouteState::Tombstone;
         tombstone.replicas.clear();
         tombstone.cold_backing = None;
+        tombstone.nof_backing = None;
 
         let result =
             self.compare_and_swap_route(&current.key, Some(current.version), Some(&tombstone))?;

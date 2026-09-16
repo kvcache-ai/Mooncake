@@ -1,6 +1,5 @@
 //! Mooncake-managed ExtentStore executor for NVMe-oF targets.
 
-use std::collections::BTreeMap;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::path::PathBuf;
 use std::ptr::NonNull;
@@ -16,7 +15,7 @@ use crate::client::extent_store_format::{
     EXTENT_STORE_ALIGNMENT, EXTENT_STORE_HEADER_LEN, EXTENT_STORE_RECORD_KIND_SINGLE,
 };
 use crate::client::{
-    decode_cold_object_manifest, encode_cold_object_manifest, payload_checksum, ColdObjectManifest,
+    decode_cold_object_manifest, encode_cold_object_manifest, payload_checksum,
     ColdPayloadMetadata, FreeSpanSet, RecoveredColdObject,
 };
 
@@ -49,13 +48,6 @@ impl ExtentStoreExecutorConfig {
 
 struct AllocatorState {
     free: FreeSpanSet,
-    reserved: BTreeMap<Vec<u8>, ReservedRecord>,
-}
-
-#[derive(Clone)]
-struct ReservedRecord {
-    locator: ExtentStoreLocator,
-    manifest: Option<ColdObjectManifest>,
 }
 
 pub struct ExtentStoreExecutor {
@@ -68,7 +60,7 @@ pub struct ExtentStoreExecutor {
 
 impl ExtentStoreExecutor {
     pub fn new(device: Arc<SpdkNofBlockDevice>, config: ExtentStoreExecutorConfig) -> Result<Self> {
-        let config = validate_config(config, device.capacity_bytes())?;
+        let config = validate_config(config, device.capacity_bytes(), device.sector_size())?;
         let free_len = config.device_bytes - config.start_offset;
         let buffer_pool_bytes = usize::try_from(free_len).unwrap_or(usize::MAX);
         Ok(Self {
@@ -80,7 +72,6 @@ impl ExtentStoreExecutor {
             .validate()?,
             state: Mutex::new(AllocatorState {
                 free: FreeSpanSet::from_range(config.start_offset, free_len),
-                reserved: BTreeMap::new(),
             }),
             buffer_pool: ExtentStoreBufferPool::new_untracked(buffer_pool_bytes),
             config,
@@ -133,26 +124,17 @@ impl ExtentStoreExecutor {
             locator_from_managed(&request.locator)?,
             request.value.len() as u64,
         )?;
-        let manifest = self
-            .state
-            .lock()
-            .reserved
-            .get(request.locator.as_bytes())
-            .map(|record| {
-                if record.locator != locator {
-                    return Err(StoreError::InvalidState(
-                        "managed ExtentStore reserved locator does not match request".to_string(),
-                    ));
-                }
-                Ok(record.manifest.clone())
-            })
-            .transpose()?
-            .flatten();
-        let manifest_bytes = manifest
-            .as_ref()
-            .map(encode_cold_object_manifest)
-            .transpose()?
-            .unwrap_or_default();
+        let identity = request.route_identity.as_ref().ok_or_else(|| {
+            StoreError::InvalidState(
+                "managed ExtentStore write requires route identity".to_string(),
+            )
+        })?;
+        let manifest = identity.manifest(
+            request.locator.to_hex(),
+            request.value.len() as u64,
+            request.checksum,
+        );
+        let manifest_bytes = encode_cold_object_manifest(&manifest)?;
         let header = self.record_header(
             request.value.len() as u64,
             manifest_bytes.len(),
@@ -214,6 +196,29 @@ impl ExtentStoreExecutor {
         }
         Ok(Some(value))
     }
+
+    fn release_one(&self, request: &NofManagedReadRequest) -> Result<()> {
+        let locator =
+            self.validate_locator(locator_from_managed(&request.locator)?, request.length)?;
+        let mut state = self.state.lock();
+        if state.free.contains(locator.offset, locator.record_len) {
+            return Ok(());
+        }
+        if state.free.overlaps(locator.offset, locator.record_len) {
+            return Err(StoreError::InvalidState(
+                "managed ExtentStore release overlaps an existing free range".to_string(),
+            ));
+        }
+        let tombstone_len = usize::try_from(self.config.alignment).map_err(|_| {
+            StoreError::InvalidState("managed ExtentStore alignment is too large".to_string())
+        })?;
+        let mut tombstone = self.buffer_pool.lease(tombstone_len)?;
+        tombstone.fill(0);
+        self.device.write_all(locator.offset, &tombstone)?;
+        self.device.flush()?;
+        state.free.insert(locator.offset, locator.record_len);
+        Ok(())
+    }
 }
 
 impl NofManagedAllocator for ExtentStoreExecutor {
@@ -243,7 +248,6 @@ impl NofManagedAllocator for ExtentStoreExecutor {
         }
         let mut state = self.state.lock();
         state.free = free;
-        state.reserved.clear();
         Ok(())
     }
 
@@ -255,19 +259,17 @@ impl NofManagedAllocator for ExtentStoreExecutor {
         requests
             .iter()
             .map(|request| {
-                let manifest_len = request
-                    .route_identity
-                    .as_ref()
-                    .map(|identity| {
-                        encode_cold_object_manifest(&identity.manifest(
-                            "0".repeat(ExtentStoreLocator::BINARY_LEN * 2),
-                            request.length,
-                            request.checksum,
-                        ))
-                        .map(|bytes| bytes.len())
-                    })
-                    .transpose()?
-                    .unwrap_or(0);
+                let identity = request.route_identity.as_ref().ok_or_else(|| {
+                    StoreError::InvalidState(
+                        "managed ExtentStore reservation requires route identity".to_string(),
+                    )
+                })?;
+                let manifest_len = encode_cold_object_manifest(&identity.manifest(
+                    "0".repeat(ExtentStoreLocator::BINARY_LEN * 2),
+                    request.length,
+                    request.checksum,
+                ))?
+                .len();
                 let header = self.record_header(
                     request.length,
                     manifest_len,
@@ -290,37 +292,15 @@ impl NofManagedAllocator for ExtentStoreExecutor {
                     generation: 0,
                 };
                 let managed = locator_to_managed(locator)?;
-                let manifest = request.route_identity.as_ref().map(|identity| {
-                    identity.manifest(managed.to_hex(), request.length, request.checksum)
-                });
-                state.reserved.insert(
-                    managed.as_bytes().to_vec(),
-                    ReservedRecord { locator, manifest },
-                );
                 Ok(managed)
             })
             .collect()
     }
 
     fn release_batch(&self, requests: &[NofManagedReadRequest]) -> Vec<Result<()>> {
-        let mut state = self.state.lock();
         requests
             .iter()
-            .map(|request| {
-                let locator =
-                    self.validate_locator(locator_from_managed(&request.locator)?, request.length)?;
-                state.reserved.remove(request.locator.as_bytes());
-                if state.free.contains(locator.offset, locator.record_len) {
-                    return Ok(());
-                }
-                if state.free.overlaps(locator.offset, locator.record_len) {
-                    return Err(StoreError::InvalidState(
-                        "managed ExtentStore release overlaps an existing free range".to_string(),
-                    ));
-                }
-                state.free.insert(locator.offset, locator.record_len);
-                Ok(())
-            })
+            .map(|request| self.release_one(request))
             .collect()
     }
 }
@@ -349,22 +329,45 @@ impl NofManagedRead for ExtentStoreExecutor {
 impl NofManagedRecovery for ExtentStoreExecutor {
     fn scan_recovered_objects(&self, target_id: &str) -> Result<Vec<RecoveredColdObject>> {
         let mut recovered = Vec::new();
-        let probe_len = usize::try_from(self.config.alignment).map_err(|_| {
-            StoreError::InvalidState("managed ExtentStore alignment is too large".to_string())
+        let cache_len = self.device.submit_chunk_bytes.max(self.config.alignment)
+            / self.config.alignment
+            * self.config.alignment;
+        let cache_len = cache_len.min(self.config.device_bytes - self.config.start_offset);
+        let cache_len = usize::try_from(cache_len).map_err(|_| {
+            StoreError::InvalidState("managed ExtentStore scan buffer is too large".to_string())
         })?;
-        let mut header_block = self.buffer_pool.lease(probe_len)?;
+        let mut header_cache = vec![0u8; cache_len];
+        let mut cache_offset = u64::MAX;
+        let mut cache_valid = 0usize;
+
         scan_extent_store_headers(
             self.config.start_offset,
             self.config.device_bytes,
             Some(self.config.alignment),
-            |offset| match self.device.read_exact(offset, &mut header_block) {
-                Ok(()) => Ok(Some(
-                    header_block[..EXTENT_STORE_HEADER_LEN]
+            |offset| {
+                let cache_end = cache_offset.saturating_add(cache_valid as u64);
+                if offset < cache_offset
+                    || offset.saturating_add(EXTENT_STORE_HEADER_LEN as u64) > cache_end
+                {
+                    cache_offset = offset;
+                    cache_valid = cache_len.min(
+                        usize::try_from(self.config.device_bytes - offset).unwrap_or(usize::MAX),
+                    );
+                    match self
+                        .device
+                        .read_exact(offset, &mut header_cache[..cache_valid])
+                    {
+                        Ok(()) => {}
+                        Err(StoreError::NotFound(_)) => return Ok(None),
+                        Err(error) => return Err(error),
+                    }
+                }
+                let start = usize::try_from(offset - cache_offset).expect("cached header offset");
+                Ok(Some(
+                    header_cache[start..start + EXTENT_STORE_HEADER_LEN]
                         .try_into()
                         .expect("extent store header slice length"),
-                )),
-                Err(StoreError::NotFound(_)) => Ok(None),
-                Err(error) => Err(error),
+                ))
             },
             |offset, header| {
                 if header.record_kind != EXTENT_STORE_RECORD_KIND_SINGLE || header.key_len == 0 {
@@ -441,16 +444,24 @@ impl NofBacking for ExtentStoreExecutor {
 fn validate_config(
     mut config: ExtentStoreExecutorConfig,
     capacity: u64,
+    sector_size: u32,
 ) -> Result<ExtentStoreExecutorConfig> {
     if config.alignment == 0 || !config.alignment.is_power_of_two() {
         return Err(StoreError::InvalidState(
             "managed ExtentStore alignment must be a non-zero power of two".to_string(),
         ));
     }
+    if !config.alignment.is_multiple_of(sector_size as u64) {
+        return Err(StoreError::InvalidState(format!(
+            "managed ExtentStore alignment {} is not a multiple of sector size {sector_size}",
+            config.alignment
+        )));
+    }
     config.start_offset = align_up_checked(config.start_offset, config.alignment)?;
     if config.device_bytes == 0 || config.device_bytes > capacity {
         config.device_bytes = capacity;
     }
+    config.device_bytes -= config.device_bytes % config.alignment;
     if config.start_offset >= config.device_bytes {
         return Err(StoreError::InvalidState(
             "managed ExtentStore configured range is empty".to_string(),

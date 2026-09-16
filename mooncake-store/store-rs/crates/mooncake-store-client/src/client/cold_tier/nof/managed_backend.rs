@@ -8,7 +8,7 @@ use crate::client::{
 
 use super::backing::validate_payload;
 use super::ensure_batch_len;
-use super::managed::{NofManagedReadRequest, NofManagedWriteRequest};
+use super::managed::{NofManagedReadRequest, NofManagedRouteIdentity, NofManagedWriteRequest};
 use super::object::repeated_error;
 use super::NofBackend;
 
@@ -41,6 +41,16 @@ impl NofManagedStorageBackend {
                     )?,
                     value: write.payload,
                     checksum: write.cold_backing.checksum,
+                    route_identity: write.route.map(|route| NofManagedRouteIdentity {
+                        key: route.key.clone(),
+                        namespace: route.namespace.clone(),
+                        logical_key: route.logical_key.clone(),
+                        canonical_key: route.canonical_key.clone(),
+                        sharing_scope: route.sharing_scope.clone(),
+                        qos_tier: route.qos_tier.clone(),
+                        route_version: route.version,
+                        target_id: write.cold_backing.cold_tier_id.clone(),
+                    }),
                 })
             });
             match request {

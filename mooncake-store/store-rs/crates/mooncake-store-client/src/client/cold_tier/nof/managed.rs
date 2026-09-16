@@ -131,6 +131,9 @@ pub struct NofManagedWriteRequest<'a> {
     pub locator: NofManagedLocator,
     pub value: &'a [u8],
     pub checksum: Option<u64>,
+    /// Route identity is carried with the write because the writer and allocator owner may be
+    /// different clients. Executors that persist recovery manifests can derive one from it.
+    pub route_identity: Option<NofManagedRouteIdentity>,
 }
 
 /// Allocator and recovery operations owned by the managed executor.

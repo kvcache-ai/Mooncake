@@ -4134,6 +4134,25 @@ impl StoreClient {
             if reported_readable_replica {
                 continue;
             }
+            if let Some(backing) = route
+                .nof_backing
+                .as_ref()
+                .filter(|backing| {
+                    backing.state == mooncake_store_core::ColdBackingState::Materialized
+                })
+            {
+                for (_, owner, _) in backing.all_targets() {
+                    if owner == &self.lease.runtime {
+                        local_hits.insert(route.key.clone());
+                    } else if readable_runtimes.contains(owner) {
+                        remote_hits
+                            .entry(owner.clone())
+                            .or_default()
+                            .insert(route.key.clone());
+                    }
+                }
+                continue;
+            }
             let Some(cold_backing) = cold_tier::materialized_cold_backing(route) else {
                 continue;
             };
