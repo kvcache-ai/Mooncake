@@ -335,6 +335,7 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             ctx.applied_seq_id = handoff->applied_cursor.last_seq;
             ctx.metadata_store = std::move(handoff->metadata_store);
             ctx.segments = std::move(handoff->segments);
+            ctx.nof_segments = std::move(handoff->nof_segments);
             ctx.applied_cursor = handoff->applied_cursor;
             ctx.producer_view_version = handoff->producer_view_version;
             ctx.max_replica_id = handoff->max_replica_id;
@@ -374,6 +375,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
             snapshot.weight_metadata.value_or(WeightMetadataSnapshot{});
         ctx.object_storage =
             snapshot.object_storage.value_or(ObjectReplicaSnapshot{});
+        ctx.nof_segments =
+            snapshot.nof_segments.value_or(std::vector<NoFSegmentInfo>{});
 
         return ctx;
     }
@@ -408,7 +411,8 @@ class CapabilityDrivenStandbyController final : public StandbyController {
         }
         return standby_service_->PreservePromotionBaseline(
             std::move(context.metadata_store), context.applied_cursor,
-            context.producer_view_version, std::move(context.segments));
+            context.producer_view_version, std::move(context.segments),
+            std::move(context.nof_segments));
     }
 
     void SetStandbyRuntimeStateCallback(

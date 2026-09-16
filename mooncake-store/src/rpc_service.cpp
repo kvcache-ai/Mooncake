@@ -2030,9 +2030,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const std::vector<NoFSegmentInfo>& nof_segments) {
     return master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments, weight_metadata);
+        objects, initial_oplog_sequence_id, segments, weight_metadata,
+        nof_segments);
 }
 
 tl::expected<void, ErrorCode>
@@ -2046,10 +2048,11 @@ tl::expected<void, ErrorCode>
 WrappedMasterService::RestoreFromBatchOpLogPromotion(
     const StandbyMetadataStore& metadata_store, DurablePrefix applied_cursor,
     const std::vector<StandbySegmentInfo>& segments, ReplicaID max_replica_id,
-    size_t chunk_object_count) {
+    size_t chunk_object_count,
+    const std::vector<NoFSegmentInfo>& nof_segments) {
     return master_service_.RestoreFromBatchOpLogPromotion(
         metadata_store, applied_cursor, segments, max_replica_id,
-        chunk_object_count);
+        chunk_object_count, nof_segments);
 }
 
 namespace {

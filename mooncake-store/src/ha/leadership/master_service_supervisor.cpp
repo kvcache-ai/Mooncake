@@ -805,10 +805,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                       *promotion_ctx->metadata_store,
                       promotion_ctx->applied_cursor, promotion_ctx->segments,
                       promotion_ctx->max_replica_id,
-                      static_cast<size_t>(config.snapshot_chunk_object_count))
+                      static_cast<size_t>(config.snapshot_chunk_object_count),
+                      promotion_ctx->nof_segments)
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments, promotion_ctx->weight_metadata);
+                      promotion_ctx->segments, promotion_ctx->weight_metadata,
+                      promotion_ctx->nof_segments);
         if (ShutdownObserved(shutdown_requested)) {
             std::unique_ptr<LeadershipMonitorHandle> no_monitor;
             stop_term_resources(no_monitor);

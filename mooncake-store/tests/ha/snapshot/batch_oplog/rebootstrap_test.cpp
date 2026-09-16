@@ -125,6 +125,10 @@ class RebootstrapTest : public ::testing::Test {
         const auto segment_key =
             ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id);
         ASSERT_TRUE(objects_->UploadBuffer(segment_key, segments));
+        const auto nof_segments = EncodeBatchOpLogSnapshotNoFSegments({});
+        const auto nof_segment_key =
+            ha::BuildBatchOpLogSnapshotNoFSegmentsKey("snapshots", snapshot_id);
+        ASSERT_TRUE(objects_->UploadBuffer(nof_segment_key, nof_segments));
         const auto chunk = EncodeBatchOpLogSnapshotObjectChunk(
             0, {{.key = key, .metadata = {}},
                 {.key = "remove-me", .metadata = {}}});
@@ -139,6 +143,10 @@ class RebootstrapTest : public ::testing::Test {
             .key = segment_key,
             .stored_size = segments.size(),
             .crc32c = Crc32cValue(segments.data(), segments.size())};
+        manifest.nof_segments = {
+            .key = nof_segment_key,
+            .stored_size = nof_segments.size(),
+            .crc32c = Crc32cValue(nof_segments.data(), nof_segments.size())};
         manifest.object_chunks = {
             {.chunk_index = 0,
              .key = chunk_key,
@@ -389,7 +397,7 @@ TEST_F(RebootstrapTest, RestartResumesPreservedPromotionCursor) {
     DurablePrefix cursor{.batch_id = 50, .last_seq = 50};
     ASSERT_EQ(ErrorCode::OK, service_->PreservePromotionBaseline(
                                  std::move(metadata), cursor,
-                                 /*producer_view_version=*/7, {}));
+                                 /*producer_view_version=*/7, {}, {}));
     Prefix(50);
     HAMetricManager::instance().set_oplog_applied_sequence_id(0);
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
@@ -397,6 +405,77 @@ TEST_F(RebootstrapTest, RestartResumesPreservedPromotionCursor) {
     EXPECT_EQ(50, HAMetricManager::instance().get_oplog_applied_sequence_id());
     EXPECT_EQ(1u, service_->GetMetadataCount());
     EXPECT_EQ(50u, service_->GetSyncStatus().applied_seq_id);
+}
+
+TEST_F(RebootstrapTest, RestartPreservesNoFBeforeAndAfterHandoff) {
+    service_->Stop();
+    const NoFSegmentInfo info{{1, 2},         {3, 4}, "pool",
+                              "nof-endpoint", 4096,   8192};
+    const auto expected = EncodeBatchOpLogSnapshotNoFSegments({info});
+    const DurablePrefix cursor{.batch_id = 50, .last_seq = 50};
+    // A registered pool need not have any KV objects. Its mount log has
+    // already been pruned; recovery must use the preserved registration.
+    ASSERT_EQ(ErrorCode::OK, service_->PreservePromotionBaseline(
+                                 std::make_unique<StandbyMetadataStore>(),
+                                 cursor, 7, {}, {info}));
+    Prefix(50);
+    backend_->Put(ha::BuildBatchOpLogSnapshotCompactionFloorKey("n09"), "50");
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    const auto expect_registration = [&] {
+        StandbySnapshot snapshot;
+        ASSERT_TRUE(service_->ExportStandbySnapshot(snapshot));
+        EXPECT_EQ(50u, snapshot.oplog_sequence_id);
+        EXPECT_TRUE(snapshot.objects.empty());
+        EXPECT_EQ(
+            expected,
+            EncodeBatchOpLogSnapshotNoFSegments(
+                snapshot.nof_segments.value_or(std::vector<NoFSegmentInfo>{})));
+    };
+    ASSERT_NO_FATAL_FAILURE(expect_registration());
+
+    // Failed promotion before detaching the store retains the applier state.
+    service_->Stop();
+    service_->MarkAppliedCursorForRestart();
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    ASSERT_NO_FATAL_FAILURE(expect_registration());
+
+    // A failure after detachment returns the entire handoff to the standby.
+    auto handoff = service_->PromoteAndDetachBatchOpLogStore();
+    ASSERT_TRUE(handoff);
+    EXPECT_EQ(expected,
+              EncodeBatchOpLogSnapshotNoFSegments(handoff->nof_segments));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->PreservePromotionBaseline(
+                  std::move(handoff->metadata_store), handoff->applied_cursor,
+                  handoff->producer_view_version, std::move(handoff->segments),
+                  std::move(handoff->nof_segments)));
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    ASSERT_NO_FATAL_FAILURE(expect_registration());
+
+    // Resume from the saved cursor and apply a new unregister, then preserve
+    // the empty registry. An older saved pool must never be resurrected.
+    OpLogEntry entry;
+    entry.sequence_id = 51;
+    entry.op_type = OpType::NOF_SEGMENT_UNMOUNT;
+    entry.object_key = info.transport_endpoint;
+    entry.payload = struct_pack::serialize<std::string>(
+        NoFSegmentUnmountOp{info.transport_endpoint});
+    OpLogBatchRecord batch;
+    batch.batch_id = batch.first_seq = batch.last_seq = 51;
+    batch.entries = {entry};
+    backend_->Put(BuildBatchRecordKey("n09", 51),
+                  EncodeOpLogBatchRecord(batch));
+    Prefix(51);
+    ASSERT_TRUE(WaitUntil(
+        [&] { return service_->GetLatestAppliedSequenceId() == 51; }));
+    service_->Stop();
+    service_->MarkAppliedCursorForRestart();
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", "n09"));
+    StandbySnapshot snapshot;
+    ASSERT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(51u, snapshot.oplog_sequence_id);
+    ASSERT_TRUE(snapshot.nof_segments.has_value());
+    EXPECT_TRUE(snapshot.nof_segments->empty());
 }
 
 }  // namespace

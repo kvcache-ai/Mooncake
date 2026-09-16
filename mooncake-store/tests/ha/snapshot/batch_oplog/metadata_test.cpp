@@ -51,6 +51,10 @@ BatchOpLogSnapshotManifest MakeManifest() {
                  .stored_size = 512,
                  .crc32c = 20},
             },
+        .nof_segments = {.key =
+                             "snapshots/batch-oplog/9-12345/nof_segments.bin",
+                         .stored_size = 96,
+                         .crc32c = 21},
     };
 }
 
@@ -114,8 +118,12 @@ TEST(BatchOpLogSnapshotTypesTest, ManifestRoundTripsChunksAndAllowsEmptySet) {
     json["future_optional_field"] = true;
     auto decoded = DecodeBatchOpLogSnapshotManifest(WriteJson(json));
     ASSERT_TRUE(decoded.has_value()) << decoded.error();
-    ASSERT_EQ(decoded->object_chunks.size(), 2u);
     EXPECT_EQ(decoded->segments.stored_size, 64u);
+    EXPECT_EQ(decoded->nof_segments.key,
+              "snapshots/batch-oplog/9-12345/nof_segments.bin");
+    EXPECT_EQ(96u, decoded->nof_segments.stored_size);
+    EXPECT_EQ(21u, decoded->nof_segments.crc32c);
+    ASSERT_EQ(decoded->object_chunks.size(), 2u);
     EXPECT_EQ(decoded->object_chunks[1].chunk_index, 1u);
     EXPECT_EQ(decoded->object_chunks[1].object_count, 50u);
 
@@ -153,6 +161,24 @@ TEST(BatchOpLogSnapshotTypesTest, WeightSnapshotRequiresVersionedArtifact) {
         EncodeBatchOpLogSnapshotManifest(manifest));
     ASSERT_TRUE(legacy);
     EXPECT_FALSE(legacy->weight_metadata);
+}
+
+TEST(BatchOpLogSnapshotTypesTest,
+     LegacyManifestWithoutNoFSegmentsDecodesAsEmpty) {
+    auto json = ParseJson(EncodeBatchOpLogSnapshotManifest(MakeManifest()));
+    json.removeMember("nof_segments");
+
+    auto decoded = DecodeBatchOpLogSnapshotManifest(WriteJson(json));
+    ASSERT_TRUE(decoded.has_value()) << decoded.error();
+    EXPECT_TRUE(decoded->nof_segments.key.empty());
+    EXPECT_EQ(0u, decoded->nof_segments.stored_size);
+    EXPECT_EQ(0u, decoded->nof_segments.crc32c);
+    EXPECT_EQ(decoded->segments.stored_size, 64u);
+    EXPECT_EQ(decoded->object_chunks.size(), 2u);
+
+    // Old snapshots may omit this field; reject explicit null.
+    json["nof_segments"] = Json::Value();
+    ExpectManifestRejected(WriteJson(json));
 }
 
 TEST(BatchOpLogSnapshotTypesTest, JsonRoundTripPreservesEscapedKeys) {
@@ -283,6 +309,8 @@ TEST(BatchOpLogSnapshotTypesTest, BuildsControlAndArtifactKeys) {
               "snapshots/batch-oplog/9-12345/manifest.json");
     EXPECT_EQ(BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id),
               "snapshots/batch-oplog/9-12345/segments.bin");
+    EXPECT_EQ(BuildBatchOpLogSnapshotNoFSegmentsKey("snapshots", snapshot_id),
+              "snapshots/batch-oplog/9-12345/nof_segments.bin");
     EXPECT_EQ(
         BuildBatchOpLogSnapshotObjectChunkKey("snapshots", snapshot_id, 7),
         "snapshots/batch-oplog/9-12345/objects/7.bin");

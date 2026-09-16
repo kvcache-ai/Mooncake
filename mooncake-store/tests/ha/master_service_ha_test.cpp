@@ -598,6 +598,26 @@ class MasterServiceHATest : public ::testing::Test {
     }
 
 #ifdef USE_NOF
+    static void PrepareNoFUnmountForTesting(MasterService& service,
+                                            const UUID& segment_id) {
+        auto access = MasterServiceTestPeer::NofSegmentManager(service)
+                          .getNoFSegmentAccess();
+        size_t capacity = 0;
+        ASSERT_EQ(ErrorCode::OK,
+                  access.PrepareUnmountSegment(segment_id, capacity));
+    }
+
+    static bool UnmountNoFByHeartbeatForTesting(MasterService& service,
+                                                const NoFSegment& segment,
+                                                const UUID& client_id) {
+        return MasterServiceTestPeer(service).TryUnmountNoFSegmentByHeartbeat(
+            MountedNoFSegmentSnapshot{.segment_id = segment.id,
+                                      .client_id = client_id,
+                                      .segment = segment,
+                                      .status = SegmentStatus::OK},
+            "test_probe_failure");
+    }
+
     NoFSegment MakeNoFSegment(
         std::string name = "test_nof_segment",
         std::string endpoint = "test_nof_segment_endpoint",
@@ -1546,7 +1566,8 @@ TEST_F(MasterServiceHATest,
     ASSERT_EQ(ErrorCode::OK,
               standby.PreservePromotionBaseline(
                   std::move(handoff.metadata_store), handoff.applied_cursor,
-                  /*producer_view_version=*/7, handoff.segments));
+                  /*producer_view_version=*/7, handoff.segments,
+                  handoff.nof_segments));
     EXPECT_EQ(11u, standby.GetSyncStatus().applied_seq_id);
     EXPECT_EQ(1u, standby.GetMetadataCount());
 }
@@ -1984,6 +2005,32 @@ TEST_F(MasterServiceHATest, RestoreRejectsDfsMode) {
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::DFS_SERVICE_UNAVAILABLE);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreRejectsUnavailableOrInvalidNoFRegistrations) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .build());
+    NoFSegmentInfo info{{1, 2}, {3, 4}, "nof", "nof-endpoint", 0, 4096};
+#ifdef USE_NOF
+    info.transport_endpoint.clear();
+    auto result = service.RestoreFromStandbySnapshot({}, 0, {}, {}, {info});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    info.transport_endpoint = "nof-endpoint";
+    info.base = std::numeric_limits<uint64_t>::max();
+    result = service.RestoreFromStandbySnapshot({}, 0, {}, {}, {info});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    EXPECT_EQ(
+        0u,
+        MasterServiceTestPeer(service).GetMountedNoFSegmentCountForTesting());
+#else
+    auto result = service.RestoreFromStandbySnapshot({}, 0, {}, {}, {info});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, result.error());
+#endif
 }
 
 TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
@@ -7004,6 +7051,228 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
 }
 
 #ifdef USE_NOF
+TEST_F(MasterServiceHATest, NoFSegmentLifecycleWritesBatchRecordOpLogs) {
+    const std::string cluster_id = "nof_segment_lifecycle";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_nof_heartbeat_interval_sec(3600)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    auto first = MakeNoFSegment("first", "first-nof-endpoint", 0);
+    auto second = MakeNoFSegment("second", "second-nof-endpoint", 4096);
+    const UUID owner = generate_uuid();
+    ASSERT_TRUE(service.MountNoFSegment(first, owner).has_value());
+    ASSERT_TRUE(service.ReMountNoFSegment({second}, owner).has_value());
+    ASSERT_TRUE(service.MountNoFSegment(first, owner).has_value());
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    uint64_t batch_id = 1;
+    for (const auto& segment : {first, second}) {
+        ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, batch_id, batch));
+        ASSERT_EQ(1u, batch.entries.size());
+        const auto& entry = batch.entries[0];
+        ASSERT_EQ(OpType::NOF_SEGMENT_MOUNT, entry.op_type);
+        EXPECT_EQ(batch_id, entry.sequence_id);
+        EXPECT_EQ(segment.te_endpoint, entry.object_key);
+        NoFSegmentMountOp mount;
+        ASSERT_EQ(struct_pack::errc::ok,
+                  struct_pack::deserialize_to(mount, entry.payload));
+        EXPECT_EQ(segment.id, mount.segment_id);
+        EXPECT_EQ(owner, mount.client_id);
+        EXPECT_EQ(segment.name, mount.segment_name);
+        EXPECT_EQ(segment.te_endpoint, mount.transport_endpoint);
+        EXPECT_EQ(segment.base, mount.base);
+        EXPECT_EQ(segment.size, mount.capacity);
+        ++batch_id;
+    }
+
+    ASSERT_TRUE(service.UnmountNoFSegment(first.id, owner).has_value());
+    ASSERT_TRUE(UnmountNoFByHeartbeatForTesting(service, second, owner));
+    // The duplicate mount must not insert an event before these unmounts.
+    for (const auto& segment : {first, second}) {
+        ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, batch_id, batch));
+        ASSERT_EQ(1u, batch.entries.size());
+        const auto& entry = batch.entries[0];
+        ASSERT_EQ(OpType::NOF_SEGMENT_UNMOUNT, entry.op_type);
+        EXPECT_EQ(batch_id, entry.sequence_id);
+        EXPECT_EQ(segment.te_endpoint, entry.object_key);
+        NoFSegmentUnmountOp unmount;
+        ASSERT_EQ(struct_pack::errc::ok,
+                  struct_pack::deserialize_to(unmount, entry.payload));
+        EXPECT_EQ(segment.te_endpoint, unmount.transport_endpoint);
+        ++batch_id;
+    }
+    EXPECT_EQ(
+        0u,
+        MasterServiceTestPeer(service).GetMountedNoFSegmentCountForTesting());
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreFromStandbyRestoresNoFRegistrationsWithoutMountOpLog) {
+    const std::string cluster_id = "nof_registration_recovery";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_nof_heartbeat_interval_sec(3600)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const NoFSegmentInfo info{
+        .segment_id = generate_uuid(),
+        .client_id = generate_uuid(),
+        .segment_name = "restored-nof",
+        .transport_endpoint = "restored-nof-endpoint",
+        .base = 4096,
+        .capacity = 8192,
+    };
+    ASSERT_TRUE(
+        service.RestoreFromStandbySnapshot({}, 0, {}, {}, {info}).has_value());
+    auto mounted = service.GetAllNoFSegments();
+    ASSERT_TRUE(mounted.has_value());
+    ASSERT_EQ(1u, mounted->size());
+    EXPECT_EQ(info.segment_id, mounted->front().id);
+    EXPECT_EQ(info.segment_name, mounted->front().name);
+    EXPECT_EQ(info.transport_endpoint, mounted->front().te_endpoint);
+    EXPECT_EQ(info.base, mounted->front().base);
+    EXPECT_EQ(info.capacity, mounted->front().size);
+    auto owners = service.GetNoFSegmentsByName(info.segment_name);
+    ASSERT_TRUE(owners.has_value());
+    ASSERT_EQ(1u, owners->size());
+    EXPECT_EQ(info.client_id, owners->front().client_id);
+    EXPECT_EQ(info.segment_id, owners->front().segment_id);
+
+    // Restoring NoF registrations must not write new mount OpLog entries.
+    // Unmount explicitly and verify that it produces the first OpLog entry.
+    ASSERT_TRUE(
+        service.UnmountNoFSegment(info.segment_id, info.client_id).has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 1, batch));
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::NOF_SEGMENT_UNMOUNT, batch.entries[0].op_type);
+    EXPECT_EQ(1u, batch.entries[0].sequence_id);
+    EXPECT_EQ(info.transport_endpoint, batch.entries[0].object_key);
+}
+
+TEST_F(MasterServiceHATest, NoFRestoreFailureRollsBackOnlyNewRegistrations) {
+    const std::string cluster_id = "nof_restore_rollback";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_nof_heartbeat_interval_sec(3600)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const NoFSegmentInfo existing{generate_uuid(),
+                                  generate_uuid(),
+                                  "existing",
+                                  "existing-endpoint",
+                                  0,
+                                  8192};
+    const NoFSegmentInfo added{generate_uuid(),
+                               generate_uuid(),
+                               "added",
+                               "added-endpoint",
+                               4096,
+                               8192};
+    ASSERT_TRUE(service.RestoreFromStandbySnapshot({}, 0, {}, {}, {existing}));
+    auto conflict = existing;
+    conflict.segment_id = generate_uuid();
+    conflict.client_id = generate_uuid();
+    auto restored = service.RestoreFromStandbySnapshot(
+        {}, 0, {}, {}, {existing, added, conflict});
+    ASSERT_FALSE(restored);
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, restored.error());
+    EXPECT_EQ(MasterService::RestoreLifecycleState::kFailed,
+              service.GetRestoreLifecycleState());
+    auto mounted = service.GetAllNoFSegments();
+    ASSERT_TRUE(mounted);
+    ASSERT_EQ(1u, mounted->size());
+    EXPECT_EQ(existing.segment_id, mounted->front().id);
+    auto owners = service.GetNoFSegmentsByName(existing.segment_name);
+    ASSERT_TRUE(owners);
+    ASSERT_EQ(1u, owners->size());
+    EXPECT_EQ(existing.client_id, owners->front().client_id);
+
+    // A failed attempt may be retried on the same service. Neither the
+    // successful prefix nor its rollback must append registration logs.
+    ASSERT_TRUE(
+        service.RestoreFromStandbySnapshot({}, 0, {}, {}, {existing, added}));
+    mounted = service.GetAllNoFSegments();
+    ASSERT_TRUE(mounted);
+    EXPECT_EQ(2u, mounted->size());
+    EXPECT_EQ(MasterService::RestoreLifecycleState::kReady,
+              service.GetRestoreLifecycleState());
+    ASSERT_TRUE(service.UnmountNoFSegment(added.segment_id, added.client_id));
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 1, batch));
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::NOF_SEGMENT_UNMOUNT, batch.entries[0].op_type);
+    EXPECT_EQ(1u, batch.entries[0].sequence_id);
+    EXPECT_EQ(added.transport_endpoint, batch.entries[0].object_key);
+}
+
+TEST_F(MasterServiceHATest, NoFRemountLogsSuccessfulItemsBeforeFailure) {
+    const std::string cluster_id = "nof_partial_remount";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_memory_allocator(BufferAllocatorType::OFFSET)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .set_nof_heartbeat_interval_sec(3600)
+                              .build());
+    ASSERT_EQ(
+        ErrorCode::OK,
+        MasterServiceTestPeer(service).SetBatchOpLogBackendForTesting(backend));
+    const UUID owner = generate_uuid();
+    auto blocked = MakeNoFSegment("blocked", "blocked-endpoint");
+    ASSERT_TRUE(service.MountNoFSegment(blocked, owner).has_value());
+    // Leave the segment in UNMOUNTING so remount fails with a status error.
+    ASSERT_NO_FATAL_FAILURE(PrepareNoFUnmountForTesting(service, blocked.id));
+    auto good = MakeNoFSegment("good", "good-endpoint", 4096);
+    auto skipped = MakeNoFSegment("skipped", "skipped-endpoint");
+    auto result = service.ReMountNoFSegment({good, blocked, skipped}, owner);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    EXPECT_TRUE(
+        MasterServiceTestPeer(service).IsNoFSegmentMountedForTesting(good.id));
+    EXPECT_FALSE(MasterServiceTestPeer(service).IsNoFSegmentMountedForTesting(
+        skipped.id));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ASSERT_NO_FATAL_FAILURE(ReadBatchEventually(storage, 2, batch));
+    ASSERT_EQ(1u, batch.entries.size());
+    NoFSegmentMountOp mount;
+    ASSERT_EQ(OpType::NOF_SEGMENT_MOUNT, batch.entries[0].op_type);
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(mount, batch.entries[0].payload));
+    EXPECT_EQ(good.id, mount.segment_id);
+    EXPECT_EQ(owner, mount.client_id);
+    EXPECT_EQ(good.te_endpoint, mount.transport_endpoint);
+}
+
 TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_nof_evict_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
@@ -7036,19 +7305,19 @@ TEST_F(MasterServiceHATest, NoFBatchEvictWritesBatchRecordOpLog) {
 
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
-    ReadBatchEventually(storage, 1, batch);
+    ReadBatchEventually(storage, 2, batch);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     MasterServiceTestPeer(service).RunNoFBatchEvictForTesting(
         /*evict_ratio_target=*/1.0,
         /*evict_ratio_lowerbound=*/1.0);
-    ReadBatchEventually(storage, 2, batch);
+    ReadBatchEventually(storage, 3, batch);
 
     ASSERT_EQ(1u, batch.entries.size());
     EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
-    EXPECT_EQ(2u, batch.entries[0].sequence_id);
+    EXPECT_EQ(3u, batch.entries[0].sequence_id);
 }
 
 TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
@@ -7082,7 +7351,7 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
 
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
-    ReadBatchEventually(storage, 1, batch);
+    ReadBatchEventually(storage, 2, batch);
     ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
@@ -7099,7 +7368,7 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
     EXPECT_FALSE(before_finalize.has_value());
 
     backend->AllowTxn();
-    ReadBatchEventually(storage, 2, batch);
+    ReadBatchEventually(storage, 3, batch);
     ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
 
     auto after_finalize =

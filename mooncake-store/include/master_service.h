@@ -934,7 +934,8 @@ class MasterService {
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments,
-        const WeightMetadataSnapshot& weight_metadata = {});
+        const WeightMetadataSnapshot& weight_metadata = {},
+        const std::vector<NoFSegmentInfo>& nof_segments = {});
     // Copies objects out of the handoff. The caller keeps ownership so a
     // failed restore or a later lease loss can still PreservePromotionBaseline.
     tl::expected<void, ErrorCode> RestoreFromBatchOpLogPromotion(
@@ -945,7 +946,8 @@ class MasterService {
         DurablePrefix applied_cursor,
         const std::vector<StandbySegmentInfo>& segments,
         ReplicaID max_replica_id,
-        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects);
+        size_t chunk_object_count = kDefaultBatchOpLogPromotionChunkObjects,
+        const std::vector<NoFSegmentInfo>& nof_segments = {});
 
     /**
      * @brief Restore lifecycle state machine (RFC #4700, slice 1).
@@ -1082,7 +1084,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const std::vector<NoFSegmentInfo>& nof_segments);
 
     // The restore implementation itself; entered only through
     // RestoreFromStandbyState above.
@@ -1093,7 +1096,8 @@ class MasterService {
         const std::vector<StandbySegmentInfo>& segments,
         size_t chunk_object_count,
         std::optional<ReplicaID> expected_max_replica_id,
-        const WeightMetadataSnapshot* legacy_weight_metadata);
+        const WeightMetadataSnapshot* legacy_weight_metadata,
+        const std::vector<NoFSegmentInfo>& nof_segments);
 
     // Tolerant legacy snapshot restore (#3760), one phase per method so each
     // stays single-purpose.
@@ -2348,6 +2352,14 @@ class MasterService {
     void PersistSegmentOpForHA(const char* why, OpType type,
                                const std::string& key,
                                const std::string& payload);
+
+    // Called under the restore lifecycle and master-state locks.
+    ErrorCode RestoreNoFSegmentsForHA(
+        const std::vector<NoFSegmentInfo>& segments);
+
+    void PersistNoFSegmentMountForHA(const NoFSegment& segment,
+                                     const UUID& client_id);
+    void PersistNoFSegmentUnmountForHA(const std::string& endpoint);
 
     /**
      * Appends a REMOVE entry for the key, without waiting for it to become
