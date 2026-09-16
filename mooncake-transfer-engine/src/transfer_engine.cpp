@@ -1088,7 +1088,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
     ~Impl() { wait(); }
 
     Status wait() {
-        PollBackoff backoff;
+        PollBackoff backoff(requests_.size());
         while (!completed_) {
             poll();
             if (!completed_) backoff.pause();
@@ -1108,7 +1108,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                            ? std::chrono::steady_clock::time_point::max()
                            : now + timeout;
         }
-        PollBackoff backoff;
+        PollBackoff backoff(requests_.size());
         while (!completed_) {
             poll();
             if (completed_) break;
@@ -1122,6 +1122,13 @@ class TransferEngine::ScatterTransferOperation::Impl {
    private:
     class PollBackoff {
        public:
+        explicit PollBackoff(size_t request_count)
+            : active_poll_deadline_(
+                  std::chrono::steady_clock::now() +
+                  (request_count >= kExtendedActivePollMinRequests
+                       ? kExtendedActivePollWindow
+                       : kDefaultActivePollWindow)) {}
+
         void pause() {
             if (!active_polling_) {
                 std::this_thread::sleep_for(kPollInterval);
@@ -1138,12 +1145,16 @@ class TransferEngine::ScatterTransferOperation::Impl {
         }
 
        private:
-        // Small scatter transfers normally complete inside this window. Avoid
-        // scheduler-scale sleeps on their latency path, then back off for
-        // larger transfers and stalled peers.
+        // Avoid scheduler-scale sleeps on latency-sensitive scatter transfers.
+        // Larger request sets need a longer window to cover RDMA completion;
+        // small requests retain the lower-CPU default before backing off.
         static constexpr uint32_t kPollsBeforeDeadlineCheck = 64;
-        std::chrono::steady_clock::time_point active_poll_deadline_ =
-            std::chrono::steady_clock::now() + std::chrono::microseconds(100);
+        static constexpr size_t kExtendedActivePollMinRequests = 128;
+        static constexpr auto kDefaultActivePollWindow =
+            std::chrono::microseconds(100);
+        static constexpr auto kExtendedActivePollWindow =
+            std::chrono::microseconds(300);
+        std::chrono::steady_clock::time_point active_poll_deadline_;
         uint32_t poll_count_ = 0;
         bool active_polling_ = true;
     };
