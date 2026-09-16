@@ -1,12 +1,12 @@
-#include "nvme_kv_executor_util.h"
-#include "nvme_kv_object_layout.h"
+#include "nvme_kv/executor_util.h"
+#include "nvme_kv/object_layout.h"
 
 #include <algorithm>
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
 
-#include "config/nvme_kv_u32_parser.h"
+#include "config/u32_parser.h"
 
 namespace mooncake {
 namespace {
