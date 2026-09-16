@@ -24,9 +24,9 @@ class MasterServiceTestPeer {
     using MetadataShardAccessorRO = MasterService::MetadataShardAccessorRO;
     using MetadataShardAccessorRW = MasterService::MetadataShardAccessorRW;
     using ObjectIdentity = MasterService::ObjectIdentity;
-    using ObjectMetadata = MasterService::ObjectMetadata;
-    using PromotionQueueResult = MasterService::PromotionQueueResult;
-    using PromotionTask = MasterService::PromotionTask;
+    using ObjectMetadata = mooncake::ObjectMetadata;
+    using PromotionQueueResult = mooncake::PromotionQueueResult;
+    using PromotionTask = mooncake::PromotionTask;
     using QuotaEraseMode = MasterService::QuotaEraseMode;
     using TenantQuotaEvictionResult = MasterService::TenantQuotaEvictionResult;
     using TenantState = MasterService::TenantState;

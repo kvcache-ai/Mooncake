@@ -304,16 +304,18 @@ TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 
     const auto normal_now = Clock::time_point(std::chrono::seconds(10));
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now, 25),
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now,
+                                            std::chrono::milliseconds(25)),
               normal_now + std::chrono::milliseconds(25));
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(
-                  normal_now, std::numeric_limits<uint64_t>::max()),
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now,
+                                            std::chrono::milliseconds::max()),
               Clock::time_point::max());
 
     const auto near_max =
         Clock::time_point::max() - std::chrono::milliseconds(5);
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(near_max, 10),
-              Clock::time_point::max());
+    EXPECT_EQ(
+        ComputeSoftPinDeadlineForTest(near_max, std::chrono::milliseconds(10)),
+        Clock::time_point::max());
 }
 
 #ifdef USE_NOF

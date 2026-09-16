@@ -266,9 +266,10 @@ class MasterServiceTest : public ::testing::Test {
     }
 
     std::chrono::system_clock::time_point ComputeSoftPinDeadlineForTest(
-        const std::chrono::system_clock::time_point& now, uint64_t ttl_ms) {
+        const std::chrono::system_clock::time_point& now,
+        std::chrono::milliseconds ttl) {
         return MasterServiceTestPeer::ObjectMetadata::ComputeSoftPinDeadline(
-            now, ttl_ms);
+            now, ttl);
     }
 
     std::string WriteTenantPolicyFile(
