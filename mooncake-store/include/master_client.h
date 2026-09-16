@@ -511,6 +511,21 @@ class MasterClient {
     PromotionObjectHeartbeat(const UUID& client_id);
 
     /**
+     * @brief Registers a prefetch (SSD->DRAM promotion) task on the master.
+     *
+     * Creates a promotion_tasks entry consumed by PromotionAllocStart, but
+     * deliberately bypasses the promotion-on-hit admission gate and the
+     * holder's heartbeat mailbox, keeping the dedicated prefetch path
+     * separate from promotion-on-hit. The caller must be the holder of the
+     * key's LOCAL_DISK replica (the master checks holder_id == client_id).
+     * Best-effort: PROMOTION_ALREADY_EXISTS means a MEMORY replica or an
+     * in-flight promotion already exists and the caller should skip quietly.
+     * The client's own tenant is used.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const UUID& client_id, const std::string& key);
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * promotion. Returns the new replica's descriptor that the caller writes
      * via Transfer Engine.

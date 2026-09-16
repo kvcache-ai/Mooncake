@@ -546,6 +546,16 @@ class Client {
         std::vector<PromotionTaskItem>& promotion_objects);
 
     /**
+     * @brief Register a master-side promotion task for SSD prefetch, without
+     * the promotion-on-hit admission gate or heartbeat mailbox. This client
+     * must hold the key's LOCAL_DISK replica. Best-effort:
+     * PROMOTION_ALREADY_EXISTS means skip quietly. The client's tenant
+     * applies.
+     */
+    virtual tl::expected<void, ErrorCode> RegisterPrefetchTask(
+        const std::string& object_key);
+
+    /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key during
      * L2->L1 promotion. Returns the new replica's descriptor that the caller
      * writes via Transfer Engine before calling NotifyPromotionSuccess.

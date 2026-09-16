@@ -4188,6 +4188,11 @@ tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     return {};
 }
 
+tl::expected<void, ErrorCode> Client::RegisterPrefetchTask(
+    const std::string& object_key) {
+    return master_client_.RegisterPrefetchTask(client_id_, object_key);
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 Client::PromotionAllocStart(
     const std::string& key, uint64_t size,

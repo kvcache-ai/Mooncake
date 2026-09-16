@@ -1649,6 +1649,22 @@ WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     return master_service_.PromotionObjectHeartbeat(client_id);
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterPrefetchTask(
+    const UUID& client_id, const std::string& key,
+    const std::string& tenant_id) {
+    ScopedVLogTimer timer(1, "RegisterPrefetchTask");
+    timer.LogRequest("action=register_prefetch_task");
+    auto result = WithRequestTenant(
+        master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
+                                               : TenantId::kDefaultValue,
+        [&](const TenantId& resolved_tenant_id) {
+            return master_service_.RegisterPrefetchTask(client_id, key,
+                                                        resolved_tenant_id);
+        });
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PromotionAllocStartResponse, ErrorCode>
 WrappedMasterService::PromotionAllocStart(
     const UUID& client_id, const std::string& key, const std::string& tenant_id,
@@ -1865,6 +1881,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::RegisterPrefetchTask>(
         &wrapped_master_service);
     server
         .register_handler<&mooncake::WrappedMasterService::PromotionAllocStart>(
