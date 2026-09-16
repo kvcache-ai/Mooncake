@@ -99,6 +99,7 @@ pub(in crate::client) struct NofTargetManager {
     managed_targets: BTreeMap<String, NofBackend>,
     route_ops: Option<mooncake_store_route::RouteOperations>,
     control_client: Arc<ControlPlaneClient>,
+    placement_lock: parking_lot::Mutex<()>,
     _heartbeat: NofHeartbeatMonitor,
 }
 
@@ -203,6 +204,7 @@ impl NofTargetManager {
             managed_targets,
             route_ops: None,
             control_client: Arc::new(ControlPlaneClient::new()?),
+            placement_lock: parking_lot::Mutex::new(()),
             _heartbeat: heartbeat,
         })
     }
@@ -636,6 +638,7 @@ impl NofTargetManager {
         require_full_set: bool,
         excluded: &BTreeSet<String>,
     ) -> Option<(Vec<ReplicaWriteCandidate<'_>>, Vec<usize>)> {
+        let _placement = self.placement_lock.lock();
         let candidates = self
             .state
             .targets
@@ -1558,6 +1561,7 @@ mod tests {
             control_client: Arc::new(
                 ControlPlaneClient::new().expect("test control client should build"),
             ),
+            placement_lock: parking_lot::Mutex::new(()),
             _heartbeat: NofHeartbeatMonitor::disabled(),
         };
 
@@ -1596,6 +1600,7 @@ mod tests {
             control_client: Arc::new(
                 ControlPlaneClient::new().expect("test control client should build"),
             ),
+            placement_lock: parking_lot::Mutex::new(()),
             _heartbeat: NofHeartbeatMonitor::disabled(),
         });
         let management = state.management_gate.read();
