@@ -529,7 +529,8 @@ impl SpdkNofBlockDeviceConfig {
 }
 
 pub struct SpdkNofBlockDevice {
-    raw: NonNull<c_void>,
+    raw: parking_lot::Mutex<Option<NonNull<c_void>>>,
+    config: SpdkNofBlockDeviceConfig,
     capacity_bytes: u64,
     sector_size: u32,
     submit_chunk_bytes: u64,
@@ -540,6 +541,17 @@ unsafe impl Sync for SpdkNofBlockDevice {}
 
 impl SpdkNofBlockDevice {
     pub fn connect(config: SpdkNofBlockDeviceConfig) -> Result<Self> {
+        let (raw, capacity_bytes, sector_size) = Self::open(&config)?;
+        Ok(Self {
+            raw: parking_lot::Mutex::new(Some(raw)),
+            submit_chunk_bytes: config.submit_chunk_bytes.max(sector_size as u64),
+            config,
+            capacity_bytes,
+            sector_size,
+        })
+    }
+
+    fn open(config: &SpdkNofBlockDeviceConfig) -> Result<(NonNull<c_void>, u64, u32)> {
         let transport = cstring("transport", config.transport.as_str())?;
         let traddr = cstring("traddr", &config.traddr)?;
         let port = cstring("port", &config.port)?;
@@ -576,12 +588,7 @@ impl SpdkNofBlockDevice {
                 "SPDK NoF target reported an empty geometry".to_string(),
             ));
         }
-        Ok(Self {
-            raw,
-            capacity_bytes: capacity,
-            sector_size,
-            submit_chunk_bytes: config.submit_chunk_bytes.max(sector_size as u64),
-        })
+        Ok((raw, capacity, sector_size))
     }
 
     pub fn capacity_bytes(&self) -> u64 {
@@ -592,12 +599,56 @@ impl SpdkNofBlockDevice {
     }
 
     fn health(&self) -> Result<()> {
+        let mut raw = self.raw.lock();
+        if let Some(current) = *raw {
+            if self.raw_health(current).is_ok() {
+                return Ok(());
+            }
+        }
+        self.reconnect(&mut raw)
+    }
+
+    fn raw_health(&self, raw: NonNull<c_void>) -> Result<()> {
         let mut error = vec![0 as c_char; 256];
-        let rc = unsafe { mc_nof_health(self.raw.as_ptr(), error.as_mut_ptr(), error.len()) };
+        let rc = unsafe { mc_nof_health(raw.as_ptr(), error.as_mut_ptr(), error.len()) };
         if rc == 0 {
             Ok(())
         } else {
             Err(StoreError::Transport(read_error(&error)))
+        }
+    }
+
+    fn reconnect(&self, raw: &mut Option<NonNull<c_void>>) -> Result<()> {
+        if let Some(previous) = raw.take() {
+            unsafe { mc_nof_close(previous.as_ptr()) };
+        }
+        let (next, capacity, sector_size) = Self::open(&self.config)?;
+        if capacity != self.capacity_bytes || sector_size != self.sector_size {
+            unsafe { mc_nof_close(next.as_ptr()) };
+            return Err(StoreError::InvalidState(
+                "SPDK NoF target geometry changed after reconnect".to_string(),
+            ));
+        }
+        *raw = Some(next);
+        Ok(())
+    }
+
+    fn with_reconnect(
+        &self,
+        mut operation: impl FnMut(NonNull<c_void>) -> Result<()>,
+    ) -> Result<()> {
+        let mut raw = self.raw.lock();
+        if raw.is_none() {
+            self.reconnect(&mut raw)?;
+        }
+        let current = raw.expect("SPDK reconnect returned without a device");
+        match operation(current) {
+            Ok(()) => Ok(()),
+            Err(error) if self.raw_health(current).is_ok() => Err(error),
+            Err(_) => {
+                self.reconnect(&mut raw)?;
+                operation(raw.expect("SPDK reconnect returned without a device"))
+            }
         }
     }
 
@@ -617,13 +668,13 @@ impl SpdkNofBlockDevice {
     }
 
     fn flush(&self) -> Result<()> {
-        let mut error = vec![0 as c_char; 256];
-        let rc = unsafe { mc_nof_flush(self.raw.as_ptr(), error.as_mut_ptr(), error.len()) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(StoreError::Transport(read_error(&error)))
-        }
+        self.with_reconnect(|raw| {
+            let mut error = vec![0 as c_char; 256];
+            let rc = unsafe { mc_nof_flush(raw.as_ptr(), error.as_mut_ptr(), error.len()) };
+            (rc == 0)
+                .then_some(())
+                .ok_or_else(|| StoreError::Transport(read_error(&error)))
+        })
     }
 
     fn for_each_chunk(
@@ -651,47 +702,49 @@ impl SpdkNofBlockDevice {
     }
 
     fn write_chunk(&self, offset: u64, src: &[u8]) -> Result<()> {
-        let mut error = vec![0 as c_char; 256];
-        let rc = unsafe {
-            mc_nof_write(
-                self.raw.as_ptr(),
-                offset,
-                src.as_ptr() as *const c_void,
-                src.len() as u64,
-                error.as_mut_ptr(),
-                error.len(),
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(StoreError::Transport(read_error(&error)))
-        }
+        self.with_reconnect(|raw| {
+            let mut error = vec![0 as c_char; 256];
+            let rc = unsafe {
+                mc_nof_write(
+                    raw.as_ptr(),
+                    offset,
+                    src.as_ptr() as *const c_void,
+                    src.len() as u64,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            (rc == 0)
+                .then_some(())
+                .ok_or_else(|| StoreError::Transport(read_error(&error)))
+        })
     }
 
     fn read_chunk(&self, offset: u64, dst: &mut [u8]) -> Result<()> {
-        let mut error = vec![0 as c_char; 256];
-        let rc = unsafe {
-            mc_nof_read(
-                self.raw.as_ptr(),
-                offset,
-                dst.as_mut_ptr() as *mut c_void,
-                dst.len() as u64,
-                error.as_mut_ptr(),
-                error.len(),
-            )
-        };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(StoreError::Transport(read_error(&error)))
-        }
+        self.with_reconnect(|raw| {
+            let mut error = vec![0 as c_char; 256];
+            let rc = unsafe {
+                mc_nof_read(
+                    raw.as_ptr(),
+                    offset,
+                    dst.as_mut_ptr() as *mut c_void,
+                    dst.len() as u64,
+                    error.as_mut_ptr(),
+                    error.len(),
+                )
+            };
+            (rc == 0)
+                .then_some(())
+                .ok_or_else(|| StoreError::Transport(read_error(&error)))
+        })
     }
 }
 
 impl Drop for SpdkNofBlockDevice {
     fn drop(&mut self) {
-        unsafe { mc_nof_close(self.raw.as_ptr()) };
+        if let Some(raw) = self.raw.get_mut().take() {
+            unsafe { mc_nof_close(raw.as_ptr()) };
+        }
     }
 }
 
