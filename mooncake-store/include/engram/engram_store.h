@@ -66,6 +66,13 @@ class EngramStore {
      */
     int lookup_many_into(const std::vector<LookupRequest>& requests) const;
 
+    /**
+     * Lookup several layers into raw Store-registered addresses. This variant
+     * is Store-backed only and leaves output contents undefined on failure.
+     */
+    int lookup_many_into_registered(
+        const std::vector<LookupRequest>& requests) const;
+
     std::vector<int> get_layer_ids() const;
     std::vector<int64_t> get_table_vocab_sizes(int layer_id) const;
     std::vector<std::string> get_store_keys(int layer_id) const;
@@ -102,6 +109,8 @@ class EngramStore {
         const std::vector<int>& layer_ids,
         const std::vector<std::string>& keys) const;
     void invalidate_query_cache(int layer_id) const;
+    int lookup_many_into_impl(const std::vector<LookupRequest>& requests,
+                              bool clear_outputs_on_failure) const;
     std::map<int, Layer> layers_;
     mutable std::mutex query_cache_mutex_;
     mutable std::map<int, std::shared_ptr<QueryCacheEntry>> query_cache_;

@@ -270,6 +270,77 @@ void bind_engram_store(py::module& m) {
             "Read several layers into registered outputs through one Store "
             "ranged-read submission.")
         .def(
+            "lookup_many_into_registered",
+            [](EngramStore& self, py::sequence layer_ids, py::sequence row_ids,
+               py::sequence output_addresses, py::sequence output_sizes) {
+                const size_t count = py::len(layer_ids);
+                if (py::len(row_ids) != count ||
+                    py::len(output_addresses) != count ||
+                    py::len(output_sizes) != count) {
+                    throw std::runtime_error(
+                        "layer_ids, row_ids, output_addresses, and "
+                        "output_sizes must have equal lengths");
+                }
+
+                std::vector<py::array> id_arrays;
+                std::vector<EngramStore::LookupRequest> requests;
+                id_arrays.reserve(count);
+                requests.reserve(count);
+                for (size_t i = 0; i < count; ++i) {
+                    const int layer_id = py::cast<int>(layer_ids[i]);
+                    py::handle ids_object = row_ids[i];
+                    if (!py::isinstance<py::array>(ids_object)) {
+                        throw std::runtime_error(
+                            "row_ids must contain NumPy arrays");
+                    }
+                    auto ids = py::reinterpret_borrow<py::array>(ids_object);
+                    if (ids.ndim() != 3 ||
+                        !ids.dtype().is(py::dtype::of<int64_t>()) ||
+                        !(ids.flags() & py::array::c_style) ||
+                        ids.shape(2) != self.get_num_heads(layer_id) ||
+                        ids.shape(0) > std::numeric_limits<int>::max() ||
+                        ids.shape(1) > std::numeric_limits<int>::max()) {
+                        throw std::runtime_error(
+                            "lookup_many_into_registered requires contiguous "
+                            "int64 IDs [B,L,H]");
+                    }
+
+                    id_arrays.push_back(ids);
+                    if (ids.size() == 0) continue;
+                    const auto output_address =
+                        py::cast<uintptr_t>(output_addresses[i]);
+                    const auto output_size = py::cast<size_t>(output_sizes[i]);
+                    if (output_address == 0) {
+                        throw std::runtime_error(
+                            "registered output address must be nonzero");
+                    }
+                    auto ids_buffer = ids.request();
+                    requests.push_back(EngramStore::LookupRequest{
+                        .layer_id = layer_id,
+                        .row_ids = static_cast<const int64_t*>(ids_buffer.ptr),
+                        .batch_size = static_cast<int>(ids_buffer.shape[0]),
+                        .sequence_length =
+                            static_cast<int>(ids_buffer.shape[1]),
+                        .output = reinterpret_cast<void*>(output_address),
+                        .output_size = output_size,
+                    });
+                }
+
+                int ret;
+                {
+                    py::gil_scoped_release release;
+                    ret = self.lookup_many_into_registered(requests);
+                }
+                if (ret != 0)
+                    throw std::runtime_error(
+                        "EngramStore lookup_many_into_registered failed");
+            },
+            py::arg("layer_ids"), py::arg("row_ids"),
+            py::arg("output_addresses"), py::arg("output_sizes"),
+            "Read several layers directly into Store-registered memory. The "
+            "caller owns pointer validation and lifetime; output contents are "
+            "undefined on failure.")
+        .def(
             "populate",
             [](EngramStore& self, int layer_id, py::list embedding_buffers,
                const ReplicateConfig& config) {

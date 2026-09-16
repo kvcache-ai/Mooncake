@@ -120,6 +120,18 @@ int EngramStore::lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
 
 int EngramStore::lookup_many_into(
     const std::vector<LookupRequest>& requests) const {
+    return lookup_many_into_impl(requests, true);
+}
+
+int EngramStore::lookup_many_into_registered(
+    const std::vector<LookupRequest>& requests) const {
+    if (!store_) return -1;
+    return lookup_many_into_impl(requests, false);
+}
+
+int EngramStore::lookup_many_into_impl(
+    const std::vector<LookupRequest>& requests,
+    bool clear_outputs_on_failure) const {
     if (requests.empty()) return 0;
 
     struct LookupPlan {
@@ -177,8 +189,10 @@ int EngramStore::lookup_many_into(
     }
 
     auto fail_lookups = [&]() {
-        for (const auto& plan : plans)
-            std::memset(plan.request->output, 0, plan.expected_size);
+        if (clear_outputs_on_failure) {
+            for (const auto& plan : plans)
+                std::memset(plan.request->output, 0, plan.expected_size);
+        }
         return -1;
     };
 

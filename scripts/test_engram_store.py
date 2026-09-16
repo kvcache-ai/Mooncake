@@ -603,6 +603,49 @@ class TestMultipleLayers(EngramStoreTestBase):
                         )
                     )
 
+            for output in outputs.values():
+                output.fill(0)
+            table.lookup_many_into_registered(
+                [first, second],
+                [ids_by_layer[first], ids_by_layer[second]],
+                [outputs[first].ctypes.data, outputs[second].ctypes.data],
+                [outputs[first].nbytes, outputs[second].nbytes],
+            )
+            for layer_id, output in outputs.items():
+                for head in range(output.shape[-2]):
+                    self.assertTrue(
+                        np.all(
+                            output[..., head, :] == head + 31 + (layer_id - first) * 50
+                        )
+                    )
+
+            with self.assertRaisesRegex(RuntimeError, "equal lengths"):
+                table.lookup_many_into_registered(
+                    [first, second],
+                    [ids_by_layer[first], ids_by_layer[second]],
+                    [outputs[first].ctypes.data],
+                    [outputs[first].nbytes, outputs[second].nbytes],
+                )
+            with self.assertRaisesRegex(RuntimeError, "must be nonzero"):
+                table.lookup_many_into_registered(
+                    [first], [ids_by_layer[first]], [0], [outputs[first].nbytes]
+                )
+            table.lookup_many_into_registered(
+                [first], [ids_by_layer[first][:, :0, :]], [0], [0]
+            )
+
+            outputs[first].fill(17)
+            bad_registered_ids = ids_by_layer[first].copy()
+            bad_registered_ids[0, 0, 0] = configs[first].table_vocab_sizes[0]
+            with self.assertRaisesRegex(RuntimeError, "registered failed"):
+                table.lookup_many_into_registered(
+                    [first],
+                    [bad_registered_ids],
+                    [outputs[first].ctypes.data],
+                    [outputs[first].nbytes],
+                )
+            self.assertTrue(np.all(outputs[first] == 17))
+
             bad_second_ids = ids_by_layer[second].copy()
             bad_second_ids[0, 0, 0] = configs[second].table_vocab_sizes[0]
             for output in outputs.values():
