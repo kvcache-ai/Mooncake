@@ -959,6 +959,7 @@ auto MasterService::MountNoFSegment(const NoFSegment& segment,
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+    PersistNoFSegmentMountForHA(segment, client_id);
     return {};
 #endif
 }
@@ -1324,7 +1325,14 @@ auto MasterService::ReMountNoFSegment(const std::vector<NoFSegment>& segments,
 #else
     ScopedNoFSegmentAccess nof_segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
-    ErrorCode err = nof_segment_access.ReMountSegment(segments, client_id);
+    std::vector<size_t> mounted_indices;
+    ErrorCode err =
+        nof_segment_access.ReMountSegment(segments, client_id, mounted_indices);
+    // Preserve successful mounts even when a later item fails. Keep the NoF
+    // lock until all events are queued so unmounts cannot overtake them.
+    for (size_t i : mounted_indices) {
+        PersistNoFSegmentMountForHA(segments[i], client_id);
+    }
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -3189,11 +3197,13 @@ auto MasterService::UnmountNoFSegment(const UUID& segment_id,
     // 3. Commit the unmount operation
     ScopedNoFSegmentAccess segment_access =
         nof_segment_manager_.getNoFSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
+    std::string endpoint;
+    auto err = segment_access.CommitUnmountSegment(
+        segment_id, client_id, metrics_dec_capacity, endpoint);
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
+    PersistNoFSegmentUnmountForHA(endpoint);
     {
         std::lock_guard<std::mutex> lock(nof_heartbeat_mutex_);
         nof_heartbeat_states_.erase(segment_id);
@@ -3410,9 +3420,11 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<NoFSegmentInfo>& nof_segments) {
     return RestoreFromStandbyState(&objects, nullptr, initial_oplog_sequence_id,
-                                   segments, objects.size(), std::nullopt);
+                                   segments, nof_segments, objects.size(),
+                                   std::nullopt);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
@@ -3424,15 +3436,16 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromBatchOpLogPromotion(
     }
     return RestoreFromStandbyState(nullptr, std::move(handoff.metadata_store),
                                    handoff.applied_cursor.last_seq,
-                                   handoff.segments, chunk_object_count,
-                                   handoff.max_replica_id);
+                                   handoff.segments, handoff.nof_segments,
+                                   chunk_object_count, handoff.max_replica_id);
 }
 
 tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     const std::vector<StandbyObjectEntry>* legacy_objects,
     std::unique_ptr<StandbyMetadataStore> metadata_store,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments, size_t chunk_object_count,
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<NoFSegmentInfo>& nof_segments, size_t chunk_object_count,
     std::optional<ReplicaID> expected_max_replica_id) {
     if (enable_dfs_) {
         LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
@@ -3496,6 +3509,21 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
             }
         }
     }
+
+#ifndef USE_NOF
+    if (!nof_segments.empty()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
+    }
+#else
+    for (const auto& nof : nof_segments) {
+        if (nof.segment_name.empty() || nof.transport_endpoint.empty() ||
+            nof.capacity == 0 ||
+            nof.base > std::numeric_limits<uintptr_t>::max() ||
+            nof.capacity > std::numeric_limits<uintptr_t>::max() - nof.base) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+#endif
 
     std::vector<StandbySegmentInfo> restored_memory_segments;
     std::unordered_map<std::string, const StandbySegmentInfo*>
@@ -3812,6 +3840,25 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
         }
     }
 
+#ifdef USE_NOF
+    {
+        auto access = nof_segment_manager_.getNoFSegmentAccess();
+        for (const auto& nof : nof_segments) {
+            NoFSegment segment;
+            segment.id = nof.segment_id;
+            segment.name = nof.segment_name;
+            segment.te_endpoint = nof.transport_endpoint;
+            segment.base = nof.base;
+            segment.size = nof.capacity;
+            // Restore directly, without emitting another mount event.
+            auto err = access.MountSegment(segment, nof.client_id);
+            if (err != ErrorCode::OK) {
+                return tl::make_unexpected(err);
+            }
+        }
+    }
+#endif
+
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
@@ -3844,8 +3891,11 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbyState(
     }
 
     LOG(INFO) << "Restored from standby: " << restored_object_count
-              << " objects, " << segments.size()
-              << " segments, initial_seq_id=" << initial_oplog_sequence_id
+              << " objects, " << segments.size() << " segments"
+#ifdef USE_NOF
+              << ", " << nof_segments.size() << " NoF segments"
+#endif
+              << ", initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
     return {};
 }
@@ -12379,8 +12429,10 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
 
     {
         auto nof_segment_access = nof_segment_manager_.getNoFSegmentAccess();
+        std::string endpoint;
         ErrorCode err = nof_segment_access.CommitUnmountSegment(
-            snapshot.segment_id, snapshot.client_id, metrics_dec_capacity);
+            snapshot.segment_id, snapshot.client_id, metrics_dec_capacity,
+            endpoint);
         if (err != ErrorCode::OK && err != ErrorCode::SEGMENT_NOT_FOUND) {
             LOG(ERROR) << "segment_id=" << snapshot.segment_id
                        << ", segment_name=" << snapshot.segment.name
@@ -12388,6 +12440,9 @@ bool MasterService::TryUnmountNoFSegmentByHeartbeat(
                           "heartbeat_failed"
                        << ", reason=" << err;
             return false;
+        }
+        if (err == ErrorCode::OK) {
+            PersistNoFSegmentUnmountForHA(endpoint);
         }
     }
 
@@ -14728,6 +14783,44 @@ void MasterService::PersistSegmentOpForHAOrEnqueue(const char* why, OpType type,
     if (!result) {
         LOG(WARNING) << why << ": segment OpLog queue failed for key=" << key
                      << ", type=" << static_cast<int>(type)
+                     << ", err=" << static_cast<int>(result.error());
+    }
+}
+
+void MasterService::PersistNoFSegmentMountForHA(const NoFSegment& segment,
+                                                const UUID& client_id) {
+    if (!enable_oplog_) {
+        return;
+    }
+    const NoFSegmentMountOp op{
+        .segment_id = segment.id,
+        .client_id = client_id,
+        .segment_name = segment.name,
+        .transport_endpoint = segment.te_endpoint,
+        .base = segment.base,
+        .capacity = segment.size,
+    };
+    auto result = AppendOpLogVisibleBeforeDurable(
+        OpType::NOF_SEGMENT_MOUNT, TenantId::Default().value(),
+        segment.te_endpoint, struct_pack::serialize<std::string>(op));
+    if (!result) {
+        LOG(WARNING) << "MountNoFSegment: OpLog queue failed for endpoint="
+                     << segment.te_endpoint
+                     << ", err=" << static_cast<int>(result.error());
+    }
+}
+
+void MasterService::PersistNoFSegmentUnmountForHA(const std::string& endpoint) {
+    if (!enable_oplog_ || endpoint.empty()) {
+        return;
+    }
+    const NoFSegmentUnmountOp op{endpoint};
+    auto result = AppendOpLogVisibleBeforeDurable(
+        OpType::NOF_SEGMENT_UNMOUNT, TenantId::Default().value(), endpoint,
+        struct_pack::serialize<std::string>(op));
+    if (!result) {
+        LOG(WARNING) << "UnmountNoFSegment: OpLog queue failed for endpoint="
+                     << endpoint
                      << ", err=" << static_cast<int>(result.error());
     }
 }

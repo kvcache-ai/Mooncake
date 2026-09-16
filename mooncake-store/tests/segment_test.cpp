@@ -510,11 +510,12 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     {
         auto segment_access = segment_manager.getNoFSegmentAccess();
         size_t metrics_dec_capacity = 0;
+        std::string endpoint;
         ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
                                                        metrics_dec_capacity),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
-                                                      metrics_dec_capacity),
+        ASSERT_EQ(segment_access.CommitUnmountSegment(
+                      segment.id, client_id, metrics_dec_capacity, endpoint),
                   ErrorCode::OK);
     }
     allocator.reset();

@@ -58,6 +58,26 @@ TEST(BatchOpLogSnapshotCodecTest, SegmentsRoundTrip) {
     EXPECT_TRUE(decoded->front().is_memory_segment);
 }
 
+TEST(BatchOpLogSnapshotCodecTest, NoFSegmentsRoundTrip) {
+    const std::vector<NoFSegmentInfo> nof_segments{
+        {{1, 2}, {3, 4}, "nof", "nof-endpoint", 0, 8192},
+        {{5, 6}, {7, 8}, "second", "second-endpoint", 4096, 16384}};
+    auto decoded = DecodeBatchOpLogSnapshotNoFSegments(
+        EncodeBatchOpLogSnapshotNoFSegments(nof_segments));
+    ASSERT_TRUE(decoded) << decoded.error();
+    ASSERT_EQ(nof_segments.size(), decoded->size());
+    for (size_t i = 0; i < nof_segments.size(); ++i) {
+        const auto& expected = nof_segments[i];
+        const auto& actual = (*decoded)[i];
+        EXPECT_EQ(expected.segment_id, actual.segment_id);
+        EXPECT_EQ(expected.client_id, actual.client_id);
+        EXPECT_EQ(expected.segment_name, actual.segment_name);
+        EXPECT_EQ(expected.transport_endpoint, actual.transport_endpoint);
+        EXPECT_EQ(expected.base, actual.base);
+        EXPECT_EQ(expected.capacity, actual.capacity);
+    }
+}
+
 TEST(BatchOpLogSnapshotCodecTest, ObjectChunkRoundTripsAndChecksEnvelope) {
     StandbyObjectMetadata metadata;
     metadata.client_id = {1, 2};
@@ -98,13 +118,16 @@ TEST(BatchOpLogSnapshotCodecTest, OldObjectChunkDefaultsHardPinnedToFalse) {
 
 TEST(BatchOpLogSnapshotCodecTest, RejectsTruncatedArtifacts) {
     auto segments = EncodeBatchOpLogSnapshotSegments({});
+    auto nof_segments = EncodeBatchOpLogSnapshotNoFSegments({});
     auto objects = EncodeBatchOpLogSnapshotObjectChunk(
         0, std::vector<StandbyObjectEntry>{
                {.tenant_id = "default", .key = "key", .metadata = {}}});
     segments.pop_back();
+    nof_segments.pop_back();
     objects.pop_back();
 
     EXPECT_FALSE(DecodeBatchOpLogSnapshotSegments(segments));
+    EXPECT_FALSE(DecodeBatchOpLogSnapshotNoFSegments(nof_segments));
     EXPECT_FALSE(DecodeBatchOpLogSnapshotObjectChunk(objects, 0, 1));
 }
 

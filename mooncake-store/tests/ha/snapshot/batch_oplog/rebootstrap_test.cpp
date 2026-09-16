@@ -124,6 +124,10 @@ class RebootstrapTest : public ::testing::Test {
         const auto segment_key =
             ha::BuildBatchOpLogSnapshotSegmentsKey("snapshots", snapshot_id);
         ASSERT_TRUE(objects_->UploadBuffer(segment_key, segments));
+        const auto nof_segments = EncodeBatchOpLogSnapshotNoFSegments({});
+        const auto nof_segment_key =
+            ha::BuildBatchOpLogSnapshotNoFSegmentsKey("snapshots", snapshot_id);
+        ASSERT_TRUE(objects_->UploadBuffer(nof_segment_key, nof_segments));
         const auto chunk = EncodeBatchOpLogSnapshotObjectChunk(
             0, {{.key = key, .metadata = {}},
                 {.key = "remove-me", .metadata = {}}});
@@ -138,6 +142,10 @@ class RebootstrapTest : public ::testing::Test {
             .key = segment_key,
             .stored_size = segments.size(),
             .crc32c = Crc32cValue(segments.data(), segments.size())};
+        manifest.nof_segments = {
+            .key = nof_segment_key,
+            .stored_size = nof_segments.size(),
+            .crc32c = Crc32cValue(nof_segments.data(), nof_segments.size())};
         manifest.object_chunks = {
             {.chunk_index = 0,
              .key = chunk_key,

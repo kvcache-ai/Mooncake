@@ -263,6 +263,7 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     // Load segment registry from snapshot
     if (oplog_applier_) {
         oplog_applier_->LoadSegmentRegistry(snapshot.segments);
+        oplog_applier_->LoadNoFSegmentRegistry({});
     }
     oplog_applier_->Recover(snapshot.snapshot_sequence_id);
     baseline_seq_id = snapshot.snapshot_sequence_id;
@@ -276,8 +277,10 @@ ErrorCode HotStandbyService::LoadBatchOpLogSnapshotBaselineLocked(
     auto temporary_applier =
         std::make_unique<OpLogApplier>(temporary_metadata.get(), cluster_id_);
     StandbySegmentRegistry temporary_registry;
+    StandbyNoFSegmentRegistry temporary_nof_registry;
     auto restored = batch_oplog_snapshot_provider_->RestoreBaseline(
-        *temporary_metadata, temporary_registry, temporary_applier.get());
+        *temporary_metadata, temporary_registry, temporary_nof_registry,
+        temporary_applier.get());
     if (!restored) {
         return restored.error();
     }
@@ -741,8 +744,11 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+        out.nof_segments =
+            oplog_applier_->GetNoFSegmentRegistry().GetAllSegments();
     } else {
         out.segments.clear();
+        out.nof_segments.clear();
     }
 
     lock.unlock();
@@ -817,6 +823,8 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
     }
 
     auto segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+    auto nof_segments =
+        oplog_applier_->GetNoFSegmentRegistry().GetAllSegments();
     err = CompletePromotionLocked();
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
@@ -828,6 +836,7 @@ HotStandbyService::PromoteAndDetachBatchOpLogStore() {
         .applied_cursor = *applied_cursor,
         .producer_view_version = producer_view_version,
         .max_replica_id = max_replica_id,
+        .nof_segments = std::move(nof_segments),
     };
     batch_standby_reader_.reset();
     oplog_applier_.reset();
@@ -888,8 +897,11 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     // Export segments from OpLogApplier's registry (Patch B)
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
+        out.nof_segments =
+            oplog_applier_->GetNoFSegmentRegistry().GetAllSegments();
     } else {
         out.segments.clear();
+        out.nof_segments.clear();
     }
 
     return true;
@@ -973,6 +985,7 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             applied_prefix->last_seq, applied_prefix->batch_id,
             producer_view_version,
             oplog_applier_->GetSegmentRegistry().GetAllSegments(),
+            oplog_applier_->GetNoFSegmentRegistry().GetAllSegments(),
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);
         ready_snapshot_capture_ = std::move(capture);
@@ -1051,8 +1064,9 @@ ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
     auto metadata = std::make_unique<StandbyMetadataStore>();
     auto applier = std::make_unique<OpLogApplier>(metadata.get(), cluster_id_);
     StandbySegmentRegistry registry;
+    StandbyNoFSegmentRegistry nof_registry;
     auto restored = provider->RestoreBaseline(
-        *metadata, registry, applier.get(), floor, [this] {
+        *metadata, registry, nof_registry, applier.get(), floor, [this] {
             return !replication_loop_running_.load(std::memory_order_acquire);
         });
     if (!restored) return restored.error();

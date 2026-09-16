@@ -451,10 +451,12 @@ int RunSupervisorLoop(const HABackendSpec& spec,
                           .producer_view_version =
                               promotion_ctx->producer_view_version,
                           .max_replica_id = promotion_ctx->max_replica_id,
+                          .nof_segments =
+                              std::move(promotion_ctx->nof_segments),
                       })
                 : wrapped_master_service->RestoreFromStandby(
                       promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                      promotion_ctx->segments);
+                      promotion_ctx->segments, promotion_ctx->nof_segments);
         if (!restore_result) {
             LOG(ERROR) << "Standby restore failed: "
                        << toString(restore_result.error());

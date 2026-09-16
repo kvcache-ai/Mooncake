@@ -50,6 +50,7 @@ struct BatchOpLogSnapshotManifest {
     uint64_t last_included_batch_id{0};
     ViewVersionId producer_view_version{0};
     BatchOpLogSnapshotObjectDescriptor segments;
+    BatchOpLogSnapshotObjectDescriptor nof_segments;
     std::vector<BatchOpLogSnapshotChunkDescriptor> object_chunks;
 };
 
@@ -82,6 +83,8 @@ std::string BuildBatchOpLogSnapshotManifestKey(const std::string& snapshot_root,
                                                std::string_view snapshot_id);
 std::string BuildBatchOpLogSnapshotSegmentsKey(const std::string& snapshot_root,
                                                std::string_view snapshot_id);
+std::string BuildBatchOpLogSnapshotNoFSegmentsKey(
+    const std::string& snapshot_root, std::string_view snapshot_id);
 std::string BuildBatchOpLogSnapshotObjectChunkKey(
     const std::string& snapshot_root, std::string_view snapshot_id,
     uint64_t chunk_index);

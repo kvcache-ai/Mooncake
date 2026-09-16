@@ -879,7 +879,7 @@ TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
     ASSERT_TRUE(
         service
             .RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
-                                        /*initial_oplog_sequence_id=*/0, {})
+                                        /*initial_oplog_sequence_id=*/0, {}, {})
             .has_value());
 
     EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));

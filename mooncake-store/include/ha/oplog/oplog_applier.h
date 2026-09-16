@@ -65,6 +65,13 @@ class OpLogApplier {
      */
     void LoadSegmentRegistry(const std::vector<StandbySegmentInfo>& segments);
 
+    const StandbyNoFSegmentRegistry& GetNoFSegmentRegistry() const;
+    /**
+     * @brief Load NoF segment registry from snapshot baseline.
+     * Clears existing registry and replaces with given segments.
+     */
+    void LoadNoFSegmentRegistry(const std::vector<NoFSegmentInfo>& segments);
+
    private:
     /**
      * @brief Apply PUT_END operation
@@ -84,6 +91,9 @@ class OpLogApplier {
      */
     void ApplyRemove(const OpLogEntry& entry);
 
+    void ApplyNoFSegmentMount(const OpLogEntry& entry);
+    void ApplyNoFSegmentUnmount(const OpLogEntry& entry);
+
     MetadataStore* metadata_store_;
 
     std::string cluster_id_;
@@ -92,8 +102,9 @@ class OpLogApplier {
     // updated by watch/apply thread. Use atomic to avoid data races.
     std::atomic<uint64_t> expected_sequence_id_{1};
 
-    // Standby segment registry
+    // Standby segment registries
     StandbySegmentRegistry segment_registry_;
+    StandbyNoFSegmentRegistry nof_segment_registry_;
 };
 
 }  // namespace mooncake

@@ -179,11 +179,15 @@ std::string AddSnapshot(RecordingObjectStore& store, uint64_t batch,
     manifest.segments = {
         ha::BuildBatchOpLogSnapshotSegmentsKey(root, manifest.snapshot_id), 1,
         Crc32cValue("s", 1)};
+    manifest.nof_segments = {
+        ha::BuildBatchOpLogSnapshotNoFSegmentsKey(root, manifest.snapshot_id),
+        1, Crc32cValue("n", 1)};
     manifest.object_chunks.push_back({0,
                                       ha::BuildBatchOpLogSnapshotObjectChunkKey(
                                           root, manifest.snapshot_id, 0),
                                       1, 1, Crc32cValue("o", 1)});
     store.objects[manifest.segments.key] = {'s'};
+    store.objects[manifest.nof_segments.key] = {'n'};
     store.objects[manifest.object_chunks[0].key] = {'o'};
     const auto bytes = ha::EncodeBatchOpLogSnapshotManifest(manifest);
     ha::BatchOpLogSnapshotDescriptor descriptor;
@@ -268,7 +272,7 @@ TEST_F(PruningTest, RejectsCorruptPointersAndArtifacts) {
         backend.values[pointer_key] = pointer;
     }
     // Exercise every artifact of both snapshots, including descriptor raw
-    // bytes, manifest CRC, segments and chunks.
+    // bytes, manifest CRC, memory and NoF segments, and chunks.
     for (const auto& [key, bytes] : original_objects) {
         SCOPED_TRACE(key);
         store.objects.erase(key);

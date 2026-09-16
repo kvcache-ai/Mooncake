@@ -38,6 +38,17 @@ DecodeBatchOpLogSnapshotSegments(const std::vector<uint8_t>& encoded) {
                                                    "snapshot segments");
 }
 
+std::vector<uint8_t> EncodeBatchOpLogSnapshotNoFSegments(
+    const std::vector<NoFSegmentInfo>& segments) {
+    return Encode(segments);
+}
+
+tl::expected<std::vector<NoFSegmentInfo>, std::string>
+DecodeBatchOpLogSnapshotNoFSegments(const std::vector<uint8_t>& encoded) {
+    return Decode<std::vector<NoFSegmentInfo>>(encoded,
+                                               "snapshot NoF segments");
+}
+
 std::vector<uint8_t> EncodeBatchOpLogSnapshotObjectChunk(
     uint64_t chunk_index, std::vector<StandbyObjectEntry> objects) {
     return Encode(

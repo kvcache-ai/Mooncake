@@ -20,6 +20,7 @@ class BatchOpLogSnapshotCapture {
           last_included_batch_id(other.last_included_batch_id),
           producer_view_version(other.producer_view_version),
           segments(std::move(other.segments)),
+          nof_segments(std::move(other.nof_segments)),
           cursor_(std::move(other.cursor_)),
           generation_(std::exchange(other.generation_, 0)),
           lease_state_(std::move(other.lease_state_)) {}
@@ -31,6 +32,7 @@ class BatchOpLogSnapshotCapture {
             last_included_batch_id = other.last_included_batch_id;
             producer_view_version = other.producer_view_version;
             segments = std::move(other.segments);
+            nof_segments = std::move(other.nof_segments);
             cursor_ = std::move(other.cursor_);
             generation_ = std::exchange(other.generation_, 0);
             lease_state_ = std::move(other.lease_state_);
@@ -48,6 +50,7 @@ class BatchOpLogSnapshotCapture {
     uint64_t last_included_batch_id;
     ViewVersionId producer_view_version;
     std::vector<StandbySegmentInfo> segments;
+    std::vector<NoFSegmentInfo> nof_segments;
 
    private:
     friend class HotStandbyService;
@@ -63,6 +66,7 @@ class BatchOpLogSnapshotCapture {
     BatchOpLogSnapshotCapture(uint64_t last_seq, uint64_t last_batch_id,
                               ViewVersionId producer_view,
                               std::vector<StandbySegmentInfo> captured_segments,
+                              std::vector<NoFSegmentInfo> captured_nof_segments,
                               StandbyMetadataStore::SnapshotCursor cursor,
                               uint64_t generation,
                               std::shared_ptr<LeaseState> lease_state)
@@ -70,6 +74,7 @@ class BatchOpLogSnapshotCapture {
           last_included_batch_id(last_batch_id),
           producer_view_version(producer_view),
           segments(std::move(captured_segments)),
+          nof_segments(std::move(captured_nof_segments)),
           cursor_(std::move(cursor)),
           generation_(generation),
           lease_state_(std::move(lease_state)) {}

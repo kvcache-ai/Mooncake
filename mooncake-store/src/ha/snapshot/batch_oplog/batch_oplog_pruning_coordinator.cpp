@@ -54,6 +54,14 @@ bool ValidateSnapshot(SnapshotObjectStore& store, const std::string& root,
                          manifest->segments.stored_size,
                          manifest->segments.crc32c))
         return false;
+    if (!manifest->nof_segments.key.empty()) {
+        const auto& nof_segments = manifest->nof_segments;
+        if (nof_segments.key != ha::BuildBatchOpLogSnapshotNoFSegmentsKey(
+                                    root, descriptor.snapshot_id) ||
+            !InspectArtifact(store, nof_segments.key, nof_segments.stored_size,
+                             nof_segments.crc32c))
+            return false;
+    }
     for (size_t i = 0; i < manifest->object_chunks.size(); ++i) {
         if (cancelled()) return false;
         const auto& chunk = manifest->object_chunks[i];

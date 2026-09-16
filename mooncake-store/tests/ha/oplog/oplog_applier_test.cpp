@@ -539,6 +539,31 @@ TEST_F(OpLogApplierTest, TestApplySegmentOperations_Mixed) {
     EXPECT_EQ(8192u, info3->capacity);
 }
 
+TEST_F(OpLogApplierTest, TestApplyNoFSegmentOperations) {
+    const std::string endpoint = "nof-endpoint";
+    const NoFSegmentMountOp mount{{1, 2}, {3, 4}, "nof", endpoint, 4096, 8192};
+    auto mount_entry = MakeEntry(1, OpType::NOF_SEGMENT_MOUNT, endpoint,
+                                 struct_pack::serialize<std::string>(mount));
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(mount_entry));
+
+    const auto& registry = applier_->GetNoFSegmentRegistry();
+    ASSERT_EQ(1u, registry.GetAllSegments().size());
+    auto info = registry.GetSegment(endpoint);
+    ASSERT_TRUE(info.has_value());
+    EXPECT_EQ(mount.segment_id, info->segment_id);
+    EXPECT_EQ(mount.client_id, info->client_id);
+    EXPECT_EQ(mount.segment_name, info->segment_name);
+    EXPECT_EQ(endpoint, info->transport_endpoint);
+    EXPECT_EQ(mount.base, info->base);
+    EXPECT_EQ(mount.capacity, info->capacity);
+
+    auto unmount_entry = MakeEntry(
+        2, OpType::NOF_SEGMENT_UNMOUNT, endpoint,
+        struct_pack::serialize<std::string>(NoFSegmentUnmountOp{endpoint}));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(unmount_entry));
+    EXPECT_TRUE(registry.GetAllSegments().empty());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

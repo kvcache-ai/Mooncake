@@ -289,7 +289,7 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesAndVerifiesMultipleChunks) {
                       object.metadata.hard_pinned.value_or(false));
         }
     }
-    EXPECT_EQ(5u, object_store.size());
+    EXPECT_EQ(6u, object_store.size());
     EXPECT_EQ(2u, object_store.string_upload_attempts);
     EXPECT_GT(object_store.download_attempts, 0u);
 }
@@ -315,6 +315,37 @@ TEST_F(BatchOpLogSnapshotWriterTest, WritesEmptyClusterWithoutObjectChunks) {
     EXPECT_TRUE(manifest->object_chunks.empty());
 }
 
+TEST_F(BatchOpLogSnapshotWriterTest, WritesNoFSegmentsFromCapture) {
+    auto capture = StartCapture(0);
+    ASSERT_TRUE(capture);
+    capture->nof_segments = {{{1, 2}, {3, 4}, "pool", "endpoint", 0, 8192}};
+    const auto expected_nof_segments =
+        EncodeBatchOpLogSnapshotNoFSegments(capture->nof_segments);
+    FakeObjectStore object_store;
+    BatchOpLogSnapshotWriter writer(object_store);
+
+    auto descriptor_json =
+        writer.Write(*standby_, *capture, "snapshots", "0-42", 2, 1234);
+
+    ASSERT_TRUE(descriptor_json) << descriptor_json.error();
+    auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(*descriptor_json);
+    ASSERT_TRUE(descriptor) << descriptor.error();
+    std::string manifest_json;
+    ASSERT_TRUE(
+        object_store.DownloadString(descriptor->manifest_key, manifest_json));
+    auto manifest = ha::DecodeBatchOpLogSnapshotManifest(manifest_json);
+    ASSERT_TRUE(manifest) << manifest.error();
+    EXPECT_EQ(ha::BuildBatchOpLogSnapshotNoFSegmentsKey("snapshots", "0-42"),
+              manifest->nof_segments.key);
+    std::vector<uint8_t> nof_segments;
+    ASSERT_TRUE(
+        object_store.DownloadBuffer(manifest->nof_segments.key, nof_segments));
+    EXPECT_EQ(expected_nof_segments, nof_segments);
+    EXPECT_EQ(nof_segments.size(), manifest->nof_segments.stored_size);
+    EXPECT_EQ(Crc32cValue(nof_segments.data(), nof_segments.size()),
+              manifest->nof_segments.crc32c);
+}
+
 TEST_F(BatchOpLogSnapshotWriterTest,
        RejectsExistingCandidateWithoutDeletingIt) {
     auto capture = StartCapture(1);
@@ -337,7 +368,7 @@ TEST_F(BatchOpLogSnapshotWriterTest, CleansCandidateOnUploadFailure) {
     auto capture = StartCapture(3);
     ASSERT_TRUE(capture);
     FakeObjectStore object_store;
-    object_store.fail_upload_at = 2;
+    object_store.fail_upload_at = 3;
     BatchOpLogSnapshotWriter writer(object_store);
 
     auto result =

@@ -62,6 +62,19 @@ struct StandbySegmentInfo {
              is_memory_segment, file_path);
 };
 
+// Persisted in HA logs and snapshots, separately from the runtime NoFSegment.
+// Consider backward compatibility when changing this format.
+struct NoFSegmentInfo {
+    UUID segment_id{0, 0};
+    UUID client_id{0, 0};
+    std::string segment_name;
+    std::string transport_endpoint;
+    uint64_t base{0};
+    uint64_t capacity{0};
+};
+YLT_REFL(NoFSegmentInfo, segment_id, client_id, segment_name,
+         transport_endpoint, base, capacity);
+
 /**
  * @brief Standby object entry with tenant-aware key
  *
@@ -85,8 +98,10 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    std::vector<NoFSegmentInfo> nof_segments;
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             nof_segments);
 };
 
 /**
@@ -143,6 +158,31 @@ class StandbySegmentRegistry {
    private:
     mutable std::shared_mutex mutex_;
     std::unordered_map<std::string, StandbySegmentInfo> segments_by_endpoint_;
+};
+
+/**
+ * Thread-safe registry of NoF segments known to standby.
+ * Maintained by applying NOF_SEGMENT_MOUNT/UNMOUNT OpLog events.
+ * Used to restore NoF registrations after promotion.
+ */
+class StandbyNoFSegmentRegistry {
+   public:
+    StandbyNoFSegmentRegistry() = default;
+
+    // Segment lifecycle events
+    void OnSegmentMount(const NoFSegmentInfo& info);
+    void OnSegmentUnmount(const std::string& transport_endpoint);
+
+    // Queries
+    bool HasSegment(const std::string& transport_endpoint) const;
+    std::optional<NoFSegmentInfo> GetSegment(
+        const std::string& transport_endpoint) const;
+    std::vector<NoFSegmentInfo> GetAllSegments() const;
+    void Clear();
+
+   private:
+    mutable std::shared_mutex mutex_;
+    std::unordered_map<std::string, NoFSegmentInfo> segments_by_endpoint_;
 };
 
 /**

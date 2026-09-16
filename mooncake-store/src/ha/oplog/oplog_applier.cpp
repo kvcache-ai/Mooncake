@@ -79,6 +79,12 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         case OpType::SEGMENT_UPDATE:
             ApplySegmentUpdate(entry);
             break;
+        case OpType::NOF_SEGMENT_MOUNT:
+            ApplyNoFSegmentMount(entry);
+            break;
+        case OpType::NOF_SEGMENT_UNMOUNT:
+            ApplyNoFSegmentUnmount(entry);
+            break;
         default:
             LOG(ERROR) << "OpLogApplier: unsupported op_type="
                        << static_cast<int>(entry.op_type)
@@ -256,6 +262,53 @@ void OpLogApplier::ApplySegmentUpdate(const OpLogEntry& entry) {
     info.file_path = op.file_path;
     segment_registry_.OnSegmentUpdate(info);
     HAMetricManager::instance().inc_oplog_applied_entries();
+}
+
+const StandbyNoFSegmentRegistry& OpLogApplier::GetNoFSegmentRegistry() const {
+    return nof_segment_registry_;
+}
+
+void OpLogApplier::LoadNoFSegmentRegistry(
+    const std::vector<NoFSegmentInfo>& segments) {
+    nof_segment_registry_.Clear();
+    for (const auto& info : segments) {
+        nof_segment_registry_.OnSegmentMount(info);
+    }
+}
+
+void OpLogApplier::ApplyNoFSegmentMount(const OpLogEntry& entry) {
+    NoFSegmentMountOp op;
+    if (struct_pack::deserialize_to(op, entry.payload) !=
+            struct_pack::errc::ok ||
+        op.transport_endpoint.empty()) {
+        LOG(ERROR) << "Invalid NOF_SEGMENT_MOUNT payload, sequence_id="
+                   << entry.sequence_id;
+        return;
+    }
+    const NoFSegmentInfo info{
+        .segment_id = op.segment_id,
+        .client_id = op.client_id,
+        .segment_name = op.segment_name,
+        .transport_endpoint = op.transport_endpoint,
+        .base = op.base,
+        .capacity = op.capacity,
+    };
+    nof_segment_registry_.OnSegmentMount(info);
+}
+
+void OpLogApplier::ApplyNoFSegmentUnmount(const OpLogEntry& entry) {
+    NoFSegmentUnmountOp op;
+    auto result = struct_pack::deserialize_to(op, entry.payload);
+    if (result != struct_pack::errc::ok) {
+        result =
+            struct_pack::deserialize_to(op.transport_endpoint, entry.payload);
+    }
+    if (result != struct_pack::errc::ok || op.transport_endpoint.empty()) {
+        LOG(ERROR) << "Invalid NOF_SEGMENT_UNMOUNT payload, sequence_id="
+                   << entry.sequence_id;
+        return;
+    }
+    nof_segment_registry_.OnSegmentUnmount(op.transport_endpoint);
 }
 
 }  // namespace mooncake

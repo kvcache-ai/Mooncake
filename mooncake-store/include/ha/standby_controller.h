@@ -34,6 +34,7 @@ struct PromotionContext {
     DurablePrefix applied_cursor;
     ViewVersionId producer_view_version{0};
     ReplicaID max_replica_id{0};
+    std::vector<NoFSegmentInfo> nof_segments;
 };
 
 class StandbyController {

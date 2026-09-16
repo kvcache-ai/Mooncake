@@ -119,6 +119,22 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     }
     std::vector<uint8_t>().swap(segments);
 
+    const std::string nof_segments_key =
+        ha::BuildBatchOpLogSnapshotNoFSegmentsKey(snapshot_root, snapshot_id);
+    auto nof_segments =
+        EncodeBatchOpLogSnapshotNoFSegments(capture.nof_segments);
+    manifest.nof_segments = {
+        .key = nof_segments_key,
+        .stored_size = nof_segments.size(),
+        .crc32c = Crc32cValue(nof_segments.data(), nof_segments.size()),
+    };
+    upload = object_store_.UploadBuffer(nof_segments_key, nof_segments);
+    if (!upload) {
+        return fail("Failed to upload snapshot NoF segments: " +
+                    upload.error());
+    }
+    std::vector<uint8_t>().swap(nof_segments);
+
     uint64_t chunk_index = 0;
     while (!capture.done()) {
         std::vector<StandbyObjectEntry> objects;
@@ -158,6 +174,14 @@ tl::expected<std::string, std::string> BatchOpLogSnapshotWriter::Write(
     if (!verify) {
         return fail(std::move(verify.error()));
     }
+
+    verify = VerifyObject(object_store_, manifest.nof_segments.key,
+                          manifest.nof_segments.stored_size,
+                          manifest.nof_segments.crc32c);
+    if (!verify) {
+        return fail(std::move(verify.error()));
+    }
+
     for (const auto& chunk : manifest.object_chunks) {
         verify = VerifyObject(object_store_, chunk.key, chunk.stored_size,
                               chunk.crc32c);

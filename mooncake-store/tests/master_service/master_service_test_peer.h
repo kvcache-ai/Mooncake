@@ -73,6 +73,12 @@ class MasterServiceTestPeer {
 
     void SetNoFProbeFnForTesting(MasterService::NoFProbeFn fn);
 
+    bool TryUnmountNoFSegmentByHeartbeat(
+        const MountedNoFSegmentSnapshot& snapshot,
+        const std::string& error_reason) {
+        return service_.TryUnmountNoFSegmentByHeartbeat(snapshot, error_reason);
+    }
+
     size_t GetMountedNoFSegmentCountForTesting();
 
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);

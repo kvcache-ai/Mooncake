@@ -147,6 +147,12 @@ TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
     manifest.segments = {ha::BuildBatchOpLogSnapshotSegmentsKey(
                              std::string(kRoot), descriptor.snapshot_id),
                          1, Crc32cValue(segment_bytes.data(), 1)};
+    const std::vector<uint8_t> nof_segment_bytes = {1};
+    manifest.nof_segments = {.key = ha::BuildBatchOpLogSnapshotNoFSegmentsKey(
+                                 std::string(kRoot), descriptor.snapshot_id),
+                             .stored_size = nof_segment_bytes.size(),
+                             .crc32c = Crc32cValue(nof_segment_bytes.data(),
+                                                   nof_segment_bytes.size())};
     const std::string manifest_json =
         ha::EncodeBatchOpLogSnapshotManifest(manifest);
     descriptor.manifest_size = manifest_json.size();
@@ -159,6 +165,7 @@ TEST(BatchOpLogSnapshotGcTest, DeletesOnlyUnprotectedAttempt) {
     object_store.objects[descriptor.manifest_key] =
         std::vector<uint8_t>(manifest_json.begin(), manifest_json.end());
     object_store.objects[manifest.segments.key] = segment_bytes;
+    object_store.objects[manifest.nof_segments.key] = nof_segment_bytes;
 
     const auto protected_prefix =
         ha::BuildBatchOpLogSnapshotArtifactPrefix(std::string(kRoot), "2-1");
