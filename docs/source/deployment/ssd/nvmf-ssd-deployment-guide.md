@@ -169,6 +169,22 @@ python3 -m mooncake.mooncake_ssd_register \
 | `--password` | SSH password used to connect to target nodes. |
 | `--key-file` | SSH private key file used to connect to target nodes. |
 
+### 4.2 HA Registration Recovery
+
+With etcd-backed HA (`enable_ha=true`) and OpLog (`enable_oplog=true`) enabled,
+a promoted master restores durable NoF segment registrations without rerunning
+the registration tool. When `enable_oplog_snapshot=true`, batch OpLog snapshots
+also retain these registrations. Durable explicit unregisters and
+heartbeat-triggered removals are applied as well.
+
+Registration changes are submitted to OpLog asynchronously. A successful
+registration RPC does not mean that its log entry is already durable.
+Registrations that have not become durable before failover may need to be
+registered again.
+
+NoF segments registered before this capability was enabled must be registered
+again once to include them in subsequent recovery.
+
 ## 5. Unregister the NVMe-oF SSD Pool
 
 ### 5.1 Unregister a Specific SSD

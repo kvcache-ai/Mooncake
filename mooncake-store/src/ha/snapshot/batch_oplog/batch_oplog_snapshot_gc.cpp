@@ -117,6 +117,14 @@ ErrorCode BatchOpLogSnapshotGc::Run(
                               weights.crc32c))
                 return ErrorCode::INTERNAL_ERROR;
         }
+        if (!manifest->nof_segments.key.empty()) {
+            const auto& nof_segments = manifest->nof_segments;
+            if (nof_segments.key != ha::BuildBatchOpLogSnapshotNoFSegmentsKey(
+                                        root_, descriptor->snapshot_id) ||
+                !VerifyObject(store_, nof_segments.key,
+                              nof_segments.stored_size, nof_segments.crc32c))
+                return ErrorCode::INTERNAL_ERROR;
+        }
         protected_prefixes.insert(prefix);
     }
 

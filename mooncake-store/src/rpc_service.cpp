@@ -1790,9 +1790,11 @@ tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments,
-    const WeightMetadataSnapshot& weight_metadata) {
+    const WeightMetadataSnapshot& weight_metadata,
+    const std::vector<NoFSegmentInfo>& nof_segments) {
     return master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments, weight_metadata);
+        objects, initial_oplog_sequence_id, segments, weight_metadata,
+        nof_segments);
 }
 
 tl::expected<void, ErrorCode>

@@ -122,8 +122,27 @@ bool ValidateSegments(const std::vector<StandbySegmentInfo>& segments) {
     return true;
 }
 
+bool ValidateNoFSegments(const std::vector<NoFSegmentInfo>& segments) {
+    std::unordered_set<std::string> endpoints;
+    for (const auto& segment : segments) {
+        const auto& endpoint = segment.transport_endpoint;
+        if (endpoint.empty() || !endpoints.insert(endpoint).second) {
+            return false;
+        }
+    }
+    return true;
+}
+
 void CopyRegistry(const StandbySegmentRegistry& source,
                   StandbySegmentRegistry& destination) {
+    destination.Clear();
+    for (const auto& segment : source.GetAllSegments()) {
+        destination.OnSegmentMount(segment);
+    }
+}
+
+void CopyNoFRegistry(const StandbyNoFSegmentRegistry& source,
+                     StandbyNoFSegmentRegistry& destination) {
     destination.Clear();
     for (const auto& segment : source.GetAllSegments()) {
         destination.OnSegmentMount(segment);
@@ -185,8 +204,8 @@ AttemptResult RestorePointer(
     const std::string& cluster_id, HaKvBackend& backend,
     SnapshotObjectStore& object_store, const std::string& snapshot_root,
     std::string_view pointer_bytes, StandbyMetadataStore& metadata,
-    StandbySegmentRegistry& registry, OpLogApplier* supplied_applier,
-    const std::function<bool()>& cancelled) {
+    StandbySegmentRegistry& registry, StandbyNoFSegmentRegistry& nof_registry,
+    OpLogApplier* supplied_applier, const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     auto decoded_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
@@ -269,6 +288,32 @@ AttemptResult RestorePointer(
         }
     }
 
+    std::vector<NoFSegmentInfo> nof_segments;
+    if (!manifest.nof_segments.key.empty()) {
+        const std::string expected_nof_segments_key =
+            ha::BuildBatchOpLogSnapshotNoFSegmentsKey(snapshot_root,
+                                                      descriptor.snapshot_id);
+        if (manifest.nof_segments.key != expected_nof_segments_key) {
+            return Invalid();
+        }
+        std::vector<uint8_t> nof_segments_bytes;
+        auto read_nof_segments = ReadVerifiedObject(
+            object_store, manifest.nof_segments.key,
+            manifest.nof_segments.stored_size, manifest.nof_segments.crc32c,
+            nof_segments_bytes);
+        if (read_nof_segments.disposition != AttemptDisposition::kSuccess) {
+            return read_nof_segments;
+        }
+        auto decoded_nof_segments =
+            DecodeBatchOpLogSnapshotNoFSegments(nof_segments_bytes);
+        std::vector<uint8_t>().swap(nof_segments_bytes);
+        if (!decoded_nof_segments ||
+            !ValidateNoFSegments(*decoded_nof_segments)) {
+            return Invalid();
+        }
+        nof_segments = std::move(*decoded_nof_segments);
+    }
+
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -276,6 +321,7 @@ AttemptResult RestorePointer(
         applier = owned_applier.get();
     }
     applier->LoadSegmentRegistry(*decoded_segments);
+    applier->LoadNoFSegmentRegistry(nof_segments);
     const DurablePrefix baseline{.batch_id = descriptor.last_included_batch_id,
                                  .last_seq = descriptor.last_included_seq};
     applier->Recover(baseline.last_seq);
@@ -343,8 +389,10 @@ AttemptResult RestorePointer(
             metrics.chunk_bytes + manifest.segments.stored_size +
             (manifest.weight_metadata ? manifest.weight_metadata->stored_size
                                       : 0) +
-            descriptor.manifest_size + pointer_bytes.size();
+            manifest.nof_segments.stored_size + descriptor.manifest_size +
+            pointer_bytes.size();
     });
+    CopyNoFRegistry(applier->GetNoFSegmentRegistry(), nof_registry);
     return {AttemptDisposition::kSuccess,
             ErrorCode::OK,
             {.last_included_seq = descriptor.last_included_seq,
@@ -359,6 +407,7 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
                                    HaKvBackend& backend,
                                    StandbyMetadataStore& metadata,
                                    StandbySegmentRegistry& registry,
+                                   StandbyNoFSegmentRegistry& nof_registry,
                                    OpLogApplier* supplied_applier,
                                    const std::function<bool()>& cancelled) {
     if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
@@ -370,6 +419,7 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
     }
     applier->Recover(0);
     applier->LoadSegmentRegistry({});
+    applier->LoadNoFSegmentRegistry({});
     OpLogBatchStorage storage(cluster_id, backend);
     DurablePrefix durable_prefix;
     const ErrorCode init_error = storage.InitDurablePrefix(durable_prefix);
@@ -387,6 +437,7 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
         return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
+    CopyNoFRegistry(applier->GetNoFSegmentRegistry(), nof_registry);
     replay.value.max_replica_id = max_replica_id;
     replay.value.last_applied_seq = replay.value.last_included_seq;
     replay.value.last_applied_batch_id = replay.value.last_included_batch_id;
@@ -404,15 +455,15 @@ BatchOpLogSnapshotProvider::BatchOpLogSnapshotProvider(
       snapshot_root_(std::move(snapshot_root)) {}
 
 tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode>
-BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
-                                            StandbySegmentRegistry& registry,
-                                            OpLogApplier* applier,
-                                            uint64_t minimum_snapshot_batch,
-                                            std::function<bool()> cancelled) {
+BatchOpLogSnapshotProvider::RestoreBaseline(
+    StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
+    StandbyNoFSegmentRegistry& nof_registry, OpLogApplier* applier,
+    uint64_t minimum_snapshot_batch, std::function<bool()> cancelled) {
     HAMetricManager::SnapshotOperationTimer metric_timer(
         HAMetricManager::SnapshotOperation::Bootstrap);
     metadata.Clear();
     registry.Clear();
+    nof_registry.Clear();
     if (!NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty() ||
         snapshot_root_.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -469,17 +520,19 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             descriptor->last_included_batch_id < minimum_snapshot_batch) {
             continue;
         }
-        auto attempt = RestorePointer(cluster_id_, backend_, object_store_,
-                                      snapshot_root_, pointer_bytes, metadata,
-                                      registry, applier, cancelled);
+        auto attempt = RestorePointer(
+            cluster_id_, backend_, object_store_, snapshot_root_, pointer_bytes,
+            metadata, registry, nof_registry, applier, cancelled);
         if (attempt.disposition == AttemptDisposition::kSuccess) {
             return metric_timer.Success(attempt.value);
         }
         metadata.Clear();
         registry.Clear();
+        nof_registry.Clear();
         if (applier != nullptr) {
             applier->Recover(0);
             applier->LoadSegmentRegistry({});
+            applier->LoadNoFSegmentRegistry({});
         }
         if (attempt.disposition == AttemptDisposition::kInfrastructure) {
             return tl::make_unexpected(attempt.error);
@@ -489,11 +542,13 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
     if (minimum_snapshot_batch != 0) {
         return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
     }
-    auto full_replay = RestoreCompleteOpLog(cluster_id_, backend_, metadata,
-                                            registry, applier, cancelled);
+    auto full_replay =
+        RestoreCompleteOpLog(cluster_id_, backend_, metadata, registry,
+                             nof_registry, applier, cancelled);
     if (full_replay.disposition != AttemptDisposition::kSuccess) {
         metadata.Clear();
         registry.Clear();
+        nof_registry.Clear();
         return tl::make_unexpected(full_replay.error);
     }
     return metric_timer.Success(full_replay.value);

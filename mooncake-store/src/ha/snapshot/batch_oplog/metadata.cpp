@@ -193,7 +193,7 @@ bool DecodeObjectDescriptor(const Json::Value& root,
                             BatchOpLogSnapshotObjectDescriptor& descriptor,
                             std::string* reason) {
     if (!root.isObject()) {
-        SetReason(reason, "segments must be a JSON object");
+        SetReason(reason, "snapshot object descriptor must be a JSON object");
         return false;
     }
     if (!GetString(root, "key", descriptor.key, reason) ||
@@ -202,7 +202,8 @@ bool DecodeObjectDescriptor(const Json::Value& root,
         return false;
     }
     if (descriptor.key.empty() || descriptor.stored_size == 0) {
-        SetReason(reason, "segments key and stored_size must be non-zero");
+        SetReason(reason,
+                  "snapshot object key and stored_size must be non-zero");
         return false;
     }
     return true;
@@ -318,6 +319,7 @@ std::string EncodeBatchOpLogSnapshotManifest(
         root["weight_metadata"] =
             EncodeObjectDescriptor(*manifest.weight_metadata);
     }
+    root["nof_segments"] = EncodeObjectDescriptor(manifest.nof_segments);
     Json::Value chunks(Json::arrayValue);
     for (const auto& descriptor : manifest.object_chunks) {
         chunks.append(EncodeChunkDescriptor(descriptor));
@@ -367,6 +369,13 @@ DecodeBatchOpLogSnapshotManifest(std::string_view value) {
             return tl::make_unexpected(std::move(reason));
         }
         decoded.object_chunks.push_back(std::move(descriptor));
+    }
+    if (!root.isMember("nof_segments")) {
+        return decoded;
+    }
+    if (!DecodeObjectDescriptor(root["nof_segments"], decoded.nof_segments,
+                                &reason)) {
+        return tl::make_unexpected(std::move(reason));
     }
     return decoded;
 }
@@ -427,6 +436,12 @@ std::string BuildBatchOpLogSnapshotSegmentsKey(const std::string& snapshot_root,
                                                std::string_view snapshot_id) {
     const std::string prefix = BuildArtifactPrefix(snapshot_root, snapshot_id);
     return prefix.empty() ? std::string() : prefix + "segments.bin";
+}
+
+std::string BuildBatchOpLogSnapshotNoFSegmentsKey(
+    const std::string& snapshot_root, std::string_view snapshot_id) {
+    const std::string prefix = BuildArtifactPrefix(snapshot_root, snapshot_id);
+    return prefix.empty() ? std::string() : prefix + "nof_segments.bin";
 }
 
 std::string BuildBatchOpLogSnapshotObjectChunkKey(

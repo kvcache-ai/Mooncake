@@ -34,6 +34,7 @@ class BatchOpLogSnapshotProvider final {
 
     tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode> RestoreBaseline(
         StandbyMetadataStore& metadata, StandbySegmentRegistry& registry,
+        StandbyNoFSegmentRegistry& nof_registry,
         OpLogApplier* applier = nullptr, uint64_t minimum_snapshot_batch = 0,
         std::function<bool()> cancelled = {});
 

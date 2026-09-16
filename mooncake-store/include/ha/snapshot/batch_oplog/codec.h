@@ -28,6 +28,11 @@ std::vector<uint8_t> EncodeBatchOpLogSnapshotWeightMetadata(
 tl::expected<WeightMetadataSnapshot, std::string>
 DecodeBatchOpLogSnapshotWeightMetadata(const std::vector<uint8_t>& encoded);
 
+std::vector<uint8_t> EncodeBatchOpLogSnapshotNoFSegments(
+    const std::vector<NoFSegmentInfo>& segments);
+tl::expected<std::vector<NoFSegmentInfo>, std::string>
+DecodeBatchOpLogSnapshotNoFSegments(const std::vector<uint8_t>& encoded);
+
 std::vector<uint8_t> EncodeBatchOpLogSnapshotObjectChunk(
     uint64_t chunk_index, std::vector<StandbyObjectEntry> objects);
 tl::expected<BatchOpLogSnapshotObjectChunk, std::string>
