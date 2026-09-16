@@ -252,9 +252,18 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
             // Notify before executing `int_p`
             __syncwarp();
+#ifdef MOONCAKE_EP_USE_MUSA
+            // Publish the cleared buffer once before any local ready tag.
+            mc_fence();
+            __syncwarp();
+#endif
             #pragma unroll
             for (int i = lane_id; i < num_experts; i += 32)
+#ifdef MOONCAKE_EP_USE_MUSA
+                mc_atomic_add_relaxed(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
+#else
                 mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG);
+#endif
         }
 
         // This SM should be responsible for some destination experts, read `topk_idx` for them
@@ -276,7 +285,13 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             auto sum = warp_reduce_sum(expert_count[i - expert_begin_idx]);
             if (lane_id == 0) {
                 shared_num_tokens_sent_per_expert[i - expert_begin_idx] = sum;
+#ifdef MOONCAKE_EP_USE_MUSA
+                // Local completion accounting; payload publication is fenced
+                // by the expert's signal sender after the count reaches its tag.
+                mc_atomic_add_relaxed(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+#else
                 mc_atomic_add_release(atomic_finish_counter_per_expert + i, FINISHED_SUM_TAG - sum);
+#endif
             }
         }
     }
@@ -293,7 +308,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         const auto num_tokens_sent = shared_num_tokens_sent_per_expert[responsible_expert_idx - sm_id * kNumWarpGroups];
 
         // Wait local sends issued and send expert counts
-#ifdef MOONCAKE_EP_USE_MACA
+#if defined(MOONCAKE_EP_USE_MACA) || defined(MOONCAKE_EP_USE_MUSA)
         while (atomicAdd(atomic_finish_counter_per_expert +
                              responsible_expert_idx, 0) !=
                FINISHED_SUM_TAG * 2) {
@@ -392,7 +407,9 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             // NOTES: only 2 load iterations for 7K hidden with 7 unrolls
             const auto src_data = reinterpret_cast<int4*>(reinterpret_cast<uint8_t*>(src_src_idx) + sizeof(int4));
             const auto dst_data = recv_x_int4 + (recv_token_begin_idx + i) * hidden_int4;
+#ifndef MOONCAKE_EP_USE_MUSA
             mc_fence();
+#endif
             UNROLLED_WARP_COPY(7, lane_id, hidden_int4, dst_data, src_data, mc_ld_nc, mc_st_na);
 
             // Copy scales
@@ -546,8 +563,15 @@ combine(void* combined_x, int32_t* active_ranks,
 
         // Notify before executing `int_p`
         __syncwarp();
+#ifdef MOONCAKE_EP_USE_MUSA
+        mc_fence();
+        __syncwarp();
+        if (lane_id == 0)
+            mc_atomic_add_relaxed(atomic_clean_flag, num_experts);
+#else
         if (lane_id == 0)
             mc_atomic_add_release(atomic_clean_flag, num_experts);
+#endif
     }
 
     // Issue IBGDA sends
@@ -622,7 +646,11 @@ combine(void* combined_x, int32_t* active_ranks,
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
 #endif
         if (sub_warp_id == 1 and lane_id == 0) {
+#ifdef MOONCAKE_EP_USE_MUSA
+            while (atomicAdd(atomic_clean_flag, 0) == 0);
+#else
             while (mc_ld_acquire(atomic_clean_flag) == 0);
+#endif
             if (dst_rank != rank) {
                 int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
                 mc_signal(comm_ctx, dst_rank,
@@ -632,7 +660,13 @@ combine(void* combined_x, int32_t* active_ranks,
             } else {
                 mc_st_release(rdma_recv_signal_buffer + global_expert_idx, 1);
             }
+#ifdef MOONCAKE_EP_USE_MUSA
+            // The peer signal already publishes the payload. This local tally
+            // is reused after the current kernel completes on the same stream.
+            mc_atomic_add_relaxed(atomic_clean_flag, -1);
+#else
             mc_atomic_add_release(atomic_clean_flag, -1);
+#endif
         }
         __syncwarp();
     } else {
