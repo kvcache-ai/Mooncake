@@ -3,6 +3,7 @@
 // layer.
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -47,57 +48,60 @@ class PromotionOnHitTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    // Friend access to MasterService::promotion_admission_threshold_, which
-    // is otherwise private. PromotionOnHitTest is friended; TEST_F-generated
-    // subclasses are not, hence this static funnel.
+    // Inspect admission state through the shared test peer.
     static uint32_t GetPromotionAdmissionThresholdForTesting(
         MasterService* service) {
-        return service->promotion_admission_threshold_;
+        return MasterServiceTestPeer::PromotionAdmissionThreshold(*service);
     }
 
     static size_t CountPromotionCandidatesForTesting(MasterService* service,
                                                      const TenantId& tenant) {
-        return service->CountCandidatesForTesting(tenant);
+        return MasterServiceTestPeer(*service).CountCandidatesForTesting(
+            tenant);
     }
 
     static constexpr uint32_t MaxPromotionCandidateRetriesForTesting() {
-        return MasterService::kPromotionCandidateMaxRetries;
+        return MasterServiceTestPeer::kPromotionCandidateMaxRetries;
     }
 
     static constexpr uint32_t MaxPromotionExecutionFailuresForTesting() {
-        return MasterService::kMaxPromotionExecutionFailures;
+        return MasterServiceTestPeer::kMaxPromotionExecutionFailures;
     }
 
     static void ResetCandidateBackoffsForTesting(MasterService* service) {
-        service->ResetCandidateBackoffsForTesting();
+        MasterServiceTestPeer(*service).ResetCandidateBackoffsForTesting();
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service) {
-        return service->RunPromotionCandidateRetryForTesting();
+        return MasterServiceTestPeer(*service)
+            .RunPromotionCandidateRetryForTesting();
     }
 
     static size_t RunPromotionCandidateRetryForTesting(MasterService* service,
                                                        size_t shards_to_scan) {
-        return service->RunPromotionCandidateRetry(shards_to_scan);
+        return MasterServiceTestPeer(*service).RunPromotionCandidateRetry(
+            shards_to_scan);
     }
 
     static void ClearCandidatesForReloadForTesting(MasterService* service) {
-        service->ClearCandidatesForReload();
+        MasterServiceTestPeer(*service).ClearCandidatesForReload();
     }
 
     static uint64_t GetPromotionCandidateCountForTesting(
         MasterService* service) {
-        return service->promotion_candidate_count_.load(
+        return MasterServiceTestPeer::PromotionCandidateCount(*service).load(
             std::memory_order_relaxed);
     }
 
     static uint64_t GetPromotionInFlightForTesting(MasterService* service) {
-        return service->promotion_in_flight_.load(std::memory_order_relaxed);
+        return MasterServiceTestPeer::PromotionInFlight(*service).load(
+            std::memory_order_relaxed);
     }
 
     static void MarkClientOfflineForTesting(MasterService* service,
                                             const UUID& client_id) {
-        auto record = service->FindClientRecord(client_id);
+        auto record =
+            MasterServiceTestPeer(*service).FindClientRecord(client_id);
         ASSERT_TRUE(record);
         const auto now = ClientLivenessRecord::Clock::now();
         ASSERT_EQ(record->Evaluate(now, std::chrono::seconds::zero(),
@@ -111,9 +115,9 @@ class PromotionOnHitTest : public ::testing::Test {
     static bool HasPromotionTaskForTesting(MasterService* service,
                                            const TenantId& tenant_id,
                                            const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         const auto* tenant_state = accessor.GetTenantState();
         return tenant_state != nullptr &&
                tenant_state->promotion_tasks.contains(key);
@@ -123,9 +127,9 @@ class PromotionOnHitTest : public ::testing::Test {
     static std::optional<uint32_t> GetPromotionTaskExecutionFailuresForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
-        MasterService::MetadataAccessorRO accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRO accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         const auto* tenant_state = accessor.GetTenantState();
         if (tenant_state == nullptr) {
             return std::nullopt;
@@ -141,18 +145,20 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
         const auto result =
-            service->TryPushPromotionQueue(MasterService::ObjectIdentity{
-                .tenant_id = tenant_id, .user_key = key});
-        return result == PromotionQueueResult::kAlreadyInFlight;
+            MasterServiceTestPeer(*service).TryPushPromotionQueue(
+                MasterServiceTestPeer::ObjectIdentity{.tenant_id = tenant_id,
+                                                      .user_key = key});
+        return result ==
+               MasterServiceTestPeer::PromotionQueueResult::kAlreadyInFlight;
     }
 
     static void MarkReplicaCompleteForTesting(MasterService* service,
                                               const TenantId& tenant_id,
                                               const std::string& key,
                                               ReplicaID replica_id) {
-        MasterService::MetadataAccessorRW accessor(
-            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
-                                                   .user_key = key});
+        MasterServiceTestPeer::MetadataAccessorRW accessor(
+            service, MasterServiceTestPeer::ObjectIdentity{
+                         .tenant_id = tenant_id, .user_key = key});
         ASSERT_TRUE(accessor.Exists());
         auto* replica = accessor.Get().GetReplicaByID(replica_id);
         ASSERT_NE(replica, nullptr);
@@ -163,7 +169,9 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService* service, const UUID& segment_id, size_t size) {
         std::shared_ptr<BufferAllocatorBase> allocator;
         {
-            auto segment_access = service->segment_manager_.getSegmentAccess();
+            auto segment_access =
+                MasterServiceTestPeer::SegmentManager(*service)
+                    .getSegmentAccess();
             allocator = segment_access.GetAllocator(segment_id);
         }
         if (!allocator) {
