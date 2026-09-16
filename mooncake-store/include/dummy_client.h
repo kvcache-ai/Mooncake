@@ -171,6 +171,13 @@ class DummyClient : public PyClient {
 
     int isExist(const std::string &key);
 
+    // ExistOptions variants: prefetch runs on the real client holding the
+    // SSD tier; the dummy shim only forwards existence checks, so the
+    // options are accepted but ignored (with a log) here.
+    int isExist(const std::string &key, const ExistOptions &options) override;
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys,
+                                  const ExistOptions &options) override;
+
     std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
     int64_t getSize(const std::string &key);

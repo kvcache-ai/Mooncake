@@ -1243,6 +1243,14 @@ int DummyClient::isExist(const std::string& key) {
     }
 }
 
+int DummyClient::isExist(const std::string& key, const ExistOptions& options) {
+    if (options.prefetch_to_memory) {
+        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
+                << "prefetch_to_memory ignored for key=" << key;
+    }
+    return isExist(key);
+}
+
 std::vector<int> DummyClient::batchIsExist(
     const std::vector<std::string>& keys) {
     auto internal_results =
@@ -1261,6 +1269,15 @@ std::vector<int> DummyClient::batchIsExist(
     }
 
     return results;
+}
+
+std::vector<int> DummyClient::batchIsExist(
+    const std::vector<std::string>& keys, const ExistOptions& options) {
+    if (options.prefetch_to_memory) {
+        VLOG(1) << "SSD prefetch is not supported via DummyClient; "
+                << "prefetch_to_memory ignored";
+    }
+    return batchIsExist(keys);
 }
 
 int64_t DummyClient::getSize(const std::string& key) {
