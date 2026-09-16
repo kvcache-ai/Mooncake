@@ -4,11 +4,14 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#include <async_simple/Promise.h>
 
 #include "ha/oplog/oplog_test_failpoint.h"
 #include "ha_metric_manager.h"
@@ -16,6 +19,9 @@
 namespace mooncake {
 
 struct OrderedOpLogWriter::Impl {
+    using DurableWaiters =
+        std::multimap<uint64_t, async_simple::Promise<ErrorCode>>;
+
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
     using Clock = std::chrono::steady_clock;
 #endif
@@ -89,10 +95,31 @@ struct OrderedOpLogWriter::Impl {
         batch_busy = true;
     }
 
+    // Called with mutex held. Extracting nodes avoids allocating while
+    // advancing the prefix and leaves later waiters untouched.
+    DurableWaiters TakeCoveredWaiters() {
+        DurableWaiters covered;
+        auto end = durable_waiters.upper_bound(durable_prefix.last_seq);
+        for (auto it = durable_waiters.begin(); it != end;) {
+            auto current = it++;
+            covered.insert(durable_waiters.extract(current));
+        }
+        return covered;
+    }
+
+    // A continuation may run inline and reenter the writer, so never call
+    // this while holding mutex.
+    static void CompleteWaiters(DurableWaiters waiters, ErrorCode error) {
+        for (auto& waiter : waiters) {
+            waiter.second.setValue(ErrorCode{error});
+        }
+    }
+
     void EnterTerminalState(ErrorCode error,
                             OrderedOpLogWriterTerminalReason reason) {
         TerminalCallback callback;
         std::optional<OrderedOpLogWriterTerminalState> state;
+        DurableWaiters waiters;
         {
             std::lock_guard<std::mutex> lock(mutex);
             if (stop_requested || terminal_state.has_value()) {
@@ -118,8 +145,10 @@ struct OrderedOpLogWriter::Impl {
             PublishRuntime();
             callback = terminal_callback;
             state = terminal_state;
+            waiters.swap(durable_waiters);
         }
         cv.notify_all();
+        CompleteWaiters(std::move(waiters), error);
         if (callback) {
             callback(*state);
         }
@@ -144,6 +173,7 @@ struct OrderedOpLogWriter::Impl {
     uint64_t next_reservation_id{1};
     uint64_t next_sequence_id{1};
     DurablePrefix durable_prefix{config.initial_durable_prefix};
+    DurableWaiters durable_waiters;
     size_t open_waiting_slots{0};
     std::unordered_set<uint64_t> active_reservations;
     std::deque<PendingEntry> committed_entries;
@@ -297,19 +327,24 @@ void OrderedOpLogWriter::Abort(Reservation&& reservation) {
     impl_->PublishRuntime();
 }
 
-ErrorCode OrderedOpLogWriter::AwaitDurable(uint64_t sequence) {
-    std::unique_lock<std::mutex> lock(impl_->mutex);
-    impl_->cv.wait(lock, [&] {
-        return impl_->durable_prefix.last_seq >= sequence ||
-               impl_->terminal_state.has_value() || impl_->stop_requested;
-    });
+async_simple::Future<ErrorCode> OrderedOpLogWriter::AwaitDurable(
+    uint64_t sequence) {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->durable_prefix.last_seq >= sequence) {
-        return ErrorCode::OK;
+        return async_simple::makeReadyFuture<ErrorCode>(ErrorCode::OK);
     }
     if (impl_->terminal_state.has_value()) {
-        return impl_->terminal_state->error;
+        return async_simple::makeReadyFuture<ErrorCode>(
+            ErrorCode{impl_->terminal_state->error});
     }
-    return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
+    if (impl_->stop_requested) {
+        return async_simple::makeReadyFuture<ErrorCode>(
+            ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    async_simple::Promise<ErrorCode> promise;
+    auto future = promise.getFuture();
+    impl_->durable_waiters.emplace(sequence, std::move(promise));
+    return future;
 }
 
 bool OrderedOpLogWriter::IsAccepting() const {
@@ -462,6 +497,7 @@ void OrderedOpLogWriter::Start() {
                     txn_latency_us);
 #endif
                 if (err == ErrorCode::OK) {
+                    Impl::DurableWaiters waiters;
                     TestFailPoint::Wait("batch_txn_succeeded_before_callback");
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                     const auto durable_at = Impl::Clock::now();
@@ -478,6 +514,7 @@ void OrderedOpLogWriter::Start() {
                         std::lock_guard<std::mutex> lock(impl_->mutex);
                         impl_->durable_prefix = {.batch_id = batch.batch_id,
                                                  .last_seq = batch.last_seq};
+                        waiters = impl_->TakeCoveredWaiters();
                         impl_->last_error = ErrorCode::OK;
                         impl_->accepting = !impl_->stop_requested;
                         impl_->retry_delay_ms = 0;
@@ -508,6 +545,7 @@ void OrderedOpLogWriter::Start() {
                         impl_->PublishRuntime();
                     }
                     impl_->cv.notify_all();
+                    Impl::CompleteWaiters(std::move(waiters), ErrorCode::OK);
                     break;
                 }
 
@@ -554,6 +592,8 @@ void OrderedOpLogWriter::Start() {
 
 void OrderedOpLogWriter::Stop() {
     bool running;
+    Impl::DurableWaiters waiters;
+    ErrorCode waiter_error;
     {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         impl_->accepting = false;
@@ -561,8 +601,13 @@ void OrderedOpLogWriter::Stop() {
         impl_->retry_delay_ms = 0;
         impl_->PublishRuntime();
         running = impl_->running;
+        waiters.swap(impl_->durable_waiters);
+        waiter_error = impl_->terminal_state.has_value()
+                           ? impl_->terminal_state->error
+                           : ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
     impl_->cv.notify_all();
+    Impl::CompleteWaiters(std::move(waiters), waiter_error);
     if (!running) {
         return;
     }

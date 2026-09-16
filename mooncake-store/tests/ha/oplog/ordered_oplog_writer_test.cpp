@@ -3,6 +3,10 @@
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/executors/SimpleExecutor.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -173,6 +177,17 @@ bool WaitForMetric(const std::function<bool()>& predicate) {
 
 namespace {
 
+async_simple::coro::Lazy<ErrorCode> AwaitOnExecutor(
+    OrderedOpLogWriter& writer, uint64_t sequence,
+    std::promise<std::thread::id>& registered,
+    std::promise<std::thread::id>& resumed) {
+    auto future = writer.AwaitDurable(sequence);
+    registered.set_value(std::this_thread::get_id());
+    auto error = co_await std::move(future);
+    resumed.set_value(std::this_thread::get_id());
+    co_return error;
+}
+
 class OrderedOpLogWriterAwaitTest : public ::testing::Test {
    protected:
     void CreateWriter(OrderedOpLogWriterConfig config = {},
@@ -185,30 +200,44 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
             std::move(callback));
     }
 
-    std::future<ErrorCode>& Await(uint64_t sequence) {
-        std::promise<void> started;
-        auto ready = started.get_future();
-        waiters_.push_back(std::async(
-            std::launch::async,
-            [this, sequence, started = std::move(started)]() mutable {
-                started.set_value();
-                return writer_->AwaitDurable(sequence);
-            }));
-        ready.wait();
+    async_simple::Future<ErrorCode>& Await(uint64_t sequence) {
+        waiters_.push_back(writer_->AwaitDurable(sequence));
         return waiters_.back();
     }
 
-    void ExpectPending(std::future<ErrorCode>& waiter) {
-        // The backend/callback gate determines ordering; this timeout only
-        // checks that a waiter cannot complete while its target is uncovered.
-        EXPECT_EQ(waiter.wait_for(std::chrono::milliseconds(20)),
-                  std::future_status::timeout);
+    void ExpectPending(async_simple::Future<ErrorCode>& waiter) {
+        // Storage is gated, so readiness can be checked without a timeout.
+        EXPECT_FALSE(waiter.hasResult());
     }
 
-    void ExpectResult(std::future<ErrorCode>& waiter, ErrorCode expected) {
-        ASSERT_EQ(waiter.wait_for(std::chrono::seconds(5)),
-                  std::future_status::ready);
-        EXPECT_EQ(waiter.get(), expected);
+    void ExpectResult(async_simple::Future<ErrorCode>& waiter,
+                      ErrorCode expected) {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!waiter.hasResult() &&
+               std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(waiter.hasResult());
+        EXPECT_EQ(std::move(waiter).get(), expected);
+    }
+
+    void ExpectReadyResult(async_simple::Future<ErrorCode>& waiter,
+                           ErrorCode expected) {
+        ASSERT_TRUE(waiter.hasResult());
+        EXPECT_EQ(std::move(waiter).get(), expected);
+    }
+
+    void ReenterFromContinuation(async_simple::Future<ErrorCode>& waiter) {
+        waiter = std::move(waiter).thenValue([this](ErrorCode error) {
+            // These methods all acquire the writer mutex. Inline completion
+            // must not hold it, including terminal failure and Stop().
+            writer_->IsAccepting();
+            writer_->LastError();
+            writer_->GetTerminalState();
+            EXPECT_TRUE(writer_->AwaitDurable(0).hasResult());
+            return error;
+        });
     }
 
     void BlockCallback() {
@@ -249,6 +278,7 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
         ASSERT_TRUE(pending.has_value());
         auto& first = Await(pending->sequence_id());
         auto& later = Await(pending->sequence_id() + 1);
+        ReenterFromContinuation(first);
         writer_->Start();
         ASSERT_TRUE(storage_.WaitForBlockedWrite());
         ExpectPending(first);
@@ -265,11 +295,11 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
         EXPECT_EQ(state->error, error);
         EXPECT_EQ(state->durable_prefix.last_seq, 10);
         EXPECT_EQ(terminal_callbacks_.load(), 1);
-        ExpectResult(Await(pending->sequence_id()), error);
-        ExpectResult(Await(10), ErrorCode::OK);
+        ExpectReadyResult(Await(pending->sequence_id()), error);
+        ExpectReadyResult(Await(10), ErrorCode::OK);
         ReleaseCallback();
         writer_->Stop();
-        ExpectResult(Await(pending->sequence_id()), error);
+        ExpectReadyResult(Await(pending->sequence_id()), error);
     }
 
     void TearDown() override {
@@ -280,7 +310,7 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
 
     FakeBatchWriter storage_;
     std::unique_ptr<OrderedOpLogWriter> writer_;
-    std::deque<std::future<ErrorCode>> waiters_;
+    std::deque<async_simple::Future<ErrorCode>> waiters_;
     std::atomic<int> terminal_callbacks_{0};
     std::atomic<bool> callback_finished_{false};
     std::mutex callback_mutex_;
@@ -294,12 +324,12 @@ class OrderedOpLogWriterAwaitTest : public ::testing::Test {
 TEST_F(OrderedOpLogWriterAwaitTest,
        RestoredPrefixSucceedsBeforeStartAndAfterStop) {
     CreateWriter({.initial_durable_prefix = {.batch_id = 2, .last_seq = 10}});
-    ExpectResult(Await(0), ErrorCode::OK);
-    ExpectResult(Await(1), ErrorCode::OK);
-    ExpectResult(Await(10), ErrorCode::OK);
+    ExpectReadyResult(Await(0), ErrorCode::OK);
+    ExpectReadyResult(Await(1), ErrorCode::OK);
+    ExpectReadyResult(Await(10), ErrorCode::OK);
     writer_->Stop();
-    ExpectResult(Await(10), ErrorCode::OK);
-    ExpectResult(Await(11), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    ExpectReadyResult(Await(10), ErrorCode::OK);
+    ExpectReadyResult(Await(11), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 TEST_F(OrderedOpLogWriterAwaitTest, CommittedSequenceWaitsForStorageSuccess) {
@@ -316,7 +346,7 @@ TEST_F(OrderedOpLogWriterAwaitTest, CommittedSequenceWaitsForStorageSuccess) {
     storage_.UnblockWrites();
     ExpectResult(waiter, ErrorCode::OK);
     // Registration after advancement cannot miss an earlier notification.
-    ExpectResult(Await(pending->sequence_id()), ErrorCode::OK);
+    ExpectReadyResult(Await(pending->sequence_id()), ErrorCode::OK);
 }
 
 TEST_F(OrderedOpLogWriterAwaitTest, PrefixAdvancesInStages) {
@@ -329,9 +359,9 @@ TEST_F(OrderedOpLogWriterAwaitTest, PrefixAdvancesInStages) {
         ASSERT_TRUE(writer_->Commit(std::move(*reservation), MakeEntry(), {})
                         .has_value());
     }
-    auto& first = Await(1);
-    auto& second = Await(2);
     auto& third = Await(3);
+    auto& second = Await(2);
+    auto& first = Await(1);
     writer_->Start();
     ASSERT_TRUE(storage_.WaitForBlockedWrite());
     ExpectPending(first);
@@ -365,6 +395,7 @@ TEST_F(OrderedOpLogWriterAwaitTest, RetryTimeoutWakesAllOutstandingWaiters) {
 TEST_F(OrderedOpLogWriterAwaitTest, StopWakesUncoveredWaitersBeforeStart) {
     CreateWriter();
     auto& waiter = Await(1);
+    ReenterFromContinuation(waiter);
     ExpectPending(waiter);
     writer_->Stop();
     ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -374,6 +405,7 @@ TEST_F(OrderedOpLogWriterAwaitTest, StopWakesUncoveredWaitersAfterStart) {
     CreateWriter();
     writer_->Start();
     auto& waiter = Await(1);
+    ReenterFromContinuation(waiter);
     ExpectPending(waiter);
     writer_->Stop();
     ExpectResult(waiter, ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
@@ -413,6 +445,112 @@ TEST_F(OrderedOpLogWriterAwaitTest, AllWaitersForSameSequenceWake) {
     for (auto& waiter : waiters_) ExpectPending(waiter);
     storage_.UnblockWrites();
     for (auto& waiter : waiters_) ExpectResult(waiter, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, DurableContinuationCanReenterWriter) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*reservation), MakeEntry(), {}).has_value());
+    auto& waiter = Await(1);
+    ReenterFromContinuation(waiter);
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+    ExpectPending(waiter);
+    storage_.UnblockWrites();
+    ExpectResult(waiter, ErrorCode::OK);
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest, CompletesWaitersInSequenceOrder) {
+    storage_.BlockWrites();
+    CreateWriter({.max_entries_per_batch = 3});
+    for (int i = 0; i < 3; ++i) {
+        auto reservation = writer_->Reserve();
+        ASSERT_TRUE(reservation.has_value());
+        ASSERT_TRUE(writer_->Commit(std::move(*reservation), MakeEntry(), {})
+                        .has_value());
+    }
+    std::mutex mutex;
+    std::vector<uint64_t> completed;
+    for (uint64_t sequence : {3, 1, 2}) {
+        auto& waiter = Await(sequence);
+        waiter = std::move(waiter).thenValue([&, sequence](ErrorCode error) {
+            std::lock_guard<std::mutex> lock(mutex);
+            completed.push_back(sequence);
+            return error;
+        });
+    }
+    writer_->Start();
+    EXPECT_TRUE(storage_.WaitForBlockedWrite());
+    storage_.UnblockWrites();
+    for (auto& waiter : waiters_) ExpectResult(waiter, ErrorCode::OK);
+    writer_->Stop();
+    std::lock_guard<std::mutex> lock(mutex);
+    EXPECT_EQ(completed, (std::vector<uint64_t>{1, 2, 3}));
+}
+
+TEST_F(OrderedOpLogWriterAwaitTest,
+       OutstandingWaitAllowsOtherWorkOnSameExecutorThread) {
+    storage_.BlockWrites();
+    CreateWriter();
+    auto reservation = writer_->Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer_->Commit(std::move(*reservation), MakeEntry(), {}).has_value());
+    writer_->Start();
+    ASSERT_TRUE(storage_.WaitForBlockedWrite());
+
+    std::promise<std::thread::id> registered;
+    std::promise<std::thread::id> resumed;
+    std::promise<std::thread::id> other_work;
+    std::promise<ErrorCode> completed;
+    auto registered_future = registered.get_future();
+    auto resumed_future = resumed.get_future();
+    auto work_future = other_work.get_future();
+    auto completed_future = completed.get_future();
+    async_simple::executors::SimpleExecutor executor(1);
+    AwaitOnExecutor(*writer_, 1, registered, resumed)
+        .via(&executor)
+        .start([&](async_simple::Try<ErrorCode>&& result) {
+            if (result.hasError()) {
+                completed.set_exception(result.getException());
+            } else {
+                completed.set_value(result.value());
+            }
+        });
+    const auto registered_status =
+        registered_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(registered_status, std::future_status::ready);
+    EXPECT_TRUE(executor.schedule(
+        [&] { other_work.set_value(std::this_thread::get_id()); }));
+    const auto work_status = work_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(work_status, std::future_status::ready);
+    EXPECT_EQ(completed_future.wait_for(std::chrono::milliseconds(0)),
+              std::future_status::timeout);
+
+    // Always release storage and drain the writer before destroying executor,
+    // even if a non-blocking/scheduling assertion above failed.
+    storage_.UnblockWrites();
+    const auto completed_status =
+        completed_future.wait_for(std::chrono::seconds(5));
+    writer_->Stop();
+    EXPECT_EQ(completed_status, std::future_status::ready);
+    if (completed_status == std::future_status::ready) {
+        EXPECT_EQ(completed_future.get(), ErrorCode::OK);
+    }
+    if (registered_status == std::future_status::ready &&
+        work_status == std::future_status::ready) {
+        const auto executor_thread = registered_future.get();
+        EXPECT_EQ(work_future.get(), executor_thread);
+        if (resumed_future.wait_for(std::chrono::milliseconds(0)) ==
+            std::future_status::ready) {
+            EXPECT_EQ(resumed_future.get(), executor_thread);
+        } else {
+            ADD_FAILURE() << "durability coroutine did not resume";
+        }
+    }
 }
 
 TEST(OrderedOpLogWriterMetricsTest, RuntimeSnapshotTracksAdmission) {

@@ -7,6 +7,8 @@
 #include <memory>
 #include <optional>
 
+#include <async_simple/Future.h>
+#include <async_simple/Promise.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "ha/oplog/oplog_batch_types.h"
@@ -80,12 +82,14 @@ class OrderedOpLogWriter {
         Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     void Abort(Reservation&& reservation);
 
-    // Wait for the sequence to be durable, independently of callback
-    // completion. An already-covered sequence succeeds even after terminal
-    // failure or Stop(). Otherwise return the terminal error, or
-    // UNAVAILABLE_IN_CURRENT_STATUS on Stop(). Callers must not hold locks
-    // needed by storage or callbacks.
-    ErrorCode AwaitDurable(uint64_t sequence);
+    // Return a future for durability, independently of callback completion,
+    // without blocking the calling thread. An already-covered sequence is
+    // immediately ready with OK, even after terminal failure or Stop().
+    // Otherwise, terminal failure completes it with the terminal error, and
+    // Stop() completes it with UNAVAILABLE_IN_CURRENT_STATUS. Promises are
+    // fulfilled outside the writer mutex. Callers can co_await the future and
+    // use via(executor) to select the continuation's execution context.
+    async_simple::Future<ErrorCode> AwaitDurable(uint64_t sequence);
 
     bool IsAccepting() const;
     ErrorCode LastError() const;
