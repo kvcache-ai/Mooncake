@@ -407,8 +407,10 @@ impl StoreClientBuilder {
         let mut endpoints = self.endpoints;
         normalize_storage_label(&self.local_memory, &mut endpoints.labels)?;
         normalize_route_label(&self.local_memory, &mut endpoints.labels);
-        let nof_target_set_fingerprint =
-            cold_tier::nof::target_set_fingerprint(&self.nof_targets)?;
+        let nof_target_set_fingerprint = cold_tier::nof::target_set_fingerprint(
+            &self.nof_targets,
+            self.nof_replica_count,
+        )?;
         if let Some(fingerprint) = nof_target_set_fingerprint.as_ref() {
             endpoints.labels.insert(
                 cold_tier::nof::NOF_TARGET_SET_LABEL.to_string(),
@@ -622,10 +624,6 @@ impl StoreClientBuilder {
             ),
             control_client.clone(),
         );
-        let nof_recovery_targets = nof_targets.managed_recovery_targets();
-        if !nof_recovery_targets.is_empty() {
-            deferred_reconciles.push(DeferredColdTierReconcile::NofManaged(nof_recovery_targets));
-        }
         for target_id in nof_targets.target_ids() {
             if cold_tier_resolver.has_backend(target_id) {
                 return Err(StoreError::InvalidState(format!(

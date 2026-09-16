@@ -116,7 +116,6 @@ impl StoreTransport for NoopTransport {
 }
 
 const DEFAULT_CLIENT_IDS: &str = "client-0";
-const DEFAULT_HOST_NQN: &str = "nqn.2026-09.io.mooncake:client-dev-5";
 const DEFAULT_DEVICE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
 
 const DEFAULT_OBJECTS_PER_CLIENT: usize = 16;
@@ -153,20 +152,28 @@ struct TestConfig {
     keyspace: String,
     bind_ip: String,
     barrier_redis_url: String,
+    barrier_run_id: String,
     barrier_timeout: Duration,
+    lease_ttl_ms: u64,
     read_retries: usize,
     read_retry_delay: Duration,
     startup_settle: Duration,
     post_offload_wait: Duration,
+    reonline_wait: Duration,
     absent_targets: BTreeSet<String>,
     expected_nof_copies: Option<usize>,
     expected_post_wait_nof_copies: Option<usize>,
     expected_post_wait_total_nof_copies: Option<usize>,
+    expected_max_target_copy_skew: Option<usize>,
+    expect_missing_routes: bool,
+    expect_post_wait_missing_routes: bool,
+    exit_after_post_wait: bool,
     watermark_high_bytes: Option<u64>,
     watermark_low_bytes: Option<u64>,
     read_only: bool,
     delete_and_rewrite: bool,
     handoff_departing_client: Option<String>,
+    handoff_abrupt_exit: bool,
     handoff_wait: Duration,
     route_control: RouteControlMode,
 }
@@ -304,10 +311,10 @@ impl TestConfig {
             env::var("NOF_REDIS_URL").map_err(|_| invalid("NOF_REDIS_URL is required"))?;
         let barrier_redis_url =
             env::var("NOF_BARRIER_REDIS_URL").unwrap_or_else(|_| redis_url.clone());
-        Ok(Self {
+        let config = Self {
             targets,
             client_ids,
-            host_nqn: env::var("NOF_HOST_NQN").unwrap_or_else(|_| DEFAULT_HOST_NQN.into()),
+            host_nqn: env::var("NOF_HOST_NQN").map_err(|_| invalid("NOF_HOST_NQN is required"))?,
             device_bytes: parse_env("NOF_DEVICE_BYTES", DEFAULT_DEVICE_BYTES)?,
             objects_per_client,
             value_bytes,
@@ -323,10 +330,14 @@ impl TestConfig {
             keyspace: env::var("NOF_KEYSPACE").map_err(|_| invalid("NOF_KEYSPACE is required"))?,
             bind_ip: env::var("NOF_BIND_IP").map_err(|_| invalid("NOF_BIND_IP is required"))?,
             barrier_redis_url,
+            barrier_run_id: env::var("NOF_BARRIER_RUN_ID")
+                .or_else(|_| env::var("NOF_RUN_TAG"))
+                .map_err(|_| invalid("NOF_BARRIER_RUN_ID or NOF_RUN_TAG is required"))?,
             barrier_timeout: Duration::from_secs(parse_env(
                 "NOF_BARRIER_TIMEOUT_SECONDS",
                 DEFAULT_BARRIER_TIMEOUT_SECONDS,
             )?),
+            lease_ttl_ms: parse_env("NOF_LEASE_TTL_MS", 600_000)?,
             read_retries: parse_env("NOF_READ_RETRIES", DEFAULT_READ_RETRIES)?,
             read_retry_delay: Duration::from_millis(parse_env(
                 "NOF_READ_RETRY_DELAY_MS",
@@ -337,6 +348,7 @@ impl TestConfig {
                 "NOF_POST_OFFLOAD_WAIT_SECONDS",
                 0u64,
             )?),
+            reonline_wait: Duration::from_secs(parse_env("NOF_REONLINE_WAIT_SECONDS", 0u64)?),
             absent_targets: env::var("NOF_EXPECT_ABSENT_TARGETS")
                 .unwrap_or_default()
                 .split(',')
@@ -375,6 +387,23 @@ impl TestConfig {
                     })
                 })
                 .transpose()?,
+            expected_max_target_copy_skew: env::var("NOF_EXPECT_MAX_TARGET_COPY_SKEW")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| {
+                    value.parse().map_err(|error| {
+                        invalid(format!(
+                            "NOF_EXPECT_MAX_TARGET_COPY_SKEW must be valid: {error}"
+                        ))
+                    })
+                })
+                .transpose()?,
+            expect_missing_routes: parse_env("NOF_EXPECT_MISSING_ROUTES", false)?,
+            expect_post_wait_missing_routes: parse_env(
+                "NOF_EXPECT_POST_WAIT_MISSING_ROUTES",
+                false,
+            )?,
+            exit_after_post_wait: parse_env("NOF_EXIT_AFTER_POST_WAIT", false)?,
             watermark_high_bytes: env::var("NOF_WATERMARK_HIGH_BYTES")
                 .ok()
                 .filter(|value| !value.trim().is_empty())
@@ -398,9 +427,70 @@ impl TestConfig {
             handoff_departing_client: env::var("NOF_HANDOFF_DEPARTING_CLIENT")
                 .ok()
                 .filter(|value| !value.trim().is_empty()),
+            handoff_abrupt_exit: parse_env("NOF_HANDOFF_ABRUPT_EXIT", false)?,
             handoff_wait: Duration::from_secs(parse_env("NOF_HANDOFF_WAIT_SECONDS", 5)?),
             route_control,
-        })
+        };
+        if config.lease_ttl_ms == 0 {
+            return Err(invalid("NOF_LEASE_TTL_MS must be greater than zero"));
+        }
+        if config.read_retries == 0 {
+            return Err(invalid("NOF_READ_RETRIES must be greater than zero"));
+        }
+        if config.barrier_run_id.trim().is_empty() {
+            return Err(invalid("NOF_BARRIER_RUN_ID must not be empty"));
+        }
+        if config.expect_missing_routes && !config.read_only {
+            return Err(invalid(
+                "NOF_EXPECT_MISSING_ROUTES requires NOF_READ_ONLY=true",
+            ));
+        }
+        if config.handoff_abrupt_exit && config.handoff_departing_client.is_none() {
+            return Err(invalid(
+                "NOF_HANDOFF_ABRUPT_EXIT requires NOF_HANDOFF_DEPARTING_CLIENT",
+            ));
+        }
+        if config.handoff_abrupt_exit
+            && config.handoff_wait.as_millis() <= u128::from(config.lease_ttl_ms) + 2_000
+        {
+            return Err(invalid(
+                "NOF_HANDOFF_WAIT_SECONDS must exceed NOF_LEASE_TTL_MS by at least two seconds for abrupt takeover",
+            ));
+        }
+        let target_ids = config
+            .targets
+            .iter()
+            .map(|target| target.target_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if let Some(unknown) = config
+            .absent_targets
+            .iter()
+            .find(|target| !target_ids.contains(target.as_str()))
+        {
+            return Err(invalid(format!(
+                "NOF_EXPECT_ABSENT_TARGETS contains unregistered target {unknown}"
+            )));
+        }
+        let has_post_wait_assertion = !config.absent_targets.is_empty()
+            || config.expected_post_wait_nof_copies.is_some()
+            || config.expected_post_wait_total_nof_copies.is_some()
+            || config.expect_post_wait_missing_routes;
+        if has_post_wait_assertion && config.post_offload_wait.is_zero() {
+            return Err(invalid(
+                "NOF_POST_OFFLOAD_WAIT_SECONDS must be greater than zero when post-wait assertions are configured",
+            ));
+        }
+        if config.exit_after_post_wait && config.post_offload_wait.is_zero() {
+            return Err(invalid(
+                "NOF_EXIT_AFTER_POST_WAIT requires NOF_POST_OFFLOAD_WAIT_SECONDS",
+            ));
+        }
+        if !config.reonline_wait.is_zero() && config.absent_targets.is_empty() {
+            return Err(invalid(
+                "NOF_REONLINE_WAIT_SECONDS requires NOF_EXPECT_ABSENT_TARGETS",
+            ));
+        }
+        Ok(config)
     }
 }
 
@@ -427,7 +517,10 @@ fn logical_mib_per_sec(bytes: usize, elapsed: Duration) -> f64 {
 }
 
 fn barrier_key(config: &TestConfig, name: &str) -> String {
-    format!("{}:barrier:{name}", config.keyspace)
+    format!(
+        "{}:barrier:{}:{name}",
+        config.keyspace, config.barrier_run_id
+    )
 }
 
 fn redis_connection(config: &TestConfig) -> Result<redis::Connection> {
@@ -569,6 +662,33 @@ fn wait_for_recovered_routes(
     }
 }
 
+fn wait_for_missing_routes(config: &TestConfig, client: &StoreClient, prefix: &str) -> Result<()> {
+    let deadline = Instant::now() + config.barrier_timeout;
+    loop {
+        let mut present = Vec::new();
+        for owner in &config.client_ids {
+            for index in 0..config.objects_per_client {
+                let key = format!("{prefix}/{owner}/{index}");
+                if client.query_route(&key)?.is_some() {
+                    present.push(key);
+                }
+            }
+        }
+        if present.is_empty() {
+            println!("verified all Managed NoF routes are absent for prefix {prefix}");
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(StoreError::Transport(format!(
+                "timed out waiting for {} Managed NoF routes to disappear; first keys: {:?}",
+                present.len(),
+                present.into_iter().take(8).collect::<Vec<_>>()
+            )));
+        }
+        sleep(Duration::from_millis(100));
+    }
+}
+
 fn verify_absent_targets(
     config: &TestConfig,
     client: &mooncake_store_client::StoreClient,
@@ -582,16 +702,12 @@ fn verify_absent_targets(
             let route = client
                 .query_route(&key)?
                 .ok_or_else(|| invalid(format!("route disappeared for {key}")))?;
-            let backing = route
-                .nof_backing
-                .ok_or_else(|| invalid(format!("managed NoF backing disappeared for {key}")))?;
-            let targets = std::iter::once(backing.target_id.as_str())
-                .chain(
-                    backing
-                        .replicas
-                        .iter()
-                        .map(|replica| replica.target_id.as_str()),
-                )
+            let Some(backing) = route.nof_backing else {
+                continue;
+            };
+            let targets = backing
+                .all_targets()
+                .map(|(target_id, _, _)| target_id)
                 .collect::<BTreeSet<_>>();
             if let Some(target) = config
                 .absent_targets
@@ -616,11 +732,20 @@ fn verify_nof_copy_count(
     client: &mooncake_store_client::StoreClient,
     expected_per_route: Option<usize>,
     expected_total: Option<usize>,
+    expected_max_target_skew: Option<usize>,
 ) -> Result<()> {
-    if expected_per_route.is_none() && expected_total.is_none() {
+    if expected_per_route.is_none()
+        && expected_total.is_none()
+        && expected_max_target_skew.is_none()
+    {
         return Ok(());
     }
     let mut total = 0usize;
+    let mut copies_by_target = config
+        .targets
+        .iter()
+        .map(|target| (target.target_id.clone(), 0usize))
+        .collect::<BTreeMap<_, _>>();
     for owner in &config.client_ids {
         for index in 0..config.objects_per_client {
             let key = format!("{}/{owner}/{index}", config.test_prefix);
@@ -630,8 +755,28 @@ fn verify_nof_copy_count(
             let backing = route
                 .nof_backing
                 .ok_or_else(|| invalid(format!("managed NoF backing disappeared for {key}")))?;
-            let actual = 1 + backing.replicas.len();
+            if backing.state != ColdBackingState::Materialized {
+                return Err(invalid(format!(
+                    "managed NoF backing for {key} is {:?}, expected Materialized",
+                    backing.state
+                )));
+            }
+            let actual = backing.all_targets().count();
+            let unique_targets = backing
+                .all_targets()
+                .map(|(target_id, _, _)| target_id)
+                .collect::<BTreeSet<_>>();
+            if unique_targets.len() != actual {
+                return Err(invalid(format!(
+                    "route {key} has duplicate NoF target copies: {unique_targets:?}"
+                )));
+            }
             total = total.saturating_add(actual);
+            for (target_id, _, _) in backing.all_targets() {
+                *copies_by_target.get_mut(target_id).ok_or_else(|| {
+                    invalid(format!("route {key} uses unknown target {target_id}"))
+                })? += 1;
+            }
             if expected_per_route.is_some_and(|expected| actual != expected) {
                 return Err(invalid(format!(
                     "route {key} has {actual} NoF copies, expected {expected_per_route:?}"
@@ -644,8 +789,135 @@ fn verify_nof_copy_count(
             "routes have {total} total NoF copies, expected {expected_total:?}"
         )));
     }
-    println!("verified Managed NoF copies: per_route={expected_per_route:?} total={total}");
+    if let Some(expected) = expected_max_target_skew {
+        let min = copies_by_target.values().copied().min().unwrap_or_default();
+        let max = copies_by_target.values().copied().max().unwrap_or_default();
+        if max.saturating_sub(min) > expected {
+            return Err(invalid(format!(
+                "Managed NoF target copy skew {} exceeds {expected}: {copies_by_target:?}",
+                max.saturating_sub(min)
+            )));
+        }
+    }
+    println!(
+        "verified Managed NoF copies: per_route={expected_per_route:?} total={total} by_target={copies_by_target:?}"
+    );
     Ok(())
+}
+
+fn recovery_expectations(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    let mut expected = config
+        .absent_targets
+        .iter()
+        .map(|target| (target.clone(), BTreeMap::new()))
+        .collect::<BTreeMap<_, _>>();
+    for owner in &config.client_ids {
+        for index in 0..config.objects_per_client {
+            let key = format!("{}/{owner}/{index}", config.test_prefix);
+            let route = client
+                .query_route(&key)?
+                .ok_or_else(|| invalid(format!("route disappeared for {key}")))?;
+            if let Some(backing) = route.nof_backing {
+                for (target, _, locator) in backing.all_targets() {
+                    if let Some(objects) = expected.get_mut(target) {
+                        objects.insert(key.clone(), locator.to_string());
+                    }
+                }
+            }
+        }
+    }
+    if let Some(target) = expected
+        .iter()
+        .find_map(|(target, keys)| keys.is_empty().then_some(target))
+    {
+        return Err(invalid(format!(
+            "expected recovery target {target} did not contain any test object before the fault"
+        )));
+    }
+    Ok(expected)
+}
+
+fn wait_for_recovered_targets(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+    expected: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<()> {
+    let deadline = Instant::now() + config.barrier_timeout;
+    while Instant::now() < deadline {
+        let complete = expected.iter().all(|(target, objects)| {
+            objects.iter().all(|(key, expected_locator)| {
+                client.query_route(key).ok().flatten().is_some_and(|route| {
+                    route.nof_backing.as_ref().is_some_and(|backing| {
+                        backing.all_targets().any(|(backing_target, _, locator)| {
+                            backing_target == target.as_str()
+                                && locator == expected_locator.as_str()
+                        })
+                    })
+                })
+            })
+        });
+        if complete {
+            println!("verified live-client target recovery: {expected:?}");
+            return Ok(());
+        }
+        sleep(config.read_retry_delay);
+    }
+    Err(StoreError::Transport(format!(
+        "timed out waiting for live-client target recovery: {expected:?}"
+    )))
+}
+
+fn verify_client_owns_data_target(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+    expected_owner: &str,
+) -> Result<()> {
+    for owner in &config.client_ids {
+        for index in 0..config.objects_per_client {
+            let key = format!("{}/{owner}/{index}", config.test_prefix);
+            let route = client
+                .query_route(&key)?
+                .ok_or_else(|| invalid(format!("route disappeared for {key}")))?;
+            if route.nof_backing.as_ref().is_some_and(|backing| {
+                backing
+                    .all_targets()
+                    .any(|(_, owner, _)| owner.stable_id.0 == expected_owner)
+            }) {
+                return Ok(());
+            }
+        }
+    }
+    Err(invalid(format!(
+        "departing client {expected_owner} does not own a target containing test data"
+    )))
+}
+
+fn nof_locators(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+    prefix: &str,
+) -> Result<BTreeSet<(String, String)>> {
+    let mut locators = BTreeSet::new();
+    for owner in &config.client_ids {
+        for index in 0..config.objects_per_client {
+            let key = format!("{prefix}/{owner}/{index}");
+            let route = client
+                .query_route(&key)?
+                .ok_or_else(|| invalid(format!("route disappeared for {key}")))?;
+            let backing = route
+                .nof_backing
+                .ok_or_else(|| invalid(format!("managed NoF backing disappeared for {key}")))?;
+            locators.extend(
+                backing
+                    .all_targets()
+                    .map(|(target_id, _, locator)| (target_id.to_string(), locator.to_string())),
+            );
+        }
+    }
+    Ok(locators)
 }
 
 fn wait_for_all_phase_done(config: &TestConfig, phase: &str) -> Result<u64> {
@@ -748,6 +1020,22 @@ fn read_and_verify_all(
     Ok(read)
 }
 
+fn probe_recovered_target(
+    config: &TestConfig,
+    client: &mooncake_store_client::StoreClient,
+    client_id: &str,
+) -> Result<()> {
+    let key = format!("{}-recovery-probe/{client_id}", config.test_prefix);
+    let payload = value(client_id, 0, config.value_bytes);
+    client.batch_put(&[PutRequest::new(&key, &payload)])?;
+    evict_all(client, client_id, "recovery-probe")?;
+    let objects = BTreeMap::from([(key.clone(), payload)]);
+    read_and_verify_all(config, client, client_id, &objects)?;
+    client.remove(&key, true)?;
+    println!("{client_id}: recovered target accepted and returned a new probe object");
+    Ok(())
+}
+
 fn verify_handoff_survivor(
     config: &TestConfig,
     client: &mooncake_store_client::StoreClient,
@@ -782,7 +1070,13 @@ fn verify_handoff_survivor(
     evict_all(client, client_id, "post-handoff")?;
     let mut rewritten_config = config.clone();
     rewritten_config.test_prefix = rewrite_prefix;
-    verify_nof_copy_count(&rewritten_config, client, config.expected_nof_copies, None)?;
+    verify_nof_copy_count(
+        &rewritten_config,
+        client,
+        config.expected_nof_copies,
+        None,
+        None,
+    )?;
     let read = read_and_verify_all(config, client, client_id, &rewritten_objects)?;
     println!(
         "{client_id}: owner handoff verified by deleting, rewriting, offloading, and reading {read}/{} objects",
@@ -854,7 +1148,7 @@ fn build_client(
         .cold_tier_watermarks(watermarks)
         .cold_tier_offload_mode(ColdTierOffloadMode::EvictTriggered)
         .route_control(config.route_control)
-        .build(now_ms() + 600_000)?;
+        .build(now_ms().saturating_add(config.lease_ttl_ms))?;
     client.register_local_memory()?;
     Ok(client)
 }
@@ -967,9 +1261,26 @@ fn run() -> Result<()> {
         println!("{client_id}: all clients completed write/offload phase");
     }
     if config.read_only {
+        if config.expect_missing_routes {
+            wait_for_missing_routes(&config, &client, &config.test_prefix)?;
+            wait_for_phase(&config, &client_id, "missing-verified")?;
+            probe_recovered_target(&config, &client, &client_id)?;
+            return Ok(());
+        }
         wait_for_recovered_routes(&config, &client, &config.test_prefix)?;
     }
-    verify_nof_copy_count(&config, &client, config.expected_nof_copies, None)?;
+    verify_nof_copy_count(
+        &config,
+        &client,
+        config.expected_nof_copies,
+        None,
+        config.expected_max_target_copy_skew,
+    )?;
+    let expected_recovery = if config.reonline_wait.is_zero() {
+        None
+    } else {
+        Some(recovery_expectations(&config, &client)?)
+    };
     if !config.post_offload_wait.is_zero() {
         wait_for_phase(&config, &client_id, "fault-ready")?;
         println!(
@@ -977,13 +1288,38 @@ fn run() -> Result<()> {
             config.post_offload_wait.as_secs()
         );
         sleep(config.post_offload_wait);
-        verify_absent_targets(&config, &client)?;
-        verify_nof_copy_count(
-            &config,
-            &client,
-            config.expected_post_wait_nof_copies,
-            config.expected_post_wait_total_nof_copies,
-        )?;
+        if config.expect_post_wait_missing_routes {
+            wait_for_missing_routes(&config, &client, &config.test_prefix)?;
+            return Ok(());
+        } else {
+            verify_absent_targets(&config, &client)?;
+            verify_nof_copy_count(
+                &config,
+                &client,
+                config.expected_post_wait_nof_copies,
+                config.expected_post_wait_total_nof_copies,
+                None,
+            )?;
+        }
+        if let Some(expected) = expected_recovery.as_ref() {
+            wait_for_phase(&config, &client_id, "reonline-ready")?;
+            println!(
+                "{client_id}: target restart window ready; waiting {} seconds",
+                config.reonline_wait.as_secs()
+            );
+            sleep(config.reonline_wait);
+            wait_for_recovered_targets(&config, &client, expected)?;
+            verify_nof_copy_count(
+                &config,
+                &client,
+                config.expected_nof_copies,
+                None,
+                config.expected_max_target_copy_skew,
+            )?;
+        }
+        if config.exit_after_post_wait {
+            return Ok(());
+        }
     }
 
     let all_objects = config
@@ -999,8 +1335,13 @@ fn run() -> Result<()> {
         .collect::<BTreeMap<_, _>>();
 
     if let Some(departing) = config.handoff_departing_client.as_ref() {
+        verify_client_owns_data_target(&config, &client, departing)?;
         wait_for_phase(&config, &client_id, "handoff-ready")?;
         if &client_id == departing {
+            if config.handoff_abrupt_exit {
+                eprintln!("{client_id}: exiting abruptly without owner drain");
+                std::process::exit(99);
+            }
             println!("{client_id}: leaving normally to hand off NoF target ownership");
             return Ok(());
         }
@@ -1045,6 +1386,8 @@ fn run() -> Result<()> {
 
     evict_all(&client, &client_id, "post-read")?;
     if config.delete_and_rewrite {
+        let original_locators = nof_locators(&config, &client, &config.test_prefix)?;
+        wait_for_phase(&config, &client_id, "reuse-baseline")?;
         for index in 0..config.objects_per_client {
             client.remove(&format!("{}/{client_id}/{index}", config.test_prefix), true)?;
         }
@@ -1068,6 +1411,22 @@ fn run() -> Result<()> {
         }
         evict_all(&client, &client_id, "rewrite")?;
         wait_for_phase(&config, &client_id, "rewritten")?;
+        let mut rewritten_config = config.clone();
+        rewritten_config.test_prefix = rewrite_prefix.clone();
+        verify_absent_targets(&rewritten_config, &client)?;
+        verify_nof_copy_count(
+            &rewritten_config,
+            &client,
+            config.expected_nof_copies,
+            None,
+            config.expected_max_target_copy_skew,
+        )?;
+        let rewritten_locators = nof_locators(&config, &client, &rewrite_prefix)?;
+        if original_locators.is_disjoint(&rewritten_locators) {
+            return Err(invalid(
+                "delete-and-rewrite did not reuse any released ExtentStore locator",
+            ));
+        }
         let rewritten_objects = config
             .client_ids
             .iter()

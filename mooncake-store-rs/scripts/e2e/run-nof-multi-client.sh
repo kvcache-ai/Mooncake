@@ -7,9 +7,11 @@ BINARY="${NOF_BINARY:-${ROOT_DIR}/target/debug/nof_multi_client}"
 LOG_DIR="${NOF_LOG_DIR:-${ROOT_DIR}/target/nof-multi-client}"
 RUN_TAG="${NOF_RUN_TAG:-$(date +%Y%m%d-%H%M%S)}"
 KEYSPACE="${NOF_KEYSPACE:-mc/store-rs/nof-multi-client/${RUN_TAG}}"
+BARRIER_RUN_ID="${NOF_BARRIER_RUN_ID:-${RUN_TAG}}"
 REDIS_URL="${NOF_REDIS_URL:-redis://127.0.0.1:6379/0}"
 BIND_IP="${NOF_BIND_IP:-127.0.0.1}"
 HOST_NQN="${NOF_HOST_NQN:-}"
+BUILD_COMMIT="${NOF_BUILD_COMMIT:-unknown}"
 SPDK_LIB_DIR="${NOF_SPDK_LIB_DIR:-${MOONCAKE_SPDK_PREFIX:+${MOONCAKE_SPDK_PREFIX}/install/lib}}"
 SKIP_TARGET_SSH_CHECK="${NOF_SKIP_TARGET_SSH_CHECK:-1}"
 NVMF_SERVICE="${NOF_NVMF_SERVICE:-}"
@@ -21,11 +23,14 @@ RPC_BASE_PORT="${NOF_RPC_BASE_PORT:-21000}"
 CLIENT_IDS_SPEC="${NOF_CLIENT_IDS:-client-0}"
 LOCAL_CLIENT_IDS_SPEC="${NOF_LOCAL_CLIENT_IDS:-${CLIENT_IDS_SPEC}}"
 TARGETS_SPEC="${NOF_TARGETS:-}"
+HANDOFF_DEPARTING_CLIENT="${NOF_HANDOFF_DEPARTING_CLIENT:-}"
+HANDOFF_ABRUPT_EXIT="${NOF_HANDOFF_ABRUPT_EXIT:-false}"
 
 [[ -x "${BINARY}" ]] || { echo "NOF_BINARY is not executable: ${BINARY}" >&2; exit 1; }
 [[ -n "${SPDK_LIB_DIR}" ]] || { echo "NOF_SPDK_LIB_DIR is required, or set MOONCAKE_SPDK_PREFIX" >&2; exit 1; }
 [[ -d "${SPDK_LIB_DIR}" ]] || { echo "NOF_SPDK_LIB_DIR does not exist: ${SPDK_LIB_DIR}" >&2; exit 1; }
 [[ -n "${TARGETS_SPEC}" ]] || { echo "NOF_TARGETS is required" >&2; exit 1; }
+[[ -n "${HOST_NQN}" ]] || { echo "NOF_HOST_NQN is required" >&2; exit 1; }
 for command in ssh ldd sha256sum timeout; do
   command -v "${command}" >/dev/null || { echo "${command} is required" >&2; exit 1; }
 done
@@ -124,9 +129,10 @@ fi
 {
   printf 'binary=%s\n' "${BINARY}"
   sha256sum "${BINARY}"
+  printf 'build_commit=%s\n' "${BUILD_COMMIT}"
   printf 'run_tag=%s\nkeyspace=%s\nbind_ip=%s\nredis_url=%s\n' \
     "${RUN_TAG}" "${KEYSPACE}" "${BIND_IP}" "${REDIS_URL}"
-  printf 'host_nqn=%s\n' "${HOST_NQN:-<default>}"
+  printf 'host_nqn=%s\n' "${HOST_NQN}"
   printf 'target_inventory=%s\nclient_ids=%s\nlocal_client_ids=%s\nroute_control=%s\n' \
     "${TARGETS_SPEC}" "${CLIENT_IDS_SPEC}" "${LOCAL_CLIENT_IDS_SPEC}" "${ROUTE_CONTROL}"
   printf 'nvmf_service=%s\n' "${NVMF_SERVICE}"
@@ -136,12 +142,24 @@ fi
   printf 'kernel=%s\n' "$(uname -srmo)"
   printf 'spdk_lib_dir=%s\n' "${SPDK_LIB_DIR}"
   printf 'runtime_dependencies=resolved\n'
+  for name in \
+    NOF_DEVICE_BYTES NOF_SUBMIT_CHUNK_BYTES NOF_OBJECTS_PER_CLIENT NOF_VALUE_BYTES \
+    NOF_BATCH_SIZE NOF_REPLICA_COUNT NOF_WATERMARK_HIGH_BYTES NOF_WATERMARK_LOW_BYTES \
+    NOF_POST_OFFLOAD_WAIT_SECONDS NOF_REONLINE_WAIT_SECONDS NOF_EXPECT_NOF_COPIES \
+    NOF_EXPECT_POST_WAIT_NOF_COPIES NOF_EXPECT_POST_WAIT_TOTAL_NOF_COPIES \
+    NOF_EXPECT_MAX_TARGET_COPY_SKEW NOF_EXPECT_ABSENT_TARGETS NOF_EXPECT_MISSING_ROUTES \
+    NOF_EXPECT_POST_WAIT_MISSING_ROUTES NOF_EXIT_AFTER_POST_WAIT NOF_READ_ONLY \
+    NOF_DELETE_AND_REWRITE NOF_LEASE_TTL_MS NOF_HANDOFF_DEPARTING_CLIENT \
+    NOF_HANDOFF_ABRUPT_EXIT NOF_HANDOFF_WAIT_SECONDS; do
+    printf '%s=%s\n' "${name}" "${!name:-}"
+  done
   if command -v ip >/dev/null; then
     ip -br link | sed 's/^/interface=/'
   fi
 } >"${LOG_DIR}/${RUN_TAG}/run-manifest.txt"
 export NOF_REDIS_URL="${REDIS_URL}"
 export NOF_KEYSPACE="${KEYSPACE}"
+export NOF_BARRIER_RUN_ID="${BARRIER_RUN_ID}"
 export NOF_BIND_IP="${BIND_IP}"
 if [[ -n "${HOST_NQN}" ]]; then
   export NOF_HOST_NQN="${HOST_NQN}"
@@ -154,6 +172,7 @@ export MC_STORE_RS_ENABLE_COLD_TIER="${MC_STORE_RS_ENABLE_COLD_TIER:-1}"
 export NOF_BARRIER_REDIS_URL="${NOF_BARRIER_REDIS_URL:-${REDIS_URL}}"
 
 pids=()
+pid_clients=()
 for index in "${!local_clients[@]}"; do
   client_id="${local_clients[${index}]}"
   [[ -n "${client_id}" ]] || { echo "NOF_CLIENT_IDS contains an empty id" >&2; exit 1; }
@@ -163,11 +182,23 @@ for index in "${!local_clients[@]}"; do
   NOF_RPC_PORT="$((RPC_BASE_PORT + index))" \
     timeout "${TIMEOUT_SECONDS}" "${BINARY}" >"${log_file}" 2>&1 &
   pids+=("$!")
+  pid_clients+=("${client_id}")
 done
 
 status=0
-for pid in "${pids[@]}"; do
-  if ! wait "${pid}"; then
+for index in "${!pids[@]}"; do
+  pid="${pids[${index}]}"
+  client_id="${pid_clients[${index}]}"
+  if wait "${pid}"; then
+    continue
+  else
+    exit_code="$?"
+  fi
+  if [[ "${HANDOFF_ABRUPT_EXIT}" == true
+        && "${client_id}" == "${HANDOFF_DEPARTING_CLIENT}"
+        && "${exit_code}" == 99 ]]; then
+    echo "accepted expected abrupt exit from ${client_id}"
+  else
     status=1
   fi
 done

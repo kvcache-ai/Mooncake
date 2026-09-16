@@ -833,11 +833,121 @@ mod state_store_tests {
         assert_ne!(first.route_key, hot_route.key);
         assert_ne!(second.route_key, hot_route.key);
     }
+
+    #[test]
+    fn managed_nof_clock_tracks_only_locally_owned_targets() {
+        let runtime = test_runtime();
+        let remote = ClientRuntimeId::new("remote-owner", ClientEpoch(1));
+        let mut route = test_route("managed-nof", &runtime);
+        route.replicas.clear();
+        route.nof_backing = Some(mooncake_store_core::NofBackingRoute {
+            owner: runtime.clone(),
+            target_id: "nof-local".to_string(),
+            object_locator: "local-locator".to_string(),
+            length: 1024,
+            checksum: None,
+            state: mooncake_store_core::ColdBackingState::Materialized,
+            replicas: vec![mooncake_store_core::NofBackingReplica {
+                owner: remote,
+                target_id: "nof-remote".to_string(),
+                object_locator: "remote-locator".to_string(),
+            }],
+        });
+
+        let mut clock = StorageClockState::default();
+        clock.sync_nof_route(&route, &runtime, false);
+
+        let victim = clock
+            .pick_victim(
+                Some(&nof_backing_clock_segment("nof-local")),
+                ColdTierEvictionPriorityPolicy::Clock,
+                0,
+            )
+            .expect("locally owned NoF target should be tracked");
+        assert_eq!(victim.route_key, route.key);
+        assert!(clock
+            .pick_victim(
+                Some(&nof_backing_clock_segment("nof-remote")),
+                ColdTierEvictionPriorityPolicy::Clock,
+                0,
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn nof_clock_consumes_read_before_tracking_for_all_local_targets() {
+        let runtime = test_runtime();
+        let remote = ClientRuntimeId::new("remote-owner", ClientEpoch(1));
+        let mut route = test_route("managed-nof-read-before-track", &runtime);
+        route.replicas.clear();
+        route.nof_backing = Some(mooncake_store_core::NofBackingRoute {
+            owner: runtime.clone(),
+            target_id: "nof-local-primary".to_string(),
+            object_locator: "local-primary-locator".to_string(),
+            length: 1024,
+            checksum: None,
+            state: mooncake_store_core::ColdBackingState::Materialized,
+            replicas: vec![
+                mooncake_store_core::NofBackingReplica {
+                    owner: runtime.clone(),
+                    target_id: "nof-local-replica".to_string(),
+                    object_locator: "local-replica-locator".to_string(),
+                },
+                mooncake_store_core::NofBackingReplica {
+                    owner: remote,
+                    target_id: "nof-remote".to_string(),
+                    object_locator: "remote-locator".to_string(),
+                },
+            ],
+        });
+
+        let mut clock = StorageClockState::default();
+        clock.mark_hot_keys(std::slice::from_ref(&route.key));
+        assert!(clock.pending_hot_keys.contains(&route.key));
+
+        clock.sync_nof_route(&route, &runtime, false);
+
+        assert!(!clock.pending_hot_keys.contains(&route.key));
+        let indices = clock
+            .by_key
+            .get(&route.key)
+            .expect("local NoF targets should be tracked");
+        assert_eq!(indices.len(), 2);
+        for index in indices {
+            let entry = clock
+                .entries
+                .get(*index)
+                .and_then(Option::as_ref)
+                .expect("tracked NoF target should have a clock entry");
+            assert!(entry.hot);
+            assert_eq!(entry.hot_credit, StorageClockState::READ_HOT_CLOCK_CREDIT);
+            assert!(!entry.fresh_write);
+        }
+
+        clock.sync_nof_route(&route, &runtime, false);
+
+        let indices = clock
+            .by_key
+            .get(&route.key)
+            .expect("local NoF targets should remain tracked");
+        for index in indices {
+            let entry = clock
+                .entries
+                .get(*index)
+                .and_then(Option::as_ref)
+                .expect("tracked NoF target should have a clock entry");
+            assert!(!entry.hot);
+            assert_eq!(entry.hot_credit, 0);
+            assert!(!entry.fresh_write);
+        }
+    }
 }
 
 impl StorageOwnerState {
     fn report_route_hits(&self, keys: &[ObjectKey]) -> RouteTrafficReport {
-        self.hot_replicas.clock.lock().mark_hot_keys(keys)
+        let report = self.hot_replicas.clock.lock().mark_hot_keys(keys);
+        self.nof_backings.clock.lock().mark_hot_keys(keys);
+        report
     }
 
     fn track_routes(&self, routes: &[ObjectRoute]) -> RouteTrafficReport {
@@ -852,28 +962,35 @@ impl StorageOwnerState {
             }
         }
         let mut clock = self.hot_replicas.clock.lock();
+        let mut nof_clock = self.nof_backings.clock.lock();
         for route in routes {
             clock.sync_fresh_route(route, &self.runtime);
+            nof_clock.sync_nof_route(route, &self.runtime, true);
         }
         RouteTrafficReport::new(routes.len(), bytes)
     }
 
     fn track_route(&self, route: &ObjectRoute) {
-        self.allocator
-            .lock()
-            .clear_pending_route(route, &self.runtime);
-        self.hot_replicas.clock.lock().track_fresh_route(route, &self.runtime);
+        let mut allocator = self.allocator.lock();
+        let mut clock = self.hot_replicas.clock.lock();
+        let mut nof_clock = self.nof_backings.clock.lock();
+        allocator.clear_pending_route(route, &self.runtime);
+        clock.track_fresh_route(route, &self.runtime);
+        nof_clock.sync_nof_route(route, &self.runtime, true);
     }
 
     fn untrack_route(&self, route: &ObjectRoute) {
         self.hot_replicas.clock.lock().untrack_route(route, &self.runtime);
+        self.nof_backings.clock.lock().remove_key(&route.key);
     }
 
     fn sync_route(&self, route: &ObjectRoute) {
-        self.allocator
-            .lock()
-            .clear_pending_route(route, &self.runtime);
-        self.hot_replicas.clock.lock().sync_route(route, &self.runtime);
+        let mut allocator = self.allocator.lock();
+        let mut clock = self.hot_replicas.clock.lock();
+        let mut nof_clock = self.nof_backings.clock.lock();
+        allocator.clear_pending_route(route, &self.runtime);
+        clock.sync_route(route, &self.runtime);
+        nof_clock.sync_nof_route(route, &self.runtime, false);
     }
 
     fn evict_until_low_watermark(&self, high_percent: u8, low_percent: u8) -> Result<usize> {
@@ -1469,6 +1586,9 @@ fn is_missing_live_allocation_error(error: &StoreError) -> bool {
     )
 }
 
+pub(in crate::client) fn nof_backing_clock_segment(target_id: &str) -> SegmentName {
+    SegmentName::new(format!("__nof_backing__/{target_id}"))
+}
 
 impl StorageClockState {
     const READ_HOT_CLOCK_CREDIT: u8 = 2;
@@ -1559,6 +1679,49 @@ impl StorageClockState {
     fn sync_fresh_route(&mut self, route: &ObjectRoute, runtime: &ClientRuntimeId) {
         self.remove_key(&route.key);
         self.track_fresh_route(route, runtime);
+    }
+
+    fn sync_nof_route(
+        &mut self,
+        route: &ObjectRoute,
+        runtime: &ClientRuntimeId,
+        fresh_write: bool,
+    ) {
+        self.remove_key(&route.key);
+        let Some(backing) = route
+            .nof_backing
+            .as_ref()
+            .filter(|backing| {
+                backing.state == mooncake_store_core::ColdBackingState::Materialized
+            })
+        else {
+            return;
+        };
+        let local_targets = backing
+            .all_targets()
+            .map(|(target_id, owner, locator)| (owner, target_id, locator))
+            .filter(|(owner, _, _)| *owner == runtime)
+            .collect::<Vec<_>>();
+        if local_targets.is_empty() {
+            return;
+        }
+        for (owner, target_id, _) in local_targets {
+            self.upsert_replica(
+                route,
+                &ReplicaRoute {
+                    owner: owner.clone(),
+                    segment_name: nof_backing_clock_segment(target_id),
+                    offset: None,
+                    segment_offset: 0,
+                    length: backing.length,
+                    checksum: backing.checksum,
+                    tier: ReplicaTier::File,
+                    priority: 0,
+                },
+                fresh_write,
+            );
+        }
+        self.pending_hot_keys.remove(&route.key);
     }
 
     fn mark_hot_keys(&mut self, keys: &[ObjectKey]) -> RouteTrafficReport {
@@ -1757,6 +1920,13 @@ impl HotReplicaTracker {
         let mut clock = self.clock.lock();
         for route in routes {
             clock.sync_route(route, runtime);
+        }
+    }
+
+    fn sync_nof_routes(&self, routes: &[ObjectRoute], runtime: &ClientRuntimeId) {
+        let mut clock = self.clock.lock();
+        for route in routes {
+            clock.sync_nof_route(route, runtime, false);
         }
     }
 

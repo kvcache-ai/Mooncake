@@ -2,6 +2,7 @@
 name = "mooncake-store-e2e"
 version = "0.1.0"
 edition = "2021"
+default-run = "mooncake-store-e2e"
 
 [features]
 default = []

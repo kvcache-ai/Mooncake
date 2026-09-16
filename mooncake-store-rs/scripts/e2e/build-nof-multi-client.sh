@@ -91,12 +91,25 @@ case "${PROFILE}" in
 esac
 
 cd "${ROOT_DIR}"
+if [[ -n "$(git status --porcelain --untracked-files=all)" ]]; then
+  echo "NoF E2E build requires a clean source tree so the artifact matches the reported commit" >&2
+  git status --short >&2
+  exit 1
+fi
+BUILD_COMMIT="$(git rev-parse HEAD)"
+EXPECTED_COMMIT="${NOF_EXPECTED_COMMIT:-${BUILD_COMMIT}}"
+if [[ "${BUILD_COMMIT}" != "${EXPECTED_COMMIT}" ]]; then
+  echo "source HEAD ${BUILD_COMMIT} does not match NOF_EXPECTED_COMMIT ${EXPECTED_COMMIT}" >&2
+  exit 1
+fi
 cargo fmt --all -- --check
 cargo build --locked "${PROFILE_ARGS[@]}" -p mooncake-store-e2e --bin nof_multi_client \
   --features nof-spdk
 
 if [[ "${NOF_RUN_UNIT_TESTS:-0}" == 1 ]]; then
   cargo test --locked -p mooncake-store-client --lib --features nof-spdk nof
+  cargo test --locked -p mooncake-store-client --lib --features nof-spdk \
+    client::cold_tier::owner::tests::
   cargo test --locked -p mooncake-store-e2e --bin nof_multi_client --features nof-spdk
 fi
 
@@ -107,10 +120,17 @@ if grep -Eq 'not found|undefined symbol:' <<<"${RUNTIME_DEPS}"; then
   printf '%s\n' "${RUNTIME_DEPS}" >&2
   exit 1
 fi
+if [[ "$(git rev-parse HEAD)" != "${BUILD_COMMIT}" || -n "$(git status --porcelain --untracked-files=all)" ]]; then
+  echo "source tree changed while building ${BUILD_COMMIT}; refusing to publish the artifact" >&2
+  exit 1
+fi
+BINARY_SHA256="$(sha256sum "${BINARY}" | awk '{print $1}')"
+printf 'build_commit=%s\nbinary_sha256=%s\n' "${BUILD_COMMIT}" "${BINARY_SHA256}" \
+  >"${BINARY}.build-manifest"
 
 printf 'built=%s\nspdk_prefix=%s\nspdk_lib_dir=%s\nlinker=%s\n' \
   "${BINARY}" "${SPDK_PREFIX}" "${SPDK_LIB_DIR}" "${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER}"
 printf 'commit=%s\ncargo=%s\nrustc=%s\nspdk_nvme=%s\n' \
-  "$(git rev-parse HEAD)" "$(cargo --version)" "$(rustc --version)" \
+  "${BUILD_COMMIT}" "$(cargo --version)" "$(rustc --version)" \
   "$(pkg-config --modversion spdk_nvme)"
-sha256sum "${BINARY}"
+printf '%s  %s\n' "${BINARY_SHA256}" "${BINARY}"

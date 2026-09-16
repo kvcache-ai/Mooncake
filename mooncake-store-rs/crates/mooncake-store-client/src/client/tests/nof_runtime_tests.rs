@@ -9,6 +9,8 @@ use crate::{
 };
 
 use super::cold_tier::nof::managed_backend::NofManagedStorageBackend;
+use super::cold_tier::nof::NofManagedRecovery;
+use crate::client::RecoveredColdObject;
 
 struct FakePhysicalNof {
     records: Mutex<BTreeMap<Vec<u8>, Vec<u8>>>,
@@ -127,6 +129,11 @@ impl NofHealth for FakePhysicalNof {
 struct FakeManagedNof {
     records: Mutex<std::collections::HashMap<NofManagedLocator, Vec<u8>>>,
     writes: AtomicUsize,
+    fail_next_reserve: AtomicBool,
+    disable_recovery: AtomicBool,
+    releases: AtomicUsize,
+    recoveries: AtomicUsize,
+    manifest_scans: AtomicUsize,
 }
 
 impl NofManagedWrite for FakeManagedNof {
@@ -158,7 +165,8 @@ impl NofManagedRead for FakeManagedNof {
 }
 
 impl NofManagedAllocator for FakeManagedNof {
-    fn recover(&self, _records: &[NofManagedReadRequest]) -> Result<()> {
+    fn recover(&self, records: &[NofManagedReadRequest]) -> Result<()> {
+        self.recoveries.fetch_add(records.len(), Ordering::Relaxed);
         Ok(())
     }
 
@@ -168,7 +176,14 @@ impl NofManagedAllocator for FakeManagedNof {
     ) -> Vec<Result<NofManagedLocator>> {
         requests
             .iter()
-            .map(|request| NofManagedLocator::new(request.key.as_bytes().to_vec()))
+            .map(|request| {
+                if self.fail_next_reserve.swap(false, Ordering::Relaxed) {
+                    return Err(StoreError::Backpressure(
+                        "injected managed NoF reserve failure".to_string(),
+                    ));
+                }
+                NofManagedLocator::new(request.key.as_bytes().to_vec())
+            })
             .collect()
     }
 
@@ -178,9 +193,17 @@ impl NofManagedAllocator for FakeManagedNof {
             .iter()
             .map(|request| {
                 records.remove(&request.locator);
+                self.releases.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             })
             .collect()
+    }
+}
+
+impl NofManagedRecovery for FakeManagedNof {
+    fn scan_recovered_objects(&self, _target_id: &str) -> Result<Vec<RecoveredColdObject>> {
+        self.manifest_scans.fetch_add(1, Ordering::Relaxed);
+        Ok(Vec::new())
     }
 }
 
@@ -205,6 +228,10 @@ impl NofBacking for FakeManagedNof {
         Some(self)
     }
 
+    fn managed_recovery(&self) -> Option<&dyn NofManagedRecovery> {
+        (!self.disable_recovery.load(Ordering::Relaxed)).then_some(self)
+    }
+
     fn health_capability(&self) -> Option<&dyn NofHealth> {
         Some(self)
     }
@@ -212,9 +239,16 @@ impl NofBacking for FakeManagedNof {
 
 impl NofHealth for FakeManagedNof {
     fn health(&self) -> Result<NofStorageHealth> {
+        let capacity = 1024usize * 1024;
+        let used = self
+            .records
+            .lock()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>();
         Ok(NofStorageHealth {
-            capacity_bytes: Some(1024 * 1024),
-            available_bytes: Some(1024 * 1024),
+            capacity_bytes: Some(capacity as u64),
+            available_bytes: Some(capacity.saturating_sub(used) as u64),
         })
     }
 }
@@ -576,6 +610,397 @@ fn managed_nof_persists_route_reads_cold_and_releases_locator() {
 }
 
 #[test]
+fn managed_nof_pending_allocation_is_not_released_before_publish() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend = Arc::new(FakeManagedNof::default());
+    let target = NofTargetConfig::new(
+        "nof-managed-pending-release",
+        NofBackend::new(backend.clone()).expect("managed NoF backend should build"),
+    )
+    .expect("managed NoF target should build");
+    let client = StoreClientBuilder::new(metadata, "nof-managed-pending-release-runtime")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "nof-managed-pending-release-segment",
+        )))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_target(target)
+        .build(test_future_expiry_ms())
+        .expect("managed NoF client should build");
+    client
+        .register_local_memory()
+        .expect("managed NoF memory should register");
+
+    client
+        .put("managed-nof-pending-release-key", &[37u8; 150])
+        .expect("managed NoF put should reserve a locator");
+    let pending = client
+        .query_route("managed-nof-pending-release-key")
+        .expect("pending route query should succeed")
+        .expect("pending route should exist");
+    assert_eq!(
+        pending.nof_backing.as_ref().unwrap().state,
+        mooncake_store_core::ColdBackingState::PendingOffload
+    );
+
+    let release = client
+        .storage_owner
+        .cold_tier_devices
+        .nof_targets
+        .release_managed_target("nof-managed-pending-release", pending);
+    assert!(matches!(release, Err(StoreError::Backpressure(_))));
+    assert_eq!(backend.releases.load(Ordering::Relaxed), 0);
+    assert!(client
+        .query_route("managed-nof-pending-release-key")
+        .unwrap()
+        .unwrap()
+        .nof_backing
+        .is_some());
+
+    assert!(matches!(
+        client.remove("managed-nof-pending-release-key", true),
+        Err(StoreError::Backpressure(_))
+    ));
+    let materialized = (0..2)
+        .map(|_| {
+            client
+                .storage_owner
+                .materialize_pending_offloads_bounded(32)
+                .expect("deleting pending allocation should finish materializing")
+        })
+        .sum::<usize>();
+    assert_eq!(materialized, 1);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        client.flush_due_reclaims().unwrap();
+        if client
+            .query_route("managed-nof-pending-release-key")
+            .unwrap()
+            .is_none()
+            && backend.records.lock().is_empty()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "deleting route did not finish");
+        sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn managed_nof_watermark_refreshes_capacity_and_stops_at_low() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let backend = Arc::new(FakeManagedNof::default());
+    let target = NofTargetConfig::new(
+        "nof-managed-watermark",
+        NofBackend::new(backend.clone()).expect("managed NoF backend should build"),
+    )
+    .expect("managed NoF target should build");
+    let client = StoreClientBuilder::new(
+        Arc::new(InMemoryMetadataBackend::new()),
+        "nof-managed-watermark-runtime",
+    )
+    .state(ClientLifecycleState::Active)
+    .label("storage", "true")
+    .transport(Arc::new(TestTransport::new(
+        "nof-managed-watermark-segment",
+    )))
+    .local_memory(storage_config_with_bytes(1024))
+    .cold_tier_watermarks(
+        ColdTierWatermarkConfig::default()
+            .high_bytes(250)
+            .low_bytes(150),
+    )
+    .nof_target(target)
+    .build(test_future_expiry_ms())
+    .expect("managed NoF client should build");
+    client.register_local_memory().unwrap();
+    for index in 0..3 {
+        let key = format!("managed-nof-watermark-{index}");
+        client
+            .put(&key, &[index as u8; 100])
+            .unwrap();
+    }
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .unwrap(),
+        3
+    );
+    let result = client
+        .storage_owner
+        .free_cold_tier_until_low_watermark_bounded(1, 8)
+        .unwrap();
+    assert_eq!(result.freed_backings, 2);
+    assert!(result.reached_low_watermark);
+    assert_eq!(backend.records.lock().len(), 1);
+}
+
+#[test]
+fn managed_nof_partial_prepare_rebuilds_deleting_offload_and_releases() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend_a = Arc::new(FakeManagedNof::default());
+    let backend_b = Arc::new(FakeManagedNof::default());
+    backend_b
+        .fail_next_reserve
+        .store(true, Ordering::Relaxed);
+    let targets = [
+        NofTargetConfig::new(
+            "nof-managed-replica-a",
+            NofBackend::new(backend_a.clone()).expect("first managed backend should build"),
+        )
+        .expect("first managed target should build"),
+        NofTargetConfig::new(
+            "nof-managed-replica-b",
+            NofBackend::new(backend_b.clone()).expect("second managed backend should build"),
+        )
+        .expect("second managed target should build"),
+    ];
+    let client = StoreClientBuilder::new(metadata, "nof-managed-replica-runtime")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .transport(Arc::new(TestTransport::new(
+            "nof-managed-replica-segment",
+        )))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_targets(targets)
+        .nof_replica_count(2)
+        .build(test_future_expiry_ms())
+        .expect("managed NoF client should build");
+    client
+        .register_local_memory()
+        .expect("managed NoF memory should register");
+
+    let payload = [41u8; 150];
+    client
+        .put("managed-nof-replica-key", &payload)
+        .expect("hot put should survive a temporary second-target reserve failure");
+    let partial = client
+        .query_route("managed-nof-replica-key")
+        .unwrap()
+        .unwrap();
+    assert!(partial.nof_backing.as_ref().unwrap().replicas.is_empty());
+
+    let publish = client
+        .storage_owner
+        .cold_tier_devices
+        .nof_targets
+        .publish_managed_route(partial.clone());
+    assert!(matches!(publish, Err(StoreError::Backpressure(_))));
+
+    client.storage_owner.pending_offloads.clear();
+    assert!(matches!(
+        client.remove("managed-nof-replica-key", true),
+        Err(StoreError::Backpressure(_))
+    ));
+
+    assert_eq!(
+        client
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .expect("retry should fill the missing target and materialize the payload"),
+        1
+    );
+    assert_eq!(backend_a.writes.load(Ordering::Relaxed), 1);
+    assert_eq!(backend_b.writes.load(Ordering::Relaxed), 1);
+    client
+        .storage_owner
+        .free_cold_tier_until_low_watermark_bounded(8, 8)
+        .unwrap();
+    assert!(backend_a.records.lock().is_empty());
+    assert!(backend_b.records.lock().is_empty());
+    assert!(client.query_route("managed-nof-replica-key").unwrap().is_none());
+}
+
+#[test]
+fn managed_nof_hot_replica_owner_writes_for_remote_target_owner() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend = Arc::new(FakeManagedNof::default());
+    let target = NofTargetConfig::new(
+        "nof-managed-remote-owner-target",
+        NofBackend::new(backend.clone()).expect("managed NoF backend should build"),
+    )
+    .expect("managed NoF target should build");
+    let build = |stable_id: &str, segment: &str| {
+        let client = StoreClientBuilder::new(metadata.clone(), stable_id)
+            .state(ClientLifecycleState::Active)
+            .label("storage", "true")
+            .route_control(RouteControlMode::EmbeddedWrh)
+            .transport(Arc::new(TestTransport::new(segment)))
+            .local_memory(storage_config_with_bytes(512))
+            .nof_target(target.clone())
+            .build(test_future_expiry_ms())
+            .expect("managed NoF client should build");
+        client
+            .register_local_memory()
+            .expect("managed NoF memory should register");
+        client
+    };
+    let client_a = build("nof-managed-writer-a", "nof-managed-writer-segment-a");
+    let client_b = build("nof-managed-writer-b", "nof-managed-writer-segment-b");
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let target_owner = loop {
+        let owner_a = client_a
+            .storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .heartbeat_owner_for("nof-managed-remote-owner-target");
+        let owner_b = client_b
+            .storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .heartbeat_owner_for("nof-managed-remote-owner-target");
+        if let (Some(owner_a), Some(owner_b)) = (&owner_a, &owner_b) {
+            if owner_a == owner_b {
+                break owner_a.clone();
+            }
+        }
+        assert!(Instant::now() < deadline, "managed owner views did not converge");
+        sleep(Duration::from_millis(25));
+    };
+    let (writer, non_writer) = if target_owner == *client_a.runtime_id() {
+        (&client_b, &client_a)
+    } else {
+        assert_eq!(target_owner, *client_b.runtime_id());
+        (&client_a, &client_b)
+    };
+
+    writer
+        .put("managed-nof-remote-owner-key", &[43u8; 150])
+        .expect("non-target-owner should publish a managed backing");
+    let route = writer
+        .query_route("managed-nof-remote-owner-key")
+        .unwrap()
+        .unwrap();
+    let writer_replica = route
+        .replicas
+        .iter()
+        .find(|replica| replica.owner == *writer.runtime_id())
+        .cloned()
+        .unwrap();
+    let mut reassigned = route.clone();
+    reassigned.version = route.version.next();
+    reassigned.replicas.push(ReplicaRoute {
+        owner: non_writer.runtime_id().clone(),
+        segment_name: SegmentName::new("nof-managed-stale-writer-segment"),
+        offset: None,
+        segment_offset: 0,
+        length: writer_replica.length,
+        checksum: writer_replica.checksum,
+        tier: mooncake_store_core::ReplicaTier::Dram,
+        priority: writer_replica.priority.saturating_add(1),
+    });
+    assert!(
+        writer
+            .cas_route(
+                "managed-nof-remote-owner-key",
+                Some(route.version),
+                Some(&reassigned),
+            )
+            .unwrap()
+            .applied
+    );
+    non_writer.storage_owner.pending_offloads.push(
+        reassigned.key.clone(),
+        reassigned.version,
+        Some(writer_replica.length),
+    );
+    assert_eq!(
+        non_writer
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .expect("non-writer must discard its stale offload entry"),
+        0
+    );
+    assert_eq!(
+        writer
+            .storage_owner
+            .materialize_pending_offloads_bounded(32)
+            .expect("hot replica owner should materialize the managed payload"),
+        1
+    );
+    assert_eq!(backend.writes.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn concurrent_managed_nof_recovery_keeps_every_target_for_the_same_object() {
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let client = StoreClientBuilder::new(metadata.clone(), "nof-recovery-race-runtime")
+        .state(ClientLifecycleState::Active)
+        .transport(Arc::new(TestTransport::new("nof-recovery-race-segment")))
+        .local_memory(storage_config_with_bytes(512))
+        .build(test_future_expiry_ms())
+        .expect("recovery test client should build");
+    client
+        .register_local_memory()
+        .expect("recovery test memory should register");
+    let directory = client.storage_owner.route_ops.directory().clone();
+    let observer = client.storage_owner.route_ops.observer().clone();
+    let workers = 8usize;
+    let barrier = Arc::new(std::sync::Barrier::new(workers));
+    let handles = (0..workers)
+        .map(|index| {
+            let metadata = metadata.clone();
+            let directory = directory.clone();
+            let observer = observer.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let target_id = format!("nof-recovery-target-{index}");
+                let recovered = RecoveredColdObject {
+                    manifest: super::ColdObjectManifest {
+                        key: ObjectKey::new("nof-recovery-race-key"),
+                        namespace: None,
+                        logical_key: None,
+                        canonical_key: None,
+                        sharing_scope: None,
+                        qos_tier: None,
+                        route_version: RouteVersion(1),
+                        cold_tier_id: target_id.clone(),
+                        object_locator: format!("locator-{index}"),
+                        length: 128,
+                        checksum: Some(71),
+                    },
+                    path: std::path::PathBuf::from(format!("nof://{target_id}/{index}")),
+                    metadata: super::ColdPayloadMetadata {
+                        length: 128,
+                        checksum: Some(71),
+                    },
+                };
+                barrier.wait();
+                super::cold_tier_storage_backend::try_register_recovered_cold_object(
+                    metadata.as_ref(),
+                    directory.as_ref(),
+                    &observer,
+                    &recovered,
+                    super::cold_tier_storage_backend::RecoveredBackingKind::Nof,
+                )
+            })
+        })
+        .collect::<Vec<_>>();
+    for handle in handles {
+        handle
+            .join()
+            .expect("recovery worker should not panic")
+            .expect("concurrent recovery should reconcile its target");
+    }
+
+    let route = directory
+        .get_object_route(&observer, &ObjectKey::new("nof-recovery-race-key"))
+        .unwrap()
+        .unwrap();
+    let backing = route.nof_backing.unwrap();
+    let targets = std::iter::once(backing.target_id)
+        .chain(backing.replicas.into_iter().map(|replica| replica.target_id))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(targets.len(), workers);
+}
+
+#[test]
 fn managed_nof_resolved_read_keeps_selected_target() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
@@ -824,10 +1249,10 @@ fn unavailable_physical_nof_target_is_pruned_after_replica_restore() {
 }
 
 #[test]
-fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
+fn managed_nof_graceful_handoff_recovers_from_snapshot() {
     let _cold_tier_env = enable_cold_tier_for_test();
     let metadata = Arc::new(InMemoryMetadataBackend::new());
-    let backend = Arc::new(FakePhysicalNof::default());
+    let backend = Arc::new(FakeManagedNof::default());
     let target = NofTargetConfig::new(
         "nof-handoff-target",
         NofBackend::new(backend.clone()).expect("handoff NoF backend should build"),
@@ -888,6 +1313,8 @@ fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
         .materialize_pending_offloads_bounded(32)
         .expect("non-owner writer should run the NoF offload");
     force_cold_only_route(writer, "nof-handoff-key");
+    let recoveries_before = backend.recoveries.load(Ordering::Relaxed);
+    let scans_before = backend.manifest_scans.load(Ordering::Relaxed);
     let (departed, survivor) = if initial_owner == *client_a.runtime_id() {
         (client_a, client_b)
     } else {
@@ -903,7 +1330,9 @@ fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
             .cold_tier_devices
             .nof_targets
             .heartbeat_owner_for("nof-handoff-target");
-        if current.as_ref() == Some(survivor.runtime_id()) {
+        if current.as_ref() == Some(survivor.runtime_id())
+            && backend.recoveries.load(Ordering::Relaxed) > recoveries_before
+        {
             break;
         }
         assert!(
@@ -912,6 +1341,11 @@ fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
         );
         sleep(Duration::from_millis(25));
     }
+    assert!(
+        backend.recoveries.load(Ordering::Relaxed) > recoveries_before,
+        "successor should recover allocator state from the handoff snapshot"
+    );
+    assert_eq!(backend.manifest_scans.load(Ordering::Relaxed), scans_before);
     assert_eq!(
         survivor
             .get("nof-handoff-key")
@@ -926,6 +1360,43 @@ fn nof_target_heartbeat_owner_handoff_does_not_gate_data_io() {
         wait_for_nof_reclaims(&survivor, || backend.records.lock().is_empty()),
         "NoF target data remained after owner handoff reclaim"
     );
+}
+
+#[test]
+fn managed_nof_without_physical_recovery_uses_existing_routes() {
+    let _cold_tier_env = enable_cold_tier_for_test();
+    let metadata = Arc::new(InMemoryMetadataBackend::new());
+    let backend = Arc::new(FakeManagedNof::default());
+    backend.disable_recovery.store(true, Ordering::Relaxed);
+    let target = NofTargetConfig::new(
+        "nof-route-recovery-target",
+        NofBackend::new(backend).expect("managed NoF backend should build without scan recovery"),
+    )
+    .expect("managed NoF target should build");
+    let client = StoreClientBuilder::new(metadata, "nof-route-recovery-client")
+        .state(ClientLifecycleState::Active)
+        .label("storage", "true")
+        .route_control(RouteControlMode::EmbeddedWrh)
+        .transport(Arc::new(TestTransport::new(
+            "nof-route-recovery-segment",
+        )))
+        .local_memory(storage_config_with_bytes(512))
+        .nof_target(target)
+        .build(test_future_expiry_ms())
+        .expect("managed NoF client should build");
+    client
+        .register_local_memory()
+        .expect("managed NoF client memory should register");
+
+    let manager = &client.storage_owner.cold_tier_devices.nof_targets;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !manager.available_for_io("nof-route-recovery-target") {
+        assert!(
+            Instant::now() < deadline,
+            "managed target without physical recovery did not become available"
+        );
+        sleep(Duration::from_millis(25));
+    }
 }
 
 #[test]

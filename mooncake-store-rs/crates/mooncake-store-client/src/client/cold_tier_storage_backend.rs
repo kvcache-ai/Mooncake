@@ -797,12 +797,13 @@ pub(crate) use local_dir_cold_backend::LocalDirPersistentStorageBackend;
 #[cfg(test)]
 pub(crate) use local_dir_cold_backend::{decode_backend_payload, encode_backend_payload};
 pub(super) use local_dir_cold_backend::{read_file_optional, remove_file_optional};
-use local_dir_cold_backend::{
-    reconcile_cold_tier_startup, try_register_recovered_cold_object, RecoveredBackingKind,
-    RecoveredObjectOutcome,
+use local_dir_cold_backend::{reconcile_cold_tier_startup, RecoveredObjectOutcome};
+#[cfg(test)]
+pub(in crate::client) use local_dir_cold_backend::{
+    try_register_recovered_cold_object, RecoveredBackingKind,
 };
-
-use cold_tier::nof::NofManagedRecoveryTarget;
+#[cfg(not(test))]
+use local_dir_cold_backend::{try_register_recovered_cold_object, RecoveredBackingKind};
 
 fn reconcile_extent_store_startup(
     metadata: &dyn MetadataBackend,
@@ -914,76 +915,149 @@ fn reconcile_extent_store_startup(
     Ok(())
 }
 
-fn reconcile_nof_managed_startup(
-    metadata: &dyn MetadataBackend,
-    route_directory: &dyn RouteDirectory,
-    observer: &ClientLease,
-    targets: &[NofManagedRecoveryTarget],
+pub(in crate::client) fn reconcile_nof_managed_startup(
+    route_ops: &mooncake_store_route::RouteOperations,
+    target_id: &str,
+    backend: &cold_tier::nof::NofBackend,
 ) -> Result<()> {
-    for target in targets {
-        let Some(recovery) = target.backend.backing.managed_recovery() else {
+    let metadata = route_ops.metadata();
+    let route_directory = route_ops.directory();
+    let observer = route_ops.observer();
+    let recovery = backend.backing.managed_recovery().ok_or_else(|| {
+        StoreError::InvalidState(format!(
+            "managed NoF target {} is missing recovery capability",
+            target_id
+        ))
+    })?;
+    let mut recovered_objects = recovery.scan_recovered_objects(target_id)?;
+    recovered_objects.sort_by(|a, b| {
+        a.manifest
+            .key
+            .cmp(&b.manifest.key)
+            .then(b.manifest.route_version.cmp(&a.manifest.route_version))
+    });
+    let mut seen_keys = std::collections::BTreeSet::new();
+    let mut physical_locators = std::collections::BTreeSet::new();
+    let mut live_records = std::collections::BTreeMap::new();
+    for recovered in &recovered_objects {
+        if !seen_keys.insert(recovered.manifest.key.clone()) {
             continue;
-        };
-        let mut recovered_objects = recovery.scan_recovered_objects(&target.target_id)?;
-        recovered_objects.sort_by(|a, b| {
-            a.manifest
-                .key
-                .cmp(&b.manifest.key)
-                .then(b.manifest.route_version.cmp(&a.manifest.route_version))
-        });
-        let mut seen_keys = std::collections::BTreeSet::new();
-        let mut live_records = Vec::new();
-        for recovered in &recovered_objects {
-            if !seen_keys.insert(recovered.manifest.key.clone()) {
-                continue;
-            }
-            match try_register_recovered_cold_object(
-                metadata,
-                route_directory,
-                observer,
-                recovered,
-                RecoveredBackingKind::Nof,
-            ) {
-                Ok(
-                    RecoveredObjectOutcome::Registered | RecoveredObjectOutcome::AlreadyConsistent,
-                ) => {
-                    live_records.push(cold_tier::nof::NofManagedReadRequest {
+        }
+        match try_register_recovered_cold_object(
+            metadata,
+            route_directory.as_ref(),
+            observer,
+            recovered,
+            RecoveredBackingKind::Nof,
+        ) {
+            Ok(RecoveredObjectOutcome::Registered | RecoveredObjectOutcome::AlreadyConsistent) => {
+                physical_locators.insert(recovered.manifest.object_locator.clone());
+                live_records.insert(
+                    recovered.manifest.object_locator.clone(),
+                    cold_tier::nof::NofManagedReadRequest {
                         locator: cold_tier::nof::NofManagedLocator::from_hex(
                             &recovered.manifest.object_locator,
                         )?,
                         length: recovered.metadata.length,
                         checksum: recovered.metadata.checksum,
-                    });
-                    if let Some(route) =
-                        route_directory.get_object_route(observer, &recovered.manifest.key)?
-                    {
-                        if let Err(error) =
-                            cold_tier::nof::mirror_managed_route_index(metadata, &route)
-                        {
-                            tracing::warn!(
-                                route_key = %route.key.0,
-                                %error,
-                                "managed NoF startup recovery route index update failed"
-                            );
-                        }
-                    }
+                    },
+                );
+                if let Some(route) = route_ops.load_route(&recovered.manifest.key)? {
+                    cold_tier::nof::mirror_managed_route_index(metadata, &route)?;
                 }
-                Ok(RecoveredObjectOutcome::Superseded) => {}
-                Err(error) => tracing::warn!(
-                    route_key = %recovered.manifest.key.0,
-                    target_id = %target.target_id,
-                    %error,
-                    "managed NoF startup recovery: skipping object due to error"
-                ),
             }
+            Ok(RecoveredObjectOutcome::Superseded) => {}
+            Err(error) => return Err(error),
         }
-        target
-            .backend
-            .backing
-            .managed_allocator()
-            .expect("managed allocator capability was checked during construction")
-            .recover(&live_records)?;
     }
+    route_directory.flush_pending_route_mirrors();
+
+    let indexed_routes = metadata.list_object_routes_by_nof_backing(
+        &mooncake_store_core::NofBackingRouteFilter {
+            target_id: Some(target_id.to_string()),
+            state: None,
+            limit: None,
+        },
+    )?;
+    for indexed in indexed_routes {
+        let Some(route) = route_ops.load_route(&indexed.key)? else {
+            let cas = metadata.compare_and_swap_object_route(
+                &indexed.key,
+                Some(indexed.version),
+                None,
+            )?;
+            if !cas.applied {
+                return Err(StoreError::Conflict(format!(
+                    "managed NoF mirror {} changed while removing a stale route",
+                    indexed.key.0
+                )));
+            }
+            continue;
+        };
+        let route = cold_tier::nof::adopt_managed_target_owner(
+            route_ops,
+            route,
+            target_id,
+            &observer.runtime,
+        )?;
+        let backing = match cold_tier::nof::managed_target_cold_backing(&route, target_id) {
+            Ok(backing) => backing,
+            Err(StoreError::NotFound(_)) => {
+                cold_tier::nof::mirror_managed_route_index(metadata, &route)?;
+                let stale = metadata
+                    .get_object_route(&route.key)?
+                    .and_then(|route| route.nof_backing)
+                    .is_some_and(|backing| {
+                        backing
+                            .all_targets()
+                            .any(|(backing_target_id, _, _)| backing_target_id == target_id)
+                    });
+                if stale {
+                    return Err(StoreError::Conflict(format!(
+                        "managed NoF mirror {} still references stale target {}",
+                        route.key.0, target_id
+                    )));
+                }
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if physical_locators.contains(&backing.object_locator)
+            || backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+        {
+            live_records
+                .entry(backing.object_locator.clone())
+                .or_insert(cold_tier::nof::NofManagedReadRequest {
+                    locator: cold_tier::nof::NofManagedLocator::from_hex(&backing.object_locator)?,
+                    length: backing.length,
+                    checksum: backing.checksum,
+                });
+            continue;
+        }
+
+        let Some((next, _)) = cold_tier::nof::route_without_managed_target(&route, target_id)?
+        else {
+            continue;
+        };
+        let cas = if cold_tier::nof::route_has_payload(&next) {
+            route_ops.compare_and_swap_route(&route.key, Some(route.version), Some(&next))?
+        } else {
+            route_ops.delete_route_with_version_fence(&route)?
+        };
+        if !cas.applied {
+            return Err(StoreError::Conflict(format!(
+                "managed NoF route {} changed during disk reconciliation",
+                route.key.0
+            )));
+        }
+        cold_tier::nof::mirror_managed_route_index(metadata, &next)?;
+    }
+    let live_records = live_records.into_values().collect::<Vec<_>>();
+    backend
+        .backing
+        .managed_allocator()
+        .expect("managed allocator capability was checked during construction")
+        .recover(&live_records)?;
     Ok(())
 }
 
@@ -993,7 +1067,6 @@ pub(super) enum DeferredColdTierReconcile {
         Arc<LocalDirPersistentStorageBackend>,
         Vec<ResolvedColdTierTarget>,
     ),
-    NofManaged(Vec<NofManagedRecoveryTarget>),
 }
 
 pub(super) fn run_deferred_cold_tier_reconciles(
@@ -1025,9 +1098,6 @@ pub(super) fn run_deferred_cold_tier_reconciles(
                 backend.as_ref(),
                 devices,
             ),
-            DeferredColdTierReconcile::NofManaged(targets) => {
-                reconcile_nof_managed_startup(metadata, route_directory, lease, targets)
-            }
         };
         if let Err(error) = result {
             tracing::warn!(

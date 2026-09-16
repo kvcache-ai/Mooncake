@@ -32,10 +32,39 @@ pub(in super::super) fn enqueue_pending_offload(
     let Some(cold_backing) = pending_persistent_backing(route) else {
         return;
     };
-    if cold_backing.owner != storage_owner.runtime {
+    let owns_write = if route.nof_backing.is_some() {
+        managed_nof_payload_writer(route) == Some(&storage_owner.runtime)
+    } else {
+        cold_backing.owner == storage_owner.runtime
+    };
+    if !owns_write {
         return;
     }
     enqueue_pending_offload_with_length(storage_owner, route, cold_backing.length);
+}
+
+fn managed_nof_payload_writer(route: &ObjectRoute) -> Option<&super::super::ClientRuntimeId> {
+    route
+        .nof_backing
+        .as_ref()
+        .filter(|backing| backing.state == mooncake_store_core::ColdBackingState::PendingOffload)?;
+    route
+        .replicas
+        .iter()
+        .min_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.owner.cmp(&right.owner))
+        })
+        .map(|replica| &replica.owner)
+}
+
+fn can_materialize_pending_offload(route: &ObjectRoute) -> bool {
+    route.state == RouteState::Active
+        || (route.state == RouteState::Deleting
+            && route.nof_backing.as_ref().is_some_and(|backing| {
+                backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+            }))
 }
 
 fn enqueue_pending_offload_with_length(
@@ -519,7 +548,7 @@ pub(in super::super) fn prepare_pending_offload_entry(
             enqueued_at: entry.enqueued_at,
             length_bytes: Some(replica.length),
         });
-    if route.state != RouteState::Active {
+    if !can_materialize_pending_offload(&route) {
         if let Some(refreshed_entry) = refreshed_pending_entry.clone() {
             storage_owner.sync_route(&route);
             return Ok(PendingOffloadPrepareOutcome::Refreshed(refreshed_entry));
@@ -535,6 +564,12 @@ pub(in super::super) fn prepare_pending_offload_entry(
         storage_owner.sync_route(&route);
         return Ok(PendingOffloadPrepareOutcome::Skipped);
     }
+    if route.nof_backing.is_some()
+        && managed_nof_payload_writer(&route) != Some(&storage_owner.runtime)
+    {
+        storage_owner.sync_route(&route);
+        return Ok(PendingOffloadPrepareOutcome::Skipped);
+    }
     let Some(replica) = route
         .replicas
         .iter()
@@ -543,6 +578,23 @@ pub(in super::super) fn prepare_pending_offload_entry(
         .cloned()
     else {
         return Ok(PendingOffloadPrepareOutcome::Retry(entry));
+    };
+    let route = if route.nof_backing.as_ref().is_some_and(|backing| {
+        backing.state == mooncake_store_core::ColdBackingState::PendingOffload
+    }) {
+        let Some(checksum) = checksum_for_cold_backing(storage_owner, &route, &replica)? else {
+            return Ok(PendingOffloadPrepareOutcome::Retry(entry));
+        };
+        let Some(pending) = storage_owner
+            .cold_tier_devices
+            .nof_targets
+            .pending_managed_backing(&route, replica.length, checksum)?
+        else {
+            return Ok(PendingOffloadPrepareOutcome::Retry(entry));
+        };
+        pending.route
+    } else {
+        route
     };
     let (cold_backing, transient_nof, route) = match pending_persistent_backing(&route) {
         Some(backing) => (backing, false, route.clone()),
@@ -1500,6 +1552,23 @@ fn rebuild_pending_offload_queue_with(
                 queue.push(route.key.clone(), route.version, Some(cold_backing.length));
             }
         }
+    }
+    let managed_routes = storage_owner.route_ops.visit_routes_by_replica_owner(
+        &storage_owner.runtime,
+        &mut |route| {
+            if can_materialize_pending_offload(&route)
+                && managed_nof_payload_writer(&route) == Some(&storage_owner.runtime)
+            {
+                if let Some(backing) = pending_persistent_backing(&route) {
+                    queue.push(route.key.clone(), route.version, Some(backing.length));
+                }
+            }
+            Ok(())
+        },
+    );
+    match managed_routes {
+        Ok(()) | Err(StoreError::Unsupported(_)) => {}
+        Err(error) => return Err(error),
     }
     let len = queue.len();
     pending_offloads.replace(queue);
