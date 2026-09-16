@@ -1038,11 +1038,19 @@ fn probe_recovered_target(
 
 fn verify_handoff_survivor(
     config: &TestConfig,
-    client: &mooncake_store_client::StoreClient,
+    client: &mut mooncake_store_client::StoreClient,
     client_id: &str,
     all_objects: &BTreeMap<String, Vec<u8>>,
 ) -> Result<()> {
-    sleep(config.handoff_wait);
+    let deadline = Instant::now() + config.handoff_wait;
+    while Instant::now() < deadline {
+        client.heartbeat(now_ms().saturating_add(config.lease_ttl_ms))?;
+        sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1)),
+        );
+    }
     for key in all_objects.keys() {
         client.remove(key, true)?;
     }
@@ -1184,7 +1192,7 @@ fn run() -> Result<()> {
         config.client_ids.len(),
         config.batch_size
     );
-    let client = build_client(&config, &client_id, rpc_port)?;
+    let mut client = build_client(&config, &client_id, rpc_port)?;
     println!(
         "{client_id}: runtime={} local memory registered; waiting for all clients",
         client.runtime_id()
@@ -1337,6 +1345,7 @@ fn run() -> Result<()> {
     if let Some(departing) = config.handoff_departing_client.as_ref() {
         verify_client_owns_data_target(&config, &client, departing)?;
         wait_for_phase(&config, &client_id, "handoff-ready")?;
+        client.heartbeat(now_ms().saturating_add(config.lease_ttl_ms))?;
         if &client_id == departing {
             if config.handoff_abrupt_exit {
                 eprintln!("{client_id}: exiting abruptly without owner drain");
@@ -1345,7 +1354,7 @@ fn run() -> Result<()> {
             println!("{client_id}: leaving normally to hand off NoF target ownership");
             return Ok(());
         }
-        return verify_handoff_survivor(&config, &client, &client_id, &all_objects);
+        return verify_handoff_survivor(&config, &mut client, &client_id, &all_objects);
     }
 
     // Every client issues batch_get_into concurrently. This matches the production batch-get
