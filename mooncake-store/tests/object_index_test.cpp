@@ -10,8 +10,6 @@
 namespace mooncake {
 namespace {
 
-// --- Object route ---
-
 TEST(ObjectIndexTest, InsertPublishesTheEntryUnderItsKey) {
     ObjectIndex store;
     EXPECT_EQ(store.ObjectCount(), 0u);

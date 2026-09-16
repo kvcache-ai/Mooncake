@@ -49,8 +49,6 @@ class ObjectIndex {
         if (!inserted) {
             return false;
         }
-        // After the slot exists, under the same lock: whatever can see the
-        // entry can see its generation.
         it->second->generation_ = ++generation_counter_;
         return true;
     }
@@ -105,8 +103,8 @@ class ObjectIndex {
 
    private:
     // Object route: the strong entry handles keyed by object key, guarded by a
-    // single shared_mutex. Per-object mutation is finer-grained
-    // (ObjectEntry::mutex).
+    // single shared_mutex. Mutating one object's state is finer-grained: each
+    // entry guards its own.
     mutable std::shared_mutex route_lock_;
     // Transparent lookup: every accessor takes a view, so a caller that already
     // has one does not build a string to find the entry.

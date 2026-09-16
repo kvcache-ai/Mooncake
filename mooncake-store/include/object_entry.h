@@ -2,8 +2,11 @@
 
 // ObjectEntry: the per-object runtime shell. The ObjectMetadata envelope is
 // the single source of identity (user_key, group_id) and group-lease wiring;
-// the entry adds the per-key task state and the per-object mutation
-// boundary.
+// the entry adds the per-key runtime state and owns the lock guarding both.
+//
+// The lock never leaves the class: everything below the identity is reachable
+// only through WithExclusiveAccess or WithSharedAccess, which hold it for the
+// callback, so a caller cannot act on half of a compound operation.
 
 #include <chrono>
 #include <cstdint>
@@ -21,8 +24,25 @@ namespace mooncake {
 
 class ObjectEntry {
    public:
-    // Takes ownership of a non-null metadata envelope; the envelope carries
-    // the object's identity (user_key, group_id).
+    // What the entry adds to the envelope: the per-key task state, at most one
+    // in-flight task per entry, and the lifecycle claims over it.
+    struct State {
+        // A primary write or a background task is in flight for this key.
+        bool is_processing{false};
+        // Teardown-once claim: a second eraser of the same entry bails out
+        // instead of double-releasing its refcounts, quota charges and KV
+        // removal events.
+        bool is_torn_down{false};
+        std::optional<ReplicationTask> replication_task;
+        std::optional<OffloadingTask> offloading_task;
+        std::optional<PromotionTask> promotion_task;
+        std::optional<PromotionCandidate> promotion_candidate;
+        std::optional<DynamicReplicaPending> dynamic_replication_pending;
+        std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
+    };
+
+    // Takes ownership of a non-null metadata envelope; the envelope carries the
+    // object's identity (user_key, group_id).
     explicit ObjectEntry(std::unique_ptr<ObjectMetadata> metadata)
         : metadata_(std::move(metadata)) {}
 
@@ -33,7 +53,7 @@ class ObjectEntry {
     ObjectEntry& operator=(ObjectEntry&&) = delete;
 
     // Identity lives in the envelope, which holds both as const members, so
-    // these read without taking `mutex`.
+    // these read without taking `mutex_`.
     const std::string& key() const noexcept { return metadata_->user_key; }
     const std::string& group_id() const noexcept { return metadata_->group_id; }
 
@@ -42,45 +62,21 @@ class ObjectEntry {
     // a later replacement of the same key.
     [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
-    // Per-key task state; at most one in-flight task per entry. Guarded by
-    // `mutex`.
-    bool is_processing{false};
-    // Teardown-once claim, set under `mutex`: a second eraser of the same entry
-    // bails out instead of double-releasing its refcounts, quota charges and KV
-    // removal events.
-    bool is_torn_down{false};
-    std::optional<ReplicationTask> replication_task;
-    std::optional<OffloadingTask> offloading_task;
-    std::optional<PromotionTask> promotion_task;
-    std::optional<PromotionCandidate> promotion_candidate;
-    std::optional<DynamicReplicaPending> dynamic_replication_pending;
-    std::chrono::steady_clock::time_point dynamic_replication_cooldown{};
-
-    // Per-object mutation boundary. The returned lock may be released and
-    // reacquired midway through a compound operation. Lock order: entry mutex
-    // → route lock → metadata spin lock; never the reverse for any pair.
-    [[nodiscard]] std::unique_lock<std::shared_mutex> LockUnique() const {
-        return std::unique_lock<std::shared_mutex>(mutex);
-    }
-    [[nodiscard]] std::shared_lock<std::shared_mutex> LockShared() const {
-        return std::shared_lock<std::shared_mutex>(mutex);
-    }
-    // Non-blocking probe: an owning lock when the mutex was free, an empty
-    // one when it was already held.
-    [[nodiscard]] std::unique_lock<std::shared_mutex> TryLockUnique() const {
-        return std::unique_lock<std::shared_mutex>(mutex, std::try_to_lock);
-    }
-
-    // Owned envelope; never null (enforced by the constructor). Read under
-    // `mutex` when the entry may be mid-mutation.
-    ObjectMetadata& metadata() const { return *metadata_; }
-
-    // Callback-scoped access: runs `fn(metadata())` while the per-object
-    // mutex is held; the reference must not escape the callback.
+    // Runs `fn(envelope, state)` with the entry held exclusively and returns
+    // whatever `fn` returns. Lock order: entry → route → metadata spin lock,
+    // never the reverse for any pair. Both references last only for the call.
     template <typename Fn>
-    void WithMetadata(Fn&& fn) const {
-        std::unique_lock<std::shared_mutex> lock(mutex);
-        std::forward<Fn>(fn)(*metadata_);
+    decltype(auto) WithExclusiveAccess(Fn&& fn) {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        return std::forward<Fn>(fn)(*metadata_, state_);
+    }
+
+    // The same for readers: `fn` sees both halves but may not mutate them.
+    template <typename Fn>
+    decltype(auto) WithSharedAccess(Fn&& fn) const {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        return std::forward<Fn>(fn)(std::as_const(*metadata_),
+                                    std::as_const(state_));
     }
 
    private:
@@ -88,7 +84,9 @@ class ObjectEntry {
 
     std::unique_ptr<ObjectMetadata> metadata_;
     uint64_t generation_{0};
-    mutable std::shared_mutex mutex;
+    // Mutable so a const entry can still be read under the shared lock.
+    mutable std::shared_mutex mutex_;
+    State state_ GUARDED_BY(mutex_);
 };
 
 }  // namespace mooncake

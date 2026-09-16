@@ -74,7 +74,7 @@ class DynamicReplicationLeaseTable {
         return leases_.empty();
     }
 
-    // Test-only: production reaches a lease by proposal, never by object key.
+    // Only the suites read a lease by key; production reaches one by proposal.
     [[nodiscard]] bool HasLeaseForObjectForTest(std::string_view key) const {
         std::shared_lock<std::shared_mutex> lock(mutex_);
         return std::any_of(leases_.begin(), leases_.end(),

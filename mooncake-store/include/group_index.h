@@ -16,21 +16,19 @@
 #include "lease.h"
 
 namespace mooncake {
-namespace metadata {
 
 // GroupIndex: group_id -> {shared Lease, member keys}. A group is not a
-// container of objects: it is a thin membership table plus a single shared
-// Lease, and that lease is the all-or-none unit eviction reads (the per-member
+// container of objects: it is a membership table plus one shared Lease, and
+// that lease is the all-or-none unit eviction reads (every member's
 // ObjectMetadata points at it). The read path extends it on a member hit
 // without touching this index. A group is dropped with its last member, and a
 // later AddMember starts a fresh group rather than reviving the old one.
 //
 // The table is striped so that writes to distinct groups do not serialize on
-// one lock; every operation on a group hashes to the same stripe. A stripe
-// costs 56 B of map plus 56 B of lock and every tenant holds one table, so the
-// stripe count trades tenant memory for write concurrency. It is a policy
-// parameter rather than a constant so a measurement or a tenant-dense
-// deployment can move it.
+// one lock; every operation on a group hashes to the same stripe. A stripe is
+// a map plus a lock and every tenant holds one table, so the count trades
+// tenant memory for write concurrency and is a template parameter rather than
+// a constant.
 template <size_t StripeCount>
 class StripedGroupIndex {
    public:
@@ -111,8 +109,6 @@ class StripedGroupIndex {
             groups;
     };
 
-    // Fixed per instance: nothing resizes the stripe array.
-
     Stripe& StripeFor(std::string_view group_id) {
         return stripes_[StripeIndex(group_id)];
     }
@@ -128,12 +124,8 @@ class StripedGroupIndex {
     std::array<Stripe, StripeCount> stripes_;
 };
 
-// 64 is the last large step of the write-concurrency curve of this table
-// (member adds/s at 32 threads, 4096 groups per thread, one thread per group
-// prefix): 6.97M at 32 stripes, 12.53M at 64, 15.40M at 128, 18.79M at 256,
-// against 7 KiB per tenant at 64 and 15 KiB at 128. The curve does not flatten
-// before 256 stripes, so a workload that groups heavily can raise the count.
+// 64 stripes: the shipped default. A grouping-heavy workload can raise it by
+// instantiating the template with a larger count.
 using GroupIndex = StripedGroupIndex<64>;
 
-}  // namespace metadata
 }  // namespace mooncake

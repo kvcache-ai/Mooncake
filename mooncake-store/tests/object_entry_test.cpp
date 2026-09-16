@@ -14,36 +14,35 @@ TEST(ObjectEntryTest, OwnsMetadataEnvelopeFromConstruction) {
     auto* raw = metadata.get();
     auto entry = std::make_shared<ObjectEntry>(std::move(metadata));
 
-    EXPECT_EQ(&entry->metadata(), raw);
-    EXPECT_EQ(entry->metadata().size, 128u);
-
-    // The callback observes the same envelope the accessor exposed.
-    bool called = false;
-    entry->WithMetadata([&](ObjectMetadata& m) {
-        called = true;
+    // The envelope is wired from construction on, so a callback always sees
+    // one and there is nothing to null-check at the call sites.
+    entry->WithExclusiveAccess([&](ObjectMetadata& m, ObjectEntry::State&) {
         EXPECT_EQ(&m, raw);
+        EXPECT_EQ(m.size, 128u);
         m.object_checksum = 42;
     });
-    EXPECT_TRUE(called);
-    ASSERT_TRUE(entry->metadata().object_checksum.has_value());
-    EXPECT_EQ(*entry->metadata().object_checksum, 42u);
-    EXPECT_EQ(&entry->metadata(), raw);  // envelope stays wired
+
+    entry->WithSharedAccess(
+        [&](const ObjectMetadata& m, const ObjectEntry::State& state) {
+            ASSERT_TRUE(m.object_checksum.has_value());
+            EXPECT_EQ(*m.object_checksum, 42u);
+            EXPECT_FALSE(state.is_processing);
+            EXPECT_FALSE(state.is_torn_down);
+        });
 }
 
-TEST(ObjectEntryTest, TryLockUniqueReportsWhetherTheEntryWasFree) {
+TEST(ObjectEntryTest, AccessorsSeeTheStateWrittenUnderTheLock) {
     auto entry = test::MakeObjectEntry("k1");
+    entry->WithExclusiveAccess([](ObjectMetadata&, ObjectEntry::State& state) {
+        state.is_processing = true;
+    });
 
-    // Free -> an owning lock the caller keeps for as long as it is in scope.
-    auto first = entry->TryLockUnique();
-    ASSERT_TRUE(first.owns_lock());
-
-    // Held -> an empty lock.
-    auto second = entry->TryLockUnique();
-    EXPECT_FALSE(second.owns_lock());
-
-    first.unlock();
-    auto third = entry->TryLockUnique();
-    EXPECT_TRUE(third.owns_lock());
+    // A shared reader sees the write, and its callback's value comes back.
+    const bool processing = entry->WithSharedAccess(
+        [](const ObjectMetadata&, const ObjectEntry::State& state) {
+            return state.is_processing;
+        });
+    EXPECT_TRUE(processing);
 }
 
 }  // namespace

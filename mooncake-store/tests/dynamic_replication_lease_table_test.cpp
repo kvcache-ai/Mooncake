@@ -28,8 +28,13 @@ int64_t EpochMillis(std::chrono::system_clock::time_point tp) {
 
 TEST(DynamicReplicationLeaseTableTest, IsKeyedByProposalId) {
     DynamicReplicationLeaseTable table;
+    EXPECT_TRUE(table.Empty());
+
+    // An in-flight proposal keeps the table non-empty, which is why the tenant
+    // aggregate has to consult it alongside the object route.
     const UUID proposal{1, 2};
     table.Put(proposal, MakeLease(proposal, "k1", 0));
+    EXPECT_FALSE(table.Empty());
 
     auto found = table.Find(proposal);
     ASSERT_TRUE(found.has_value());
@@ -43,6 +48,7 @@ TEST(DynamicReplicationLeaseTableTest, IsKeyedByProposalId) {
     EXPECT_TRUE(table.Remove(proposal));
     EXPECT_FALSE(table.Remove(proposal));
     EXPECT_FALSE(table.Find(proposal).has_value());
+    EXPECT_TRUE(table.Empty());
 }
 
 TEST(DynamicReplicationLeaseTableTest, ErasingForAnObjectLeavesOtherKeysAlone) {
@@ -70,23 +76,6 @@ TEST(DynamicReplicationLeaseTableTest, ErasingExpiredKeepsTheLiveOnes) {
 
     EXPECT_FALSE(table.Find(expired).has_value());
     EXPECT_TRUE(table.Find(live).has_value());
-}
-
-TEST(DynamicReplicationLeaseTableTest, EmptyTracksTheTable) {
-    DynamicReplicationLeaseTable table;
-    EXPECT_TRUE(table.Empty());
-
-    // A proposal that can still land keeps the table non-empty, which is why
-    // the tenant aggregate has to consult it alongside the object route.
-    const UUID proposal{1, 2};
-    table.Put(
-        proposal,
-        MakeLease(proposal, "k1",
-                  EpochMillis(std::chrono::system_clock::now()) + 60'000));
-    EXPECT_FALSE(table.Empty());
-
-    ASSERT_TRUE(table.Remove(proposal));
-    EXPECT_TRUE(table.Empty());
 }
 
 }  // namespace

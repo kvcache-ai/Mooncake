@@ -1,4 +1,4 @@
-#include "tenant/group_index.h"
+#include "group_index.h"
 
 #include <chrono>
 #include <string>
@@ -6,7 +6,6 @@
 #include <gtest/gtest.h>
 
 namespace mooncake {
-namespace metadata {
 namespace {
 
 TEST(GroupIndexTest, AddMemberCreatesAndSharesOneLeasePerGroup) {
@@ -52,8 +51,8 @@ TEST(GroupIndexTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
     EXPECT_TRUE(index.RemoveMember("g1", "k1"));
     EXPECT_TRUE(index.Members("g1").empty());
 
-    // A retained-but-empty group also answers Members() with nothing, so
-    // re-add and check the Lease is new.
+    // The dropped group is not revived: the re-add materializes a fresh group
+    // with a new Lease.
     auto after = index.AddMember("g1", "k1");
     ASSERT_NE(after, nullptr);
     EXPECT_NE(before.get(), after.get());
@@ -82,5 +81,4 @@ TEST(GroupIndexTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
 }
 
 }  // namespace
-}  // namespace metadata
 }  // namespace mooncake
