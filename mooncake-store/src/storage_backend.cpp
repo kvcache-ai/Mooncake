@@ -24,7 +24,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
-#include "nvme_kv_backend.h"
+#include "nvme_kv/backend.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "crc32c.h"
@@ -1588,6 +1588,10 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
+    // Keys/metadatas actually committed below (duplicates skipped). The
+    // complete handler and the rollback path must only see these.
+    std::vector<std::string> committed_keys;
+    std::vector<StorageObjectMetadata> committed_metadatas;
 
     // Commit to metadata maps under exclusive lock FIRST.
     // This ensures any concurrent BatchLoad arriving after Master redirects
@@ -1599,44 +1603,63 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
         ReleasePreparedWriteLocked(pending);
 
-        // Pre-check for duplicates before modifying any state
-        bool duplicate_found = false;
-        for (const auto& key : bucket_keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                duplicate_found = true;
-                break;
+        // Duplicate safety net under mutex_: skip keys that PrepareEviction
+        // flagged as already persisted or in flight, plus anything that got
+        // committed since (defense in depth). GroupOffloadingKeysByBucket
+        // filters persisted keys under offloading_mutex_, but a key can
+        // still be committed by a concurrent BatchOffload between that
+        // check and this one. Re-offloading an already persisted key is an
+        // idempotent no-op (same as Put), not an error.
+        const std::unordered_set<std::string> skipped_keys(
+            pending.skipped_keys.begin(), pending.skipped_keys.end());
+        std::vector<size_t> committed_indices;
+        for (size_t i = 0; i < bucket_keys.size(); ++i) {
+            if (skipped_keys.find(bucket_keys[i]) != skipped_keys.end() &&
+                object_bucket_map_.find(bucket_keys[i]) !=
+                    object_bucket_map_.end()) {
+                continue;  // Still persisted elsewhere: idempotent skip.
+            }
+            if (object_bucket_map_.find(bucket_keys[i]) ==
+                object_bucket_map_.end()) {
+                committed_indices.push_back(i);
+            } else {
+                VLOG(1) << "Key already committed by a concurrent offload, "
+                           "skipping: "
+                        << bucket_keys[i];
             }
         }
 
-        if (!duplicate_found) {
-            total_size_ += bucket->data_size + bucket->meta_size;
-            object_bucket_map_.reserve(object_bucket_map_.size() +
-                                       bucket_keys.size());
-            for (size_t i = 0; i < bucket_keys.size(); ++i) {
-                auto [it, inserted] =
-                    object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
-                CHECK(inserted)
-                    << "Reserved key became duplicated: " << bucket_keys[i];
-            }
-            auto ts = 0LL;
-            // Update LRU timestamp for in case of eviction.
-            if (bucket_backend_config_.eviction_policy ==
-                BucketEvictionPolicy::LRU) {
-                ts =
-                    std::chrono::steady_clock::now().time_since_epoch().count();
-                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
-            }
-            buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(ts, bucket_id);
-        }
-        if (duplicate_found) {
-            LOG(ERROR) << "Reserved key became duplicated before commit, "
-                          "bucket_id="
-                       << bucket_id;
+        if (committed_indices.empty()) {
+            // Every key was already persisted: nothing new to commit or
+            // notify, the written bucket file is redundant.
             lock.unlock();
             CleanupOrphanedBucket(bucket_id);
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            return bucket_id;
         }
+
+        int64_t committed_data_size = bucket->meta_size;
+        object_bucket_map_.reserve(object_bucket_map_.size() +
+                                   committed_indices.size());
+        for (size_t i : committed_indices) {
+            auto [it, inserted] =
+                object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
+            CHECK(inserted)
+                << "Reserved key became duplicated: " << bucket_keys[i];
+            committed_data_size +=
+                metadatas[i].data_size + metadatas[i].key_size;
+            committed_keys.push_back(bucket_keys[i]);
+            committed_metadatas.push_back(metadatas[i]);
+        }
+        total_size_ += committed_data_size;
+        auto ts = 0LL;
+        // Update LRU timestamp for in case of eviction.
+        if (bucket_backend_config_.eviction_policy ==
+            BucketEvictionPolicy::LRU) {
+            ts = std::chrono::steady_clock::now().time_since_epoch().count();
+            bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+        }
+        buckets_.emplace(bucket_id, std::move(bucket));
+        lru_index_.emplace(ts, bucket_id);
     }
     // Lock released. From this point forward, concurrent BatchLoad
     // can find the keys and read from the committed bucket files.
@@ -1646,17 +1669,17 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     // complete_handler before the RPC); int64_t fields carry the metadata
     // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket_keys, metadatas);
+        auto error_code = complete_handler(committed_keys, committed_metadatas);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket_keys.size()
+                       << ", Key count: " << committed_keys.size()
                        << ", Bucket id: " << bucket_id;
             // Master was NOT notified. The local index has entries that
             // Master doesn't know about — a "client can read but Master
             // doesn't know" ghost replica. Rollback the local commit
             // (removes index entries + waits for inflight reads + deletes
             // on-disk files).
-            RollbackCommittedBucket(bucket_id, bucket_keys);
+            RollbackCommittedBucket(bucket_id, committed_keys);
             return tl::make_unexpected(error_code);
         }
     }
@@ -2747,16 +2770,27 @@ BucketStorageBackend::PrepareEviction(
     if (!write_keys.empty()) {
         for (const auto& key : write_keys) {
             if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
-                pending_eviction_keys_.find(key) !=
-                    pending_eviction_keys_.end() ||
                 pending_write_keys_.find(key) != pending_write_keys_.end()) {
+                // Already persisted, or being persisted by a concurrent
+                // offload: re-offloading is an idempotent no-op (Put
+                // semantics), skip it instead of failing the whole batch.
+                result.skipped_keys.push_back(key);
+                continue;
+            }
+            if (pending_eviction_keys_.find(key) !=
+                pending_eviction_keys_.end()) {
+                // About to be evicted: the old copy is on its way out, so a
+                // skip could lose the only replica. Fail loudly here.
                 return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
+            result.write_keys.push_back(key);
         }
-        result.write_keys = write_keys;
-        result.write_size = required_size;
-        pending_write_size_ += required_size;
-        pending_write_keys_.insert(write_keys.begin(), write_keys.end());
+        if (!result.write_keys.empty()) {
+            result.write_size = required_size;
+            pending_write_size_ += required_size;
+            pending_write_keys_.insert(result.write_keys.begin(),
+                                       result.write_keys.end());
+        }
     }
 
     if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
@@ -2784,7 +2818,7 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!write_keys.empty() && required_size > 0)
+            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
                                   ? static_cast<uint64_t>(required_size)
                                   : 0;
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
@@ -2867,7 +2901,10 @@ BucketStorageBackend::PrepareEviction(
         buckets_.erase(evict_it);
 
         int64_t evicted_size = evict_meta->meta_size;
-        // Remove all keys belonging to this bucket from the object map.
+        // Remove all keys belonging to this bucket from the object map, and
+        // report ONLY those to the master: a key skipped as a duplicate at
+        // commit time keeps pointing at its authoritative bucket, so
+        // reporting it here would make the master drop a live replica.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
@@ -2877,16 +2914,13 @@ BucketStorageBackend::PrepareEviction(
                 total_size_ -= object_size;
                 evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
+                pending_eviction_keys_.insert(key);
+                result.keys.push_back(key);
             }
         }
         total_size_ -= evict_meta->meta_size;
         result.evicted_size += evicted_size;
 
-        // Collect for notification and file deletion.
-        for (const auto& key : evict_meta->keys) {
-            pending_eviction_keys_.insert(key);
-            result.keys.push_back(key);
-        }
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
@@ -2903,7 +2937,7 @@ BucketStorageBackend::PrepareEviction(
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
+    if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -2931,6 +2965,8 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
     for (const auto& key : pending.keys) {
         pending_eviction_keys_.erase(key);
     }
+    const std::unordered_set<std::string> restore_keys(pending.keys.begin(),
+                                                       pending.keys.end());
     for (auto& [bucket_id, bucket_meta] : pending.buckets) {
         if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
             continue;
@@ -2938,6 +2974,11 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
 
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
+            if (restore_keys.find(key) == restore_keys.end()) {
+                // matched-only mirror of the prepare phase: skipped duplicates
+                // stay pointed at their authoritative bucket, never re-pointed
+                continue;
+            }
             const auto& object_meta = bucket_meta->metadatas[i];
             object_bucket_map_[key] = StorageObjectMetadata{
                 bucket_id, object_meta.offset, object_meta.key_size,

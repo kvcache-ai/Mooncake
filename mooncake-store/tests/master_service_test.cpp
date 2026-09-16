@@ -1,4 +1,5 @@
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "rpc_service.h"
 
 #include <glog/logging.h>
@@ -303,16 +304,18 @@ TEST_F(MasterServiceTest, SoftPinDeadlineCalculationSaturatesAtMaximum) {
     using Clock = std::chrono::system_clock;
 
     const auto normal_now = Clock::time_point(std::chrono::seconds(10));
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now, 25),
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now,
+                                            std::chrono::milliseconds(25)),
               normal_now + std::chrono::milliseconds(25));
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(
-                  normal_now, std::numeric_limits<uint64_t>::max()),
+    EXPECT_EQ(ComputeSoftPinDeadlineForTest(normal_now,
+                                            std::chrono::milliseconds::max()),
               Clock::time_point::max());
 
     const auto near_max =
         Clock::time_point::max() - std::chrono::milliseconds(5);
-    EXPECT_EQ(ComputeSoftPinDeadlineForTest(near_max, 10),
-              Clock::time_point::max());
+    EXPECT_EQ(
+        ComputeSoftPinDeadlineForTest(near_max, std::chrono::milliseconds(10)),
+        Clock::time_point::max());
 }
 
 #ifdef USE_NOF
@@ -738,7 +741,7 @@ TEST_F(MasterServiceTest, RemoveAllKeepsObjectWhenOpLogReservationFails) {
 // key belongs to, commit there, and the clear must be withheld.
 TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
     MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
@@ -754,41 +757,44 @@ TEST_F(MasterServiceTest, ConcurrentCommitDuringScanSuppressesClear) {
 
     const size_t racer_shard = ShardIndexForKey(service, "racer_key");
     bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        // Commit exactly once, immediately after the scan releases the shard
-        // the new key hashes to, so the scan can never observe it.
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "racer_key",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "racer_key",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+        [&](size_t shard) {
+            // Commit exactly once, immediately after the scan releases the
+            // shard the new key hashes to, so the scan can never observe it.
+            if (shard != racer_shard || committed) {
+                return;
+            }
+            committed = true;
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, "racer_key",
+                                      TenantId::Default(), 1024, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, "racer_key",
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        });
 
     service.RemoveAll(true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
     auto exists = service.ExistKey("racer_key", TenantId::Default());
     ASSERT_TRUE(exists.has_value());
     EXPECT_TRUE(exists.value()) << "the raced commit must still be live";
 
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting())
+    EXPECT_EQ(0u,
+              MasterServiceTestPeer(service).GetKvClearedPublishedForTesting())
         << "a clear here would retract racer_key, which was just announced";
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+    EXPECT_EQ(
+        1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
 }
 
 // The mirror image: with no concurrent commit the epoch is unchanged, so the
 // clear must still go out. Without this the fix could pass by never publishing.
 TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
     MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
@@ -804,8 +810,10 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
 
     service.RemoveAll(true);
 
-    EXPECT_EQ(1u, service.GetKvClearedPublishedForTesting());
-    EXPECT_EQ(0u, service.GetKvClearedSuppressedForTesting());
+    EXPECT_EQ(1u,
+              MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
+    EXPECT_EQ(
+        0u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
 }
 
 // The tenant-scoped overload reads the epoch before its scan instead of at
@@ -813,7 +821,7 @@ TEST_F(MasterServiceTest, UncontendedScanStillPublishesClear) {
 // rule.
 TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
     MasterService service;
-    service.SetKvTenantEpochTrackingForTesting(true);
+    MasterServiceTestPeer(service).SetKvTenantEpochTrackingForTesting(true);
     const auto context = PrepareSimpleSegment(service);
     ReplicateConfig config;
     config.replica_num = 1;
@@ -829,27 +837,30 @@ TEST_F(MasterServiceTest, TenantScopedRemoveAllSuppressesClearOnRace) {
 
     const size_t racer_shard = ShardIndexForKey(service, "scoped_racer");
     bool committed = false;
-    service.SetRemoveAllShardHookForTesting([&](size_t shard) {
-        if (shard != racer_shard || committed) {
-            return;
-        }
-        committed = true;
-        ASSERT_TRUE(service
-                        .PutStart(context.client_id, "scoped_racer",
-                                  TenantId::Default(), 1024, config)
-                        .has_value());
-        ASSERT_TRUE(service
-                        .PutEnd(context.client_id, "scoped_racer",
-                                TenantId::Default(), ReplicaType::ALL)
-                        .has_value());
-    });
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(
+        [&](size_t shard) {
+            if (shard != racer_shard || committed) {
+                return;
+            }
+            committed = true;
+            ASSERT_TRUE(service
+                            .PutStart(context.client_id, "scoped_racer",
+                                      TenantId::Default(), 1024, config)
+                            .has_value());
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, "scoped_racer",
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        });
 
     service.RemoveAll(TenantId::Default(), true);
-    service.SetRemoveAllShardHookForTesting(nullptr);
+    MasterServiceTestPeer(service).SetRemoveAllShardHookForTesting(nullptr);
 
     ASSERT_TRUE(committed) << "the hook never fired, so nothing was raced";
-    EXPECT_EQ(0u, service.GetKvClearedPublishedForTesting());
-    EXPECT_EQ(1u, service.GetKvClearedSuppressedForTesting());
+    EXPECT_EQ(0u,
+              MasterServiceTestPeer(service).GetKvClearedPublishedForTesting());
+    EXPECT_EQ(
+        1u, MasterServiceTestPeer(service).GetKvClearedSuppressedForTesting());
 }
 
 TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
@@ -1736,7 +1747,7 @@ TEST_F(MasterServiceTest, BatchEvictShrinksSparseMetadataMaps) {
     const size_t buckets_before = MetadataBucketCount(*service_, target_shard);
     ASSERT_GT(buckets_before, kShrinkMinBucketCount);
 
-    service_->RunBatchEvictForTesting(1.0, 1.0);
+    MasterServiceTestPeer(*service_).RunBatchEvictForTesting(1.0, 1.0);
 
     const size_t buckets_after = MetadataBucketCount(*service_, target_shard);
     ASSERT_GT(buckets_after, 0u);

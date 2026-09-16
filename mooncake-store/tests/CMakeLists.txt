@@ -6,6 +6,7 @@ function(add_store_test name)
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
+           master_service_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
@@ -23,6 +24,7 @@ function(add_ha_test name)
   target_link_libraries(
     ${name}
     PUBLIC mooncake_store
+           master_service_test_peer
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
@@ -267,11 +269,11 @@ add_ha_test(batch_oplog_snapshot_rebootstrap_test
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
-add_store_test(nvme_kv_connector_config_test nvme_kv_connector_config_test.cpp)
+add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
 add_store_test(redis_connection_config_test redis_connection_config_test.cpp)
 add_store_test(nvme_kv_io_concurrency_config_test
-               nvme_kv_io_concurrency_config_test.cpp)
-add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
+               nvme_kv/io_concurrency_config_test.cpp)
+add_store_test(nvme_kv_storage_backend_test nvme_kv/storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(bucket_backend_config_test bucket_backend_config_test.cpp)
 add_store_test(file_per_key_config_test file_per_key_config_test.cpp)
@@ -300,6 +302,7 @@ set_tests_properties(dummy_client_object_checksum_test
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 if(MOONCAKE_OSS_ADAPTER_ENABLED)
+  add_store_test(oss_adapter_config_test oss_adapter_config_test.cpp)
   add_store_test(oss_adapter_test oss_adapter_test.cpp)
 endif()
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)

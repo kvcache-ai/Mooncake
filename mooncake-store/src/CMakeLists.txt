@@ -93,17 +93,17 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
-    nvme_kv_backend.cpp
-    nvme_kv_connector.cpp
-    config/nvme_kv_connector_config.cpp
-    config/nvme_kv_io_concurrency_config.cpp
-    config/nvme_kv_u32_parser.cpp
-    nvme_kv_executor_io_uring.cpp
-    nvme_kv_executor_ioctl.cpp
-    nvme_kv_executor_util.cpp
-    nvme_kv_key_codec.cpp
-    nvme_kv_key_conflict_policy.cpp
-    nvme_kv_object_layout.cpp
+    nvme_kv/backend.cpp
+    nvme_kv/connector.cpp
+    nvme_kv/config/connector_config.cpp
+    nvme_kv/config/io_concurrency_config.cpp
+    nvme_kv/config/u32_parser.cpp
+    nvme_kv/executor_io_uring.cpp
+    nvme_kv/executor_ioctl.cpp
+    nvme_kv/executor_util.cpp
+    nvme_kv/key_codec.cpp
+    nvme_kv/key_conflict_policy.cpp
+    nvme_kv/object_layout.cpp
     transfer_task.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -144,7 +144,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     engram/engram_store.cpp)
 
 if(BUILD_UNIT_TESTS)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_stub.cpp)
 endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -195,7 +195,8 @@ if(CURL_FOUND AND OpenSSL_FOUND)
   set(MOONCAKE_OSS_ADAPTER_ENABLED
       TRUE
       CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES storage/distributed/oss_adapter.cpp)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+       storage/distributed/oss_adapter.cpp)
   list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
   add_definitions(-DHAVE_OSS_ADAPTER)
 else()
@@ -302,6 +303,10 @@ if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${SPDK_WRAPPER_SOURCES})
 
+  # The master's NoF heartbeat probe also goes through SpdkWrapper.
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES ${SPDK_WRAPPER_SOURCES}
+       config/spdk_controller_config.cpp)
+
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
       CACHE PATH "SPDK include directory")
@@ -314,6 +319,16 @@ if(USE_NOF)
   set(DPDK_LIB_DIR
       "/usr/local/lib"
       CACHE PATH "DPDK static library directory")
+
+  set(SPDK_ISA_L_LIB_DIR
+      "${CMAKE_SOURCE_DIR}/extern/spdk/isa-l/.libs"
+      CACHE PATH "isa-l static library directory")
+  if(NOT EXISTS "${SPDK_ISA_L_LIB_DIR}/libisal.a")
+    message(
+      FATAL_ERROR
+        "isa-l not found at ${SPDK_ISA_L_LIB_DIR}/libisal.a. Run "
+        "`sudo bash dependencies.sh --with-spdk`, or set -DSPDK_ISA_L_LIB_DIR.")
+  endif()
 
   set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
@@ -367,6 +382,7 @@ if(USE_NOF)
       crypto
       aio
       z
+      -L${SPDK_ISA_L_LIB_DIR}
       isal
       elf
       ibverbs
@@ -534,9 +550,14 @@ add_library(
                                $<TARGET_OBJECTS:mooncake_store_master_objects>)
 target_include_directories(mooncake_store_master
                            PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
+if(USE_NOF)
+  target_include_directories(mooncake_store_master_objects
+                             PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+endif()
 target_link_libraries(
   mooncake_store_master
-  PRIVATE mooncake_local_ssd
+  PRIVATE ${SPDK_STATIC_LIBS}
+          mooncake_local_ssd
           cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
           glog::glog
