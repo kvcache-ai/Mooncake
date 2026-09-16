@@ -331,6 +331,91 @@ TEST_F(RealClientTest, SessionRangesReadDfsAndPropagateShortRead) {
 }
 
 #ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, SessionRangesReadDfsIntoGpuUsesPinnedArena) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "distributed_storage_backend");
+    ScopedEnvVar local_buffer("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES",
+                              "16777216");
+    ScopedEnvVar dfs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar dfs_shards("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar dfs_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "16777216");
+    ScopedEnvVar dfs_alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar dfs_eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar dfs_deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar dfs_single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    char path[] = "/tmp/mooncake_session_dfs_gpu_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+    ScopedEnvVar dfs_root("MOONCAKE_DFS_ROOT_DIR", ssd_path_.c_str());
+
+    ASSERT_TRUE(master_.Start(
+        InProcMasterConfigBuilder().set_default_kv_lease_ttl(1000).build()));
+    master_address_ = master_.master_address();
+    constexpr char kClientAddress[] = "localhost:17825";
+    ASSERT_EQ(
+        py_client_->setup_real(kClientAddress, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, "tcp", "", master_address_,
+                               nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 4096;
+    constexpr size_t kSourceOffset = 257;
+    constexpr size_t kRangeSize = 1024;
+    const std::string key = "session_dfs_gpu";
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.dfs_replica_num = 1;
+    ASSERT_EQ(py_client_->put(key, source, config), 0);
+    ASSERT_EQ(py_client_->batch_replica_clear({key}, kClientAddress).size(), 1);
+    const auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_dfs_replica());
+    ASSERT_EQ(py_client_->batch_get_session_start({key}), std::vector<int>{0});
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    // Remove the fallback allocator so success proves that device-targeted DFS
+    // staging came from the pinned restore arena.
+    auto fallback_allocator = std::move(py_client_->client_buffer_allocator_);
+    auto results = py_client_->batch_get_into_multi_buffer_ranges(
+        {key}, {{gpu_destination}}, {{kRangeSize}}, {{kSourceOffset}});
+    py_client_->client_buffer_allocator_ = std::move(fallback_allocator);
+
+    ASSERT_EQ(results, std::vector<int>{static_cast<int>(kRangeSize)});
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+    EXPECT_EQ(py_client_->batch_get_session_end({key}), 0);
+}
+
 TEST_F(RealClientTest, RangedSnapshotGpuReadBypassesNewerHotCacheValue) {
     int device_count = 0;
     if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {

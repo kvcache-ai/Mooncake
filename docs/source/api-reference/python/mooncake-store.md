@@ -2898,6 +2898,9 @@ Typical flow:
 Get sessions cache a filtered `QueryResult` (one complete MEMORY or DFS replica
 plus its lease). The MEMORY path remains zero-copy. DFS replicas are read into
 request-scoped host staging and then scattered to host or device destinations.
+If a key has no complete MEMORY or DFS replica, for example because it has only
+LOCAL_DISK, DISK, or NOF replicas, `batch_get_session_start` returns
+`INVALID_REPLICA` for that key and does not open a session.
 For device destinations, DFS staging first uses the fixed-capacity pinned restore
 arena configured by `MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES`; if that arena is
 unavailable or exhausted, it falls back to the regular client buffer allocator.
