@@ -1771,6 +1771,16 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
             &wrapped_master_service);
+    // Read-only replica queries, exposed over RPC so clients can fetch replica
+    // metadata without taking a lease, triggering promotion-on-hit, or
+    // updating valid_get metrics. Purely additive: existing callers and older
+    // peers are unaffected.
+    server.register_handler<
+        &mooncake::WrappedMasterService::GetReplicaListForAdmin>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchGetReplicaListForAdmin>(
+        &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutStart>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::PutEnd>(

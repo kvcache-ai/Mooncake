@@ -208,6 +208,29 @@ class MasterClient {
                         const std::string& tenant_id);
 
     /**
+     * @brief Read-only variants of GetReplicaList / BatchGetReplicaList.
+     *
+     * Backed by the admin read-only RPCs: the master grants no lease, does
+     * not trigger promotion-on-hit, and does not update valid_get metrics.
+     * Note the response still carries the master's default lease_ttl_ms
+     * value; callers that need lease semantics must force it to 0 (see
+     * Client::QueryReadOnly).
+     *
+     * Intended for best-effort background paths (e.g. SSD prefetch metadata
+     * classification) that must not perturb hot-path state.
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaListReadOnly(const std::string& object_key,
+                           const std::string& tenant_id);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaListReadOnly(const std::vector<std::string>& object_keys,
+                                const std::string& tenant_id);
+
+    /**
      * @brief Starts a put operation
      * @param key Object key
      * @param slice_lengths Vector of slice lengths

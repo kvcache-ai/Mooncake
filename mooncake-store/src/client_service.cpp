@@ -1185,6 +1185,20 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
         result.value().object_checksum);
 }
 
+tl::expected<QueryResult, ErrorCode> Client::QueryReadOnly(
+    const std::string& object_key) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto result = master_client_.GetReplicaListReadOnly(object_key);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    // The admin read-only path grants no lease: pin the expiry to now so the
+    // caller cannot mistake this metadata for a lease-protected one.
+    return QueryResult(std::move(result.value().replicas), start_time,
+                       result.value().object_checksum);
+}
+
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     const std::vector<std::string>& object_keys) {
     return BatchQuery(object_keys, master_client_.tenant_id());
@@ -1216,6 +1230,45 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
+                response[i].value().object_checksum));
+        } else {
+            results.emplace_back(tl::unexpected(response[i].error()));
+        }
+    }
+    return results;
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryReadOnly(
+    const std::vector<std::string>& object_keys) {
+    return BatchQueryReadOnly(object_keys, master_client_.tenant_id());
+}
+
+std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQueryReadOnly(
+    const std::vector<std::string>& object_keys, const std::string& tenant_id) {
+    std::chrono::steady_clock::time_point start_time =
+        std::chrono::steady_clock::now();
+    auto response =
+        master_client_.BatchGetReplicaListReadOnly(object_keys, tenant_id);
+
+    // Check if we got the expected number of responses
+    if (response.size() != object_keys.size()) {
+        LOG(ERROR) << "BatchQueryReadOnly response size mismatch. Expected: "
+                   << object_keys.size() << ", Got: " << response.size();
+        // Return vector of RPC_FAIL errors
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
+        results.reserve(object_keys.size());
+        for (size_t i = 0; i < object_keys.size(); ++i) {
+            results.emplace_back(tl::unexpected(ErrorCode::RPC_FAIL));
+        }
+        return results;
+    }
+    std::vector<tl::expected<QueryResult, ErrorCode>> results;
+    results.reserve(response.size());
+    for (size_t i = 0; i < response.size(); ++i) {
+        if (response[i]) {
+            // No lease granted on the read-only path: expiry pinned to now.
+            results.emplace_back(QueryResult(
+                std::move(response[i].value().replicas), start_time,
                 response[i].value().object_checksum));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
