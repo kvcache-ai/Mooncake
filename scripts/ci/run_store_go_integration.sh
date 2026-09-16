@@ -19,17 +19,30 @@ case "${MOONCAKE_STORE_GO_SANITIZED:-0}" in
         ;;
 esac
 
+# The Go test client publishes rpc_meta over HTTP to the master's embedded
+# metadata server (see integration_test.go's run instructions). Older runs
+# got 8080 served by an unrelated shared master that no longer exists in this
+# job, so this master must serve metadata itself.
 ci_start_service master "$RUNNER_TEMP/mooncake-master.log" \
     "$GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master" \
     --eviction_high_watermark_ratio=0.95 \
     --cluster_id="$MOONCAKE_STORE_CLUSTER_ID" \
-    --port 50051
+    --port 50051 \
+    --enable_http_metadata_server=true
 ci_wait_service master 50051
 
 cd "$GITHUB_WORKSPACE/mooncake-store/go"
 export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
 export CGO_ENABLED=1
 export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
+
+# master_service.cpp (inside libmooncake_store.a) calls into LocalSsdManager,
+# which lives in its own static archive under local_ssd/. Link it inside the
+# group so cyclic references resolve.
+local_ssd_lib=()
+if [ -f "$GITHUB_WORKSPACE/build/mooncake-store/src/local_ssd/libmooncake_local_ssd.a" ]; then
+    local_ssd_lib=("-L$GITHUB_WORKSPACE/build/mooncake-store/src/local_ssd" -lmooncake_local_ssd)
+fi
 
 linker_flags=(
     "-L$GITHUB_WORKSPACE/build/mooncake-store/src"
@@ -40,7 +53,7 @@ linker_flags=(
     "-L$GITHUB_WORKSPACE/build/mooncake-common/src"
     "-L$GITHUB_WORKSPACE/build/mooncake-common/etcd"
     -Wl,--start-group
-    -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase
+    -lmooncake_store "${local_ssd_lib[@]}" -lcachelib_memory_allocator -ltransfer_engine -lbase
     -lmooncake_common
     -Wl,--end-group
 )
@@ -57,6 +70,13 @@ if $sanitized; then
 fi
 linker_flags+=(-lxxhash -lyaml-cpp)
 export CGO_LDFLAGS="${linker_flags[*]}"
+
+# OSS adapter request signing uses OpenSSL HMAC (EVP_sha256). Static archives
+# carry no transitive deps, so the Go link needs libcrypto explicitly when the
+# adapter was compiled in (CURL + OpenSSL found at CMake time).
+if grep -q '^MOONCAKE_OSS_ADAPTER_ENABLED:INTERNAL=TRUE$' "$GITHUB_WORKSPACE/build/CMakeCache.txt"; then
+    export CGO_LDFLAGS="$CGO_LDFLAGS -lcrypto"
+fi
 
 # Link cudart if CUDA is available (needed for D2H staging in mooncake_store).
 if [ -d /usr/local/cuda/lib64 ]; then
