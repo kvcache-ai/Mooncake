@@ -1,0 +1,8 @@
+{
+  "w02_commit": "e92af584fa106668c3e311b66e1592bd8922b42b",
+  "w02_writer_sha256": "e3b79764e9e6ef52da6c108e3c79b18354102a4e27285f4d289da373c20f2219",
+  "build_type": "Release",
+  "compiler": "AppleClang 21.0.0.21000101",
+  "architecture": "arm64",
+  "nlohmann_header_sha256": "0d55a51a8ad7a9e3ff129639c29d23eea480242aa1d855d4f4d47e629555dbd2"
+}
