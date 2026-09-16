@@ -10,10 +10,12 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#include <cstdio>
 #include <cstdint>
 #include <ctime>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <mutex>
 #include <string_view>
 #include <utility>
@@ -152,10 +154,29 @@ std::string CanonicalQuery(const std::map<std::string, std::string>& query) {
     return result;
 }
 
-size_t BodyCallback(char* data, size_t size, size_t count, void* user_data) {
-    auto* body = static_cast<std::string*>(user_data);
-    body->append(data, size * count);
-    return size * count;
+struct DownloadContext {
+    std::string* body = nullptr;
+    char* buffer = nullptr;
+    size_t capacity = 0;
+    size_t transferred = 0;
+    bool overflow = false;
+};
+
+size_t DownloadCallback(char* data, size_t size, size_t count,
+                        void* user_data) {
+    auto* context = static_cast<DownloadContext*>(user_data);
+    const size_t bytes = size * count;
+    if (context->buffer) {
+        if (bytes > context->capacity - context->transferred) {
+            context->overflow = true;
+            return 0;
+        }
+        std::memcpy(context->buffer + context->transferred, data, bytes);
+    } else {
+        context->body->append(data, bytes);
+    }
+    context->transferred += bytes;
+    return bytes;
 }
 
 size_t HeaderCallback(char* data, size_t size, size_t count, void* user_data) {
@@ -175,6 +196,20 @@ size_t HeaderCallback(char* data, size_t size, size_t count, void* user_data) {
         (*headers)[std::move(name)] = std::move(value);
     }
     return length;
+}
+
+tl::expected<size_t, ErrorCode> GetIovecSize(const iovec* iov, int iovcnt) {
+    if (iovcnt < 0 || (!iov && iovcnt > 0))
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i) {
+        if ((!iov[i].iov_base && iov[i].iov_len > 0) ||
+            iov[i].iov_len > std::numeric_limits<size_t>::max() - total) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        total += iov[i].iov_len;
+    }
+    return total;
 }
 
 struct IovecUploadContext {
@@ -209,9 +244,53 @@ size_t IovecUploadCallback(char* buffer, size_t size, size_t count,
     return copied;
 }
 
+int IovecSeekCallback(void* user_data, curl_off_t offset, int origin) {
+    if (origin != SEEK_SET || offset != 0) return CURL_SEEKFUNC_CANTSEEK;
+    auto* context = static_cast<IovecUploadContext*>(user_data);
+    context->index = 0;
+    context->offset = 0;
+    return CURL_SEEKFUNC_OK;
+}
+
 bool IsSuccess(long status) { return status >= 200 && status < 300; }
 
 }  // namespace
+
+struct OssObjectStorageAdapter::BatchRequest {
+    bool upload = false;
+    std::string logical_key;
+    const iovec* upload_iov = nullptr;
+    int upload_iovcnt = 0;
+    void* download_buffer = nullptr;
+    size_t size = 0;
+};
+
+struct OssObjectStorageAdapter::RequestContext {
+    RequestContext() = default;
+    RequestContext(const RequestContext&) = delete;
+    RequestContext& operator=(const RequestContext&) = delete;
+    RequestContext(RequestContext&&) = delete;
+    RequestContext& operator=(RequestContext&&) = delete;
+
+    ~RequestContext() {
+        if (curl) {
+            if (multi) curl_multi_remove_handle(multi, curl);
+            curl_easy_cleanup(curl);
+        }
+        curl_slist_free_all(headers);
+    }
+
+    size_t index = 0;
+    bool upload = false;
+    size_t expected_size = 0;
+    CURL* curl = nullptr;
+    // Set only after a successful add. The owning batch outlives this context.
+    CURLM* multi = nullptr;
+    curl_slist* headers = nullptr;
+    std::string error_body;
+    IovecUploadContext upload_context;
+    DownloadContext download_context;
+};
 
 OssObjectStorageAdapter::OssObjectStorageAdapter(std::string key_prefix)
     : key_prefix_(std::move(key_prefix)) {
@@ -241,10 +320,21 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::Init() {
 
     std::call_once(curl_init_once,
                    [] { curl_global_init(CURL_GLOBAL_DEFAULT); });
+    max_connections_ =
+        std::max<long>(1, Environ::GetInt("MOONCAKE_OSS_MAX_CONNECTIONS", 64));
+    receive_buffer_size_ = std::clamp<long>(
+        Environ::GetInt("MOONCAKE_OSS_RECEIVE_BUFFER_SIZE", 1024 * 1024),
+        16 * 1024, 10 * 1024 * 1024);
+    upload_buffer_size_ = std::clamp<long>(
+        Environ::GetInt("MOONCAKE_OSS_UPLOAD_BUFFER_SIZE", 1024 * 1024),
+        16 * 1024, 2 * 1024 * 1024);
     initialized_ = true;
     LOG(INFO) << "OSS adapter initialized: endpoint=" << endpoint_
               << ", bucket=" << bucket_ << ", region=" << region_
-              << ", key_prefix=" << key_prefix_;
+              << ", key_prefix=" << key_prefix_
+              << ", max_connections=" << max_connections_
+              << ", receive_buffer_size=" << receive_buffer_size_
+              << ", upload_buffer_size=" << upload_buffer_size_;
     return {};
 }
 
@@ -358,23 +448,25 @@ std::string OssObjectStorageAdapter::BuildAuthorization(
            ",Signature=" + Hex(signature.data(), signature.size());
 }
 
-tl::expected<OssObjectStorageAdapter::Response, ErrorCode>
-OssObjectStorageAdapter::Request(
-    const std::string& method, const std::string& physical_key,
+tl::expected<void, ErrorCode> OssObjectStorageAdapter::PrepareRequest(
+    RequestContext& context, const std::string& method,
+    const std::string& physical_key,
     const std::map<std::string, std::string>& query, const char* body,
     size_t body_size, const std::string& range, const iovec* upload_iov,
-    int upload_iovcnt) const {
-    if (!initialized_) {
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    CURL* curl = curl_easy_init();
+    int upload_iovcnt, void* download_buffer, size_t download_capacity) const {
+    CURL* curl = context.curl;
     if (!curl) return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
-    Response response;
-    IovecUploadContext upload_context;
-    curl_slist* headers = nullptr;
+    context.upload = method == "PUT";
+    context.download_context = {&context.error_body,
+                                static_cast<char*>(download_buffer),
+                                download_capacity};
+    bool headers_ok = true;
     auto add_header = [&](const std::string& header) {
-        headers = curl_slist_append(headers, header.c_str());
+        auto* appended = curl_slist_append(context.headers, header.c_str());
+        if (appended)
+            context.headers = appended;
+        else
+            headers_ok = false;
     };
 
     const std::string timestamp = OssTimestamp().first;
@@ -395,39 +487,69 @@ OssObjectStorageAdapter::Request(
     add_header("Expect:");
     add_header("Content-Type:");
     if (!range.empty()) add_header("Range: " + range);
+    if (!headers_ok)
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
 
     const std::string url = BuildUrl(physical_key, query);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method.c_str());
-    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, BodyCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response.body);
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response.headers);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, context.headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, DownloadCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &context.download_context);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 5000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 120000L);
     if (method == "HEAD") curl_easy_setopt(curl, CURLOPT_NOBODY, 1L);
     if (method == "PUT") {
         if (upload_iov) {
-            upload_context = {upload_iov, upload_iovcnt};
+            context.upload_context = {upload_iov, upload_iovcnt};
             curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
             curl_easy_setopt(curl, CURLOPT_READFUNCTION, IovecUploadCallback);
-            curl_easy_setopt(curl, CURLOPT_READDATA, &upload_context);
+            curl_easy_setopt(curl, CURLOPT_READDATA, &context.upload_context);
+            curl_easy_setopt(curl, CURLOPT_SEEKFUNCTION, IovecSeekCallback);
+            curl_easy_setopt(curl, CURLOPT_SEEKDATA, &context.upload_context);
             curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE,
                              static_cast<curl_off_t>(body_size));
+            curl_easy_setopt(curl, CURLOPT_UPLOAD_BUFFERSIZE,
+                             upload_buffer_size_);
         } else {
             curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
             curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE,
                              static_cast<curl_off_t>(body_size));
         }
     }
+    return {};
+}
 
-    const CURLcode result = curl_easy_perform(curl);
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &response.status);
-    curl_slist_free_all(headers);
-    curl_easy_cleanup(curl);
-    if (result != CURLE_OK) {
+tl::expected<OssObjectStorageAdapter::Response, ErrorCode>
+OssObjectStorageAdapter::Request(
+    const std::string& method, const std::string& physical_key,
+    const std::map<std::string, std::string>& query, const char* body,
+    size_t body_size, const std::string& range, const iovec* upload_iov,
+    int upload_iovcnt, void* download_buffer, size_t download_capacity) const {
+    if (!initialized_) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    RequestContext context;
+    context.curl = curl_easy_init();
+    auto prepared = PrepareRequest(context, method, physical_key, query, body,
+                                   body_size, range, upload_iov, upload_iovcnt,
+                                   download_buffer, download_capacity);
+    if (!prepared) return tl::make_unexpected(prepared.error());
+    Response response;
+    curl_easy_setopt(context.curl, CURLOPT_HEADERFUNCTION, HeaderCallback);
+    curl_easy_setopt(context.curl, CURLOPT_HEADERDATA, &response.headers);
+
+    const CURLcode result = curl_easy_perform(context.curl);
+    curl_easy_getinfo(context.curl, CURLINFO_RESPONSE_CODE, &response.status);
+    response.transferred = context.download_context.transferred;
+    response.body = std::move(context.error_body);
+    // A 404 error body may exceed the caller's object buffer. Preserve the
+    // HTTP error only for this local abort, not for other transfer failures.
+    const bool missing_object = method == "GET" && response.status == 404 &&
+                                result == CURLE_WRITE_ERROR &&
+                                context.download_context.overflow;
+    if (result != CURLE_OK && !missing_object) {
         LOG(ERROR) << "OSS " << method
                    << " request failed: " << curl_easy_strerror(result);
         return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
@@ -451,23 +573,203 @@ tl::expected<void, ErrorCode> OssObjectStorageAdapter::Put(
 
 tl::expected<void, ErrorCode> OssObjectStorageAdapter::PutV(
     const std::string& logical_key, const iovec* iov, int iovcnt) {
-    if (iovcnt < 0 || (!iov && iovcnt > 0))
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    size_t total = 0;
-    for (int i = 0; i < iovcnt; ++i) {
-        if ((!iov[i].iov_base && iov[i].iov_len > 0) ||
-            iov[i].iov_len > std::numeric_limits<size_t>::max() - total) {
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        total += iov[i].iov_len;
-    }
-    if (total == 0) return Put(logical_key, {});
+    auto total = GetIovecSize(iov, iovcnt);
+    if (!total) return tl::make_unexpected(total.error());
+    if (*total == 0) return Put(logical_key, {});
     auto response = Request("PUT", LogicalToPhysicalKey(logical_key), {},
-                            nullptr, total, "", iov, iovcnt);
+                            nullptr, *total, "", iov, iovcnt);
     if (!response) return tl::make_unexpected(response.error());
     if (!IsSuccess(response->status))
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     return {};
+}
+
+std::vector<tl::expected<size_t, ErrorCode>>
+OssObjectStorageAdapter::RequestBatch(
+    const std::vector<BatchRequest>& requests) {
+    std::vector<tl::expected<size_t, ErrorCode>> results;
+    results.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        results.emplace_back(
+            tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+    }
+    if (requests.empty()) return results;
+    if (!initialized_) {
+        for (auto& result : results)
+            result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        return results;
+    }
+
+    // Each batch owns its pool; contexts must be destroyed before the pool.
+    std::unique_ptr<CURLM, decltype(&curl_multi_cleanup)> multi(
+        curl_multi_init(), &curl_multi_cleanup);
+    if (!multi) {
+        LOG(ERROR) << "Failed to initialize OSS batch curl multi handle";
+        return results;
+    }
+    if (curl_multi_setopt(multi.get(), CURLMOPT_MAX_TOTAL_CONNECTIONS,
+                          max_connections_) != CURLM_OK ||
+        curl_multi_setopt(multi.get(), CURLMOPT_MAX_HOST_CONNECTIONS,
+                          max_connections_) != CURLM_OK ||
+        curl_multi_setopt(multi.get(), CURLMOPT_MAXCONNECTS,
+                          max_connections_) != CURLM_OK) {
+        LOG(ERROR) << "Failed to configure OSS batch curl multi handle";
+        return results;
+    }
+    std::vector<RequestContext> contexts(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        auto& context = contexts[i];
+        context.curl = curl_easy_init();
+        context.index = i;
+        context.expected_size = request.size;
+        const std::string range =
+            request.upload || request.size == 0
+                ? ""
+                : "bytes=0-" + std::to_string(request.size - 1);
+        auto prepared = PrepareRequest(
+            context, request.upload ? "PUT" : "GET",
+            LogicalToPhysicalKey(request.logical_key), {}, nullptr,
+            request.upload ? request.size : 0, range, request.upload_iov,
+            request.upload_iovcnt, request.download_buffer,
+            request.upload ? 0 : request.size);
+        if (!prepared) return results;
+        curl_easy_setopt(context.curl, CURLOPT_BUFFERSIZE,
+                         receive_buffer_size_);
+        curl_easy_setopt(context.curl, CURLOPT_PRIVATE, &context);
+    }
+
+    size_t next = 0;
+    size_t active = 0;
+    // Wait outside CURLM so queued requests retain their full timeout.
+    auto admit = [&]() {
+        while (next < contexts.size() &&
+               active < static_cast<size_t>(max_connections_)) {
+            auto& context = contexts[next];
+            auto result = curl_multi_add_handle(multi.get(), context.curl);
+            if (result != CURLM_OK) return result;
+            context.multi = multi.get();
+            ++next;
+            ++active;
+        }
+        return CURLM_OK;
+    };
+    CURLMcode multi_result = admit();
+    while (multi_result == CURLM_OK && active > 0) {
+        int running = 0;
+        multi_result = curl_multi_perform(multi.get(), &running);
+        if (multi_result != CURLM_OK) break;
+        bool completed = false;
+        int remaining = 0;
+        while (CURLMsg* message =
+                   curl_multi_info_read(multi.get(), &remaining)) {
+            if (message->msg != CURLMSG_DONE) continue;
+            RequestContext* context = nullptr;
+            curl_easy_getinfo(message->easy_handle, CURLINFO_PRIVATE, &context);
+            if (!context) continue;
+            long status = 0;
+            curl_easy_getinfo(message->easy_handle, CURLINFO_RESPONSE_CODE,
+                              &status);
+            if (!context->upload && status == 404 &&
+                (message->data.result == CURLE_OK ||
+                 (message->data.result == CURLE_WRITE_ERROR &&
+                  context->download_context.overflow))) {
+                results[context->index] =
+                    tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
+            } else if (message->data.result != CURLE_OK) {
+                LOG(ERROR) << "OSS batch " << (context->upload ? "PUT" : "GET")
+                           << " failed: "
+                           << curl_easy_strerror(message->data.result);
+                results[context->index] =
+                    tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
+            } else if (context->upload && IsSuccess(status)) {
+                results[context->index] = context->expected_size;
+            } else if (!context->upload && status == 206 &&
+                       context->download_context.transferred ==
+                           context->expected_size) {
+                results[context->index] = context->download_context.transferred;
+            } else {
+                LOG(ERROR) << "OSS batch " << (context->upload ? "PUT" : "GET")
+                           << " returned HTTP " << status;
+                results[context->index] = tl::make_unexpected(
+                    context->upload ? ErrorCode::FILE_WRITE_FAIL
+                                    : ErrorCode::FILE_READ_FAIL);
+            }
+            curl_multi_remove_handle(multi.get(), context->curl);
+            context->multi = nullptr;
+            --active;
+            completed = true;
+        }
+        multi_result = admit();
+        if (multi_result != CURLM_OK || active == 0) break;
+        if (completed) continue;
+        int ready = 0;
+        multi_result = curl_multi_poll(multi.get(), nullptr, 0, 1000, &ready);
+    }
+    if (multi_result != CURLM_OK) {
+        LOG(ERROR) << "OSS batch request failed: "
+                   << curl_multi_strerror(multi_result);
+    }
+
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> OssObjectStorageAdapter::PutBatch(
+    const std::vector<ObjectPutRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i)
+        results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+
+    std::vector<BatchRequest> batch;
+    std::vector<size_t> mapping;
+    batch.reserve(requests.size());
+    mapping.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        auto total = GetIovecSize(request.iov, request.iovcnt);
+        if (!total) continue;
+        batch.push_back({true, request.logical_key, request.iov, request.iovcnt,
+                         nullptr, *total});
+        mapping.push_back(i);
+    }
+    auto batch_results = RequestBatch(batch);
+    for (size_t i = 0; i < batch_results.size(); ++i) {
+        if (batch_results[i])
+            results[mapping[i]] = {};
+        else
+            results[mapping[i]] = tl::make_unexpected(batch_results[i].error());
+    }
+    return results;
+}
+
+std::vector<tl::expected<size_t, ErrorCode>> OssObjectStorageAdapter::GetBatch(
+    const std::vector<ObjectGetRequest>& requests) {
+    std::vector<tl::expected<size_t, ErrorCode>> results;
+    results.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i)
+        results.emplace_back(tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+
+    std::vector<BatchRequest> batch;
+    std::vector<size_t> mapping;
+    batch.reserve(requests.size());
+    mapping.reserve(requests.size());
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        if (request.size == 0) {
+            results[i] = size_t{0};
+            continue;
+        }
+        if (!request.buffer) continue;
+        batch.push_back({false, request.logical_key, nullptr, 0, request.buffer,
+                         request.size});
+        mapping.push_back(i);
+    }
+    auto batch_results = RequestBatch(batch);
+    for (size_t i = 0; i < batch_results.size(); ++i)
+        results[mapping[i]] = std::move(batch_results[i]);
+    return results;
 }
 
 tl::expected<size_t, ErrorCode> OssObjectStorageAdapter::Get(
@@ -486,13 +788,12 @@ tl::expected<size_t, ErrorCode> OssObjectStorageAdapter::GetRange(
     const std::string range = "bytes=" + std::to_string(first) + "-" +
                               std::to_string(first + len - 1);
     auto response = Request("GET", LogicalToPhysicalKey(logical_key), {},
-                            nullptr, 0, range);
+                            nullptr, 0, range, nullptr, 0, buf, len);
     if (!response) return tl::make_unexpected(response.error());
     if (response->status == 404)
         return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
-    if (response->status != 206 || response->body.size() != len)
+    if (response->status != 206 || response->transferred != len)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    if (len > 0) std::memcpy(buf, response->body.data(), len);
     return len;
 }
 
