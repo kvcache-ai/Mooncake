@@ -143,6 +143,14 @@ static inline std::string extractProtocolFromConnString(
     return "etcd";
 }
 
+// A cached REMOTE segment whose backend fetch keeps failing this many
+// consecutive sync cycles is treated as gone (peer unmounted / master expiry
+// cleanup removed its key) and invalidated from the local cache. The plugin
+// get() collapses "not found" and "transient error" into a single false, so a
+// single blip must not trigger a purge -- only a streak that persists across
+// cycles does.
+static constexpr int kStaleSegmentFailureThreshold = 2;
+
 struct TransferNotifyUtil {
     static Json::Value encode(const TransferMetadata::NotifyDesc &desc) {
         Json::Value root;
@@ -295,6 +303,20 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
             << "Unable to create metadata storage plugin with conn string "
             << conn_string;
     }
+    startMetadataRefreshPollingIfNeeded();
+}
+
+TransferMetadata::TransferMetadata(
+    std::shared_ptr<MetadataStoragePlugin> storage_plugin) {
+    // Test-only seam (see header). Mirrors the conn-string ctor's key-prefix
+    // setup so getFullMetadataKey() yields "mooncake/ram/<name>" keys, but
+    // skips the plugin factory (no etcd/redis/http needed) and the P2P
+    // handshake daemon. The background refresh poller stays disabled when the
+    // caller configures a zero refresh interval.
+    next_segment_id_.store(1);
+    common_key_prefix_ = "mooncake/";
+    rpc_meta_prefix_ = common_key_prefix_ + "rpc_meta/";
+    storage_plugin_ = std::move(storage_plugin);
     startMetadataRefreshPollingIfNeeded();
 }
 
@@ -1252,13 +1274,14 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
-    const std::string &segment_name) {
-    return getSegmentDescInternal(segment_name, false);
+    const std::string &segment_name, GetResult *status) {
+    return getSegmentDescInternal(segment_name, false, status);
 }
 
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
-                                         bool force_rpc_update) {
+                                         bool force_rpc_update,
+                                         GetResult *status) {
     Json::Value peer_json;
 
     if (p2p_handshake_mode_) {
@@ -1270,22 +1293,27 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
             auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
             if (it == segment_id_to_desc_map_.end() || !it->second) {
                 LOG(ERROR) << "Local segment descriptor not found";
+                if (status) *status = GetResult::kUnavailable;
                 return nullptr;
             }
             desc = it->second;
         }
         int ret = encodeSegmentDesc(*desc.get(), local_json);
         if (ret) {
+            if (status) *status = GetResult::kUnavailable;
             return nullptr;
         }
         ret = handshake_plugin_->exchangeMetadata(ip, port, local_json,
                                                   peer_json);
         if (ret) {
+            if (status) *status = GetResult::kUnavailable;
             return nullptr;
         }
     } else {
-        if (!storage_plugin_->get(getFullMetadataKey(segment_name),
-                                  peer_json)) {
+        GetResult result = storage_plugin_->getWithStatus(
+            getFullMetadataKey(segment_name), peer_json);
+        if (result != GetResult::kFound) {
+            if (status) *status = result;
             LOG(WARNING) << "Failed to retrieve segment descriptor, name "
                          << segment_name;
             return nullptr;
@@ -1293,6 +1321,11 @@ TransferMetadata::getSegmentDescInternal(const std::string &segment_name,
     }
 
     auto result = decodeSegmentDesc(peer_json, segment_name);
+    if (!result) {
+        if (status) *status = GetResult::kUnavailable;
+        return nullptr;
+    }
+    if (status) *status = GetResult::kFound;
 
     // Compatibility for descriptors published before tcp_data_host was part
     // of SegmentDesc. Freeze the legacy RPC location into this descriptor
@@ -1368,17 +1401,35 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     size_t unchanged_count = 0;
     size_t skipped_count = 0;
     std::vector<std::string> updated_names;
+    size_t invalidated_count = 0;
+    size_t unavailable_count = 0;
 
     // Fetch updates without holding lock (may involve network I/O)
     std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
+    // Cached REMOTE segment names whose backend lookup returned kNotFound
+    // (authoritative key absence -- the master removed the key on peer
+    // unmount/expiry). Resolved into per-segment failure streaks under the
+    // write lock below, so no shared state (segment_failure_counts_) is
+    // touched during network I/O. Transient failures (kUnavailable) do NOT
+    // enter this list -- they must not advance the streak.
+    std::vector<std::string> failed_names;
     for (const auto &name : names_to_sync) {
-        auto segment_desc = getSegmentDescInternal(name, true);
+        GetResult status = GetResult::kUnavailable;
+        auto segment_desc = getSegmentDescInternal(name, true, &status);
         if (segment_desc) {
             updates.emplace_back(name, segment_desc);
             ++fetched_count;
-        } else {
+        } else if (status == GetResult::kNotFound) {
             ++failed_count;
+            failed_names.push_back(name);
             LOG(WARNING) << "segment " << name << " is now invalid";
+        } else {
+            // Transient backend failure (kUnavailable): the key may still
+            // exist; do NOT advance the invalidation streak. The cached
+            // entry survives and is retried next sync cycle.
+            ++unavailable_count;
+            LOG(WARNING) << "segment " << name
+                         << " backend unavailable (transient)";
         }
     }
 
@@ -1386,6 +1437,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
         // Apply updates with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         for (const auto &[name, desc] : updates) {
+            // A successful fetch ends any prior failure streak for this
+            // segment; the entry stays cached. Done under the write lock
+            // because segment_failure_counts_ is guarded by segment_lock_.
+            segment_failure_counts_[name] = 0;
             auto it = segment_name_to_id_map_.find(name);
             if (it == segment_name_to_id_map_.end()) {
                 ++skipped_count;
@@ -1432,6 +1487,40 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             LOG(INFO) << "New segment descriptor:";
             desc->dump();
         }
+
+        // Invalidate stale REMOTE segments. Only authoritative key-absence
+        // results (kNotFound -- the master removed the key on peer
+        // unmount/expiry) enter failed_names and advance the streak.
+        // Transient backend failures (kUnavailable) are excluded above, so
+        // a metadata-service outage cannot purge the cache and strand
+        // in-flight transfers whose callers still hold a shared_ptr copy
+        // of the descriptor. A consecutive-failure streak that persists
+        // across sync cycles is the signal that the segment is genuinely
+        // gone; only then do we drop the cached entry, mirroring the erase
+        // pattern in removeSegmentDesc() (segment_id_to_desc_map_ + name map).
+        for (const auto &name : failed_names) {
+            ++segment_failure_counts_[name];
+        }
+        for (auto fit = segment_failure_counts_.begin();
+             fit != segment_failure_counts_.end();) {
+            if (fit->second < kStaleSegmentFailureThreshold) {
+                ++fit;
+                continue;
+            }
+            const auto &name = fit->first;
+            auto name_it = segment_name_to_id_map_.find(name);
+            // Only invalidate cached remote entries; LOCAL_SEGMENT_ID is
+            // skipped by the collect phase and must never be purged here.
+            if (name_it != segment_name_to_id_map_.end() &&
+                name_it->second != LOCAL_SEGMENT_ID) {
+                segment_id_to_desc_map_.erase(name_it->second);
+                segment_name_to_id_map_.erase(name_it);
+                ++invalidated_count;
+                LOG(WARNING)
+                    << "Invalidated stale segment cache entry, name=" << name;
+            }
+            fit = segment_failure_counts_.erase(fit);
+        }
     }
 
     // RPC locations are cached independently from segment descriptors under
@@ -1453,7 +1542,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
               << ", scanned=" << names_to_sync.size()
               << ", fetched=" << fetched_count << ", updated=" << updated_count
               << ", unchanged=" << unchanged_count
-              << ", failed=" << failed_count << ", skipped=" << skipped_count
+              << ", failed=" << failed_count
+              << ", unavailable=" << unavailable_count
+              << ", skipped=" << skipped_count
+              << ", invalidated=" << invalidated_count
               << ", sync_duration_ms=" << sync_duration_ms;
     return 0;
 }

@@ -28,7 +28,6 @@
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "crc32c.h"
-#include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -52,59 +51,14 @@ struct FdGuard {
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
+#ifdef HAVE_OSS_ADAPTER
+#include "storage/distributed/oss_adapter.h"
+#endif
 #ifdef USE_3FS
 #include "storage/distributed/hf3fs_adapter.h"
 #endif
 
 namespace mooncake {
-
-bool BucketBackendConfig::Validate() const {
-    if (bucket_keys_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
-        return false;
-    }
-    if (bucket_size_limit <= 0) {
-        LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
-        return false;
-    }
-    return true;
-}
-
-BucketBackendConfig BucketBackendConfig::FromEnvironment() {
-    BucketBackendConfig config;
-
-    config.bucket_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
-
-    config.bucket_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
-
-    config.max_total_size =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
-                          Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
-                                            config.max_total_size));
-
-    config.max_physical_bytes =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES",
-                          config.max_physical_bytes);
-
-    config.disk_scan_cache_ms =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
-                          config.disk_scan_cache_ms);
-
-    const auto policy_str = Environ::GetString(
-        "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
-        Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
-    if (policy_str == "fifo") {
-        config.eviction_policy = BucketEvictionPolicy::FIFO;
-    } else if (policy_str == "lru") {
-        config.eviction_policy = BucketEvictionPolicy::LRU;
-    } else {
-        config.eviction_policy = BucketEvictionPolicy::NONE;
-    }
-
-    return config;
-}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -3602,6 +3556,22 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
+#ifdef USE_URING
+        // O_DIRECT vector I/O rounds writes up to 4 KiB. An unaligned capacity
+        // can let an end-of-file write grow the data file past capacity_, after
+        // which recovery's exact size check rejects the file.
+        constexpr uint64_t kDirectIoAlignment = 4096;
+        if (file_storage_config_.use_uring &&
+            (capacity_ % kDirectIoAlignment) != 0) {
+            LOG(ERROR)
+                << "Invalid capacity for OffsetAllocatorStorageBackend with "
+                   "uring/O_DIRECT: "
+                << capacity_ << ". Capacity must be a multiple of "
+                << kDirectIoAlignment;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+#endif
+
         // Ensure storage path exists
         {
             std::error_code ec;
@@ -3743,6 +3713,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
 
         // Open/truncate data file in read-write mode
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             LOG(ERROR) << "Failed to open data file: " << data_file_path_;
@@ -4518,6 +4493,11 @@ OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
         // Open data file without truncation
         data_file_path_ = GetDataFilePath();
         int flags = O_CLOEXEC | O_RDWR;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
             const int open_errno = errno;
@@ -5466,8 +5446,13 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
     // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
     // its I/O completes — no use-after-free.
     if (!data_file_path_.empty()) {
-        int fd = open(data_file_path_.c_str(),
-                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            flags |= O_DIRECT;
+        }
+#endif
+        int fd = open(data_file_path_.c_str(), flags, 0644);
         if (fd >= 0) {
 #ifdef USE_URING
             if (file_storage_config_.use_uring) {
@@ -5534,20 +5519,31 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 throw std::invalid_argument(
                     "Invalid DistributedStorage configuration");
             }
-            std::unique_ptr<FileSystemAdapter> adapter;
+            std::unique_ptr<FileSystemAdapter> fs_adapter;
+            std::unique_ptr<ObjectStorageAdapter> object_storage_adapter;
             if (distributed_config.fs_adapter_type == "posix") {
-                adapter = std::make_unique<PosixFsAdapter>();
+                fs_adapter = std::make_unique<PosixFsAdapter>();
             } else if (distributed_config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
-                adapter = std::make_unique<Hf3fsAdapter>();
+                fs_adapter = std::make_unique<Hf3fsAdapter>();
 #else
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else if (distributed_config.fs_adapter_type == "oss") {
+#ifdef HAVE_OSS_ADAPTER
+                object_storage_adapter =
+                    std::make_unique<OssObjectStorageAdapter>(
+                        distributed_config.fsdir);
+#else
+                LOG(ERROR) << "OSS adapter requires libcurl and OpenSSL";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 #endif
             } else {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
             return std::make_shared<DistributedStorageBackend>(
-                config, distributed_config, std::move(adapter));
+                config, distributed_config, std::move(fs_adapter),
+                std::move(object_storage_adapter));
         }
         default: {
             LOG(ERROR) << "Unsupported backend type: "

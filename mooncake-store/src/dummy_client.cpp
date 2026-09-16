@@ -183,6 +183,10 @@ constexpr bool can_invoke_when_disconnected() {
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return tl::make_unexpected(ErrorCode::RPC_FAIL);
+    }
     auto pool = client_accessor_.GetClientPool();
 
     if constexpr (!can_invoke_when_disconnected<ServiceMethod>()) {
@@ -216,6 +220,11 @@ tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
+    RpcDrainGuard::ScopedCall inflight(rpc_drain_);
+    if (!inflight.ok()) {
+        return std::vector<tl::expected<ResultType, ErrorCode>>(
+            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+    }
     auto pool = client_accessor_.GetClientPool();
     if (!connected_.load()) {
         LOG(ERROR) << "Dummy Client not connected";
@@ -266,7 +275,28 @@ DummyClient::DummyClient()
     mooncake::init_ylt_log_level();
 }
 
-DummyClient::~DummyClient() { tearDownAll(); }
+DummyClient::~DummyClient() {
+    // Teardown-order invariant (review #3943): an in-flight RPC never touches
+    // the members tearDownAll() resets. The RPC path holds a ScopedCall
+    // across the whole round trip and otherwise touches only the client pool
+    // (kept alive process-wide by the registry), atomic flags like
+    // connected_, by-value arguments, and the drain's shared State.
+    // shm_helper_, the registered-buffer tables, the local/hot-cache mappings
+    // and the ping thread are only ever accessed synchronously on caller
+    // threads, outside the drain's scope; a caller racing ~DummyClient is a
+    // usage-level data race no teardown order can fix.
+    //
+    // The reverse order is impossible: unregister_shm() is itself an RPC and
+    // the ping thread is only joined inside tearDownAll(), so draining first
+    // would reject the unmap and spin the reconnection loop for the whole
+    // wait (#3943 review).
+    tearDownAll();
+    // Never release the pool under a suspended request coroutine (#3909).
+    if (!rpc_drain_.drain_for(std::chrono::seconds(30))) {
+        LOG(ERROR) << "DummyClient teardown: RPCs still in flight after 30s "
+                      "drain; releasing the pool regardless";
+    }
+}
 
 void DummyClient::ObserveTransferMetric(TransferOperationKind kind,
                                         const char* op_name, size_t bytes,

@@ -208,6 +208,7 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      liburing-devel \
                      jemalloc-devel \
                      msgpack-devel \
+                     zeromq-devel \
                      libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \

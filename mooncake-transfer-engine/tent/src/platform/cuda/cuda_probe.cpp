@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "tent/platform/cuda.h"
+#include "tent/platform/cuda_utils.h"
 #include "tent/common/status.h"
 #include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
@@ -299,35 +300,17 @@ bool cudaAbiMatches() {
 MemoryType CudaPlatform::getMemoryType(void* addr) {
     if (!cudaDevicePresent()) return MTYPE_CPU;
     if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
-    cudaPointerAttributes attributes{};
-    cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
-        return MTYPE_UNKNOWN;
-    }
-    if (attributes.type == cudaMemoryTypeDevice) return MTYPE_CUDA;
-    return MTYPE_CPU;
+    return getCudaDeviceForPtr(addr) >= 0 ? MTYPE_CUDA : MTYPE_CPU;
 }
 
 int CudaPlatform::getPointerDeviceId(void* addr) {
-    // Same guards as getMemoryType(): the cudaPointerAttributes layout changes
-    // across CUDA majors, so the struct must not be read on a runtime whose ABI
-    // does not match what we built against.
+    // Same guards as getMemoryType().
     if (!cudaDevicePresent() || !cudaAbiMatches()) {
         return CUDAStreamPool::kCurrentDevice;
     }
-    cudaPointerAttributes attributes{};
-    if (cudaPointerGetAttributes(&attributes, addr) != cudaSuccess) {
-        // Clear the latched error so it cannot surface at an unrelated
-        // cudaGetLastError() call site.
-        cudaGetLastError();
-        return CUDAStreamPool::kCurrentDevice;
-    }
-    if (attributes.type != cudaMemoryTypeDevice) {
-        return CUDAStreamPool::kCurrentDevice;
-    }
-    return attributes.device;
+    int device = getCudaDeviceForPtr(addr);
+    if (device < 0) return CUDAStreamPool::kCurrentDevice;
+    return device;
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {
@@ -356,17 +339,11 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
         return entries;
     }
     if (cudaDevicePresent()) {
-        cudaPointerAttributes attributes{};
-        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
-        if (result != cudaSuccess) {
-            LOG(WARNING) << "cudaPointerGetAttributes: "
-                         << cudaGetErrorString(result);
-            entries.push_back({(uint64_t)start, len, kWildcardLocation});
-            return entries;
-        }
-        if (attributes.type == cudaMemoryTypeDevice) {
+        // Unregistered pointers fall through to the NUMA probe below.
+        int cuda_dev = getCudaDeviceForPtr(start);
+        if (cuda_dev >= 0) {
             entries.push_back(
-                {(uint64_t)start, len, genCudaNodeName(attributes.device)});
+                {(uint64_t)start, len, genCudaNodeName(cuda_dev)});
             return entries;
         }
     }

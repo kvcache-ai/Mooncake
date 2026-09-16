@@ -64,7 +64,6 @@ namespace ha {
 class SnapshotCatalogStore;
 class MasterSnapshotCodec;
 struct MasterSnapshotPayloads;
-class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
 class EtcdOpLogStore;
@@ -79,38 +78,9 @@ class OpLogBatchStorage;
 class OrderedOpLogWriter;
 struct MetadataStoragePlugin;
 
-// Forward declarations for test classes
 namespace test {
-class MasterServiceTest;
-class MasterServiceSnapshotTestBase;
-class SnapshotChildProcessTest;
-// Friended so the promotion-on-hit tests can drive a serialize/reset/
-// deserialize cycle directly via the otherwise-private
-// MetadataSerializer, and inspect private clamp fields. This avoids
-// standing up a full snapshot catalog + child-process harness, and
-// exposing test-only accessors on MasterService itself.
-class PromotionOnHitTest;
-class DynamicReplicationTest;
-class MasterServiceTenantQuotaTest;
-class MasterScenario;
-class MasterServiceHATest;
-// Friended so the processing_keys double-erase reproduction test can
-// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
-// ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
-class MasterServiceProcessingKeyDoubleEraseTest;
-// Friended so the LOCAL_DISK deregistration interleaving tests can run the
-// two halves of UnmountLocalDiskSegment (deregistration, replica sweep)
-// with a competing mount + register serialized between them, pinning the
-// interleaving instead of hoping a thread scheduler produces it.
-class LocalDiskUnmountInterleavingTest;
-// Friended so the #2997 regression test can call the private
-// PushOffloadingQueue directly with degenerate replica states that the
-// public PutStart/PutEnd path never produces.
-class MasterServiceSSDTest;
+class MasterServiceTestPeer;
 }  // namespace test
-namespace benchmarks {
-class BatchEvictBench;
-}  // namespace benchmarks
 
 // std::unordered_map/set never shrink their bucket array on erase, so a
 // container that once held millions of entries keeps its high-water bucket
@@ -151,29 +121,12 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
  */
 
 class MasterService {
-    // Test friend class for snapshot/restore testing
-    friend class test::MasterServiceSnapshotTestBase;
-    friend class test::MasterServiceTest;
-    friend class test::SnapshotChildProcessTest;
-    friend class test::PromotionOnHitTest;
-    friend class test::DynamicReplicationTest;
-    friend class benchmarks::BatchEvictBench;
-    friend class test::MasterServiceTenantQuotaTest;
-    // The scenario DSL controls lease timestamps so eviction tests do not
-    // depend on sleeps or the background eviction thread.
-    friend class test::MasterScenario;
-    // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
-    friend class test::MasterServiceProcessingKeyDoubleEraseTest;
-    friend class test::LocalDiskUnmountInterleavingTest;
-    // #2997 regression: exercises PushOffloadingQueue's no-op paths directly.
-    friend class test::MasterServiceSSDTest;
+    friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
-    friend class ha::MasterSnapshotCodecTest;  // codec round-trip unit test
-    friend class test::MasterServiceHATest;
 
    public:
     using NoFProbeFn =
@@ -188,11 +141,6 @@ class MasterService {
     MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
-    void SetNoFProbeFnForTesting(NoFProbeFn fn);
-    size_t GetMountedNoFSegmentCountForTesting();
-    bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
-    std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
-        const UUID& segment_id);
     [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
@@ -204,43 +152,9 @@ class MasterService {
     DeleteTenantQuotaPolicy(const TenantId& tenant_id);
     uint64_t GetTenantQuotaAllocatableCapacityBytes();
 
-    ErrorCode SetBatchOpLogBackendForTesting(
-        std::shared_ptr<HaKvBackend> backend);
-    void SetBatchOpLogWriterFactoryForTesting(BatchOpLogWriterFactory factory);
     void SetBatchOpLogTerminalCallback(
         OrderedOpLogWriter::TerminalCallback callback);
     void StopBatchOpLogWriter();
-
-    /**
-     * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
-     *        unit tests can drive a single eviction cycle synchronously
-     *        without standing up the periodic eviction thread.
-     */
-    void RunBatchEvictForTesting(double evict_ratio_target,
-                                 double evict_ratio_lowerbound);
-    void RunNoFBatchEvictForTesting(double evict_ratio_target,
-                                    double evict_ratio_lowerbound);
-    void RunDfsEvictionForTesting();
-
-    /**
-     * @brief Enables the tenant-epoch bookkeeping that decides whether
-     *        RemoveAll may publish `cleared`. Production turns this on from the
-     *        publisher config; tests need it without a live ZMQ socket.
-     */
-    void SetKvTenantEpochTrackingForTesting(bool enabled);
-    /**
-     * @brief Installs a callback invoked after each shard's lock is released
-     *        during a RemoveAll scan, receiving the shard index just finished.
-     *        Lets a test commit into an already-scanned shard
-     *        deterministically.
-     */
-    void SetRemoveAllShardHookForTesting(std::function<void(size_t)> hook);
-    /**
-     * @brief Counts of `cleared` publications and of clears withheld because a
-     *        concurrent commit advanced the tenant epoch mid-scan.
-     */
-    uint64_t GetKvClearedPublishedForTesting() const;
-    uint64_t GetKvClearedSuppressedForTesting() const;
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -1043,6 +957,12 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
+    // Background pass: evict any tenant that is over its own watermark down to
+    // (watermark - eviction_ratio) of its effective quota. Called from
+    // EvictionThreadFunc, and a no-op unless multi-tenancy and
+    // tenant_eviction_high_watermark_ratio are both enabled.
+    void EvictTenantsOverWatermark();
+
     std::shared_ptr<ClientLivenessRecord> FindClientRecord(
         const UUID& client_id) const;
     // Caller holds the Replica owner's retaining guard.
@@ -1778,6 +1698,8 @@ class MasterService {
     GroupDomain group_domain_;
 
     class SoftPinDeadlineIndex {
+        friend class test::MasterServiceTestPeer;
+
        public:
         using TimePoint = std::chrono::system_clock::time_point;
 
@@ -1794,9 +1716,6 @@ class MasterService {
                              const TimePoint& deadline);
         std::vector<Entry> PopExpired(const TimePoint& now);
         void Clear();
-
-        size_t HeapSizeForTest() const;
-        size_t RegistrationCountForTest() const;
 
        private:
         struct Registration {
@@ -2062,9 +1981,8 @@ class MasterService {
                                         const TenantId& tenant_id);
     TenantQuotaHandle GetBoundTenantQuotaHandle(
         const TenantState& tenant_state) const;
-    tl::expected<void, ErrorCode> ChargeTenantQuota(
-        TenantQuotaHandle account, uint64_t bytes,
-        uint64_t* deficit_bytes = nullptr);
+    tl::expected<void, ErrorCode> ChargeTenantQuota(TenantQuotaHandle account,
+                                                    uint64_t bytes);
     void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
@@ -2151,6 +2069,26 @@ class MasterService {
     // write cannot straddle a deregistration.
     bool HasMountedLocalDiskSegment(const UUID& client_id);
 
+    // Allocate the physical replicas without changing object metadata.  This
+    // is used by leased upserts to prove that replacement storage is available
+    // before the old metadata is removed.
+    auto AllocateReplicas(const std::string& key, uint64_t value_length,
+                          const ReplicateConfig& config,
+                          const std::string& writer_host_id)
+        -> tl::expected<std::vector<Replica>, ErrorCode>;
+
+    auto InsertMetadata(MetadataShardAccessorRW& shard, const UUID& client_id,
+                        const std::string& key, uint64_t value_length,
+                        const ReplicateConfig& config,
+                        const std::string& group_id, const TenantId& tenant_id,
+                        const std::chrono::system_clock::time_point& now,
+                        const ResolvedSoftPinRequest& soft_pin_request,
+                        std::vector<Replica>&& replicas,
+                        uint64_t pending_quota_charge,
+                        std::optional<std::chrono::system_clock::time_point>
+                            committed_soft_pin_timeout = std::nullopt)
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+
     // Helper: allocate replicas, create ObjectMetadata, insert into shard,
     // and return descriptor list.  Shared by PutStart and UpsertStart.
     auto AllocateAndInsertMetadata(
@@ -2160,7 +2098,6 @@ class MasterService {
         const std::string& group_id, const TenantId& tenant_id,
         const std::chrono::system_clock::time_point& now,
         const ResolvedSoftPinRequest& soft_pin_request,
-        uint64_t& quota_deficit_bytes,
         std::optional<std::chrono::system_clock::time_point>
             committed_soft_pin_timeout = std::nullopt)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -2250,9 +2187,6 @@ class MasterService {
     bool IsTransientResult(PromotionQueueResult result) const;
     size_t RunPromotionCandidateRetry(size_t max_shards_to_scan);
     size_t RunPromotionCandidateRetry();
-    size_t RunPromotionCandidateRetryForTesting();
-    size_t CountCandidatesForTesting(const TenantId& tenant_id);
-    void ResetCandidateBackoffsForTesting();
 
     // Erase any in-flight PromotionTask for `key`, refund its pending charge,
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task
@@ -2289,6 +2223,11 @@ class MasterService {
         false};  // Set to trigger NoF eviction when allocation fails
     const double eviction_ratio_;                     // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
+    // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
+    // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
+    // sufficient once quotas partition the pool.
+    const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
     const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
@@ -2297,6 +2236,12 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    // The eviction thread wakes every 10 ms, but the tenant pass has to walk
+    // every registered tenant and lock every quota shard, so it is throttled
+    // rather than run on each tick. Quota pressure builds over seconds, not
+    // milliseconds, and admission still has its own synchronous fallback in
+    // between.
+    static constexpr uint64_t kTenantEvictionCheckIntervalMs = 1000;
 
     // Snapshot manager handles snapshot lifecycle orchestration
     std::unique_ptr<MasterSnapshotManager> snapshot_manager_;

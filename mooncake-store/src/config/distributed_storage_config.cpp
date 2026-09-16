@@ -21,10 +21,14 @@ bool DistributedStorageConfig::Validate() const {
             << fsdir;
         return false;
     }
-    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix") {
+    if (fs_adapter_type != "hf3fs" && fs_adapter_type != "posix" &&
+        fs_adapter_type != "oss") {
         LOG(ERROR) << "DistributedStorageConfig: unsupported fs_adapter_type: "
                    << fs_adapter_type;
         return false;
+    }
+    if (fs_adapter_type == "oss") {
+        return true;
     }
     if (shard_count <= 0) {
         LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
@@ -52,6 +56,11 @@ bool DistributedStorageConfig::Validate() const {
 
 bool DistributedStorageConfig::ValidateForAllocator() const {
     if (!Validate()) return false;
+    if (fs_adapter_type == "oss") {
+        LOG(ERROR) << "DistributedStorageConfig: DFS allocator requires a "
+                      "filesystem adapter";
+        return false;
+    }
 
     if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
         eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||

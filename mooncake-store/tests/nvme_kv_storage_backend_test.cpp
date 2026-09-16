@@ -2,6 +2,7 @@
 #include "nvme_kv_executor_util.h"
 #include "storage_backend.h"
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include <array>
@@ -40,6 +41,19 @@ class EnvVarGuard {
    private:
     std::string name_;
     std::optional<std::string> old_value_;
+};
+
+class BoolFlagGuard {
+   public:
+    BoolFlagGuard(bool &flag, bool value) : flag_(flag), old_value_(flag) {
+        flag_ = value;
+    }
+
+    ~BoolFlagGuard() { flag_ = old_value_; }
+
+   private:
+    bool &flag_;
+    bool old_value_;
 };
 
 class NvmeKvStorageBackendTest : public ::testing::Test {
@@ -124,6 +138,33 @@ TEST_F(NvmeKvStorageBackendTest, StatusMappingHandlesKvSpecificStatusCodes) {
     EXPECT_FALSE(ShouldRetryNvmeKvRetrieveWithMaxBuffer(
         ErrorCode::INVALID_PARAMS, 0, kDefaultNvmeKvRuntimeTransferLimit,
         kDefaultNvmeKvRuntimeTransferLimit));
+}
+
+TEST_F(NvmeKvStorageBackendTest, IoWorkerConcurrencyPreservesDependentCaps) {
+    EnvVarGuard driver_guard("MOONCAKE_NVME_KV_DRIVER", "stub");
+    EnvVarGuard maximum_guard("MOONCAKE_NVME_KV_MAX_IO_CONCURRENCY", "8");
+    EnvVarGuard io_guard("MOONCAKE_NVME_KV_IO_CONCURRENCY", "16");
+    EnvVarGuard batch_guard("MOONCAKE_NVME_KV_BATCH_SUBMIT_CONCURRENCY", "99");
+    EnvVarGuard root_guard("MOONCAKE_NVME_KV_ROOT_SUBMIT_CONCURRENCY", "99");
+    EnvVarGuard prepare_guard("MOONCAKE_NVME_KV_PREPARE_CONCURRENCY", "99");
+    BoolFlagGuard log_to_stderr_guard(FLAGS_logtostderr, true);
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path_ + "/concurrency_caps";
+    config.storage_backend_type = StorageBackendType::kNvmeKv;
+
+    testing::internal::CaptureStderr();
+    NvmeKvStorageBackend backend(config);
+    const auto result = backend.Init();
+    const std::string diagnostics = testing::internal::GetCapturedStderr();
+
+    ASSERT_TRUE(result.has_value());
+    EXPECT_NE(diagnostics.find(
+                  "NVMe KV backend I/O concurrency: 8 (max 8), batch submit "
+                  "concurrency: 7, root submit concurrency: 7, prepare "
+                  "concurrency: 1"),
+              std::string::npos)
+        << diagnostics;
 }
 
 TEST_F(NvmeKvStorageBackendTest, BackendLoadsKnownObjectsFromDevice) {

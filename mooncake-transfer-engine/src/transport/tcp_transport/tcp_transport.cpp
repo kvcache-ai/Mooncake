@@ -515,16 +515,13 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             std::to_string(batch_id));
     }
     auto& task = batch_desc.task_list[task_id];
-    // These counters are updated with __atomic_fetch_add from the I/O
-    // thread(s) in Slice::markSuccess/markFailed; read them atomically here to
-    // match MultiTransport::getTransferStatus and avoid a data race with the
-    // completion path (the read runs on the polling submission thread).
-    status.transferred_bytes =
-        __atomic_load_n(&task.transferred_bytes, __ATOMIC_ACQUIRE);
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
         __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Acquire completion counters before reading the bytes they publish.
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
             status.s = TransferStatusEnum::FAILED;

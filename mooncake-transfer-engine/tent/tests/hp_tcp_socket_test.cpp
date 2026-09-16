@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <optional>
 #include <thread>
 
@@ -61,13 +62,15 @@ __attribute__((no_sanitize("thread"))) bool SocketOrderedEqual(
 
 class Runtime {
    public:
-    explicit Runtime(size_t max_connections = 16, uint64_t timeout_ms = 500)
+    explicit Runtime(size_t max_connections = 16, uint64_t timeout_ms = 500,
+                     uint64_t idle_timeout_ms = 60000)
         : workers({.worker_count = 2}),
           client({.max_transfer_bytes = 1 << 20,
                   .chunk_size = 128,
                   .connect_timeout_ms = 500,
                   .progress_timeout_ms = timeout_ms,
-                  .connections_per_peer = 2},
+                  .connections_per_peer = 2,
+                  .idle_connection_timeout_ms = idle_timeout_ms},
                  &workers),
           server({.bind_address = "127.0.0.1",
                   .port = 0,
@@ -168,6 +171,116 @@ TEST(HighPerformanceTcpSocketTest, WriteReadAndReuseConnection) {
     EXPECT_EQ(read.status, COMPLETED);
     EXPECT_TRUE(SocketOrderedEqual(destination, source));
     EXPECT_EQ(runtime.client.connectionsCreatedForTest(), 1u);
+}
+
+TEST(HighPerformanceTcpSocketTest, IdleClientsReleaseCapacityAndReconnect) {
+    std::array<uint8_t, 4> remote{};
+    std::array<uint8_t, 4> source{1, 2, 3, 4};
+    Runtime runtime(/*max_connections=*/2, /*timeout_ms=*/500,
+                    /*idle_timeout_ms=*/500);
+    runtime.start();
+    uint64_t registration = 0;
+    ASSERT_TRUE(runtime.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+    uint64_t request_id = 1;
+    auto write = [&](SegmentID peer_id, Completion& completion) {
+        auto operation =
+            Operation(source.data(), source.size(),
+                      reinterpret_cast<uint64_t>(remote.data()), registration,
+                      request_id++, HighPerformanceTcpOpcode::kWrite,
+                      &completion, runtime.port);
+        operation.peer_id = peer_id;
+        return runtime.submit(std::move(operation));
+    };
+    for (SegmentID peer_id : {1, 2}) {
+        Completion completion;
+        ASSERT_TRUE(write(peer_id, completion).ok());
+        ASSERT_TRUE(completion.wait());
+        ASSERT_EQ(completion.status, COMPLETED);
+    }
+    ASSERT_EQ(runtime.server.activeSessionsForTest(), 2u);
+    Completion rejected;
+    ASSERT_TRUE(write(3, rejected).ok());
+    ASSERT_TRUE(rejected.wait());
+    EXPECT_EQ(rejected.status, FAILED);
+
+    // Completed historical traffic must eventually give up receiver slots.
+    // No server eviction or explicit client shutdown is needed.
+    ASSERT_TRUE(
+        WaitUntil([&] { return runtime.server.activeSessionsForTest() == 0; }));
+    Completion newcomer;
+    ASSERT_TRUE(write(3, newcomer).ok());
+    ASSERT_TRUE(newcomer.wait());
+    ASSERT_EQ(newcomer.status, COMPLETED);
+    EXPECT_TRUE(SocketOrderedEqual(remote, source));
+
+    // The original lane remains usable after its socket was reclaimed.
+    source.fill(0x5a);
+    Completion reconnect;
+    ASSERT_TRUE(write(1, reconnect).ok());
+    ASSERT_TRUE(reconnect.wait());
+    EXPECT_EQ(reconnect.status, COMPLETED);
+    EXPECT_EQ(reconnect.bytes, source.size());
+    EXPECT_FALSE(reconnect.protocol_status.has_value());
+    EXPECT_TRUE(SocketOrderedEqual(remote, source));
+}
+
+TEST(HighPerformanceTcpSocketTest, IdleTimerDoesNotExpireActiveOrQueuedWrites) {
+    std::array<uint8_t, 4> remote{};
+    std::array<uint8_t, 4> source{1, 2, 3, 4};
+    Runtime receiver(/*max_connections=*/16, /*timeout_ms=*/1000);
+    Runtime sender(/*max_connections=*/16, /*timeout_ms=*/1000,
+                   /*idle_timeout_ms=*/100);
+    receiver.start();
+    sender.start();
+    uint64_t registration = 0;
+    ASSERT_TRUE(receiver.registry
+                    .add(reinterpret_cast<uint64_t>(remote.data()),
+                         remote.size(), kGlobalReadWrite, &registration)
+                    .ok());
+    auto write = [&](uint64_t id, Completion& completion) {
+        return sender.submit(Operation(
+            source.data(), source.size(),
+            reinterpret_cast<uint64_t>(remote.data()), registration, id,
+            HighPerformanceTcpOpcode::kWrite, &completion, receiver.port));
+    };
+    Completion warm;
+    ASSERT_TRUE(write(1, warm).ok());
+    ASSERT_TRUE(warm.wait());
+    ASSERT_EQ(warm.status, COMPLETED);
+
+    // The first accepted session belongs to receiver worker 0. Hold it while
+    // the client's old idle deadline passes, with one WRITE awaiting its ACK
+    // and another queued. Sender workers and their timers keep running.
+    std::promise<void> entered;
+    std::promise<void> release;
+    auto resume = release.get_future().share();
+    asio::post(receiver.workers.ioContext(0), [&] {
+        entered.set_value();
+        resume.wait();
+    });
+    const auto entered_status = entered.get_future().wait_for(2s);
+    Completion first;
+    Completion second;
+    const Status submit_first = write(2, first);
+    const Status submit_second = write(3, second);
+    std::this_thread::sleep_for(200ms);
+    const bool prematurely_done = first.done.load(std::memory_order_acquire) ||
+                                  second.done.load(std::memory_order_acquire);
+    release.set_value();
+
+    ASSERT_EQ(entered_status, std::future_status::ready);
+    ASSERT_TRUE(submit_first.ok());
+    ASSERT_TRUE(submit_second.ok());
+    EXPECT_FALSE(prematurely_done);
+    ASSERT_TRUE(first.wait());
+    ASSERT_TRUE(second.wait());
+    EXPECT_EQ(first.status, COMPLETED);
+    EXPECT_EQ(second.status, COMPLETED);
+    EXPECT_EQ(sender.client.connectionsCreatedForTest(), 1u);
+    EXPECT_TRUE(SocketOrderedEqual(remote, source));
 }
 
 TEST(HighPerformanceTcpSocketTest, RejectedWriteBodyCannotBecomeNextFrame) {

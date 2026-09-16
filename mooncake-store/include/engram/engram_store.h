@@ -1,11 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include "engram/engram_store_config.h"
+#include "replica.h"
 
 namespace mooncake {
 
@@ -14,7 +16,7 @@ class PyClient;
 namespace engram {
 
 /**
- * Mooncake backend for Engram embedding tables.
+ * Mooncake backend for all layers of a model's Engram embedding tables.
  *
  * This class intentionally owns only storage-side concerns:
  * - per-head table naming/layout in Mooncake Store
@@ -26,57 +28,60 @@ namespace engram {
  */
 class EngramStore {
    public:
-    EngramStore(int layer_id, const EngramStoreConfig& config,
+    EngramStore(const std::map<int, EngramStoreConfig>& layers,
                 std::shared_ptr<PyClient> store = nullptr);
 
     ~EngramStore() = default;
 
+    // Bind immutable caller-owned tables before lookup, without a Store client.
+    // The caller must keep these buffers alive until this EngramStore is
+    // destroyed.
+    int bind_local(int layer_id, const std::vector<const void*>& buffers,
+                   const std::vector<size_t>& sizes);
+
     /**
      * Lookup embedding rows for a batch of precomputed row IDs.
      * @param row_ids [B, L, H] precomputed row IDs, where H == num_heads
-     * @param output [B, L, H, D] output buffer
+     * Store-backed lookup requires registered output; local lookup does not.
+     * @param output [B, L, H, row_bytes] contiguous byte output buffer
      * @param output_size Size of output buffer in bytes
      * @return 0 on success, negative on error
      */
-    int lookup_rows(
-        const std::vector<std::vector<std::vector<int64_t>>>& row_ids,
-        void* output, size_t output_size) const;
+    int lookup_into(int layer_id, const int64_t* row_ids, int B, int L,
+                    void* output, size_t output_size) const;
+
+    std::vector<int> get_layer_ids() const;
+    std::vector<int64_t> get_table_vocab_sizes(int layer_id) const;
+    std::vector<std::string> get_store_keys(int layer_id) const;
+    int get_num_heads(int layer_id) const;
+    int get_row_bytes(int layer_id) const;
 
     /**
-     * Fast path for contiguous row-id buffers with shape [B, L, H].
-     */
-    int lookup_rows_contiguous(const int64_t* row_ids, int B, int L,
-                               void* output, size_t output_size) const;
-
-    std::vector<int64_t> get_table_vocab_sizes() const;
-    std::vector<std::string> get_store_keys() const;
-    int get_num_heads() const;
-    int get_embedding_dim() const;
-
-    /**
-     * Remove all head tables owned by this EngramStore layer from Mooncake
+     * Remove all head tables owned by the selected layer from Mooncake
      * Store. Missing keys are ignored. Returns the number of removed tables on
      * success, or a negative error code on failure.
      */
-    int remove_from_store(bool force = false);
+    int remove_from_store(int layer_id, bool force = false);
 
     /**
      * Populate Store with per-head embedding tensors.
-     * @param embedding_buffers Buffers for each head [N_h, D]
+     * @param embedding_buffers Byte buffers for each head [N_h, row_bytes]
      * @param buffer_sizes Size in bytes for each buffer
      * @return 0 on success, negative on error
      */
-    int populate(const std::vector<void*>& embedding_buffers,
-                 const std::vector<size_t>& buffer_sizes);
+    int populate(int layer_id, const std::vector<void*>& embedding_buffers,
+                 const std::vector<size_t>& buffer_sizes,
+                 const ReplicateConfig& config = ReplicateConfig{});
 
    private:
-    int lookup_rows_flat(const int64_t* row_ids, int B, int L, void* output,
-                         size_t output_size) const;
-
     std::shared_ptr<PyClient> store_;
-    std::vector<int64_t> table_vocab_sizes_;
-    int embedding_dim_;
-    std::vector<std::string> embed_keys_;
+    struct Layer {
+        EngramStoreConfig config;
+        std::vector<std::string> keys;
+        std::vector<const void*> local_tables;
+    };
+    const Layer& get_layer(int layer_id) const;
+    std::map<int, Layer> layers_;
 };
 
 }  // namespace engram

@@ -309,11 +309,14 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
 
     // Fallback for tasks without a transport pointer (legacy path)
-    status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count =
         __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
     uint64_t failed_slice_count =
         __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    // Completion counters publish the byte updates made by
+    // Slice::markSuccess().
+    status.transferred_bytes =
+        __atomic_load_n(&task.transferred_bytes, __ATOMIC_RELAXED);
     assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
@@ -375,7 +378,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+    if (batch_desc.status_cached.load(std::memory_order_acquire) ||
         task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         status.transferred_bytes =
@@ -407,9 +410,10 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.is_finished.store(true, std::memory_order_release);
         batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
-                                                 std::memory_order_release);
+                                                 std::memory_order_relaxed);
+        batch_desc.status_cached.store(true, std::memory_order_release);
+        batch_desc.is_finished.store(true, std::memory_order_release);
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }

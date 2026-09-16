@@ -180,14 +180,18 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
-# Stage migrated EP modules and the legacy Reshard package for the combined
-# wheel builder. Each tracked source remains in its authoritative tree.
+# Stage migrated root Python modules and the legacy Reshard package for the
+# combined-wheel builder. Each tracked source remains in its authoritative tree.
 MIGRATED_PYTHON_SOURCE_DIR="python/mooncake"
 MIGRATED_PYTHON_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake"
 MIGRATED_PYTHON_MODULES=(
     ep.py
     mooncake_ep_buffer.py
     mooncake_elastic_buffer.py
+    _administration.py
+    mooncake_ssd_register.py
+    mooncake_ssd_unregister.py
+    spdk_tgt_create.py
 )
 RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
 RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
@@ -436,6 +440,10 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# Bundle OpenSSL when required: the OSS adapter links libcrypto directly, and
+# target systems may not provide the OpenSSL ABI used by the wheel builder.
+# Keep libssl eligible too, so auditwheel can repair its libcrypto dependency.
+#
 # `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
 # its own wheel / CMake install and is upgraded independently of Mooncake, so
 # engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
@@ -460,8 +468,6 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude librtmp.so* \
     --exclude libssh.so* \
     --exclude libpsl.so* \
-    --exclude libssl.so* \
-    --exclude libcrypto.so* \
     --exclude libgssapi_krb5.so* \
     --exclude libldap.so* \
     --exclude liblber.so* \

@@ -121,13 +121,15 @@ Status ParseHpTcpTransportConfig(const Config& config,
                               &parsed.params.connect_timeout_ms));
     CHECK_STATUS(ReadUnsigned(hp_tcp, "progress_timeout_ms",
                               &parsed.params.progress_timeout_ms));
+    CHECK_STATUS(ReadUnsigned(hp_tcp, "idle_connection_timeout_ms",
+                              &parsed.params.idle_connection_timeout_ms));
 
     const auto& hp = parsed.params;
     if (parsed.enabled &&
         (hp.worker_count == 0 || hp.connections_per_peer == 0 ||
          hp.max_outstanding_tasks == 0 || hp.max_outstanding_bytes == 0 ||
          hp.max_transfer_bytes == 0 || hp.connect_timeout_ms == 0 ||
-         hp.progress_timeout_ms == 0)) {
+         hp.progress_timeout_ms == 0 || hp.idle_connection_timeout_ms == 0)) {
         return Invalid("transports/hp_tcp",
                        "contains zero or inconsistent limits");
     }
