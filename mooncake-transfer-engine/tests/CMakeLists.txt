@@ -502,7 +502,11 @@ endif()
 # Fake verbs cover MR-size overrides, metadata and rollback without RDMA
 # hardware.
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  add_executable(rdma_mr_override_test ${WORKSPACE}/rdma_mr_override_test.cpp)
+  # --wrap only rewrites references at the final link, not inside an already
+  # linked shared library. Include the RDMA objects directly so the fake verbs
+  # also intercept registration when BUILD_SHARED_LIBS is ON.
+  add_executable(rdma_mr_override_test ${WORKSPACE}/rdma_mr_override_test.cpp
+                                       $<TARGET_OBJECTS:rdma_transport>)
   target_link_libraries(rdma_mr_override_test PRIVATE transfer_engine gtest
                                                       gtest_main)
   target_link_options(rdma_mr_override_test PRIVATE "-Wl,--wrap=ibv_reg_mr"
