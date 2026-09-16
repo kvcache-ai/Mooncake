@@ -51,11 +51,17 @@ class GroupIndex {
         if (it == stripe.groups.end()) {
             return false;
         }
-        const bool erased = it->second.member_keys.erase(member_key) > 0;
-        if (erased && it->second.Empty()) {
+        // Heterogeneous lookup, then erase by iterator: the container has no
+        // heterogeneous erase of its own.
+        const auto member = it->second.member_keys.find(member_key);
+        if (member == it->second.member_keys.end()) {
+            return false;
+        }
+        it->second.member_keys.erase(member);
+        if (it->second.Empty()) {
             stripe.groups.erase(it);
         }
-        return erased;
+        return true;
     }
 
     [[nodiscard]] std::vector<std::string> Members(

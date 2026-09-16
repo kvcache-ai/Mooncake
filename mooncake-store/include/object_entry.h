@@ -38,8 +38,8 @@ class ObjectEntry {
     const std::string& group_id() const noexcept { return metadata_->group_id; }
 
     // Monotonic generation assigned by ObjectIndex at route publication
-    // (0 = never published). Lets a pinned handle distinguish itself from a
-    // later replacement of the same key; see ObjectIndex::IsCurrent.
+    // (0 = never published). Lets a holder distinguish the entry it holds from
+    // a later replacement of the same key.
     [[nodiscard]] uint64_t generation() const noexcept { return generation_; }
 
     // Per-key task state; at most one in-flight task per entry. Guarded by
