@@ -155,6 +155,38 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
 }
 #endif
 namespace mooncake {
+namespace {
+
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> ToTentOpCode(
+    TransferRequest::OpCode op_code) {
+    switch (op_code) {
+        case TransferRequest::READ:
+            return tent::Request::READ;
+        case TransferRequest::WRITE:
+            return tent::Request::WRITE;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<tent::IntentType> ToTentIntent(TransferIntent intent) {
+    switch (intent) {
+        case TransferIntent::kUnspecified:
+            return tent::IntentType::INTENT_UNSPEC;
+        case TransferIntent::kForegroundGet:
+            return tent::IntentType::FOREGROUND_GET;
+        case TransferIntent::kBackgroundPrefetch:
+            return tent::IntentType::BACKGROUND_PREFETCH;
+        case TransferIntent::kMigration:
+            return tent::IntentType::MIGRATION;
+        default:
+            return std::nullopt;
+    }
+}
+#endif
+
+}  // namespace
 
 #ifdef USE_NOF
 SpdkNofQos::SpdkNofQos(uint32_t block_size) {
@@ -863,60 +895,66 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+    if (!tent_engine_) {
+        VLOG(1) << "Waiting for transfer engine completion for batch "
+                << batch_id_;
 
-    // Wait directly on BatchDesc's condition variable.
-    auto& batch_desc = Transport::toBatchDesc(batch_id_);
-    bool completed;
-    bool failed = false;
+        // Wait directly on BatchDesc's condition variable.
+        auto& batch_desc = Transport::toBatchDesc(batch_id_);
+        bool completed;
+        bool failed = false;
 
-    // Fast path: if already finished, avoid taking the mutex and waiting.
-    // Use acquire here to pair with the writer's release-store, because this
-    // path may skip taking the mutex. It ensures all prior updates are visible.
-    completed = batch_desc.is_finished.load(std::memory_order_acquire);
-    if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to
-        // avoid missed notifications. The predicate is re-checked under the
-        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
-        // orders prior writes.
-        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
-        const int64_t elapsed_milliseconds =
-            getCurrentTimeInMilli() - start_ts_;
-        if (elapsed_milliseconds < timeout_milliseconds) {
-            completed = batch_desc.completion_cv.wait_for(
-                lock,
-                std::chrono::milliseconds(timeout_milliseconds -
-                                          elapsed_milliseconds),
-                [&batch_desc] {
-                    return batch_desc.is_finished.load(
-                        std::memory_order_relaxed);
-                });
+        // Fast path: if already finished, avoid taking the mutex and waiting.
+        // Use acquire here to pair with the writer's release-store, because
+        // this path may skip taking the mutex. It ensures all prior updates are
+        // visible.
+        completed = batch_desc.is_finished.load(std::memory_order_acquire);
+        if (!completed) {
+            // Use the same mutex as the notifier when updating the predicate to
+            // avoid missed notifications. The predicate is re-checked under the
+            // lock. Under the mutex, relaxed is sufficient; the mutex acquire
+            // orders prior writes.
+            std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+            const int64_t elapsed_milliseconds =
+                getCurrentTimeInMilli() - start_ts_;
+            if (elapsed_milliseconds < timeout_milliseconds) {
+                completed = batch_desc.completion_cv.wait_for(
+                    lock,
+                    std::chrono::milliseconds(timeout_milliseconds -
+                                              elapsed_milliseconds),
+                    [&batch_desc] {
+                        return batch_desc.is_finished.load(
+                            std::memory_order_relaxed);
+                    });
+            }
+        }  // Explicitly release completion_mutex before acquiring mutex_
+
+        // Once completion is observed, read failure flag.
+        if (completed) {
+            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
         }
-    }  // Explicitly release completion_mutex before acquiring mutex_
 
-    // Once completion is observed, read failure flag.
-    if (completed) {
-        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+        ErrorCode error_code =
+            completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
+                      : ErrorCode::TRANSFER_FAIL;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            set_result_internal(error_code);
+        }
+
+        if (completed) {
+            VLOG(1) << "Transfer engine operation completed for batch "
+                    << batch_id_
+                    << " with result: " << static_cast<int>(error_code);
+        } else {
+            LOG(ERROR) << "Failed to complete transfers after "
+                       << timeout_milliseconds << " milliseconds for batch "
+                       << batch_id_;
+        }
+        return;
     }
-
-    ErrorCode error_code =
-        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
-                  : ErrorCode::TRANSFER_FAIL;
-
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        set_result_internal(error_code);
-    }
-
-    if (completed) {
-        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
-                << " with result: " << static_cast<int>(error_code);
-    } else {
-        LOG(ERROR) << "Failed to complete transfers after "
-                   << timeout_milliseconds << " milliseconds for batch "
-                   << batch_id_;
-    }
-#else
+#endif
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
 
     while (true) {
@@ -940,7 +978,6 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
     }
-#endif
 }
 
 // ============================================================================
@@ -1010,7 +1047,8 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code, void* ptr, size_t size, int intent) {
+    TransferRequest::OpCode op_code, void* ptr, size_t size,
+    TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1068,7 +1106,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code, int intent) {
+    TransferRequest::OpCode op_code, TransferIntent intent) {
     if (replicas.size() != all_slices.size()) {
         LOG(ERROR) << "Mismatched replicas and slice lists";
         return std::nullopt;
@@ -1155,11 +1193,11 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 
 TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers,
-    int intent) {
+    TransferIntent intent) {
     if (tent_engine_) {
         auto mutable_transfers = transfers;
         for (auto& range : mutable_transfers) {
-            range.intent_type = intent;
+            range.intent_type = static_cast<int>(intent);
         }
         return engine_.submitScatter(mutable_transfers);
     }
@@ -1171,7 +1209,7 @@ TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
-    OffloadBufferAccess buffer_access, int intent) {
+    OffloadBufferAccess buffer_access, TransferIntent intent) {
     if (keys.size() != pointers.size()) {
         LOG(ERROR) << "Mismatched offload transfer argument counts";
         return std::nullopt;
@@ -1295,7 +1333,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests, int intent) {
+    std::vector<TransferRequest>& requests, TransferIntent intent) {
     const size_t batch_size = requests.size();
 
     BatchID batch_id = INVALID_BATCH_ID;
@@ -1310,16 +1348,30 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         }
         std::vector<tent::Request> tent_reqs;
         tent_reqs.reserve(requests.size());
+        auto tent_intent = ToTentIntent(intent);
+        if (!tent_intent) {
+            LOG(ERROR) << "Invalid TENT transfer intent: "
+                       << static_cast<int>(intent);
+            tent_engine_->freeBatch(batch_id);
+            return std::nullopt;
+        }
         for (auto& r : requests) {
+            auto tent_opcode = ToTentOpCode(r.opcode);
+            if (!tent_opcode) {
+                LOG(ERROR) << "Invalid TENT transfer opcode: "
+                           << static_cast<int>(r.opcode);
+                tent_engine_->freeBatch(batch_id);
+                return std::nullopt;
+            }
             tent::Request tr;
-            tr.opcode = static_cast<tent::Request::OpCode>(r.opcode);
+            tr.opcode = *tent_opcode;
             tr.source = r.source;
             tr.target_id = r.target_id;
             tr.target_offset = r.target_offset;
             tr.length = r.length;
             tr.transport_hint =
                 mooncake::tent::c_to_transport_hint(r.transport_hint);
-            tr.intent_type = static_cast<mooncake::tent::IntentType>(intent);
+            tr.intent_type = *tent_intent;
             tent_reqs.push_back(tr);
         }
         auto tent_status = tent_engine_->submitTransfer(batch_id, tent_reqs);
@@ -1354,7 +1406,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code, uint64_t src_offset, int intent) {
+    const TransferRequest::OpCode op_code, uint64_t src_offset,
+    TransferIntent intent) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -1408,7 +1461,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t src_offset, int intent) {
+    uint64_t src_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1427,7 +1480,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    uint64_t dst_offset, int intent) {
+    uint64_t dst_offset, TransferIntent intent) {
     TransferStrategy strategy = selectStrategy(handle, slices);
 
     if (strategy == TransferStrategy::LOCAL_MEMCPY) {
@@ -1446,7 +1499,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemoryWriteOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t src_offset, int intent) {
+    uint64_t src_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -1482,7 +1535,7 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
 std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    uint64_t dst_offset, int intent) {
+    uint64_t dst_offset, TransferIntent intent) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {

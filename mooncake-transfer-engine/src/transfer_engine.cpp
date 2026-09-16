@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cassert>
 #include <limits>
+#include <optional>
 #include <thread>
 #include <unordered_map>
 
@@ -350,6 +351,12 @@ std::string TransferEngine::showLinks(bool json) const {
 namespace mooncake {
 namespace {
 
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> toTentOpcode(
+    TransferRequest::OpCode opcode);
+std::optional<tent::IntentType> toTentIntent(int intent_type);
+#endif
+
 class TransferEngineShutdownToken : public ShutdownToken {
    public:
     explicit TransferEngineShutdownToken(TransferEngine* engine)
@@ -645,15 +652,18 @@ Status TransferEngine::submitTransfer(
         std::vector<mooncake::tent::Request> requests;
         for (auto& item : entries) {
             mooncake::tent::Request req;
-            req.opcode = (mooncake::tent::Request::OpCode)(int)item.opcode;
+            auto opcode = toTentOpcode(item.opcode);
+            auto intent = toTentIntent(item.intent_type);
+            if (!opcode || !intent)
+                return Status::InvalidArgument("invalid TENT transfer request");
+            req.opcode = *opcode;
             req.length = item.length;
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
-            req.intent_type =
-                static_cast<mooncake::tent::IntentType>(item.intent_type);
+            req.intent_type = *intent;
             requests.push_back(req);
         }
         auto status = impl_tent_->submitTransfer(batch_id, requests);
@@ -673,15 +683,18 @@ Status TransferEngine::submitTransferWithNotify(
         std::vector<mooncake::tent::Request> requests;
         for (auto& item : entries) {
             mooncake::tent::Request req;
-            req.opcode = (mooncake::tent::Request::OpCode)(int)item.opcode;
+            auto opcode = toTentOpcode(item.opcode);
+            auto intent = toTentIntent(item.intent_type);
+            if (!opcode || !intent)
+                return Status::InvalidArgument("invalid TENT transfer request");
+            req.opcode = *opcode;
             req.length = item.length;
             req.source = item.source;
             req.target_id = item.target_id;
             req.target_offset = item.target_offset;
             req.transport_hint =
                 mooncake::tent::c_to_transport_hint(item.transport_hint);
-            req.intent_type =
-                static_cast<mooncake::tent::IntentType>(item.intent_type);
+            req.intent_type = *intent;
             requests.push_back(req);
         }
         mooncake::tent::Notification notifi;
@@ -962,6 +975,50 @@ std::string TransferEngine::showLinks(bool json) const {
 #endif
 
 namespace mooncake {
+namespace {
+
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> toTentOpcode(
+    TransferRequest::OpCode opcode);
+std::optional<tent::IntentType> toTentIntent(int intent_type);
+#endif
+
+#ifdef USE_TENT
+std::optional<tent::Request::OpCode> toTentOpcode(
+    TransferRequest::OpCode opcode) {
+    switch (opcode) {
+        case TransferRequest::READ:
+            return tent::Request::READ;
+        case TransferRequest::WRITE:
+            return tent::Request::WRITE;
+        default:
+            return std::nullopt;
+    }
+}
+
+std::optional<tent::IntentType> toTentIntent(int intent_type) {
+    switch (intent_type) {
+        case 0:
+            return tent::IntentType::INTENT_UNSPEC;
+        case 1:
+            return tent::IntentType::FOREGROUND_GET;
+        case 2:
+            return tent::IntentType::BACKGROUND_PREFETCH;
+        case 3:
+            return tent::IntentType::MIGRATION;
+        case 4:
+            return tent::IntentType::CHECKPOINT;
+        case 5:
+            return tent::IntentType::WEIGHT_LOADING;
+        case 6:
+            return tent::IntentType::STAGING_INTERNAL;
+        default:
+            return std::nullopt;
+    }
+}
+#endif
+
+}  // namespace
 
 class TransferEngine::ScatterTransferOperation::Impl {
    public:
@@ -1085,6 +1142,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
         completed_ = true;
         callbacks_.clear();
         requests_.clear();
+#ifdef USE_TENT
+        tent_requests_.clear();
+#endif
         request_fragments_.clear();
         done_.clear();
         task_sizes_.clear();
@@ -1182,9 +1242,20 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     auto [segment, inserted] = segment_handles_.emplace(
                         range.remote_segment,
                         static_cast<SegmentHandle>(ERR_INVALID_ARGUMENT));
-                    if (inserted)
-                        segment->second =
-                            engine.openSegment(range.remote_segment);
+                    if (inserted) {
+#ifdef USE_TENT
+                        if (useTent()) {
+                            tent::SegmentID segment_id;
+                            auto status = backend_.tent->openSegment(
+                                segment_id, range.remote_segment);
+                            if (status.ok()) segment->second = segment_id;
+                        } else
+#endif
+                        {
+                            segment->second =
+                                engine.openSegment(range.remote_segment);
+                        }
+                    }
                     segment_handle = &segment->second;
                 }
                 if (*segment_handle ==
@@ -1195,6 +1266,20 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     continue;
                 }
 
+#ifdef USE_TENT
+                std::optional<tent::Request::OpCode> tent_opcode;
+                std::optional<tent::IntentType> tent_intent;
+                if (useTent()) {
+                    tent_opcode = toTentOpcode(range.opcode);
+                    tent_intent = toTentIntent(range.intent_type);
+                    if (!tent_opcode || !tent_intent) {
+                        complete(range_index, fragment_index,
+                                 Status::InvalidArgument(
+                                     "invalid TENT scatter transfer request"));
+                        continue;
+                    }
+                }
+#endif
                 TransferRequest req{
                     .opcode = range.opcode,
                     .source =
@@ -1206,6 +1291,18 @@ class TransferEngine::ScatterTransferOperation::Impl {
                 };
                 req.intent_type = range.intent_type;
                 requests_.push_back(req);
+#ifdef USE_TENT
+                if (useTent()) {
+                    tent::Request tent_request;
+                    tent_request.opcode = *tent_opcode;
+                    tent_request.source = req.source;
+                    tent_request.target_id = req.target_id;
+                    tent_request.target_offset = req.target_offset;
+                    tent_request.length = req.length;
+                    tent_request.intent_type = *tent_intent;
+                    tent_requests_.push_back(tent_request);
+                }
+#endif
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
         }
@@ -1219,9 +1316,19 @@ class TransferEngine::ScatterTransferOperation::Impl {
         Status submit_status = Status::OK();
         if (useTent()) {
             task_sizes_.assign(requests_.size(), 1);
-            batch_id_ = engine.allocateBatchID(requests_.size());
-            if (batch_id_ != INVALID_BATCH_ID)
-                submit_status = engine.submitTransfer(batch_id_, requests_);
+#ifdef USE_TENT
+            batch_id_ = backend_.tent->allocateBatch(requests_.size());
+            if (batch_id_ == 0) {
+                batch_id_ = INVALID_BATCH_ID;
+                submit_status = Status::InvalidArgument(
+                    "failed to allocate TENT scatter transfer batch");
+            } else {
+                auto status =
+                    backend_.tent->submitTransfer(batch_id_, tent_requests_);
+                if (!status.ok())
+                    submit_status = Status::Context(status.ToString());
+            }
+#endif
         } else {
             MultiTransport::ScatterSubmission submission;
             submit_status =
@@ -1344,6 +1451,9 @@ class TransferEngine::ScatterTransferOperation::Impl {
 
     Backend backend_;
     std::vector<TransferRequest> requests_;
+#ifdef USE_TENT
+    std::vector<tent::Request> tent_requests_;
+#endif
     std::vector<std::pair<size_t, size_t>> request_fragments_;
     std::vector<std::function<void(size_t, const Status&)>> callbacks_;
     std::unordered_map<std::string, SegmentHandle> segment_handles_;

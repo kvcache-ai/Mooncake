@@ -67,6 +67,22 @@ class TransferTaskTest : public ::testing::Test {
     }
 };
 
+TEST(TransferIntentTest, UsesStableNamedValues) {
+    EXPECT_EQ(static_cast<int>(TransferIntent::kUnspecified), 0);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kForegroundGet), 1);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kBackgroundPrefetch), 2);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kMigration), 3);
+}
+
+TEST(TransferIntentTest, ParsesLegacyIntegerValues) {
+    EXPECT_EQ(TransferIntentFromInt(0), TransferIntent::kUnspecified);
+    EXPECT_EQ(TransferIntentFromInt(1), TransferIntent::kForegroundGet);
+    EXPECT_EQ(TransferIntentFromInt(2), TransferIntent::kBackgroundPrefetch);
+    EXPECT_EQ(TransferIntentFromInt(3), TransferIntent::kMigration);
+    EXPECT_FALSE(TransferIntentFromInt(-1).has_value());
+    EXPECT_FALSE(TransferIntentFromInt(4).has_value());
+}
+
 // Test MemcpyOperationState functionality
 TEST_F(TransferTaskTest, MemcpyOperationState) {
     auto state = std::make_shared<MemcpyOperationState>();
@@ -341,14 +357,16 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
         TransferSubmitter submitter(engine, backend, endpoint);
         auto future = submitter.submit_batch_get_offload_object(
             endpoint, keys, pointers, slices,
-            OffloadBufferAccess::kLocalAddress, 2);
+            OffloadBufferAccess::kLocalAddress,
+            TransferIntent::kBackgroundPrefetch);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
         EXPECT_EQ(future->get(), ErrorCode::OK);
         EXPECT_FALSE(submitter.submit_batch_get_offload_object(
             endpoint, keys, {std::numeric_limits<uint64_t>::max() - 7},
             {{"key", {{destination.data(), 16}}}},
-            OffloadBufferAccess::kLocalAddress, 2));
+            OffloadBufferAccess::kLocalAddress,
+            TransferIntent::kBackgroundPrefetch));
     }
     EXPECT_EQ(destination, source);
 
@@ -357,7 +375,7 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectHonorsLocalMemcpySetting) {
     TransferSubmitter submitter(engine, backend, endpoint);
     EXPECT_FALSE(submitter.submit_batch_get_offload_object(
         endpoint, keys, pointers, slices, OffloadBufferAccess::kLocalAddress,
-        2));
+        TransferIntent::kBackgroundPrefetch));
     EXPECT_EQ(engine.freeEngine(), 0);
 }
 
@@ -390,7 +408,8 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectCopiesPinnedHostToGpu) {
             {reinterpret_cast<uintptr_t>(static_cast<char*>(pinned_source) +
                                          kSourceOffset)},
             {{"gpu", {{gpu_destination, kSize}}}},
-            OffloadBufferAccess::kLocalAddress, 2);
+            OffloadBufferAccess::kLocalAddress,
+            TransferIntent::kBackgroundPrefetch);
         ASSERT_TRUE(future);
         EXPECT_EQ(future->get(), ErrorCode::OK);
     }
@@ -462,8 +481,9 @@ TEST_F(TransferTaskTest, BatchWriteHonorsLocalMemcpySetting) {
                                     engine.getLocalIpAndPort());
         std::vector<std::vector<Slice>> slices{
             {{source.data(), source.size()}}};
-        auto future = submitter.submit_batch({replica}, slices,
-                                             TransferRequest::WRITE, 1);
+        auto future =
+            submitter.submit_batch({replica}, slices, TransferRequest::WRITE,
+                                   TransferIntent::kUnspecified);
 
         ASSERT_TRUE(future);
         EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
