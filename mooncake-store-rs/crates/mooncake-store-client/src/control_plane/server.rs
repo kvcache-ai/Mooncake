@@ -106,7 +106,9 @@ impl ControlPlaneHandle {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
-        self.thread.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -179,16 +181,16 @@ fn run_server(
         let listener = tokio::net::TcpListener::from_std(listener).map_err(|error| {
             StoreError::Transport(format!("control plane listener conversion failed: {error}"))
         })?;
-        Server::builder()
+        let server = Server::builder()
             .tcp_nodelay(true)
             .add_service(pb::control_plane_service_server::ControlPlaneServiceServer::new(service))
-            .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
-                let _ = shutdown.await;
-            })
-            .await
-            .map_err(|error| {
+            .serve_with_incoming(TcpListenerStream::new(listener));
+        tokio::select! {
+            result = server => result.map_err(|error| {
                 StoreError::Transport(format!("control plane gRPC server failed: {error}"))
-            })
+            }),
+            _ = shutdown => Ok(()),
+        }
     });
     if let Err(error) = result {
         warn!(error = %error, "control plane server terminated with error");
