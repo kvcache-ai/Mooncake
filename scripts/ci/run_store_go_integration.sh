@@ -37,23 +37,20 @@ export CGO_ENABLED=1
 export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
 
 # master_service.cpp (inside libmooncake_store.a) calls into LocalSsdManager,
-# which lives in its own static archive under local_ssd/. Link it inside the
-# group so cyclic references resolve.
-local_ssd_lib=()
-if [ -f "$GITHUB_WORKSPACE/build/mooncake-store/src/local_ssd/libmooncake_local_ssd.a" ]; then
-    local_ssd_lib=("-L$GITHUB_WORKSPACE/build/mooncake-store/src/local_ssd" -lmooncake_local_ssd)
-fi
-
+# which lives in its own static archive under local_ssd/. It is built
+# unconditionally and is a required dependency of mooncake_store, so link it
+# inside the group where cyclic references resolve.
 linker_flags=(
     "-L$GITHUB_WORKSPACE/build/mooncake-store/src"
     "-L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator"
+    "-L$GITHUB_WORKSPACE/build/mooncake-store/src/local_ssd"
     "-L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src"
     "-L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base"
     "-L$GITHUB_WORKSPACE/build/mooncake-common"
     "-L$GITHUB_WORKSPACE/build/mooncake-common/src"
     "-L$GITHUB_WORKSPACE/build/mooncake-common/etcd"
     -Wl,--start-group
-    -lmooncake_store "${local_ssd_lib[@]}" -lcachelib_memory_allocator -ltransfer_engine -lbase
+    -lmooncake_store -lmooncake_local_ssd -lcachelib_memory_allocator -ltransfer_engine -lbase
     -lmooncake_common
     -Wl,--end-group
 )

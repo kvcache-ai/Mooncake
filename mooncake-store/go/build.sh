@@ -36,19 +36,17 @@ CGO_CFLAGS+=" -I${REPO_ROOT}/mooncake-transfer-engine/include"
 
 # CGo linker flags — link against mooncake_store, transfer_engine, and deps
 # master_service.cpp (inside libmooncake_store.a) calls into LocalSsdManager,
-# which lives in its own static archive under local_ssd/. Link it inside the
-# group so cyclic references resolve.
-local_ssd_lib=()
-if [ -f "${BUILD_DIR}/mooncake-store/src/local_ssd/libmooncake_local_ssd.a" ]; then
-    local_ssd_lib=("-L${BUILD_DIR}/mooncake-store/src/local_ssd" -lmooncake_local_ssd)
-fi
+# which lives in its own static archive under local_ssd/. It is built
+# unconditionally and is a required dependency of mooncake_store, so link it
+# inside the group where cyclic references resolve.
 CGO_LDFLAGS="-L${BUILD_DIR}/mooncake-store/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-store/src/cachelib_memory_allocator"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-store/src/local_ssd"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
-CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store ${local_ssd_lib[@]} -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group"
+CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store -lmooncake_local_ssd -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group"
 CGO_LDFLAGS+=" -lasio -lxxhash -lyaml-cpp"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -lm"
 
