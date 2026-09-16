@@ -93,6 +93,9 @@ production `OpLogApplier` and `StandbyMetadataStore`: exact object metadata,
 tenant isolation, deleted/revoked objects, Segment state, replay cursor, replica
 IDs, and duplicate replay idempotence are checked. Memory addresses in descriptors
 are fixtures; no data buffers are dereferenced or serving resources rebuilt.
+The [P02 gating notes](results/2026-09-16/RESULTS.md#p02-codec-decision-versus-production-rollout)
+separate codec/schema evidence from the serving-recovery validation required for
+production rollout, including cases where descriptor semantics affect selection.
 
 The bridge deliberately does extra JSON/binary conversions: its latency is
 **not a binary storage-throughput benchmark**. This is storage correctness E2E,
