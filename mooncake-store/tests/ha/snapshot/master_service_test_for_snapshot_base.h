@@ -1,6 +1,7 @@
 #pragma once
 
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "master_snapshot_manager.h"
 #include "master_metric_manager.h"
 #include "segment.h"
@@ -161,16 +162,15 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
-    // Wrapper method: Call MasterSnapshotManager's PersistState through
-    // MasterService This class is a friend of MasterService, so it can access
-    // private members
+    // Persist the master's snapshot using state exposed by the test peer.
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
         std::unique_lock<std::shared_mutex> snapshot_lock(
-            service->snapshot_mutex_);
+            MasterServiceTestPeer::SnapshotMutex(*service));
         // If snapshot_manager_ exists, use it; otherwise create a temporary one
-        if (service->snapshot_manager_) {
-            return service->snapshot_manager_->PersistState(snapshot_id);
+        if (MasterServiceTestPeer::SnapshotManager(*service)) {
+            return MasterServiceTestPeer::SnapshotManager(*service)
+                ->PersistState(snapshot_id);
         }
 
         // For tests that don't have snapshot_manager_ initialized,
@@ -186,22 +186,24 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         options.use_snapshot_backup_dir = false;
 
         auto temp_manager = std::make_unique<MasterSnapshotManager>(
-            service, options, service->snapshot_mutex_,
-            service->snapshot_object_store_.get(),
-            service->snapshot_catalog_store_.get());
+            service, options, MasterServiceTestPeer::SnapshotMutex(*service),
+            MasterServiceTestPeer::SnapshotObjectStore(*service).get(),
+            MasterServiceTestPeer::SnapshotCatalogStore(*service).get());
 
         return temp_manager->PersistState(snapshot_id);
     }
 
     static void EnsureSnapshotStores(MasterService* service) {
-        if (!service->snapshot_object_store_) {
-            service->snapshot_object_store_ = SnapshotObjectStore::Create(
-                SnapshotObjectStoreType::LOCAL_FILE);
+        if (!MasterServiceTestPeer::SnapshotObjectStore(*service)) {
+            MasterServiceTestPeer::SnapshotObjectStore(*service) =
+                SnapshotObjectStore::Create(
+                    SnapshotObjectStoreType::LOCAL_FILE);
         }
-        if (!service->snapshot_catalog_store_ &&
-            service->snapshot_object_store_) {
-            service->snapshot_catalog_store_ =
-                service->CreateSnapshotCatalogStore(MasterServiceConfig{});
+        if (!MasterServiceTestPeer::SnapshotCatalogStore(*service) &&
+            MasterServiceTestPeer::SnapshotObjectStore(*service)) {
+            MasterServiceTestPeer::SnapshotCatalogStore(*service) =
+                MasterServiceTestPeer(*service).CreateSnapshotCatalogStore(
+                    MasterServiceConfig{});
         }
     }
 
@@ -279,7 +281,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
         // === LocalSSD persisted state ===
         {
-            auto access = service->segment_manager_.getAllocatorAccess();
+            auto access = MasterServiceTestPeer::SegmentManager(*service)
+                              .getAllocatorAccess();
             for (const auto& name : state.all_segments) {
                 auto client_id = access.GetOwnerClientId(name);
                 if (client_id) {
@@ -287,7 +290,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 }
             }
             for (const auto& [client_id, client] :
-                 service->local_ssd_manager_.ExportPersistedState()) {
+                 MasterServiceTestPeer::LocalSsdManager(*service)
+                     .ExportPersistedState()) {
                 LocalDiskSegmentState seg_state;
                 seg_state.enable_offloading = client.enable_offloading;
                 seg_state.offloading_objects = client.pending_offloads;
@@ -295,9 +299,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             }
         }
 
-        // === TaskManager State (via friend access) ===
+        // === TaskManager State (via test peer) ===
         {
-            auto read_access = service->task_manager_.get_read_access();
+            auto read_access =
+                MasterServiceTestPeer::TaskManager(*service).get_read_access();
             for (const auto& [task_id, task] : read_access) {
                 TaskState task_state;
                 task_state.id = task.id;
@@ -752,22 +757,31 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     static void AssertRestoredClientAffiliations(MasterService* service) {
         std::unordered_set<const ClientLivenessRecord*> known_records;
         {
-            auto segment_access = service->segment_manager_.getSegmentAccess();
+            auto segment_access =
+                MasterServiceTestPeer::SegmentManager(*service)
+                    .getSegmentAccess();
             std::vector<std::pair<Segment, UUID>> segments;
             ASSERT_EQ(segment_access.GetAllSegments(segments), ErrorCode::OK);
             for (const auto& [segment, owner] : segments) {
                 (void)segment;
                 const auto record =
-                    service->client_liveness_records_.find(owner);
-                ASSERT_NE(record, service->client_liveness_records_.end());
+                    MasterServiceTestPeer::ClientLivenessRecords(*service).find(
+                        owner);
+                ASSERT_NE(record,
+                          MasterServiceTestPeer::ClientLivenessRecords(*service)
+                              .end());
                 known_records.insert(record->second.get());
             }
         }
-        for (const auto& owner : service->local_ssd_manager_.GetClientIds()) {
-            ASSERT_TRUE(service->client_liveness_records_.contains(owner));
+        for (const auto& owner :
+             MasterServiceTestPeer::LocalSsdManager(*service).GetClientIds()) {
+            ASSERT_TRUE(
+                MasterServiceTestPeer::ClientLivenessRecords(*service).contains(
+                    owner));
         }
 
-        for (const auto& shard : service->metadata_shards_) {
+        for (const auto& shard :
+             MasterServiceTestPeer::MetadataShards(*service)) {
             for (const auto& [tenant_id, tenant_state] : shard.tenants) {
                 (void)tenant_id;
                 for (const auto& [key, metadata] : tenant_state.metadata) {
@@ -782,9 +796,14 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                                 replica.get_local_disk_client_id();
                             ASSERT_TRUE(owner.has_value());
                             const auto record =
-                                service->client_liveness_records_.find(*owner);
-                            ASSERT_NE(record,
-                                      service->client_liveness_records_.end());
+                                MasterServiceTestPeer::ClientLivenessRecords(
+                                    *service)
+                                    .find(*owner);
+                            ASSERT_NE(
+                                record,
+                                MasterServiceTestPeer::ClientLivenessRecords(
+                                    *service)
+                                    .end());
                             EXPECT_TRUE(
                                 replica.isAffiliatedWith(record->second));
                         }
@@ -815,7 +834,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_object_store_type("local")
-                .set_root_fs_dir(service->root_fs_dir_)
+                .set_root_fs_dir(MasterServiceTestPeer::RootFsDir(*service))
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
@@ -880,9 +899,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // eviction worker can otherwise mutate replica metadata while the
         // snapshot is being serialized, making the post-restore comparison
         // compare two different points in time.
-        service_->eviction_running_ = false;
-        if (service_->eviction_thread_.joinable()) {
-            service_->eviction_thread_.join();
+        MasterServiceTestPeer::EvictionRunning(*service_) = false;
+        if (MasterServiceTestPeer::EvictionThread(*service_).joinable()) {
+            MasterServiceTestPeer::EvictionThread(*service_).join();
         }
 
         // Some test configs may not enable snapshot/restore, so the backend

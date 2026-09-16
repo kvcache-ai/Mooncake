@@ -8,6 +8,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     etcd_helper.cpp
     uds_transport.cpp
     config/distributed_storage_config.cpp
+    config/rpc_protocol_config.cpp
     storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     common/file_util.cpp)
@@ -16,6 +17,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
     config/local_file_snapshot_config.cpp
+    config/redis_connection_config.cpp
     segment_allocator_registration.cpp
     client_offboarding.cpp
     master_service.cpp
@@ -28,6 +30,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     segment/catalog.cpp
     segment/pool.cpp
     segment/pool_mount.cpp
+    segment/snapshot.cpp
+    ha/snapshot/allocator_snapshot_codec.cpp
+    ha/snapshot/store_resource_snapshot_codec.cpp
     segment/pool_write_access.cpp
     segment/pool_read_access.cpp
     segment.cpp
@@ -55,6 +60,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.cpp
     ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.cpp
+    ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.cpp
     ha/snapshot/snapshot_maintenance_lease.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/local_ssd_codec.cpp
@@ -80,6 +86,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
 set(MOONCAKE_STORE_CLIENT_SOURCES
     common/client_buffer_allocation.cpp
     mmap_arena.cpp
+    config/hugepage_config.cpp
     config/mmap_arena_config.cpp
     common/mmap_buffer.cpp
     client_service.cpp
@@ -89,6 +96,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     nvme_kv_backend.cpp
     nvme_kv_connector.cpp
     config/nvme_kv_connector_config.cpp
+    config/nvme_kv_io_concurrency_config.cpp
     config/nvme_kv_u32_parser.cpp
     nvme_kv_executor_io_uring.cpp
     nvme_kv_executor_ioctl.cpp
@@ -108,8 +116,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     file_storage.cpp
     config/client_metric_config.cpp
     config/file_storage_config.cpp
+    config/bucket_backend_config.cpp
     config/file_per_key_config.cpp
     config/client_auto_port_config.cpp
+    config/client_auto_discovery_config.cpp
     config/cxl_segment_config.cpp
     config/client_numa_config.cpp
     config/local_hot_cache_config.cpp
@@ -117,6 +127,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     config/offset_allocator_backend_config.cpp
     config/replica_selection_config.cpp
     config/rpc_timeout_config.cpp
+    config/spdk_controller_config.cpp
     config/transfer_submitter_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
@@ -174,6 +185,26 @@ int main(int argc, char**) {
       message(FATAL_ERROR "16-byte atomic operations are not supported")
     endif()
   endif()
+endif()
+
+# Alibaba Cloud OSS adapter (REST API with OSS V4 signing).
+find_package(CURL QUIET)
+find_package(OpenSSL QUIET)
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "Alibaba Cloud OSS adapter: Enabled")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES config/oss_adapter_config.cpp
+       storage/distributed/oss_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_OSS_ADAPTER)
+else()
+  message(
+    STATUS "Alibaba Cloud OSS adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
 endif()
 
 # Find AWS SDK
@@ -445,8 +476,9 @@ add_library(mooncake_store_client_objects OBJECT
             ${MOONCAKE_STORE_CLIENT_SOURCES})
 set_target_properties(mooncake_store_client_objects
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_include_directories(mooncake_store_client_objects
-                           PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS})
+target_include_directories(
+  mooncake_store_client_objects PRIVATE ${MOONCAKE_STORE_INCLUDE_DIRS}
+                                        ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(
   mooncake_store_client_objects
   PRIVATE mooncake_store_shared_objects

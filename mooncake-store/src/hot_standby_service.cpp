@@ -7,7 +7,9 @@
 #include <thread>
 
 #include "etcd_helper.h"
+#ifdef STORE_USE_ETCD
 #include "ha/kv/etcd_ha_kv_backend.h"
+#endif
 #include "ha_metric_manager.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_batch_standby_reader.h"
@@ -96,6 +98,7 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     }
 
     last_error_.store(ErrorCode::OK, std::memory_order_release);
+    recovering_.store(false, std::memory_order_release);
 
     // Trigger START event
     auto result = state_machine_.ProcessEvent(StandbyEvent::START);
@@ -109,8 +112,10 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
     cluster_id_ = cluster_id;
 
     if (config_.enable_oplog_following) {
-#ifdef STORE_USE_ETCD
+        // Injected test backends exercise the production Start/replication
+        // path without a live etcd cluster (and without STORE_USE_ETCD).
         if (!catch_up_batch_kv_backend_for_testing_) {
+#ifdef STORE_USE_ETCD
             ErrorCode err =
                 EtcdHelper::ConnectToEtcdStoreClient(oplog_endpoints.c_str());
             if (err != ErrorCode::OK) {
@@ -118,16 +123,14 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
                 state_machine_.ProcessEvent(StandbyEvent::CONNECTION_FAILED);
                 return err;
             }
-        }
 #else
-        // Without STORE_USE_ETCD, the following loop needs an injected test
-        // backend.
-        if (!catch_up_batch_kv_backend_for_testing_) {
+            // Without STORE_USE_ETCD, the following loop needs an injected
+            // test backend.
             state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
             LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
             return ErrorCode::INTERNAL_ERROR;
-        }
 #endif
+        }
     }
 
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
@@ -302,7 +305,13 @@ ErrorCode HotStandbyService::StartOplogFollowingLocked(
     if (catch_up_batch_kv_backend_for_testing_) {
         batch_standby_kv_backend_ = catch_up_batch_kv_backend_for_testing_;
     } else {
+#ifdef STORE_USE_ETCD
         batch_standby_kv_backend_ = std::make_shared<EtcdHaKvBackend>();
+#else
+        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+        LOG(ERROR) << "Batch-record OpLog requires STORE_USE_ETCD";
+        return ErrorCode::INTERNAL_ERROR;
+#endif
     }
     batch_standby_reader_ = std::make_unique<OpLogBatchStandbyReader>(
         cluster_id_, *batch_standby_kv_backend_, *oplog_applier_);
@@ -449,16 +458,9 @@ void HotStandbyService::NotifySnapshotStop() {
 StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     StandbySyncStatus status;
 
-    // Get applied sequence ID from OpLogApplier
-    if (oplog_applier_) {
-        uint64_t expected = oplog_applier_->GetExpectedSequenceId();
-        status.applied_seq_id = (expected > 0) ? (expected - 1) : 0;
-        if (status.applied_seq_id == 0) {
-            status.applied_seq_id = applied_seq_id_.load();  // Fallback
-        }
-    } else {
-        status.applied_seq_id = applied_seq_id_.load();
-    }
+    // Callbacks can query status while mutex_ is held or state is swapped.
+    status.applied_seq_id = applied_seq_id_.load();
+    status.is_recovering = recovering_.load(std::memory_order_acquire);
 
     // Primary sequence ID (best-effort): updated by ReplicationLoop via etcd
     // `/latest`.
@@ -485,6 +487,9 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
 }
 
 bool HotStandbyService::IsReadyForPromotion() const {
+    if (recovering_.load(std::memory_order_acquire)) {
+        return false;
+    }
     // Use state machine to check if ready for promotion
     if (!state_machine_.IsReadyForPromotion()) {
         return false;
@@ -527,8 +532,13 @@ ErrorCode HotStandbyService::FinalCatchUpForPromotionLocked(
             *catch_up_batch_kv_backend_for_testing_, policy);
     }
 
+#ifdef STORE_USE_ETCD
     EtcdHaKvBackend batch_backend;
     return FinalCatchUpBatchRecordsLocked(batch_backend, policy);
+#else
+    LOG(ERROR) << "Final OpLog catch-up requires STORE_USE_ETCD";
+    return ErrorCode::INTERNAL_ERROR;
+#endif
 }
 
 ErrorCode HotStandbyService::FinalCatchUpBatchRecordsLocked(
@@ -658,6 +668,10 @@ ErrorCode HotStandbyService::PreparePromotionLocked(
     uint64_t current_applied_seq_id, PromotionCatchUpPolicy policy) {
     NotifySnapshotPromotion();
     StopReplicationLoop();
+    if (recovering_.load(std::memory_order_acquire)) {
+        state_machine_.ProcessEvent(StandbyEvent::PROMOTION_FAILED);
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
     ErrorCode catch_up_err =
         FinalCatchUpForPromotionLocked(current_applied_seq_id, policy);
     if (catch_up_err != ErrorCode::OK) {
@@ -886,8 +900,8 @@ HotStandbyService::BeginBatchOpLogSnapshotCapture() {
     std::unique_lock<std::mutex> service_lock(mutex_);
     auto state = snapshot_capture_state_;
     std::unique_lock<std::mutex> capture_lock(state->mutex);
-    if (!IsRunning() || !batch_standby_reader_ || state->requested ||
-        state->active) {
+    if (!IsRunning() || recovering_.load(std::memory_order_acquire) ||
+        !batch_standby_reader_ || state->requested || state->active) {
         return std::nullopt;
     }
 
@@ -1002,6 +1016,101 @@ void HotStandbyService::SetBatchOpLogSnapshotProvider(
     batch_oplog_snapshot_provider_ = std::move(provider);
 }
 
+ErrorCode HotStandbyService::RebootstrapBatchOpLog(uint64_t floor) {
+    recovering_.store(true, std::memory_order_release);
+    CancelSnapshotCapture();
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_.reset();
+    }
+    NotifySyncStatus();
+
+    // Stop/promotion can hold mutex_ while joining this worker. Never block
+    // on that mutex once the worker has been asked to stop.
+    auto lock_while_running = [this](std::unique_lock<std::mutex>& lock) {
+        while (replication_loop_running_.load(std::memory_order_acquire)) {
+            if (lock.try_lock()) {
+                return replication_loop_running_.load(
+                    std::memory_order_acquire);
+            }
+            std::unique_lock<std::mutex> wait_lock(replication_loop_mutex_);
+            replication_loop_cv_.wait_for(
+                wait_lock, std::chrono::milliseconds(1),
+                [this] { return !replication_loop_running_.load(); });
+        }
+        return false;
+    };
+    std::shared_ptr<BatchOpLogSnapshotProvider> provider;
+    {
+        std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+        if (!lock_while_running(lock)) return ErrorCode::ETCD_CTX_CANCELLED;
+        provider = batch_oplog_snapshot_provider_;
+    }
+    if (!provider) return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+
+    auto metadata = std::make_unique<StandbyMetadataStore>();
+    auto applier = std::make_unique<OpLogApplier>(metadata.get(), cluster_id_);
+    StandbySegmentRegistry registry;
+    auto restored = provider->RestoreBaseline(
+        *metadata, registry, applier.get(), floor, [this] {
+            return !replication_loop_running_.load(std::memory_order_acquire);
+        });
+    if (!restored) return restored.error();
+    auto reader = std::make_unique<OpLogBatchStandbyReader>(
+        cluster_id_, *batch_standby_kv_backend_, *applier);
+    const DurablePrefix baseline{.batch_id = restored->last_applied_batch_id,
+                                 .last_seq = restored->last_applied_seq};
+    auto err = reader->SetBaselineCursor(baseline);
+    if (err != ErrorCode::OK) return err;
+    // Recheck the floor and durable suffix after restoring the candidate.
+    OpLogBatchStandbyPollResult poll;
+    do {
+        if (!replication_loop_running_.load(std::memory_order_acquire)) {
+            return ErrorCode::ETCD_CTX_CANCELLED;
+        }
+        poll = reader->PollOnce();
+        if (poll.error != ErrorCode::OK) return poll.error;
+    } while (poll.durable_prefix_present &&
+             applier->GetExpectedSequenceId() - 1 <
+                 poll.durable_prefix.last_seq);
+    auto cursor = reader->GetLastAppliedDurablePrefix();
+    if (!poll.durable_prefix_present || !cursor ||
+        *cursor != poll.durable_prefix ||
+        cursor->last_seq < applied_seq_id_.load()) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    TestFailPoint::Wait("standby_rebootstrap_before_swap");
+    uint64_t current_floor = 0;
+    OpLogBatchStorage storage(cluster_id_, *batch_standby_kv_backend_);
+    err = storage.ReadCompactionFloor(current_floor);
+    if (err != ErrorCode::OK && err != ErrorCode::ETCD_KEY_NOT_EXIST)
+        return err;
+    if (err == ErrorCode::OK &&
+        restored->last_included_batch_id < current_floor) {
+        return ErrorCode::INCOMPLETE_OPLOG_CATCH_UP;
+    }
+    std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+    if (!lock_while_running(lock) || !IsRunning()) {
+        return ErrorCode::ETCD_CTX_CANCELLED;
+    }
+    // Swapping preserves old state until all replacement references exist.
+    // Locals destroy the old reader before its applier and metadata store.
+    metadata_store_.swap(metadata);
+    oplog_applier_.swap(applier);
+    batch_standby_reader_.swap(reader);
+    batch_snapshot_baseline_ = *cursor;
+    batch_snapshot_producer_view_version_ = restored->producer_view_version;
+    {
+        std::lock_guard<std::mutex> cursor_lock(batch_snapshot_cursor_mutex_);
+        last_applied_batch_snapshot_prefix_ = *cursor;
+    }
+    applied_seq_id_.store(cursor->last_seq);
+    primary_seq_id_.store(cursor->last_seq);
+    last_error_.store(ErrorCode::OK);
+    recovering_.store(false, std::memory_order_release);
+    return ErrorCode::OK;
+}
+
 void HotStandbyService::ReplicationLoop() {
     LOG(INFO) << "Replication loop started (OpLog sync)";
 
@@ -1015,6 +1124,7 @@ void HotStandbyService::ReplicationLoop() {
         std::max(retry_base, std::chrono::milliseconds(5000));
     auto retry_delay = retry_base;
     std::optional<std::chrono::steady_clock::time_point> retry_started;
+    uint64_t recovery_floor = 0;
 
     auto wait_for_next_poll = [this](std::chrono::milliseconds delay) {
         std::unique_lock<std::mutex> lock(replication_loop_mutex_);
@@ -1027,6 +1137,20 @@ void HotStandbyService::ReplicationLoop() {
            IsRunning()) {
         if (!IsConnected()) {
             wait_for_next_poll(std::chrono::seconds(1));
+            continue;
+        }
+
+        if (recovering_.load(std::memory_order_acquire)) {
+            const auto error = RebootstrapBatchOpLog(recovery_floor);
+            last_error_.store(error, std::memory_order_release);
+            NotifySyncStatus();
+            if (error != ErrorCode::OK) {
+                wait_for_next_poll(retry_delay);
+                retry_delay = std::min(retry_delay * 2, max_retry_delay);
+            } else {
+                retry_started.reset();
+                retry_delay = retry_base;
+            }
             continue;
         }
 
@@ -1056,6 +1180,12 @@ void HotStandbyService::ReplicationLoop() {
             if (result.error != ErrorCode::OK) {
                 last_error_.store(result.error, std::memory_order_release);
                 const bool made_progress = expected_after > expected_before;
+                if (result.disposition ==
+                    OpLogBatchStandbyPollDisposition::REBOOTSTRAP_REQUIRED) {
+                    recovery_floor = result.compaction_floor;
+                    recovering_.store(true, std::memory_order_release);
+                    continue;
+                }
                 if (result.disposition ==
                     OpLogBatchStandbyPollDisposition::RETRYABLE) {
                     const auto now = std::chrono::steady_clock::now();

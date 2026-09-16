@@ -3,9 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <csignal>
-#include <cstdlib>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string_view>
 #include <thread>
@@ -13,6 +11,7 @@
 #include <glog/logging.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "config/rpc_protocol_config.h"
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/leader_label_reconciler.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
@@ -410,8 +409,7 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         coro_rpc::coro_rpc_server server(
             config.rpc_thread_num, config.rpc_port, config.rpc_address,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
-        const char* protocol = std::getenv("MC_RPC_PROTOCOL");
-        if (protocol && std::string_view(protocol) == "rdma") {
+        if (RpcProtocolConfig::FromEnvironment().use_rdma) {
             server.init_ibv();
         }
 
@@ -422,22 +420,21 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         wrapped_config.enable_snapshot_restore = false;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
+        // Keep the gate alive until after the service is destroyed because the
+        // OpLog writer owned by the service invokes a callback that uses it.
+        detail::ServingStateGate serving_state;
         auto wrapped_master_service = std::make_shared<WrappedMasterService>(
             wrapped_config, config.http_metadata_server,
             config.http_metadata_remote_url);
-        auto writer_terminal = std::make_shared<std::atomic<bool>>(false);
-        auto serving_gate = std::make_shared<std::mutex>();
         wrapped_master_service->SetBatchOpLogTerminalCallback(
             [&](const OrderedOpLogWriterTerminalState& state) {
-                std::lock_guard<std::mutex> lock(*serving_gate);
-                if (writer_terminal->exchange(true)) return;
-                LOG(ERROR) << "Batch OpLog writer terminal: "
-                           << toString(state.error);
-                admin_server.SetServiceAvailable(false);
-                admin_server.SetServiceDelegate(nullptr);
-                label_reconciler.SetLeader(false);
-                SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
-                server.stop();
+                serving_state.RequestShutdown([&]() {
+                    LOG(ERROR) << "Batch OpLog writer terminal: "
+                               << toString(state.error);
+                    DeactivateServingState(admin_server, label_reconciler);
+                    SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
+                    server.stop();
+                });
             });
 
         // Restore is the serving gate: do not register or expose a candidate
@@ -506,18 +503,17 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             continue;
         }
 
-        std::atomic<bool> serve_shutdown_requested{false};
         auto leadership_monitor = leader_coordinator.StartLeadershipMonitor(
-            *leadership_session,
-            [&server, &admin_server, &serve_shutdown_requested,
-             &label_reconciler](auto reason) {
-                serve_shutdown_requested.store(true, std::memory_order_release);
-                admin_server.SetServiceAvailable(false);
-                label_reconciler.SetLeader(false);
-                SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
-                LOG(INFO) << "Trying to stop server, reason="
-                          << LeadershipLossReasonToString(reason);
-                server.stop();
+            *leadership_session, [&server, &admin_server, &serving_state,
+                                  &label_reconciler](auto reason) {
+                serving_state.RequestShutdown([&]() {
+                    admin_server.SetServiceAvailable(false);
+                    label_reconciler.SetLeader(false);
+                    SetRuntimeState(admin_server, MasterRuntimeState::kStandby);
+                    LOG(INFO) << "Trying to stop server, reason="
+                              << LeadershipLossReasonToString(reason);
+                    server.stop();
+                });
             });
         if (!leadership_monitor) {
             DeactivateServingState(admin_server, label_reconciler);
@@ -534,10 +530,21 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         }
         auto leadership_monitor_handle = std::move(leadership_monitor.value());
 
-        async_simple::Future<coro_rpc::err_code> ec = server.async_start();
-        if (ec.hasResult()) {
+        std::optional<async_simple::Future<coro_rpc::err_code>> ec;
+        serving_state.RunIfActive([&]() { ec.emplace(server.async_start()); });
+        if (!ec.has_value()) {
+            StopLeadershipMonitor(leadership_monitor_handle);
+            DeactivateServingState(admin_server, label_reconciler);
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates, std::nullopt);
+            LogLeadershipReleaseWarning(
+                "serve startup cancellation",
+                leader_coordinator.ReleaseLeadership(*leadership_session));
+            continue;
+        }
+        if (ec->hasResult()) {
             LOG(ERROR) << "Failed to start master service: "
-                       << ec.result().value();
+                       << ec->result().value();
             StopLeadershipMonitor(leadership_monitor_handle);
             DeactivateServingState(admin_server, label_reconciler);
             EnterStandbyMode(admin_server, *standby_controller,
@@ -551,16 +558,46 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             return -1;
         }
 
-        {
-            std::lock_guard<std::mutex> lock(*serving_gate);
-            if (!serve_shutdown_requested.load(std::memory_order_acquire) &&
-                !writer_terminal->load(std::memory_order_acquire)) {
-                ActivateServingState(admin_server, wrapped_master_service,
-                                     label_reconciler);
+        ErrorCode publish_ready_err = ErrorCode::OK;
+        if (serving_state.IsActive()) {
+            // The backend call can take several seconds. Keep it outside the
+            // transition gate so leadership loss can stop the listener
+            // promptly.
+            publish_ready_err =
+                leader_coordinator.PublishServiceReady(*leadership_session);
+            if (publish_ready_err == ErrorCode::OK) {
+                serving_state.RunIfActive([&]() {
+                    ActivateServingState(admin_server, wrapped_master_service,
+                                         label_reconciler);
+                });
+            } else {
+                serving_state.RequestShutdown([&]() {
+                    DeactivateServingState(admin_server, label_reconciler);
+                    server.stop();
+                });
             }
         }
 
-        auto server_err = std::move(ec).get();
+        if (publish_ready_err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to publish master service readiness: "
+                       << toString(publish_ready_err);
+            StopLeadershipMonitor(leadership_monitor_handle);
+            auto server_err = std::move(ec.value()).get();
+            LOG(ERROR) << "Master service stopped after readiness failure: "
+                       << server_err;
+            EnterStandbyMode(admin_server, *standby_controller,
+                             accept_standby_runtime_updates,
+                             leadership_session->view);
+            if (HandleLeadershipPhaseError(
+                    "service readiness publication failure",
+                    "publish master service readiness", leader_coordinator,
+                    *leadership_session, publish_ready_err, spec.type)) {
+                return -1;
+            }
+            continue;
+        }
+
+        auto server_err = std::move(ec.value()).get();
         LOG(ERROR) << "Master service stopped: " << server_err;
 
         StopLeadershipMonitor(leadership_monitor_handle);

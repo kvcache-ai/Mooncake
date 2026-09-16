@@ -41,6 +41,7 @@
 #include "common/network.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
+#include "config/client_auto_discovery_config.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
@@ -66,6 +67,7 @@ std::optional<size_t> GetTransportRegistrationLimit(
 namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
+constexpr auto kInitialLeaderReadyTimeout = std::chrono::seconds(30);
 
 class ScopedObjectChecksumBuffer {
    public:
@@ -520,46 +522,6 @@ ReplicateConfig Client::AttachHostId(const ReplicateConfig& config) const {
     return client_cfg;
 }
 
-static std::optional<bool> get_auto_discover() {
-    const char* ev_ad = std::getenv("MC_MS_AUTO_DISC");
-    if (ev_ad) {
-        try {
-            int iv = std::stoi(ev_ad);
-            if (iv == 1) {
-                LOG(INFO) << "auto discovery set by env MC_MS_AUTO_DISC";
-                return true;
-            } else if (iv == 0) {
-                LOG(INFO) << "auto discovery not set by env MC_MS_AUTO_DISC";
-                return false;
-            }
-        } catch (const std::exception&) {
-            // A non-numeric or out-of-range value makes std::stoi throw; fall
-            // through to the warning below and use the default instead of
-            // letting the exception abort client initialization.
-        }
-        LOG(WARNING)
-            << "invalid MC_MS_AUTO_DISC value: " << ev_ad
-            << ", should be 0 or 1, using default: auto discovery not set";
-    }
-    return std::nullopt;
-}
-
-static std::vector<std::string> get_auto_discover_filters() {
-    const char* raw_filters = std::getenv("MC_MS_FILTERS");
-    if (raw_filters == nullptr) {
-        return {};
-    }
-
-    LOG(INFO) << "whitelist filters: " << raw_filters;
-    std::vector<std::string> filters;
-    boost::split(filters, std::string(raw_filters), boost::is_any_of(","),
-                 boost::token_compress_off);
-    for (auto& filter : filters) {
-        filter = std::string(TrimAsciiWhitespace(filter));
-    }
-    return filters;
-}
-
 static std::vector<std::string> ParseDeviceNames(std::string_view value) {
     std::vector<std::string> devices;
     boost::split(devices, std::string(value), boost::is_any_of(","),
@@ -630,19 +592,22 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
             return coordinator.error();
         }
 
-        auto current_view = coordinator.value()->ReadCurrentView();
-        if (!current_view) {
-            LOG(ERROR) << "Failed to read current master view: "
-                       << toString(current_view.error());
-            return current_view.error();
+        auto master_view = ha::ReadCurrentViewOrWaitForReady(
+            *coordinator.value(), kInitialLeaderReadyTimeout);
+        if (!master_view) {
+            LOG(ERROR) << "Failed to discover a ready master view: "
+                       << toString(master_view.error());
+            return master_view.error();
         }
-        if (!current_view.value().has_value()) {
-            LOG(ERROR) << "No master is available in HA backend";
+        if (!master_view->has_value()) {
+            // An absent ready view can mean either no elected leader or an
+            // elected leader whose endpoint is still hidden during recovery.
+            LOG(ERROR) << "No master became ready within "
+                       << kInitialLeaderReadyTimeout.count() << " seconds";
             return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
         }
 
-        const auto& master_view = current_view.value().value();
-        auto err = SwitchLeader(master_view);
+        auto err = SwitchLeader(master_view->value());
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to connect to master";
             return err;
@@ -650,11 +615,10 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
 
         leader_coordinator_ = std::move(coordinator.value());
         direct_master_address_.clear();
-
-        leader_monitor_running_ = true;
-        leader_monitor_thread_ =
-            std::thread([this]() { this->LeaderMonitorThreadMain(); });
-
+        if (!leader_monitor_running_.exchange(true)) {
+            leader_monitor_thread_ =
+                std::thread([this]() { this->LeaderMonitorThreadMain(); });
+        }
         return ErrorCode::OK;
     } else {
         auto err = master_client_.Connect(master_server_entry);
@@ -669,6 +633,17 @@ ErrorCode Client::ConnectToMaster(const std::string& master_server_entry) {
         last_ping_success_.store(true);
         return ErrorCode::OK;
     }
+}
+
+void Client::EnterHaRuntimeMode() {
+    if (!leader_coordinator_) {
+        return;
+    }
+
+    // Foreground RPCs keep their normal retry policy. Only the HA heartbeat
+    // and leader-readiness probes use the separately configured fast-fail
+    // control pool once initialization has completed.
+    master_client_.EnableHaConnectionPolicy();
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -728,6 +703,25 @@ void Client::LeaderMonitorThreadMain() {
         }
 
         if (!view_change->changed || !view_change->current_view.has_value()) {
+            // A warming leader owns master_view without exposing a routable
+            // endpoint. Acknowledge the empty observation so the next wait
+            // blocks on the ready-value update instead of spinning on the old
+            // view version.
+            if (view_change->changed &&
+                !view_change->current_view.has_value()) {
+                std::lock_guard<std::mutex> lock(leader_switch_mutex_);
+                // Do not let a stale empty watch result erase a newer view
+                // installed concurrently by the heartbeat recovery path.
+                const bool still_on_observed_view =
+                    known_version.has_value()
+                        ? current_master_view_.has_value() &&
+                              current_master_view_->view_version ==
+                                  known_version.value()
+                        : !current_master_view_.has_value();
+                if (still_on_observed_view) {
+                    current_master_view_.reset();
+                }
+            }
             continue;
         }
 
@@ -777,20 +771,9 @@ ErrorCode Client::InitTransferEngine(
 
     bool auto_discover = false;
     if (!use_tent) {
-        // Get auto_discover and filters from env (non-TENT only)
-        std::optional<bool> env_auto_discover = get_auto_discover();
-        if (env_auto_discover.has_value()) {
-            // Use user-specified auto-discover setting
-            auto_discover = env_auto_discover.value();
-        } else {
-            // Enable auto-discover for RDMA/EFA if no devices are specified
-            if ((protocol == "rdma" || protocol == "efa") &&
-                !device_names.has_value()) {
-                LOG(INFO) << "Set auto discovery ON by default for " << protocol
-                          << " protocol, since no device names provided";
-                auto_discover = true;
-            }
-        }
+        auto config = ClientAutoDiscoveryConfig::FromEnvironment(
+            protocol, device_names.has_value());
+        auto_discover = config.enabled;
         transfer_engine_->setAutoDiscover(
             {.enabled = auto_discover, .protocol = protocol});
 
@@ -799,15 +782,11 @@ ErrorCode Client::InitTransferEngine(
             LOG(INFO)
                 << "Transfer engine auto discovery is enabled for protocol: "
                 << protocol;
-            auto filters = get_auto_discover_filters();
-            transfer_engine_->setWhitelistFilters(std::move(filters));
-        } else {
-            const char* env_filters = std::getenv("MC_MS_FILTERS");
-            if (env_filters && *env_filters != '\0') {
-                LOG(WARNING)
-                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                    << "ignoring whitelist: " << env_filters;
-            }
+        }
+
+        config.LoadFiltersFromEnvironment();
+        if (auto_discover) {
+            transfer_engine_->setWhitelistFilters(std::move(config.filters));
         }
     }
 
@@ -1087,6 +1066,8 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     }
 
+    client->EnterHaRuntimeMode();
+
     // this only performs RPC calls
     if (protocol == "rpc_only") {
         LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
@@ -1198,8 +1179,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(
-        std::move(result.value().replicas),
+    return tl::expected<QueryResult, ErrorCode>(
+        tl::in_place, std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
         result.value().object_checksum);
 }
@@ -1231,11 +1212,11 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            results.emplace_back(QueryResult(
-                std::move(response[i].value().replicas),
+            results.emplace_back(
+                tl::in_place, std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().object_checksum));
+                response[i].value().object_checksum);
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1585,6 +1566,17 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                                        op.replicas[idx]);
                 }
             }
+        }
+    }
+    // A successful transfer is only valid while its read lease is live.
+    // Check once all segment batches have completed, as in the regular
+    // BatchGet path, and preserve errors from validation or transfer.
+    auto now = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        if (results[i].has_value() && query_results[i].IsLeaseExpired(now)) {
+            LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
+                         << object_keys[i];
+            results[i] = tl::unexpected(ErrorCode::LEASE_EXPIRED);
         }
     }
     return results;
@@ -2516,7 +2508,7 @@ void Client::healDanglingLocalDiskBatchStarts(
             }
             continue;
         }
-        op.replicas = retry_responses[r].value();
+        op.replicas = std::move(retry_responses[r].value());
         op.RecordAllocatedReplicas();
         if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
             op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2598,7 +2590,7 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start put operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2688,7 +2680,7 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                                 PutOperationState::MASTER_FAILED,
                                 "Master failed to start upsert operation");
         } else {
-            op.replicas = start_responses[i].value();
+            op.replicas = std::move(start_responses[i].value());
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,

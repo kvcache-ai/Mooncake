@@ -66,6 +66,7 @@ struct StandbySyncStatus {
     std::chrono::milliseconds lag_time{0};
     bool is_syncing{false};
     bool is_connected{false};
+    bool is_recovering{false};
     StandbyState state{StandbyState::STOPPED};
     std::chrono::milliseconds time_in_state{0};
     ErrorCode last_error{ErrorCode::OK};
@@ -207,8 +208,9 @@ class HotStandbyService {
     void SetSyncStatusCallback(SyncStatusCallback callback);
 
     /**
-     * @brief Test seam: when set, promotion final catch-up first tries
-     *        batch-record durable prefix/batches from this backend.
+     * @brief Test seam: inject a HaKvBackend used for Start()/replication and
+     *        promotion catch-up. When set, Start() skips live etcd connection
+     *        (and works even when STORE_USE_ETCD is OFF).
      */
     void SetCatchUpBatchKvBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
@@ -258,6 +260,7 @@ class HotStandbyService {
      * @brief Main replication loop (runs in background thread)
      */
     void ReplicationLoop();
+    ErrorCode RebootstrapBatchOpLog(uint64_t floor);
 
     /**
      * @brief Verification loop (runs in background thread)
@@ -269,7 +272,7 @@ class HotStandbyService {
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};
-    std::unique_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
+    std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;
@@ -288,6 +291,7 @@ class HotStandbyService {
     std::atomic<uint64_t> applied_seq_id_{0};
     std::atomic<uint64_t> primary_seq_id_{0};
     std::atomic<ErrorCode> last_error_{ErrorCode::OK};
+    std::atomic<bool> recovering_{false};
 
     // State machine for managing service lifecycle
     StandbyStateMachine state_machine_;

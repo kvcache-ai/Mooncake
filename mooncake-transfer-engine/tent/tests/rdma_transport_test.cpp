@@ -683,6 +683,176 @@ TEST_F(RdmaContextEventTest, CqErrLeavesAvailabilityAlone) {
     EXPECT_TRUE(selector_->isDeviceAvailable(kDev));
 }
 
+// ---- how a request is cut into slices ------------------------------------
+
+// Walk a plan the way submitTransferTasks() walks it: a block each, and
+// whatever is left for the last. Returns the lengths handed out.
+std::vector<uint64_t> walkPlan(const RdmaSlicePlan& plan, uint64_t length) {
+    std::vector<uint64_t> lengths;
+    uint64_t offset = 0;
+    for (uint64_t i = 0; i < plan.count; ++i) {
+        const uint64_t n =
+            (i + 1 == plan.count) ? length - offset : plan.block_size;
+        lengths.push_back(n);
+        offset += n;
+    }
+    return lengths;
+}
+
+// The whole contract, over a sweep of lengths against both caps: the slices
+// cover the request exactly, none is empty, the cap holds, and the block
+// stays a whole number of configured blocks.
+TEST(RdmaSlicePlanTest, EverySliceCarriesDataAndTheyCoverTheRequest) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t max_slices : {32ul, 64ul}) {
+        for (uint64_t length :
+             {1ul, 2ul, kBase - 1, kBase, kBase + 1, 3 * kBase, 3 * kBase + 7,
+              100 * kBase, 100 * kBase + 1, 160 * kBase, 160 * kBase + 8192,
+              1000 * kBase, 1000 * kBase - 1}) {
+            const auto plan = planRdmaSlices(length, kBase, max_slices);
+            SCOPED_TRACE("length=" + std::to_string(length) +
+                         " max=" + std::to_string(max_slices));
+            EXPECT_LE(plan.count, max_slices);
+            EXPECT_GT(plan.count, 0u);
+            EXPECT_EQ(plan.block_size % kBase, 0u);
+
+            const auto lengths = walkPlan(plan, length);
+            uint64_t total = 0;
+            for (size_t i = 0; i < lengths.size(); ++i) {
+                EXPECT_GT(lengths[i], 0u) << "empty slice";
+                if (i + 1 < lengths.size()) {
+                    EXPECT_EQ(lengths[i], plan.block_size);
+                } else {
+                    // The last one carries a folded tail at most.
+                    EXPECT_LE(lengths[i], 2 * plan.block_size);
+                }
+                total += lengths[i];
+            }
+            EXPECT_EQ(total, length);
+        }
+    }
+}
+
+// Under the cap nothing is rounded: blocks are not enlarged unasked.
+TEST(RdmaSlicePlanTest, BelowTheCapTheBlockIsTheConfiguredOne) {
+    constexpr uint64_t kBase = 65536;
+    for (uint64_t blocks = 1; blocks <= 32; ++blocks) {
+        const auto exact = planRdmaSlices(blocks * kBase, kBase, 64);
+        EXPECT_EQ(exact.block_size, kBase) << "blocks=" << blocks;
+        EXPECT_EQ(exact.count, blocks) << "blocks=" << blocks;
+
+        // One byte over is a tail far too short to post on its own, so it
+        // joins the slice before it instead of adding one.
+        const auto ragged = planRdmaSlices(blocks * kBase + 1, kBase, 64);
+        EXPECT_EQ(ragged.block_size, kBase) << "blocks=" << blocks;
+        EXPECT_EQ(ragged.count, blocks) << "blocks=" << blocks;
+    }
+}
+
+// A tail under a quarter block joins the slice before it: one work request
+// and one completion saved, and the request still spread over as many
+// slices as its size deserves. Reducing the count before choosing the block
+// -- what this used to do -- would round the block up to 128 KB instead,
+// which both halves the slices and leaves the 8 KB tail on its own anyway.
+TEST(RdmaSlicePlanTest, AShortTailJoinsTheSliceBeforeIt) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 8192;  // 520 KB
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);  // not widened
+    EXPECT_EQ(plan.count, 8u);          // not 9, and not 5
+
+    const auto lengths = walkPlan(plan, length);
+    ASSERT_EQ(lengths.size(), 8u);
+    EXPECT_EQ(lengths.back(), kBase + 8192);
+    for (size_t i = 0; i + 1 < lengths.size(); ++i)
+        EXPECT_EQ(lengths[i], kBase);
+}
+
+// A tail that is worth a slice of its own keeps one.
+TEST(RdmaSlicePlanTest, ALongTailKeepsItsOwnSlice) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + kBase / 2;  // half a block over
+
+    const auto plan = planRdmaSlices(length, kBase, 64);
+    EXPECT_EQ(plan.block_size, kBase);
+    EXPECT_EQ(plan.count, 9u);
+    EXPECT_EQ(walkPlan(plan, length).back(), kBase / 2);
+}
+
+// The ratio is the whole policy, so a caller can turn folding off.
+TEST(RdmaSlicePlanTest, AZeroRatioNeverFolds) {
+    constexpr uint64_t kBase = 65536;
+    const uint64_t length = 8 * kBase + 1;
+
+    const auto folded = planRdmaSlices(length, kBase, 64);
+    const auto plain = planRdmaSlices(length, kBase, 64, /*merge_ratio=*/0.0);
+    EXPECT_EQ(folded.count, 8u);
+    EXPECT_EQ(plain.count, 9u);
+    EXPECT_EQ(walkPlan(plain, length).back(), 1u);
+}
+
+// Folding never empties the plan: two slices whose tail is short become one
+// slice holding everything, not zero.
+TEST(RdmaSlicePlanTest, FoldingNeverDropsTheLastSlice) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(kBase + 1, kBase, 64);
+    EXPECT_EQ(plan.count, 1u);
+    EXPECT_EQ(walkPlan(plan, kBase + 1).front(), kBase + 1);
+}
+
+// The regression: a 10 MB read asks for 64 slices of 160 KB, rounded up to
+// 192 KB, and 54 of those cover it. Asking for 64 anyway left ten empty.
+TEST(RdmaSlicePlanTest, RoundingUpTheBlockTakesTheSurplusOutOfTheCount) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(10ull << 20, kBase, 64);
+    EXPECT_EQ(plan.block_size, 3 * kBase);  // 192 KB
+    EXPECT_EQ(plan.count, 54u);             // not 64
+
+    // The same shape one cap down, where writes and CUDA sources live.
+    const auto write = planRdmaSlices(3ull << 20, kBase, 32);
+    EXPECT_EQ(write.block_size, 2 * kBase);  // 128 KB
+    EXPECT_EQ(write.count, 24u);             // not 32
+}
+
+// Dividing evenly needs no rounding, so the count is the cap -- nothing was
+// wasted here before the change either.
+TEST(RdmaSlicePlanTest, ArequestThatDividesEvenlyUsesTheWholeCap) {
+    constexpr uint64_t kBase = 65536;
+    const auto plan = planRdmaSlices(6ull << 20, kBase, 32);
+    EXPECT_EQ(plan.block_size, 3 * kBase);  // 192 KB
+    EXPECT_EQ(plan.count, 32u);
+}
+
+// However large the request, the count stops at the cap and the block grows.
+TEST(RdmaSlicePlanTest, TheCapBoundsTheCountAndTheBlockGrowsInstead) {
+    constexpr uint64_t kBase = 65536;
+    const auto small = planRdmaSlices(1ull << 30, kBase, 32);
+    const auto large = planRdmaSlices(1ull << 30, kBase, 64);
+    EXPECT_LE(small.count, 32u);
+    EXPECT_LE(large.count, 64u);
+    EXPECT_GT(small.block_size, large.block_size);
+    EXPECT_EQ(small.block_size % kBase, 0u);
+    EXPECT_EQ(large.block_size % kBase, 0u);
+}
+
+// A zero-length request keeps its one slice; a zero cap or block is treated
+// as one rather than dividing by zero.
+TEST(RdmaSlicePlanTest, DegenerateInputsStayInRange) {
+    constexpr uint64_t kBase = 65536;
+    const auto empty = planRdmaSlices(0, kBase, 64);
+    EXPECT_EQ(empty.count, 1u);
+    EXPECT_EQ(empty.block_size, kBase);
+
+    const auto no_cap = planRdmaSlices(4096, kBase, 0);
+    EXPECT_EQ(no_cap.count, 1u);
+
+    const auto no_block = planRdmaSlices(4096, 0, 64);
+    EXPECT_GT(no_block.count, 0u);
+    EXPECT_LE(no_block.count, 64u);
+    EXPECT_EQ(walkPlan(no_block, 4096).size(), no_block.count);
+}
+
 // ibv_query_port_speed() exists only in rdma-core >= 62. It must be resolved
 // as an optional symbol: present -> non-null, absent -> null, and either way
 // the mandatory verbs are still there (an older libibverbs must not lose
