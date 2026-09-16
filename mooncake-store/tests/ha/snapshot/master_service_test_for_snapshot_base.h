@@ -835,10 +835,20 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_object_store_type("local")
                 .set_root_fs_dir(MasterServiceTestPeer::RootFsDir(*service))
+                // Prevent eviction before the constructor returns and we can
+                // stop the restored instance's eviction worker.
+                .set_eviction_high_watermark_ratio(1.0)
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
         ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+        // Freeze the restored instance before comparing snapshots. Its
+        // eviction worker would otherwise mutate metadata between snapshots.
+        MasterServiceTestPeer::EvictionRunning(*restored_service) = false;
+        if (MasterServiceTestPeer::EvictionThread(*restored_service)
+                .joinable()) {
+            MasterServiceTestPeer::EvictionThread(*restored_service).join();
+        }
         AssertRestoredClientAffiliations(restored_service.get());
 
         // ========== Phase 4: Persist restored metadata again ==========
