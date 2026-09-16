@@ -90,6 +90,29 @@ statistical significance or quote a single best run.
 
 ## Boundary and reproduction
 
+### P02 codec decision versus production rollout
+
+The fixture descriptor addresses are opaque serialized values: replay checks
+their metadata fidelity, not whether they point to valid rebuilt serving buffers
+or resources. This gap does not invalidate the measured outer-envelope sizes,
+codec CPU observations, or schema/replay equality. Those are P01 evidence for
+considering a P02 candidate, not proof that a recovered standby can serve data.
+
+Before P02 selects a format, confirm representative workload distributions and
+the candidate's fidelity for all supported payload/descriptor variants, retain
+the same-library control, and define versioning, mixed-history reader compatibility,
+and corruption handling. Any integration that interprets descriptors or changes
+resource reconstruction must also validate those semantics before the codec
+decision; this experiment does not establish that they are codec-independent.
+
+Production writer selection or rollout needs a separate serving-recovery gate:
+rebuild buffers/resources from real descriptors, verify RPC Put/Upsert and actual
+data access after restart/standby promotion, and exercise the full HA lifecycle.
+Metadata-only replay and the 8/8 storage cases cannot satisfy that gate. P02/P03
+remain conditional; no format is selected by these measurements.
+
+### Reproduction
+
 The test-only backend bridge transcodes isolated fixture batch values while
 reusing production storage transactions. Its extra transcoding is not timed.
 RPC Put/Upsert, promotion/resource rebuilding, and full HA service E2E are not
