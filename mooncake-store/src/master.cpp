@@ -128,6 +128,9 @@ DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_string(metrics_host, "0.0.0.0",
               "Address for the HTTP metrics/admin server to listen on. "
               "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
+DECLARE_bool(enable_rpc_health_probe);
+DECLARE_int32(rpc_probe_interval_seconds);
+DECLARE_int32(rpc_probe_timeout_seconds);
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -1775,6 +1778,12 @@ int main(int argc, char* argv[]) {
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);
+        admin_server.ConfigureRpcProbe(
+            master_config.rpc_address,
+            static_cast<uint16_t>(master_config.rpc_port),
+            FLAGS_enable_rpc_health_probe,
+            std::chrono::seconds(FLAGS_rpc_probe_interval_seconds),
+            std::chrono::seconds(FLAGS_rpc_probe_timeout_seconds));
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;

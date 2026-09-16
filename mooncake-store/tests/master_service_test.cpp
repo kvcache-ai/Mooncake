@@ -2978,6 +2978,72 @@ TEST_F(MasterServiceTest,
     EXPECT_FALSE(FindClientLivenessForTest(service, client_id));
 }
 
+TEST_F(MasterServiceTest, HealthCheckReturnsOkWhenNoLockHeld) {
+    auto service_config = MasterServiceConfig::builder().build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    const auto start = std::chrono::steady_clock::now();
+    auto result = service_->HealthCheck();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                             std::chrono::steady_clock::now() - start)
+                             .count();
+
+    ASSERT_TRUE(result.has_value()) << "HealthCheck returned error";
+    EXPECT_TRUE(result->ok) << "expected ok=true with no shard locks held";
+    EXPECT_EQ(result->shards_checked, GetNumShardsForTest());
+    EXPECT_EQ(result->shards_blocked, 0u);
+    // 1024 non-contended try_lock_shared calls should be fast (well under a
+    // second). Use a generous bound to avoid flakiness on loaded CI hosts.
+    EXPECT_LT(elapsed, 1000);
+}
+
+TEST_F(MasterServiceTest, HealthCheckDetectsShardWriteLockHeld) {
+    auto service_config = MasterServiceConfig::builder().build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Hold a write lock on shard 0 on a background thread for longer than the
+    // HealthCheck shard-lock budget (2s) so the probe cannot acquire its read
+    // lock on that shard within the budget.
+    constexpr size_t kBlockedShard = 0;
+    constexpr auto kHoldDuration = std::chrono::milliseconds(2500);
+    std::atomic<bool> lock_acquired{false};
+    std::atomic<bool> release_now{false};
+
+    std::thread holder([&]() {
+        // MasterServiceTest is a friend of MasterService; use the fixture
+        // helper to obtain the shard mutex and hold it exclusively.
+        auto& mutex = GetShardMutexForTest(*service_, kBlockedShard);
+        std::unique_lock<SharedMutex> lock(mutex);
+        lock_acquired.store(true);
+        while (!release_now.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    // Wait until the holder has the write lock before probing.
+    while (!lock_acquired.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    auto result = service_->HealthCheck();
+    ASSERT_TRUE(result.has_value()) << "HealthCheck returned error";
+    EXPECT_FALSE(result->ok)
+        << "expected ok=false while a shard write lock is held beyond budget";
+    EXPECT_EQ(result->shards_blocked, kBlockedShard);
+    // shards_checked is the count acquired before hitting the blocked shard;
+    // shard 0 is first, so nothing was checked before it.
+    EXPECT_EQ(result->shards_checked, 0u);
+
+    // Release the write lock and verify HealthCheck recovers to ok=true.
+    release_now.store(true);
+    holder.join();
+
+    auto recovered = service_->HealthCheck();
+    ASSERT_TRUE(recovered.has_value());
+    EXPECT_TRUE(recovered->ok);
+    EXPECT_EQ(recovered->shards_checked, GetNumShardsForTest());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

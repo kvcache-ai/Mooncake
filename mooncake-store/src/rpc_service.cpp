@@ -1471,6 +1471,21 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<HealthCheckResponse, ErrorCode>
+WrappedMasterService::HealthCheck() {
+    ScopedVLogTimer timer(1, "HealthCheck");
+
+    MasterMetricManager::instance().inc_healthcheck_requests();
+
+    auto result = master_service_.HealthCheck();
+
+    timer.LogResponseExpected(result);
+    if (!result) {
+        MasterMetricManager::instance().inc_healthcheck_failures();
+    }
+    return result;
+}
+
 TieredStorageUsageSnapshot WrappedMasterService::GetStorageUsageSnapshot()
     const {
     return master_service_.GetStorageUsageSnapshot();
@@ -1838,6 +1853,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::HealthCheck>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(

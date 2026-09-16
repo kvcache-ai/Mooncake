@@ -192,11 +192,18 @@ class MasterMetricManager {
     void inc_remount_nof_segment_failures(int64_t val = 1);
     void inc_ping_requests(int64_t val = 1);
     void inc_ping_failures(int64_t val = 1);
+    void inc_healthcheck_requests(int64_t val = 1);
+    void inc_healthcheck_failures(int64_t val = 1);
     void inc_nof_heartbeat_success_total(int64_t val = 1);
     void inc_nof_heartbeat_failure_total(int64_t val = 1);
     void inc_nof_heartbeat_timeout_total(int64_t val = 1);
     void inc_nof_segments_unmounted_by_heartbeat_total(int64_t val = 1);
     void observe_nof_heartbeat_probe_latency_ms(int64_t latency_ms);
+
+    // RPC self-health probe (set by the admin server probe thread).
+    void set_rpc_responsive(bool responsive);
+    void set_rpc_probe_latency_ms(int64_t latency_ms);
+    void inc_rpc_probe_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
@@ -596,6 +603,12 @@ class MasterMetricManager {
     ylt::metric::gauge_t client_liveness_active_clients_;
     ylt::metric::gauge_t client_liveness_suspected_clients_;
     ylt::metric::gauge_t client_liveness_offline_clients_;
+
+    // RPC self-health probe metrics. Set by the admin server's loopback
+    // HealthCheck probe thread; consumed by /readyz and Prometheus alerts.
+    ylt::metric::gauge_t rpc_responsive_;
+    ylt::metric::gauge_t rpc_probe_latency_ms_;
+    ylt::metric::counter_t rpc_probe_failures_;
     ylt::metric::counter_t client_liveness_suspected_transitions_;
     ylt::metric::counter_t client_liveness_recoveries_;
     ylt::metric::counter_t client_liveness_offline_transitions_;
@@ -639,6 +652,8 @@ class MasterMetricManager {
     ylt::metric::counter_t remount_nof_segment_failures_;
     ylt::metric::counter_t ping_requests_;
     ylt::metric::counter_t ping_failures_;
+    ylt::metric::counter_t healthcheck_requests_;
+    ylt::metric::counter_t healthcheck_failures_;
     ylt::metric::counter_t nof_heartbeat_success_total_;
     ylt::metric::counter_t nof_heartbeat_failure_total_;
     ylt::metric::counter_t nof_heartbeat_timeout_total_;

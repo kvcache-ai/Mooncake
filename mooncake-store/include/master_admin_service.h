@@ -26,6 +26,15 @@ class MasterAdminServer {
     MasterAdminServer(uint16_t http_port, bool enable_metric_reporting,
                       std::string http_host = "0.0.0.0");
 
+    // Loopback RPC probe target and timing. When enable_rpc_probe is true the
+    // admin server starts a background thread that periodically calls the
+    // HealthCheck RPC against rpc_host:rpc_port (normally 127.0.0.1:<rpc_port>)
+    // and drives /readyz + the mooncake_master_rpc_responsive gauge.
+    void ConfigureRpcProbe(std::string rpc_host, uint16_t rpc_port,
+                           bool enable_rpc_probe,
+                           std::chrono::seconds rpc_probe_interval,
+                           std::chrono::seconds rpc_probe_timeout);
+
     ~MasterAdminServer();
 
     bool Start();
@@ -67,6 +76,8 @@ class MasterAdminServer {
     void HandleMetricsSummary(coro_http::coro_http_request& req,
                               coro_http::coro_http_response& resp);
     void HandleHealth(coro_http::coro_http_request& req,
+                      coro_http::coro_http_response& resp);
+    void HandleReadyz(coro_http::coro_http_request& req,
                       coro_http::coro_http_response& resp);
     void HandleVersion(coro_http::coro_http_request& req,
                        coro_http::coro_http_response& resp);
@@ -113,6 +124,11 @@ class MasterAdminServer {
 
     void RegisterHandler();
     void RefreshStorageMetrics() const;
+    // Background loopback HealthCheck probe. Updates rpc_responsive_ and the
+    // latency gauge; /readyz reads the cached result.
+    void RpcProbeThreadMain();
+    // Run one loopback HealthCheck probe. Returns true on success.
+    bool RunRpcProbeOnce();
 
     uint16_t http_port_;
     std::string http_host_;
@@ -134,6 +150,20 @@ class MasterAdminServer {
     std::optional<ha::MasterView> leader_view_;
     std::shared_ptr<WrappedMasterService> service_;
     bool service_available_ = false;
+
+    // Loopback RPC probe configuration + state.
+    std::string rpc_probe_host_;
+    uint16_t rpc_probe_port_ = 0;
+    bool enable_rpc_probe_ = false;
+    std::chrono::seconds rpc_probe_interval_{5};
+    std::chrono::seconds rpc_probe_timeout_{3};
+    std::thread rpc_probe_thread_;
+    std::atomic<bool> rpc_probe_running_{false};
+    std::binary_semaphore rpc_probe_stop_sem_{0};
+    // Cached probe result, read by /readyz. Initialized to not-responsive so a
+    // not-yet-probed leader reports 503 until the first successful probe.
+    std::atomic<bool> rpc_probe_ok_{false};
+    std::atomic<int64_t> rpc_probe_latency_ms_{0};
 };
 
 }  // namespace mooncake
