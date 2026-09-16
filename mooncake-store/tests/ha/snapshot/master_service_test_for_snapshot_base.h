@@ -845,7 +845,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // Freeze the restored instance before comparing snapshots. Its
         // eviction worker would otherwise mutate metadata between snapshots.
         MasterServiceTestPeer::EvictionRunning(*restored_service) = false;
-        if (MasterServiceTestPeer::EvictionThread(*restored_service).joinable()) {
+        if (MasterServiceTestPeer::EvictionThread(*restored_service)
+                .joinable()) {
             MasterServiceTestPeer::EvictionThread(*restored_service).join();
         }
         AssertRestoredClientAffiliations(restored_service.get());
