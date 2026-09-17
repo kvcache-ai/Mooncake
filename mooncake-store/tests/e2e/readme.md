@@ -149,3 +149,40 @@ python3 store_client_e2e.py \
 - `--payload-size 4096`: keep NoF writes 4K aligned
 - `--duration-sec`: total workload duration
 - `--sleep-ms`: interval between operations
+
+### run_oplog_snapshot_smoke.sh
+
+Runs the batch OpLog snapshot path with two real master processes and a local
+etcd instance. It publishes two snapshots with multiple object chunks, stops
+and restarts the standby, verifies suffix replay and promotion, and audits
+surviving and removed objects.
+
+```bash
+./run_oplog_snapshot_smoke.sh \
+  --build-dir /path/to/build \
+  --run-dir /tmp/mooncake-oplog-snapshot-smoke
+```
+
+Set `--failpoint-dir` to verify the same launcher environment path used by
+crash tests. The script requires `mooncake_master`, `oplog_ha_client`,
+`oplog_batch_inspector`, `hot_standby_snapshot_bootstrap_test`, `etcd`,
+`etcdctl`, `curl`, `setsid`, and Python `aiohttp`. It is a manual real-etcd
+check and is not registered in CI/nightly.
+
+The run directory must be new. The script stores configurations, master and
+client logs, snapshot artifacts, and audit results there, and stops its test
+processes on exit. Local snapshot storage is shared by the two test masters;
+for multi-host deployment, every master must be able to read the same durable
+snapshot artifacts.
+
+The production mode is opt-in with `enable_oplog_snapshot=true` together with
+`enable_oplog=true`, HA/etcd and a configured snapshot object store. The default
+chunk size is 1,000,000 objects and the default snapshot interval is 600 seconds.
+The smoke overrides these to two objects and two seconds. A chunk bounds object
+count, not byte size or total standby memory. Legacy catalog restore is not
+used by this mode. Snapshot upload failures do not stop OpLog apply, but a node
+must not serve if its recovery history cannot be proven complete.
+
+This smoke does not cover the full crash/corruption/lease-contention matrix,
+S3 outages, large-scale memory/freeze-time measurements, or safe OpLog pruning.
+Keep batch history until retention/pruning has its own verified recovery gate.

@@ -15,10 +15,12 @@
 // Unit tests for the deadline-aware bandwidth arbitration ordering (#2792).
 
 #include "tent/transport/rdma/bw_arbitration.h"
+#include "tent/runtime/deadline_mlu.h"
 
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <limits>
 #include <vector>
 
 namespace mooncake {
@@ -31,6 +33,78 @@ constexpr double kBw = 1e9;               // 1 GB/s -> 16 B takes 16 ns
 // A flow whose window is `window_ns` from now, transferring `len` bytes.
 ArbFlow flow(uint64_t window_ns, size_t len) {
     return ArbFlow{kNow + window_ns, len};
+}
+
+// The admission queue's drop predictor and the NIC arbitration must compute
+// the same MLU from the same inputs; DeadlineMlu is that one definition.
+TEST(DeadlineMluTest, PredictedTimeOverWindow) {
+    // 16 B at 1 GB/s = 16 ns; a 32 ns window is half used.
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, kNow + 32, kNow, kBw), 0.5);
+}
+
+// A deadline is absolute, so time spent behind bytes already in the pipeline
+// counts against the window: it is an additive delay, not a slower link.
+TEST(DeadlineMluTest, BytesAheadAddToPredictedTime) {
+    EXPECT_DOUBLE_EQ(DeadlineMlu(16, 16, kNow + 32, kNow, kBw), 1.0);
+    // Queueing alone can exhaust the window even for a tiny request.
+    EXPECT_DOUBLE_EQ(DeadlineMlu(64, 0, kNow + 32, kNow, kBw), 2.0);
+}
+
+TEST(DeadlineMluTest, NoDeadlineOrNoBandwidthIsNotUrgent) {
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, 0, kNow, kBw), 0.0);
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, kNow + 32, kNow, 0.0), 0.0);
+    EXPECT_DOUBLE_EQ(DeadlineMlu(0, 16, kNow + 32, kNow, -1.0), 0.0);
+}
+
+TEST(DeadlineMluTest, PastDeadlineIsInfinitelyUrgent) {
+    EXPECT_EQ(DeadlineMlu(0, 16, kNow, kNow, kBw),
+              std::numeric_limits<double>::max());
+    EXPECT_EQ(DeadlineMlu(0, 16, kNow - 1, kNow, kBw),
+              std::numeric_limits<double>::max());
+}
+
+TEST(DeadlineMluTest, ArbitrationUsesTheSameDefinition) {
+    const ArbFlow f = flow(32, 16);
+    EXPECT_DOUBLE_EQ(PredictedMlu(f, kNow, kBw),
+                     DeadlineMlu(0, f.length, f.deadline_ns, kNow, kBw));
+    EXPECT_DOUBLE_EQ(PredictedMlu(f, kNow, kBw, 48),
+                     DeadlineMlu(48, f.length, f.deadline_ns, kNow, kBw));
+}
+
+TEST(BwArbitrationTest, BytesAheadFavorTheTighterWindow) {
+    std::vector<ArbFlow> flows = {
+        flow(100'000, 4096),  // idx0: 4.1us of 100us  -> MLU 0.041
+        flow(30'000, 1024),   // idx1: 1.0us of 30us   -> MLU 0.034
+    };
+    // On an idle NIC the bigger request is (slightly) more urgent...
+    auto idle = OrderByUrgency(flows, kNow, kBw);
+    EXPECT_EQ(idle[0], 0u);
+    // ...but behind 64 KiB already queued (65.5us) the 30us window is gone
+    // while the 100us one still has room, so the small flow must go first.
+    auto busy = OrderByUrgency(flows, kNow, kBw, 65536);
+    EXPECT_EQ(busy[0], 1u);
+    EXPECT_EQ(busy[1], 0u);
+}
+
+// Ordering is decided one slot at a time: once a flow takes a slot, the
+// flows still waiting sit behind its bytes too, so the queue-ahead term
+// grows as the order is built. Scoring everyone once against the same value
+// would miss that.
+TEST(BwArbitrationTest, EachSlotIsScoredBehindTheOnesBeforeIt) {
+    // 1 GB/s: 1 byte == 1 ns of wire time.
+    std::vector<ArbFlow> flows = {
+        flow(40'000, 100'000),  // idx0: 100us of a 40us window -> 2.50
+        flow(100'000, 20'000),  // idx1: 20us of a 100us window -> 0.20
+        flow(50'000, 5'000),    // idx2: 5us of a 50us window   -> 0.10
+    };
+    // Scored once, the order would be its own MLU ranking: 0, 1, 2.
+    // Behind idx0's 100us, though, idx2's 50us window is blown (105/50 =
+    // 2.10) while idx1 still fits (120/100 = 1.20), so idx2 goes first.
+    auto order = OrderByUrgency(flows, kNow, kBw);
+    ASSERT_EQ(order.size(), 3u);
+    EXPECT_EQ(order[0], 0u);
+    EXPECT_EQ(order[1], 2u);
+    EXPECT_EQ(order[2], 1u);
 }
 
 TEST(BwArbitrationTest, TighterDeadlineSortsFirst) {

@@ -39,6 +39,7 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cp -r python/tests/services test_env/service_tests
 cp -r mooncake-reshard/tests test_env/reshard_tests
+cp -r python/tests/ssd test_env/ssd_tests
 cd test_env
 pip install torch numpy
 python -c "import mooncake._fast_copy"
@@ -52,8 +53,8 @@ echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
 
 echo "Running reshard contract tests..."
-python -m pip install pytest hypothesis==6.141.0
-python -m pytest reshard_tests -q
+python -m pip install pytest hypothesis==6.141.0 paramiko
+python -m pytest reshard_tests ssd_tests -q
 
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable

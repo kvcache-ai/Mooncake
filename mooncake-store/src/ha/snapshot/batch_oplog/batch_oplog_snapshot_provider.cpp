@@ -128,31 +128,9 @@ void CopyRegistry(const StandbySegmentRegistry& source,
     }
 }
 
-tl::expected<ReplicaID, ErrorCode> ScanLiveReplicaIds(
-    const StandbyMetadataStore& metadata) {
-    auto cursor = metadata.BeginSnapshotTraversal();
-    ReplicaID max_replica_id = 0;
-    while (!cursor.done()) {
-        std::vector<StandbyObjectEntry> objects;
-        if (!metadata.CopyNextSnapshotChunk(1, cursor, objects)) {
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        for (const auto& object : objects) {
-            std::unordered_set<ReplicaID> object_ids;
-            for (const auto& replica : object.metadata.replicas) {
-                if (replica.id == 0 || !object_ids.insert(replica.id).second) {
-                    return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
-                }
-                max_replica_id = std::max(max_replica_id, replica.id);
-            }
-        }
-    }
-    return max_replica_id;
-}
-
 AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
-                           OpLogApplier& applier,
-                           const DurablePrefix* baseline) {
+                           OpLogApplier& applier, const DurablePrefix* baseline,
+                           const std::function<bool()>& cancelled) {
     OpLogBatchStandbyReader reader(cluster_id, backend, applier);
     const DurablePrefix start =
         baseline == nullptr ? DurablePrefix{} : *baseline;
@@ -161,6 +139,9 @@ AttemptResult ReplaySuffix(const std::string& cluster_id, HaKvBackend& backend,
     }
 
     for (;;) {
+        if (cancelled && cancelled()) {
+            return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        }
         auto poll = reader.PollOnce();
         if (poll.error != ErrorCode::OK) {
             return IsRetryableBackendError(poll.error)
@@ -189,7 +170,9 @@ AttemptResult RestorePointer(
     const std::string& cluster_id, HaKvBackend& backend,
     SnapshotObjectStore& object_store, const std::string& snapshot_root,
     std::string_view pointer_bytes, StandbyMetadataStore& metadata,
-    StandbySegmentRegistry& registry, OpLogApplier* supplied_applier) {
+    StandbySegmentRegistry& registry, OpLogApplier* supplied_applier,
+    const std::function<bool()>& cancelled) {
+    if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     auto decoded_descriptor =
         ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
     if (!decoded_descriptor) {
@@ -262,6 +245,9 @@ AttemptResult RestorePointer(
     applier->Recover(baseline.last_seq);
 
     for (size_t i = 0; i < manifest.object_chunks.size(); ++i) {
+        if (cancelled && cancelled()) {
+            return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+        }
         const auto& chunk = manifest.object_chunks[i];
         const std::string expected_key =
             ha::BuildBatchOpLogSnapshotObjectChunkKey(
@@ -282,6 +268,9 @@ AttemptResult RestorePointer(
             return Invalid();
         }
         for (const auto& entry : decoded_chunk->objects) {
+            if (cancelled && cancelled()) {
+                return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
+            }
             if (entry.key.empty() || !TenantId(entry.tenant_id).IsValid()) {
                 return Invalid();
             }
@@ -298,13 +287,14 @@ AttemptResult RestorePointer(
         }
     }
 
-    auto suffix = ReplaySuffix(cluster_id, backend, *applier, &baseline);
+    auto suffix =
+        ReplaySuffix(cluster_id, backend, *applier, &baseline, cancelled);
     if (suffix.disposition != AttemptDisposition::kSuccess) {
         return suffix;
     }
-    auto live_max_replica_id = ScanLiveReplicaIds(metadata);
-    if (!live_max_replica_id) {
-        return Invalid(live_max_replica_id.error());
+    ReplicaID live_max_replica_id = 0;
+    if (!metadata.ValidateReplicaIds(live_max_replica_id)) {
+        return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
     return {AttemptDisposition::kSuccess,
@@ -314,14 +304,16 @@ AttemptResult RestorePointer(
              .last_applied_seq = suffix.value.last_included_seq,
              .last_applied_batch_id = suffix.value.last_included_batch_id,
              .producer_view_version = descriptor.producer_view_version,
-             .max_replica_id = *live_max_replica_id}};
+             .max_replica_id = live_max_replica_id}};
 }
 
 AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
                                    HaKvBackend& backend,
                                    StandbyMetadataStore& metadata,
                                    StandbySegmentRegistry& registry,
-                                   OpLogApplier* supplied_applier) {
+                                   OpLogApplier* supplied_applier,
+                                   const std::function<bool()>& cancelled) {
+    if (cancelled && cancelled()) return Invalid(ErrorCode::ETCD_CTX_CANCELLED);
     std::unique_ptr<OpLogApplier> owned_applier;
     OpLogApplier* applier = supplied_applier;
     if (applier == nullptr) {
@@ -337,16 +329,17 @@ AttemptResult RestoreCompleteOpLog(const std::string& cluster_id,
         return IsRetryableBackendError(init_error) ? Infrastructure(init_error)
                                                    : Invalid(init_error);
     }
-    auto replay = ReplaySuffix(cluster_id, backend, *applier, nullptr);
+    auto replay =
+        ReplaySuffix(cluster_id, backend, *applier, nullptr, cancelled);
     if (replay.disposition != AttemptDisposition::kSuccess) {
         return replay;
     }
-    auto max_replica_id = ScanLiveReplicaIds(metadata);
-    if (!max_replica_id) {
-        return Invalid(max_replica_id.error());
+    ReplicaID max_replica_id = 0;
+    if (!metadata.ValidateReplicaIds(max_replica_id)) {
+        return Invalid(ErrorCode::DESERIALIZE_FAIL);
     }
     CopyRegistry(applier->GetSegmentRegistry(), registry);
-    replay.value.max_replica_id = *max_replica_id;
+    replay.value.max_replica_id = max_replica_id;
     replay.value.last_applied_seq = replay.value.last_included_seq;
     replay.value.last_applied_batch_id = replay.value.last_included_batch_id;
     return replay;
@@ -365,17 +358,31 @@ BatchOpLogSnapshotProvider::BatchOpLogSnapshotProvider(
 tl::expected<BatchOpLogSnapshotRestoreResult, ErrorCode>
 BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
                                             StandbySegmentRegistry& registry,
-                                            OpLogApplier* applier) {
+                                            OpLogApplier* applier,
+                                            uint64_t minimum_snapshot_batch,
+                                            std::function<bool()> cancelled) {
     metadata.Clear();
     registry.Clear();
     if (!NormalizeAndValidateClusterId(cluster_id_) || cluster_id_.empty() ||
         snapshot_root_.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    OpLogBatchStorage storage(cluster_id_, backend_);
+    uint64_t floor = 0;
+    const auto floor_error = storage.ReadCompactionFloor(floor);
+    if (floor_error != ErrorCode::OK &&
+        floor_error != ErrorCode::ETCD_KEY_NOT_EXIST) {
+        return tl::make_unexpected(floor_error);
+    }
+    if (floor_error == ErrorCode::OK) {
+        minimum_snapshot_batch = std::max(minimum_snapshot_batch, floor);
+    }
 
     for (const std::string& pointer_key :
          {ha::BuildBatchOpLogSnapshotLatestKey(cluster_id_),
           ha::BuildBatchOpLogSnapshotFallbackKey(cluster_id_)}) {
+        if (cancelled && cancelled())
+            return tl::make_unexpected(ErrorCode::ETCD_CTX_CANCELLED);
         std::string pointer_bytes;
         const ErrorCode pointer_error =
             backend_.Get(pointer_key, pointer_bytes);
@@ -386,9 +393,14 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
             return tl::make_unexpected(pointer_error);
         }
 
-        auto attempt =
-            RestorePointer(cluster_id_, backend_, object_store_, snapshot_root_,
-                           pointer_bytes, metadata, registry, applier);
+        auto descriptor = ha::DecodeBatchOpLogSnapshotDescriptor(pointer_bytes);
+        if (!descriptor ||
+            descriptor->last_included_batch_id < minimum_snapshot_batch) {
+            continue;
+        }
+        auto attempt = RestorePointer(cluster_id_, backend_, object_store_,
+                                      snapshot_root_, pointer_bytes, metadata,
+                                      registry, applier, cancelled);
         if (attempt.disposition == AttemptDisposition::kSuccess) {
             return attempt.value;
         }
@@ -403,8 +415,11 @@ BatchOpLogSnapshotProvider::RestoreBaseline(StandbyMetadataStore& metadata,
         }
     }
 
+    if (minimum_snapshot_batch != 0) {
+        return tl::make_unexpected(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP);
+    }
     auto full_replay = RestoreCompleteOpLog(cluster_id_, backend_, metadata,
-                                            registry, applier);
+                                            registry, applier, cancelled);
     if (full_replay.disposition != AttemptDisposition::kSuccess) {
         metadata.Clear();
         registry.Clear();

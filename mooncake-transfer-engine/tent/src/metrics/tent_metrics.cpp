@@ -35,6 +35,20 @@ namespace {
 const char* operationName(Request::OpCode operation) {
     return operation == Request::READ ? "read" : "write";
 }
+
+const char* taskFailureReasonName(TentMetrics::TaskFailureReason reason) {
+    switch (reason) {
+        case TentMetrics::TaskFailureReason::Submit:
+            return "submit";
+        case TentMetrics::TaskFailureReason::Poll:
+            return "poll";
+        case TentMetrics::TaskFailureReason::Timeout:
+            return "timeout";
+        case TentMetrics::TaskFailureReason::Canceled:
+            return "canceled";
+    }
+    return "unknown";
+}
 }  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
@@ -195,6 +209,7 @@ void TentMetrics::shutdown() {
     // Clear metric vectors
     counters_.clear();
     histograms_.clear();
+    gauges_.clear();
 
     // Reset bound port so httpPort() returns 0 after shutdown, not a stale
     // port from a previous initialization. Without this, a re-initialize
@@ -221,8 +236,14 @@ void TentMetrics::registerMetrics() {
         &failover_total_,
         &transport_attempts_total_,
         &transport_attempt_failures_total_,
+        &task_failures_total_,
         &deadline_infeasible_total_,
         &quarantined_batches_total_,
+    };
+
+    gauges_ = {
+        &inflight_attempts_,
+        &registered_buffer_bytes_,
     };
 
     // Register the N=1 per-transport histograms for unified serialization.
@@ -299,6 +320,43 @@ void TentMetrics::recordBatchQuarantined() {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
     quarantined_batches_total_.inc();
+}
+
+void TentMetrics::recordTaskFailure(TransportType tp,
+                                    TaskFailureReason reason) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    task_failures_total_.incCached(taskFailureSlot(tp, reason), [tp, reason] {
+        return std::array<std::string, 2>{transportTypeName(tp),
+                                          taskFailureReasonName(reason)};
+    });
+}
+
+// Gauge updates below deliberately ignore runtime_enabled_: gauges track
+// engine state through paired add/sub operations (attempt start/finish,
+// register/unregister), and skipping one half of a pair across a
+// setEnabled() transition would permanently corrupt the value. Counters and
+// histograms are samples and may be dropped while disabled; gauges are not.
+void TentMetrics::recordInflightAttemptStarted(TransportType tp) {
+    if (!initialized_) return;
+    inflight_attempts_.incCached(transportSlot(tp), [tp] {
+        return std::array<std::string, 1>{transportTypeName(tp)};
+    });
+}
+
+void TentMetrics::recordInflightAttemptFinished(TransportType tp) {
+    if (!initialized_) return;
+    inflight_attempts_.incCached(
+        transportSlot(tp),
+        [tp] { return std::array<std::string, 1>{transportTypeName(tp)}; }, -1);
+}
+
+void TentMetrics::recordRegisteredBufferBytes(TransportType tp, int64_t delta) {
+    if (!initialized_) return;
+    registered_buffer_bytes_.incCached(
+        transportSlot(tp),
+        [tp] { return std::array<std::string, 1>{transportTypeName(tp)}; },
+        delta);
 }
 
 void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
@@ -418,6 +476,11 @@ std::string TentMetrics::getPrometheusMetrics() {
         // N=2 transport-attempt latency histogram (labels: transport,
         // operation) goes through the same helper, instantiated for N=2.
         serializeHistogramPrometheus(transport_attempt_latency_, result);
+
+        // Gauges: current value per label.
+        for (auto* gauge : gauges_) {
+            serializeGaugePrometheus(*gauge, result);
+        }
 
         return result;
     } catch (const std::exception& e) {
@@ -587,6 +650,29 @@ void TentMetrics::serializeHistogramPrometheus(
     }
 }
 
+void TentMetrics::serializeGaugePrometheus(
+    metrics::CachedDynamicCounter<1>& gauge, std::string& out) const {
+    auto cells = gauge.copy();
+    if (cells.empty()) return;
+    const std::string& name = gauge.str_name();
+    out.append("# HELP ")
+        .append(name)
+        .append(" ")
+        .append(gauge.help())
+        .append("\n");
+    out.append("# TYPE ").append(name).append(" gauge\n");
+    for (auto& e : cells) {
+        out.append(name)
+            .append("{")
+            .append(gauge.labels_name()[0])
+            .append("=\"")
+            .append(e->label[0])
+            .append("\"} ")
+            .append(std::to_string(e->value.load(std::memory_order_relaxed)))
+            .append("\n");
+    }
+}
+
 std::string TentMetrics::getJsonMetrics() {
     if (!initialized_) return "{}";
 
@@ -617,6 +703,14 @@ std::string TentMetrics::getJsonMetrics() {
             sumCounterValues(&deadline_infeasible_total_);
         root[quarantined_batches_total_.str_name()] =
             static_cast<int64_t>(quarantined_batches_total_.value());
+
+        // Gauges: aggregate across transport labels (total in-flight attempts
+        // / total registered bytes). Per-transport breakdown is via the
+        // Prometheus endpoint.
+        root[inflight_attempts_.str_name()] =
+            sumCounterValues(&inflight_attempts_);
+        root[registered_buffer_bytes_.str_name()] =
+            sumCounterValues(&registered_buffer_bytes_);
 
         // Histograms: sum bucket counts across all transport labels. The
         // templated helper also reads back the histogram's sum counter so the
@@ -711,6 +805,10 @@ void TentMetrics::recordTransportAttemptFinished(TransportType, Request::OpCode,
 void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordBatchQuarantined() {}
+void TentMetrics::recordTaskFailure(TransportType, TaskFailureReason) {}
+void TentMetrics::recordInflightAttemptStarted(TransportType) {}
+void TentMetrics::recordInflightAttemptFinished(TransportType) {}
+void TentMetrics::recordRegisteredBufferBytes(TransportType, int64_t) {}
 void TentMetrics::recordStageLatency(Stage, TransportType, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {

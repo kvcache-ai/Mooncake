@@ -2,8 +2,6 @@
 
 #include <chrono>
 #include <exception>
-#include <cstdlib>
-#include <cstring>
 #include <memory>
 #include <optional>
 #include <string>
@@ -13,6 +11,7 @@
 #include <glog/logging.h>
 
 #include "types.h"
+#include "config/ha_cluster_namespace_config.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -662,14 +661,7 @@ ClusterNamespace RedisLeaderCoordinator::ResolveClusterNamespace(
         return cluster_namespace;
     }
 
-    std::string resolved_namespace;
-    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
-    if (env_cluster_id != nullptr && std::strlen(env_cluster_id) > 0) {
-        resolved_namespace = env_cluster_id;
-    } else {
-        resolved_namespace = DEFAULT_CLUSTER_ID;
-    }
-    return resolved_namespace;
+    return HaClusterNamespaceConfig::FromEnvironment().cluster_namespace;
 }
 
 std::string RedisLeaderCoordinator::BuildMasterViewKey(

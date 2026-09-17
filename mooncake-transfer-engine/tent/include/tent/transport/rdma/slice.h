@@ -41,6 +41,54 @@ struct RdmaSliceList {
     int num_slices = 0;
 };
 
+// `count` slices: the first count - 1 of `block_size` bytes and the last
+// holding what remains, which is a short tail folded in when one was worth
+// folding -- so up to `block_size` more than a block, never less than one
+// byte.
+struct RdmaSlicePlan {
+    uint64_t block_size = 0;
+    uint64_t count = 0;
+};
+
+// Cut `length` into at most `max_slices` slices, each a whole number of
+// `base_block` bytes. Rounding the block up covers the request in fewer
+// slices than were asked for, so the count comes from the block and not the
+// other way round: an empty slice would still cost a work request, a CQE, a
+// path selection and a completion.
+//
+// A last slice shorter than `merge_ratio` of a block is given to the slice
+// before it instead of being posted on its own, trading a fraction of a
+// block of extra work on that one slice for a work request, a CQE and a
+// completion. This has to happen after the block is chosen: asking for one
+// slice fewer up front only makes the block round up to the next whole one,
+// which leaves the short tail as its own slice anyway and spreads the
+// request over half as many slices. A ratio of 0 never folds.
+//
+// Zero length keeps one slice -- task accounting counts slices, and a task
+// with none never reaches a terminal status.
+inline RdmaSlicePlan planRdmaSlices(uint64_t length, uint64_t base_block,
+                                    uint64_t max_slices,
+                                    double merge_ratio = 0.25) {
+    if (base_block == 0) base_block = 1;
+    if (max_slices == 0) max_slices = 1;
+    if (length == 0) return {base_block, 1};
+
+    uint64_t count = (length + base_block - 1) / base_block;
+    if (count > max_slices) count = max_slices;
+
+    const uint64_t per_slice = (length + count - 1) / count;
+    const uint64_t block_size = (per_slice % base_block == 0)
+                                    ? per_slice
+                                    : (per_slice / base_block + 1) * base_block;
+
+    count = (length + block_size - 1) / block_size;
+    if (count > 1) {
+        const uint64_t tail = length - (count - 1) * block_size;
+        if (static_cast<double>(tail) < merge_ratio * block_size) --count;
+    }
+    return {block_size, count};
+}
+
 // Forward declarations
 class RdmaEndPoint;
 struct RdmaTask;
@@ -107,15 +155,41 @@ struct RdmaSlice {
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
+    // Worker lane that enqueued this slice: the one whose inflight_slice_set
+    // holds it. Whichever lane later sweeps the slice off a queue pair must
+    // hand the set entry back to this one -- with qp_pools several lanes can
+    // share a queue pair, so the sweeper is often somebody else. -1 until
+    // Workers::submit() picks a lane. Atomic because a retry re-points it to
+    // the lane that re-queued the slice (Workers::submitFromTick) while the
+    // lane it is leaving may still hold a set entry it has not drained, and
+    // reads that entry to route the removal home.
+    std::atomic<int> owner_worker{-1};
+    // Worker lane whose inflight_slices counts this slice, -1 while none
+    // does. Each accounting the slice carries names the counter it sits in,
+    // so whichever path takes it out -- its own completion, another lane's
+    // sweep of the queue pair they share, the timeout pass that finds it
+    // already terminal -- exchanges the field for -1 and pays back exactly
+    // what it read; a second path reads -1 and does nothing. Usually the
+    // owner lane, but a retry moves the count in one exchange
+    // (Workers::submitFromTick) while the old set entry drains later.
+    std::atomic<int> counted_lane{-1};
     int retry_count = 0;
     // Flat (source,target) combination index last tried by
     // selectFallbackDevice; the next fallback resumes just past it so retries
     // rotate through all combinations with wraparound instead of hammering one.
     int last_fallback_idx = -1;
     bool failed = false;
-    // True while DeviceSelector accounts this slice against source_dev_id.
-    // The worker clears it exactly once on completion, failure, or cancel.
-    bool quota_charged = false;
+    // Device DeviceSelector accounts this slice against, -1 while none.
+    // Same discipline as counted_lane: whoever releases the charge --
+    // completion, failure, timeout or cancel -- exchanges it for -1 and
+    // pays that device, so a fallback that has already rewritten
+    // source_dev_id cannot misdirect the release. Atomic because on a pooled
+    // QP the timeout sweep and the CQ poller run on different workers.
+    std::atomic<int> charged_dev{-1};
+    // Device whose posted backlog counts this slice: set when the work
+    // request reaches the hardware, -1 again once the slice leaves the queue
+    // pair. A charged slice waiting in a worker queue is not posted.
+    std::atomic<int> posted_dev{-1};
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
     // Non-owning pointer to the per-worker RailMonitor for this slice's

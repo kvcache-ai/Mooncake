@@ -20,7 +20,7 @@ from ..manifest import (
 )
 from ..storage_manifest import (
     StoredFragmentSnapshot,
-    WeightManifest,
+    StoredWeightManifest,
     validate_weight_manifest_snapshot,
 )
 from .bound_contracts import ExecutorTransferPlan, RuntimeFragmentSnapshot, TransferPlan
@@ -168,8 +168,8 @@ def _tensor_map(
 
 def _validated_store_source_manifest(
     logical_plan: LogicalTransferPlan,
-    source_manifest: WeightManifest | None,
-) -> WeightManifest | None:
+    source_manifest: StoredWeightManifest | None,
+) -> StoredWeightManifest | None:
     if logical_plan.source_manifest is None:
         if source_manifest is not None:
             raise ValueError("runtime source plan must not receive a source manifest")
@@ -187,7 +187,7 @@ def _validated_store_source_manifest(
 
 def _validate_logical_tensor_snapshots(
     logical_plan: LogicalTransferPlan,
-    source_manifest: WeightManifest | None,
+    source_manifest: StoredWeightManifest | None,
 ) -> None:
     source_tensors = _tensor_map(logical_plan.source_tensors)
     target_tensors = _tensor_map(logical_plan.target_tensors)
@@ -228,7 +228,7 @@ def _validate_logical_tensor_snapshots(
 
 def _validate_logical_fragment_snapshots(
     logical_plan: LogicalTransferPlan,
-    source_manifest: WeightManifest | None,
+    source_manifest: StoredWeightManifest | None,
 ) -> None:
     logical_plan.validate_source_manifest_snapshot()
     target_by_id = {
@@ -429,7 +429,7 @@ def bind_logical_transfer_plan(
     target_bindings: Sequence[WeightRuntimeBindingManifest],
     *,
     source_bindings: Sequence[WeightRuntimeBindingManifest] = (),
-    source_manifest: WeightManifest | None = None,
+    source_manifest: StoredWeightManifest | None = None,
 ) -> TransferPlan:
     """Bind an address-free logical plan to validated runtime locations."""
 
@@ -586,16 +586,22 @@ def resolve_executor_plans(
     )
     if not expected_executors:
         raise ValueError(f"{side} executor snapshot mismatch: unknown instance")
-    current_executors = _build_executor_plans(
-        (placement,),
-        (binding,),
-        side,
-        selected_fragment_ids=frozenset(
-            fragment_id
-            for executor in expected_executors
-            for fragment_id in executor.fragment_ids
-        ),
+    expected_fragment_ids = frozenset(
+        fragment_id
+        for executor in expected_executors
+        for fragment_id in executor.fragment_ids
     )
+    try:
+        current_executors = _build_executor_plans(
+            (placement,),
+            (binding,),
+            side,
+            selected_fragment_ids=expected_fragment_ids,
+        )
+    except ValueError as error:
+        if str(error) == f"missing selected {side} runtime fragment":
+            raise ValueError(f"{side} executor snapshot mismatch") from error
+        raise
     executor_keys = [
         (executor.rank, executor.worker_id) for executor in expected_executors
     ]
