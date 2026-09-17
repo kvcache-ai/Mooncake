@@ -4638,8 +4638,12 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 auto MasterService::AllocateReplicas(const std::string& key,
                                      uint64_t value_length,
                                      const ReplicateConfig& config,
-                                     const std::string& writer_host_id)
+                                     const std::string& writer_host_id,
+                                     bool* dfs_allocation_failed)
     -> tl::expected<std::vector<Replica>, ErrorCode> {
+    if (dfs_allocation_failed != nullptr) {
+        *dfs_allocation_failed = false;
+    }
     std::vector<Replica> replicas;
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
@@ -4801,6 +4805,10 @@ auto MasterService::AllocateReplicas(const std::string& key,
         if (!alloc) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=" << alloc.error();
+            if (dfs_allocation_failed != nullptr) {
+                *dfs_allocation_failed =
+                    alloc.error() == ErrorCode::NO_AVAILABLE_HANDLE;
+            }
             return tl::make_unexpected(alloc.error());
         }
         replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
@@ -4907,7 +4915,8 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     std::optional<std::chrono::system_clock::time_point>
-        committed_soft_pin_timeout)
+        committed_soft_pin_timeout,
+    bool* dfs_allocation_failed)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
     if (tenant_state.metadata.contains(key)) {
@@ -4924,7 +4933,8 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     auto allocation_result =
-        AllocateReplicas(key, value_length, config, writer_host_id);
+        AllocateReplicas(key, value_length, config, writer_host_id,
+                         dfs_allocation_failed);
     if (!allocation_result) {
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                            pending_quota_charge);
@@ -5025,6 +5035,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     [[maybe_unused]] auto object_operation_lock =
         AcquireObjectOperationLock(object_id.tenant_id, object_id.user_key);
+    // Set by AllocateReplicas only when DFS allocation itself failed with
+    // capacity exhaustion; gates the forced bucket eviction retry below so
+    // memory/NoF exhaustion cannot delete unrelated DFS data.
+    bool dfs_allocation_failed = false;
     auto admit =
         [&]() -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
         auto now = std::chrono::system_clock::now();
@@ -5107,7 +5121,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             if (it == tenant_state.metadata.end()) {
                 return AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, config, writer_host_id,
-                    group_id, object_id.tenant_id, now, *soft_pin_request);
+                    group_id, object_id.tenant_id, now, *soft_pin_request,
+                    std::nullopt, &dfs_allocation_failed);
             }
             // Logically unreachable: the object-exists paths above always
             // return or erase the entry. Kept for -Wreturn-type.
@@ -5117,9 +5132,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     // Tenant over-quota remains a background-eviction concern. Bucket-count
     // exhaustion is different: one forced, fully validated bucket eviction is
-    // allowed before retrying this admission once.
+    // allowed before retrying this admission once. The retry is gated on
+    // dfs_allocation_failed so only genuine DFS capacity exhaustion triggers
+    // it; memory/NoF exhaustion keeps its background-eviction path.
     auto result = admit();
-    if (!result && result.error() == ErrorCode::NO_AVAILABLE_HANDLE &&
+    if (!result && dfs_allocation_failed &&
         config.dfs_replica_num > 0 && bucket_allocator_ != nullptr &&
         TryRecoverDfsSpaceAfterAllocationFailure()) {
         result = admit();
