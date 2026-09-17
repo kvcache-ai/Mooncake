@@ -10,6 +10,7 @@
 #include <future>
 #include <iostream>
 #include <limits>
+#include <new>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -3635,8 +3636,10 @@ TEST_F(StorageBackendTest, BucketBatchOffloadContinuesAfterFinalizeFailure) {
     EXPECT_TRUE(new_exists.value());
 
     // #3528: end the live client before same-path re-Init (flock).
+    // Destroy via temporary unique_ptr move-out is unavailable (fd would
+    // double-close); use explicit destroy + reconstruct.
     storage_backend.~BucketStorageBackend();
-    new (&storage_backend) BucketStorageBackend(config, bucket_config);
+    ::new (&storage_backend) BucketStorageBackend(config, bucket_config);
 
     BucketStorageBackend restarted_backend(config, bucket_config);
     ASSERT_TRUE(restarted_backend.Init());
@@ -3706,8 +3709,10 @@ TEST_F(StorageBackendTest,
     EXPECT_FALSE(exists.value());
 
     // #3528: end the live client before same-path re-Init (flock).
+    // Destroy via temporary unique_ptr move-out is unavailable (fd would
+    // double-close); use explicit destroy + reconstruct.
     storage_backend.~BucketStorageBackend();
-    new (&storage_backend) BucketStorageBackend(config, bucket_config);
+    ::new (&storage_backend) BucketStorageBackend(config, bucket_config);
 
     BucketStorageBackend restarted_backend(config, bucket_config);
     ASSERT_TRUE(restarted_backend.Init());
