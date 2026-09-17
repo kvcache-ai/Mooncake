@@ -1,7 +1,5 @@
 # Mooncake E2E Test Guide
 
-Platform layout and ROCm entry: [E2E layout](../e2e/README.md).
-
 ## Overview
 
 This directory contains end-to-end (E2E) test cases for the Mooncake project. These test cases are used for CI testing and are executed on the [T-One](https://tone.openanolis.cn) platform.

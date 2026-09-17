@@ -1,7 +1,5 @@
 # Mooncake E2E 测试用例指南
 
-平台拆分及 ROCm 独立入口见 [E2E 目录说明](../e2e/README.md)。
-
 ## 概述
 
 本目录包含 Mooncake 项目的端到端（E2E）测试用例，这些用例被用来做CI测试，会在 [T-One](https://tone.openanolis.cn) 平台上执行。
