@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <limits>
 #include <thread>
 #include <vector>
 
@@ -209,6 +210,67 @@ TEST(WeightMetadataStoreTest, LeaseExpiryIsGenerationFencedAndIdempotent) {
     EXPECT_FALSE(metadata_store.HasActiveLease(ready.identity,
                                                ready.metadata_generation, 350));
     EXPECT_TRUE(metadata_store.PrepareExpireLeases(350).empty());
+}
+
+TEST(WeightMetadataStoreTest, LeaseReplayAdvancesAllocatorWatermark) {
+    WeightMetadataStore source;
+    WeightMetadataStore replay_target;
+    auto source_ready = PublishReady(source);
+    auto target_ready = PublishReady(replay_target);
+    ASSERT_EQ(source_ready, target_ready);
+
+    auto replayed = source.PrepareAcquireLease(
+        AcquireWeightRevisionLeaseRequest{
+            .identity = source_ready.identity,
+            .expected_metadata_generation =
+                source_ready.metadata_generation,
+            .holder = "worker-1",
+            .ttl_ms = 100,
+        },
+        300);
+    ASSERT_TRUE(replayed.has_value());
+    ASSERT_TRUE(replay_target.Publish(*replayed).has_value());
+
+    const auto snapshot = replay_target.ExportSnapshot();
+    EXPECT_EQ(replayed->lease_id + 1, snapshot.next_lease_id);
+    WeightMetadataStore restored;
+    EXPECT_TRUE(restored.RestoreSnapshot(snapshot).has_value());
+
+    auto next = replay_target.PrepareAcquireLease(
+        AcquireWeightRevisionLeaseRequest{
+            .identity = target_ready.identity,
+            .expected_metadata_generation =
+                target_ready.metadata_generation,
+            .holder = "worker-2",
+            .ttl_ms = 100,
+        },
+        301);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_NE(replayed->lease_id, next->lease_id);
+}
+
+TEST(WeightMetadataStoreTest, LeaseReplayRejectsExhaustedAllocatorId) {
+    WeightMetadataStore source;
+    WeightMetadataStore replay_target;
+    auto ready = PublishReady(source);
+    ASSERT_EQ(ready, PublishReady(replay_target));
+
+    auto replayed = source.PrepareAcquireLease(
+        AcquireWeightRevisionLeaseRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+            .holder = "worker-1",
+            .ttl_ms = 100,
+        },
+        300);
+    ASSERT_TRUE(replayed.has_value());
+    replayed->lease_id = std::numeric_limits<uint64_t>::max();
+    replayed->next->lease_id = replayed->lease_id;
+
+    auto published = replay_target.Publish(*replayed);
+    ASSERT_FALSE(published.has_value());
+    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED,
+              published.error());
 }
 
 TEST(WeightMetadataStoreTest, ExcludesConcurrentResidencyOperations) {
@@ -450,6 +512,72 @@ TEST(WeightMetadataStoreTest, CompletesResidencyOperationAndRetainsRecord) {
               view->metadata.metadata_generation);
     EXPECT_EQ(*completed,
               *metadata_store.QueryOperation(completed->operation_id));
+}
+
+TEST(WeightMetadataStoreTest, OperationReplayAdvancesAllocatorWatermark) {
+    WeightMetadataStore source;
+    WeightMetadataStore replay_target;
+    auto source_ready = PublishReady(source);
+    auto target_ready = PublishReady(replay_target);
+    ASSERT_EQ(source_ready, target_ready);
+
+    auto replayed = source.PrepareStartOperation(
+        StartWeightResidencyOperationRequest{
+            .identity = source_ready.identity,
+            .expected_metadata_generation =
+                source_ready.metadata_generation,
+            .target_residency = WeightResidencyState::COLD,
+        },
+        300);
+    ASSERT_TRUE(replayed.has_value());
+    ASSERT_TRUE(replay_target.Publish(*replayed).has_value());
+
+    const auto snapshot = replay_target.ExportSnapshot();
+    EXPECT_EQ(replayed->next->operation_id + 1,
+              snapshot.next_operation_id);
+    WeightMetadataStore restored;
+    EXPECT_TRUE(restored.RestoreSnapshot(snapshot).has_value());
+
+    auto finished = replay_target.PrepareFinishOperation(
+        replayed->next->operation_id, WeightResidencyState::COLD, 400);
+    ASSERT_TRUE(finished.has_value());
+    ASSERT_TRUE(replay_target.Publish(*finished).has_value());
+    auto current = replay_target.Get(target_ready.identity, 400);
+    ASSERT_TRUE(current.has_value());
+    auto next = replay_target.PrepareStartOperation(
+        StartWeightResidencyOperationRequest{
+            .identity = target_ready.identity,
+            .expected_metadata_generation =
+                current->metadata.metadata_generation,
+            .target_residency = WeightResidencyState::HOT,
+        },
+        500);
+    ASSERT_TRUE(next.has_value());
+    EXPECT_NE(replayed->next->operation_id, next->next->operation_id);
+}
+
+TEST(WeightMetadataStoreTest, OperationReplayRejectsExhaustedAllocatorId) {
+    WeightMetadataStore source;
+    WeightMetadataStore replay_target;
+    auto ready = PublishReady(source);
+    ASSERT_EQ(ready, PublishReady(replay_target));
+
+    auto replayed = source.PrepareStartOperation(
+        StartWeightResidencyOperationRequest{
+            .identity = ready.identity,
+            .expected_metadata_generation = ready.metadata_generation,
+            .target_residency = WeightResidencyState::COLD,
+        },
+        300);
+    ASSERT_TRUE(replayed.has_value());
+    const auto exhausted = std::numeric_limits<uint64_t>::max();
+    replayed->metadata.next->operation_id = exhausted;
+    replayed->next->operation_id = exhausted;
+
+    auto published = replay_target.Publish(*replayed);
+    ASSERT_FALSE(published.has_value());
+    EXPECT_EQ(WeightManagementError::GENERATION_EXHAUSTED,
+              published.error());
 }
 
 TEST(WeightMetadataStoreTest, RestoresMultipleCompletedOperations) {

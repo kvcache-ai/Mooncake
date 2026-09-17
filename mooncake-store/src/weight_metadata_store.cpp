@@ -597,7 +597,14 @@ WeightMetadataStore::Result<WeightRevisionLease> WeightMetadataStore::Publish(
     if (revision->second.operation != WeightOperationState::NONE) {
         return tl::make_unexpected(WeightManagementError::BUSY);
     }
+    if (!mutation.previous.has_value() &&
+        next.lease_id == std::numeric_limits<uint64_t>::max()) {
+        return tl::make_unexpected(WeightManagementError::GENERATION_EXHAUSTED);
+    }
     leases_[next.lease_id] = next;
+    if (!mutation.previous.has_value()) {
+        next_lease_id_ = std::max(next_lease_id_, next.lease_id + 1);
+    }
     return next;
 }
 
@@ -875,8 +882,17 @@ WeightMetadataStore::Publish(const WeightOperationMutation& mutation) {
     } else if (operation != operations_.end()) {
         return tl::make_unexpected(WeightManagementError::CONFLICT);
     }
+    if (!mutation.previous.has_value() &&
+        mutation.next->operation_id ==
+            std::numeric_limits<uint64_t>::max()) {
+        return tl::make_unexpected(WeightManagementError::GENERATION_EXHAUSTED);
+    }
     revisions_[mutation.metadata.identity] = *mutation.metadata.next;
     operations_[mutation.next->operation_id] = *mutation.next;
+    if (!mutation.previous.has_value()) {
+        next_operation_id_ =
+            std::max(next_operation_id_, mutation.next->operation_id + 1);
+    }
     return *mutation.next;
 }
 
