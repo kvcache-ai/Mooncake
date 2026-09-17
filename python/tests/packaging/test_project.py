@@ -174,10 +174,6 @@ def test_scikit_build_consumes_unified_python_sources() -> None:
     # mooncake.cli / mooncake.cli_client wrappers resolve them in place.
     assert "install(TARGETS mooncake_master mooncake_client" in integration_cmake
     assert "RUNTIME DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR}" in integration_cmake
-    # Known gap: transfer_engine_bench install is guarded by BUILD_EXAMPLES,
-    # which the scikit-build cmake.define does not enable today. Its console
-    # script therefore has no backing binary in a scikit-build wheel; tracked
-    # as a Phase-2 cut-over item.
     assert "if(WITH_TE AND BUILD_EXAMPLES)" in integration_cmake
 
 

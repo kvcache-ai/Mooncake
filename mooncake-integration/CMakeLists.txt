@@ -220,6 +220,7 @@ if(NOT SKBUILD)
   install(
     FILES
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/_launcher.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/cli_bench.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../python/mooncake/transfer_engine_topology_dump.py"
       "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
