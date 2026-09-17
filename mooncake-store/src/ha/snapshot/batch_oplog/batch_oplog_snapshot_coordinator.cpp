@@ -11,6 +11,7 @@
 #include "ha/oplog/oplog_batch_storage.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
+#include "ha/snapshot/batch_oplog/batch_oplog_pruning_coordinator.h"
 #include "ha/snapshot/batch_oplog/metadata.h"
 #include "ha/snapshot/batch_oplog/writer.h"
 #include "ha/snapshot/snapshot_maintenance_lease.h"
@@ -429,11 +430,11 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
     if (publish_error == ErrorCode::OK) {
         BatchOpLogSnapshotGc gc(backend_, object_store_, cluster_id_,
                                 config_.snapshot_root);
+        auto cancelled = [this] {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return stop_requested_ || promotion_requested_;
+        };
         try {
-            auto cancelled = [this] {
-                std::lock_guard<std::mutex> lock(mutex_);
-                return stop_requested_ || promotion_requested_;
-            };
             if (gc.Run(*lease, *descriptor, expected_fallback, cancelled) !=
                 ErrorCode::OK)
                 LOG(WARNING) << "Batch snapshot object GC skipped or failed";
@@ -441,6 +442,20 @@ ErrorCode BatchOpLogSnapshotCoordinator::RunAttempt() {
             LOG(WARNING) << "Batch snapshot object GC threw: " << e.what();
         } catch (...) {
             LOG(WARNING) << "Batch snapshot object GC threw unknown exception";
+        }
+        // GC is best-effort and must not prevent independently validated
+        // pruning, including when it throws. Keep the publication successful.
+        try {
+            BatchOpLogPruningCoordinator pruning(
+                backend_, object_store_, cluster_id_, config_.snapshot_root);
+            const auto error = pruning.Run(*lease, cancelled);
+            if (error != ErrorCode::OK)
+                LOG(WARNING) << "Batch OpLog pruning skipped or failed: "
+                             << static_cast<int>(error);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Batch OpLog pruning threw: " << e.what();
+        } catch (...) {
+            LOG(WARNING) << "Batch OpLog pruning threw unknown exception";
         }
     }
     release_lease();

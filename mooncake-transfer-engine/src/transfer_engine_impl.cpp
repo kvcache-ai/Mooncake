@@ -417,7 +417,10 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using Intra-Node NVLink transport "
                          "(MC_INTRANODE_NVLINK set)";
-        } else if (kGpuP2PCompiled && (force_gpu_p2p || no_hca)) {
+        } else if (kGpuP2PCompiled &&
+                   (force_gpu_p2p || (no_hca && !force_hca))) {
+            // MC_FORCE_HCA suppresses automatic no-HCA fallback, but keeps
+            // explicitly requested GPU P2P transport precedence unchanged.
             Transport* t =
                 multi_transports_->installTransport(gpu_p2p_protocol, nullptr);
             if (!t) {
