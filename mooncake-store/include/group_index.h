@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <mutex>
@@ -32,20 +33,29 @@ namespace mooncake {
 template <size_t StripeCount>
 class StripedGroupIndex {
    public:
-    // Materialize the group on demand and register the member under one lock
-    // section, returning the group's single shared Lease (nullptr when already
-    // a member). One step, so the lease and the membership cannot disagree.
+    // Materialize the group on demand, register the member and return the
+    // group's single shared Lease under one lock section, so a lease and its
+    // membership cannot disagree. Every member of a group shares that one
+    // lease, and the metadata that receives it is what keeps it alive: the
+    // group itself is dropped with its last member.
+    //
+    // Re-registering a member returns the same lease, because membership is a
+    // set and a repeat is not an error. An empty group_id is the ungrouped
+    // case: it joins no group and gets no lease, so no ungrouped object is ever
+    // registered here.
     [[nodiscard]] std::shared_ptr<Lease> AddMember(
         std::string_view group_id, std::string_view member_key) {
+        if (group_id.empty()) {
+            return nullptr;
+        }
         auto& stripe = StripeFor(group_id);
         std::unique_lock<std::shared_mutex> lock(stripe.mutex);
         auto [it, inserted] = stripe.groups.try_emplace(std::string(group_id));
         if (inserted) {
             it->second.lease = std::make_shared<Lease>();
+            group_count_.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!it->second.member_keys.insert(std::string(member_key)).second) {
-            return nullptr;  // already a member
-        }
+        it->second.member_keys.insert(std::string(member_key));
         return it->second.lease;
     }
 
@@ -66,6 +76,7 @@ class StripedGroupIndex {
         it->second.member_keys.erase(member);
         if (it->second.Empty()) {
             stripe.groups.erase(it);
+            group_count_.fetch_sub(1, std::memory_order_relaxed);
         }
         return true;
     }
@@ -81,14 +92,10 @@ class StripedGroupIndex {
         return {it->second.member_keys.begin(), it->second.member_keys.end()};
     }
 
+    // Materialized groups, counted as they are created and dropped, so this
+    // does not take one lock per stripe.
     [[nodiscard]] bool Empty() const {
-        for (const auto& stripe : stripes_) {
-            std::shared_lock<std::shared_mutex> lock(stripe.mutex);
-            if (!stripe.groups.empty()) {
-                return false;
-            }
-        }
-        return true;
+        return group_count_.load(std::memory_order_relaxed) == 0;
     }
 
    private:
@@ -100,8 +107,6 @@ class StripedGroupIndex {
         bool Empty() const { return member_keys.empty(); }
     };
 
-    // Group operations are O(1) map/set updates, so a per-group-id stripe keeps
-    // concurrent puts on distinct groups from serializing on one lock.
     struct Stripe {
         mutable std::shared_mutex mutex;
         std::unordered_map<std::string, GroupState, TransparentStringHash,
@@ -122,6 +127,10 @@ class StripedGroupIndex {
     }
 
     std::array<Stripe, StripeCount> stripes_;
+    // Groups materialized across every stripe. A count rather than a flag: the
+    // stripes that are not being written cannot tell whether they are the last
+    // group, so only a count can be lowered again.
+    std::atomic<size_t> group_count_{0};
 };
 
 // 64 stripes: the shipped default. A grouping-heavy workload can raise it by
