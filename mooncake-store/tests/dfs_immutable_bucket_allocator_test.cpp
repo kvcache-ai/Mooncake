@@ -177,6 +177,63 @@ TEST(ImmutableBucketAllocatorTest, RetiresWholeBucketAfterDelete) {
     EXPECT_FALSE(allocator.GetBucketIdForKey("cold"));
 }
 
+TEST(ImmutableBucketAllocatorTest,
+     FailedEvictionDeleteAllowsSameKeyReallocation) {
+    TempDir dir;
+    auto config = BucketConfig(dir);
+    ImmutableBucketAllocator allocator;
+    ASSERT_TRUE(allocator.Init(config));
+
+    auto old = allocator.Allocate("same", 100);
+    auto active = allocator.Allocate("active", 4097);
+    ASSERT_TRUE(old);
+    ASSERT_TRUE(active);
+    ASSERT_NE(old->shard_idx, active->shard_idx);
+    ASSERT_TRUE(allocator.MarkCommitted("same", *old));
+    ASSERT_TRUE(allocator.MarkCommitted("active", *active));
+
+    auto eviction = allocator.PrepareEvictionForAllocationFailure();
+    ASSERT_FALSE(eviction.Empty());
+    ASSERT_EQ(eviction.Candidates().size(), 1u);
+    ASSERT_EQ(eviction.Candidates().front().key, "same");
+    const auto old_bucket_id = old->shard_idx;
+    const std::filesystem::path old_bucket_path = old->file_path;
+
+    ASSERT_TRUE(std::filesystem::remove(old_bucket_path));
+    ASSERT_TRUE(std::filesystem::create_directory(old_bucket_path));
+    std::ofstream(old_bucket_path / "keep") << "force unlink failure";
+
+    auto committed = allocator.CommitEviction(std::move(eviction));
+    ASSERT_FALSE(committed);
+    EXPECT_EQ(committed.error(), ErrorCode::FILE_WRITE_FAIL);
+    EXPECT_FALSE(allocator.GetBucketIdForKey("same"));
+    EXPECT_EQ(allocator.GetBucketCount(), 2u);
+    EXPECT_EQ(allocator.GetUsedBytes(), 2 * config.bucket_capacity);
+
+    auto replacement = allocator.Allocate("same", 100);
+    ASSERT_TRUE(replacement);
+    ASSERT_NE(replacement->shard_idx, old_bucket_id);
+    ASSERT_TRUE(allocator.MarkCommitted("same", *replacement));
+    const auto replacement_bucket = allocator.GetBucketIdForKey("same");
+    ASSERT_TRUE(replacement_bucket);
+    EXPECT_EQ(*replacement_bucket, replacement->shard_idx);
+    EXPECT_EQ(allocator.GetBucketCount(), 3u);
+    EXPECT_EQ(allocator.GetUsedBytes(),
+              2 * config.bucket_capacity + config.alignment);
+
+    ASSERT_TRUE(std::filesystem::remove_all(old_bucket_path));
+    std::ofstream(old_bucket_path) << "retry deletion";
+    EXPECT_EQ(allocator.RetryFailedEvictions(), 1u);
+
+    EXPECT_FALSE(std::filesystem::exists(old_bucket_path));
+    EXPECT_EQ(allocator.GetBucketCount(), 2u);
+    const auto preserved_bucket = allocator.GetBucketIdForKey("same");
+    ASSERT_TRUE(preserved_bucket);
+    EXPECT_EQ(*preserved_bucket, replacement->shard_idx);
+    EXPECT_EQ(allocator.GetUsedBytes(),
+              config.bucket_capacity + config.alignment);
+}
+
 TEST(ImmutableBucketAllocatorTest, RejectsExistingBucketArtifacts) {
     TempDir dir;
     std::ofstream(dir.file("bucket_000000.data")) << "old";

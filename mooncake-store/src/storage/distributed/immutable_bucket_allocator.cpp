@@ -495,6 +495,15 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::CommitEviction(
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         bucket = it->second;
+        // Logical commit: keys become re-allocatable now; capacity is
+        // released only when the physical delete succeeds.
+        for (const auto& [key, entry] : bucket->entries) {
+            (void)entry;
+            const auto indexed = key_index_.find(key);
+            if (indexed != key_index_.end() && indexed->second == bucket->id) {
+                key_index_.erase(indexed);
+            }
+        }
         bucket->lifecycle = BucketLifecycle::EVICTING;
         pending.owner_ = nullptr;
     }
@@ -509,13 +518,6 @@ tl::expected<void, ErrorCode> ImmutableBucketAllocator::CommitEviction(
     std::lock_guard lock(mutex_);
     const auto current = buckets_.find(bucket->id);
     if (current != buckets_.end() && current->second == bucket) {
-        for (const auto& [key, entry] : bucket->entries) {
-            (void)entry;
-            const auto indexed = key_index_.find(key);
-            if (indexed != key_index_.end() && indexed->second == bucket->id) {
-                key_index_.erase(indexed);
-            }
-        }
         bucket->lifecycle = BucketLifecycle::RETIRED;
         buckets_.erase(current);
     }
@@ -546,13 +548,6 @@ size_t ImmutableBucketAllocator::RetryFailedEvictions() {
         if (current == buckets_.end() || current->second != bucket ||
             bucket->lifecycle != BucketLifecycle::EVICTING) {
             continue;
-        }
-        for (const auto& [key, entry] : bucket->entries) {
-            (void)entry;
-            const auto indexed = key_index_.find(key);
-            if (indexed != key_index_.end() && indexed->second == id) {
-                key_index_.erase(indexed);
-            }
         }
         bucket->lifecycle = BucketLifecycle::RETIRED;
         buckets_.erase(current);
