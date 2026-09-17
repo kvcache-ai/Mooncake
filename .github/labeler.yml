@@ -72,6 +72,8 @@ Tests:
       - 'mooncake-reshard/tests/**/*'
       - 'python/tests/**/*'
       - 'scripts/tone_tests/**/*'
+      - 'scripts/rocm_tests/**/*'
+      - 'scripts/e2e/**/*'
 
 Ascend/NPU:
   - changed-files:

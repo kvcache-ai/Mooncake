@@ -439,7 +439,7 @@ jobs:
     - name: Run focused shell regression tests
       run: |
         bash scripts/tone_tests/tests/test_common_cleanup.sh
-        python3 scripts/tone_tests/tests/test_hicache_model_selection.py
+        python3 -m unittest discover -s scripts/tone_tests/tests -p 'test_*.py'
       shell: bash
 
   clang-format:
