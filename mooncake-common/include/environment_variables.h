@@ -232,6 +232,10 @@ struct ClientAutoDiscoveryEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MC_MS_FILTERS);
 };
 
+struct ClientHostIdentityEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MOONCAKE_HOST_ID);
+};
+
 struct NvmeKvIoConcurrencyEnvironmentVariables {
     // Keep these values as strings to preserve the existing NVMe unsigned
     // syntax, zero fallback, and silent invalid-value behavior.
