@@ -126,15 +126,48 @@ struct CoreAccess {
             addSaturating(state->deferred_bytes_, bytes);
             return {Decision::kAvoid, false, false};
         }
+        if (path_state == PathState::kProbing) {
+            std::lock_guard<std::mutex> lock(state->probe_mutex_);
+            if (generation !=
+                    state->generation_.load(std::memory_order_acquire) ||
+                state->state_.load(std::memory_order_acquire) !=
+                    PathState::kProbing) {
+                return {Decision::kAvoid, false, false};
+            }
+            if (state->probe_draining_) {
+                addSaturating(state->deferred_bytes_, bytes);
+                return {Decision::kDefer, false, false};
+            }
+
+            const uint64_t probe_epoch =
+                state->probe_epoch_.load(std::memory_order_relaxed);
+            const uint64_t limit =
+                std::min(state->window_bytes_.load(std::memory_order_relaxed),
+                         state->config_.probe_window_bytes);
+            uint64_t current =
+                state->inflight_bytes_.load(std::memory_order_relaxed);
+            while (true) {
+                if (current != 0 &&
+                    (bytes > limit || current > limit - bytes)) {
+                    addSaturating(state->deferred_bytes_, bytes);
+                    return {Decision::kDefer, false, false};
+                }
+                if (state->inflight_bytes_.compare_exchange_weak(
+                        current, current + bytes, std::memory_order_acquire,
+                        std::memory_order_relaxed)) {
+                    if (state->active_probe_permits_ ==
+                        std::numeric_limits<uint64_t>::max()) {
+                        releaseBytes(*state, bytes);
+                        addSaturating(state->deferred_bytes_, bytes);
+                        return {Decision::kDefer, false, false};
+                    }
+                    ++state->active_probe_permits_;
+                    return {Decision::kAllow, true, probe_epoch};
+                }
+            }
+        }
 
         uint64_t limit = state->window_bytes_.load(std::memory_order_relaxed);
-        const uint64_t probe_epoch =
-            path_state == PathState::kProbing
-                ? state->probe_epoch_.load(std::memory_order_acquire)
-                : 0;
-        if (probe_epoch != 0) {
-            limit = std::min(limit, state->config_.probe_window_bytes);
-        }
 
         uint64_t current =
             state->inflight_bytes_.load(std::memory_order_relaxed);
@@ -150,23 +183,28 @@ struct CoreAccess {
                     std::memory_order_relaxed)) {
                 const PathState current_state =
                     state->state_.load(std::memory_order_acquire);
-                const uint64_t current_probe_epoch =
-                    state->probe_epoch_.load(std::memory_order_acquire);
-                const bool entered_probe =
-                    probe_epoch == 0 && current_state == PathState::kProbing;
-                const bool left_probe =
-                    probe_epoch != 0 &&
-                    (current_state == PathState::kQuarantined ||
-                     current_probe_epoch != probe_epoch);
-                if (current_state == PathState::kQuarantined || entered_probe ||
-                    left_probe) {
+                const bool entered_probe = current_state == PathState::kProbing;
+                if (current_state == PathState::kQuarantined || entered_probe) {
                     releaseBytes(*state, bytes);
                     addSaturating(state->deferred_bytes_, bytes);
                     return {Decision::kAvoid, false, 0};
                 }
-                return {Decision::kAllow, true, probe_epoch};
+                return {Decision::kAllow, true, 0};
             }
         }
+    }
+
+    static void releaseProbePermit(DomainState* state, uint32_t generation,
+                                   uint64_t probe_epoch) {
+        if (state == nullptr || probe_epoch == 0) return;
+        std::lock_guard<std::mutex> lock(state->probe_mutex_);
+        if (state->generation_.load(std::memory_order_acquire) != generation ||
+            state->probe_epoch_.load(std::memory_order_relaxed) !=
+                probe_epoch ||
+            state->active_probe_permits_ == 0) {
+            return;
+        }
+        --state->active_probe_permits_;
     }
 
     static void addSignals(DomainState& state, uint32_t generation,
@@ -366,7 +404,11 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit) {
     const AcquireResult route =
         CoreAccess::acquireOne(path.route, path.route_generation, bytes);
     if (route.decision != Decision::kAllow) {
-        if (device.reserved) CoreAccess::releaseBytes(*path.device, bytes);
+        if (device.reserved) {
+            CoreAccess::releaseProbePermit(path.device, path.device_generation,
+                                           device.probe_epoch);
+            CoreAccess::releaseBytes(*path.device, bytes);
+        }
         permit.active_.store(false, std::memory_order_release);
         return route.decision;
     }
@@ -380,8 +422,16 @@ Decision tryAcquire(const PathHandle& path, uint64_t bytes, Permit& permit) {
         path.route_generation ==
             path.route->generation_.load(std::memory_order_acquire);
     if (!device_current || !route_current) {
-        if (device.reserved) CoreAccess::releaseBytes(*path.device, bytes);
-        if (route.reserved) CoreAccess::releaseBytes(*path.route, bytes);
+        if (device.reserved) {
+            CoreAccess::releaseProbePermit(path.device, path.device_generation,
+                                           device.probe_epoch);
+            CoreAccess::releaseBytes(*path.device, bytes);
+        }
+        if (route.reserved) {
+            CoreAccess::releaseProbePermit(path.route, path.route_generation,
+                                           route.probe_epoch);
+            CoreAccess::releaseBytes(*path.route, bytes);
+        }
         permit.active_.store(false, std::memory_order_release);
         return Decision::kAvoid;
     }
@@ -406,16 +456,20 @@ bool complete(Permit& permit, OutcomeClass outcome, FailureScope scope) {
         return false;
     }
 
-    if (permit.device_reserved_)
-        CoreAccess::releaseBytes(*permit.device_, permit.bytes_);
-    if (permit.route_reserved_)
-        CoreAccess::releaseBytes(*permit.route_, permit.bytes_);
     CoreAccess::recordOutcome(permit.device_, permit.device_generation_,
                               permit.bytes_, outcome, scope, false,
                               permit.device_probe_epoch_);
     CoreAccess::recordOutcome(permit.route_, permit.route_generation_,
                               permit.bytes_, outcome, scope, true,
                               permit.route_probe_epoch_);
+    CoreAccess::releaseProbePermit(permit.device_, permit.device_generation_,
+                                   permit.device_probe_epoch_);
+    CoreAccess::releaseProbePermit(permit.route_, permit.route_generation_,
+                                   permit.route_probe_epoch_);
+    if (permit.device_reserved_)
+        CoreAccess::releaseBytes(*permit.device_, permit.bytes_);
+    if (permit.route_reserved_)
+        CoreAccess::releaseBytes(*permit.route_, permit.bytes_);
     return true;
 }
 
@@ -491,10 +545,13 @@ void controlTick(DomainState& state, uint64_t now_ns) {
     PathState path_state = state.state_.load(std::memory_order_relaxed);
     if (path_state == PathState::kQuarantined) {
         if (now_ns >= state.quarantine_until_ns_) {
+            std::lock_guard<std::mutex> lock(state.probe_mutex_);
             state.window_bytes_.store(state.config_.probe_window_bytes,
                                       std::memory_order_relaxed);
             const uint64_t current_epoch =
                 state.probe_epoch_.load(std::memory_order_relaxed);
+            state.active_probe_permits_ = 0;
+            state.probe_draining_ = false;
             state.probe_epoch_.store(nextEpoch(current_epoch),
                                      std::memory_order_release);
             state.state_.store(PathState::kProbing, std::memory_order_release);
@@ -503,19 +560,28 @@ void controlTick(DomainState& state, uint64_t now_ns) {
     }
 
     if (path_state == PathState::kProbing) {
+        std::lock_guard<std::mutex> lock(state.probe_mutex_);
         if (probe_failures != 0 || fatal_failures != 0 || hard_errors != 0 ||
             timeouts != 0) {
             state.quarantine_until_ns_ =
                 addBounded(now_ns, state.config_.cooldown_ns);
             state.state_.store(PathState::kQuarantined,
                                std::memory_order_release);
-        } else if (probe_successes != 0) {
+            state.probe_draining_ = false;
+        } else {
+            if (probe_successes != 0) {
+                state.probe_draining_ = true;
+            }
+            if (!state.probe_draining_ || state.active_probe_permits_ != 0) {
+                return;
+            }
             state.hard_error_streak_ = 0;
             state.high_pressure_streak_ = 0;
             state.low_pressure_streak_ = 0;
             state.window_bytes_.store(state.config_.min_window_bytes,
                                       std::memory_order_relaxed);
             state.state_.store(PathState::kHealthy, std::memory_order_release);
+            state.probe_draining_ = false;
         }
         return;
     }
@@ -602,11 +668,14 @@ void resetGeneration(DomainState& state, uint32_t generation) {
     if (!CoreAccess::pauseFeedback(state, current_generation)) return;
 
     CoreAccess::clearSignals(state);
+    std::lock_guard<std::mutex> lock(state.probe_mutex_);
     state.high_pressure_streak_ = 0;
     state.low_pressure_streak_ = 0;
     state.hard_error_streak_ = 0;
     state.quarantine_until_ns_ = 0;
     state.probe_epoch_.store(0, std::memory_order_relaxed);
+    state.active_probe_permits_ = 0;
+    state.probe_draining_ = false;
     state.deferred_bytes_.store(0, std::memory_order_relaxed);
     state.window_bytes_.store(state.config_.min_window_bytes,
                               std::memory_order_relaxed);
