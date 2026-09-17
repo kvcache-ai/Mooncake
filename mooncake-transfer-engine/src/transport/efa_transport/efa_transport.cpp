@@ -35,6 +35,7 @@
 #include "config.h"
 #include "environ.h"
 #include "memory_location.h"
+#include "transport/efa_transport/efa_neuron.h"
 #include "topology.h"
 #include "transport/batch_registration.h"
 #include "transport/efa_transport/efa_context.h"
@@ -291,16 +292,35 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
         chunks.emplace_back(addr, length);
     }
 
-    // Resolve location name once (based on original buffer)
+    // Resolve location name once (based on original buffer).
+    //
+    // The Neuron probe deliberately runs ahead of the caller-supplied hint.  A
+    // hint is normally authoritative, but a hint of "cpu:N" over Neuron HBM is
+    // not merely imprecise: "cpu" opts the buffer into the preTouchMemory()
+    // path below, which stores to every page from the CPU.  Callers whose
+    // vocabulary is only "host or CUDA" would silently corrupt device memory,
+    // so the probe wins and says so.  On hosts without Neuron devices the probe
+    // is a cached bool, so this costs nothing.
     std::string resolved_name;
-    if (name == kWildcardLocation) {
+    int neuron_device = 0;
+    if (neuronProbeAddress(addr, length, &neuron_device)) {
+        resolved_name = neuronLocationName(neuron_device);
+        if (name != kWildcardLocation && name != resolved_name) {
+            LOG(WARNING) << "Ignoring location hint \"" << name
+                         << "\" for Neuron HBM " << addr << " (" << length
+                         << " bytes), registering it as " << resolved_name;
+        } else {
+            LOG(INFO) << "Registering Neuron HBM " << addr << " (" << length
+                      << " bytes) as " << resolved_name;
+        }
+    } else if (name != kWildcardLocation) {
+        resolved_name = name;
+    } else {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
         if (entries.empty()) return -1;
         resolved_name = entries[0].location;
-    } else {
-        resolved_name = name;
     }
 
     // Pre-compute NIC assignments for each chunk.

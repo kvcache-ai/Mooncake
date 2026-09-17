@@ -29,6 +29,7 @@
 #include "config.h"
 #include "cuda_alike.h"
 #include "transport/efa_transport/efa_endpoint.h"
+#include "transport/efa_transport/efa_neuron.h"
 #include "transport/efa_transport/efa_transport.h"
 #include "transport/transport.h"
 
@@ -62,8 +63,46 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     // initialization creates a CUDA primary context on GPU 0 and leaks
     // ~616 MiB of device memory even when no GPU memory is ever registered.
     // Only set if the user hasn't explicitly configured FI_HMEM.
-    setenv("FI_HMEM", "system", 0);
+    //
+    // On a Neuron host the same guard has to name "neuron" instead: FI_HMEM
+    // takes exactly one interface, not a list, so "system" (or even
+    // "system,neuron") makes fi_getinfo() below report -FI_ENODATA once
+    // FI_MR_HMEM is in mr_mode.  Selecting "neuron" still leaves host memory
+    // registrable -- FI_HMEM_SYSTEM is always available -- and still keeps
+    // libfabric away from libcudart, which is the point of the guard.
+    setenv("FI_HMEM", neuronAvailable() ? "neuron" : "system", 0);
 #endif
+
+    // Keep libfabric's SHM sub-provider out of the way on Neuron hosts.
+    //
+    // For same-host peers the EFA provider hands the transfer to an internal
+    // shm endpoint (efa_shm_info_create() in prov/efa/src/efa_shm.c), and shm
+    // cannot move Neuron HBM.  libfabric's FI_HMEM_NEURON op table
+    // (src/hmem.c) implements copy_to_hmem only: copy_from_hmem is
+    // neuron_copy_from_dev(), whose whole body is
+    //   FI_WARN_ONCE("Copies from AWS Neuron to host memory are not
+    //                 supported."); return -FI_ENOSYS;
+    // and every IPC entry is a ofi_hmem_no_* stub, so smr_ep.c's
+    //   use_ipc = ofi_hmem_is_ipc_enabled(iface) && ...
+    // is always false and shm has no protocol left that could read out of a
+    // source Neuron buffer.  The shm provider never uses dmabuf either.
+    //
+    // Left to itself shm therefore treats the /dev/neuron mapping as ordinary
+    // host memory and memcpy()s across what is really an uncached PCIe BAR:
+    // correct bytes, 0.07 GB/s.  Disabling shm sends intra-node traffic back
+    // over the EFA device instead, measured at 19.23 GB/s -- the same as the
+    // inter-node rate for one chip, i.e. no loss at all.
+    //
+    // Declaring FI_HMEM in hints->caps, which is what the CUDA path does and
+    // what efa_shm.c keys FI_MR_HMEM off, would be worse than this: it makes
+    // shm HMEM-aware and the transfer then fails outright on that ENOSYS
+    // rather than merely crawling.
+    //
+    // Overwrite is 0, so an explicit FI_EFA_ENABLE_SHM_TRANSFER from the
+    // environment still wins.  This is process-global and also takes host
+    // memory off the shm path on Neuron hosts; that is an acceptable trade,
+    // since intra-node host transfers loop back over EFA just as well.
+    if (neuronAvailable()) setenv("FI_EFA_ENABLE_SHM_TRANSFER", "0", 0);
 
     // Setup hints for EFA provider
     hints_ = fi_allocinfo();
@@ -100,6 +139,15 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
                                    | FI_MR_HMEM
 #endif
         ;
+    // FI_MR_HMEM is mandatory for FI_HMEM_NEURON: without it the EFA provider
+    // matches no fi_info at all (fi_getinfo -> -FI_ENODATA) rather than merely
+    // refusing the later fi_mr_regattr().  Unlike CUDA this is a runtime
+    // decision -- Neuron support costs no build flag, see efa_neuron.h.
+    //
+    // Note that FI_HMEM is deliberately NOT added to caps here, unlike the
+    // CUDA path above.  See the FI_EFA_ENABLE_SHM_TRANSFER guard below for
+    // why declaring it would turn a slow intra-node path into a broken one.
+    if (neuronAvailable()) hints_->domain_attr->mr_mode |= FI_MR_HMEM;
     hints_->domain_attr->threading = FI_THREAD_SAFE;
 
     // Get fabric info.
@@ -556,27 +604,65 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     }
 #endif
 
+#ifdef MOONCAKE_HAVE_FI_HMEM_NEURON
+    // Neuron (Trainium/Inferentia) HBM.  Detected at runtime from the
+    // /dev/neuron<N> mapping backing the buffer, so this needs no Neuron SDK;
+    // the build flag is only about whether the libfabric we compile against
+    // knows the interface at all -- see efa_neuron.h.
+    int neuron_device = 0;
+    if (iface == FI_HMEM_SYSTEM &&
+        neuronProbeAddress(addr, length, &neuron_device)) {
+        iface = FI_HMEM_NEURON;
+        device_ordinal = neuron_device;
+    }
+#endif
+
     int ret;
     if (iface != FI_HMEM_SYSTEM) {
 #if defined(USE_CUDA)
+        // Declared out here so the context stays current until the
+        // registration below is done, but only bound for CUDA memory:
+        // device_ordinal is a CUDA device only when the iface says so, and
+        // binding to a Neuron ordinal would fail the registration outright.
         ScopedCudaContext reg_context;
-        if (!reg_context.valid() || !reg_context.bind(device_ordinal))
+        if (iface == FI_HMEM_CUDA &&
+            (!reg_context.valid() || !reg_context.bind(device_ordinal)))
             return ERR_CONTEXT;
 #endif
-        // GPU memory: use fi_mr_regattr with explicit iface and device
+        // Device memory: use fi_mr_regattr with explicit iface and device
         struct iovec iov = {.iov_base = addr, .iov_len = length};
         struct fi_mr_attr attr = {};
         attr.mr_iov = &iov;
         attr.iov_count = 1;
         attr.access = fi_access;
         attr.iface = iface;
-        attr.device.cuda = device_ordinal;
+        // fi_mr_attr::device is a union of per-interface ordinals; name the
+        // member that matches the iface we just selected.
+#ifdef MOONCAKE_HAVE_FI_HMEM_NEURON
+        if (iface == FI_HMEM_NEURON) {
+            attr.device.neuron = device_ordinal;
+        } else
+#endif
+        {
+            attr.device.cuda = device_ordinal;
+        }
 
         ret = fi_mr_regattr(domain_, &attr, 0, &mrMeta.mr);
         if (ret) {
-            LOG(ERROR) << "fi_mr_regattr failed for GPU memory " << addr
-                       << " (device " << device_ordinal
-                       << "): " << fi_strerror(-ret);
+            LOG(ERROR) << "fi_mr_regattr failed for device memory " << addr
+                       << " (iface " << (int)iface << ", device "
+                       << device_ordinal << "): " << fi_strerror(-ret);
+            if (ret == -FI_ENOSYS) {
+                // ENOSYS means libfabric never populated the op table for this
+                // interface, which for Neuron is almost always a libnrt it
+                // could not dlopen; see dlopenNeuronRuntime() in
+                // efa_neuron.cpp.
+                LOG(ERROR)
+                    << "This interface was not initialized by libfabric. "
+                       "Re-run with FI_LOG_LEVEL=warn to see why, and "
+                       "check that the device runtime library is on the "
+                       "loader path.";
+            }
             return ERR_CONTEXT;
         }
     } else {

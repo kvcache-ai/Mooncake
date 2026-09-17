@@ -12,23 +12,34 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <dlfcn.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <signal.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <unordered_map>
+#include <vector>
 
 #include "common.h"
 #include "common/base/status.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
+
+#ifdef USE_EFA
+// For neuronProbeAddress(), which answers which /dev/neuron<N> a pointer
+// belongs to -- the same lookup the transport uses to name a buffer's location.
+#include "transport/efa_transport/efa_neuron.h"
+#endif
 
 #ifdef USE_TENT
 #include "tent/transfer_engine.h"
@@ -117,10 +128,331 @@ DEFINE_int32(gpu_id, 0,
              "GPU/NPU ID to use, -1 for all GPUs, not supported for NPUs");
 #endif
 
+#ifdef USE_EFA
+DEFINE_int32(neuron_device, -1,
+             "Allocate buffers from AWS Neuron (Trainium/Inferentia) HBM on "
+             "this logical NeuronCore instead of DRAM; -1 disables. Valid if "
+             "protocol=efa");
+DEFINE_int32(
+    neuron_device_count, 1,
+    "Number of Neuron devices to spread buffers over, starting at the "
+    "one holding --neuron_device. One buffer per device, since only two "
+    "EFA NICs sit on any one device's PCIe switch and a single device "
+    "therefore cannot use the whole fabric");
+DEFINE_int32(
+    neuron_fill_byte, 0xCC,
+    "Byte to prefill Neuron HBM with. Give the two sides different "
+    "values and --mode=target reports, on shutdown, how much of its "
+    "HBM the peer actually overwrote -- the only end-to-end check that "
+    "the bytes landed in device memory, since the host cannot memcmp() "
+    "it");
+DEFINE_int32(neuron_core_stride, 0,
+             "Logical NeuronCores to step between the buffers of "
+             "--neuron_device_count. 0 (the default) does not step a fixed "
+             "amount at all: it finds one logical core per physical device by "
+             "probing, which needs no assumption about core fusion. Set it "
+             "only to reproduce a particular placement. Either way the "
+             "\"Registering Neuron HBM ... as neuron:N\" lines say where the "
+             "buffers landed");
+#endif
+
 using namespace mooncake;
+
+#ifdef USE_EFA
+// Neuron HBM allocation for the benchmark.
+//
+// libnrt is reached through dlopen() rather than linked, so a stock build of
+// this benchmark still starts on hosts with no Neuron SDK -- the same reason
+// the transport itself takes no build flag for Neuron (see efa_neuron.h).  Note
+// that no location string is derived from FLAGS_neuron_device here: that is a
+// *logical* NeuronCore index, which NEURON_RT_VISIBLE_CORES renumbers and which
+// several cores share per physical device.  Naming is left to the transport,
+// which reads the real device ordinal back out of the pointer.
+namespace {
+struct nrt_tensor;
+
+struct NeuronRuntime {
+    int (*init)(int, const char*, const char*) = nullptr;
+    int (*tensor_allocate)(int, int, size_t, const char*,
+                           struct nrt_tensor**) = nullptr;
+    void* (*tensor_get_va)(struct nrt_tensor*) = nullptr;
+    void (*tensor_free)(struct nrt_tensor**) = nullptr;
+    int (*tensor_write)(struct nrt_tensor*, const void*, size_t,
+                        size_t) = nullptr;
+    int (*tensor_read)(struct nrt_tensor*, void*, size_t, size_t) = nullptr;
+};
+
+// Tensor handles are kept keyed by VA because allocateMemoryPool() hands its
+// caller a bare pointer and freeMemoryPool() only ever gets that pointer back.
+std::unordered_map<void*, struct nrt_tensor*> neuron_tensors;
+
+const NeuronRuntime* neuronRuntime() {
+    static NeuronRuntime rt;
+    static bool ok = [&]() -> bool {
+        // Prefer an already-loaded libnrt over a second independent copy of the
+        // device runtime in one process.
+        void* handle = dlopen("libnrt.so.1", RTLD_LAZY | RTLD_NOLOAD);
+        if (!handle) handle = dlopen("libnrt.so.1", RTLD_LAZY);
+        if (!handle)
+            handle = dlopen("/opt/aws/neuron/lib/libnrt.so.1", RTLD_LAZY);
+        if (!handle) {
+            // dlerror() may return NULL; streaming a NULL const char* is UB.
+            const char* err = dlerror();
+            LOG(ERROR) << "--neuron_device requires libnrt: "
+                       << (err ? err : "no dlerror() message");
+            return false;
+        }
+        rt.init = (decltype(rt.init))dlsym(handle, "nrt_init");
+        rt.tensor_allocate =
+            (decltype(rt.tensor_allocate))dlsym(handle, "nrt_tensor_allocate");
+        rt.tensor_get_va =
+            (decltype(rt.tensor_get_va))dlsym(handle, "nrt_tensor_get_va");
+        rt.tensor_free =
+            (decltype(rt.tensor_free))dlsym(handle, "nrt_tensor_free");
+        rt.tensor_write =
+            (decltype(rt.tensor_write))dlsym(handle, "nrt_tensor_write");
+        rt.tensor_read =
+            (decltype(rt.tensor_read))dlsym(handle, "nrt_tensor_read");
+        if (!rt.init || !rt.tensor_allocate || !rt.tensor_get_va ||
+            !rt.tensor_free) {
+            LOG(ERROR) << "libnrt is missing the tensor API";
+            return false;
+        }
+        // NRT_FRAMEWORK_TYPE_NO_FW.  Idempotent, so calling it here is safe
+        // even when a framework in the same process has already initialised the
+        // runtime.
+        int rc = rt.init(1, "", "");
+        if (rc != 0) {
+            LOG(ERROR) << "nrt_init failed with NRT_STATUS " << rc
+                       << "; check NEURON_RT_VISIBLE_CORES (the range must be "
+                          "contiguous) and that no other process owns the core";
+            return false;
+        }
+        return true;
+    }();
+    return ok ? &rt : nullptr;
+}
+
+// The logical core index of the first core of each distinct physical device,
+// starting the scan at --neuron_device, discovered by allocating a page on each
+// core in turn and asking the transport which device the pointer came from.
+//
+// This exists because there is no arithmetic that gets it right on every
+// instance type.  Stepping by a fixed number of cores requires knowing the
+// core-fusion factor (LNC), which is a runtime setting with no clean query --
+// nrt_get_visible_vnc_count() segfaults when called with the signature its
+// symbol suggests -- and guessing it wrong is silent: on trn1.32xlarge, where
+// Trainium1 does not fuse cores at all, a step derived from trn2's LNC=2 puts
+// two buffers on each of half the devices, leaves the other half idle, and only
+// shows up as ~10% less throughput.  Asking where a pointer actually landed
+// needs no such guess and cannot be silently wrong.
+const std::vector<int>& neuronFirstCorePerDevice() {
+    // Bounded by the largest instance today (trn2.48xlarge: 16 devices x 4
+    // logical cores), with room to spare; the scan also stops at the first core
+    // the runtime refuses, which is the usual way out.
+    constexpr int kMaxCoreScan = 128;
+    static const std::vector<int> cores = []() {
+        std::vector<int> cores;
+        const NeuronRuntime* rt = neuronRuntime();
+        if (!rt) return cores;
+
+        // Every probe is held until the scan is over, and only then freed.  The
+        // runtime hands the *same* virtual address straight back after a free,
+        // so freeing as we went made every core look like the one before it and
+        // the whole scan reported a single device.
+        std::vector<struct nrt_tensor*> probes;
+        std::set<int> seen_devices;
+        const int first = std::max(0, FLAGS_neuron_device);
+        for (int core = first; core < first + kMaxCoreScan; ++core) {
+            struct nrt_tensor* tensor = nullptr;
+            // A page is enough: the probe reads the device ordinal out of the
+            // /dev/neuron<N> mapping the allocation sits in, not out of its
+            // size.  Anything the runtime refuses ends the scan -- that is how
+            // the last visible core is found (NRT_STATUS 2, invalid, on the
+            // first core past the visible range).
+            int rc =
+                rt->tensor_allocate(0, core, 4096, "mooncake_probe", &tensor);
+            if (rc != 0) {
+                VLOG(1) << "Neuron: logical core " << core
+                        << " refused a probe allocation (NRT_STATUS " << rc
+                        << "), ending the scan";
+                break;
+            }
+            probes.push_back(tensor);
+            void* va = rt->tensor_get_va(tensor);
+            int device_index = -1;
+            const bool found =
+                va && neuronProbeAddress(va, 4096, &device_index);
+            VLOG(1) << "Neuron: logical core " << core << " at " << va
+                    << " belongs to device "
+                    << (found ? std::to_string(device_index)
+                              : std::string("(unknown)"));
+            if (found && seen_devices.insert(device_index).second) {
+                cores.push_back(core);
+            }
+        }
+        for (auto& tensor : probes) rt->tensor_free(&tensor);
+        if (!cores.empty()) {
+            LOG(INFO) << "Neuron: " << cores.size()
+                      << " distinct device(s) found among logical cores "
+                      << first << ".." << (first + kMaxCoreScan - 1)
+                      << ", one buffer will go on each";
+        }
+        return cores;
+    }();
+    return cores;
+}
+
+// How far to step, in nrt_tensor_allocate() core indices, to land on the next
+// physical device.  The fallback for when the probe above comes up short, and
+// what --neuron_core_stride overrides.
+int neuronCoresPerDevice() {
+    static const int stride = []() -> int {
+        if (FLAGS_neuron_core_stride > 0) return FLAGS_neuron_core_stride;
+
+        int physical_cores = 0;
+        std::ifstream f(
+            "/sys/devices/virtual/neuron_device/neuron0/core_count");
+        if (!(f >> physical_cores) || physical_cores <= 0) {
+            LOG(WARNING)
+                << "Cannot read Neuron core_count from sysfs, stepping "
+                   "one core per buffer; pass --neuron_core_stride if "
+                   "the buffers land on the same device";
+            return 1;
+        }
+        // LNC=2 is the trn2 default and the only fusion factor shipped so far.
+        const int stride = physical_cores >= 2 ? physical_cores / 2 : 1;
+        LOG(INFO) << "Neuron: " << physical_cores
+                  << " physical cores per device, stepping " << stride
+                  << " logical core(s) per buffer";
+        return stride;
+    }();
+    return stride;
+}
+
+void* allocateNeuronMemory(size_t size, int buffer_id) {
+    const NeuronRuntime* rt = neuronRuntime();
+    if (!rt) return nullptr;
+
+    // One buffer per device.  The probed core list is used only when it covers
+    // every buffer asked for: a probe that came up short (an old libfabric, so
+    // neuronProbeAddress() answers false for everything, or mappings the
+    // runtime had not published yet) would otherwise quietly stack the
+    // remaining buffers onto devices already in use, which is the failure this
+    // replaced.  Falling back to the arithmetic keeps such a host exactly where
+    // it was.
+    const auto& probed = neuronFirstCorePerDevice();
+    const bool use_probed = FLAGS_neuron_core_stride <= 0 && !probed.empty() &&
+                            (int)probed.size() >= FLAGS_neuron_device_count;
+    if (FLAGS_neuron_core_stride <= 0 && !use_probed && buffer_id == 0) {
+        LOG(WARNING) << "Neuron: probed " << probed.size() << " device(s) for "
+                     << FLAGS_neuron_device_count
+                     << " buffer(s), falling back to a fixed core step of "
+                     << neuronCoresPerDevice()
+                     << "; check the \"as neuron:N\" ordinals below and pass "
+                        "--neuron_core_stride if they repeat";
+    }
+    const int core =
+        use_probed ? probed[buffer_id % probed.size()]
+                   : FLAGS_neuron_device + buffer_id * neuronCoresPerDevice();
+
+    struct nrt_tensor* tensor = nullptr;
+    // 0 == NRT_TENSOR_PLACEMENT_DEVICE, i.e. HBM rather than pinned host
+    // memory, which is the whole point of the exercise.
+    int rc = rt->tensor_allocate(0, core, size, "mooncake_bench", &tensor);
+    if (rc != 0) {
+        LOG(ERROR) << "nrt_tensor_allocate(" << size << " bytes on NeuronCore "
+                   << core << ") failed with NRT_STATUS " << rc;
+        return nullptr;
+    }
+    void* va = rt->tensor_get_va(tensor);
+    if (!va) {
+        rt->tensor_free(&tensor);
+        LOG(ERROR) << "nrt_tensor_get_va returned NULL";
+        return nullptr;
+    }
+    // The buffer is filled through the runtime, never with memset(): host
+    // stores into device HBM are exactly what the transport's Neuron path
+    // exists to avoid.  Skipped silently if libnrt predates nrt_tensor_write.
+    if (rt->tensor_write) {
+        std::vector<uint8_t> pattern(std::min<size_t>(size, 1ull << 20),
+                                     (uint8_t)FLAGS_neuron_fill_byte);
+        for (size_t off = 0; off < size; off += pattern.size()) {
+            size_t len = std::min(pattern.size(), size - off);
+            rc = rt->tensor_write(tensor, pattern.data(), off, len);
+            if (rc != 0) {
+                LOG(WARNING) << "nrt_tensor_write at offset " << off
+                             << " failed with NRT_STATUS " << rc
+                             << ", buffer left uninitialized";
+                break;
+            }
+        }
+    }
+    LOG(INFO) << "Allocated " << size << " bytes of Neuron HBM at " << va
+              << " on logical NeuronCore " << core;
+    neuron_tensors[va] = tensor;
+    return va;
+}
+
+// Reports how much of each Neuron buffer no longer holds the fill byte, i.e.
+// how much of it the peer's transfers actually landed in HBM.
+//
+// This is the only end-to-end data check available on the Neuron path: the
+// buffer is device memory, so the validator's memcmp() approach cannot look at
+// it, and a completion queue entry only says the NIC believed it wrote
+// somewhere.  Reading it back through the runtime is what distinguishes "the
+// transport reported success" from "the bytes are in HBM".
+void reportNeuronOverwrite(const std::vector<void*>& addr) {
+    const NeuronRuntime* rt = neuronRuntime();
+    if (!rt || !rt->tensor_read) {
+        LOG(WARNING) << "libnrt has no nrt_tensor_read, cannot check what the "
+                        "peer wrote into Neuron HBM";
+        return;
+    }
+
+    const size_t kWindow = 1ull << 20;
+    for (size_t i = 0; i < addr.size(); ++i) {
+        auto it = neuron_tensors.find(addr[i]);
+        if (it == neuron_tensors.end()) continue;
+
+        std::vector<uint8_t> readback(kWindow);
+        int rc = rt->tensor_read(it->second, readback.data(), 0, kWindow);
+        if (rc != 0) {
+            LOG(WARNING) << "nrt_tensor_read on buffer " << i
+                         << " failed with NRT_STATUS " << rc;
+            continue;
+        }
+        size_t changed = 0;
+        int first_new_value = -1;
+        for (size_t off = 0; off < kWindow; ++off) {
+            if (readback[off] == (uint8_t)FLAGS_neuron_fill_byte) continue;
+            if (first_new_value < 0) first_new_value = readback[off];
+            ++changed;
+        }
+        LOG(INFO) << "Neuron buffer " << i << " at " << addr[i] << ": "
+                  << changed << "/" << kWindow
+                  << " bytes of the first MiB differ from the fill byte 0x"
+                  << std::hex << (FLAGS_neuron_fill_byte & 0xff)
+                  << ", first new value 0x"
+                  << (first_new_value < 0 ? 0 : first_new_value) << std::dec;
+    }
+}
+
+void freeNeuronMemory(void* addr) {
+    const NeuronRuntime* rt = neuronRuntime();
+    auto it = neuron_tensors.find(addr);
+    if (!rt || it == neuron_tensors.end()) return;
+    rt->tensor_free(&it->second);
+    neuron_tensors.erase(it);
+}
+}  // namespace
+#endif  // USE_EFA
 
 static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
+#ifdef USE_EFA
+    if (FLAGS_neuron_device >= 0) return allocateNeuronMemory(size, buffer_id);
+#endif
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
@@ -194,6 +526,12 @@ static void* allocateMemoryPool(size_t size, int buffer_id,
 }
 
 static void freeMemoryPool(void* addr, size_t size) {
+#ifdef USE_EFA
+    if (FLAGS_neuron_device >= 0) {
+        freeNeuronMemory(addr);
+        return;
+    }
+#endif
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
@@ -308,6 +646,14 @@ static inline void setWorkerDeviceIfNeeded() {
 
 // Common helper to determine buffer count based on GPU/NUMA configuration
 static int determineBufferCount() {
+#ifdef USE_EFA
+    if (FLAGS_neuron_device >= 0) {
+        LOG(INFO) << "Neuron HBM is used, " << FLAGS_neuron_device_count
+                  << " device(s) starting at logical NeuronCore "
+                  << FLAGS_neuron_device;
+        return std::max(1, FLAGS_neuron_device_count);
+    }
+#endif
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_SUPA) || defined(USE_SUNRISE)
@@ -364,6 +710,12 @@ static void freeBuffers(std::vector<void*>& addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
+#ifdef USE_EFA
+    // Deliberately unnamed: FLAGS_neuron_device is a logical NeuronCore, not
+    // the physical device ordinal the location string needs.  The transport
+    // resolves the real one from the pointer.
+    if (FLAGS_neuron_device >= 0) return kWildcardLocation;
+#endif
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||    \
     defined(USE_MACA) || defined(USE_HYGON) || defined(USE_COREX) || \
     defined(USE_UBSHMEM) || defined(USE_SUPA) || defined(USE_SUNRISE)
@@ -463,12 +815,18 @@ std::string formatDeviceNames(const std::string& device_names) {
 std::string loadNicPriorityMatrix() {
     if (!FLAGS_nic_priority_matrix.empty()) {
         std::ifstream file(FLAGS_nic_priority_matrix);
-        if (file.is_open()) {
-            std::string content((std::istreambuf_iterator<char>(file)),
-                                std::istreambuf_iterator<char>());
-            file.close();
-            return content;
+        // Falling through to the fabricated matrix below on a typo would be
+        // silent and wrong: that matrix names --device_name (mlx5_2 by
+        // default), which exists on no Trainium host, so the run comes up with
+        // no usable NIC instead of with the ones the file asked for.
+        if (!file.is_open()) {
+            LOG(FATAL) << "Cannot open --nic_priority_matrix="
+                       << FLAGS_nic_priority_matrix;
         }
+        std::string content((std::istreambuf_iterator<char>(file)),
+                            std::istreambuf_iterator<char>());
+        file.close();
+        return content;
     }
     // Build JSON Data
     auto device_names = formatDeviceNames(FLAGS_device_name);
@@ -509,8 +867,19 @@ static Transport* installTransportFromFlags(TransferEngine* engine) {
         xport = engine->installTransport(FLAGS_protocol, nullptr);
     } else if (FLAGS_protocol == "efa") {
         // EFA needs topology discovery to find devices, but auto_discovery
-        // would auto-install RDMA transport. Manually discover instead.
-        engine->getLocalTopology()->discover({});
+        // would auto-install RDMA transport. Manually discover instead --
+        // unless an explicit matrix was given, which is then the only way to
+        // pin EFA transfers to a subset of the NICs (discovery always takes
+        // all of them).
+        if (FLAGS_nic_priority_matrix.empty()) {
+            engine->getLocalTopology()->discover({});
+        } else {
+            int rc = engine->getLocalTopology()->parse(loadNicPriorityMatrix());
+            if (rc) {
+                LOG(FATAL) << "Cannot parse --nic_priority_matrix="
+                           << FLAGS_nic_priority_matrix << ", rc " << rc;
+            }
+        }
         xport = engine->installTransport("efa", nullptr);
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
                FLAGS_protocol == "musa" || FLAGS_protocol == "hip" ||
@@ -616,6 +985,10 @@ int target() {
     }
 
     while (target_running) sleep(1);
+
+#ifdef USE_EFA
+    if (FLAGS_neuron_device >= 0) reportNeuronOverwrite(addr);
+#endif
 
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
@@ -850,6 +1223,17 @@ void check_total_buffer_size() {
 int main(int argc, char** argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     check_total_buffer_size();
+
+#ifdef USE_EFA
+    // Only the EFA transport can register Neuron HBM.  Any other protocol
+    // would take these buffers down a host path -- and since they are
+    // registered under the wildcard location, nothing downstream would stop
+    // preTouchMemory() from writing to device memory from the CPU.
+    if (FLAGS_neuron_device >= 0 && FLAGS_protocol != "efa") {
+        LOG(FATAL) << "--neuron_device requires --protocol=efa, got --protocol="
+                   << FLAGS_protocol;
+    }
+#endif
 
 #if defined(USE_UBSHMEM)
     if (FLAGS_gpu_id != -1) {

@@ -76,6 +76,57 @@ TEST(ToplogyTest, TestHcaList2) {
     }
 }
 
+// resolve() must number HCAs from the contents of the matrix, never from the
+// order its entries happen to sit in matrix_ (an unordered_map, so that order
+// follows insertion).  A device index is not private to one process: a peer
+// rebuilds this matrix with parse() and then indexes the device and rkey arrays
+// we published with the numbers *its* resolve() produced, so both ends have to
+// derive the same numbering or every affinity preference is silently defeated
+// on the remote side.
+//
+// Reversing the JSON text alone cannot catch a regression here -- jsoncpp
+// returns getMemberNames() sorted, so parse() inserts in the same order either
+// way.  What does catch it is pinning the numbering to the sorted keys: with
+// `for (auto &entry : matrix_)` the walk order of these six keys is not their
+// sort order, and the expectation below fails.
+TEST(ToplogyTest, TestHcaNumberingIndependentOfInsertionOrder) {
+    auto entry = [](const std::string &location, const std::string &hca) {
+        return "\"" + location + "\" : [[\"" + hca + "\"],[]]";
+    };
+    const std::vector<std::pair<std::string, std::string>> entries = {
+        {"cpu:0", "erdma_0"},    {"cpu:1", "erdma_1"},
+        {"cuda:0", "erdma_2"},   {"cuda:1", "erdma_3"},
+        {"neuron:0", "erdma_4"}, {"neuron:1", "erdma_5"}};
+
+    // Same matrix, members emitted in sorted and in reverse-sorted order.
+    std::string forward, reverse;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto &e = entries[i];
+        const auto &r = entries[entries.size() - 1 - i];
+        forward += (i ? "," : "") + entry(e.first, e.second);
+        reverse += (i ? "," : "") + entry(r.first, r.second);
+    }
+
+    // entries is in sorted key order, so its HCAs are the expected numbering.
+    std::vector<std::string> expected;
+    for (const auto &e : entries) expected.push_back(e.second);
+
+    mooncake::Topology from_forward, from_reverse;
+    ASSERT_EQ(from_forward.parse("{" + forward + "}"), 0);
+    ASSERT_EQ(from_reverse.parse("{" + reverse + "}"), 0);
+    EXPECT_EQ(from_forward.getHcaList(), expected);
+    EXPECT_EQ(from_reverse.getHcaList(), expected);
+
+    // The same contract, stated the way a peer consumes it: the index handed
+    // out for a location must be the position of that location's NIC in the
+    // published device list.
+    for (size_t i = 0; i < entries.size(); ++i) {
+        EXPECT_EQ(from_forward.selectDevice(entries[i].first),
+                  static_cast<int>(i))
+            << entries[i].first;
+    }
+}
+
 TEST(ToplogyTest, TestMatrix) {
     mooncake::Topology topology;
     std::string json_str = "{\"cpu:0\" : [[\"erdma_0\"],[\"erdma_1\"]]}";
