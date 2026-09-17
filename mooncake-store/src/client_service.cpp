@@ -17,9 +17,7 @@
 #include <cstdlib>
 #include <iomanip>
 #include <limits>
-#ifdef USE_NOF
 #include <numa.h>
-#endif
 #include <optional>
 #include <ranges>
 #include <span>
@@ -83,7 +81,6 @@ class ScopedObjectChecksumBuffer {
     PinnedBufferPool::Buffer buffer_;
 };
 
-#ifdef USE_NOF
 int GetCurrentNumaSocketId() {
     if (numa_available() < 0) {
         return 0;
@@ -95,7 +92,6 @@ int GetCurrentNumaSocketId() {
     int node = numa_node_of_cpu(cpu);
     return node < 0 ? 0 : node;
 }
-#endif
 
 struct ContiguousSliceRange {
     void* ptr = nullptr;
@@ -969,18 +965,14 @@ void Client::InitTransferSubmitter() {
     // Initialize TransferSubmitter after transfer engine is ready
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
-#ifdef USE_NOF
+    // Unconditional; no NofWorkerPool is created when nof_initiator_ is null.
     const int numa_socket_id =
         ClientNumaConfig::FromEnvironment().socket_id.value_or(
             GetCurrentNumaSocketId());
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
         *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id);
-#else
-    transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        *transfer_engine_, storage_backend_, local_hostname_,
-        metrics_ ? &metrics_->transfer_metric : nullptr);
-#endif
+        metrics_ ? &metrics_->transfer_metric : nullptr, numa_socket_id,
+        nof_initiator_);
 }
 
 std::optional<std::shared_ptr<Client>> Client::Create(
@@ -988,9 +980,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
     const std::shared_ptr<TransferEngine>& transfer_engine,
-    std::map<std::string, std::string> labels, const std::string& tenant_id) {
+    std::map<std::string, std::string> labels, const std::string& tenant_id,
+    std::shared_ptr<NVMeoFInitiator> nof_initiator) {
     auto client = std::shared_ptr<Client>(new Client(
         local_hostname, metadata_connstring, protocol, labels, tenant_id));
+    client->nof_initiator_ = std::move(nof_initiator);
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {

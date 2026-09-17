@@ -124,8 +124,8 @@ void ShrinkBucketsIfSparse(UnorderedContainer& container) {
 
 class MasterService {
     friend class test::MasterServiceTestPeer;
-    friend class MasterSnapshotManager;    // Allow access to internal state for
-                                           // snapshot
+    friend class MasterSnapshotManager;  // Allow access to internal state for
+                                         // snapshot
     friend class ClientOffboardingWorker;
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
                                            // members
@@ -1601,15 +1601,15 @@ class MasterService {
         false};  // Set to trigger memory eviction when allocation fails
     std::atomic<bool> need_nof_eviction_{
         false};  // Set to trigger NoF eviction when allocation fails
-    const double eviction_ratio_;                     // in range [0.0, 1.0]
-    const double eviction_high_watermark_ratio_;      // in range [0.0, 1.0]
+    const double eviction_ratio_;                 // in range [0.0, 1.0]
+    const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
     // Per-tenant watermark as a fraction of each tenant's OWN effective quota.
     // Defaults to the same 0.90 as the pool-wide ratio above; 0.0 disables the
     // pass. See EvictTenantsOverWatermark for why the pool-wide ratio is not
     // sufficient once quotas partition the pool.
     const double tenant_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
-    const double nof_eviction_ratio_;                 // in range [0.0, 1.0]
-    const double nof_eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
+    const double nof_eviction_ratio_;                    // in range [0.0, 1.0]
+    const double nof_eviction_high_watermark_ratio_;     // in range [0.0, 1.0]
 
     // Eviction thread related members
     std::thread eviction_thread_;
@@ -1988,6 +1988,15 @@ class MasterService {
     static constexpr uint64_t kNoFHeartbeatThreadSleepMs = 100;
     mutable std::mutex nof_probe_fn_mutex_;
     NoFProbeFn nof_probe_fn_;
+
+    // Shared NoF probe default, used by both the constructor and the
+    // test-seam reset. A single function-static initiator keeps the probe
+    // path aligned with the process-global NofPageRegistry and avoids
+    // duplicating the lambda body in two places. Private but reachable from
+    // the friend test peer, which resets nof_probe_fn_ to this default.
+    static bool DefaultProbeNofSegment(const std::string& te_endpoint,
+                                       uint32_t timeout_ms,
+                                       std::string* error_reason);
 
     // if high availability features enabled
     const bool enable_ha_;

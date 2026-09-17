@@ -4,9 +4,6 @@
 #include <cassert>
 
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
 
 namespace mooncake::test {
 
@@ -69,12 +66,7 @@ void MasterServiceTestPeer::SetNoFProbeFnForTesting(
         service_.nof_probe_fn_ = std::move(fn);
         return;
     }
-    service_.nof_probe_fn_ = [](const std::string& te_endpoint,
-                                uint32_t timeout_ms,
-                                std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
+    service_.nof_probe_fn_ = &MasterService::DefaultProbeNofSegment;
 #else
     (void)fn;
 #endif
