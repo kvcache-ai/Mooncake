@@ -65,7 +65,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           path: .release-ci
           persist-credentials: false
-          sparse-checkout: scripts/rocm_tests/python/verify_rocm_wheel.py
+          sparse-checkout: scripts/tone_tests/python/verify_rocm_wheel.py
           sparse-checkout-cone-mode: false
 
       - name: Mark repository as safe
@@ -208,7 +208,7 @@ jobs:
             mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
           export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
           "$smoke_venv/bin/python" \
-            .release-ci/scripts/rocm_tests/python/verify_rocm_wheel.py
+            .release-ci/scripts/tone_tests/python/verify_rocm_wheel.py
           site="$("$smoke_venv/bin/python" -c 'import mooncake, os; print(os.path.dirname(mooncake.__file__))')"
           "$site/mooncake_master" --version
 

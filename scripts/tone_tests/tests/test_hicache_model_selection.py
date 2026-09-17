@@ -65,6 +65,13 @@ class TestModelSelection(unittest.TestCase):
                 "upstream-default-model",
             )
 
+    def test_rocm_uses_ci_model(self):
+        with mock.patch.dict(os.environ, {"CI_ACCELERATOR": "rocm"}):
+            self.assertEqual(
+                self.module.HiCacheStorageMooncakeBackendBaseMixin._get_model_name(),
+                "Qwen/Qwen3-8B",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

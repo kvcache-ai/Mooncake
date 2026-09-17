@@ -392,8 +392,6 @@ jobs:
       run: |
         bash scripts/tone_tests/tests/test_common_cleanup.sh
         python3 scripts/tone_tests/tests/test_hicache_model_selection.py
-        bash scripts/rocm_tests/tests/test_common_cleanup.sh
-        python3 scripts/rocm_tests/tests/test_hicache_model_selection.py
       shell: bash
 
   clang-format:

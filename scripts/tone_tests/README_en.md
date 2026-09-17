@@ -27,8 +27,10 @@ This directory contains end-to-end (E2E) test cases for the Mooncake project. Th
 
 **Description**: vLLM Prefill-Decode disaggregation test with the Mooncake connector
 
-This directory is the CUDA / T-one controller. ROCm runs independently from
-[`../rocm_tests/`](../rocm_tests/README.md); do not add accelerator switches here.
+The ROCm core tier runs this as serialized smoke coverage with
+`num_workers=1`. It validates basic connector and transfer behavior, but it
+does not validate concurrent sender workers while
+[vLLM issue #44238](https://github.com/vllm-project/vllm/issues/44238) remains unresolved.
 
 ## T-One/tone-cli Support
 

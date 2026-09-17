@@ -29,7 +29,9 @@ start_server()
     fi
 
     local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
-
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        extra_args="${extra_args} --disaggregation-ib-device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
+    fi
     if ! launch_sglang_server "$model_name" "$host" "30001" "$sglang_server_log_path" "$mode_name" "$extra_args"; then
         return 1
     fi

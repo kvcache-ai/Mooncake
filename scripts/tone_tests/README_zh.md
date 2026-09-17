@@ -27,8 +27,11 @@
 
 **用例说明**：使用 Mooncake connector 的 vLLM Prefill-Decode 分离测试
 
-本目录仅用于 CUDA / T-one。ROCm 使用独立的
-[`../rocm_tests/`](../rocm_tests/README.md)，不在这里增加平台判断分支。
+ROCm core tier 使用 `num_workers=1` 运行串行 smoke test。该用例验证基础的
+connector 和传输行为，但在
+[vLLM issue #44238](https://github.com/vllm-project/vllm/issues/44238)
+解决前，不覆盖并发 sender worker 场景。
+
 
 ## T-One/tone-cli 支持
 

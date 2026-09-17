@@ -2,23 +2,51 @@
 
 CONTAINER_NAME=${CONTAINER_NAME:-"mooncake-ci-test"}
 MODEL_CACHE=${MODEL_CACHE:-"/root/.cache"}
-if [ "${CI_ACCELERATOR:-cuda}" != "cuda" ]; then
-    echo "This controller only supports cuda; use the other platform's test directory" >&2
-    exit 2
+MOONCAKE_RUNTIME_CACHE=${MOONCAKE_RUNTIME_CACHE:-}
+HF_TOKEN_FILE=${HF_TOKEN_FILE:-"/etc/mooncake-ci/huggingface.token"}
+CI_ACCELERATOR=${CI_ACCELERATOR:-"cuda"}
+if [ "$CI_ACCELERATOR" = "rocm" ]; then
+    : "${REGISTRY_ADDR_SGLANG:?REGISTRY_ADDR_SGLANG is required for ROCm}"
+    : "${REGISTRY_ADDR_VLLM:?REGISTRY_ADDR_VLLM is required for ROCm}"
+    : "${MOONCAKE_CI_TIER:?MOONCAKE_CI_TIER is required for ROCm}"
+    : "${MOONCAKE_RENDER_DEVICES:?MOONCAKE_RENDER_DEVICES is required for ROCm}"
+    : "${MOONCAKE_GPU_INDICES:?MOONCAKE_GPU_INDICES is required for ROCm}"
+    : "${MOONCAKE_CPUSET_CPUS:?MOONCAKE_CPUSET_CPUS is required for ROCm}"
+    : "${MOONCAKE_CPUSET_MEMS:?MOONCAKE_CPUSET_MEMS is required for ROCm}"
+    : "${MOONCAKE_RDMA_DEVICES:?MOONCAKE_RDMA_DEVICES is required for ROCm}"
+    : "${MOONCAKE_RDMA_NETDEVS:?MOONCAKE_RDMA_NETDEVS is required for ROCm}"
+    : "${MOONCAKE_TRANSFER_DEVICE:?MOONCAKE_TRANSFER_DEVICE is required for ROCm}"
+    : "${MOONCAKE_GID_INDEX:?MOONCAKE_GID_INDEX is required for ROCm}"
+    : "${MOONCAKE_SGLANG_BASE_GPU_ID:?MOONCAKE_SGLANG_BASE_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_EPD_ENCODER_GPU_ID:?MOONCAKE_EPD_ENCODER_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_EPD_PREFILL_GPU_ID:?MOONCAKE_EPD_PREFILL_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_EPD_DECODE_GPU_ID:?MOONCAKE_EPD_DECODE_GPU_ID is required for ROCm}"
+    : "${MOONCAKE_VLLM_VISIBLE_DEVICES:?MOONCAKE_VLLM_VISIBLE_DEVICES is required for ROCm}"
+    : "${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:?MOONCAKE_SGLANG_MEM_FRACTION_STATIC is required for ROCm}"
+    : "${MOONCAKE_RUNTIME_CACHE:?MOONCAKE_RUNTIME_CACHE is required for ROCm}"
+    : "${AINIC_VERSION:?AINIC_VERSION is required for ROCm}"
+    USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-false}
+else
+    REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG:-"lmsysorg/sglang:latest"}
+    REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM:-"vllm/vllm-openai:latest"}
+    MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}
+    MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}
+    MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}
+    MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID:-6}
+    MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}
+    MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:-}
+    MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER:-"full"}
+    MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES:-}
+    MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS:-}
+    MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-}
+    MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX:-}
+    USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
 fi
-CI_ACCELERATOR=cuda
-
-REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG:-"lmsysorg/sglang:latest"}
-REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM:-"vllm/vllm-openai:latest"}
-MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}
-MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}
-MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}
-MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID:-6}
-MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}
-MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:-}
-MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER:-"full"}
-USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR:-true}
-
+MOONCAKE_RENDER_DEVICES=${MOONCAKE_RENDER_DEVICES:-}
+MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES:-}
+MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS:-}
+MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS:-}
+AINIC_VERSION=${AINIC_VERSION:-}
 HUGGINGFACE_MIRROR=${HUGGINGFACE_MIRROR:-"https://hf-mirror.com"}
 USE_MODELSCOPE=${USE_MODELSCOPE:-false}
 REMOTE_TEST_DIR=${REMOTE_TEST_DIR:-"/tmp/Mooncake_tone/mooncake_ci_test"}
@@ -33,27 +61,46 @@ WHEEL_DIR_VLLM=${WHEEL_DIR_VLLM:-$WHEEL_DIR}
 GIT_REPO=${GIT_REPO:-}
 MOONCAKE_ENV_UNHEALTHY=false
 
-if [ "$MOONCAKE_CI_TIER" != "full" ]; then
-    echo "ERROR: cuda controller requires MOONCAKE_CI_TIER=full" >&2
+if [ "$MOONCAKE_CI_TIER" = "core-4gpu" ]; then
+    # The upstream heterogeneous-TP test starts TP4 and TP2 workers on the
+    # same host and therefore needs eight GPUs. Mooncake Elastic EP is also
+    # CUDA-only, so neither test belongs in the permanent 4+4 ROCm tier.
+    All_TEST_SCRIPTS_SGLANG=(
+        "test_hicache_storage_mooncake_backend.sh"
+        "test_1p1d_erdma.sh"
+        "test_epd_sglang.sh"
+    )
+elif [ "$MOONCAKE_CI_TIER" = "full" ]; then
+    All_TEST_SCRIPTS_SGLANG=(
+        "test_hicache_storage_mooncake_backend.sh"
+        "test_disaggregation_different_tp.sh"
+        "test_1p1d_erdma.sh"
+        "test_epd_sglang.sh"
+        "test_moe_mooncake.sh"
+    )
+else
+    echo "ERROR: unsupported MOONCAKE_CI_TIER: $MOONCAKE_CI_TIER" >&2
     exit 2
 fi
-All_TEST_SCRIPTS_SGLANG=(
-    "test_hicache_storage_mooncake_backend.sh"
-    "test_disaggregation_different_tp.sh"
-    "test_1p1d_erdma.sh"
-    "test_epd_sglang.sh"
-    "test_moe_mooncake.sh"
-)
 
 All_TEST_SCRIPTS_VLLM=(
     "test_vllm_1p1d_erdma.sh"
 )
 
-REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"$REMOTE_IP"}
-SSH_CMD=${SSH_CMD:-"ssh -o StrictHostKeyChecking=no"}
-RSYNC_RSH=${RSYNC_RSH:-"ssh -o StrictHostKeyChecking=no"}
-SCP_CMD=${SCP_CMD:-"scp -o StrictHostKeyChecking=no"}
-
+if [ "$CI_ACCELERATOR" = "rocm" ]; then
+    # The ROCm cluster uses a dedicated CI identity and pinned host key. Keep
+    # the serving/RDMA address separate from the SSH management endpoint.
+    : "${REMOTE_SSH_TARGET:?REMOTE_SSH_TARGET is required for ROCm}"
+    : "${MOONCAKE_SSH_CONFIG:?MOONCAKE_SSH_CONFIG is required for ROCm}"
+    SSH_CMD=${SSH_CMD:-"ssh -F ${MOONCAKE_SSH_CONFIG}"}
+    RSYNC_RSH=${RSYNC_RSH:-"ssh -F ${MOONCAKE_SSH_CONFIG}"}
+    SCP_CMD=${SCP_CMD:-"scp -F ${MOONCAKE_SSH_CONFIG}"}
+else
+    REMOTE_SSH_TARGET=${REMOTE_SSH_TARGET:-"$REMOTE_IP"}
+    SSH_CMD=${SSH_CMD:-"ssh -o StrictHostKeyChecking=no"}
+    RSYNC_RSH=${RSYNC_RSH:-"ssh -o StrictHostKeyChecking=no"}
+    SCP_CMD=${SCP_CMD:-"scp -o StrictHostKeyChecking=no"}
+fi
 readonly REMOTE_SSH_TARGET SSH_CMD RSYNC_RSH SCP_CMD
 
 TONE_TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
@@ -165,6 +212,8 @@ export CONTAINER_NAME=${CONTAINER_NAME}
 export CI_ACCELERATOR=${CI_ACCELERATOR}
 export MOONCAKE_CI_TIER=${MOONCAKE_CI_TIER}
 export MODEL_CACHE=${MODEL_CACHE}
+export MOONCAKE_RUNTIME_CACHE=${MOONCAKE_RUNTIME_CACHE}
+export HF_TOKEN_FILE=${HF_TOKEN_FILE}
 export REGISTRY_ADDR_SGLANG=${REGISTRY_ADDR_SGLANG}
 export REGISTRY_ADDR_VLLM=${REGISTRY_ADDR_VLLM}
 export USE_HUGGINGFACE_MIRROR=${USE_HUGGINGFACE_MIRROR}
@@ -179,12 +228,21 @@ export BASE_DIR=${TONE_TESTS_DIR}
 export TEST_RUN_DIR=${RUN_DIR}
 export TEST_RESULT_DIR=${RUN_DIR}/logs
 export REMOTE_TEST_DIR=${REMOTE_TEST_DIR}
+export MOONCAKE_RENDER_DEVICES="${MOONCAKE_RENDER_DEVICES}"
+export MOONCAKE_GPU_INDICES=${MOONCAKE_GPU_INDICES}
+export MOONCAKE_CPUSET_CPUS=${MOONCAKE_CPUSET_CPUS}
+export MOONCAKE_CPUSET_MEMS=${MOONCAKE_CPUSET_MEMS}
 export MOONCAKE_SGLANG_BASE_GPU_ID=${MOONCAKE_SGLANG_BASE_GPU_ID}
 export MOONCAKE_EPD_ENCODER_GPU_ID=${MOONCAKE_EPD_ENCODER_GPU_ID}
 export MOONCAKE_EPD_PREFILL_GPU_ID=${MOONCAKE_EPD_PREFILL_GPU_ID}
 export MOONCAKE_EPD_DECODE_GPU_ID=${MOONCAKE_EPD_DECODE_GPU_ID}
 export MOONCAKE_VLLM_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES}
 export MOONCAKE_SGLANG_MEM_FRACTION_STATIC=${MOONCAKE_SGLANG_MEM_FRACTION_STATIC}
+export MOONCAKE_RDMA_DEVICES=${MOONCAKE_RDMA_DEVICES}
+export MOONCAKE_RDMA_NETDEVS=${MOONCAKE_RDMA_NETDEVS}
+export MOONCAKE_TRANSFER_DEVICE=${MOONCAKE_TRANSFER_DEVICE}
+export MOONCAKE_GID_INDEX=${MOONCAKE_GID_INDEX}
+export AINIC_VERSION=${AINIC_VERSION}
 EOF
 
     echo "===== Preparing local machine ====="
@@ -202,8 +260,11 @@ EOF
 validated_remote_test_dir() {
     local remote_dir=$1
     local allowed_root
-
-    allowed_root=/tmp/Mooncake_tone/mooncake_ci_test
+    if [ "$CI_ACCELERATOR" = "rocm" ]; then
+        allowed_root=/var/lib/mooncake-ci/work
+    else
+        allowed_root=/tmp/Mooncake_tone/mooncake_ci_test
+    fi
 
     if ! [[ "$remote_dir" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
         echo "ERROR: REMOTE_TEST_DIR contains unsupported characters: $remote_dir" >&2
@@ -415,7 +476,7 @@ run_all_tests(){
 }
 
 show_help(){
-    echo "Mooncake TONE CI Controller"
+    echo "Mooncake CI Controller"
     echo "Usage: $0 <command> [args]"
     echo ""
     echo "Commands:"
