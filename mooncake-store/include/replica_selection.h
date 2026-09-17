@@ -114,12 +114,16 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
 
 // Select the best replica from a list: prefer local MEMORY, local NOF_SSD,
 // remote MEMORY, remote NOF_SSD, LOCAL_DISK, DFS, then DISK. Master may return
-// replicas in any order, so we always scan. When scoring is enabled and there
-// are multiple remote MEMORY replicas, the best-scoring one is chosen instead
-// of the first encountered.
+// replicas in any order, so we always scan all replicas before deciding — this
+// ensures local MEMORY is always preferred over local NOF regardless of the
+// order replicas appear in the list. When scoring is enabled and there are
+// multiple remote MEMORY replicas, the best-scoring one is chosen instead of
+// the first encountered.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
+    const Replica::Descriptor *local_memory = nullptr;
+    const Replica::Descriptor *local_nof = nullptr;
     const Replica::Descriptor *first_memory = nullptr;
     const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
@@ -128,18 +132,23 @@ inline const Replica::Descriptor *SelectBestReplica(
             if (local_endpoints.count(
                     r.get_memory_descriptor()
                         .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
+                if (!local_memory) local_memory = &r;
+            } else {
+                if (!first_memory) first_memory = &r;
             }
-            if (!first_memory) first_memory = &r;
         } else if (r.is_nof_replica()) {
             if (local_endpoints.count(
                     r.get_nof_descriptor()
                         .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
+                if (!local_nof) local_nof = &r;
+            } else {
+                if (!first_nof) first_nof = &r;
             }
-            if (!first_nof) first_nof = &r;
         }
     }
+    // Local MEMORY always beats local NOF regardless of list order.
+    if (local_memory) return local_memory;
+    if (local_nof) return local_nof;
     // No local replica. Among remote MEMORY replicas, optionally pick the
     // best-scoring one instead of the first encountered (issue #2516).
     if (first_memory && RemoteReplicaScoringEnabled()) {
@@ -163,6 +172,35 @@ inline const Replica::Descriptor *SelectBestReplica(
         }
     }
     return best;
+}
+
+// Select a complete MEMORY replica for the session range-read path. The
+// session ranged-get path (Client::BatchTransferReadRanges) only ever reads
+// MEMORY replicas: it rejects every non-MEMORY entry, so selecting a NOF_SSD
+// replica here would let a session start and then fail the actual transfer.
+// Among complete MEMORY replicas, a local one is preferred; otherwise the
+// first complete MEMORY replica is returned (nullptr if there is none).
+//
+// Unlike SelectBestReplica this deliberately does NOT consider NOF_SSD: the
+// session path cannot read it. Local MEMORY is still preferred over a remote
+// MEMORY replica regardless of the order the master returned them in.
+inline const Replica::Descriptor *SelectCompleteMemoryReplica(
+    const std::vector<Replica::Descriptor> &replicas,
+    const std::unordered_set<std::string> &local_endpoints) {
+    const Replica::Descriptor *first_memory = nullptr;
+    for (const auto &r : replicas) {
+        if (r.status != ReplicaStatus::COMPLETE || !r.is_memory_replica()) {
+            continue;
+        }
+        if (local_endpoints.count(r.get_memory_descriptor()
+                                      .buffer_descriptor.transport_endpoint_)) {
+            return &r;
+        }
+        if (!first_memory) {
+            first_memory = &r;
+        }
+    }
+    return first_memory;
 }
 
 }  // namespace mooncake

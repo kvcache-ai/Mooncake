@@ -117,6 +117,74 @@ TEST_F(ReplicaSelectionTest, LocalMemoryAlwaysWins) {
         "nodeB");  // locality beats protocol
 }
 
+// Regression for issue #3658: a complete local MEMORY replica must win over a
+// complete local NOF replica regardless of the order they appear in the list.
+// ObjectMetadata preserves insertion order, and promotion appends a new MEMORY
+// replica to existing metadata, so a MEMORY replica may legally appear after a
+// NOF replica. The session range-read path is memory-only, so selecting NOF
+// here would regress a session that still has a usable MEMORY replica.
+TEST_F(ReplicaSelectionTest, LocalMemoryBeatsLocalNoFInBothOrders) {
+    std::unordered_set<std::string> local = {"memB", "nofB"};
+
+    // local NOF listed before local MEMORY
+    std::vector<Replica::Descriptor> nof_first = {
+        MakeNoF("nofB"),
+        MakeMemory("memB", "tcp"),
+    };
+    const auto* sel = SelectBestReplica(nof_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+
+    // local MEMORY listed before local NOF (the previously-correct order)
+    std::vector<Replica::Descriptor> mem_first = {
+        MakeMemory("memB", "tcp"),
+        MakeNoF("nofB"),
+    };
+    sel = SelectBestReplica(mem_first, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+}
+
+// Regression for issue #3658 (session range-read path): the session ranged-get
+// path only reads MEMORY replicas, so a session must never be started against a
+// NOF_SSD replica — it would pass the size check and then fail the actual
+// transfer. SelectCompleteMemoryReplica must therefore skip a NOF-only object
+// and return nullptr (the caller then rejects the session), even though
+// SelectBestReplica would have selected the NOF replica for the single-object
+// get path.
+TEST_F(ReplicaSelectionTest, SessionPathRejectsNoFOnlyObject) {
+    std::unordered_set<std::string> local = {"nofB"};
+
+    // A NOF-only object: SelectBestReplica returns the NOF replica (it is the
+    // last-resort tier for the single-object get path), but the session path
+    // cannot read NOF, so the session selector must decline it.
+    std::vector<Replica::Descriptor> nof_only = {MakeNoF("nofB")};
+    const auto* best = SelectBestReplica(nof_only, local);
+    ASSERT_NE(best, nullptr);
+    EXPECT_TRUE(best->is_nof_replica());  // single-object path would use it
+    EXPECT_EQ(SelectCompleteMemoryReplica(nof_only, local),
+              nullptr);  // session path: nothing to read
+
+    // A local MEMORY replica must still be selected for the session even when a
+    // local NOF replica is also present (local MEMORY outranks local NOF).
+    std::vector<Replica::Descriptor> mem_and_nof = {
+        MakeNoF("nofB"),
+        MakeMemory("memB", "tcp"),
+    };
+    const auto* sel = SelectCompleteMemoryReplica(mem_and_nof, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_memory_replica());
+    EXPECT_EQ(
+        sel->get_memory_descriptor().buffer_descriptor.transport_endpoint_,
+        "memB");
+}
+
 TEST_F(ReplicaSelectionTest, ScoringOffKeepsFirstRemoteMemory) {
     // No scorer injected and env not set -> must return the FIRST remote
     // MEMORY.
