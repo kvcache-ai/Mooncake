@@ -521,6 +521,30 @@ __forceinline__ __device__ void red_add_rel_sys(const int64_t* ptr,
 #endif
 }
 
+__forceinline__ __device__ void red_add_rel_gpu(const int* ptr,
+                                                const int& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<int*>(ptr), value);
+    __threadfence();
+#else
+    asm volatile("red.release.gpu.global.add.s32 [%0], %1;" ::"l"(ptr),
+                 "r"(value));
+#endif
+}
+
+__forceinline__ __device__ void red_add_rel_gpu(const int64_t* ptr,
+                                                const int64_t& value) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    atomicAdd(const_cast<unsigned long long*>(
+                  reinterpret_cast<const unsigned long long*>(ptr)),
+              static_cast<unsigned long long>(value));
+    __threadfence();
+#else
+    asm volatile("red.release.gpu.global.add.u64 [%0], %1;" ::"l"(ptr),
+                 "l"(value));
+#endif
+}
+
 template <typename dtype_t>
 __forceinline__ __device__ dtype_t ld_acquire_sys(const dtype_t* ptr) {
 #ifdef MOONCAKE_EP_USE_MUSA

@@ -24,12 +24,32 @@ extern "C" {
 
 typedef void *mooncake_store_t;
 
+/*
+ * Soft-pin intent for mooncake_replicate_config_t::soft_pin_action.
+ * A soft pin guards an object from eviction until a deadline fixed at
+ * write time; reads never extend it. Zero-initialized configs default
+ * to MOONCAKE_SOFT_PIN_PRESERVE without a TTL.
+ */
+enum mooncake_soft_pin_action {
+    MOONCAKE_SOFT_PIN_PRESERVE = 0, /* keep an existing unexpired deadline */
+    MOONCAKE_SOFT_PIN_ENABLE = 1,   /* commit a new soft pin on publish */
+    MOONCAKE_SOFT_PIN_DISABLE = 2   /* remove an existing soft pin */
+};
+
 struct mooncake_replicate_config {
     size_t replica_num;
-    int with_soft_pin;
     int with_hard_pin;
     const char **preferred_segments;
     size_t preferred_segments_count;
+    /* One of enum mooncake_soft_pin_action; put functions return -1
+     * for any other value. */
+    int soft_pin_action;
+    /* TTL override in milliseconds; meaningful only with
+     * MOONCAKE_SOFT_PIN_ENABLE. When unset, the master default TTL
+     * applies. The master rejects TTLs on other actions and values
+     * above its configured maximum. */
+    int has_soft_pin_ttl;
+    uint64_t soft_pin_ttl_ms;
 };
 typedef struct mooncake_replicate_config mooncake_replicate_config_t;
 
