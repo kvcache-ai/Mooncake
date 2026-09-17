@@ -130,13 +130,11 @@ design/transfer-engine/index
 design/mooncake-reshard/index
 design/tent/overview
 design/store/mooncake-store
-design/kv-event/publisher-design
-design/kv-event/subscriber-guide
 design/nvme-kv-backend
 design/mooncake-backend-pg
 design/mooncake-ep
 design/p2p-store
-design/conductor/conductor-architecture-design
+design/conductor/index
 design/hicache-design
 :::
 
