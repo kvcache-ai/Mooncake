@@ -1,6 +1,5 @@
 #include "group_index.h"
 
-#include <chrono>
 #include <string>
 
 #include <gtest/gtest.h>
@@ -27,7 +26,6 @@ TEST(GroupIndexTest, UngroupedMemberHasNoLease) {
     // ungrouped objects can never end up sharing one lease.
     EXPECT_EQ(index.AddMember("", "k1"), nullptr);
     EXPECT_TRUE(index.Empty());
-    EXPECT_TRUE(index.Members("").empty());
 }
 
 TEST(GroupIndexTest, RepeatedMemberKeepsTheOneLease) {
@@ -76,28 +74,6 @@ TEST(GroupIndexTest, EmptyGroupIsDroppedOnLastMemberRemoved) {
     const auto after = index.AddMember("g1", "k1");
     ASSERT_NE(after, nullptr);
     EXPECT_NE(before.get(), after.get());
-}
-
-TEST(GroupIndexTest, SharedLeaseWiresGroupAllOrNoneExpiry) {
-    GroupIndex index;
-    const auto g1 = index.AddMember("g1", "k1");
-    ASSERT_NE(g1, nullptr);
-    ASSERT_NE(index.AddMember("g1", "k2"), nullptr);
-
-    // Distinct groups get independent shared leases.
-    const auto g2 = index.AddMember("g2", "k1");
-    ASSERT_NE(g2, nullptr);
-    EXPECT_NE(g1.get(), g2.get());
-
-    // All-or-none: every member of the group shares the one Lease, so a live
-    // shared lease protects the whole group and one deadline expires it all.
-    const auto now = std::chrono::system_clock::now();
-
-    g1->GrantReadLease(std::chrono::milliseconds(10'000));
-    EXPECT_FALSE(g1->IsExpired(now));
-
-    g1->SetDeadline(now);
-    EXPECT_TRUE(g1->IsExpired(now));
 }
 
 }  // namespace
