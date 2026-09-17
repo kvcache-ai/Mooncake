@@ -55,21 +55,24 @@ bool DistributedStorageConfig::Validate() const {
                    << allocator_type;
         return false;
     }
-    if (shard_count <= 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
-        return false;
-    }
-    if (shard_capacity == 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
-        return false;
-    }
+    // alignment is shared by both allocators.
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
         LOG(ERROR) << "DistributedStorageConfig: alignment must be power of 2";
         return false;
     }
-    if (shard_capacity % alignment != 0) {
-        LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
-        return false;
+    if (*parsed_allocator == DfsAllocatorType::SHARD) {
+        if (shard_count <= 0) {
+            LOG(ERROR) << "DistributedStorageConfig: shard_count must > 0";
+            return false;
+        }
+        if (shard_capacity == 0) {
+            LOG(ERROR) << "DistributedStorageConfig: shard_capacity must > 0";
+            return false;
+        }
+        if (shard_capacity % alignment != 0) {
+            LOG(ERROR) << "DistributedStorageConfig: shard_capacity must align";
+            return false;
+        }
     }
     if (*parsed_allocator == DfsAllocatorType::BUCKET &&
         (bucket_capacity == 0 || bucket_capacity % alignment != 0 ||
