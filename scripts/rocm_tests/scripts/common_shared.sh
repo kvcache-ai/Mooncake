@@ -1,1 +1,0 @@
-../../e2e/scripts/common.sh

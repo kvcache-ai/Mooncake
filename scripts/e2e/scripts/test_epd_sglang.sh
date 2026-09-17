@@ -91,7 +91,7 @@ run_proxy()
 run_request()
 {
     local model_name=$1
-    local image_file_path=${2:-"${BASE_DIR}/assets/test_cat.jpg"}
+    local image_file_path=${2:-"${E2E_DIR}/assets/test_cat.jpg"}
     local request_timeout=60
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
         request_timeout=180
@@ -190,7 +190,7 @@ start_remote_decode()
     local model_name=$1
     local model_name_clean=$2
 
-    if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"; then
+    if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$E2E_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"; then
         echo "ERROR: Failed to start remote decode component"
         return 1
     fi

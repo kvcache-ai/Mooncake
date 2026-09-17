@@ -48,7 +48,7 @@ does not validate concurrent sender workers while
 ### 1. Script Wrapper Requirements
 
 - **Must Use Shell Script Wrapper**: Regardless of using Python or other languages, tests must be wrapped in Shell scripts
-- **Script Location**: Place in the `scripts/` directory
+- **Script Location**: Place shared cases in `scripts/e2e/scripts/`
 - **Naming Convention**: Start with `test_` (e.g., `test_1p1d_erdma.sh`)
 
 ### 2. Variable Declaration Requirements
@@ -193,7 +193,7 @@ run_test()
 
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
-        cd /test_workspace && \
+        cd /test_run/e2e/python && \
         python3 -m pytest test_demo.py -v -s --tb=long" | tee "$log_file"
 
     return ${PIPESTATUS[0]}

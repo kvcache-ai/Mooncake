@@ -1,1 +1,0 @@
-../../e2e/scripts/test_vllm_1p1d_erdma.sh

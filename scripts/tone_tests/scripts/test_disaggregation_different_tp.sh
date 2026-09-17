@@ -1,1 +1,0 @@
-../../e2e/scripts/test_disaggregation_different_tp.sh

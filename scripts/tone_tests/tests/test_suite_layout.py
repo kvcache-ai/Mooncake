@@ -17,36 +17,58 @@ class TestSuiteLayout(unittest.TestCase):
             text = (SCRIPTS / suite / "scripts/common.sh").read_text()
             self.assertNotIn('"${CI_ACCELERATOR:-cuda}"', text)
 
-    def test_local_links_have_shared_mount(self):
+    def test_shared_helpers_are_loaded_explicitly(self):
         for suite in ("tone_tests", "rocm_tests"):
             common = SCRIPTS / suite / "scripts/common.sh"
-            output = self.shell(
-                f'CONTAINER_NAME=test; source "{common}"; '
-                'printf "%s\\n" "${SHARED_MOUNT_ARGS[@]}"'
+            self.shell(
+                f'CONTAINER_NAME=test; E2E_DIR="{SCRIPTS}/e2e"; source "{common}"; '
+                "declare -f launch_sglang_server >/dev/null; "
+                "declare -f docker_launch >/dev/null"
             )
-            self.assertIn(f"{SCRIPTS}/e2e:/e2e:ro", output)
+            self.assertFalse(any(p.is_symlink() for p in (SCRIPTS / suite).rglob("*")))
 
     @unittest.skipUnless(shutil.which("rsync"), "rsync is required")
-    def test_remote_copy_is_self_contained(self):
+    def test_remote_setup_uses_explicit_shared_directory(self):
         for suite in ("tone_tests", "rocm_tests"):
             with tempfile.TemporaryDirectory() as destination:
-                subprocess.run(
-                    [
-                        "rsync",
-                        "-aL",
-                        "--exclude=run",
-                        f"{SCRIPTS / suite}/",
-                        destination,
-                    ],
-                    check=True,
-                )
                 root = Path(destination)
-                self.assertFalse(any(p.is_symlink() for p in root.rglob("*")))
-                self.assertTrue((root / "assets/test_cat.jpg").is_file())
+                platform = root / "platform"
+                (platform / "scripts").mkdir(parents=True)
+                shutil.copy(SCRIPTS / suite / "scripts/common.sh", platform / "scripts")
                 self.shell(
-                    f'CONTAINER_NAME=test; source "{root}/scripts/common.sh"; '
-                    '[ "${#SHARED_MOUNT_ARGS[@]}" = 0 ]'
+                    f"""CONTAINER_NAME=test
+                    SUITE_DIR="{platform}"
+                    RUN_DIR="$SUITE_DIR/run"
+                    E2E_DIR="{SCRIPTS}/e2e"
+                    REMOTE_WORK_ROOT="{root}/worker"
+                    REMOTE_TEST_DIR=$REMOTE_WORK_ROOT
+                    REMOTE_IP=192.0.2.2
+                    REMOTE_SSH_TARGET=worker
+                    SSH_CMD=mock_ssh
+                    RSYNC_RSH="ssh -F /test/config"
+                    MOONCAKE_RENDER_DEVICES="/dev/dri/renderD129 /dev/dri/renderD137"
+                    source "$SUITE_DIR/scripts/common.sh"
+                    source "$E2E_DIR/scripts/controller.sh"
+                    get_whl() {{ :; }}
+                    mock_ssh() {{ shift; bash -eu -c "$1"; }}
+                    rsync() {{
+                        [ "$1" = -av ]
+                        local src="${{@: -2:1}}" dst="${{@: -1}}"
+                        command rsync -a "$src" "${{dst#worker:}}"
+                    }}
+                    prepare_double_env image SGLANG
+                    source "$REMOTE_TEST_DIR/run/.shrc"
+                    [ "$E2E_DIR" = "$REMOTE_TEST_DIR/e2e" ]
+                    [ "$BASE_DIR" = "$REMOTE_TEST_DIR" ]
+                    [ "$RSYNC_RSH" = "ssh -F /test/config" ]
+                    [ "$MOONCAKE_RENDER_DEVICES" = "/dev/dri/renderD129 /dev/dri/renderD137" ]
+                    source "$BASE_DIR/scripts/common.sh"
+                    [ "$(get_test_type test_1p1d_erdma.sh)" = double ]
+                    test -f "$E2E_DIR/assets/test_cat.jpg"
+                    test -f "$E2E_DIR/python/toy_proxy_server.py"
+                    """
                 )
+                self.assertFalse(any(p.is_symlink() for p in root.rglob("*")))
 
     def test_case_functions_do_not_leak(self):
         with tempfile.TemporaryDirectory() as directory:

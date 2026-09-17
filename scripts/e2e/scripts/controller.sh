@@ -3,12 +3,12 @@
 get_test_type() {
     local test_name=$1
 
-    if [ ! -f "$SUITE_DIR/scripts/$test_name" ]; then
+    if [ ! -f "$E2E_DIR/scripts/$test_name" ]; then
         echo "unknown"
         return 1
     fi
 
-    local test_type=$(grep "^TEST_TYPE=" "$SUITE_DIR/scripts/$test_name" | head -n 1 | cut -d'"' -f2)
+    local test_type=$(grep "^TEST_TYPE=" "$E2E_DIR/scripts/$test_name" | head -n 1 | cut -d'"' -f2)
 
     if [ -z "$test_type" ]; then
         echo "unknown"
@@ -82,7 +82,7 @@ prepare_single_env(){
         MOONCAKE_RUNTIME_CACHE HF_TOKEN_FILE REGISTRY_ADDR_SGLANG REGISTRY_ADDR_VLLM
         USE_HUGGINGFACE_MIRROR HUGGINGFACE_MIRROR USE_MODELSCOPE ARTIFACT_ID
         WHEEL_DIR GIT_REPO LOCAL_IP REMOTE_IP
-        BASE_DIR TEST_RUN_DIR TEST_RESULT_DIR REMOTE_TEST_DIR
+        BASE_DIR TEST_RUN_DIR TEST_RESULT_DIR REMOTE_TEST_DIR E2E_DIR
         MOONCAKE_RENDER_DEVICES MOONCAKE_GPU_INDICES MOONCAKE_CPUSET_CPUS MOONCAKE_CPUSET_MEMS
         MOONCAKE_SGLANG_BASE_GPU_ID MOONCAKE_EPD_ENCODER_GPU_ID MOONCAKE_EPD_PREFILL_GPU_ID MOONCAKE_EPD_DECODE_GPU_ID
         MOONCAKE_VLLM_VISIBLE_DEVICES MOONCAKE_SGLANG_MEM_FRACTION_STATIC MOONCAKE_RDMA_DEVICES MOONCAKE_RDMA_NETDEVS
@@ -156,14 +156,21 @@ prepare_double_env(){
         return 1
     fi
 
-    if ! rsync -avL -e "$RSYNC_RSH" "${SUITE_DIR}/" \
+    if ! rsync -av -e "$RSYNC_RSH" "${SUITE_DIR}/" \
         "$REMOTE_SSH_TARGET:${REMOTE_TEST_DIR}/"; then
         echo "ERROR: Failed to sync files to remote server" >&2
         return 1
     fi
 
+    if ! rsync -av -e "$RSYNC_RSH" "${E2E_DIR}/" \
+        "$REMOTE_SSH_TARGET:${REMOTE_TEST_DIR}/e2e/"; then
+        echo "ERROR: Failed to sync shared E2E files" >&2
+        return 1
+    fi
+
     if ! ${SSH_CMD} "$REMOTE_SSH_TARGET" \
-        "sed -i 's|^export BASE_DIR=.*$|export BASE_DIR=${REMOTE_TEST_DIR}|' ${REMOTE_TEST_DIR}/run/.shrc && \
+        "sed -i 's|^export E2E_DIR=.*$|export E2E_DIR=${REMOTE_TEST_DIR}/e2e|' ${REMOTE_TEST_DIR}/run/.shrc && \
+         sed -i 's|^export BASE_DIR=.*$|export BASE_DIR=${REMOTE_TEST_DIR}|' ${REMOTE_TEST_DIR}/run/.shrc && \
          sed -i 's|^export TEST_RUN_DIR=.*$|export TEST_RUN_DIR=${REMOTE_TEST_DIR}/run|' ${REMOTE_TEST_DIR}/run/.shrc && \
          sed -i 's|^export TEST_RESULT_DIR=.*$|export TEST_RESULT_DIR=${REMOTE_TEST_DIR}/logs|' ${REMOTE_TEST_DIR}/run/.shrc"; then
         echo "ERROR: Failed to configure the remote test environment on $REMOTE_IP" >&2
@@ -250,7 +257,7 @@ run_single_test(){
     fi
 
     source "$RUN_DIR/.shrc"
-    cd "$SUITE_DIR/scripts"
+    cd "$E2E_DIR/scripts"
     local exit_code=0
     execute_test "$test_name" "$@" || exit_code=1
 
@@ -280,7 +287,7 @@ run_all_tests(){
     fi
 
     source "$RUN_DIR/.shrc"
-    cd "$SUITE_DIR/scripts"
+    cd "$E2E_DIR/scripts"
 
     local all_passed=true
     local test_index=0

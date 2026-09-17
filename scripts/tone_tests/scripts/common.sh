@@ -1,6 +1,6 @@
 #!/bin/bash
 # Platform-specific lifecycle; test helpers are shared.
-source "$(dirname "${BASH_SOURCE[0]}")/common_shared.sh"
+source "${E2E_DIR:?E2E_DIR must point to the shared E2E directory}/scripts/common.sh"
 
 docker_launch(){
     local registry_addr=$1
@@ -10,7 +10,7 @@ docker_launch(){
     -d --ipc=host --cap-add=SYS_PTRACE --network=host --gpus all \
     --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=128g \
     -v ${MODEL_CACHE}:/root/.cache $extra_args --privileged \
-    -v $BASE_DIR:/test_run ${SHARED_MOUNT_ARGS[*]} \
+    -v $BASE_DIR:/test_run -v ${E2E_DIR}:/test_run/e2e:ro \
     -v /root/test.jsonl:/tmp/test.jsonl \
     --entrypoint bash \
     ${registry_addr} -c \"hostname;sleep 360000\""

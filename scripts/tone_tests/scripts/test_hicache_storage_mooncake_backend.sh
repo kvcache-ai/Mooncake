@@ -1,1 +1,0 @@
-../../e2e/scripts/test_hicache_storage_mooncake_backend.sh

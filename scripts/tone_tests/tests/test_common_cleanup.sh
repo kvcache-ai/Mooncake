@@ -4,6 +4,7 @@ set -euo pipefail
 TEST_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 COMMON_SH="${TEST_DIR}/../../rocm_tests/scripts/common.sh"
 TONE_COMMON_SH="${TEST_DIR}/../scripts/common.sh"
+export E2E_DIR="$(cd "$TEST_DIR/../../e2e" && pwd)"
 
 fail() {
     echo "FAIL: $*" >&2
@@ -287,6 +288,7 @@ test_run_all_propagates_cleanup_failure() (
     temp_dir=$(mktemp -d)
     trap 'rm -rf "$temp_dir"' EXIT
     SUITE_DIR=$temp_dir
+    E2E_DIR=$temp_dir
     RUN_DIR="$temp_dir/run"
     mkdir -p "$RUN_DIR" "$SUITE_DIR/scripts"
     printf 'test_case_name="cleanup_caller"\nTEST_TYPE="double"\nrun_test() { return 0; }\nparse() { return 0; }\n' \

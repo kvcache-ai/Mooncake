@@ -18,7 +18,7 @@ run_test()
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
         export PYTHONPATH=/sgl-workspace/sglang/test/registered/hicache:\$PYTHONPATH && \
-        cd /test_run/python && \
+        cd /test_run/e2e/python && \
         ${pytest_env}python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" \
         2>&1 | tee "$log_file"
 

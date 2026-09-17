@@ -1,6 +1,6 @@
 #!/bin/bash
 # Platform-specific lifecycle; test helpers are shared.
-source "$(dirname "${BASH_SOURCE[0]}")/common_shared.sh"
+source "${E2E_DIR:?E2E_DIR must point to the shared E2E directory}/scripts/common.sh"
 
 prepare_rocm_runtime_cache_args() {
     local registry_addr=$1
@@ -101,9 +101,9 @@ docker_launch(){
         -e SGLANG_SET_CPU_AFFINITY=0
         -v "${MODEL_CACHE}:/root/.cache"
         -v "${BASE_DIR}:/test_run"
+        -v "${E2E_DIR}:/test_run/e2e:ro"
         --entrypoint bash
     )
-    docker_args+=("${SHARED_MOUNT_ARGS[@]}")
     prepare_rocm_runtime_cache_args "$registry_addr" || return 1
     docker_args+=("${ROCM_RUNTIME_CACHE_ARGS[@]}")
     local host_libionic=""
@@ -333,7 +333,7 @@ case \"\$gid\" in ''|'::'|'0:0:0:0:0:0:0:0') echo 'RDMA GID is empty' >&2; exit 
         return 1
     fi
 
-    local mooncake_install_check="python3 /test_run/python/verify_rocm_wheel.py && ! python3 -m pip show mooncake-transfer-engine >/dev/null 2>&1"
+    local mooncake_install_check="python3 /test_run/e2e/python/verify_rocm_wheel.py && ! python3 -m pip show mooncake-transfer-engine >/dev/null 2>&1"
     if ! ${docker_exec} "${mooncake_install_check}"; then
         echo "ERROR: The ROCm wheel did not replace all image-provided Mooncake files" >&2
         return 1

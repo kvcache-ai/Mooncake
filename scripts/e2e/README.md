@@ -6,13 +6,17 @@
 - Each suite owns its configuration, test inventory and `scripts/common.sh`
   platform lifecycle. ROCm supports the `core-4gpu` inventory; TONE uses `full`.
 - This directory owns shared cases, Python helpers, assets and orchestration.
-  Suite links keep the existing `/test_run` layout. Local containers mount this
-  directory read-only at `/e2e`; `rsync -L` materializes links on remote workers,
-  which therefore need no repository checkout or extra mount.
+  Entrypoints explicitly reference this directory via `E2E_DIR`. Containers
+  mount the platform directory at `/test_run` and shared sources read-only at
+  `/test_run/e2e`. Workers receive the platform directory and shared `e2e/`
+  directory via ordinary `rsync -a`, with the same container layout. No symlinks
+  or link-specific synchronization/mount handling are needed.
 
 Both entries accept `run-all [SGLANG|VLLM]` and `run-single <test_name.sh>`.
 Run them from a complete repository checkout, not a copy of just one suite.
-Generated environment, wheels and logs remain under the selected suite's `run/`.
+`BASE_DIR` identifies the platform directory (including writable `run/` output);
+`E2E_DIR` identifies shared sources. Generated environment, wheels and logs remain
+under the selected suite's `run/`.
 Each case runs in a subshell to avoid leaking functions/configuration into the
 next case. Setup always refreshes the wheel and environment; it does not reuse
 an old `.shrc` as a cache key.

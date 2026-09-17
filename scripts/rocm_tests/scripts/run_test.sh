@@ -69,11 +69,12 @@ export REMOTE_SSH_TARGET SSH_CMD RSYNC_RSH SCP_CMD
 
 SUITE_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
 RUN_DIR="$SUITE_DIR/run"
+E2E_DIR=$(cd "$SUITE_DIR/../e2e" && pwd)
 
 . $SUITE_DIR/scripts/common.sh
 
 REMOTE_WORK_ROOT=/var/lib/mooncake-ci/work
-source "$SUITE_DIR/scripts/controller.sh"
+source "$E2E_DIR/scripts/controller.sh"
 
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
     main "$@"

@@ -3,14 +3,6 @@
 TEST_CASE_RESULT_PATH="run/logs/${test_case_name:-}"
 docker_exec="docker exec ${CONTAINER_NAME} bash -c"
 
-# Local suites use links to shared cases. Workers receive regular files via
-# rsync --copy-links, so they need no additional mount.
-SHARED_MOUNT_ARGS=()
-if [ -L "${BASH_SOURCE[0]}" ]; then
-    shared_root=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
-    SHARED_MOUNT_ARGS=(-v "${shared_root}:/e2e:ro")
-fi
-
 setup_directory(){
     local dir_path=$1
 
@@ -399,7 +391,7 @@ setup_log_directory_dual() {
     setup_log_directory "$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean"
 
     if [ -n "$REMOTE_IP" ]; then
-        ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && source ./common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
+        ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; source \$BASE_DIR/scripts/common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
     fi
 }
 
@@ -425,7 +417,7 @@ cleanup_model_processes() {
     if [ "$ISREMOTE" == "0" ] && [ -n "$REMOTE_IP" ]; then
         echo "===== Killing model processes (remote: $REMOTE_IP) ====="
         if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" \
-            "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server"; then
+            "source $REMOTE_TEST_DIR/run/.shrc; cd \$E2E_DIR/scripts && ./$test_case_name.sh stop_server"; then
             echo "ERROR: Remote model-process cleanup failed" >&2
             cleanup_failed=true
         fi

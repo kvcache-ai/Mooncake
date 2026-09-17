@@ -1,1 +1,0 @@
-../../e2e/scripts/test_moe_mooncake.sh
