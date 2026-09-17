@@ -17,8 +17,24 @@ option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
+option(MOONCAKE_ENABLE_OTEL_TRACING
+       "Enable OpenTelemetry tracing (OTLP/HTTP & OTLP/gRPC spans) for mooncake_master and mooncake_client. Links a pre-built, installed opentelemetry-cpp (run install_otel.sh first). Adds --otlp-traces-endpoint to the binaries; libcurl is the only added runtime shared dep (HTTP exporter), the SDK/protobuf/abseil fold in statically. Default OFF: zero OTel/protobuf dependency, no-op tracing stubs."
+       OFF)
 
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+
+# OpenTelemetry tracing consumes a pre-built, installed opentelemetry-cpp
+# (v1.28.0) produced by `install_otel.sh` (cmake --install to the default
+# prefix). It is no longer built from the in-tree submodule, which has been
+# removed. When tracing is enabled we find the installed package here; the
+# headers come from the imported targets' interface include directories.
+# install_otel.sh builds with WITH_OTLP_HTTP=ON, WITH_OTLP_GRPC=ON and
+# WITH_HTTP_CLIENT_CURL=ON. When tracing is disabled no opentelemetry-cpp
+# dependency is pulled in at all.
+if(MOONCAKE_ENABLE_OTEL_TRACING)
+  find_package(utf8_range CONFIG REQUIRED)
+  find_package(opentelemetry-cpp CONFIG REQUIRED)
+endif()
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"

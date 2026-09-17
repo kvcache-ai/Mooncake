@@ -41,6 +41,7 @@ add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
+add_store_test(request_context_trace_test request_context_trace_test.cpp)
 add_subdirectory(p2p)
 add_subdirectory(e2e)
 
