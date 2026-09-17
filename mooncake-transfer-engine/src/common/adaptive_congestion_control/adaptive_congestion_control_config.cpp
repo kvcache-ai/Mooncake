@@ -19,7 +19,7 @@
 #include <limits>
 #include <string_view>
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 namespace {
 
 ConfigLoadResult invalid(const char* reason) {
@@ -58,7 +58,7 @@ bool parsePositiveCount(const char* name, uint32_t& output) {
 
 ConfigLoadResult loadConfigFromEnvironment() {
     ConfigLoadResult result;
-    if (const char* mode = std::getenv("MC_ADAPTIVE_CC_MODE")) {
+    if (const char* mode = std::getenv("MC_ADAPTIVE_CONGESTION_CONTROL_MODE")) {
         const std::string_view value(mode);
         if (value == "off") {
             result.config.mode = Mode::kOff;
@@ -67,50 +67,56 @@ ConfigLoadResult loadConfigFromEnvironment() {
         } else if (value == "enforce") {
             result.config.mode = Mode::kEnforce;
         } else {
-            return invalid("MC_ADAPTIVE_CC_MODE");
+            return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_MODE");
         }
     }
 
-    if (!parsePositive("MC_ADAPTIVE_CC_MIN_WINDOW_BYTES",
+    if (!parsePositive("MC_ADAPTIVE_CONGESTION_CONTROL_MIN_WINDOW_BYTES",
                        result.config.min_window_bytes)) {
-        return invalid("MC_ADAPTIVE_CC_MIN_WINDOW_BYTES");
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_MIN_WINDOW_BYTES");
     }
-    if (!parsePositive("MC_ADAPTIVE_CC_MAX_WINDOW_BYTES",
+    if (!parsePositive("MC_ADAPTIVE_CONGESTION_CONTROL_MAX_WINDOW_BYTES",
                        result.config.max_window_bytes)) {
-        return invalid("MC_ADAPTIVE_CC_MAX_WINDOW_BYTES");
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_MAX_WINDOW_BYTES");
     }
     if (result.config.min_window_bytes > result.config.max_window_bytes) {
         return invalid("adaptive congestion window range");
     }
 
     uint64_t target_drain_us = result.config.target_drain_time_ns / 1000;
-    if (!parsePositive("MC_ADAPTIVE_CC_TARGET_DRAIN_US", target_drain_us) ||
+    if (!parsePositive("MC_ADAPTIVE_CONGESTION_CONTROL_TARGET_DRAIN_US",
+                       target_drain_us) ||
         target_drain_us > std::numeric_limits<uint64_t>::max() / 1000) {
-        return invalid("MC_ADAPTIVE_CC_TARGET_DRAIN_US");
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_TARGET_DRAIN_US");
     }
     result.config.target_drain_time_ns = target_drain_us * 1000;
 
-    if (!parsePositiveCount("MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS",
-                            result.config.high_pressure_epochs)) {
-        return invalid("MC_ADAPTIVE_CC_HIGH_PRESSURE_EPOCHS");
+    if (!parsePositiveCount(
+            "MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS",
+            result.config.high_pressure_epochs)) {
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_HIGH_PRESSURE_EPOCHS");
     }
-    if (!parsePositiveCount("MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS",
-                            result.config.low_pressure_epochs)) {
-        return invalid("MC_ADAPTIVE_CC_LOW_PRESSURE_EPOCHS");
+    if (!parsePositiveCount(
+            "MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS",
+            result.config.low_pressure_epochs)) {
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_LOW_PRESSURE_EPOCHS");
     }
-    if (!parsePositiveCount("MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD",
-                            result.config.hard_error_threshold)) {
-        return invalid("MC_ADAPTIVE_CC_HARD_ERROR_THRESHOLD");
+    if (!parsePositiveCount(
+            "MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD",
+            result.config.hard_error_threshold)) {
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_HARD_ERROR_THRESHOLD");
     }
 
     uint64_t cooldown_ms = result.config.cooldown_ns / 1'000'000;
-    if (!parsePositive("MC_ADAPTIVE_CC_COOLDOWN_MS", cooldown_ms) ||
+    if (!parsePositive("MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS",
+                       cooldown_ms) ||
         cooldown_ms > std::numeric_limits<uint64_t>::max() / 1'000'000) {
-        return invalid("MC_ADAPTIVE_CC_COOLDOWN_MS");
+        return invalid("MC_ADAPTIVE_CONGESTION_CONTROL_COOLDOWN_MS");
     }
     result.config.cooldown_ns = cooldown_ms * 1'000'000;
 
-    constexpr const char* probe_name = "MC_ADAPTIVE_CC_PROBE_WINDOW_BYTES";
+    constexpr const char* probe_name =
+        "MC_ADAPTIVE_CONGESTION_CONTROL_PROBE_WINDOW_BYTES";
     const bool probe_override = std::getenv(probe_name) != nullptr;
     if (!parsePositive(probe_name, result.config.probe_window_bytes)) {
         return invalid(probe_name);
@@ -122,4 +128,4 @@ ConfigLoadResult loadConfigFromEnvironment() {
     return result;
 }
 
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control

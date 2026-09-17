@@ -3,10 +3,10 @@ project(mooncake-transfer-engine)
 
 include(CheckCXXSourceCompiles)
 
-option(MOONCAKE_ENABLE_ADAPTIVE_CC
+option(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
        "Build adaptive congestion control for RDMA transports" OFF)
-if(MOONCAKE_ENABLE_ADAPTIVE_CC)
-  add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CC=1)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=1)
 endif()
 
 if (NOT GLOBAL_CONFIG)
@@ -91,7 +91,7 @@ endif()
 
 include_directories(../mooncake-common/include)
 include_directories(include)
-if(MOONCAKE_ENABLE_ADAPTIVE_CC)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
   include_directories(src/common/adaptive_congestion_control)
 endif()
 add_subdirectory(include)

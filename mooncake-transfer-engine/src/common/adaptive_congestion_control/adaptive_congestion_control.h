@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <mutex>
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 
 struct CoreAccess;
 struct PathHandle;
@@ -188,6 +188,6 @@ void resetGeneration(DomainState& state, uint32_t generation);
 uint32_t generation(const DomainState& state);
 Snapshot snapshot(const DomainState& state);
 
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control
 
 #endif  // MOONCAKE_ADAPTIVE_CONGESTION_CONTROL_H

@@ -14,7 +14,7 @@
 
 #include "rdma_error_classifier.h"
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 namespace {
 
 Classification makeClassification(OutcomeClass outcome, FailureScope scope,
@@ -101,4 +101,4 @@ std::optional<Classification> classifyAsyncEvent(ibv_event_type event) {
     }
 }
 
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control

@@ -13,10 +13,10 @@ endif()
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-option(MOONCAKE_ENABLE_ADAPTIVE_CC
+option(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL
        "Build adaptive congestion control for RDMA transports" OFF)
-if(MOONCAKE_ENABLE_ADAPTIVE_CC)
-  add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CC=1)
+if(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL)
+  add_compile_definitions(MOONCAKE_ENABLE_ADAPTIVE_CONGESTION_CONTROL=1)
   if(NOT TARGET adaptive_congestion_control_core)
     add_subdirectory(../src/common/adaptive_congestion_control
                      ${CMAKE_CURRENT_BINARY_DIR}/adaptive_congestion_control)

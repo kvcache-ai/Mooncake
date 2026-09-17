@@ -22,7 +22,7 @@
 
 #include "adaptive_congestion_control.h"
 
-namespace mooncake::adaptive_cc {
+namespace mooncake::adaptive_congestion_control {
 namespace {
 
 constexpr uint64_t kBytesPerOperation = 64ULL << 10;
@@ -111,10 +111,10 @@ double percentile(const std::vector<double>& samples, double fraction) {
 }
 
 }  // namespace
-}  // namespace mooncake::adaptive_cc
+}  // namespace mooncake::adaptive_congestion_control
 
 int main(int argc, char** argv) {
-    using namespace mooncake::adaptive_cc;
+    using namespace mooncake::adaptive_congestion_control;
     if (argc != 2) {
         std::cerr << "usage: adaptive_congestion_control_benchmark MODE\n";
         return 2;
