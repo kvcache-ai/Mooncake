@@ -30,6 +30,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <thread>
 #include <utility>
 
 #include "multi_transport.h"
@@ -1212,6 +1213,99 @@ TEST_F(TransportTest, RepeatedBatchQueryPreservesAggregatedBytes) {
     EXPECT_EQ(status.transferred_bytes, total_bytes);
 }
 
+TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+
+    Transport::TransferTask first;
+    Transport::TransferTask second;
+    first.batch_id = batch.id;
+    second.batch_id = batch.id;
+    first.slice_count = 1;
+    second.slice_count = 1;
+
+    Transport::Slice first_slice{};
+    first_slice.task = &first;
+    first_slice.length = 4;
+    first_slice.markSuccess();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(first.is_finished);
+#else
+    EXPECT_FALSE(first.is_finished);
+#endif
+    EXPECT_FALSE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+
+    Transport::Slice second_slice{};
+    second_slice.task = &second;
+    second_slice.length = 4;
+    second_slice.markSuccess();
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(second.is_finished);
+    EXPECT_TRUE(batch.is_finished.load());
+#else
+    EXPECT_FALSE(second.is_finished);
+    // Foreground aggregation publishes the status/byte cache when polling.
+    EXPECT_FALSE(batch.is_finished.load());
+#endif
+    EXPECT_EQ(batch.finished_task_count.load(), 2u);
+}
+
+TEST_F(TransportTest, SealPublishesWhenAllSlicesCompletedFirst) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    Transport::TransferTask task;
+    task.batch_id = batch.id;
+    task.slice_count = 1;
+    Transport::Slice::unsealTaskSubmission(&task);
+
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.length = 4;
+    slice.markSuccess();
+    EXPECT_FALSE(task.completion_published);
+    EXPECT_EQ(batch.finished_task_count.load(), 0u);
+
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_TRUE(task.completion_published);
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+}
+
+TEST_F(TransportTest, MarkFailedWithoutBatchIdDoesNotTouchBatchDesc) {
+    Transport::TransferTask task;
+    Transport::Slice slice{};
+    slice.task = &task;
+    slice.markFailed();
+    EXPECT_EQ(task.failed_slice_count, 1u);
+    EXPECT_FALSE(task.completion_published);
+}
+
+TEST_F(TransportTest, LastSliceAndSealConcurrentlyStillPublish) {
+    for (int iter = 0; iter < 2000; ++iter) {
+        Transport::BatchDesc batch{};
+        batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+        batch.batch_size = 1;
+        Transport::TransferTask task;
+        task.batch_id = batch.id;
+        task.slice_count = 1;
+        Transport::Slice::unsealTaskSubmission(&task);
+
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.length = 4;
+
+        std::thread cq([&] { slice.markSuccess(); });
+        std::thread sealer(
+            [&] { Transport::Slice::sealTaskSubmission(&task); });
+        cq.join();
+        sealer.join();
+        EXPECT_TRUE(task.completion_published) << "iter=" << iter;
+        EXPECT_EQ(batch.finished_task_count.load(), 1u) << "iter=" << iter;
+    }
+}
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::BatchDesc batch{};
@@ -1220,7 +1314,7 @@ TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::TransferTask task;
     task.batch_id = batch.id;
     task.request_count = 2;
-    task.submission_sealed = false;
+    Transport::Slice::unsealTaskSubmission(&task);
 
     auto complete_slice = [&] {
         __atomic_add_fetch(&task.slice_count, 1, __ATOMIC_ACQ_REL);
