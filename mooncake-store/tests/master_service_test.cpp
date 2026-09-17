@@ -580,8 +580,7 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
 TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     const auto dfs_root =
         (std::filesystem::temp_directory_path() /
-         ("master_dfs_bucket_memory_failure_" +
-          std::to_string(::getpid())))
+         ("master_dfs_bucket_memory_failure_" + std::to_string(::getpid())))
             .string();
     std::filesystem::create_directories(dfs_root);
     ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
@@ -592,16 +591,15 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
     ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
     ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
     ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
-    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK",
-                                "1.0");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "1.0");
     ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.9");
     ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
     ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
 
     {
         MasterService service;
-        const auto context = PrepareSimpleSegment(
-            service, "small_memory", kDefaultSegmentBase, 8192);
+        const auto context = PrepareSimpleSegment(service, "small_memory",
+                                                  kDefaultSegmentBase, 8192);
         ReplicateConfig config;
         config.replica_num = 1;
         config.dfs_replica_num = 1;
@@ -611,14 +609,14 @@ TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
                                           TenantId::Default(), 4096, config);
             ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
             ASSERT_TRUE(service
-                            .PutEnd(context.client_id, key,
-                                    TenantId::Default(), ReplicaType::ALL)
+                            .PutEnd(context.client_id, key, TenantId::Default(),
+                                    ReplicaType::ALL)
                             .has_value());
         }
 
-        ASSERT_TRUE(service
-                        .UnmountSegment(context.segment_id, context.client_id)
-                        .has_value());
+        ASSERT_TRUE(
+            service.UnmountSegment(context.segment_id, context.client_id)
+                .has_value());
 
         auto failed = service.PutStart(context.client_id, "memory_full_c",
                                        TenantId::Default(), 4096, config);

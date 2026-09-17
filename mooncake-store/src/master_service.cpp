@@ -4932,9 +4932,8 @@ auto MasterService::AllocateAndInsertMetadata(
         return tl::make_unexpected(quota_result.error());
     }
 
-    auto allocation_result =
-        AllocateReplicas(key, value_length, config, writer_host_id,
-                         dfs_allocation_failed);
+    auto allocation_result = AllocateReplicas(
+        key, value_length, config, writer_host_id, dfs_allocation_failed);
     if (!allocation_result) {
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
                            pending_quota_charge);
@@ -5136,8 +5135,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     // dfs_allocation_failed so only genuine DFS capacity exhaustion triggers
     // it; memory/NoF exhaustion keeps its background-eviction path.
     auto result = admit();
-    if (!result && dfs_allocation_failed &&
-        config.dfs_replica_num > 0 && bucket_allocator_ != nullptr &&
+    if (!result && dfs_allocation_failed && config.dfs_replica_num > 0 &&
+        bucket_allocator_ != nullptr &&
         TryRecoverDfsSpaceAfterAllocationFailure()) {
         result = admit();
     }
