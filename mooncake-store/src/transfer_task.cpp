@@ -1214,6 +1214,9 @@ class StoreScatterTransferOperation::Impl {
     explicit Impl(TransferEngine::ScatterTransferOperation operation)
         : classic_operation_(std::move(operation)) {}
 
+    explicit Impl(Status status)
+        : aggregate_status_(std::move(status)), completed_(true) {}
+
 #ifdef USE_TENT
     Impl(std::shared_ptr<tent::TransferEngine> engine,
          const std::vector<TransferEngine::ScatterTransferRange>& ranges,
@@ -1543,6 +1546,18 @@ StoreScatterTransferOperation TransferSubmitter::submitScatter(
     return StoreScatterTransferOperation(
         std::make_unique<StoreScatterTransferOperation::Impl>(
             engine_.submitScatter(transfers)));
+}
+
+StoreScatterTransferOperation TransferSubmitter::submitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers,
+    int intent) {
+    auto parsed_intent = TransferIntentFromInt(intent);
+    if (!parsed_intent) {
+        return StoreScatterTransferOperation(
+            std::make_unique<StoreScatterTransferOperation::Impl>(
+                Status::InvalidArgument("invalid transfer intent")));
+    }
+    return submitScatter(transfers, *parsed_intent);
 }
 
 std::optional<TransferFuture>

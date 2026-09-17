@@ -43,21 +43,21 @@ enum class OffloadBufferAccess {
 };
 
 enum class TransferIntent : int {
-    kUnspecified = 0,
-    kForegroundGet,
-    kBackgroundPrefetch,
-    kMigration,
+    kUnspecified = transfer_intent_values::kUnspecified,
+    kForegroundGet = transfer_intent_values::kForegroundGet,
+    kBackgroundPrefetch = transfer_intent_values::kBackgroundPrefetch,
+    kMigration = transfer_intent_values::kMigration,
 };
 
 inline std::optional<TransferIntent> TransferIntentFromInt(int intent) {
     switch (intent) {
-        case 0:
+        case transfer_intent_values::kUnspecified:
             return TransferIntent::kUnspecified;
-        case 1:
+        case transfer_intent_values::kForegroundGet:
             return TransferIntent::kForegroundGet;
-        case 2:
+        case transfer_intent_values::kBackgroundPrefetch:
             return TransferIntent::kBackgroundPrefetch;
-        case 3:
+        case transfer_intent_values::kMigration:
             return TransferIntent::kMigration;
         default:
             return std::nullopt;
@@ -644,10 +644,7 @@ class TransferSubmitter {
         TransferIntent intent = TransferIntent::kUnspecified);
     StoreScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers,
-        int intent) {
-        return submitScatter(transfers, TransferIntentFromInt(intent).value_or(
-                                            TransferIntent::kUnspecified));
-    }
+        int intent);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,

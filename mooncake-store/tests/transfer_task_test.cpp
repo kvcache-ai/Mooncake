@@ -72,10 +72,14 @@ class TransferTaskTest : public ::testing::Test {
 };
 
 TEST(TransferIntentTest, UsesStableNamedValues) {
-    EXPECT_EQ(static_cast<int>(TransferIntent::kUnspecified), 0);
-    EXPECT_EQ(static_cast<int>(TransferIntent::kForegroundGet), 1);
-    EXPECT_EQ(static_cast<int>(TransferIntent::kBackgroundPrefetch), 2);
-    EXPECT_EQ(static_cast<int>(TransferIntent::kMigration), 3);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kUnspecified),
+              transfer_intent_values::kUnspecified);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kForegroundGet),
+              transfer_intent_values::kForegroundGet);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kBackgroundPrefetch),
+              transfer_intent_values::kBackgroundPrefetch);
+    EXPECT_EQ(static_cast<int>(TransferIntent::kMigration),
+              transfer_intent_values::kMigration);
 }
 
 TEST(TransferIntentTest, ParsesLegacyIntegerValues) {

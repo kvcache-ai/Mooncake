@@ -1154,13 +1154,13 @@ std::optional<tent::Request::OpCode> toTentOpcode(
 
 std::optional<tent::IntentType> toTentIntent(int intent_type) {
     switch (intent_type) {
-        case 0:
+        case transfer_intent_values::kUnspecified:
             return tent::IntentType::INTENT_UNSPEC;
-        case 1:
+        case transfer_intent_values::kForegroundGet:
             return tent::IntentType::FOREGROUND_GET;
-        case 2:
+        case transfer_intent_values::kBackgroundPrefetch:
             return tent::IntentType::BACKGROUND_PREFETCH;
-        case 3:
+        case transfer_intent_values::kMigration:
             return tent::IntentType::MIGRATION;
         case 4:
             return tent::IntentType::CHECKPOINT;

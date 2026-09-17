@@ -36,6 +36,13 @@ namespace tent {
 class Config;
 class TransferEngine;
 };
+
+namespace transfer_intent_values {
+inline constexpr int kUnspecified = 0;
+inline constexpr int kForegroundGet = 1;
+inline constexpr int kBackgroundPrefetch = 2;
+inline constexpr int kMigration = 3;
+}  // namespace transfer_intent_values
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
     !defined(USE_CXI)
 namespace device {

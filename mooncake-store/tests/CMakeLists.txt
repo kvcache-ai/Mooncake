@@ -189,6 +189,14 @@ if(USE_TENT)
   )
   set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
                                                            "MC_USE_TENT=1")
+  add_test(
+    NAME transfer_submitter_scatter_tent_test
+    COMMAND
+      transfer_task_test
+      --gtest_filter=TransferTaskTest.TransferSubmitterScatterUsesTentDataPath
+  )
+  set_tests_properties(transfer_submitter_scatter_tent_test PROPERTIES
+                       ENVIRONMENT "MC_USE_TENT=1")
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
