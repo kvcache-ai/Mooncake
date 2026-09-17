@@ -575,6 +575,66 @@ TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
     std::filesystem::remove_all(dfs_root, ec);
 }
 
+TEST_F(MasterServiceTest, DfsBucketMemoryAllocationFailurePreservesBuckets) {
+    const auto dfs_root =
+        (std::filesystem::temp_directory_path() /
+         ("master_dfs_bucket_memory_failure_" +
+          std::to_string(::getpid())))
+            .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar allocator("MOONCAKE_DFS_ALLOCATOR", "bucket");
+    ScopedEnvVar bucket_capacity("MOONCAKE_DFS_BUCKET_CAPACITY", "8192");
+    ScopedEnvVar max_bucket_count("MOONCAKE_DFS_MAX_BUCKET_COUNT", "4");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK",
+                                "1.0");
+    ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.9");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(
+            service, "small_memory", kDefaultSegmentBase, 8192);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        for (const std::string& key : {"memory_full_a", "memory_full_b"}) {
+            auto start = service.PutStart(context.client_id, key,
+                                          TenantId::Default(), 4096, config);
+            ASSERT_TRUE(start.has_value()) << key << ": " << start.error();
+            ASSERT_TRUE(service
+                            .PutEnd(context.client_id, key,
+                                    TenantId::Default(), ReplicaType::ALL)
+                            .has_value());
+        }
+
+        ASSERT_TRUE(service
+                        .UnmountSegment(context.segment_id, context.client_id)
+                        .has_value());
+
+        auto failed = service.PutStart(context.client_id, "memory_full_c",
+                                       TenantId::Default(), 4096, config);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+        for (const std::string& key : {"memory_full_a", "memory_full_b"}) {
+            auto query = service.GetReplicaList(key, TenantId::Default());
+            ASSERT_TRUE(query.has_value()) << key;
+            ASSERT_EQ(query->replicas.size(), 1u);
+            EXPECT_TRUE(query->replicas.front().is_dfs_replica());
+        }
+    }
+
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
 TEST_F(MasterServiceTest, LeasedUpsertAllocationFailurePreservesObject) {
     MasterServiceConfig service_config;
     service_config.memory_allocator = BufferAllocatorType::OFFSET;
