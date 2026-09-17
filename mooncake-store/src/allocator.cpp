@@ -4,12 +4,56 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <numeric>
+#include <stdexcept>
 
 #include "master_metric_manager.h"
 
 namespace mooncake {
+namespace {
+
+bool IsValidCachelibLayout(size_t base, size_t size) noexcept {
+    const size_t slab_count = size / sizeof(facebook::cachelib::Slab);
+    return base != 0 && base % facebook::cachelib::Slab::kSize == 0 &&
+           size >= facebook::cachelib::Slab::kSize &&
+           size % facebook::cachelib::Slab::kSize == 0 &&
+           slab_count <= std::numeric_limits<unsigned int>::max() &&
+           base <= std::numeric_limits<size_t>::max() - size;
+}
+
+bool IsValidAllocation(const LiveAllocation& allocation,
+                       size_t capacity) noexcept {
+    return allocation.requested_size != 0 &&
+           allocation.offset_from_base < capacity &&
+           allocation.requested_size <= capacity - allocation.offset_from_base;
+}
+
+}  // namespace
+
+void BufferAllocatorBase::AttachUsageTracker(
+    const std::shared_ptr<StorageUsageTracker>& usage_tracker) {
+    if (!usage_tracker || usage_registration_) {
+        return;
+    }
+    usage_registration_ = std::make_unique<StorageUsageRegistration>(
+        usage_tracker, cur_size_, capacity());
+}
+
+void BufferAllocatorBase::RecordAllocation(size_t bytes) noexcept {
+    cur_size_.fetch_add(bytes, std::memory_order_relaxed);
+    if (usage_registration_) {
+        usage_registration_->AddUsedBytes(bytes);
+    }
+}
+
+void BufferAllocatorBase::RecordDeallocation(size_t bytes) noexcept {
+    cur_size_.fetch_sub(bytes, std::memory_order_relaxed);
+    if (usage_registration_) {
+        usage_registration_->RemoveUsedBytes(bytes);
+    }
+}
 
 std::string AllocatedBuffer::getSegmentName() const noexcept {
     auto alloc = allocator_.lock();
@@ -39,6 +83,14 @@ AllocatedBuffer::AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
     if (protocol == "cxl") {
         segment_name_ = descriptor.transport_endpoint_;
     }
+}
+
+bool AllocatedBuffer::copyTransferProtocolFrom(const AllocatedBuffer& source) {
+    if (protocol == "cxl" || source.protocol == "cxl") {
+        return false;
+    }
+    protocol = source.protocol;
+    return true;
 }
 
 // Implementation of get_descriptor
@@ -83,7 +135,49 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
               << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
 }
 
-// Removed allocated_bytes parameter and member initialization
+tl::expected<std::shared_ptr<CachelibBufferAllocator>, ErrorCode>
+CachelibBufferAllocator::Create(std::string segment_name, size_t base,
+                                size_t size, std::string transport_endpoint,
+                                ReplicaType replica_type) {
+    if (!IsValidCachelibLayout(base, size)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // CacheLib's parameter-dependent constructor failures are covered by the
+    // layout validation above. Do not catch allocation failures here: metadata
+    // exhaustion follows the process-level fail-fast policy.
+    return std::shared_ptr<CachelibBufferAllocator>(new CachelibBufferAllocator(
+        std::move(segment_name), base, size, std::move(transport_endpoint),
+        replica_type));
+}
+
+tl::expected<std::shared_ptr<BufferAllocatorBase>, ErrorCode>
+CreateBufferAllocator(BufferAllocatorType allocator_type,
+                      std::string segment_name, size_t base, size_t size,
+                      std::string transport_endpoint,
+                      ReplicaType replica_type) {
+    switch (allocator_type) {
+        case BufferAllocatorType::CACHELIB: {
+            auto allocator = CachelibBufferAllocator::Create(
+                std::move(segment_name), base, size,
+                std::move(transport_endpoint), replica_type);
+            if (!allocator) {
+                return tl::make_unexpected(allocator.error());
+            }
+            return std::shared_ptr<BufferAllocatorBase>(std::move(*allocator));
+        }
+        case BufferAllocatorType::OFFSET:
+            // Offset construction has no parameter-dependent throwing path;
+            // metadata allocation failures intentionally follow fail-fast.
+            return std::shared_ptr<BufferAllocatorBase>(
+                std::make_shared<OffsetBufferAllocator>(
+                    std::move(segment_name), base, size,
+                    std::move(transport_endpoint), replica_type));
+        default:
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+}
+
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint,
@@ -91,7 +185,6 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0),
       transport_endpoint_(std::move(transport_endpoint)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
@@ -127,10 +220,11 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 CachelibBufferAllocator::~CachelibBufferAllocator() {
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               cur_size_);
+                                                               size());
+        MasterMetricManager::instance().remove_segment_metrics(segment_name_);
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
-                                                               cur_size_);
+                                                               size());
     }
 };
 
@@ -144,7 +238,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         if (!buffer) {
             VLOG(1) << "allocation_failed size=" << size
                     << " segment=" << segment_name_
-                    << " current_size=" << cur_size_;
+                    << " current_size=" << GetUsageBytes();
             return nullptr;
         }
     } catch (const std::exception& e) {
@@ -156,7 +250,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     }
     VLOG(1) << "allocation_succeeded size=" << size
             << " segment=" << segment_name_ << " address=" << buffer;
-    cur_size_.fetch_add(size);
+    RecordAllocation(size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
                                                                size);
@@ -176,7 +270,7 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
         memory_allocator_->free(buffer);
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
-        cur_size_.fetch_sub(freed_size);
+        RecordDeallocation(freed_size);
         if (replica_type_ == ReplicaType::MEMORY) {
             MasterMetricManager::instance().dec_allocated_mem_size(
                 segment_name_, freed_size);
@@ -194,58 +288,57 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 }
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::adoptImportedBuffer(
-    const AllocatedBuffer::Descriptor& descriptor) {
-    cur_size_.fetch_add(descriptor.size_);
+    const LiveAllocation& allocation) {
+    RecordAllocation(allocation.requested_size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(
-            segment_name_, descriptor.size_);
+            segment_name_, allocation.requested_size);
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().inc_allocated_nof_size(
-            segment_name_, descriptor.size_);
+            segment_name_, allocation.requested_size);
     }
-    return std::make_unique<AllocatedBuffer>(shared_from_this(), descriptor);
+    return std::make_unique<AllocatedBuffer>(
+        shared_from_this(),
+        reinterpret_cast<void*>(base_ + allocation.offset_from_base),
+        allocation.requested_size);
 }
 
-std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
+std::optional<RestoredCachelibBufferAllocator> ImportCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
+    const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
     if (replica_type != ReplicaType::MEMORY ||
-        base % facebook::cachelib::Slab::kSize != 0 ||
-        size < facebook::cachelib::Slab::kSize ||
-        size % facebook::cachelib::Slab::kSize != 0 ||
-        base > std::numeric_limits<size_t>::max() - size) {
+        !IsValidCachelibLayout(base, size)) {
         return std::nullopt;
     }
-    const size_t end = base + size;
     std::vector<MemoryAllocator::ImportedAllocation> imports;
-    imports.reserve(descriptors.size());
-    for (const auto& descriptor : descriptors) {
-        if (descriptor.protocol_ == "cxl" ||
-            descriptor.transport_endpoint_ != transport_endpoint ||
-            descriptor.size_ == 0 || descriptor.size_ > UINT32_MAX ||
-            descriptor.buffer_address_ < base ||
-            descriptor.buffer_address_ >= end ||
-            descriptor.size_ > end - descriptor.buffer_address_) {
+    imports.reserve(allocations.size());
+    for (const auto& allocation : allocations) {
+        if (!IsValidAllocation(allocation, size) ||
+            allocation.requested_size > UINT32_MAX) {
             return std::nullopt;
         }
-        imports.push_back({reinterpret_cast<void*>(descriptor.buffer_address_),
-                           static_cast<uint32_t>(std::max<uint64_t>(
-                               descriptor.size_, kMinSliceSize))});
+        imports.push_back(
+            {reinterpret_cast<void*>(base + allocation.offset_from_base),
+             static_cast<uint32_t>(std::max<uint64_t>(allocation.requested_size,
+                                                      kMinSliceSize))});
     }
 
-    auto allocator = std::make_shared<CachelibBufferAllocator>(
+    auto created = CachelibBufferAllocator::Create(
         std::move(segment_name), base, size, transport_endpoint, replica_type);
+    if (!created) {
+        return std::nullopt;
+    }
+    auto allocator = std::move(*created);
     if (!allocator->memory_allocator_->importAllocations(allocator->pool_id_,
                                                          imports)) {
         return std::nullopt;
     }
 
     std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
-    buffers.reserve(descriptors.size());
-    for (const auto& descriptor : descriptors) {
-        buffers.push_back(allocator->adoptImportedBuffer(descriptor));
+    buffers.reserve(allocations.size());
+    for (const auto& allocation : allocations) {
+        buffers.push_back(allocator->adoptImportedBuffer(allocation));
     }
     return RestoredCachelibBufferAllocator{std::move(allocator),
                                            std::move(buffers)};
@@ -259,7 +352,6 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
-      cur_size_(0),
       transport_endpoint_(std::move(transport_endpoint)),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
@@ -277,7 +369,9 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
         max_capacity =
             std::max(max_capacity, static_cast<uint64_t>(1024 * 1024));
         max_capacity =
-            std::min(max_capacity, static_cast<uint64_t>(64 * 1024 * 1024));
+            std::min(max_capacity,
+                     static_cast<uint64_t>(
+                         offset_allocator::OffsetAllocatorSnapshot::kMaxNodes));
         // Create the offset allocator
         offset_allocator_ = offset_allocator::OffsetAllocator::create(
             base, size, static_cast<uint32_t>(init_capacity),
@@ -295,13 +389,87 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
     }
 }
 
+OffsetBufferAllocator::OffsetBufferAllocator(
+    OffsetBufferAllocatorSnapshot snapshot,
+    std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator)
+    : segment_name_(std::move(snapshot.segment_name)),
+      base_(snapshot.base),
+      total_size_(snapshot.capacity),
+      transport_endpoint_(std::move(snapshot.transport_endpoint)),
+      replica_type_(ReplicaType::MEMORY),
+      offset_allocator_(std::move(offset_allocator)) {}
+
+tl::expected<void, std::string>
+OffsetBufferAllocatorSnapshot::ValidateMetadata() const {
+    if (allocation_state.base != base ||
+        allocation_state.capacity != capacity) {
+        return tl::make_unexpected(fmt::format(
+            "allocator bounds mismatch: outer base={}, capacity={}; inner "
+            "base={}, capacity={}",
+            base, capacity, allocation_state.base, allocation_state.capacity));
+    }
+    if (used_bytes > capacity ||
+        used_bytes >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+        return tl::make_unexpected(
+            fmt::format("invalid usage {} for capacity {} or signed metrics",
+                        used_bytes, capacity));
+    }
+    if (used_bytes != allocation_state.allocated_size) {
+        return tl::make_unexpected(
+            fmt::format("used_bytes {} does not match allocated_size {}",
+                        used_bytes, allocation_state.allocated_size));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> OffsetBufferAllocatorSnapshot::Validate()
+    const {
+    if (auto valid = ValidateMetadata(); !valid) return valid;
+    return allocation_state.Validate();
+}
+
+tl::expected<std::shared_ptr<OffsetBufferAllocator>, ErrorCode>
+OffsetBufferAllocator::Restore(OffsetBufferAllocatorSnapshot snapshot) {
+    const auto used_bytes = snapshot.used_bytes;
+    if (auto valid = snapshot.ValidateMetadata(); !valid) {
+        LOG(ERROR) << "OffsetBufferAllocator::Restore rejected snapshot for "
+                   << snapshot.segment_name << ": " << valid.error();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    // The inner factory validates its complete snapshot and logs the specific
+    // failure before constructing an allocator. No metrics are published yet.
+    auto offset_allocator = offset_allocator::OffsetAllocator::Restore(
+        std::move(snapshot.allocation_state));
+    if (!offset_allocator) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto allocator =
+        std::shared_ptr<OffsetBufferAllocator>(new OffsetBufferAllocator(
+            std::move(snapshot), std::move(*offset_allocator)));
+    // No allocation handles exist yet. Pair restored usage with the same
+    // accounting that allocate()/destruction use, before publishing the object.
+    MasterMetricManager::instance().inc_allocated_mem_size(
+        allocator->segment_name_, static_cast<int64_t>(used_bytes));
+    allocator->SetUsageBytesForRestore(used_bytes);
+    return allocator;
+}
+
+OffsetBufferAllocatorSnapshot OffsetBufferAllocator::CaptureSnapshot() const {
+    return {segment_name_,       base_,
+            total_size_,         size(),
+            transport_endpoint_, offset_allocator_->CaptureSnapshot()};
+}
+
 OffsetBufferAllocator::~OffsetBufferAllocator() {
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               cur_size_);
+                                                               size());
+        MasterMetricManager::instance().remove_segment_metrics(segment_name_);
     } else if (replica_type_ == ReplicaType::NOF_SSD) {
         MasterMetricManager::instance().dec_allocated_nof_size(segment_name_,
-                                                               cur_size_);
+                                                               size());
     }
 };
 
@@ -318,7 +486,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         if (!allocation_handle) {
             VLOG(1) << "allocation_failed size=" << size
                     << " segment=" << segment_name_
-                    << " current_size=" << cur_size_;
+                    << " current_size=" << GetUsageBytes();
             return nullptr;
         }
 
@@ -339,7 +507,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         return nullptr;
     }
 
-    cur_size_.fetch_add(size);
+    RecordAllocation(size);
     if (replica_type_ == ReplicaType::MEMORY) {
         MasterMetricManager::instance().inc_allocated_mem_size(segment_name_,
                                                                size);
@@ -356,7 +524,7 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         // when the OffsetAllocationHandle goes out of scope
         size_t freed_size = handle->size();
         handle->offset_handle_.reset();
-        cur_size_.fetch_sub(freed_size);
+        RecordDeallocation(freed_size);
         if (replica_type_ == ReplicaType::MEMORY) {
             MasterMetricManager::instance().dec_allocated_mem_size(
                 segment_name_, freed_size);
@@ -392,11 +560,10 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
     }
 }
 
-std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
+std::optional<RestoredOffsetBufferAllocator> ImportOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
+    const std::vector<LiveAllocation>& allocations, ReplicaType replica_type) {
     if (base > std::numeric_limits<size_t>::max() - size) {
         return std::nullopt;
     }
@@ -405,14 +572,14 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
         std::move(segment_name), base, size, transport_endpoint, replica_type);
     const auto offset_allocator = allocator->getOffsetAllocator();
 
-    std::vector<size_t> order(descriptors.size());
+    std::vector<size_t> order(allocations.size());
     std::iota(order.begin(), order.end(), 0);
     std::sort(order.begin(), order.end(), [&](size_t lhs, size_t rhs) {
-        return descriptors[lhs].buffer_address_ <
-               descriptors[rhs].buffer_address_;
+        return allocations[lhs].offset_from_base <
+               allocations[rhs].offset_from_base;
     });
 
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers(descriptors.size());
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers(allocations.size());
     std::vector<std::unique_ptr<AllocatedBuffer>> gaps;
     size_t cursor = base;
 
@@ -452,26 +619,25 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     };
 
     for (const size_t index : order) {
-        const auto& descriptor = descriptors[index];
-        if (descriptor.transport_endpoint_ != transport_endpoint ||
-            descriptor.size_ == 0 || descriptor.buffer_address_ < cursor ||
-            descriptor.buffer_address_ < base ||
-            descriptor.buffer_address_ >= end ||
-            descriptor.size_ > end - descriptor.buffer_address_) {
+        const auto& allocation = allocations[index];
+        if (!IsValidAllocation(allocation, size)) {
             return std::nullopt;
         }
-        const uint64_t occupied =
-            offset_allocator->normalizedAllocationSize(descriptor.size_);
-        if (occupied == 0 || occupied > end - descriptor.buffer_address_ ||
-            !fill_gap(descriptor.buffer_address_ - cursor)) {
+        const size_t address = base + allocation.offset_from_base;
+        if (address < cursor) {
             return std::nullopt;
         }
-        auto buffer = allocator->allocate(descriptor.size_);
-        if (!buffer || reinterpret_cast<size_t>(buffer->data()) !=
-                           descriptor.buffer_address_) {
+        const uint64_t occupied = offset_allocator->normalizedAllocationSize(
+            allocation.requested_size);
+        if (occupied == 0 || occupied > end - address ||
+            !fill_gap(address - cursor)) {
             return std::nullopt;
         }
-        cursor = descriptor.buffer_address_ + occupied;
+        auto buffer = allocator->allocate(allocation.requested_size);
+        if (!buffer || reinterpret_cast<size_t>(buffer->data()) != address) {
+            return std::nullopt;
+        }
+        cursor = address + occupied;
         buffers[index] = std::move(buffer);
     }
 

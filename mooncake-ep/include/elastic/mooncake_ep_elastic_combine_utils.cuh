@@ -37,11 +37,10 @@ template <int kHiddenBytes>
 struct CombineVecTraits {
 #if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 1000)
-    // On SM100+, use longlong4_t (32 bytes) if hidden is aligned, otherwise
-    // fall back to int4 (16 bytes)
-    static constexpr bool kUseLonglong4 =
-        (kHiddenBytes % sizeof(longlong4_t) == 0) and
-        ((kHiddenBytes / sizeof(longlong4_t)) % 32 == 0);
+    // 256-bit longlong4_t accesses regress this reduction on the validated
+    // SM100+ kernel shapes. Keep the faster 128-bit int4 path until a workload
+    // demonstrates that the wider vector is beneficial.
+    static constexpr bool kUseLonglong4 = false;
     using vec_t = std::conditional_t<kUseLonglong4, longlong4_t, int4>;
 #else
     using vec_t = int4;

@@ -21,8 +21,8 @@
 #include "serialize/serializer.h"
 #include "segment.h"
 #include "task_manager.h"
-#include "utils/file_util.h"
-#include "utils/zstd_util.h"
+#include "common/file_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake {
 
@@ -146,6 +146,20 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
+            if (!snapshot_running_.load()) {
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                break;
+            }
+            if (master_service_->ShouldSkipSnapshotForClientOffboarding()) {
+                LOG(WARNING)
+                    << "[Snapshot] Skipping snapshot while Client offboarding "
+                       "is pending, snapshot_id="
+                    << snapshot_id;
+                close(log_pipe[0]);
+                close(log_pipe[1]);
+                continue;
+            }
             pid = fork();
         }
         if (pid == -1) {

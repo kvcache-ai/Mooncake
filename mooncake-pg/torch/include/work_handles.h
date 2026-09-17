@@ -8,6 +8,7 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/torch.h>
 
+#include <atomic>
 #include <any>
 #include <functional>
 #include <memory>
@@ -46,6 +47,10 @@ class MooncakeWorkTracker final {
     void evictCompleted() noexcept;
     void shutdown() noexcept;
 
+    // Captured CUDA work stays retained while graph capture is active because
+    // querying its event is illegal on a capturing CUDA context.
+    void notifyCapture(bool capturing) noexcept;
+
    private:
     friend class MooncakeWorkCpu;
     friend class MooncakeWorkCuda;
@@ -65,6 +70,7 @@ class MooncakeWorkTracker final {
     std::vector<RetiredResources> retired_;
     std::vector<std::any> retained_until_shutdown_;
     bool is_shutdown_ = false;
+    std::atomic<int> capture_depth_{0};
 };
 
 // Collective Work handles
@@ -94,10 +100,12 @@ class MooncakeWorkCpu : public ::c10d::Work {
 
 class MooncakeWorkCuda : public ::c10d::Work {
    public:
+    // The capture state is supplied by the collective's actual CUDA stream.
     MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<c10::Event> event,
                      FailedRanksHint failedRanksHint,
                      std::shared_ptr<MooncakeWorkTracker> tracker,
-                     std::vector<at::Tensor> keepAlive = {});
+                     std::vector<at::Tensor> keepAlive = {},
+                     bool is_captured = false);
     ~MooncakeWorkCuda() override;
 
     bool isCompleted() override { return event_->query(); }
