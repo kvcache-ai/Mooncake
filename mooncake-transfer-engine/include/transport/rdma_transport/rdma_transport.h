@@ -61,6 +61,11 @@ class RdmaTransport : public Transport {
 
     const char *getName() const override { return "rdma"; }
 
+    // Ordinary RDMA's native notification channel. Success means the SEND
+    // was posted locally, not that the remote application consumed it.
+    int sendNativeNotify(const std::string &peer_server_name,
+                         const TransferMetadata::NotifyDesc &notify);
+
     int registerLocalMemory(void *addr, size_t length,
                             const std::string &location, bool remote_accessible,
                             bool update_metadata) override;

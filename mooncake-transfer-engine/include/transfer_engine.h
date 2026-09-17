@@ -240,6 +240,8 @@ class TransferEngine {
 
     int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
+    // RDMA success means queued on the notification QP, not remote delivery.
+    // Completion errors are processed asynchronously; TCP fallback is sync.
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
 
