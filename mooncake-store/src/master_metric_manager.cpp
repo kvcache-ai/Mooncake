@@ -450,20 +450,17 @@ MasterMetricManager::MasterMetricManager()
           {"client_id"}),
       offload_completed_total_(
           "master_offload_completed_total",
-          "SSD offload tasks completed (worker reported OK)",
-          {"client_id"}),
-      offload_failed_total_(
-          "master_offload_failed_total",
-          "SSD offload tasks failed (worker reported NACK)",
-          {"client_id"}),
+          "SSD offload tasks completed (worker reported OK)", {"client_id"}),
+      offload_failed_total_("master_offload_failed_total",
+                            "SSD offload tasks failed (worker reported NACK)",
+                            {"client_id"}),
       offload_cancelled_total_(
           "master_offload_cancelled_total",
           "SSD offload tasks cancelled (preempted before write)",
           {"client_id"}),
       offload_enqueue_rejected_total_(
           "master_offload_enqueue_rejected_total",
-          "SSD offload tasks rejected at enqueue (queue full)",
-          {"client_id"}),
+          "SSD offload tasks rejected at enqueue (queue full)", {"client_id"}),
 
       // Snapshot Metrics
       snapshot_duration_ms_(
