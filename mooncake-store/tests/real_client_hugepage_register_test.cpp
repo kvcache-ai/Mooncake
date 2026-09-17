@@ -20,6 +20,7 @@
 // to end.
 
 #include "client_service.h"
+#include "config.h"
 #include "real_client.h"
 #include "shm_helper.h"
 #include "test_server_helpers.h"
@@ -221,6 +222,49 @@ TEST_F(RealClientHugepageRegisterTest, HotCacheShmRegistersAlignedSegment) {
     } else {
         unsetenv("MC_STORE_LOCAL_HOT_CACHE_USE_SHM");
     }
+}
+
+// A non-hugepage-aligned effective max_mr_size must not create misaligned
+// chunk boundaries. registerLocalMemoryInternal rounds the chunk limit down to
+// the buffer's page size before splitting, so every chunk (and every preTouch
+// block) stays hugepage-aligned and registers cleanly. Without the alignment a
+// chunk boundary lands inside a huge page and ibv_reg_mr fails with EINVAL
+// (ibv_fork_init makes MADV_DONTFORK refuse to split the hugetlb VMA at a
+// non-hugepage-aligned boundary). All chunks succeed here, so this test leaves
+// no fork-protection residue and is safe to run before the misaligned test.
+TEST_F(RealClientHugepageRegisterTest,
+       MisalignedMaxMrSizeChunksStayPageAligned) {
+    if (protocol_ != std::string("rdma")) {
+        GTEST_SKIP() << "chunk registration is exercised on the RDMA path only";
+    }
+
+    // 16MB segment = 8 hugepages (2MB each).
+    const size_t kSegmentSize = 16 * 1024 * 1024;
+    void* base = ShmHelper::getInstance()->allocate(kSegmentSize);
+    ASSERT_NE(base, nullptr);
+    auto shm = ShmHelper::getInstance()->get_shm(base);
+    ASSERT_NE(shm, nullptr);
+    ASSERT_EQ(shm->size, kSegmentSize);
+    ASSERT_TRUE(ShmHelper::getInstance()->is_hugepage());
+
+    // 5MB is not a 2MB multiple. The 16MB buffer exceeds it and is chunked;
+    // align_down(5MB, 2MB) = 4MB keeps all four chunk boundaries (0/4/8/12 MB)
+    // on huge-page boundaries. The raw 5MB limit would place boundaries at
+    // 5/10/15 MB, inside a huge page, and fail with EINVAL.
+    const uint64_t saved_max_mr_size = globalConfig().max_mr_size;
+    globalConfig().max_mr_size = 5 * 1024 * 1024;
+
+    const int rc = client_->register_buffer(base, kSegmentSize);
+
+    globalConfig().max_mr_size = saved_max_mr_size;
+
+    EXPECT_EQ(rc, 0) << "chunking with a non-2MB-aligned max_mr_size produced "
+                        "a misaligned MR boundary";
+    if (rc == 0) {
+        EXPECT_EQ(client_->unregister_buffer(base), 0);
+    }
+
+    EXPECT_EQ(ShmHelper::getInstance()->free(base), 0);
 }
 
 // Sub-range registrations are not special-cased: an interior pointer is
