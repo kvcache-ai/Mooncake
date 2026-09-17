@@ -8004,8 +8004,8 @@ auto MasterService::Ping(const UUID& client_id)
     const auto record_it = view->liveness_records.find(client_id);
     bool observation_accepted = false;
     if (record_it != view->liveness_records.end()) {
-        const auto observation =
-            record_it->second->Observe(ClientLivenessRecord::Clock::now());
+        const auto observation = record_it->second->ObserveHeartbeat(
+            ClientLivenessRecord::Clock::now());
         observation_accepted =
             observation != ClientLivenessObservation::REJECTED_OFFLINE;
         if (observation == ClientLivenessObservation::RECOVERED_ACTIVE) {

@@ -2965,6 +2965,29 @@ TEST_F(MasterServiceTest,
     EXPECT_EQ(response->client_status, ClientStatus::OK);
 }
 
+TEST_F(MasterServiceTest, PingReturnsWhileTheClientsOwnRecordIsGuarded) {
+    MasterService service;
+    auto segment = MakeSegment("ping_guarded_record_segment");
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+    ASSERT_TRUE(service.ReMountSegment({segment}, client_id).has_value());
+    const auto liveness = FindClientLivenessForTest(service, client_id);
+    ASSERT_TRUE(liveness);
+
+    auto remount_in_progress = liveness->TryAcquireRetainingGuard();
+    ASSERT_TRUE(remount_in_progress.has_value());
+    auto ping =
+        std::async(std::launch::async, [&] { return service.Ping(client_id); });
+    const bool ping_returned_during_guard =
+        ping.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+    remount_in_progress.reset();
+
+    ASSERT_TRUE(ping_returned_during_guard);
+    auto response = ping.get();
+    ASSERT_TRUE(response.has_value());
+    EXPECT_EQ(response->client_status, ClientStatus::OK);
+}
+
 TEST_F(MasterServiceTest, PingSeesReMountedClientAsSoonAsReMountReturns) {
     MasterService service;
     auto segment = MakeSegment("ping_after_remount_segment");
