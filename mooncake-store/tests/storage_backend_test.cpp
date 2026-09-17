@@ -638,6 +638,7 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
     int64_t valid_bucket_id = 0;
+    const std::string key = "test_key";
     {
         // Create a valid bucket, then drop the live client so later Init can
         // reclaim the same storage_path (#3528 flock).
@@ -649,7 +650,6 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
 
         // Create one valid bucket
         std::unordered_map<std::string, std::vector<Slice>> batched_slices;
-        std::string key = "test_key";
         std::string data = "test_data_content";
         void* buffer = client_buffer_allocator->allocate(data.size());
         memcpy(buffer, data.data(), data.size());
