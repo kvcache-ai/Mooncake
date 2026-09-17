@@ -916,10 +916,10 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_milliseconds = 60 * 1000;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-    if (!tent_engine_) {
+    // TENT batches do not use the classic transport BatchDesc layout.
+    if (!engine_.isUsingTent()) {
         VLOG(1) << "Waiting for transfer engine completion for batch "
                 << batch_id_;
-
         // Wait directly on BatchDesc's condition variable.
         auto& batch_desc = Transport::toBatchDesc(batch_id_);
         bool completed;
@@ -954,16 +954,13 @@ void TransferEngineOperationState::wait_for_completion() {
         if (completed) {
             failed = batch_desc.has_failure.load(std::memory_order_relaxed);
         }
-
         ErrorCode error_code =
             completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
                       : ErrorCode::TRANSFER_FAIL;
-
         {
             std::lock_guard<std::mutex> lock(mutex_);
             set_result_internal(error_code);
         }
-
         if (completed) {
             VLOG(1) << "Transfer engine operation completed for batch "
                     << batch_id_

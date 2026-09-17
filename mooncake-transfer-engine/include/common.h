@@ -77,6 +77,27 @@ static inline std::string getHostname() {
     return hostname;
 }
 
+// True when the variable is set to anything other than 0/false/no/off.
+// Used by MC_FORCE_SHM.
+inline bool envFlagEnabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (!value || !*value) return false;
+    auto eqIgnoreCase = [](const char *a, const char *b) {
+        for (; *a && *b; ++a, ++b) {
+            unsigned char ca = static_cast<unsigned char>(*a);
+            unsigned char cb = static_cast<unsigned char>(*b);
+            if (ca >= 'A' && ca <= 'Z')
+                ca = static_cast<unsigned char>(ca - 'A' + 'a');
+            if (cb >= 'A' && cb <= 'Z')
+                cb = static_cast<unsigned char>(cb - 'A' + 'a');
+            if (ca != cb) return false;
+        }
+        return *a == *b;
+    };
+    return !eqIgnoreCase(value, "0") && !eqIgnoreCase(value, "false") &&
+           !eqIgnoreCase(value, "no") && !eqIgnoreCase(value, "off");
+}
+
 // libnuma fills the cache numa_node_to_cpus() reads lazily and without locking,
 // so concurrent first callers each allocate it and all but one are orphaned --
 // a leak LeakSanitizer fails the build on. Worker pools bind every thread at

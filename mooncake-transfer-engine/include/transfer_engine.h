@@ -33,6 +33,7 @@ namespace mooncake {
 class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
+class Config;
 class TransferEngine;
 };
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -104,6 +105,11 @@ class TransferEngine {
              const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name, uint64_t rpc_port,
+             const std::string& protocol);
+
     int freeEngine();
 
     Transport* installTransport(const std::string& proto, void** args);
@@ -134,6 +140,14 @@ class TransferEngine {
                             const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
+
+    // Allocate POSIX shm that ShmTransport can export to same-host peers.
+    // Requires ShmTransport (MC_FORCE_SHM=1 or installTransport("shm")).
+    // Caller must registerLocalMemory before remote access. Returns nullptr
+    // on failure.
+    void* allocateSharedMemory(size_t length);
+
+    int freeSharedMemory(void* addr);
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
@@ -254,10 +268,11 @@ class TransferEngine {
 #endif
 
     /**
-     * @brief Check if TCP is the only installed transport.
+     * @brief Check if TCP is the only installed host transport.
      *
-     * When only TCP transport is available (no RDMA, NVLink, etc.),
-     * local memcpy is preferred over TCP loopback for same-host transfers.
+     * When only TCP is available (no RDMA, NVLink, etc.), local memcpy is
+     * preferred over TCP loopback for same-host transfers. POSIX SHM is
+     * intra-node only and does not change this classification.
      */
     bool isTcpOnly() const;
 
@@ -287,9 +302,16 @@ class TransferEngine {
     std::string showLinks(bool json = false) const;
 
    private:
+    std::shared_ptr<mooncake::tent::Config> buildTentConfig(
+        const std::string& metadata_conn_string,
+        const std::string& local_server_name) const;
+
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
     std::shared_ptr<ShutdownToken> shutdown_token_;
+    // Classic callers provide this through TransferEngine(auto_discover,
+    // filter) before init() creates the native TENT engine.
+    std::vector<std::string> tent_device_filter_;
     bool use_tent_{false};
     friend class TransferEngineImplTestPeer;
 };

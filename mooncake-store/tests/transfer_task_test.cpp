@@ -4,6 +4,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdlib>
 #include <limits>
@@ -570,6 +571,50 @@ TEST_F(TransferTaskTest, BatchWriteHonorsLocalMemcpySetting) {
     }
     EXPECT_EQ(destination, source);
     EXPECT_EQ(engine.freeEngine(), 0);
+}
+
+TEST_F(TransferTaskTest, RemoteTransferWaitCompletesCorrectly) {
+    ScopedEnvVar memcpy_disabled("MC_STORE_MEMCPY", "0");
+    ScopedEnvVar tent_config("MC_TENT_CONF", nullptr);
+    constexpr size_t kSize = 16 * 1024 * 1024;
+    std::vector<char> local(kSize, 0), remote(kSize, 'A');
+    TransferEngine client(false), server(false);
+    ASSERT_EQ(client.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    ASSERT_EQ(server.init("P2PHANDSHAKE", "127.0.0.1:0", "", 0, "tcp"), 0);
+    if (!client.isUsingTent()) {
+        ASSERT_NE(client.installTransport("tcp", nullptr), nullptr);
+        ASSERT_NE(server.installTransport("tcp", nullptr), nullptr);
+    }
+    ASSERT_EQ(client.registerLocalMemory(local.data(), local.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(server.registerLocalMemory(remote.data(), remote.size(), "cpu:0"),
+              0);
+
+    MemoryDescriptor memory;
+    memory.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(remote.data());
+    memory.buffer_descriptor.size_ = remote.size();
+    memory.buffer_descriptor.transport_endpoint_ = server.getLocalIpAndPort();
+    memory.buffer_descriptor.protocol_ = "tcp";
+    Replica::Descriptor replica;
+    replica.descriptor_variant = memory;
+    replica.status = ReplicaStatus::COMPLETE;
+    std::shared_ptr<StorageBackend> backend;
+    TransferSubmitter submitter(client, backend, client.getLocalIpAndPort());
+    std::vector<Slice> slices{{local.data(), local.size()}};
+
+    for (auto opcode : {TransferRequest::READ, TransferRequest::WRITE}) {
+        if (opcode == TransferRequest::WRITE) {
+            std::fill(local.begin(), local.end(), 'B');
+        }
+        auto future = submitter.submit(replica, slices, opcode);
+        ASSERT_TRUE(future);
+        EXPECT_EQ(future->strategy(), TransferStrategy::TRANSFER_ENGINE);
+        ASSERT_EQ(future->get(), ErrorCode::OK);
+        EXPECT_EQ(local, remote);
+    }
+    EXPECT_EQ(client.unregisterLocalMemory(local.data()), 0);
+    EXPECT_EQ(server.unregisterLocalMemory(remote.data()), 0);
 }
 
 // Test TransferStrategy enum and stream operator
