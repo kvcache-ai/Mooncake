@@ -1,6 +1,6 @@
 #pragma once
 
-// TenantDirectory: tenant id -> a strong handle to that tenant's store.
+// TenantDirectory: tenant id -> a strong handle to that tenant's state.
 //
 // Every object operation resolves its tenant, while tenants are created and
 // removed rarely, so the table is copy-on-write: a lookup is one atomic
