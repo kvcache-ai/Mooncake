@@ -12,9 +12,9 @@
 #include <thread>
 #include <vector>
 
-#include "allocator.h"
-#include "master_metric_manager.h"
-#include "types.h"
+#include "master/allocator.h"
+#include "master/master_metric_manager.h"
+#include "common/types.h"
 
 namespace mooncake {
 

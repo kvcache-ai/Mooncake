@@ -21,7 +21,7 @@
 #include <memory>
 #include <string>
 
-#include "real_client.h"
+#include "client/real_client.h"
 #include "test_server_helpers.h"
 #include "common.h"
 

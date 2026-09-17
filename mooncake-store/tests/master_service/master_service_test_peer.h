@@ -2,7 +2,7 @@
 
 #include <utility>
 
-#include "master_service.h"
+#include "master/master_service.h"
 
 namespace mooncake::test {
 

@@ -1,0 +1,361 @@
+#pragma once
+
+#include "common/result.h"
+
+#include <atomic>
+#include <csignal>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
+
+#include "client/client_metric.h"
+#include "client/device/cuda_ipc_buffer_handle.h"
+#include "client/pyclient.h"
+#include "common/store_rpc_client_io_context.h"
+#include "client/shm_helper.h"
+#include <memory>
+
+namespace mooncake {
+
+class DummyClient : public PyClient {
+   public:
+    DummyClient();
+    // Drains in-flight RPCs before the pool member is released (#3909).
+    ~DummyClient();
+
+    int64_t unregister_shm();
+
+    int setup_real(const std::string &local_hostname,
+                   const std::string &metadata_server,
+                   size_t global_segment_size, size_t local_buffer_size,
+                   const std::string &protocol, const std::string &rdma_devices,
+                   const std::string &master_server_addr,
+                   const std::shared_ptr<TransferEngine> &transfer_engine,
+                   const std::string &ipc_socket_path,
+                   bool enable_ssd_offload = false,
+                   const std::string &ssd_offload_path = "",
+                   const std::string &tenant_id = "default",
+                   bool enable_client_http_server = false,
+                   int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+        // Dummy client does not support real setup
+        return -1;
+    };
+
+    int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path);
+
+    int initAll(const std::string &protocol, const std::string &device_name,
+                size_t mount_segment_size) {
+        // Dummy client does not support real setup
+        return -1;
+    }
+
+    uint64_t alloc_from_mem_pool(size_t size);
+
+    int put(const std::string &key, std::span<const char> value,
+            const ReplicateConfig &config = ReplicateConfig{});
+
+    int register_buffer(void *buffer, size_t size);
+
+    int unregister_buffer(void *buffer);
+
+    int64_t get_into(const std::string &key, void *buffer, size_t size);
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes);
+
+    std::vector<int64_t> batch_get_into_cuda_ipc(
+        const std::vector<CudaIpcReadRequest> &requests);
+
+    std::vector<int> batch_get_into_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node);
+
+    int put_from(const std::string &key, void *buffer, size_t size,
+                 const ReplicateConfig &config = ReplicateConfig{});
+
+    int put_from_with_metadata(
+        const std::string &key, void *buffer, void *metadata_buffer,
+        size_t size, size_t metadata_size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_put_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_put_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
+
+    std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
+        const std::vector<std::string> &keys);
+
+    int put_parts(const std::string &key,
+                  std::vector<std::span<const char>> values,
+                  const ReplicateConfig &config = ReplicateConfig{});
+
+    int put_batch(const std::vector<std::string> &keys,
+                  const std::vector<std::span<const char>> &values,
+                  const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert(const std::string &key, std::span<const char> value,
+               const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_from(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_parts(const std::string &key,
+                     std::vector<std::span<const char>> values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    [[nodiscard]] std::string get_hostname() const;
+
+    // Check if a pointer falls within the hot cache shm region
+    bool is_hot_cache_ptr(const void *ptr) const {
+        if (!hot_cache_base_) return false;
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        auto base = reinterpret_cast<uintptr_t>(hot_cache_base_);
+        return p >= base && p < base + hot_cache_size_;
+    }
+
+    int remove(const std::string &key, bool force = false);
+
+    long removeByRegex(const std::string &str, bool force = false);
+
+    long removeAll(bool force = false);
+
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
+
+    int isExist(const std::string &key);
+
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    int64_t getSize(const std::string &key);
+
+    std::map<std::string, std::vector<Replica::Descriptor>>
+    batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override {
+        return {};
+    }
+
+    int tearDownAll();
+
+    int health_check() override;
+
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
+
+    std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
+
+   private:
+    struct PreparedBuffer {
+        void *original = nullptr;
+        void *dummy = nullptr;
+        size_t size = 0;
+        std::unique_ptr<BufferHandle> staging;
+        bool copy_back = false;
+    };
+
+    bool is_device_buffer(void *buffer) const;
+    bool is_dummy_shm_buffer(void *buffer, size_t size) const;
+    std::optional<size_t> external_buffer_remaining(void *buffer) const;
+    bool is_registered_buffer(void *buffer, size_t size) const;
+    int register_external_buffer(void *buffer, size_t size);
+    int unregister_external_buffer(void *buffer);
+#if defined(USE_ASCEND_DIRECT)
+    std::optional<size_t> registered_ascend_buffer_remaining(
+        void *buffer) const;
+#endif
+    std::optional<PreparedBuffer> prepare_buffer(void *buffer, size_t size,
+                                                 bool copy_to_staging,
+                                                 bool copy_back = false);
+    std::optional<PreparedBuffer> prepare_ranged_read_buffer(
+        void *buffer, std::vector<std::vector<size_t>> &dst_offsets,
+        const std::vector<std::vector<size_t>> &sizes);
+    bool copy_from_staging(const PreparedBuffer &buffer, size_t size,
+                           size_t offset = 0, size_t staging_offset = 0) const;
+
+    struct PreparedMultiBuffers {
+        std::vector<PreparedBuffer> buffers;
+        std::vector<std::vector<uint64_t>> dummy_buffers;
+    };
+    std::optional<PreparedMultiBuffers> prepare_multi_buffers(
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool copy_to_staging = true, bool copy_back = false);
+
+    struct ExternalBufferRegistration {
+        size_t size = 0;
+        size_t references = 0;
+    };
+    using BufferRegistrationMap =
+        std::unordered_map<uintptr_t, ExternalBufferRegistration>;
+    enum class BufferRegistrationAction { kReject, kFirst, kRetained };
+    enum class BufferReleaseAction { kReject, kFinal, kRetained };
+    static BufferRegistrationAction retain_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base, size_t size);
+    static BufferReleaseAction release_buffer_registration(
+        BufferRegistrationMap &registrations, uintptr_t base);
+    mutable std::mutex registered_external_buffers_mutex_;
+    BufferRegistrationMap registered_external_buffers_;
+
+    ErrorCode connect(const std::string &server_address);
+
+    int register_ascend_shm(const ShmHelper::ShmSegment *shm,
+                            bool is_local = false);
+
+    int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
+                             bool is_local = false);
+
+#if defined(USE_ASCEND_DIRECT)
+    int register_device_buffer_for_reconnect(void *buffer, size_t size);
+
+    int unregister_device_buffer_for_reconnect(void *buffer);
+
+    int reregister_fabric_buffers();
+
+    int reregister_device_buffers();
+#endif
+
+    /**
+     * @brief Generic RPC invocation helper for single-result operations
+     * @tparam ServiceMethod Pointer to WrappedMasterService member function
+     * @tparam ReturnType The expected return type of the RPC call
+     * @tparam Args Parameter types for the RPC call
+     * @param args Arguments to pass to the RPC call
+     * @return The result of the RPC call
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        Args &&...args);
+
+    /**
+     * @brief Generic RPC invocation helper for batch operations
+     * @tparam ServiceMethod Pointer to WrappedMasterService member function
+     * @tparam ResultType The expected return type of the RPC call
+     * @tparam Args Parameter types for the RPC call
+     * @param input_size Size of input batch for error handling
+     * @param args Arguments to pass to the RPC call
+     * @return Vector of results from the batch RPC call
+     */
+    template <auto ServiceMethod, typename ResultType, typename... Args>
+    [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
+    invoke_batch_rpc(size_t input_size, Args &&...args);
+
+    template <auto ServiceMethod, typename... Args>
+    int invoke_observed_void_rpc(TransferOperationKind kind,
+                                 const char *op_name, size_t bytes, bool batch,
+                                 Args &&...args) {
+        auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
+            [&]() {
+                return invoke_rpc<ServiceMethod, void>(
+                    std::forward<Args>(args)...);
+            },
+            [](const auto &ret) { return ret.has_value(); },
+            [&](uint64_t latency_us, const auto &) {
+                ObserveTransferMetric(kind, op_name, bytes, latency_us, batch);
+            });
+        return to_py_ret(result);
+    }
+
+    RpcClientPool client_accessor_;
+    RpcDrainGuard rpc_drain_;
+
+    // The client identification.
+    const UUID client_id_;
+
+    // Mutex to insure the Connect function is atomic.
+    mutable Mutex connect_mutex_;
+    // The address which is passed to the coro_rpc_client
+    std::string client_addr_param_ GUARDED_BY(connect_mutex_);
+
+    // For shared memory management
+    ShmHelper *shm_helper_ = nullptr;
+    std::string ipc_socket_path_;
+    void *local_buffer_base_ = nullptr;
+
+    // Hot cache shm mapping (obtained from real client via IPC)
+    void *hot_cache_base_ = nullptr;
+    size_t hot_cache_size_ = 0;
+    int hot_cache_fd_ = -1;
+
+    int request_hot_cache_fd();
+
+    // For high availability
+    std::thread ping_thread_;
+    std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_healthy_{false};
+    void ping_thread_main();
+    std::atomic<bool> connected_{false};
+
+#if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex external_fabric_registration_mutex_;
+    mutable std::mutex registered_device_buffers_mutex_;
+    // Tracks directly mapped Ascend device and Fabric host buffers.
+    BufferRegistrationMap registered_device_buffers_;
+#endif
+
+    // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
+    int32_t device_id_ = 0;
+
+    std::unique_ptr<ClientMetric> metrics_;
+
+    void ObserveTransferMetric(TransferOperationKind kind, const char *op_name,
+                               size_t bytes, uint64_t latency_us, bool batch);
+};
+
+}  // namespace mooncake

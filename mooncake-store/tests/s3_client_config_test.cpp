@@ -1,4 +1,4 @@
-#include "../src/config/s3_client_config.h"
+#include "../master/config/s3_client_config.h"
 
 #include <gtest/gtest.h>
 

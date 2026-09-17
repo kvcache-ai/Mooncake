@@ -1,4 +1,4 @@
-#include "ha/oplog/oplog_applier.h"
+#include "master/ha/oplog/oplog_applier.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -10,10 +10,10 @@
 
 #include <xxhash.h>
 
-#include "metadata_store.h"
+#include "master/metadata_store.h"
 #include "mock_metadata_store.h"
-#include "ha/oplog/oplog_types.h"
-#include "types.h"
+#include "master/ha/oplog/oplog_types.h"
+#include "common/types.h"
 
 using mooncake::test::MockMetadataStore;
 

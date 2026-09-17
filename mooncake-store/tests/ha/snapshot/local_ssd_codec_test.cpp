@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include "ha/snapshot/local_ssd_codec.h"
+#include "master/ha/snapshot/local_ssd_codec.h"
 
 namespace mooncake::ha {
 namespace {

@@ -1,4 +1,4 @@
-#include "storage/distributed/object_storage_adapter.h"
+#include "common/storage/distributed/object_storage_adapter.h"
 
 #include <gtest/gtest.h>
 
@@ -17,7 +17,7 @@
 
 #include <unistd.h>
 
-#include "storage/distributed/distributed_storage_backend.h"
+#include "common/storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
 namespace {

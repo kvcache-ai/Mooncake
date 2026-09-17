@@ -1,4 +1,4 @@
-#include "device/runtime_accelerator.h"
+#include "client/device/runtime_accelerator.h"
 
 #include <cstring>
 

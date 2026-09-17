@@ -10,11 +10,11 @@
 #include <thread>
 
 #ifdef STORE_USE_K8S_LEASE
-#include "k8s_lease_helper.h"
+#include "master/k8s_lease_helper.h"
 #endif
-#include "ha/leadership/leader_coordinator_factory.h"
+#include "master/ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
-#include "types.h"
+#include "common/types.h"
 
 namespace mooncake {
 namespace testing {

@@ -17,11 +17,11 @@
 
 #include <unistd.h>
 
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/oplog_batch_types.h"
-#include "tenant_quota_policy_store.h"
-#include "types.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_storage.h"
+#include "master/ha/oplog/oplog_batch_types.h"
+#include "master/tenant_quota_policy_store.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 namespace {

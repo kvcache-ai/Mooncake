@@ -8,9 +8,9 @@
 #include <string>
 #include <vector>
 
-#include "allocator.h"
-#include "common/client_buffer_allocation.h"
-#include "client_service.h"
+#include "master/allocator.h"
+#include "client/common/client_buffer_allocation.h"
+#include "client/client_service.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 

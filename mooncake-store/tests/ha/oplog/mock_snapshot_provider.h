@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "ha/snapshot/snapshot_provider.h"
-#include "metadata_store.h"
+#include "master/ha/snapshot/snapshot_provider.h"
+#include "master/metadata_store.h"
 
 namespace mooncake::test {
 

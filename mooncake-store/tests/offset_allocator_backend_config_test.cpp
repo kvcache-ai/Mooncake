@@ -1,4 +1,4 @@
-#include "config/offset_allocator_backend_config.h"
+#include "client/config/offset_allocator_backend_config.h"
 
 #include <gtest/gtest.h>
 

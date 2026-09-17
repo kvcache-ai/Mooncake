@@ -11,8 +11,8 @@
 #include <hiredis/hiredis.h>
 
 #include "ha/common/redis/redis_test_utils.h"
-#include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
-#include "types.h"
+#include "master/ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 

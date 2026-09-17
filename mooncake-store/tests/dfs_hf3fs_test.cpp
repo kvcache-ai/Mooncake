@@ -14,11 +14,11 @@
 #include <unordered_map>
 #include <vector>
 
-#include "hf3fs/hf3fs.h"
-#include "storage/distributed/dfs_global_allocator.h"
-#include "storage/distributed/distributed_storage_backend.h"
-#include "storage/distributed/hf3fs_adapter.h"
-#include "storage_backend.h"
+#include "common/hf3fs/hf3fs.h"
+#include "master/storage/distributed/dfs_global_allocator.h"
+#include "common/storage/distributed/distributed_storage_backend.h"
+#include "common/storage/distributed/hf3fs_adapter.h"
+#include "client/storage_backend.h"
 
 namespace mooncake::test {
 namespace {

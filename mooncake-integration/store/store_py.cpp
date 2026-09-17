@@ -9,14 +9,14 @@
 #include <unordered_map>
 #include <unordered_set>
 
-#include "pyclient.h"
-#include "dummy_client.h"
-#include "real_client.h"
-#include "types.h"
-#include "memory_alloc.h"
-#include "ssd_register_client.h"
-#include "device/accelerator_registry.h"
-#include "device/cuda_ipc_buffer.h"
+#include "client/pyclient.h"
+#include "client/dummy_client.h"
+#include "client/real_client.h"
+#include "common/types.h"
+#include "client/memory_alloc.h"
+#include "client/ssd_register_client.h"
+#include "client/device/accelerator_registry.h"
+#include "client/device/cuda_ipc_buffer.h"
 
 #include <cstdlib>  // for atexit
 #include <memory>
@@ -30,8 +30,8 @@ namespace engram {
 void bind_engram_store(py::module &m);
 }
 }  // namespace mooncake
-#include "engram/engram_store.h"
-#include "engram/engram_store_config.h"
+#include "client/engram/engram_store.h"
+#include "client/engram/engram_store_config.h"
 
 namespace py = pybind11;
 

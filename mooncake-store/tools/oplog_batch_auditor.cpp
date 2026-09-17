@@ -12,8 +12,8 @@
 #include <json/json.h>  // CentOS
 #endif
 
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_types.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_types.h"
 
 namespace mooncake {
 namespace {

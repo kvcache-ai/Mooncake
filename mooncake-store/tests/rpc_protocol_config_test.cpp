@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include "config/rpc_protocol_config.h"
+#include "common/config/rpc_protocol_config.h"
 
 namespace mooncake {
 namespace {

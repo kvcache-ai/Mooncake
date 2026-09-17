@@ -11,14 +11,14 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "common/network.h"
-#include "master_admin_service.h"
-#include "master_service.h"
-#include "segment.h"
-#include "rpc_service.h"
-#include "types.h"
-#include "master_config.h"
-#include "master_metric_manager.h"
-#include "version.h"
+#include "master/master_admin_service.h"
+#include "master/master_service.h"
+#include "master/segment.h"
+#include "master/rpc_service.h"
+#include "common/types.h"
+#include "master/master_config.h"
+#include "master/master_metric_manager.h"
+#include "common/version.h"
 
 namespace mooncake::test {
 

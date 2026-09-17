@@ -1,4 +1,4 @@
-#include "ha/oplog/ordered_oplog_writer.h"
+#include "master/ha/oplog/ordered_oplog_writer.h"
 
 #include <gtest/gtest.h>
 #include <xxhash.h>
@@ -17,7 +17,7 @@
 #include <thread>
 #include <vector>
 
-#include "ha_metric_manager.h"
+#include "master/ha_metric_manager.h"
 
 namespace mooncake::test {
 namespace {

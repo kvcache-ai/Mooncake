@@ -7,7 +7,7 @@
 
 #include <filesystem>
 
-#include "client_service.h"
+#include "client/client_service.h"
 
 namespace mooncake {
 namespace {

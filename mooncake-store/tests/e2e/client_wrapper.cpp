@@ -3,7 +3,7 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "common/client_buffer_allocation.h"
+#include "client/common/client_buffer_allocation.h"
 
 namespace mooncake {
 namespace testing {

@@ -1,4 +1,4 @@
-#include "ha/oplog/oplog_batch_standby_reader.h"
+#include "master/ha/oplog/oplog_batch_standby_reader.h"
 
 #include <gtest/gtest.h>
 #include <xxhash.h>
@@ -9,9 +9,9 @@
 #include <string>
 #include <vector>
 
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_applier.h"
-#include "ha/oplog/oplog_batch_codec.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_applier.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
 #include "mock_metadata_store.h"
 
 namespace mooncake::test {

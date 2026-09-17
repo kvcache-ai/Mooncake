@@ -1,4 +1,4 @@
-#include "ha/standby_metadata_store.h"
+#include "master/ha/standby_metadata_store.h"
 
 #include <gtest/gtest.h>
 

@@ -1,4 +1,4 @@
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
@@ -23,16 +23,16 @@
 
 #include <unistd.h>
 
-#include "hot_standby_service.h"
-#include "ha/kv/ha_kv_backend.h"
+#include "master/hot_standby_service.h"
+#include "master/ha/kv/ha_kv_backend.h"
 #include "ha/oplog/mock_metadata_store.h"
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_batch_storage.h"
-#include "ha/oplog/oplog_batch_standby_reader.h"
-#include "ha/oplog/oplog_batch_types.h"
-#include "ha/oplog/oplog_applier.h"
-#include "ha/oplog/ordered_oplog_writer.h"
-#include "types.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_batch_storage.h"
+#include "master/ha/oplog/oplog_batch_standby_reader.h"
+#include "master/ha/oplog/oplog_batch_types.h"
+#include "master/ha/oplog/oplog_applier.h"
+#include "master/ha/oplog/ordered_oplog_writer.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 

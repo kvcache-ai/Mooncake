@@ -13,9 +13,9 @@
 #include <ylt/easylog.hpp>
 #include <ylt/easylog/record.hpp>
 
-#include "client_service.h"
-#include "master_metric_manager.h"
-#include "common/client_buffer_allocation.h"
+#include "client/client_service.h"
+#include "master/master_metric_manager.h"
+#include "client/common/client_buffer_allocation.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
 

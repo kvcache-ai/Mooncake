@@ -1,4 +1,4 @@
-#include "storage_backend.h"
+#include "client/storage_backend.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -26,7 +26,7 @@
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocator.h"
+#include "master/allocator.h"
 #include "common/timestamp.h"
 #include "common/file_util.h"
 #include "utils/common.h"

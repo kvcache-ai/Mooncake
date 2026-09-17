@@ -5,7 +5,7 @@
 // MEMORY replica instead of the first one the master happened to return
 // (issue #2516).
 
-#include "replica_selection.h"
+#include "client/replica_selection.h"
 
 #include <gtest/gtest.h>
 

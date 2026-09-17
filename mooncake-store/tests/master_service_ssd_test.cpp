@@ -1,4 +1,4 @@
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
 
 #include <glog/logging.h>
@@ -10,8 +10,8 @@
 #include <thread>
 #include <vector>
 
-#include "master_metric_manager.h"
-#include "types.h"
+#include "master/master_metric_manager.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 

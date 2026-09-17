@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include "client_auto_port_config.h"
+#include "client/client_auto_port_config.h"
 
 namespace mooncake {
 namespace {

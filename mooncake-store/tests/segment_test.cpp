@@ -1,6 +1,6 @@
-#include "segment.h"
+#include "master/segment.h"
 
-#include "master_metric_manager.h"
+#include "master/master_metric_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

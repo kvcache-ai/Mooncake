@@ -1,4 +1,4 @@
-#include "config/file_per_key_config.h"
+#include "client/config/file_per_key_config.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

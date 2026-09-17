@@ -1,0 +1,327 @@
+#pragma once
+
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "master/ha/oplog/oplog_applier.h"
+#include "master/ha/oplog/oplog_batch_types.h"
+#include "master/ha/oplog/oplog_types.h"
+#include "master/ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
+#include "master/ha/snapshot/batch_oplog/capture.h"
+#include "master/ha/snapshot/batch_oplog/promotion.h"
+#include "master/ha/snapshot/snapshot_provider.h"
+#include "master/ha/standby_metadata_store.h"
+#include "master/standby_state_machine.h"
+#include "common/types.h"
+
+namespace mooncake {
+
+// Forward declarations
+class MasterService;
+class HaKvBackend;
+class OpLogBatchStandbyReader;
+enum class OpLogBatchStandbyPollDisposition;
+struct OpLogBatchStandbyPollResult;
+
+/**
+ * @brief Configuration for HotStandbyService
+ */
+struct HotStandbyConfig {
+    std::string standby_id;
+    std::string primary_address;
+    uint32_t replication_port{0};
+    uint32_t verification_interval_sec{30};
+    uint32_t max_replication_lag_entries{1000};
+    bool enable_verification{true};
+
+    // Snapshot bootstrap phase (optional): Standby will try to load the latest
+    // snapshot baseline before switching to steady-state replication.
+    bool enable_snapshot_bootstrap{false};
+
+    // OpLog following phase (optional): when disabled, Start() stops after the
+    // snapshot bootstrap phase and keeps the standby in a snapshot-only steady
+    // state.
+    bool enable_oplog_following{true};
+
+    int oplog_poll_interval_ms{1000};
+    uint32_t batch_oplog_retry_timeout_sec{180};
+};
+
+/**
+ * @brief Sync status information for HotStandbyService
+ */
+struct StandbySyncStatus {
+    uint64_t applied_seq_id{0};
+    uint64_t primary_seq_id{0};
+    uint64_t lag_entries{0};
+    std::chrono::milliseconds lag_time{0};
+    bool is_syncing{false};
+    bool is_connected{false};
+    bool is_recovering{false};
+    StandbyState state{StandbyState::STOPPED};
+    std::chrono::milliseconds time_in_state{0};
+    ErrorCode last_error{ErrorCode::OK};
+};
+
+/**
+ * @brief HotStandbyService manages standby replication and promotion
+ *
+ * This service runs on Standby Master nodes and is responsible for:
+ * - Connecting to Primary and receiving OpLog entries
+ * - Applying OpLog entries to local metadata store
+ * - Periodically verifying data consistency with Primary
+ * - Promoting to Primary when elected as new Leader
+ *
+ * For now, this is a skeleton implementation without actual network
+ * communication. The gRPC integration will be added later.
+ */
+class HotStandbyService {
+   public:
+    using SyncStatusCallback = std::function<void(const StandbySyncStatus&)>;
+
+    explicit HotStandbyService(const HotStandbyConfig& config);
+    ~HotStandbyService();
+
+    /**
+     * @brief Start standby runtime: snapshot bootstrap plus optional OpLog
+     * following
+     * @param primary_address Address of the Primary Master (not used with
+     * OpLog backend-based sync)
+     * @param oplog_endpoints Comma-separated OpLog backend endpoints
+     * @param cluster_id Cluster identifier for OpLog path
+     * @return ErrorCode::OK on success
+     */
+    ErrorCode Start(const std::string& primary_address,
+                    const std::string& oplog_endpoints,
+                    const std::string& cluster_id);
+
+    /**
+     * @brief Stop replication and disconnect from Primary
+     */
+    void Stop();
+
+    /**
+     * @brief Get current synchronization status
+     * @return StandbySyncStatus with current sync state
+     */
+    StandbySyncStatus GetSyncStatus() const;
+
+    /**
+     * @brief Check if standby is ready for promotion
+     * @return true if replication lag is within threshold
+     */
+    bool IsReadyForPromotion() const;
+
+    /**
+     * @brief Promote this standby to Primary
+     *
+     * This method should be called after successful leader election.
+     * It ensures all Op Logs are applied and transitions the state machine.
+     * The caller is responsible for creating the MasterService separately.
+     *
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode Promote();
+
+    /**
+     * @brief Promote this standby to Primary and export a snapshot atomically.
+     *
+     * Holds mutex_ through the entire promotion + export process, ensuring
+     * the snapshot is captured before any state is released.
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return ErrorCode::OK on success, other codes on failure
+     */
+    ErrorCode PromoteAndExportSnapshot(StandbySnapshot& out);
+
+    bool IsBatchOpLogSnapshotMode() const;
+    tl::expected<BatchOpLogPromotionHandoff, ErrorCode>
+    PromoteAndDetachBatchOpLogStore();
+
+    /**
+     * @brief Get the number of metadata entries in the local store
+     */
+    size_t GetMetadataCount() const;
+
+    /**
+     * @brief Get the latest applied sequence ID after promotion
+     *
+     * This should be called after Promote() to get the sequence_id
+     * that the new Primary's ordered writer should start from.
+     *
+     * @return Latest applied sequence ID, or 0 if not available
+     */
+    uint64_t GetLatestAppliedSequenceId() const;
+
+    // Export a point-in-time snapshot of all replicated metadata.
+    // This is used by MasterServiceSupervisor to initialize the new Primary
+    // after leader election (fast recovery).
+    bool ExportMetadataSnapshot(std::vector<StandbyObjectEntry>& out) const;
+
+    /**
+     * Export complete standby snapshot including:
+     * - Applied OpLog sequence ID
+     * - All object metadata
+     * - All registered segments (via OpLogApplier's segment registry)
+     *
+     * @param out Output parameter to receive the snapshot
+     * @return true on success, false on failure (e.g., service not running)
+     */
+    bool ExportStandbySnapshot(StandbySnapshot& out) const;
+
+    std::optional<BatchOpLogSnapshotCapture> BeginBatchOpLogSnapshotCapture();
+    bool CopyNextBatchOpLogSnapshotChunk(size_t count,
+                                         BatchOpLogSnapshotCapture& capture,
+                                         std::vector<StandbyObjectEntry>& out);
+    void EndBatchOpLogSnapshotCapture(BatchOpLogSnapshotCapture& capture);
+
+    // N06 coordinator seams. These stay inert unless a coordinator is
+    // explicitly constructed by the caller.
+    std::optional<DurablePrefix> GetLastAppliedBatchOpLogSnapshotPrefix() const;
+    void CancelBatchOpLogSnapshotCapture();
+    using SnapshotLifecycleCallback = std::function<void()>;
+    void SetBatchOpLogSnapshotCaptureReleasedCallback(
+        SnapshotLifecycleCallback callback);
+    void SetBatchOpLogSnapshotPromotionCallback(
+        SnapshotLifecycleCallback callback);
+    void SetBatchOpLogSnapshotStopCallback(SnapshotLifecycleCallback callback);
+
+    // Inject a snapshot provider (from external snapshot implementation).
+    void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
+
+    // Inject the new batch-OpLog bootstrap path. It owns no running state;
+    // Start() gives it temporary stores and installs them only on success.
+    void SetBatchOpLogSnapshotProvider(
+        std::unique_ptr<BatchOpLogSnapshotProvider> provider);
+
+    // Notify callers when standby sync status changes. The callback is invoked
+    // from existing standby worker threads; no extra monitor thread is created.
+    void SetSyncStatusCallback(SyncStatusCallback callback);
+
+    /**
+     * @brief Test seam: inject a HaKvBackend used for Start()/replication and
+     *        promotion catch-up. When set, Start() skips live etcd connection
+     *        (and works even when STORE_USE_ETCD is OFF).
+     */
+    void SetCatchUpBatchKvBackendForTesting(
+        std::shared_ptr<HaKvBackend> backend);
+
+    /**
+     * @brief Get current state from state machine
+     */
+    StandbyState GetState() const { return state_machine_.GetState(); }
+
+    /**
+     * @brief Get state machine for monitoring/debugging
+     */
+    const StandbyStateMachine& GetStateMachine() const {
+        return state_machine_;
+    }
+
+   private:
+    enum class PromotionCatchUpPolicy {
+        kLegacyTotalDeadline,
+        kBoundedNoProgress,
+    };
+
+    ErrorCode PrepareBootstrapBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode LoadBatchOpLogSnapshotBaselineLocked(uint64_t& baseline_seq_id);
+    ErrorCode StartOplogFollowingLocked(uint64_t baseline_seq_id);
+    void ActivateSnapshotOnlyStandbyLocked(uint64_t baseline_seq_id);
+    uint64_t GetLocalLastAppliedSequenceIdLocked() const;
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id,
+                                             PromotionCatchUpPolicy policy);
+    ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend,
+                                             PromotionCatchUpPolicy policy);
+    void StopReplicationLoop();
+    void HandleSnapshotCaptureRequest(
+        const OpLogBatchStandbyPollResult& result);
+    void CancelSnapshotCapture();
+    void NotifySnapshotPromotion();
+    void NotifySnapshotStop();
+
+    ErrorCode PreparePromotionLocked(uint64_t current_applied_seq_id,
+                                     PromotionCatchUpPolicy policy);
+    ErrorCode CompletePromotionLocked();
+
+    void NotifySyncStatus();
+
+    /**
+     * @brief Main replication loop (runs in background thread)
+     */
+    void ReplicationLoop();
+    ErrorCode RebootstrapBatchOpLog(uint64_t floor);
+
+    /**
+     * @brief Verification loop (runs in background thread)
+     */
+    void VerificationLoop();
+
+    HotStandbyConfig config_;
+
+    std::unique_ptr<StandbyMetadataStore> metadata_store_;
+    std::unique_ptr<SnapshotProvider> snapshot_provider_{
+        std::make_unique<NoopSnapshotProvider>()};
+    std::shared_ptr<BatchOpLogSnapshotProvider> batch_oplog_snapshot_provider_;
+
+    // OpLog replication components
+    std::unique_ptr<OpLogApplier> oplog_applier_;
+    std::shared_ptr<HaKvBackend> batch_standby_kv_backend_;
+    std::unique_ptr<OpLogBatchStandbyReader> batch_standby_reader_;
+    std::optional<DurablePrefix> batch_snapshot_baseline_;
+    ViewVersionId batch_snapshot_producer_view_version_{0};
+
+    std::shared_ptr<HaKvBackend> catch_up_batch_kv_backend_for_testing_;
+
+    // Configuration for OpLog sync
+    std::string oplog_endpoints_;
+    std::string cluster_id_;
+
+    // Replication state
+    std::atomic<uint64_t> applied_seq_id_{0};
+    std::atomic<uint64_t> primary_seq_id_{0};
+    std::atomic<ErrorCode> last_error_{ErrorCode::OK};
+    std::atomic<bool> recovering_{false};
+
+    // State machine for managing service lifecycle
+    StandbyStateMachine state_machine_;
+
+    // Helper methods for state machine
+    bool IsRunning() const { return state_machine_.IsRunning(); }
+    bool IsConnected() const { return state_machine_.IsConnected(); }
+
+    // Background threads
+    std::thread replication_thread_;
+    std::thread verification_thread_;
+    std::atomic<bool> replication_loop_running_{false};
+    std::mutex replication_loop_mutex_;
+    std::condition_variable replication_loop_cv_;
+    mutable std::mutex batch_snapshot_cursor_mutex_;
+    std::optional<DurablePrefix> last_applied_batch_snapshot_prefix_;
+
+    std::shared_ptr<BatchOpLogSnapshotCapture::LeaseState>
+        snapshot_capture_state_{
+            std::make_shared<BatchOpLogSnapshotCapture::LeaseState>()};
+    std::optional<BatchOpLogSnapshotCapture> ready_snapshot_capture_;
+
+    // Synchronization
+    mutable std::mutex mutex_;
+    mutable std::mutex sync_status_callback_mutex_;
+    mutable std::mutex snapshot_lifecycle_callback_mutex_;
+    SyncStatusCallback sync_status_callback_;
+    SnapshotLifecycleCallback snapshot_capture_released_callback_;
+    SnapshotLifecycleCallback snapshot_promotion_callback_;
+    SnapshotLifecycleCallback snapshot_stop_callback_;
+};
+
+}  // namespace mooncake

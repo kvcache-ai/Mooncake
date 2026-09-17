@@ -3,7 +3,7 @@
 #include <atomic>
 #include <thread>
 
-#include "local_ssd/manager.h"
+#include "common/local_ssd/manager.h"
 
 namespace mooncake {
 namespace {

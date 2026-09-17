@@ -21,9 +21,9 @@
 
 #include "common/network.h"
 #include "default_config.h"
-#include "dummy_client.h"
+#include "client/dummy_client.h"
 #include "environ.h"
-#include "real_client.h"
+#include "client/real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");

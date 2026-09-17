@@ -4,7 +4,7 @@
 #include <optional>
 #include <string>
 
-#include "config/replica_selection_config.h"
+#include "client/config/replica_selection_config.h"
 
 namespace mooncake {
 namespace {

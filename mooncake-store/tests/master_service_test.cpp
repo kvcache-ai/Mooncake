@@ -1,6 +1,6 @@
-#include "master_service.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
-#include "rpc_service.h"
+#include "master/rpc_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -25,8 +25,8 @@
 
 #include <unistd.h>
 
-#include "tenant_quota_policy_store.h"
-#include "types.h"
+#include "master/tenant_quota_policy_store.h"
+#include "common/types.h"
 #include "master_service_test_fixture.h"
 
 namespace mooncake::test {

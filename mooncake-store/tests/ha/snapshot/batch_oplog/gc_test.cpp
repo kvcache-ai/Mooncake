@@ -1,4 +1,4 @@
-#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
+#include "master/ha/snapshot/batch_oplog/batch_oplog_snapshot_gc.h"
 
 #include <gtest/gtest.h>
 
@@ -8,11 +8,11 @@
 #include <string_view>
 #include <vector>
 
-#include "crc32c.h"
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/snapshot/batch_oplog/metadata.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
-#include "ha/snapshot/snapshot_maintenance_lease.h"
+#include "common/crc32c.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/snapshot/batch_oplog/metadata.h"
+#include "master/ha/snapshot/object/snapshot_object_store.h"
+#include "master/ha/snapshot/snapshot_maintenance_lease.h"
 
 namespace mooncake::test {
 

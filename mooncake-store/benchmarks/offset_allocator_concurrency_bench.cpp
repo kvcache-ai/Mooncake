@@ -17,9 +17,9 @@
 
 #include <gflags/gflags.h>
 
-#include "allocation_strategy.h"
-#include "allocator.h"
-#include "offset_allocator/offset_allocator.h"
+#include "master/allocation_strategy.h"
+#include "master/allocator.h"
+#include "master/offset_allocator/offset_allocator.h"
 
 DEFINE_uint32(threads, 16, "Number of concurrent worker threads");
 DEFINE_uint64(iterations, 100000, "Measured operations per worker and phase");

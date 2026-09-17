@@ -1,6 +1,6 @@
 #pragma once
-#include "file_storage.h"
-#include "storage_backend.h"
+#include "client/file_storage.h"
+#include "client/storage_backend.h"
 namespace mooncake {
 namespace fs = std::filesystem;
 inline tl::expected<void, ErrorCode> BatchOffloadUtil(

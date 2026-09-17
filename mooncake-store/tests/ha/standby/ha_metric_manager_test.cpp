@@ -1,4 +1,4 @@
-#include "ha_metric_manager.h"
+#include "master/ha_metric_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

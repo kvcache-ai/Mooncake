@@ -1,4 +1,4 @@
-#include "common/client_buffer_allocation.h"
+#include "client/common/client_buffer_allocation.h"
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>

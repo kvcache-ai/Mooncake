@@ -1,5 +1,5 @@
 // transfer_task_test.cpp
-#include "transfer_task.h"
+#include "client/transfer_task.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -13,8 +13,8 @@
 #include <thread>
 #include <vector>
 
-#include "types.h"
-#include "pinned_buffer_pool.h"
+#include "common/types.h"
+#include "client/pinned_buffer_pool.h"
 #if defined(USE_CUDA) || defined(MOONCAKE_TEST_CUDA_H2D)
 #include <cuda_runtime_api.h>
 #endif

@@ -25,7 +25,7 @@ TransferEngine may generate various types of errors during execution. For most A
 
 ## Mooncake Store
 
-Mooncake Store may generate various types of errors during execution. For most APIs, the return value indicates the error reason. For details, refer to `mooncake-store/include/types.h`.
+Mooncake Store may generate various types of errors during execution. For most APIs, the return value indicates the error reason. For details, refer to `mooncake-store/include/common/types.h`.
 
 | Group                    | Return Value                    | Description                                                                                               |
 |--------------------------|--------------------------------|-----------------------------------------------------------------------------------------------------------|

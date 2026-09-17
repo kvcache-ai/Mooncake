@@ -25,7 +25,7 @@ TransferEngine 在执行期间可能会产生各种类型的错误，对于绝�
 
 ## Mooncake Store
 
-Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝大多数接口，返回值会指示错误原因。详细信息请参见 `mooncake-store/include/types.h`。
+Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝大多数接口，返回值会指示错误原因。详细信息请参见 `mooncake-store/include/common/types.h`。
 
 | 分组    | 返回值                                      | 描述               |
 | ----- | ---------------------------------------- | ---------------- |

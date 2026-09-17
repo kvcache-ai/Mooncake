@@ -1,4 +1,4 @@
-#include "segment/pool.h"
+#include "master/segment/pool.h"
 
 #include <gtest/gtest.h>
 #include <msgpack.hpp>
@@ -17,12 +17,12 @@
 #include <thread>
 #include <vector>
 
-#include "client_liveness.h"
-#include "ha/snapshot/store_resource_snapshot_codec.h"
-#include "master_metric_manager.h"
-#include "segment.h"
-#include "segment/pool_read_access.h"
-#include "segment/pool_write_access.h"
+#include "master/client_liveness.h"
+#include "master/ha/snapshot/store_resource_snapshot_codec.h"
+#include "master/master_metric_manager.h"
+#include "master/segment.h"
+#include "master/segment/pool_read_access.h"
+#include "master/segment/pool_write_access.h"
 #include "test_buffer_allocator.h"
 
 namespace mooncake::test {

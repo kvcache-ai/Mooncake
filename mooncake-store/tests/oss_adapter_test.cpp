@@ -21,9 +21,9 @@
 #include <utility>
 #include <vector>
 
-#include "storage/distributed/distributed_storage_backend.h"
-#include "storage/distributed/oss_adapter.h"
-#include "storage_backend.h"
+#include "common/storage/distributed/distributed_storage_backend.h"
+#include "client/storage/distributed/oss_adapter.h"
+#include "client/storage_backend.h"
 
 namespace mooncake {
 namespace {

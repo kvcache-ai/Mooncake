@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/client_numa_config.h"
+#include "../client/config/client_numa_config.h"
 
 namespace mooncake {
 namespace {

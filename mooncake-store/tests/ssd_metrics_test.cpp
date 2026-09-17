@@ -5,7 +5,7 @@
 #include <map>
 #include <thread>
 
-#include "client_metric.h"
+#include "client/client_metric.h"
 
 namespace mooncake::test {
 

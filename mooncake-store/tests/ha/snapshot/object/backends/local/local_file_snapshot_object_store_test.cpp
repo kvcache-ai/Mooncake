@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
+#include "master/ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 
 namespace mooncake::test {
 

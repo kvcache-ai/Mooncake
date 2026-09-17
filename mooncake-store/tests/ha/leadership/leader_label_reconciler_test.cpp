@@ -1,4 +1,4 @@
-#include "ha/leadership/leader_label_reconciler.h"
+#include "master/ha/leadership/leader_label_reconciler.h"
 
 #include <gtest/gtest.h>
 

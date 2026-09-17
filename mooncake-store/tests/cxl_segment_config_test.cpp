@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/cxl_segment_config.h"
+#include "../client/config/cxl_segment_config.h"
 
 namespace mooncake {
 namespace {

@@ -22,8 +22,8 @@
 #include <unordered_set>
 #include <vector>
 
-#include "spdk/spdk_wrapper.h"
-#include "transfer_task.h"
+#include "common/spdk/spdk_wrapper.h"
+#include "client/transfer_task.h"
 
 constexpr uint64_t KiB = 1024;
 constexpr uint64_t MiB = 1024 * KiB;

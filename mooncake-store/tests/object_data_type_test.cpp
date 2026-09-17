@@ -1,6 +1,6 @@
-#include "types.h"
-#include "replica.h"
-#include "master_service.h"
+#include "common/types.h"
+#include "master/replica.h"
+#include "master/master_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_types.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_types.h"
 
 namespace mooncake {
 

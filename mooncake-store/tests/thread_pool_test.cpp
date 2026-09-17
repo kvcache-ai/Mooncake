@@ -4,7 +4,7 @@
 #include <chrono>
 #include <mutex>
 #include <condition_variable>
-#include "thread_pool.h"
+#include "common/thread_pool.h"
 
 namespace mooncake {
 

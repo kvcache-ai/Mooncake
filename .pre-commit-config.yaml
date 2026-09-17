@@ -46,7 +46,7 @@ repos:
         language: system
         pass_filenames: false
         require_serial: true
-        files: '^(mooncake-store/include/store_c\.h|mooncake-store/rust/(Cargo\.(toml|lock)|examples/generate_dlopen_bindings\.rs|src/generated/ffi_dlopen_bindings\.rs))$'
+        files: '^(mooncake-store/include/client/store_c\.h|mooncake-store/rust/(Cargo\.(toml|lock)|examples/generate_dlopen_bindings\.rs|src/generated/ffi_dlopen_bindings\.rs))$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.6.9

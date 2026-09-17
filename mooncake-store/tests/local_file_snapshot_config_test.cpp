@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <string>
 
-#include "../src/config/local_file_snapshot_config.h"
+#include "../master/config/local_file_snapshot_config.h"
 
 namespace mooncake {
 namespace {

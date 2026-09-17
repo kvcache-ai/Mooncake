@@ -1,4 +1,4 @@
-#include "../src/config/nof_register_config.h"
+#include "../client/config/nof_register_config.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 
-#include "../src/config/client_auto_discovery_config.h"
+#include "../client/config/client_auto_discovery_config.h"
 #include "environment_variables.h"
 
 namespace mooncake {

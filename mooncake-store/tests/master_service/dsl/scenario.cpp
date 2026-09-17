@@ -13,9 +13,9 @@
 
 #include <unistd.h>
 
-#include "mutex.h"
-#include "tenant_quota_policy_store.h"
-#include "types.h"
+#include "common/mutex.h"
+#include "master/tenant_quota_policy_store.h"
+#include "common/types.h"
 
 namespace mooncake::test {
 namespace {

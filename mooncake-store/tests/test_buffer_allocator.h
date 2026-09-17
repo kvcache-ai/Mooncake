@@ -6,8 +6,8 @@
 #include <memory>
 #include <string>
 
-#include "allocator.h"
-#include "replica.h"
+#include "master/allocator.h"
+#include "master/replica.h"
 
 namespace mooncake::test {
 

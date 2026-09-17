@@ -1,4 +1,4 @@
-#include "ha/snapshot/batch_oplog/codec.h"
+#include "master/ha/snapshot/batch_oplog/codec.h"
 
 #include <gtest/gtest.h>
 

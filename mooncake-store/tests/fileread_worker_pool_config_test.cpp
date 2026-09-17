@@ -6,7 +6,7 @@
 #include <string>
 #include <utility>
 
-#include "../src/config/fileread_worker_pool_config.h"
+#include "../client/config/fileread_worker_pool_config.h"
 
 namespace mooncake {
 namespace {

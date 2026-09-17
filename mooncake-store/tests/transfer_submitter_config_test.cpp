@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "../src/config/transfer_submitter_config.h"
+#include "../client/config/transfer_submitter_config.h"
 
 namespace mooncake {
 namespace {

@@ -128,11 +128,11 @@ The parameter is passed as a gflag to the master process at startup.
 
 | File | Change |
 |------|--------|
-| `mooncake-store/include/types.h` | Add `SSD_FREE_RATIO_FIRST` enum value to the allocation strategy enum |
-| `mooncake-store/include/allocation_strategy.h` | Add `SsdMetricsProvider` interface and `SsdFreeRatioFirstAllocationStrategy` class |
-| `mooncake-store/include/segment.h` | Add `ssd_total_capacity_bytes` and `ssd_used_bytes` fields to `LocalDiskSegment`; inherit `SsdMetricsProvider` |
-| `mooncake-store/src/segment.cpp` | Implement `getSsdTotalCapacity` and `getSsdUsedBytes` |
-| `mooncake-store/src/master_service.cpp` | Pass SSD metrics only to `SSD_FREE_RATIO_FIRST`; update `ssd_used_bytes` after successful `NotifyOffloadSuccess` metadata insertion; release usage when `LOCAL_DISK` replicas are erased |
+| `mooncake-store/include/common/types.h` | Add `SSD_FREE_RATIO_FIRST` enum value to the allocation strategy enum |
+| `mooncake-store/include/master/allocation_strategy.h` | Add `SsdMetricsProvider` interface and `SsdFreeRatioFirstAllocationStrategy` class |
+| `mooncake-store/include/master/segment.h` | Add `ssd_total_capacity_bytes` and `ssd_used_bytes` fields to `LocalDiskSegment`; inherit `SsdMetricsProvider` |
+| `mooncake-store/master/segment.cpp` | Implement `getSsdTotalCapacity` and `getSsdUsedBytes` |
+| `mooncake-store/master/master_service.cpp` | Pass SSD metrics only to `SSD_FREE_RATIO_FIRST`; update `ssd_used_bytes` after successful `NotifyOffloadSuccess` metadata insertion; release usage when `LOCAL_DISK` replicas are erased |
 
 ---
 

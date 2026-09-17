@@ -6,13 +6,13 @@
 
 #include <msgpack.hpp>
 
-#include "ha/snapshot/master_snapshot_codec.h"
-#include "master_config.h"
-#include "master_service.h"
+#include "master/ha/snapshot/master_snapshot_codec.h"
+#include "master/master_config.h"
+#include "master/master_service.h"
 #include "master_service/master_service_test_peer.h"
-#include "segment.h"
-#include "task_manager.h"
-#include "tenant_id.h"
+#include "master/segment.h"
+#include "master/task_manager.h"
+#include "common/tenant_id.h"
 #include "common/zstd_util.h"
 
 namespace mooncake::ha {

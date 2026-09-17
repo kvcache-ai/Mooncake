@@ -1,4 +1,4 @@
-#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
+#include "master/ha/snapshot/batch_oplog/batch_oplog_snapshot_coordinator.h"
 
 #include <gtest/gtest.h>
 
@@ -13,13 +13,13 @@
 #include <utility>
 #include <vector>
 
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/oplog/oplog_types.h"
-#include "ha/snapshot/batch_oplog/metadata.h"
-#include "ha/snapshot/snapshot_maintenance_lease.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
-#include "hot_standby_service.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_types.h"
+#include "master/ha/snapshot/batch_oplog/metadata.h"
+#include "master/ha/snapshot/snapshot_maintenance_lease.h"
+#include "master/ha/snapshot/object/snapshot_object_store.h"
+#include "master/hot_standby_service.h"
 
 namespace mooncake::test {
 namespace {

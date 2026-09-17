@@ -21,7 +21,7 @@ endif()
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
+  include_directories("../mooncake-store/include/client/engram")
 
   include_directories(
     "../mooncake-store/include/cachelib_memory_allocator/include")

@@ -11,7 +11,7 @@
 #include <string_view>
 #include <utility>
 
-#include "ha/oplog/oplog_batch_codec.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
 #include "tools/oplog_batch_auditor.h"
 
 namespace mooncake {

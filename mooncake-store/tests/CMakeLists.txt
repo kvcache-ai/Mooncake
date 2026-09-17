@@ -429,7 +429,7 @@ if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
 add_executable(
   oplog_test_failpoint_test ha/oplog/oplog_test_failpoint_test.cpp
-                            ../src/ha/oplog/oplog_test_failpoint.cpp)
+                            ../master/ha/oplog/oplog_test_failpoint.cpp)
 target_include_directories(oplog_test_failpoint_test
                            PRIVATE ${MOONCAKE_STORE_INCLUDE_ROOT})
 target_compile_definitions(oplog_test_failpoint_test

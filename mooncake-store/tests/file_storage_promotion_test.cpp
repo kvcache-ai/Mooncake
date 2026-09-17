@@ -10,9 +10,9 @@
 #include <set>
 #include <thread>
 
-#include "client_service.h"
-#include "file_storage.h"
-#include "storage_backend.h"
+#include "client/client_service.h"
+#include "client/file_storage.h"
+#include "client/storage_backend.h"
 
 namespace mooncake {
 

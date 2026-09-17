@@ -1,4 +1,4 @@
-#include "hot_standby_service.h"
+#include "master/hot_standby_service.h"
 
 #include <gtest/gtest.h>
 #include <unistd.h>
@@ -12,12 +12,12 @@
 #include <mutex>
 #include <thread>
 
-#include "crc32c.h"
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_codec.h"
-#include "ha/snapshot/batch_oplog/codec.h"
-#include "ha/snapshot/batch_oplog/metadata.h"
-#include "ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
+#include "common/crc32c.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/oplog/oplog_batch_codec.h"
+#include "master/ha/snapshot/batch_oplog/codec.h"
+#include "master/ha/snapshot/batch_oplog/metadata.h"
+#include "master/ha/snapshot/object/backends/local/local_file_snapshot_object_store.h"
 
 namespace mooncake::test {
 namespace {

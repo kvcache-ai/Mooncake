@@ -1,6 +1,6 @@
-#include "nvme_kv/backend.h"
-#include "nvme_kv/executor_util.h"
-#include "storage_backend.h"
+#include "client/nvme_kv/backend.h"
+#include "client/nvme_kv/executor_util.h"
+#include "client/storage_backend.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>

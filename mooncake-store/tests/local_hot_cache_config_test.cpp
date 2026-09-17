@@ -5,7 +5,7 @@
 #include <optional>
 #include <string>
 
-#include "local_hot_cache.h"
+#include "client/local_hot_cache.h"
 
 namespace mooncake {
 namespace {

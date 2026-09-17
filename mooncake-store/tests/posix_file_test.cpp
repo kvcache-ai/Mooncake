@@ -13,8 +13,8 @@
 #include <sys/uio.h>
 #include <string_view>
 #include <vector>
-#include "file_interface.h"
-#include "../src/uring_submit.h"
+#include "common/file_interface.h"
+#include "../client/uring_submit.h"
 
 namespace mooncake {
 

@@ -1,4 +1,4 @@
-#include "master_config.h"
+#include "master/master_config.h"
 
 #include <gtest/gtest.h>
 

@@ -1,4 +1,4 @@
-#include "ha/snapshot/batch_oplog/metadata.h"
+#include "master/ha/snapshot/batch_oplog/metadata.h"
 
 #include <gtest/gtest.h>
 

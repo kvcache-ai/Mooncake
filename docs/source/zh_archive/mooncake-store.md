@@ -709,7 +709,7 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 
 > **实验性功能：** HF3FS（3FS USRBIO）相关集成仍在开发中，尚未达到可视为生产就绪的程度；接口与行为可能变更，建议仅用于评估与测试。
 
-如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
+如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/common/hf3fs/README.md)。
 
 ### 内置元数据服务器
 

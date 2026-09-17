@@ -1,10 +1,10 @@
 // client_local_hot_cache_test.cpp
-#include "client_service.h"
-#include "client_buffer.h"
-#include "common/client_buffer_allocation.h"
-#include "count_min_sketch.h"
-#include "local_hot_cache.h"
-#include "replica.h"
+#include "client/client_service.h"
+#include "client/client_buffer.h"
+#include "client/common/client_buffer_allocation.h"
+#include "common/count_min_sketch.h"
+#include "client/local_hot_cache.h"
+#include "master/replica.h"
 #include "test_server_helpers.h"
 
 #include <glog/logging.h>

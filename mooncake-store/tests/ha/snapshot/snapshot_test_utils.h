@@ -13,15 +13,15 @@
 #include <msgpack.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
-#include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
-#include "ha/snapshot/catalog/snapshot_catalog_store.h"
-#include "ha/snapshot/object/snapshot_object_store.h"
-#include "master_config.h"
-#include "replica.h"
-#include "segment.h"
-#include "serialize/serializer.h"
-#include "types.h"
+#include "master/ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.h"
+#include "master/ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
+#include "master/ha/snapshot/catalog/snapshot_catalog_store.h"
+#include "master/ha/snapshot/object/snapshot_object_store.h"
+#include "master/master_config.h"
+#include "master/replica.h"
+#include "master/segment.h"
+#include "master/serialize/serializer.h"
+#include "common/types.h"
 #include "common/zstd_util.h"
 
 namespace mooncake::test {

@@ -13,12 +13,12 @@
 #include <sys/resource.h>
 
 #include <gflags/gflags.h>
-#include "types.h"
+#include "common/types.h"
 
-#include "offset_allocator/offset_allocator.h"
-#include "allocator.h"
-#include "allocation_strategy.h"
-#include "local_ssd/manager.h"
+#include "master/offset_allocator/offset_allocator.h"
+#include "master/allocator.h"
+#include "master/allocation_strategy.h"
+#include "common/local_ssd/manager.h"
 
 // --- gflags definitions ---
 DEFINE_int64(segment_capacity, 1024,

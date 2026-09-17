@@ -1,4 +1,4 @@
-#include "ha/ha_types.h"
+#include "master/ha/ha_types.h"
 
 #include <gtest/gtest.h>
 #include <ylt/util/tl/expected.hpp>

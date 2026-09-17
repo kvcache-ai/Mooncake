@@ -1,4 +1,4 @@
-#include "ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.h"
+#include "master/ha/snapshot/batch_oplog/batch_oplog_snapshot_publisher.h"
 
 #include <gtest/gtest.h>
 
@@ -6,14 +6,14 @@
 #include <string>
 #include <vector>
 
-#include "ha/kv/ha_kv_backend.h"
-#include "ha/snapshot/batch_oplog/metadata.h"
-#include "ha/snapshot/snapshot_maintenance_lease.h"
+#include "master/ha/kv/ha_kv_backend.h"
+#include "master/ha/snapshot/batch_oplog/metadata.h"
+#include "master/ha/snapshot/snapshot_maintenance_lease.h"
 #ifdef STORE_USE_ETCD
 #include <unistd.h>
 
-#include "etcd_helper.h"
-#include "ha/kv/etcd_ha_kv_backend.h"
+#include "common/etcd_helper.h"
+#include "master/ha/kv/etcd_ha_kv_backend.h"
 #endif
 
 namespace mooncake::test {
