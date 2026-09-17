@@ -156,6 +156,16 @@ Status MultiTransport::submitTransfer(
         transports.push_back(transport);
     }
 
+    if (entries.empty()) return Status::OK();
+    batch_desc.counter_eligible =
+        (batch_desc.task_list.empty() || batch_desc.counter_eligible) &&
+        std::all_of(transports.begin(), transports.end(), [](Transport* t) {
+            return t->supportsBatchCompletionCounter();
+        });
+    batch_desc.status_cached.store(false, std::memory_order_relaxed);
+    batch_desc.is_finished.store(false, std::memory_order_relaxed);
+    batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
+
     auto& task_list = batch_desc.task_list;
     task_list.reserve(task_list.size() + entries.size());
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
@@ -180,6 +190,8 @@ Status MultiTransport::submitTransfer(
         task.request = &entries[i];
 #endif
         task.request_count = count;
+        if (transports[i]->supportsBatchCompletionCounter())
+            task.submission_sealed = false;
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         if (count > 1) task.submission_sealed = false;
 #endif
@@ -191,12 +203,11 @@ Status MultiTransport::submitTransfer(
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
-#ifdef USE_EVENT_DRIVEN_COMPLETION
         for (auto* task : entry.second)
-            if (task->request_count > 1)
+            if (!task->submission_sealed)
                 Transport::Slice::sealTaskSubmission(task);
-#endif
         if (!status.ok()) {
+            batch_desc.counter_eligible = false;
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
             overall_status = status;
@@ -228,6 +239,12 @@ Status MultiTransport::mp_submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
+    if (entries.empty()) return Status::OK();
+    // Explicit-protocol dispatch retains transport-specific polling.
+    batch_desc.counter_eligible = false;
+    batch_desc.status_cached.store(false, std::memory_order_relaxed);
+    batch_desc.is_finished.store(false, std::memory_order_relaxed);
+    batch_desc.finished_transfer_bytes.store(0, std::memory_order_relaxed);
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
@@ -385,6 +402,21 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
             batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
         return Status::OK();
     }
+
+    // Capability, not a nonzero counter, determines whether polling can be
+    // skipped. Mixed/legacy transports may need polling to make progress.
+    // Timeout and failure inspection still use the per-task path.
+    const uint64_t finished =
+        batch_desc.finished_task_count.load(std::memory_order_acquire);
+    if (batch_desc.counter_eligible && globalConfig().slice_timeout <= 0 &&
+        !batch_desc.has_failure.load(std::memory_order_acquire) &&
+        finished < task_count) {
+        status.s = Transport::TransferStatusEnum::WAITING;
+        return Status::OK();
+    }
+    // On completion, aggregate the actual transferred bytes once. The CQ
+    // is_finished flag alone is insufficient: it can also represent failure
+    // and is published before foreground byte aggregation.
 
     size_t success_count = 0;
     for (size_t task_id = 0; task_id < task_count; task_id++) {

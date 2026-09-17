@@ -1212,6 +1212,40 @@ TEST_F(TransportTest, RepeatedBatchQueryPreservesAggregatedBytes) {
     EXPECT_EQ(status.transferred_bytes, total_bytes);
 }
 
+TEST_F(TransportTest, CqMarkSuccessPublishesBatchFinishedTaskCount) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 2;
+
+    Transport::TransferTask first;
+    Transport::TransferTask second;
+    first.batch_id = batch.id;
+    second.batch_id = batch.id;
+    first.slice_count = 1;
+    second.slice_count = 1;
+
+    Transport::Slice first_slice{};
+    first_slice.task = &first;
+    first_slice.length = 4;
+    first_slice.markSuccess();
+    EXPECT_TRUE(first.is_finished);
+    EXPECT_FALSE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+
+    Transport::Slice second_slice{};
+    second_slice.task = &second;
+    second_slice.length = 4;
+    second_slice.markSuccess();
+    EXPECT_TRUE(second.is_finished);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    EXPECT_TRUE(batch.is_finished.load());
+#else
+    // Foreground aggregation publishes the status/byte cache when polling.
+    EXPECT_FALSE(batch.is_finished.load());
+#endif
+    EXPECT_EQ(batch.finished_task_count.load(), 2u);
+}
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
 TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
     Transport::BatchDesc batch{};
