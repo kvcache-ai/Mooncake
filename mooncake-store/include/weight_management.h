@@ -408,6 +408,17 @@ inline WeightValidationResult ValidateWeightRevisionMetadata(
     if (!identity_result.ok()) {
         return identity_result;
     }
+    if (metadata.manifest.payload_group_id !=
+        MakeWeightPayloadGroupId(metadata.identity)) {
+        return WeightValidationResult::Failure(
+            "payload_group_id is not canonical");
+    }
+    if (!metadata.manifest.manifest_key.empty() &&
+        metadata.manifest.manifest_key !=
+            MakeWeightManifestKey(metadata.identity)) {
+        return WeightValidationResult::Failure(
+            "manifest_key is not canonical");
+    }
     if (metadata.metadata_generation == 0 ||
         metadata.metadata_generation == std::numeric_limits<uint64_t>::max()) {
         return WeightValidationResult::Failure("invalid metadata_generation");

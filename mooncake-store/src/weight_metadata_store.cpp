@@ -127,6 +127,8 @@ WeightMetadataStore::PrepareBeginImport(const BeginWeightImportRequest& request,
                                         uint64_t now_ms) const {
     if (!ValidateWeightRevisionIdentity(request.identity).ok() ||
         !IsValidWeightComponent(request.payload_group_id) ||
+        request.payload_group_id !=
+            MakeWeightPayloadGroupId(request.identity) ||
         request.expected_payload_count == 0 ||
         request.expected_logical_bytes == 0) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
@@ -186,6 +188,10 @@ WeightMetadataStore::PrepareCommitImport(
     const CommitWeightImportRequest& request, uint64_t now_ms) const {
     if (!ValidateWeightRevisionIdentity(request.identity).ok() ||
         !ValidateWeightManifestReference(request.manifest).ok() ||
+        request.manifest.payload_group_id !=
+            MakeWeightPayloadGroupId(request.identity) ||
+        request.manifest.manifest_key !=
+            MakeWeightManifestKey(request.identity) ||
         request.expected_metadata_generation == 0) {
         return tl::make_unexpected(WeightManagementError::INVALID_ARGUMENT);
     }

@@ -25,10 +25,11 @@ WeightRevisionIdentity ValidIdentity() {
 }
 
 WeightManifestReference ValidManifest() {
+    const auto identity = ValidIdentity();
     return WeightManifestReference{
-        .manifest_key = "weights/production/llama-70b/step-100/7/manifest",
+        .manifest_key = MakeWeightManifestKey(identity),
         .manifest_sha256 = std::string(64, 'a'),
-        .payload_group_id = "weight-group-7",
+        .payload_group_id = MakeWeightPayloadGroupId(identity),
         .payload_keys_sha256 = std::string(64, 'b'),
         .payload_count = 3,
         .logical_bytes = 4096,
@@ -85,6 +86,27 @@ TEST(WeightManagementContractTest, ValidatesSha256AndGeneration) {
     EXPECT_FALSE(CanAdvanceWeightMetadataGeneration(0));
     EXPECT_FALSE(CanAdvanceWeightMetadataGeneration(
         std::numeric_limits<uint64_t>::max() - 1));
+}
+
+TEST(WeightManagementContractTest, RejectsNonCanonicalWeightObjectNames) {
+    WeightRevisionMetadata metadata{
+        .identity = ValidIdentity(),
+        .manifest = ValidManifest(),
+        .availability = WeightAvailabilityState::READY,
+        .residency = WeightResidencyState::HOT,
+        .operation = WeightOperationState::NONE,
+        .metadata_generation = 1,
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+    EXPECT_TRUE(ValidateWeightRevisionMetadata(metadata).ok());
+
+    metadata.manifest.payload_group_id = "valid-but-non-canonical-group";
+    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
+
+    metadata.manifest = ValidManifest();
+    metadata.manifest.manifest_key = "valid-but-non-canonical-manifest";
+    EXPECT_FALSE(ValidateWeightRevisionMetadata(metadata).ok());
 }
 
 TEST(WeightManagementContractTest, EnforcesStateCombinationAndOperationIds) {

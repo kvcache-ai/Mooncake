@@ -64,6 +64,11 @@ Its manifest object key is canonical:
 weights/<namespace>/<resource_id>/<revision>/<weight_generation>/manifest
 ```
 
+`WeightMetadataStore` validates that the payload group ID and manifest key are
+the canonical values derived from the revision identity. The Master integration
+separately validates those references against physical Store object type,
+membership, count, logical bytes, and payload-key digest.
+
 The three textual path components are UTF-8 URL-encoded as individual path
 segments. The manifest is hard-pinned during import and stored as
 `ObjectDataType::METADATA`. Payload fragments are stored as

@@ -25,17 +25,18 @@ BeginWeightImportRequest BeginRequest(
     const WeightRevisionIdentity& identity = Identity()) {
     return BeginWeightImportRequest{
         .identity = identity,
-        .payload_group_id = "weight-group-7",
+        .payload_group_id = MakeWeightPayloadGroupId(identity),
         .expected_payload_count = 3,
         .expected_logical_bytes = 4096,
     };
 }
 
 WeightManifestReference Manifest() {
+    const auto identity = Identity();
     return WeightManifestReference{
-        .manifest_key = "weights/production/llama-70b/step-100/7/manifest",
+        .manifest_key = MakeWeightManifestKey(identity),
         .manifest_sha256 = std::string(64, 'a'),
-        .payload_group_id = "weight-group-7",
+        .payload_group_id = MakeWeightPayloadGroupId(identity),
         .payload_keys_sha256 = std::string(64, 'b'),
         .payload_count = 3,
         .logical_bytes = 4096,
@@ -67,7 +68,7 @@ WeightRevisionMetadata PublishReady(WeightMetadataStore& metadata_store) {
     return *published;
 }
 
-TEST(WeightMetadataStoreTest, BeginIsIdempotentAndRejectsConflicts) {
+TEST(WeightMetadataStoreTest, BeginIsIdempotent) {
     WeightMetadataStore metadata_store;
     auto first = PublishBegin(metadata_store, BeginRequest());
     EXPECT_EQ(WeightAvailabilityState::IMPORTING, first.availability);
@@ -80,11 +81,45 @@ TEST(WeightMetadataStoreTest, BeginIsIdempotentAndRejectsConflicts) {
     ASSERT_TRUE(retried.has_value());
     EXPECT_EQ(first, *retried);
 
-    auto conflicting = BeginRequest();
-    conflicting.payload_group_id = "different-group";
-    auto rejected = metadata_store.PrepareBeginImport(conflicting, 160);
+}
+
+TEST(WeightMetadataStoreTest, RejectsNonCanonicalWeightObjectNames) {
+    WeightMetadataStore metadata_store;
+    auto noncanonical_begin = BeginRequest();
+    noncanonical_begin.payload_group_id = "valid-but-non-canonical-group";
+    auto rejected =
+        metadata_store.PrepareBeginImport(noncanonical_begin, 100);
     ASSERT_FALSE(rejected.has_value());
-    EXPECT_EQ(WeightManagementError::CONFLICT, rejected.error());
+    EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, rejected.error());
+
+    auto importing = PublishBegin(metadata_store, BeginRequest());
+    auto noncanonical_manifest = Manifest();
+    noncanonical_manifest.manifest_key =
+        "valid-but-non-canonical-manifest";
+    rejected = metadata_store.PrepareCommitImport(
+        CommitWeightImportRequest{
+            .identity = importing.identity,
+            .expected_metadata_generation = importing.metadata_generation,
+            .manifest = std::move(noncanonical_manifest),
+        },
+        200);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT, rejected.error());
+
+    auto ready = PublishReady(metadata_store);
+    auto snapshot = metadata_store.ExportSnapshot();
+    snapshot.metadata[0].manifest.payload_group_id =
+        "valid-but-non-canonical-group";
+    WeightMetadataStore restored;
+    EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT,
+              restored.RestoreSnapshot(snapshot).error());
+
+    snapshot = metadata_store.ExportSnapshot();
+    snapshot.metadata[0].manifest.manifest_key =
+        "valid-but-non-canonical-manifest";
+    EXPECT_EQ(WeightManagementError::INVALID_ARGUMENT,
+              restored.RestoreSnapshot(snapshot).error());
+    EXPECT_EQ(ready, metadata_store.Get(ready.identity, 200)->metadata);
 }
 
 TEST(WeightMetadataStoreTest, CommitUsesCasAndIsRetryableAfterResponseLoss) {
@@ -150,10 +185,9 @@ TEST(WeightMetadataStoreTest, AbortRetryRequiresAdjacentGeneration) {
 TEST(WeightMetadataStoreTest, LookupAndPaginationAreExactAndDeterministic) {
     WeightMetadataStore metadata_store;
     for (const auto& [revision, generation] :
-         std::vector<std::pair<std::string, uint64_t>>{
+        std::vector<std::pair<std::string, uint64_t>>{
              {"step-20", 2}, {"step-10", 3}, {"step-10", 1}}) {
         auto request = BeginRequest(Identity(revision, generation));
-        request.payload_group_id = revision + "-" + std::to_string(generation);
         PublishBegin(metadata_store, request);
     }
 
