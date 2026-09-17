@@ -16,6 +16,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
 set(MOONCAKE_STORE_MASTER_SOURCES
     allocation_strategy.cpp
     allocator.cpp
+    config/ha_cluster_namespace_config.cpp
     config/local_file_snapshot_config.cpp
     config/redis_connection_config.cpp
     segment_allocator_registration.cpp

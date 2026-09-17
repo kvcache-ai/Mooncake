@@ -281,6 +281,8 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(nvme_kv_connector_config_test nvme_kv/connector_config_test.cpp)
+add_store_test(ha_cluster_namespace_config_test
+               ha_cluster_namespace_config_test.cpp)
 add_store_test(redis_connection_config_test redis_connection_config_test.cpp)
 add_store_test(nvme_kv_io_concurrency_config_test
                nvme_kv/io_concurrency_config_test.cpp)

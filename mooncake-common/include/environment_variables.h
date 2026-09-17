@@ -176,6 +176,10 @@ struct LocalFileSnapshotEnvironmentVariables {
     MC_DEFINE_ENV_VAR(std::string, MOONCAKE_SNAPSHOT_LOCAL_PATH);
 };
 
+struct HaClusterNamespaceEnvironmentVariables {
+    MC_DEFINE_ENV_VAR(std::string, MC_STORE_CLUSTER_ID);
+};
+
 struct TransferSubmitterEnvironmentVariables {
     // Keep the raw string to preserve the legacy token set, whitespace,
     // invalid-value fallback, and warning behavior.
