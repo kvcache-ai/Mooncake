@@ -1522,6 +1522,7 @@ int main(int argc, char* argv[]) {
         google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
     mooncake::LogAllocatorStatus();
+    mooncake::InstallAllocatorStatsCollector();
 
     LOG(INFO) << "Mooncake master version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;

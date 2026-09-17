@@ -1941,6 +1941,11 @@ std::string MasterMetricManager::serialize_metrics() {
         ss << metric_str;
     };
 
+    // The generic lambda above accepts AllocatorMetric because it matches the
+    // serialize(std::string&) shape of every other metric type here.
+    allocator_metric_.Refresh();
+    serialize_metric(allocator_metric_);
+
     // Serialize Gauges
     serialize_metric(mem_allocated_size_);
     serialize_metric(mem_total_capacity_);

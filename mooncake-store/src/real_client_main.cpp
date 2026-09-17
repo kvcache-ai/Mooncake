@@ -121,6 +121,7 @@ int main(int argc, char *argv[]) {
         google::InitGoogleLogging(argv[0]);
     }
     mooncake::LogAllocatorStatus();
+    mooncake::InstallAllocatorStatsCollector();
 
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
