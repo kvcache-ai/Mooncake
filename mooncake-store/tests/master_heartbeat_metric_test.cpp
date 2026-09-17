@@ -1,4 +1,6 @@
 #include "master_heartbeat_metric.h"
+#include "rpc_types.h"
+#include <ylt/util/tl/expected.hpp>
 
 #include <gtest/gtest.h>
 
@@ -16,6 +18,127 @@ std::string Serialize(MasterHeartbeatMetric& metric) {
 
 void Connect(MasterHeartbeatMetric& metric) {
     metric.EndConnection(metric.BeginConnection(), true);
+}
+
+tl::expected<PingResponse, ErrorCode> Ping(ClientStatus status) {
+    return PingResponse{42, status};
+}
+
+TEST(MasterHeartbeatMetricTest,
+     ObserveConnectPreservesResultAndInvalidatesSample) {
+    MasterHeartbeatMetric metric;
+    int calls = 0;
+    EXPECT_EQ(metric.ObserveConnect([&] {
+        ++calls;
+        EXPECT_TRUE(Serialize(metric).empty());
+        EXPECT_FALSE(metric.BeginObservation());
+        return ErrorCode::OK;
+    }),
+              ErrorCode::OK);
+    EXPECT_EQ(calls, 1);
+    metric.ObservePing([] { return Ping(ClientStatus::OK); });
+    EXPECT_FALSE(Serialize(metric).empty());
+    EXPECT_EQ(metric.ObserveConnect([&] {
+        ++calls;
+        EXPECT_TRUE(Serialize(metric).empty());
+        return ErrorCode::RPC_FAIL;
+    }),
+              ErrorCode::RPC_FAIL);
+    EXPECT_EQ(calls, 2);
+    EXPECT_FALSE(metric.BeginObservation());
+    EXPECT_TRUE(Serialize(metric).empty());
+}
+
+TEST(MasterHeartbeatMetricTest, ObservePingMapsStatusAndPreservesResponse) {
+    MasterHeartbeatMetric metric;
+    metric.ObserveConnect([] { return ErrorCode::OK; });
+    for (auto status : {ClientStatus::OK, ClientStatus::NEED_REMOUNT}) {
+        const auto before = std::chrono::system_clock::now();
+        int calls = 0;
+        auto result = metric.ObservePing([&] {
+            ++calls;
+            // Reentering serialization would deadlock if the wrapper held
+            // the metric lock while invoking the RPC callback.
+            Serialize(metric);
+            return Ping(status);
+        });
+        const auto after = std::chrono::system_clock::now();
+        ASSERT_TRUE(result);
+        EXPECT_EQ(calls, 1);
+        EXPECT_EQ(result->view_version_id, 42);
+        EXPECT_EQ(result->client_status, status);
+        const auto text = Serialize(metric);
+        EXPECT_NE(
+            text.find(status == ClientStatus::OK ? "heartbeat_status_ok 1\n"
+                                                 : "heartbeat_status_ok 0\n"),
+            std::string::npos);
+        const std::string name =
+            "\nmooncake_client_master_heartbeat_observation_timestamp_seconds ";
+        const auto offset = text.find(name);
+        ASSERT_NE(offset, std::string::npos);
+        const auto timestamp = std::stod(text.substr(offset + name.size()));
+        // The gauge exposition rounds to six decimal places.
+        EXPECT_GE(
+            timestamp,
+            std::chrono::duration<double>(before.time_since_epoch()).count() -
+                1e-6);
+        EXPECT_LE(
+            timestamp,
+            std::chrono::duration<double>(after.time_since_epoch()).count() +
+                1e-6);
+    }
+}
+
+TEST(MasterHeartbeatMetricTest,
+     ObservePingClearsFailedAndUnsupportedResponses) {
+    MasterHeartbeatMetric metric;
+    metric.ObserveConnect([] { return ErrorCode::OK; });
+    metric.ObservePing([] { return Ping(ClientStatus::OK); });
+    auto unsupported =
+        metric.ObservePing([] { return Ping(ClientStatus::UNDEFINED); });
+    ASSERT_TRUE(unsupported);
+    EXPECT_EQ(unsupported->client_status, ClientStatus::UNDEFINED);
+    EXPECT_TRUE(Serialize(metric).empty());
+    metric.ObservePing([] { return Ping(ClientStatus::OK); });
+    auto failed =
+        metric.ObservePing([]() -> tl::expected<PingResponse, ErrorCode> {
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        });
+    ASSERT_FALSE(failed);
+    EXPECT_EQ(failed.error(), ErrorCode::RPC_FAIL);
+    EXPECT_TRUE(Serialize(metric).empty());
+}
+
+TEST(MasterHeartbeatMetricTest, ObservePingRejectsLateSuccessAndFailure) {
+    MasterHeartbeatMetric metric;
+    metric.ObserveConnect([] { return ErrorCode::OK; });
+    for (bool success : {true, false}) {
+        std::string current;
+        auto result =
+            metric.ObservePing([&]() -> tl::expected<PingResponse, ErrorCode> {
+                metric.ObserveConnect([] { return ErrorCode::OK; });
+                metric.ObservePing(
+                    [] { return Ping(ClientStatus::NEED_REMOUNT); });
+                current = Serialize(metric);
+                if (success) return Ping(ClientStatus::OK);
+                return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            });
+        EXPECT_EQ(result.has_value(), success);
+        EXPECT_FALSE(current.empty());
+        EXPECT_EQ(Serialize(metric), current);
+    }
+}
+
+TEST(MasterHeartbeatMetricTest, ObservePingDuringConnectCannotPublish) {
+    MasterHeartbeatMetric metric;
+    metric.ObserveConnect([&] {
+        auto result = metric.ObservePing([] { return Ping(ClientStatus::OK); });
+        EXPECT_TRUE(result);
+        EXPECT_TRUE(Serialize(metric).empty());
+        return ErrorCode::OK;
+    });
+    EXPECT_TRUE(metric.BeginObservation());
+    EXPECT_TRUE(Serialize(metric).empty());
 }
 
 TEST(MasterHeartbeatMetricTest, InitialObservationIsUnknown) {

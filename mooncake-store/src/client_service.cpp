@@ -648,11 +648,9 @@ void Client::EnterHaRuntimeMode() {
 
 ErrorCode Client::ConnectMasterEndpoint(const std::string& address) {
     if (!metrics_) return master_client_.Connect(address);
-    auto& heartbeat = metrics_->master_heartbeat_metric;
-    const auto generation = heartbeat.BeginConnection();
-    const auto result = master_client_.Connect(address);
-    heartbeat.EndConnection(generation, result == ErrorCode::OK);
-    return result;
+
+    return metrics_->master_heartbeat_metric.ObserveConnect(
+        [this, &address] { return master_client_.Connect(address); });
 }
 
 ErrorCode Client::SwitchLeader(const ha::MasterView& target_view) {
@@ -5123,34 +5121,10 @@ void Client::StorageHeartbeatThreadMain() {
             remount_segment_future = std::future<void>();
         }
 
-        // Capture the connection generation before sending the Ping. A
-        // concurrent leader switch invalidates both successes and failures.
-        const auto observation =
-            metrics_ ? metrics_->master_heartbeat_metric.BeginObservation()
-                     : std::nullopt;
-        auto ping_result = master_client_.Ping();
-        if (metrics_) {
-            std::optional<bool> status_ok;
-            double timestamp_seconds = 0;
-            if (ping_result) {
-                switch (ping_result->client_status) {
-                    case ClientStatus::OK:
-                        status_ok = true;
-                        break;
-                    case ClientStatus::NEED_REMOUNT:
-                        status_ok = false;
-                        break;
-                    default:
-                        break;
-                }
-                timestamp_seconds =
-                    std::chrono::duration<double>(
-                        std::chrono::system_clock::now().time_since_epoch())
-                        .count();
-            }
-            metrics_->master_heartbeat_metric.Observe(observation, status_ok,
-                                                      timestamp_seconds);
-        }
+        auto ping_result = metrics_
+                               ? metrics_->master_heartbeat_metric.ObservePing(
+                                     [this] { return master_client_.Ping(); })
+                               : master_client_.Ping();
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
 #include <mutex>
@@ -7,6 +8,8 @@
 #include <string>
 #include <utility>
 #include <ylt/metric/gauge.hpp>
+
+#include "types.h"
 
 namespace mooncake {
 
@@ -26,6 +29,42 @@ class MasterHeartbeatMetric {
               "Client Unix receive time of the same Master Ping observation "
               "in seconds; absent when unknown",
               EscapeLabels(labels)) {}
+
+    template <typename Fn>
+    ErrorCode ObserveConnect(Fn&& connect) {
+        const auto generation = BeginConnection();
+        const auto result = std::forward<Fn>(connect)();
+        EndConnection(generation, result == ErrorCode::OK);
+        return result;
+    }
+
+    template <typename Fn>
+    auto ObservePing(Fn&& ping) {
+        // Capture the generation before the RPC so reconnects invalidate late
+        // successes and failures. The callback runs without holding mutex_.
+        const auto generation = BeginObservation();
+        auto result = std::forward<Fn>(ping)();
+        std::optional<bool> status_ok;
+        double timestamp_seconds = 0;
+        if (result) {
+            switch (result->client_status) {
+                case ClientStatus::OK:
+                    status_ok = true;
+                    break;
+                case ClientStatus::NEED_REMOUNT:
+                    status_ok = false;
+                    break;
+                default:
+                    break;
+            }
+            timestamp_seconds =
+                std::chrono::duration<double>(
+                    std::chrono::system_clock::now().time_since_epoch())
+                    .count();
+        }
+        Observe(generation, status_ok, timestamp_seconds);
+        return result;
+    }
 
     uint64_t BeginConnection() {
         std::lock_guard<std::mutex> lock(mutex_);
