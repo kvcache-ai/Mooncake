@@ -17,7 +17,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include <ylt/util/tl/expected.hpp>
-#include "utils.h"
+#include "common/network.h"
 
 namespace mooncake {
 namespace testing {

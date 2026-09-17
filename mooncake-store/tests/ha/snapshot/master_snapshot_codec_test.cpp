@@ -9,12 +9,15 @@
 #include "ha/snapshot/master_snapshot_codec.h"
 #include "master_config.h"
 #include "master_service.h"
+#include "master_service/master_service_test_peer.h"
 #include "segment.h"
 #include "task_manager.h"
 #include "tenant_id.h"
-#include "utils/zstd_util.h"
+#include "common/zstd_util.h"
 
 namespace mooncake::ha {
+
+using mooncake::test::MasterServiceTestPeer;
 
 class MasterSnapshotCodecTest : public ::testing::Test {
    protected:
@@ -29,13 +32,13 @@ class MasterSnapshotCodecTest : public ::testing::Test {
         return std::make_unique<MasterService>(config);
     }
 
-    // The fixture is befriended by MasterService, so private state access is
-    // funneled through this helper (friendship is not inherited by the
-    // TEST_F-generated subclasses).
+    // Assemble the codec state view through the shared test peer.
     static MasterSnapshotStateView MakeStateView(MasterService& service) {
         return MasterSnapshotStateView(
-            service, service.segment_manager_, service.local_ssd_manager_,
-            service.nof_segment_manager_, service.task_manager_);
+            service, MasterServiceTestPeer::SegmentManager(service),
+            MasterServiceTestPeer::LocalSsdManager(service),
+            MasterServiceTestPeer::NofSegmentManager(service),
+            MasterServiceTestPeer::TaskManager(service));
     }
 
     std::unique_ptr<MasterService> master_service_;

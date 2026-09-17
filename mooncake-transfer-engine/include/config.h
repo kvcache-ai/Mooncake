@@ -91,6 +91,12 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Context-level circuit-breaker pause. Repeated local WC failures
+    // deactivate the local RNIC context for this many milliseconds. The
+    // monitor then reactivates it with a reset failure count. Must be positive
+    // so a breaker trip cannot recreate the legacy permanent latch. Override
+    // via MC_CONTEXT_PAUSE_TTL_MS.
+    int context_pause_ttl_ms = 5000;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;

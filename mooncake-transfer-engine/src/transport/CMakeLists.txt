@@ -41,6 +41,9 @@ if(USE_CXL)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
 
+add_subdirectory(shm_transport)
+target_sources(transport PUBLIC $<TARGET_OBJECTS:shm_transport>)
+
 if(USE_ASCEND_DIRECT)
   add_subdirectory(ascend_transport)
 elseif(USE_ASCEND)
@@ -107,11 +110,17 @@ if(USE_CUDA
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5
   # DevX symbols (mlx5dv_devx_*, mlx5dv_init_obj) directly.
-  if((USE_CUDA OR USE_MUSA) AND NOT USE_CXI)
+  if((USE_CUDA OR USE_MUSA OR USE_MACA) AND NOT USE_CXI)
     target_link_libraries(transport PUBLIC mlx5)
   endif()
   if(USE_CUDA AND MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
     target_compile_definitions(device_transport PRIVATE _GNU_SOURCE)
     target_link_libraries(transport PUBLIC ${CMAKE_DL_LIBS})
   endif()
+endif()
+
+if(USE_FLAGCX)
+  add_subdirectory(flagcx_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:flagcx_transport>)
+  target_link_libraries(transport PRIVATE FlagCX::flagcx)
 endif()
