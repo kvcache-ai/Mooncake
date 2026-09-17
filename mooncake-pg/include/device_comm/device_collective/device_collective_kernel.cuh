@@ -3,9 +3,9 @@
 
 #include <cooperative_groups.h>
 #include <cuda/atomic>
-#include <transport/device/device_ops.cuh>
 
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/d2h_request_slot.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_collective/device_control_update.cuh"
 #include "device_comm/device_collective/device_collective_types.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
@@ -20,7 +20,7 @@ struct CollectivePreparationResult {
     }
 };
 
-// A protocol describes only the peers whose control state must match before
+// An algorithm describes only the peers whose control state must match before
 // communication starts. The common startup path owns the synchronization
 // procedure itself.
 struct ViewEpochPeer {
@@ -81,7 +81,7 @@ synchronizeCollectiveViewEpoch(uint64_t view_epoch, uint64_t timeout_ticks,
 
 // Elect the first resident CTA to apply one pending control update, then check
 // the updated Plan's required view-epoch peers. Every other CTA stays outside
-// protocol state until preparation succeeds or reports one failed peer.
+// algorithm state until preparation succeeds or reports one failed peer.
 //
 // The first CTA to reach this function becomes the startup leader. CUDA does
 // not guarantee that block 0 becomes resident first; if resident CTAs waited
@@ -90,14 +90,14 @@ synchronizeCollectiveViewEpoch(uint64_t view_epoch, uint64_t timeout_ticks,
 //
 // InvocationState is reused across kernel launches. StrongStream guarantees
 // that only one collective invocation uses it at a time.
-template <typename Plan, typename PrepareProtocol>
+template <typename Plan, typename PrepareAlgorithm>
 [[nodiscard]] __device__ __forceinline__ CollectivePreparationResult
 prepareCollectiveInvocation(PlanSlot<Plan>* plan_slot,
                             const uint64_t* view_epoch_signals,
                             InvocationState* invocation,
                             ControlMailbox* control_mailbox,
                             uint32_t lane_index,
-                            PrepareProtocol prepare_protocol,
+                            PrepareAlgorithm prepare_algorithm,
                             cooperative_groups::thread_block block) {
     __shared__ uint32_t is_startup_leader;
     if (block.thread_rank() == 0) {
@@ -116,7 +116,7 @@ prepareCollectiveInvocation(PlanSlot<Plan>* plan_slot,
         block.sync();
 
         PG_DEVICE_ASSERT(plan_slot->status == DevicePlanStatus::Ready);
-        const auto preparation = prepare_protocol(
+        const auto preparation = prepare_algorithm(
             plan_slot->plan, view_epoch_signals, lane_index, block);
         block.sync();
         if (block.thread_rank() == 0) {
@@ -146,7 +146,7 @@ __device__ __forceinline__ void completeChannel(
     InGroupRank detected_failed_rank = kInvalidInGroupRank,
     int32_t* failed_ranks_hint = nullptr) {
     // No thread may publish channel completion while another thread in the CTA
-    // can still access the current Plan or protocol buffers.
+    // can still access the current Plan or algorithm buffers.
     block.sync();
     if (block.thread_rank() == 0) {
         cuda::atomic_ref<uint32_t, cuda::thread_scope_device> failure_latched(
@@ -173,30 +173,17 @@ __device__ __forceinline__ void completeChannel(
         // Each acq_rel increment publishes this CTA's prior accesses and
         // carries visibility from earlier arrivals. The final arriving CTA
         // therefore observes every channel quiescent before replacing Plan or
-        // protocol state.
+        // algorithm state.
         const uint32_t previous_arrival_count =
             completion_arrival_count.fetch_add(1, cuda::memory_order_acq_rel);
         if (previous_arrival_count + 1 == gridDim.x) {
             if (failure_latched.load(cuda::memory_order_relaxed) != 0) {
-                const uint64_t generation =
-                    device::mc_ld_acquire_u64(
-                        &control_mailbox->failure_generation) +
-                    1;
-
-                control_mailbox->failed_rank = invocation->failed_rank;
-                control_mailbox->failed_hint_address =
-                    invocation->failed_hint_address;
-
-                // Make the copied failure metadata system-visible before the
-                // release store notifies the host. The matching acquire load
-                // lets the host read the metadata and replace the Plan and
-                // protocol state only after all channels are quiescent.
-                __threadfence_system();
-                device::mc_st_release_u64(&control_mailbox->failure_generation,
-                                          generation);
-                while (device::mc_ld_acquire_u64(
-                           &control_mailbox->ready_generation) < generation) {
-                }
+                control_mailbox->recovery
+                    .submit(CollectiveFailureReport{
+                        .failed_rank = invocation->failed_rank,
+                        .failed_hint_address = invocation->failed_hint_address,
+                    })
+                    .wait();
                 applyPinnedControlUpdate(&control_mailbox->control_update_slot);
             }
 

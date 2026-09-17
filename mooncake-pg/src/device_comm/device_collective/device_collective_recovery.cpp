@@ -1,7 +1,6 @@
 #include "device_comm/device_collective/device_collective_recovery.h"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <exception>
 #include <mutex>
@@ -11,6 +10,8 @@
 #include <vector>
 
 #include <glog/logging.h>
+
+#include "device_comm/device_utils/d2h_request_slot.h"
 
 namespace mooncake {
 
@@ -22,20 +23,13 @@ struct DeviceCollectiveRecoveryWorker::MailboxState {
 void DeviceCollectiveRecoveryWorker::runLoop() {
     while (true) {
         MailboxState* pending = nullptr;
-        uint64_t generation = 0;
+        ControlMailbox::RecoverySlot::ReceivedRequest received;
         {
             std::unique_lock<std::mutex> lock(mutex_);
             if (shutdown_requested_) break;
             for (const auto& state : mailboxes_) {
-                const uint64_t observed =
-                    std::atomic_ref(state->mailbox->failure_generation)
-                        .load(std::memory_order_acquire);
-                const uint64_t ready =
-                    std::atomic_ref(state->mailbox->ready_generation)
-                        .load(std::memory_order_acquire);
-                if (observed <= ready) continue;
+                if (!state->mailbox->recovery.tryReceive(received)) continue;
                 pending = state.get();
-                generation = observed;
                 active_mailbox_ = state->mailbox;
                 break;
             }
@@ -45,7 +39,7 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
             }
         }
 
-        auto prepared_resume = pending->prepare_resume();
+        auto prepared_resume = pending->prepare_resume(received.request);
         if (!prepared_resume.has_value()) {
             LOG(ERROR) << "Device collective recovery failed; the last "
                           "channel CTA remains waiting: "
@@ -60,8 +54,7 @@ void DeviceCollectiveRecoveryWorker::runLoop() {
         // The callback pinned the update before this acknowledgement. The
         // acquire load in the last channel CTA therefore observes the complete
         // update before applying it and leaving the failed collective.
-        std::atomic_ref(pending->mailbox->ready_generation)
-            .store(generation, std::memory_order_release);
+        received.handle.reply({});
 
         std::lock_guard<std::mutex> lock(mutex_);
         active_mailbox_ = nullptr;

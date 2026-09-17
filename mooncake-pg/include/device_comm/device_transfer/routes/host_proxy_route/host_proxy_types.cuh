@@ -23,30 +23,6 @@ struct HostProxyCommand {
     GlobalRank target_rank = kInvalidGlobalRank;
 };
 
-// One mapped SPSC command slot belongs to each device lane:
-//
-//   GPU producer                         Host proxy consumer
-//   ------------                         -------------------
-//   acquire completed_sequence == N - 1
-//   write command
-//   system fence
-//   release submitted_sequence = N  -->  acquire submitted_sequence == N
-//                                        snapshot command
-//                                        execute payload, then signal action
-//                                        write result
-//   acquire completed_sequence = N  <--  release completed_sequence = N
-//   read result
-//
-// The service contract permits only one producer per lane at a time.
-struct HostProxyCommandSlot {
-    uint64_t submitted_sequence = 0;
-    uint64_t completed_sequence = 0;
-
-    HostProxyCommandResult result = HostProxyCommandResult::Succeeded;
-
-    HostProxyCommand command;
-};
-
 }  // namespace mooncake
 
 #endif  // MOONCAKE_PG_DEVICE_COMM_DEVICE_TRANSFER_ROUTES_HOST_PROXY_ROUTE_HOST_PROXY_TYPES_CUH

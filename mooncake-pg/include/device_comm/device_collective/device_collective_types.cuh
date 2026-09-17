@@ -6,6 +6,7 @@
 #include <cuda_alike.h>
 
 #include "common_types.h"
+#include "device_comm/device_utils/d2h_request_slot_types.h"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
@@ -138,22 +139,24 @@ struct PlanSlot {
     Plan plan{};
 };
 
+struct CollectiveFailureReport {
+    InGroupRank failed_rank = kInvalidInGroupRank;
+    uint64_t failed_hint_address = 0;
+};
+
 // Host-mapped control state shared by the collective kernel and runtime. The
 // control-update slot carries ordinary Plan updates as well as the pinned
 // update used by failure recovery.
 //
 // The device publishes a new failure generation only after every active
-// channel CTA has stopped touching the old Plan and protocol buffers. Recovery
+// channel CTA has stopped touching the old Plan and algorithm buffers. Recovery
 // pins a control update and then acknowledges the matching failure generation.
 // The last channel CTA applies the pinned update before it leaves the failed
 // collective.
 struct alignas(64) ControlMailbox {
-    uint64_t failure_generation = 0;
-    uint64_t ready_generation = 0;
-
-    // Valid only while failure_generation is newer than ready_generation.
-    InGroupRank failed_rank = 0;
-    uint64_t failed_hint_address = 0;
+    using RecoverySlot = D2HRequestSlot<CollectiveFailureReport>;
+    // The host replies only after pinning the corresponding recovery update.
+    RecoverySlot recovery;
 
     // Valid for the last channel CTA only while its state is Pinned and
     // ready_generation has caught up with failure_generation.
@@ -162,9 +165,9 @@ struct alignas(64) ControlMailbox {
 
 // State shared by all channel CTAs in one collective launch. A CTA increments
 // completion_arrival_count after all of its threads have stopped using the Plan
-// and protocol buffers; a non-last CTA then returns. If a failure was reported,
-// the last CTA publishes the latched metadata to the host control mailbox and
-// remains in the kernel until recovery finishes.
+// and algorithm buffers; a non-last CTA then returns. If a failure was
+// reported, the last CTA publishes the latched metadata to the host control
+// mailbox and remains in the kernel until recovery finishes.
 struct alignas(64) InvocationState {
     uint32_t startup_arrival_count = 0;
     uint32_t startup_complete = 0;

@@ -75,7 +75,7 @@ struct DeviceTransferEndpoint {
     bool operator==(const DeviceTransferEndpoint&) const = default;
 };
 
-// Group-level endpoint of one Ring AllReduce protocol instance. Signals are
+// Group-level endpoint of one Ring AllReduce algorithm instance. Signals are
 // communicator-local even though their backing memory comes from the
 // process-wide peer-accessible region.
 struct RingAllReduceEndpoint {
@@ -86,7 +86,7 @@ struct RingAllReduceEndpoint {
 };
 
 // Group-level endpoints published by the device collective runtime and the
-// protocols owned by one communicator.
+// algorithms owned by one communicator.
 struct DeviceGroupEndpoint {
     // Runtime-owned signal slice for synchronizing one GroupView incarnation.
     // Each slot is written only by the peer with the matching InGroupRank.
@@ -99,7 +99,7 @@ struct DeviceGroupEndpoint {
         return view_epoch_signal_count == 0 && !ring_all_reduce.has_value();
     }
 
-    // True when the runtime and every protocol required by the New backend
+    // True when the runtime and every algorithm required by the New backend
     // have published their group-level endpoints.
     [[nodiscard]] bool hasAllRequiredEndpoints() const noexcept {
         return view_epoch_signal_count != 0 && ring_all_reduce.has_value();
@@ -136,7 +136,7 @@ struct GroupEndpointInfo {
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
 
-    // Empty for CPU communicators and ranks without device protocols.
+    // Empty for CPU communicators and ranks without device algorithms.
     DeviceGroupEndpoint device_collective;
 
     bool operator==(const GroupEndpointInfo&) const = default;

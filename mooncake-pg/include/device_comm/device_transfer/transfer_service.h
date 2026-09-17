@@ -52,7 +52,7 @@ class DeviceTransferService {
 
     // Read the selected route from the service's host route image. This is a
     // control-path query; it does not synchronize with or copy from the GPU.
-    PGResult<DeviceRouteKind> routeKind(GlobalRank rank);
+    PGResult<DeviceRouteType> routeType(GlobalRank rank);
 
     // Install the immutable endpoint published by one peer for its current
     // rank epoch. Rank-epoch validation remains in the control plane.

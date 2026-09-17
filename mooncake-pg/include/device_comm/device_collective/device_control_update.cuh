@@ -5,7 +5,7 @@
 
 #include <cuda/atomic>
 
-#include "device_comm/device_assert.cuh"
+#include "device_comm/device_utils/device_assert.cuh"
 #include "device_comm/device_collective/device_collective_types.cuh"
 
 namespace mooncake {
@@ -77,10 +77,10 @@ __device__ __forceinline__ void executeClaimedControlUpdate(
 
 }  // namespace detail
 
-// Called by the elected first resident CTA before any CTA reads protocol state.
-// Publication constructs the batch before taking Writing, so a device that
-// loses the state CAS can safely wait for it and then claim the newly published
-// complete update.
+// Called by the elected first resident CTA before any CTA reads algorithm
+// state. Publication constructs the batch before taking Writing, so a device
+// that loses the state CAS can safely wait for it and then claim the newly
+// published complete update.
 __device__ __forceinline__ void applyPendingControlUpdate(
     ControlUpdateSlot* slot) {
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> state(slot->state);

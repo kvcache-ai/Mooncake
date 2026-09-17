@@ -117,7 +117,7 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
         if (mapped_region_address == 0) continue;
 
         routes[rank] = DeviceTransferRoute{
-            .kind = DeviceRouteKind::P2p,
+            .type = DeviceRouteType::P2p,
             .region_size = endpoints[rank]->region_size,
             .p2p = {.mapped_region_address = mapped_region_address},
         };

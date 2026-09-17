@@ -50,8 +50,6 @@ class HostTransferProxy {
     };
 
     // These helpers inspect state protected by mutex_.
-    static uint64_t loadSubmitted(const Lane& lane);
-    static uint64_t loadCompleted(const Lane& lane);
     static bool laneIdle(const Lane& lane);
     static bool laneSetIdle(const LaneSet& lane_set);
     bool lanesIdle() const;

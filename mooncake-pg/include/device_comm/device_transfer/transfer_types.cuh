@@ -15,7 +15,7 @@ class TransferLane;
 // The caller decides how lanes map to its work.
 inline constexpr uint32_t kTransferLaneCount = 32;
 
-enum class DeviceRouteKind : uint32_t {
+enum class DeviceRouteType : uint32_t {
     Unreachable = 0,
     P2p = 1,
     HostProxy = 2,
@@ -41,7 +41,7 @@ struct DeviceHostProxyRoute {
 
 // One entry in the device-resident route table indexed by GlobalRank.
 struct DeviceTransferRoute {
-    DeviceRouteKind kind = DeviceRouteKind::Unreachable;
+    DeviceRouteType type = DeviceRouteType::Unreachable;
     uint64_t region_size = 0;
     union {
         DeviceP2pRoute p2p = {};
@@ -49,7 +49,13 @@ struct DeviceTransferRoute {
     };
 };
 
-struct HostProxyCommandSlot;
+template <typename Request, typename Reply>
+class D2HRequestSlot;
+struct HostProxyCommand;
+enum class HostProxyCommandResult : uint32_t;
+// Each lane owns one command/reply slot serviced by the host proxy.
+using HostProxyCommandSlot =
+    D2HRequestSlot<HostProxyCommand, HostProxyCommandResult>;
 
 // Non-owning device view of one DTS-managed local allocation.
 struct DeviceLocalRegion {
@@ -85,16 +91,16 @@ struct DeviceTransferHandle {
     [[nodiscard]] __device__ __forceinline__ void* remotePtr(
         GlobalRank rank, uint64_t remote_offset) const {
         const auto& route = routes[rank];
-        if (route.kind != DeviceRouteKind::P2p) return nullptr;
+        if (route.type != DeviceRouteType::P2p) return nullptr;
         return reinterpret_cast<char*>(
                    static_cast<uintptr_t>(route.p2p.mapped_region_address)) +
                remote_offset;
     }
 
     // Return the route currently selected for a peer.
-    [[nodiscard]] __device__ __forceinline__ DeviceRouteKind
-    routeKind(GlobalRank rank) const {
-        return routes[rank].kind;
+    [[nodiscard]] __device__ __forceinline__ DeviceRouteType
+    routeType(GlobalRank rank) const {
+        return routes[rank].type;
     }
 
     // Return a lightweight view of one fixed service lane.

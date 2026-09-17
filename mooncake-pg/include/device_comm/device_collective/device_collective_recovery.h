@@ -40,7 +40,8 @@ class DeviceCollectiveRecoveryWorker {
     struct MailboxState;
     // Called after the worker observes a new device failure. The callback must
     // prepare and pin the control update that lets the last channel CTA exit.
-    using PrepareResumeCallback = std::function<PGResult<void>()>;
+    using PrepareResumeCallback =
+        std::function<PGResult<void>(const CollectiveFailureReport&)>;
 
     PGResult<void> addMailbox(ControlMailbox* mailbox,
                               PrepareResumeCallback prepare_resume);

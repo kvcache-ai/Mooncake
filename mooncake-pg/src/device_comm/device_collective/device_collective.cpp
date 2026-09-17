@@ -8,8 +8,9 @@
 
 #include <glog/logging.h>
 
+#include "device_comm/device_utils/d2h_request_slot.h"
+#include "device_comm/device_collective/algorithms/ring/ring_all_reduce.h"
 #include "device_comm/device_collective/device_control_update.h"
-#include "device_comm/device_collective/protocols/ring/ring_all_reduce.h"
 #include "device_comm/device_collective/strong_stream.h"
 #include "pg_utils.h"
 
@@ -153,7 +154,7 @@ DeviceCollectiveRuntime::create(DeviceTransferService& transfer_service,
     }
     PG_TRY(
         runtime->all_reduce_,
-        RingAllReduceProtocol::create(
+        RingAllReduceAlgorithm::create(
             transfer_service, workspace,
             static_cast<const uint64_t*>(runtime->view_epoch_signals_.addr()),
             runtime->invocation_state_, device_control_mailbox, timeout_ticks,
@@ -206,7 +207,7 @@ PGResult<void> DeviceCollectiveRuntime::applyGroupView(const GroupView& view) {
                       "device collective runtime is shutting down");
     PG_ASSERT(view.epoch != kInvalidViewEpoch,
               "device collective View epoch uses the reserved invalid value");
-    // A duplicate group view must not reset protocol state again.
+    // A duplicate group view must not reset algorithm state again.
     if (view_epoch_ == view.epoch) return {};
 
     PG_TRY(all_reduce_->applyGroupView(view));
@@ -246,12 +247,7 @@ PGResult<void> DeviceCollectiveRuntime::publishControlState(
 }
 
 bool DeviceCollectiveRuntime::hasPendingRecovery() const noexcept {
-    const uint64_t ready = std::atomic_ref(control_mailbox_->ready_generation)
-                               .load(std::memory_order_acquire);
-    const uint64_t failure =
-        std::atomic_ref(control_mailbox_->failure_generation)
-            .load(std::memory_order_acquire);
-    return failure > ready;
+    return control_mailbox_->recovery.hasPendingRequest();
 }
 
 PGResult<void> DeviceCollectiveRuntime::attachGraphUse(
@@ -275,17 +271,16 @@ PGResult<void> DeviceCollectiveRuntime::attachGraphUse(
     return object.transferToGraph(capture);
 }
 
-PGResult<void> DeviceCollectiveRuntime::prepareFailureResume() {
-    auto& mailbox = *control_mailbox_;
-
+PGResult<void> DeviceCollectiveRuntime::prepareFailureResume(
+    const CollectiveFailureReport& failure) {
     // The last channel CTA of the failed invocation remains resident while the
     // host-proxy worker can still make progress, so drain outstanding route
-    // work before replacing protocol state.
+    // work before replacing algorithm state.
     PG_TRY(transfer_service_.waitUntilIdle());
 
-    const auto failed_rank = mailbox.failed_rank;
-    if (mailbox.failed_hint_address != 0) {
-        auto* hint = reinterpret_cast<int32_t*>(mailbox.failed_hint_address);
+    const auto failed_rank = failure.failed_rank;
+    if (failure.failed_hint_address != 0) {
+        auto* hint = reinterpret_cast<int32_t*>(failure.failed_hint_address);
         hint[failed_rank] = 1;
     }
 
@@ -318,8 +313,10 @@ PGResult<void> DeviceCollectiveRuntime::enableRecovery(
     DeviceCollectiveRecoveryWorker& worker, FailureRecoveryCallback callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     failure_recovery_callback_ = std::move(callback);
-    auto added = worker.addMailbox(control_mailbox_,
-                                   [this] { return prepareFailureResume(); });
+    auto added = worker.addMailbox(
+        control_mailbox_, [this](const CollectiveFailureReport& failure) {
+            return prepareFailureResume(failure);
+        });
     if (!added.has_value()) {
         failure_recovery_callback_ = {};
         return makePGError(std::move(added).error());
@@ -399,13 +396,13 @@ PGResult<void> DeviceCollectiveRuntime::shutdown() {
         recovery_worker->removeMailbox(control_mailbox_);
     }
 
-    std::unique_ptr<RingAllReduceProtocol> protocol_to_release;
+    std::unique_ptr<RingAllReduceAlgorithm> algorithm_to_release;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         failure_recovery_callback_ = {};
-        protocol_to_release = std::move(all_reduce_);
+        algorithm_to_release = std::move(all_reduce_);
     }
-    protocol_to_release.reset();
+    algorithm_to_release.reset();
     releaseState();
     {
         std::lock_guard<std::mutex> lock(mutex_);
