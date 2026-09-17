@@ -1,3 +1,4 @@
+#include "ha_metric_manager.h"
 #include "ha/snapshot/batch_oplog/batch_oplog_snapshot_provider.h"
 
 #include <gtest/gtest.h>
@@ -68,6 +69,7 @@ class EmptyBackend final : public HaKvBackend {
 class BatchOpLogSnapshotProviderTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        HAMetricManager::instance().reset_snapshot_runtime(true);
         char pattern[] = "/tmp/mooncake-provider-XXXXXX";
         const char* root = mkdtemp(pattern);
         ASSERT_NE(nullptr, root);
@@ -252,6 +254,10 @@ TEST_F(BatchOpLogSnapshotProviderTest, ReturnsFinalCursorAfterSuffixReplay) {
     EXPECT_EQ(1u, result->last_included_batch_id);
     EXPECT_EQ(2u, result->last_applied_seq);
     EXPECT_EQ(2u, result->last_applied_batch_id);
+    EXPECT_EQ(
+        1u, HAMetricManager::instance().get_snapshot_runtime().suffix_batches);
+    EXPECT_EQ(2u,
+              HAMetricManager::instance().get_snapshot_runtime().durable_batch);
 }
 
 TEST_F(BatchOpLogSnapshotProviderTest,

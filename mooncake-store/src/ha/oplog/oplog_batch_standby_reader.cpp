@@ -90,6 +90,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
 OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollBatches(
     size_t max_batches, uint64_t floor) {
     OpLogBatchStandbyPollResult result;
+    result.compaction_floor = floor;
     DurablePrefix prefix;
     auto err = storage_.ReadDurablePrefix(prefix);
     if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
