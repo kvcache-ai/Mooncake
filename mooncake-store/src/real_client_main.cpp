@@ -2,6 +2,7 @@
 #include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
+#include "allocator_status.h"
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
@@ -119,6 +120,7 @@ int main(int argc, char *argv[]) {
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
     }
+    mooncake::LogAllocatorStatus();
 
     LOG(INFO) << "Mooncake real client version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;

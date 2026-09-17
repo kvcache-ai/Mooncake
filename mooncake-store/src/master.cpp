@@ -14,6 +14,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "allocator_status.h"
 #include "config/rpc_protocol_config.h"
 #include "default_config.h"
 #include "duration_utils.h"
@@ -1520,6 +1521,7 @@ int main(int argc, char* argv[]) {
         google::SetLogDestination(google::GLOG_FATAL, "");
         google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
+    mooncake::LogAllocatorStatus();
 
     LOG(INFO) << "Mooncake master version: "
               << mooncake::MOONCAKE_DISPLAY_VERSION;
