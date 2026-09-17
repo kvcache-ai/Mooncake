@@ -240,145 +240,64 @@ the next scheduler/bootstrap read.
 
 ### Batch OpLog Capacity Operations
 
-Batch pruning removes application keys through the validated fallback snapshot's
-batch ID. The `compaction_floor` is a **batch ID**, never an etcd MVCC revision.
-Pruning, MVCC compaction, and backend defragmentation are separate operations.
-Mooncake does not run an etcd maintenance controller or change legacy retention.
+Batch pruning removes keys, but etcd MVCC history and backend files require
+separate compaction and defragmentation. Mooncake does not run these operations.
+The snapshot `compaction_floor` is a **batch ID**, not an etcd revision.
 
-Before enabling `enable_oplog_snapshot` (which also enables pruning):
+Before enabling pruning through `enable_oplog_snapshot`, deploy compaction-floor
+rebootstrap support to every electable standby; older binaries cannot follow a
+pruned log. Verify shared durable snapshot storage and two distinct, readable
+latest/fallback snapshots, with matching descriptor/manifest cursors and
+`latest.last_included_batch_id > fallback.last_included_batch_id`. Pointer presence
+alone is insufficient. The runtime revalidates both snapshots before pruning;
+rehearse cold restore and promotion before rollout.
 
-1. Deploy compaction-floor/rebootstrap support to **every electable standby**
-   (N09), and retain rollout evidence. An older binary cannot safely follow a
-   pruned log; do not roll back to one after the floor advances.
-2. Verify shared snapshot storage is accessible from every candidate master.
-   A `local` store must use persistent storage shared across those candidates.
-3. After publication, inspect `/oplog/<cluster>/snapshot/latest` and `fallback`.
-   Require distinct descriptors, `latest.batch_id > fallback.batch_id`, matching
-   descriptor/manifest identities and cursors, and readable referenced segments
-   and chunks. These JSON fields are named `last_included_batch_id`. Pointer
-   presence alone is insufficient. Rehearse cold restore and promotion with
-   acknowledged-data verification before production rollout. The first snapshot
-   cannot authorize pruning; the runtime independently revalidates both snapshots
-   before advancing the floor.
+Configure `--quota-backend-bytes` for measured history growth and disk headroom.
+For auto-compaction, `--auto-compaction-mode=periodic --auto-compaction-retention=1h`
+is an example; choose retention for all watch/revision consumers and keep member
+configuration consistent. Monitor each member's `dbSize`, `dbSizeInUse`, quota
+utilization and free disk space. Increasing quota does not replace cleanup.
 
-#### Monitor and provision
+For Mooncake alerts, use `ha_snapshot_active=1` and the metrics described above.
+Snapshot storage outages stall new baselines and pruning; GC failures retain
+orphan artifacts. These failures retain recovery data safely but grow storage
+until availability is at risk. The logical retained suffix does not include
+undeleted keys below the floor. Never lower the floor or manually delete batch
+keys/pointers to clear a capacity alarm.
 
-Persist the configuration and before/after output for each maintenance window.
-Choose `--quota-backend-bytes` from measured write rate, retained history and disk
-headroom; increasing it is not a replacement for cleanup. For example,
-`--auto-compaction-mode=periodic --auto-compaction-retention=1h` is a starting
-policy, to be adjusted for the cluster's watch/revision consumers. Keep configuration
-consistent across members. See [etcd configuration](https://etcd.io/docs/v3.5/op-guide/configuration/).
-
-Monitor every member's `dbSize`, `dbSizeInUse`, quota utilization, disk space,
-leader and alarm state. The metrics endpoint exposes
-`etcd_mvcc_db_total_size_in_bytes`, `etcd_mvcc_db_total_size_in_use_in_bytes`,
-and `etcd_server_quota_backend_bytes`; use the names exported by your etcd version.
-Alert before quota exhaustion with room for the maintenance response time.
-See [etcd monitoring](https://etcd.io/docs/v3.5/op-guide/monitoring/).
-
-For Mooncake, filter snapshot freshness/capacity alerts on `ha_snapshot_active=1`.
-Track latest/fallback age, floor progress, upload/bootstrap/prune latency and
-independent GC/prune errors. `ha_snapshot_uncompacted_batches` is a logical suffix,
-not a count of physical keys: failed deletion can leave keys below the floor.
-Count `/oplog/<cluster>/batches/` separately. A snapshot backend outage prevents new
-recovery baselines and therefore bounds on retained history from advancing. A GC
-backlog retains orphan artifacts. These failures preserve data rather than deleting
-unverified recovery state, but sustained growth can exhaust storage and affect
-availability. Do not clear pointers, lower the floor, or delete batch keys manually
-as an alarm workaround.
-
-#### Operator maintenance sequence
-
-Use your deployment's authentication/TLS options with these commands. `$ENDPOINTS`
-contains all members; `$MEMBER` is exactly one endpoint selected by the operator.
-Save command output, including failures, in the maintenance record.
+Use your deployment's TLS/authentication options. Before and after maintenance,
+save these checks; `$ENDPOINTS` lists all members:
 
 ```bash
-export ETCDCTL_API=3
 etcdctl --endpoints="$ENDPOINTS" member list -w json
 etcdctl --endpoints="$ENDPOINTS" endpoint health
 etcdctl --endpoints="$ENDPOINTS" endpoint status -w json
 etcdctl --endpoints="$ENDPOINTS" alarm list
 ```
 
-Establish healthy quorum and identify the current leader. Select a revision from a
-successful linearizable read that respects all consumers' required history. For an
-emergency with mutations quiesced, the current revision can reclaim all older
-history; record that choice. Never substitute Mooncake's floor for this revision.
-Compact once, then defragment **one member at a time**, healthy followers first and
-the leader last. Recheck health/quorum and status between members; stop if degraded.
-Defragmentation blocks requests on that member. Inspect sizes rather than trusting
-exit status alone. See [etcd maintenance](https://etcd.io/docs/v3.5/op-guide/maintenance/).
+Confirm healthy quorum and identify the leader. Select `$REVISION` from a successful
+linearizable read, respecting required history; with mutations quiesced, the current
+revision can be used for emergency reclamation. Compact once, then defragment one
+member at a time, healthy followers first and leader last. `$MEMBER` must name one
+endpoint. Defrag blocks that member; recheck health/quorum between members and stop
+if degraded. Compare sizes before/after rather than relying only on exit status.
 
 ```bash
 etcdctl --endpoints="$MEMBER" compact "$REVISION" --physical
-# Repeat separately for each selected member, checking quorum between calls.
-etcdctl --endpoints="$MEMBER" defrag
-etcdctl --endpoints="$ENDPOINTS" endpoint health
-etcdctl --endpoints="$ENDPOINTS" endpoint status -w json
-etcdctl --endpoints="$ENDPOINTS" alarm list
+etcdctl --endpoints="$MEMBER" defrag  # Repeat separately for each member.
 ```
 
-For `NOSPACE`, first stop or limit application mutations. Health probes requiring a
-commit may fail under the alarm: use member status/leader information as well.
-Remove only independently known disposable data if necessary; compact history,
-defragment members sequentially, and confirm space below quota on every member.
-Then disarm the alarm, check health and a controlled write/read, and restore traffic
-gradually. Mooncake may require master restart/re-election after writer fail-stop;
-audit previously acknowledged data and promotion readiness before resuming load.
+For `NOSPACE`: stop/limit mutations → compact → defrag each member → confirm space
+below quota on every member → `etcdctl --endpoints="$ENDPOINTS" alarm disarm` →
+repeat checks and verify a controlled write/read → gradually restore traffic.
+Health probes requiring a commit may fail under the alarm; inspect member status
+as well. After writer fail-stop, Mooncake may need master restart/re-election;
+verify acknowledged data and promotion readiness before resuming load.
 
-```bash
-etcdctl --endpoints="$ENDPOINTS" alarm disarm
-etcdctl --endpoints="$ENDPOINTS" alarm list
-etcdctl --endpoints="$ENDPOINTS" endpoint health
-etcdctl --endpoints="$ENDPOINTS" endpoint status -w json
-```
-
-#### Reproducible capacity tests
-
-Build `mooncake_master`, `oplog_batch_inspector`, and `oplog_ha_client` with
-`STORE_USE_ETCD=ON`. Put matching etcd/etcdctl 3.5+ binaries on `PATH`; the harness
-also needs its existing Python/aiohttp environment. Run from the repository root:
-
-```bash
-bash mooncake-store/tests/e2e/run_oplog_batch_cluster_test.sh
-mooncake-store/tests/e2e/run_oplog_batch_cluster.sh capacity-soak \
-  --build-dir /path/to/build --run-dir /tmp/n13-soak \
-  --capacity-seconds 3600 --capacity-max-batches 2048
-mooncake-store/tests/e2e/run_oplog_batch_cluster.sh capacity-nospace \
-  --build-dir /path/to/build --run-dir /tmp/n13-nospace
-```
-
-Both commands require a new directory and create their own local etcd; external
-endpoints are rejected. The fixture uses two masters, shared local snapshots and a
-single etcd member. It validates reclamation/recovery, **not multi-member quorum
-availability**. Rehearse the sequential member procedure separately on a staging
-cluster matching production topology.
-
-The soak keeps live objects bounded while repeatedly writing, snapshotting,
-rotating pointers, collecting orphans and pruning. It samples consistent-revision
-key/control state and raw Prometheus metrics, and compacts/defragments every six
-workload rounds and at the end. It requires at least three positive floor values,
-a configured live-key bound, no missing durable batches above the floor, and
-completed deletion at the final floor. Restart and promotion audit fixed surviving
-keys, recent acknowledged writes and deleted keys; new writes must work afterward.
-
-The NOSPACE case first establishes the same recovery state, quiesces masters, then
-fills history using one disposable non-Mooncake key under a 16 MiB quota. It checks
-the actual NOSPACE alarm, deletes only its padding key, compacts, defragments,
-disarms, verifies health/write recovery, and runs the master/data audits. Production
-namespace deletion is never part of this recipe.
-
-`<run-dir>/capacity/` retains each sample's batch keys, revision, durable prefix,
-latest/fallback/floor, member status, alarms and metrics. Operation counts and
-cumulative durations come from M02; capture pause is a last-observed sample, not a
-latency histogram. Maintenance directories retain status before compaction, after
-compaction and after defrag. `soak-result.json` records the measured duration and
-peak key count; `audits.log` records restart/promotion checks and elapsed times.
-Logs and acknowledgement manifests remain under `logs/` and `workload/` even when
-a test fails. Processes are stopped on exit. A short `--capacity-seconds 30` run is
-only a smoke test; retain the duration and evidence when reporting long-soak results.
+See the etcd [maintenance](https://etcd.io/docs/v3.5/op-guide/maintenance/) and
+[configuration](https://etcd.io/docs/v3.5/op-guide/configuration/) guides for details.
+Capacity test commands and evidence are documented in
+`mooncake-store/tests/e2e/readme.md` under “Batch OpLog capacity tests”.
 
 ---
 
