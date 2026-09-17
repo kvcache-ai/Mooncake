@@ -183,6 +183,10 @@ DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
+DEFINE_uint32(heartbeat_rpc_port, 0,
+              "Port of a separate RPC server that also serves Ping, so a long "
+              "handler on the main server cannot delay heartbeats; clients "
+              "discover it on Connect (0 = disabled, non-HA mode only)");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Mem eviction ratio must be between 0.0 and 1.0";
@@ -512,6 +516,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
+    default_config.GetUInt32("heartbeat_rpc_port",
+                             &master_config.heartbeat_rpc_port,
+                             FLAGS_heartbeat_rpc_port);
     default_config.GetDurationMs("default_kv_lease_ttl",
                                  &master_config.default_kv_lease_ttl,
                                  mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL);
@@ -857,6 +864,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.rpc_enable_tcp_no_delay = FLAGS_rpc_enable_tcp_no_delay;
+    }
+    if ((google::GetCommandLineFlagInfo("heartbeat_rpc_port", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.heartbeat_rpc_port = FLAGS_heartbeat_rpc_port;
     }
     if ((google::GetCommandLineFlagInfo("enable_metric_reporting", &info) &&
          !info.is_default) ||
@@ -1683,6 +1695,7 @@ int main(int argc, char* argv[]) {
         << ", rpc_conn_timeout_seconds="
         << master_config.rpc_conn_timeout_seconds
         << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
+        << ", heartbeat_rpc_port=" << master_config.heartbeat_rpc_port
         << ", rpc protocol=" << protocol
         << ", cluster_id=" << master_config.cluster_id
         << ", root_fs_dir=" << master_config.root_fs_dir
@@ -1751,6 +1764,8 @@ int main(int argc, char* argv[]) {
     }
 
     if (master_config.enable_ha) {
+        LOG_IF(WARNING, master_config.heartbeat_rpc_port != 0)
+            << "heartbeat_rpc_port is not supported in HA mode and is ignored";
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
         supervisor_config.http_metadata_server = metadata_server_ptr;
@@ -1786,6 +1801,27 @@ int main(int argc, char* argv[]) {
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
 
+        std::unique_ptr<coro_rpc::coro_rpc_server> heartbeat_server;
+        if (master_config.heartbeat_rpc_port != 0) {
+            heartbeat_server = std::make_unique<coro_rpc::coro_rpc_server>(
+                /*thread_num=*/1, master_config.heartbeat_rpc_port,
+                master_config.rpc_address,
+                std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
+                master_config.rpc_enable_tcp_no_delay);
+            if (mooncake::RpcProtocolConfig::FromEnvironment().use_rdma) {
+                heartbeat_server->init_ibv();
+            }
+            mooncake::RegisterHeartbeatRpcService(*heartbeat_server,
+                                                  *wrapped_master_service);
+            if (auto ec = heartbeat_server->async_start(); ec.hasResult()) {
+                LOG(ERROR) << "Failed to start heartbeat RPC server on port "
+                           << master_config.heartbeat_rpc_port;
+                return 1;
+            }
+            wrapped_master_service->SetHeartbeatRpcPort(
+                master_config.heartbeat_rpc_port);
+        }
+
         static std::atomic<bool> shutdown_requested{false};
         auto signal_handler = [](int /* signum */) {
             shutdown_requested.store(true);
@@ -1806,6 +1842,9 @@ int main(int argc, char* argv[]) {
 
         server.stop();
         server_thread.join();
+        if (heartbeat_server) {
+            heartbeat_server->stop();
+        }
 
         if (shutdown_requested.load()) {
             LOG(INFO) << "Shutdown signal received, exiting gracefully";
