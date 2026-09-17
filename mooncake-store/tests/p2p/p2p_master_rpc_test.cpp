@@ -399,8 +399,23 @@ class P2PMasterRpcShutdownTest : public ::testing::TestWithParam<bool> {
                 return true;
             }
             if (error) {
-                LOG(ERROR) << "Unexpected listener probe failure: " << error;
-                return false;
+                // coro_rpc 0.5.7's close_acceptor() runs acceptor_.cancel()
+                // and acceptor_.close() asynchronously on the acceptor's
+                // executor (then signals the waiter). In the brief window
+                // between the two, a probe SYN can still complete the
+                // handshake and sit in the accept backlog; the listener
+                // then closes without accepting it, so the kernel RSTs that
+                // queued connection and connect() reports ECONNRESET -- not
+                // yet ECONNREFUSED. ECONNREFUSED only appears once the listen
+                // socket is fully gone, when the kernel rejects bare SYNs.
+                // Hence connection_reset is a legitimate "listener is tearing
+                // down" intermediate state, not an unexpected failure: keep
+                // polling until we observe the definitive connection_refused
+                // (or hit the deadline) instead of bailing the whole probe.
+                if (error != asio::error::connection_reset) {
+                    LOG(ERROR) << "Unexpected listener probe failure: " << error;
+                    return false;
+                }
             }
             // Poll listener state; request/stop ordering is controlled by
             // gates.
