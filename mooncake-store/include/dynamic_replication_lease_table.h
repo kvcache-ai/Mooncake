@@ -120,12 +120,6 @@ class DynamicReplicationLeaseTable {
         return leases_.empty();
     }
 
-    // Only the suites read a lease by key; production reaches one by proposal.
-    [[nodiscard]] bool HasLeaseForObjectForTest(std::string_view key) const {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        return by_key_.contains(key);
-    }
-
    private:
     // Earliest deadline first.
     struct Deadline {

@@ -41,10 +41,8 @@ TEST(DynamicReplicationLeaseTableTest, IsKeyedByProposalId) {
     ASSERT_TRUE(found.has_value());
     EXPECT_EQ(found->key, "k1");
 
-    // An unknown proposal finds nothing, and the by-key view agrees.
+    // An unknown proposal finds nothing.
     EXPECT_FALSE(table.Find(UUID{9, 9}).has_value());
-    EXPECT_TRUE(table.HasLeaseForObjectForTest("k1"));
-    EXPECT_FALSE(table.HasLeaseForObjectForTest("k2"));
 
     EXPECT_TRUE(table.Remove(proposal));
     EXPECT_FALSE(table.Remove(proposal));
@@ -58,12 +56,13 @@ TEST(DynamicReplicationLeaseTableTest, ReplaceMovesTheProposalToItsNewKey) {
     table.Put(proposal, MakeLease(proposal, "k1", 0));
     table.Put(proposal, MakeLease(proposal, "k2", 0));
 
-    EXPECT_FALSE(table.HasLeaseForObjectForTest("k1"));
-    EXPECT_TRUE(table.HasLeaseForObjectForTest("k2"));
-
-    // Retracting the old key must not touch the lease it no longer holds.
+    // Retracting the old key must not touch a lease that no longer sits under
+    // it, and the key the lease moved to is the one that retracts it.
     table.EraseForObject("k1");
     EXPECT_TRUE(table.Find(proposal).has_value());
+
+    table.EraseForObject("k2");
+    EXPECT_FALSE(table.Find(proposal).has_value());
 }
 
 TEST(DynamicReplicationLeaseTableTest,
@@ -91,14 +90,19 @@ TEST(DynamicReplicationLeaseTableTest, ErasingExpiredKeepsTheLiveOnes) {
     const auto now = std::chrono::system_clock::now();
     const UUID expired{1, 2};
     const UUID live{3, 4};
+    // One key on purpose: the sweep has to drop the expired proposal without
+    // taking the live one, or its key, out with it.
     table.Put(expired, MakeLease(expired, "k1", EpochMillis(now) - 1));
-    table.Put(live, MakeLease(live, "k2", EpochMillis(now) + 60'000));
+    table.Put(live, MakeLease(live, "k1", EpochMillis(now) + 60'000));
 
     table.EraseExpired(now);
 
     EXPECT_FALSE(table.Find(expired).has_value());
     EXPECT_TRUE(table.Find(live).has_value());
-    EXPECT_FALSE(table.HasLeaseForObjectForTest("k1"));
+
+    // The key still retracts what is left under it.
+    table.EraseForObject("k1");
+    EXPECT_FALSE(table.Find(live).has_value());
 }
 
 TEST(DynamicReplicationLeaseTableTest, SweepKeepsALeaseExtendedPastTheOldOne) {
