@@ -356,6 +356,32 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
     // are address-range based, so each chunk gets the correct key).
     size_t chunk_limit = (size_t)globalConfig().max_mr_size;
+    // Round the chunk limit down to the buffer's page size before splitting.
+    // Otherwise a non-page-aligned effective max_mr_size (e.g. a hand-set
+    // MC_MAX_MR_SIZE) produces chunk boundaries that fall inside a HugeTLB
+    // page. ibv_fork_init() then makes ibv_reg_mr()/pre-touch run MADV_DONTFORK
+    // on that range, and the kernel refuses to split a hugetlb VMA at a
+    // non-hugepage-aligned boundary, failing with EINVAL. Aligning the limit
+    // down keeps every chunk (and thus every pre-touch block) page-aligned.
+    // A limit smaller than one page cannot yield a page-aligned chunk at all,
+    // so report the conflict instead of silently registering an oversized or
+    // misaligned MR.
+    const size_t buffer_page_size = detectBufferPageSize(addr);
+    if (chunk_limit > 0 && buffer_page_size > 0) {
+        const size_t aligned_limit =
+            chunk_limit / buffer_page_size * buffer_page_size;
+        if (aligned_limit == 0) {
+            LOG(ERROR) << "Effective max_mr_size " << chunk_limit
+                       << " is smaller than the buffer page size "
+                       << buffer_page_size
+                       << "; cannot form a page-aligned MR chunk. Raise "
+                          "MC_MAX_MR_SIZE to at least one page, or check it "
+                          "against the device max_mr_size and the hugepage "
+                          "configuration.";
+            return ERR_INVALID_ARGUMENT;
+        }
+        chunk_limit = aligned_limit;
+    }
     std::vector<std::pair<void *, size_t>> chunks;
     if (chunk_limit > 0 && length > chunk_limit) {
         for (size_t offset = 0; offset < length;) {
