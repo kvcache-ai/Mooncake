@@ -286,12 +286,12 @@ jobs:
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_rust_cluster
           MOONCAKE_STORE_RUST_LINK_ASAN: "0"
-        run: ./scripts/ci/smoke/run_store_rust_smoke.sh
+        run: ./scripts/ci/run_store_rust_smoke.sh
 
       - name: Run Transfer Engine Rust smoke test
         env:
           MOONCAKE_TE_RUST_LINK_ASAN: "0"
-        run: ./scripts/ci/smoke/run_transfer_engine_rust_smoke.sh
+        run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
 
       - name: Check Mooncake Store Rust bindings, examples, and tests
         env:
@@ -322,7 +322,7 @@ jobs:
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_go_cluster
           MOONCAKE_STORE_GO_SANITIZED: "0"
-        run: ./scripts/ci/integration/run_store_go_integration.sh
+        run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Build and install Python wheel for integration tests
         run: |
@@ -378,7 +378,7 @@ jobs:
           python scripts/test_drain_http_api.py --timeout-sec 90
 
       - name: Run RPC Communicator Bandwidth Test
-        run: ./scripts/ci/smoke/run_rpc_smoke.sh
+        run: ./scripts/ci/run_rpc_smoke.sh
         shell: bash
 
   nightly-coverage:
@@ -453,18 +453,18 @@ jobs:
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_asan_rust_cluster
           MOONCAKE_STORE_RUST_LINK_ASAN: "1"
-        run: ./scripts/ci/smoke/run_store_rust_smoke.sh
+        run: ./scripts/ci/run_store_rust_smoke.sh
 
       - name: Run Transfer Engine Rust sanitizer smoke test
         env:
           MOONCAKE_TE_RUST_LINK_ASAN: "1"
-        run: ./scripts/ci/smoke/run_transfer_engine_rust_smoke.sh
+        run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
 
       - name: Run Go store binding sanitizer integration tests
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_asan_go_cluster
           MOONCAKE_STORE_GO_SANITIZED: "1"
-        run: ./scripts/ci/integration/run_store_go_integration.sh
+        run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Generate coverage report
         id: coverage

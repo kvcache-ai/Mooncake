@@ -12,7 +12,7 @@ from packaging.version import Version
 
 def _load_gate_module():
     repository = Path(__file__).resolve().parents[2]
-    script = repository / "scripts" / "ci" / "release" / "testpypi_wheel_gate.py"
+    script = repository / "scripts" / "ci" / "testpypi_wheel_gate.py"
     spec = importlib.util.spec_from_file_location("testpypi_wheel_gate", script)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

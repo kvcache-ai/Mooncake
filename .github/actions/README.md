@@ -1,11 +1,11 @@
-# CI layout
+# Shared CI actions
 
 Keep workflow entry points at their established paths directly under
 `.github/workflows/`: GitHub Actions does not discover workflow subdirectories.
 
 Workflows declare triggers, permissions, runners, job dependencies, build options,
 and the sequence of named steps. Shared implementation belongs in composite
-actions under `.github/actions/` or scripts here, not copied inline shell blocks.
+actions under `.github/actions/` or existing CI scripts, not copied inline shell blocks.
 
 ## Shared steps
 
@@ -40,17 +40,8 @@ For example, after building and starting services:
 Platform-specific build flags, permissions, secrets, matrices, and job IDs remain
 in the workflows. Do not hide these behind a universal shell dispatcher.
 
-## Script directories
-
-- `common/`: service lifecycle helpers for smoke and integration suites.
-- `smoke/`: RPC, Store API, SSD offload, and Rust smoke suites.
-- `integration/`: Go integration suite.
-- `release/`: TestPyPI wheel validation.
-- `tests/`: unit tests for CI scripts and shared actions.
-
-Run lightweight tests from the repository root:
+## Local validation
 
 ```sh
-python -m unittest discover -s scripts/ci/tests -v
-python -m pytest -q mooncake-wheel/tests/test_testpypi_wheel_gate.py
+python -m unittest discover -s .github/actions/tests -v
 ```

@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 
-SERVICES = Path(__file__).resolve().parents[1] / "common" / "services.sh"
+SERVICES = Path(__file__).resolve().parents[1] / "services.sh"
 
 
 class ServicesTest(unittest.TestCase):

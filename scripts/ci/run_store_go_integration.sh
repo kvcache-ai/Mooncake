@@ -2,8 +2,8 @@
 
 set -e -o pipefail
 
-# shellcheck source=scripts/ci/common/services.sh
-source "$(dirname "${BASH_SOURCE[0]}")/../common/services.sh"
+# shellcheck source=scripts/ci/services.sh
+source "$(dirname "${BASH_SOURCE[0]}")/services.sh"
 : "${RUNNER_TEMP:=${TMPDIR:-/tmp}}"
 trap 'ci_cleanup_services "$?"' EXIT
 

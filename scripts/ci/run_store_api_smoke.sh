@@ -2,9 +2,9 @@
 
 set -e -o pipefail
 
-cd "$(dirname "${BASH_SOURCE[0]}")/../../.."
+cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 : "${RUNNER_TEMP:=${TMPDIR:-/tmp}}"
-source scripts/ci/common/services.sh
+source scripts/ci/services.sh
 
 trap 'ci_cleanup_services "$?"' EXIT
 

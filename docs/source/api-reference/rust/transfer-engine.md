@@ -26,7 +26,7 @@ For Transfer Engine design docs and non-Rust APIs, see:
 - **Runtime**:
   - Dynamic linker must find Transfer Engine shared libraries (`libasio.so`, …).
   - A metadata server (HTTP metadata, etcd, or `P2PHANDSHAKE`) must be reachable.
-  - GitHub Actions runs `scripts/ci/smoke/run_transfer_engine_rust_smoke.sh` after the
+  - GitHub Actions runs `scripts/ci/run_transfer_engine_rust_smoke.sh` after the
     C++ build (`cargo test --lib` plus the TCP loopback `minimal_smoke` test).
 
 ## Quick start

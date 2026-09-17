@@ -106,7 +106,7 @@ cargo test --test minimal_smoke -- --nocapture
 ```
 
 GitHub Actions runs the same smoke (plus `cargo test --lib`) from
-`scripts/ci/smoke/run_transfer_engine_rust_smoke.sh` after the C++ build. ASan
+`scripts/ci/run_transfer_engine_rust_smoke.sh` after the C++ build. ASan
 jobs set `MOONCAKE_TE_RUST_LINK_ASAN=1`; nightly Release jobs leave it at
 `0`. CI points `MC_METADATA_SERVER` at the HTTP metadata bootstrap server.
 

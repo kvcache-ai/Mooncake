@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 
-ACTIONS = Path(__file__).resolve().parents[3] / ".github" / "actions"
+ACTIONS = Path(__file__).resolve().parents[1]
 
 
 class SharedActionsTest(unittest.TestCase):

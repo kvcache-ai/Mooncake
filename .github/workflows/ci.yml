@@ -142,15 +142,15 @@ jobs:
         sudo sysctl -w \
           "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
 
-        ./scripts/ci/smoke/run_store_api_smoke.sh
-        ./scripts/ci/smoke/run_rpc_smoke.sh
+        ./scripts/ci/run_store_api_smoke.sh
+        ./scripts/ci/run_rpc_smoke.sh
       shell: bash
 
     - name: Run SSD offload and promotion end-to-end tests
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       run: |
         source test_env/bin/activate
-        ./scripts/ci/smoke/run_ssd_offload_smoke.sh
+        ./scripts/ci/run_ssd_offload_smoke.sh
       shell: bash
 
   unit-tests:
@@ -550,7 +550,7 @@ jobs:
               - 'cmake/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
-              - 'scripts/ci/smoke/run_transfer_engine_rust_smoke.sh'
+              - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
               - '.github/actions/**'
               - '.github/workflows/ci.yml'
             docs:
@@ -729,7 +729,7 @@ jobs:
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
         MOONCAKE_TE_RUST_LINK_ASAN: "0"
-      run: ./scripts/ci/smoke/run_transfer_engine_rust_smoke.sh
+      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
       shell: bash
 
     - name: Run sccache stat for check
