@@ -106,6 +106,38 @@ TEST(AdaptiveCongestionControlTest, ObserveModeAllowsStaleGeneration) {
     EXPECT_EQ(snapshot(route).inflight_bytes, 0u);
 }
 
+TEST(AdaptiveCongestionControlTest,
+     ObserveModeRecoversAfterSuccessfulCurrentProbe) {
+    Config config = testConfig(Mode::kObserve);
+    config.hard_error_threshold = 1;
+    DomainState route(config);
+
+    Permit failed;
+    ASSERT_EQ(tryAcquire({nullptr, &route, 0, generation(route)}, 8, failed),
+              Decision::kAllow);
+    ASSERT_TRUE(complete(failed, OutcomeClass::kFatal, FailureScope::kRoute));
+    controlTick(route, 1'000);
+    ASSERT_EQ(snapshot(route).state, PathState::kQuarantined);
+
+    Permit allowed_during_quarantine;
+    EXPECT_EQ(tryAcquire({nullptr, &route, 0, generation(route)}, 8,
+                         allowed_during_quarantine),
+              Decision::kAllow);
+    ASSERT_TRUE(complete(allowed_during_quarantine, OutcomeClass::kDerivedFlush,
+                         FailureScope::kOperation));
+
+    controlTick(route, 11'000);
+    ASSERT_EQ(snapshot(route).state, PathState::kProbing);
+
+    Permit probe;
+    ASSERT_EQ(tryAcquire({nullptr, &route, 0, generation(route)}, 8, probe),
+              Decision::kAllow);
+    ASSERT_TRUE(
+        complete(probe, OutcomeClass::kSuccess, FailureScope::kOperation));
+    controlTick(route, 12'000);
+    EXPECT_EQ(snapshot(route).state, PathState::kHealthy);
+}
+
 TEST(AdaptiveCongestionControlTest, MovingPermitTransfersItsReservation) {
     DomainState device(testConfig());
     DomainState route(testConfig());
