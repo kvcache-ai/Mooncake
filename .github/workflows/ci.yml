@@ -142,15 +142,15 @@ jobs:
         sudo sysctl -w \
           "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
 
-        ./scripts/ci/run_store_api_smoke.sh
-        ./scripts/ci/run_rpc_smoke.sh
+        ./scripts/ci/smoke/run_store_api_smoke.sh
+        ./scripts/ci/smoke/run_rpc_smoke.sh
       shell: bash
 
     - name: Run SSD offload and promotion end-to-end tests
       if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.12'
       run: |
         source test_env/bin/activate
-        ./scripts/ci/run_ssd_offload_smoke.sh
+        ./scripts/ci/smoke/run_ssd_offload_smoke.sh
       shell: bash
 
   unit-tests:
@@ -598,7 +598,7 @@ jobs:
               - 'cmake/**'
               - 'CMakeLists.txt'
               - 'dependencies.sh'
-              - 'scripts/ci/run_transfer_engine_rust_smoke.sh'
+              - 'scripts/ci/smoke/run_transfer_engine_rust_smoke.sh'
               - '.github/actions/**'
               - '.github/workflows/ci.yml'
             docs:
@@ -618,13 +618,13 @@ jobs:
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
-    uses: ./.github/workflows/ci_efa.yml
+    uses: ./.github/workflows/ci-efa.yml
     secrets: inherit
 
   build-wheel-rocm:
     needs: [spell-check, clang-format, check-paths]
     if: needs.check-paths.outputs.src == 'true'
-    uses: ./.github/workflows/ci_rocm.yml
+    uses: ./.github/workflows/ci-rocm.yml
     secrets: inherit
 
   tent-ci:
@@ -784,7 +784,7 @@ jobs:
       env:
         MOONCAKE_BUILD_DIR: ${{ github.workspace }}/build-tent
         MOONCAKE_TE_RUST_LINK_ASAN: "0"
-      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+      run: ./scripts/ci/smoke/run_transfer_engine_rust_smoke.sh
       shell: bash
 
     - name: Run sccache stat for check

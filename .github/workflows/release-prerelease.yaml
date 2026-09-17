@@ -39,7 +39,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          normalized=$(python scripts/ci/testpypi_wheel_gate.py \
+          normalized=$(python scripts/ci/release/testpypi_wheel_gate.py \
             normalize-version --tag "$RELEASE_TAG")
           echo "package_version=${normalized}" >> "$GITHUB_OUTPUT"
           echo "Normalized ${RELEASE_TAG} to ${normalized}"
@@ -155,7 +155,7 @@ jobs:
 
       - name: Validate empty or resumable TestPyPI upload state
         run: |
-          python scripts/ci/testpypi_wheel_gate.py validate-upload-state \
+          python scripts/ci/release/testpypi_wheel_gate.py validate-upload-state \
             --directory mooncake-wheel/dist-release \
             --version "$PACKAGE_VERSION"
 
@@ -169,7 +169,7 @@ jobs:
 
       - name: Verify every published wheel hash
         run: |
-          python scripts/ci/testpypi_wheel_gate.py wait-upload-state \
+          python scripts/ci/release/testpypi_wheel_gate.py wait-upload-state \
             --directory mooncake-wheel/dist-release \
             --version "$PACKAGE_VERSION"
 
@@ -289,7 +289,7 @@ jobs:
   tone-integration:
     name: Validate T-one integration with TestPyPI wheel
     needs: [version-stamp, consume-testpypi]
-    uses: ./.github/workflows/integration-test.yml
+    uses: ./.github/workflows/ci-integration.yml
     with:
       testpypi_version: ${{ needs.version-stamp.outputs.package_version }}
     secrets: inherit

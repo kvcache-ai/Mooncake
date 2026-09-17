@@ -9,7 +9,7 @@ on:
 jobs:
   qoder-assistant:
     if: |
-      contains(github.event.comment.body, '@qoder') && 
+      contains(github.event.comment.body, '@qoder') &&
       !endsWith(github.event.comment.user.login, '[bot]')
     runs-on: ubuntu-latest
     permissions:
@@ -36,17 +36,17 @@ jobs:
           URL: ${{ github.event.comment.html_url }}
           IS_PR: ${{ github.event.issue.pull_request != null || github.event_name == 'pull_request_review_comment' }}
           ISSUE_OR_PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}"
-          
+
           if [ -n "${{ github.event.comment.pull_request_review_id }}" ]; then
             ARGS="$ARGS
           REVIEW_ID: ${{ github.event.comment.pull_request_review_id }}"
           fi
-          
+
           if [ -n "${{ github.event.comment.in_reply_to_id }}" ]; then
             ARGS="$ARGS
           REPLY_TO_COMMENT_ID: ${{ github.event.comment.in_reply_to_id }}"
           fi
-          
+
           echo "args<<EOF" >> $GITHUB_OUTPUT
           echo "$ARGS" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT

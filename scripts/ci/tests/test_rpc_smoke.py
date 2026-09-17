@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 
-SCRIPT = Path(__file__).resolve().parents[1] / "run_rpc_smoke.sh"
+SCRIPT = Path(__file__).resolve().parents[1] / "smoke" / "run_rpc_smoke.sh"
 
 
 class RpcSmokeTest(unittest.TestCase):
