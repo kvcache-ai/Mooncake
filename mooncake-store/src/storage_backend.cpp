@@ -1521,8 +1521,7 @@ BucketIdGenerator::BucketIdGenerator(int64_t start) {
         auto cur_time_stamp = time_gen();
         // Salt with pid so two clients starting in the same second do not
         // share an identical id sequence (Mooncake #3528).
-        const int64_t salt =
-            static_cast<int64_t>(::getpid()) & SEQUENCE_MASK;
+        const int64_t salt = static_cast<int64_t>(::getpid()) & SEQUENCE_MASK;
         current_id_ = (cur_time_stamp << TIMESTAMP_SHIFT) | salt;
     } else {
         current_id_ = start;

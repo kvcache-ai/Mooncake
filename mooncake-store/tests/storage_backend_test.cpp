@@ -602,32 +602,68 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
     EXPECT_GE(last_id, 101000);  // Should have increased by at least 100,000
 }
 
+TEST_F(StorageBackendTest, SharedStoragePathSecondLiveInitFails) {
+    // #3528: one live client per storage_path — second Init must fail fast.
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend first(config, bucket_config);
+    ASSERT_TRUE(first.Init().has_value());
+
+    BucketStorageBackend second(config, bucket_config);
+    auto second_init = second.Init();
+    ASSERT_FALSE(second_init.has_value())
+        << "second live client on the same storage_path must fail Init";
+}
+
+TEST_F(StorageBackendTest, SplitStoragePathBothInitOk) {
+    // #3528: per-client directories remain supported.
+    FileStorageConfig config_a;
+    FileStorageConfig config_b;
+    config_a.storage_filepath = data_path + "/client_a";
+    config_b.storage_filepath = data_path + "/client_b";
+    fs::create_directories(config_a.storage_filepath);
+    fs::create_directories(config_b.storage_filepath);
+    BucketBackendConfig bucket_config;
+
+    BucketStorageBackend a(config_a, bucket_config);
+    BucketStorageBackend b(config_b, bucket_config);
+    ASSERT_TRUE(a.Init().has_value());
+    ASSERT_TRUE(b.Init().has_value());
+}
+
 TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
-    // Create a valid bucket with data and metadata
-    BucketStorageBackend storage_backend(config, bucket_config);
-    ASSERT_TRUE(storage_backend.Init());
+    int64_t valid_bucket_id = 0;
+    {
+        // Create a valid bucket, then drop the live client so later Init can
+        // reclaim the same storage_path (#3528 flock).
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
 
-    std::shared_ptr<SimpleAllocator> client_buffer_allocator =
-        std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
+        std::shared_ptr<SimpleAllocator> client_buffer_allocator =
+            std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
 
-    // Create one valid bucket
-    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
-    std::string key = "test_key";
-    std::string data = "test_data_content";
-    void* buffer = client_buffer_allocator->allocate(data.size());
-    memcpy(buffer, data.data(), data.size());
-    batched_slices.emplace(key, std::vector<Slice>{Slice{buffer, data.size()}});
+        // Create one valid bucket
+        std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+        std::string key = "test_key";
+        std::string data = "test_data_content";
+        void* buffer = client_buffer_allocator->allocate(data.size());
+        memcpy(buffer, data.data(), data.size());
+        batched_slices.emplace(key,
+                               std::vector<Slice>{Slice{buffer, data.size()}});
 
-    auto result = storage_backend.BatchOffload(
-        batched_slices, [](const std::vector<std::string>& keys,
-                           std::vector<StorageObjectMetadata>& metadatas) {
-            return ErrorCode::OK;
-        });
-    ASSERT_TRUE(result);
-    int64_t valid_bucket_id = result.value();
+        auto result = storage_backend.BatchOffload(
+            batched_slices, [](const std::vector<std::string>& keys,
+                               std::vector<StorageObjectMetadata>& metadatas) {
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(result);
+        valid_bucket_id = result.value();
+    }
 
     // Manually create an orphaned bucket file (simulate crash scenario)
     // The orphaned file will have a different ID and no corresponding .meta
@@ -3598,6 +3634,10 @@ TEST_F(StorageBackendTest, BucketBatchOffloadContinuesAfterFinalizeFailure) {
     ASSERT_TRUE(new_exists.has_value());
     EXPECT_TRUE(new_exists.value());
 
+    // #3528: end the live client before same-path re-Init (flock).
+    storage_backend.~BucketStorageBackend();
+    new (&storage_backend) BucketStorageBackend(config, bucket_config);
+
     BucketStorageBackend restarted_backend(config, bucket_config);
     ASSERT_TRUE(restarted_backend.Init());
 
@@ -3664,6 +3704,10 @@ TEST_F(StorageBackendTest,
     auto exists = storage_backend.IsExist("watermark_key");
     ASSERT_TRUE(exists.has_value());
     EXPECT_FALSE(exists.value());
+
+    // #3528: end the live client before same-path re-Init (flock).
+    storage_backend.~BucketStorageBackend();
+    new (&storage_backend) BucketStorageBackend(config, bucket_config);
 
     BucketStorageBackend restarted_backend(config, bucket_config);
     ASSERT_TRUE(restarted_backend.Init());
