@@ -47,6 +47,12 @@ def test_dependency_boundaries_are_declared() -> None:
         "structured",
         "vllm",
     }
+    assert metadata["optional-dependencies"]["administration"] == ["paramiko"]
+
+
+def test_legacy_packaging_entrypoints_are_removed() -> None:
+    assert not (REPOSITORY_ROOT / "mooncake-wheel/pyproject.toml").exists()
+    assert not (REPOSITORY_ROOT / "scripts/build_wheel.sh").exists()
 
 
 def test_tracked_source_roots_contain_no_generated_native_artifacts() -> None:
@@ -123,6 +129,33 @@ def test_release_runtime_install_conditions(tmp_path, artifact, defines, expecte
     if expected:
         assert artifact in result.read_text()
         assert "COMPONENT;python" in result.read_text()
+
+
+def test_ssd_administration_modules_have_one_authoritative_source() -> None:
+    package_root = REPOSITORY_ROOT / "python" / "mooncake"
+    legacy_package_root = REPOSITORY_ROOT / "mooncake-wheel" / "mooncake"
+    direct_install = (
+        REPOSITORY_ROOT / "mooncake-integration" / "CMakeLists.txt"
+    ).read_text()
+    modules = (
+        "_administration.py",
+        "mooncake_ssd_register.py",
+        "mooncake_ssd_unregister.py",
+        "spdk_tgt_create.py",
+    )
+
+    for module in modules:
+        assert (package_root / module).is_file()
+        assert not (legacy_package_root / module).exists()
+        assert f"../python/mooncake/{module}" in direct_install
+        assert f"../mooncake-wheel/mooncake/{module}" not in direct_install
+
+    assert (
+        REPOSITORY_ROOT / "python" / "tests" / "ssd" / "test_spdk_tgt_create.py"
+    ).is_file()
+    assert not (
+        REPOSITORY_ROOT / "mooncake-wheel" / "tests" / "test_spdk_tgt_create.py"
+    ).exists()
 
 
 def test_pg_extension_build_stages_outside_the_source_tree(

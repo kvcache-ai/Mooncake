@@ -19,6 +19,9 @@
 #include "common.h"
 #include "char_util.h"
 
+#include <linux/mman.h>
+#include <sys/mman.h>
+
 #if defined(USE_CUDA)
 #include <bits/stdint-uintn.h>
 #include <cuda.h>
@@ -173,6 +176,57 @@ static std::string cpuLocationFromPages(void* addr, int expected_node) {
     return entries[0].location;
 }
 
+#ifndef MAP_HUGE_2MB
+#define MAP_HUGE_2MB (21 << 26)
+#endif
+#ifndef MAP_HUGE_1GB
+#define MAP_HUGE_1GB (30 << 26)
+#endif
+#ifndef MAP_HUGE_512MB
+#define MAP_HUGE_512MB (29 << 26)
+#endif
+
+static size_t hugepageBytes() {
+    return XferBenchConfig::hugepage_size == 0
+               ? mooncake::SharedMemoryOptions::kHugepage2MB
+               : XferBenchConfig::hugepage_size;
+}
+
+static int hugepageMmapFlags(size_t hp) {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB | MAP_POPULATE;
+    if (hp == mooncake::SharedMemoryOptions::kHugepage2MB)
+        flags |= MAP_HUGE_2MB;
+    else if (hp == mooncake::SharedMemoryOptions::kHugepage512MB)
+        flags |= MAP_HUGE_512MB;
+    else if (hp == mooncake::SharedMemoryOptions::kHugepage1GB)
+        flags |= MAP_HUGE_1GB;
+    return flags;
+}
+
+static void* allocateHugepageOnNode(size_t size, int node) {
+    const size_t hp = hugepageBytes();
+    if (hp == 0 || size % hp != 0) {
+        LOG(ERROR) << "RDMA hugepage buffer " << size
+                   << " is not a multiple of hugepage size " << hp;
+        return nullptr;
+    }
+    void* buf = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                     hugepageMmapFlags(hp), -1, 0);
+    if (buf == MAP_FAILED) {
+        PLOG(ERROR) << "MAP_HUGETLB mmap failed for " << size
+                    << " bytes (hp=" << hp
+                    << "); refusing 4K fallback to avoid blowing NIC PTEs";
+        return nullptr;
+    }
+    if (numa_available() >= 0 && node >= 0) {
+        numa_tonode_memory(buf, size, node);
+    }
+    auto* p = static_cast<char*>(buf);
+    for (size_t off = 0; off < size; off += hp) p[off] = 0;
+    if (size > 0) p[size - 1] = 0;
+    return buf;
+}
+
 static void freeMemoryPool(void* addr, size_t size) {
 #if defined(USE_CUDA) && defined(USE_MNNVL)
     CUmemGenericAllocationHandle handle;
@@ -206,15 +260,29 @@ int TEBenchRunner::allocateBuffers() {
         int num_buffers = numa_num_configured_nodes();
         pinned_buffer_list_.resize(num_buffers, nullptr);
         shm_backed_.assign(num_buffers, 0);
+        hugepage_backed_.assign(num_buffers, 0);
         for (int i = 0; i < num_buffers; ++i) {
             std::string location = "cpu:" + std::to_string(i);
             if (use_shm) {
+                mooncake::SharedMemoryOptions opt;
+                if (XferBenchConfig::use_hugepage) {
+                    opt.use_hugepage = true;
+                    opt.hugepage_size = XferBenchConfig::hugepage_size;
+                    opt.hugetlbfs_path = XferBenchConfig::hugetlbfs_path;
+                }
                 pinned_buffer_list_[i] =
-                    engine_->allocateSharedMemory(total_buffer_size);
+                    engine_->allocateSharedMemory(total_buffer_size, opt);
                 shm_backed_[i] = 1;
                 if (pinned_buffer_list_[i]) {
                     bindShmBufferToNode(pinned_buffer_list_[i],
                                         total_buffer_size, i);
+                    location = cpuLocationFromPages(pinned_buffer_list_[i], i);
+                }
+            } else if (XferBenchConfig::use_hugepage) {
+                pinned_buffer_list_[i] =
+                    allocateHugepageOnNode(total_buffer_size, i);
+                hugepage_backed_[i] = 1;
+                if (pinned_buffer_list_[i]) {
                     location = cpuLocationFromPages(pinned_buffer_list_[i], i);
                 }
             } else {
@@ -229,8 +297,14 @@ int TEBenchRunner::allocateBuffers() {
             }
         }
         if (use_shm) {
-            LOG(INFO) << "tebench: DRAM buffers allocated from POSIX shm "
-                         "and bound to NUMA nodes";
+            LOG(INFO) << "tebench: DRAM buffers allocated from "
+                      << (XferBenchConfig::use_hugepage ? "hugetlbfs"
+                                                        : "POSIX shm")
+                      << " and bound to NUMA nodes";
+        } else if (XferBenchConfig::use_hugepage) {
+            LOG(INFO) << "tebench: DRAM buffers allocated with MAP_HUGETLB "
+                         "hugepages (hp="
+                      << hugepageBytes() << ") for RDMA MR registration";
         }
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
     } else if (XferBenchConfig::seg_type == "VRAM") {
@@ -269,11 +343,18 @@ int TEBenchRunner::freeBuffers() {
             engine_->freeSharedMemory(pinned_buffer_list_[i]);
         } else {
             engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
-            freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+            if (i < hugepage_backed_.size() && hugepage_backed_[i]) {
+                if (munmap(pinned_buffer_list_[i], total_buffer_size) != 0) {
+                    PLOG(WARNING) << "munmap hugepage buffer failed";
+                }
+            } else {
+                freeMemoryPool(pinned_buffer_list_[i], total_buffer_size);
+            }
         }
     }
     pinned_buffer_list_.clear();
     shm_backed_.clear();
+    hugepage_backed_.clear();
     return 0;
 }
 

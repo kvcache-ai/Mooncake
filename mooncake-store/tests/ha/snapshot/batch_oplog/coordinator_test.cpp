@@ -6,6 +6,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -25,6 +26,10 @@ namespace {
 
 class EmptyBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view, std::string_view) override {
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         auto it = values.find(std::string(key));
         if (it == values.end()) {
@@ -83,6 +88,19 @@ class UnusedObjectStore final : public SnapshotObjectStore {
 
 class RecordingBackend final : public HaKvBackend {
    public:
+    ErrorCode DeleteRange(std::string_view begin,
+                          std::string_view end) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        EXPECT_EQ(
+            "1",
+            values_[ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")]);
+        ++delete_count;
+        values_.erase(values_.lower_bound(std::string(begin)),
+                      values_.lower_bound(std::string(end)));
+        return ErrorCode::OK;
+    }
+    size_t delete_count{0};
+
     ErrorCode Get(std::string_view key, std::string& value) override {
         std::lock_guard<std::mutex> lock(mutex_);
         auto it = values_.find(std::string(key));
@@ -192,6 +210,10 @@ class RecordingObjectStore final : public SnapshotObjectStore {
     }
     tl::expected<void, std::string> ListObjectsWithPrefix(
         const std::string& prefix, std::vector<std::string>& output) override {
+        if (prefix == "snapshots/batch-oplog/") {
+            if (gc_failure == 1) return tl::make_unexpected("GC list failed");
+            if (gc_failure == 2) throw std::runtime_error("GC list threw");
+        }
         output.clear();
         for (const auto& [key, value] : objects_) {
             (void)value;
@@ -207,6 +229,7 @@ class RecordingObjectStore final : public SnapshotObjectStore {
                                         .crc32c = std::nullopt};
     }
     std::string GetConnectionInfo() const override { return "recording"; }
+    int gc_failure{0};
 
    private:
     std::map<std::string, std::vector<uint8_t>> objects_;
@@ -256,7 +279,9 @@ TEST(BatchOpLogSnapshotCoordinatorTest, EmptyStandbySkipsWithoutLease) {
     EXPECT_FALSE(coordinator.IsRunning());
 }
 
-TEST(BatchOpLogSnapshotCoordinatorTest, PublishesAfterCaptureAndResumesApply) {
+class SnapshotMaintenanceTest : public ::testing::TestWithParam<int> {};
+
+TEST_P(SnapshotMaintenanceTest, PublishesAndPrunesDespiteGcFailure) {
     auto backend = std::make_shared<RecordingBackend>();
     ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey("cluster", 1),
                                           EncodeOpLogBatchRecord(MakeBatch())));
@@ -286,6 +311,7 @@ TEST(BatchOpLogSnapshotCoordinatorTest, PublishesAfterCaptureAndResumesApply) {
     }
 
     RecordingObjectStore object_store;
+    object_store.gc_failure = GetParam();
     BatchOpLogSnapshotCoordinatorConfig config;
     config.snapshot_root = "snapshots";
     config.snapshot_interval_seconds = 0;
@@ -300,7 +326,34 @@ TEST(BatchOpLogSnapshotCoordinatorTest, PublishesAfterCaptureAndResumesApply) {
         backend->Contains(ha::BuildBatchOpLogSnapshotLatestKey("cluster")));
     EXPECT_EQ(1u, coordinator.GetStatus().attempts);
     EXPECT_TRUE(coordinator.GetStatus().catch_up_target.has_value());
+    EXPECT_FALSE(backend->Contains(
+        ha::BuildBatchOpLogSnapshotCompactionFloorKey("cluster")));
+    auto second = MakeBatch();
+    second.batch_id = second.first_seq = second.last_seq = 2;
+    second.entries[0].sequence_id = 2;
+    ASSERT_EQ(ErrorCode::OK, backend->Put(BuildBatchRecordKey("cluster", 2),
+                                          EncodeOpLogBatchRecord(second)));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey("cluster"),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
+    const auto next_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < next_deadline) {
+        const auto prefix = standby.GetLastAppliedBatchOpLogSnapshotPrefix();
+        if (prefix && prefix->batch_id == 2) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(2u, standby.GetLastAppliedBatchOpLogSnapshotPrefix()->batch_id);
+    ASSERT_EQ(ErrorCode::OK, coordinator.RunOnce());
+    EXPECT_EQ(2u, coordinator.GetStatus().attempts);
+    EXPECT_EQ(1u, backend->delete_count);
+    EXPECT_FALSE(backend->Contains(BuildBatchRecordKey("cluster", 1)));
+    EXPECT_TRUE(backend->Contains(BuildBatchRecordKey("cluster", 2)));
     standby.Stop();
 }
+
+INSTANTIATE_TEST_SUITE_P(GcOutcomes, SnapshotMaintenanceTest,
+                         ::testing::Values(0, 1, 2));
 
 }  // namespace mooncake::test

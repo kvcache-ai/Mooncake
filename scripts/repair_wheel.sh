@@ -67,11 +67,13 @@ case "$ARCH" in
 esac
 PLATFORM_TAG=${PLATFORM_TAG:-manylinux_${GLIBC_VERSION}_${ARCH}}
 
+# Bundle OpenSSL when required by the OSS adapter; target systems may not
+# provide the build container's OpenSSL ABI.
 # These are externally supplied runtime libraries, not wheel-owned artifacts.
 # In particular MPComm is independently installed and may contain CUDA fatbins.
 EXCLUDED_LIBRARIES='libcurl.so* libfabric.so* libefa.so* libibverbs.so* libmlx5.so*
 libnuma.so* libstdc++.so* libgcc_s.so* libc.so* libnghttp2.so* libidn2.so*
-librtmp.so* libssh.so* libpsl.so* libssl.so* libcrypto.so* libgssapi_krb5.so*
+librtmp.so* libssh.so* libpsl.so* libgssapi_krb5.so*
 libldap.so* liblber.so* libbrotlidec.so* libz.so* libnl-route-3.so* libnl-3.so*
 libm.so* liblzma.so* libunistring.so* libgnutls.so* libhogweed.so* libnettle.so*
 libgmp.so* libkrb5.so* libk5crypto.so* libcom_err.so* libkrb5support.so*

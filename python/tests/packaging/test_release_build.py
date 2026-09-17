@@ -312,6 +312,8 @@ def test_repair_keeps_cuda_payload_out_of_auditwheel(tmp_path):
         "    with zipfile.ZipFile(wheel) as archive:\n"
         "        assert not any('device.so' in name for name in archive.namelist())\n"
         "    assert 'libmooncake_ep_device.so*' in sys.argv\n"
+        "    assert 'libssl.so*' not in sys.argv\n"
+        "    assert 'libcrypto.so*' not in sys.argv\n"
         "    assert '/opt/conda/lib' in os.environ['LD_LIBRARY_PATH'].split(':')\n"
         "    shutil.copy(wheel, sys.argv[sys.argv.index('-w') + 1])\n"
         "else:\n"

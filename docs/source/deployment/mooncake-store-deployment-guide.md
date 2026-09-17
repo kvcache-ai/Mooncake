@@ -267,6 +267,8 @@ HA leadership and metadata replication are configured separately:
 
 - `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
 - `--enable_oplog_snapshot`: Enable standby-generated snapshots for batch OpLog recovery. Defaults to `false`; requires `enable_oplog=true`, HA with etcd, a valid snapshot object store, and a persistent `MOONCAKE_SNAPSHOT_LOCAL_PATH` when using `local`.
+- With `enable_oplog_snapshot=true`, each successful publication also attempts batch OpLog pruning under the same maintenance lease. Pruning requires two independently validated snapshots: it publishes a monotonic `compaction_floor` at the fallback snapshot's batch ID before deleting covered batches. The first snapshot does not prune. GC or pruning failures keep the published snapshot successful; failed deletions can be retried after a later successful publication.
+- Before enabling this mode, every standby that may be promoted must support compaction-floor rebootstrap. Once pruning has started, rollback requires a binary that understands the batch snapshot and floor protocol. This maintenance does not perform etcd MVCC compaction/defragmentation or delete legacy snapshot/OpLog data.
 - `--snapshot_chunk_object_count`: Maximum objects written to one batch OpLog snapshot chunk. Defaults to `1000000`; must be greater than zero when `enable_oplog_snapshot=true`.
 - `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
 - `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
@@ -1281,6 +1283,7 @@ Do not run binaries from before and after checksum support was introduced in the
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `512MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+| `MC_STORE_REGISTER_SPDK` | unset | Set `1` to register `ShmHelper`-allocated shared memory (host pool, dummy local buffer) with SPDK for NoF zero-copy transfers. Forces HugeTLB backing for those allocations, defaulting to 2MB hugepages when `MC_STORE_USE_HUGEPAGE` is unset. Must be set on BOTH the dummy and the real process (SPDK registration is per-process) |
 
 RDMA Store segments backed by HugeTLB are populated in parallel immediately
 before transfer-engine registration. No additional population-mode setting is
@@ -1296,6 +1299,25 @@ NUMA-segmented mappings, each worker is scheduled on the NUMA node associated
 with its `mbind()` region before touching pages. The mmap arena retains its
 eager `MAP_POPULATE` behavior for DMA safety; set `MC_DISABLE_MMAP_ARENA=1` if
 the deferred direct-mmap path is desired while the arena is otherwise enabled.
+
+For NoF (NVMe-oF) zero-copy, `MC_STORE_REGISTER_SPDK=1` registers the shared
+memory allocated by `ShmHelper` (SGLang host pool, dummy local buffer) with
+SPDK (`spdk_mem_register`) so the NoF RDMA transport can DMA to/from it
+directly — without it those buffers fail with `No translation for ptr`.
+`spdk_mem_register` is per-process, so set this switch on BOTH the dummy
+(sender) and the real client (receiver): the dummy registers its own mapping
+in `ShmHelper::allocate`, and the real client registers its separate mapping
+of the same shared fd in `RealClient::map_shm_internal_with_device`. Setting
+it on only one process leaves the other without an SPDK translation and NoF
+transfers still fail with `No translation for ptr`. SPDK
+registration in iova=pa mode requires PHYSICALLY 2MB-aligned memory, which only
+HugeTLB pages satisfy, so this switch forces HugeTLB for the affected
+allocations even when `MC_STORE_USE_HUGEPAGE` is unset; it then defaults to 2MB
+hugepages (set `MC_STORE_USE_HUGEPAGE=1` and `MC_STORE_HUGEPAGE_SIZE=1GB` for
+1GB). Reserve enough HugeTLB pages (`/proc/sys/vm/nr_hugepages`) for the host
+pool plus any hugepage-backed segments; when the pool is exhausted the first
+allocation aborts with a clear error naming the hugepage size and count needed
+rather than silently degrading.
 
 #### yalantinglibs Log Level
 
