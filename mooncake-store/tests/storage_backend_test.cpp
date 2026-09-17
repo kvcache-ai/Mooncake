@@ -35,6 +35,18 @@
 namespace fs = std::filesystem;
 namespace mooncake::test {
 
+// Ignore the #3528 path lock when tests assert "empty" / file counts.
+static int CountDataFiles(const std::string& dir) {
+    int n = 0;
+    if (!fs::exists(dir)) return 0;
+    for (const auto& entry : fs::directory_iterator(dir)) {
+        if (!entry.is_regular_file()) continue;
+        if (entry.path().filename() == ".mooncake_local_disk.lock") continue;
+        ++n;
+    }
+    return n;
+}
+
 class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
@@ -374,7 +386,8 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     BucketStorageBackend storage_backend(config, bucket_config);
 
     ASSERT_TRUE(storage_backend.Init());
-    ASSERT_TRUE(fs::directory_iterator(data_path) == fs::directory_iterator{});
+    // Fresh Init may only leave the path lock from #3528.
+    ASSERT_EQ(CountDataFiles(data_path), 0);
     ASSERT_TRUE(!storage_backend.Init());
     std::unordered_map<std::string, std::string> test_data;
     std::vector<std::string> keys;
@@ -697,13 +710,8 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(fs::exists(orphaned_bucket_path));
     ASSERT_TRUE(fs::exists(orphaned_bucket_path_2));
 
-    // Count files before cleanup
-    int file_count_before = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_before++;
-        }
-    }
+    // Count files before cleanup (exclude #3528 path lock)
+    int file_count_before = CountDataFiles(data_path);
     // Should have: 1 valid .bucket + 1 valid .meta + 2 orphaned .bucket = 4
     ASSERT_EQ(file_count_before, 4);
 
@@ -730,13 +738,8 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     ASSERT_TRUE(fs::exists(valid_meta_path))
         << "Valid bucket metadata file should still exist";
 
-    // Count files after cleanup
-    int file_count_after = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_after++;
-        }
-    }
+    // Count files after cleanup (exclude #3528 path lock)
+    int file_count_after = CountDataFiles(data_path);
     // Should have only: 1 valid .bucket + 1 valid .meta = 2
     ASSERT_EQ(file_count_after, 2);
 
@@ -2197,12 +2200,7 @@ TEST_F(StorageBackendTest,
     int64_t bucket1_id = result1.value();
 
     // Count files before duplicate attempt
-    int file_count_before = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_before++;
-        }
-    }
+    int file_count_before = CountDataFiles(data_path);
     // Should have 1 .bucket + 1 .meta = 2 files
     EXPECT_EQ(file_count_before, 2);
 
@@ -2223,12 +2221,8 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
     // Count files after duplicate attempt - orphaned files should be cleaned up
-    int file_count_after = 0;
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            file_count_after++;
-        }
-    }
+    // (exclude #3528 path lock)
+    int file_count_after = CountDataFiles(data_path);
     // Should still have only 2 files (orphaned bucket 2 files should be cleaned
     // up)
     EXPECT_EQ(file_count_after, 2) << "Orphaned bucket files should be cleaned "
