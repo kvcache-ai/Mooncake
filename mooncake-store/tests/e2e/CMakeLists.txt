@@ -96,3 +96,17 @@ add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp
 target_link_libraries(oplog_batch_e2e_test PUBLIC glog::glog gtest pthread)
 add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
 set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)
+
+# P02 reader integration harness. It needs a live etcd endpoint supplied at
+# runtime, so it is deliberately not registered with CTest. The runner script
+# owns etcd startup, namespace isolation, and cross-process restarts.
+add_executable(oplog_p02_reader_e2e oplog_p02_reader_e2e.cpp)
+target_link_libraries(oplog_p02_reader_e2e PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog::glog
+    gflags::gflags
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
